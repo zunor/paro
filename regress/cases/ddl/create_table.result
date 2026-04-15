@@ -1,0 +1,7 @@
+INSERT INTO ddl_create_table_case VALUES (1, 'alice'), (2, 'bob');
+INSERT 0 2
+
+SELECT id, name FROM ddl_create_table_case ORDER BY id;
+id	name
+1	alice
+2	bob

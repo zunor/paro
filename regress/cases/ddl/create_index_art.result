@@ -1,0 +1,52 @@
+DROP INDEX IF EXISTS idx_art_orders_customer_id;
+DROP INDEX
+
+DROP TABLE IF EXISTS art_orders;
+DROP TABLE
+
+CREATE TABLE art_orders (
+    order_id INT PRIMARY KEY,
+    customer_id INT,
+    status VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO art_orders VALUES
+    (1, 10, 'new'),
+    (2, 20, 'paid'),
+    (3, 20, 'shipped'),
+    (4, 30, 'paid');
+INSERT 0 4
+
+CREATE INDEX idx_art_orders_customer_id ON art_orders (customer_id);
+CREATE INDEX
+
+SELECT index_name, index_type, build_state, entry_count
+FROM paro_indexes()
+WHERE table_name = 'art_orders'
+ORDER BY index_name;
+index_name	index_type	build_state	entry_count
+idx_art_orders_customer_id	ART	READY	4
+
+CREATE INDEX IF NOT EXISTS idx_art_orders_customer_id ON art_orders (customer_id);
+CREATE INDEX
+
+SELECT order_id, status
+FROM art_orders
+WHERE customer_id = 20
+ORDER BY order_id;
+order_id	status
+2	paid
+3	shipped
+
+DROP INDEX idx_art_orders_customer_id;
+DROP INDEX
+
+SELECT COUNT(*) AS remaining_indexes
+FROM paro_indexes()
+WHERE table_name = 'art_orders';
+remaining_indexes
+0
+
+DROP TABLE art_orders;
+DROP TABLE

@@ -1,0 +1,983 @@
+---------- Input ----------
+checkpoint
+---------- Output ---------
+CHECKPOINT
+---------- AST ------------
+Checkpoint(
+    CheckpointStmt,
+)
+
+
+---------- Input ----------
+prepare stmt1 as select 1
+---------- Output ---------
+PREPARE stmt1 AS SELECT 1
+---------- AST ------------
+Prepare(
+    PrepareStmt {
+        name: Identifier {
+            span: Some(
+                8..13,
+            ),
+            name: "stmt1",
+            quote: None,
+            ident_type: None,
+        },
+        parameter_types: [],
+        statement: Query(
+            Query {
+                span: Some(
+                    17..25,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            17..25,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            AliasedExpr {
+                                expr: Literal {
+                                    span: Some(
+                                        24..25,
+                                    ),
+                                    value: UInt64(
+                                        1,
+                                    ),
+                                },
+                                alias: None,
+                            },
+                        ],
+                        from: [],
+                        selection: None,
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+prepare stmt2(int, varchar) as select $1, $2
+---------- Output ---------
+PREPARE stmt2 (Int32, STRING) AS SELECT $1, $2
+---------- AST ------------
+Prepare(
+    PrepareStmt {
+        name: Identifier {
+            span: Some(
+                8..13,
+            ),
+            name: "stmt2",
+            quote: None,
+            ident_type: None,
+        },
+        parameter_types: [
+            Int32,
+            String,
+        ],
+        statement: Query(
+            Query {
+                span: Some(
+                    31..44,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            31..44,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            AliasedExpr {
+                                expr: ColumnRef {
+                                    span: Some(
+                                        38..40,
+                                    ),
+                                    column: ColumnRef {
+                                        schema: None,
+                                        table: None,
+                                        column: Position(
+                                            ColumnPosition {
+                                                span: Some(
+                                                    38..40,
+                                                ),
+                                                pos: 1,
+                                                name: "$1",
+                                            },
+                                        ),
+                                    },
+                                },
+                                alias: None,
+                            },
+                            AliasedExpr {
+                                expr: ColumnRef {
+                                    span: Some(
+                                        42..44,
+                                    ),
+                                    column: ColumnRef {
+                                        schema: None,
+                                        table: None,
+                                        column: Position(
+                                            ColumnPosition {
+                                                span: Some(
+                                                    42..44,
+                                                ),
+                                                pos: 2,
+                                                name: "$2",
+                                            },
+                                        ),
+                                    },
+                                },
+                                alias: None,
+                            },
+                        ],
+                        from: [],
+                        selection: None,
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+execute stmt1
+---------- Output ---------
+EXECUTE stmt1
+---------- AST ------------
+Execute(
+    ExecuteStmt {
+        name: Identifier {
+            span: Some(
+                8..13,
+            ),
+            name: "stmt1",
+            quote: None,
+            ident_type: None,
+        },
+        args: [],
+    },
+)
+
+
+---------- Input ----------
+declare c scroll cursor with hold for select 1
+---------- Output ---------
+DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT 1
+---------- AST ------------
+DeclareCursor(
+    DeclareCursorStmt {
+        name: Identifier {
+            span: Some(
+                8..9,
+            ),
+            name: "c",
+            quote: None,
+            ident_type: None,
+        },
+        scroll: Scroll,
+        hold: true,
+        query: Query(
+            Query {
+                span: Some(
+                    38..46,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            38..46,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            AliasedExpr {
+                                expr: Literal {
+                                    span: Some(
+                                        45..46,
+                                    ),
+                                    value: UInt64(
+                                        1,
+                                    ),
+                                },
+                                alias: None,
+                            },
+                        ],
+                        from: [],
+                        selection: None,
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+fetch next from c
+---------- Output ---------
+FETCH NEXT FROM c
+---------- AST ------------
+Fetch(
+    FetchStmt {
+        ismove: false,
+        direction: Next,
+        cursor: Identifier {
+            span: Some(
+                16..17,
+            ),
+            name: "c",
+            quote: None,
+            ident_type: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+move all from c
+---------- Output ---------
+MOVE FORWARD ALL FROM c
+---------- AST ------------
+Fetch(
+    FetchStmt {
+        ismove: true,
+        direction: ForwardAll,
+        cursor: Identifier {
+            span: Some(
+                14..15,
+            ),
+            name: "c",
+            quote: None,
+            ident_type: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+close c
+---------- Output ---------
+CLOSE c
+---------- AST ------------
+CloseCursor(
+    CloseCursorStmt {
+        name: Some(
+            Identifier {
+                span: Some(
+                    6..7,
+                ),
+                name: "c",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+discard all
+---------- Output ---------
+DISCARD ALL
+---------- AST ------------
+Discard(
+    DiscardStmt {
+        target: All,
+    },
+)
+
+
+---------- Input ----------
+show processlist
+---------- Output ---------
+SHOW processlist
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..16,
+                ),
+                name: "processlist",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show functions
+---------- Output ---------
+SHOW functions
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..14,
+                ),
+                name: "functions",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show engines
+---------- Output ---------
+SHOW engines
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..12,
+                ),
+                name: "engines",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show metrics
+---------- Output ---------
+SHOW metrics
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..12,
+                ),
+                name: "metrics",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show table_functions
+---------- Output ---------
+SHOW table_functions
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..20,
+                ),
+                name: "table_functions",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show indexes
+---------- Output ---------
+SHOW indexes
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..12,
+                ),
+                name: "indexes",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show locks
+---------- Output ---------
+SHOW locks
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..10,
+                ),
+                name: "locks",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show stages
+---------- Output ---------
+SHOW stages
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..11,
+                ),
+                name: "stages",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show full streams
+---------- Output ---------
+SHOW FULL STREAMS
+---------- AST ------------
+ShowStreams(
+    ShowStreamsStmt {
+        database: None,
+        schema: None,
+        full: true,
+        limit: None,
+    },
+)
+
+
+---------- Input ----------
+show tasks
+---------- Output ---------
+SHOW tasks
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..10,
+                ),
+                name: "tasks",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+list @stage_a;
+---------- Output ---------
+LIST @stage_a
+---------- AST ------------
+ListStage {
+    location: "stage_a",
+    pattern: None,
+}
+
+
+---------- Input ----------
+list @~;
+---------- Output ---------
+LIST @~
+---------- AST ------------
+ListStage {
+    location: "~",
+    pattern: None,
+}
+
+
+---------- Input ----------
+PRESIGN @my_stage
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN @my_stage/path/to/dir/
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/path/to/dir/ EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/path/to/dir/",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN @my_stage/path/to/file
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/path/to/file EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/path/to/file",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN @my_stage/my\ file.csv
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/my\ file.csv EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/my file.csv",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN @my_stage/\"file\".csv
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/\"file\".csv EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/\"file\".csv",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN @my_stage/\'file\'.csv
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/\'file\'.csv EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/'file'.csv",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN @my_stage/\\file\\.csv
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/\\file\\.csv EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/\\file\\.csv",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN DOWNLOAD @my_stage/path/to/file
+---------- Output ---------
+PRESIGN DOWNLOAD @my_stage/path/to/file EXPIRE = 3600
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Download,
+        location: StageLocation(
+            "my_stage/path/to/file",
+        ),
+        expire: 3600s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN UPLOAD @my_stage/path/to/file EXPIRE=7200
+---------- Output ---------
+PRESIGN UPLOAD @my_stage/path/to/file EXPIRE = 7200
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Upload,
+        location: StageLocation(
+            "my_stage/path/to/file",
+        ),
+        expire: 7200s,
+        content_type: None,
+    },
+)
+
+
+---------- Input ----------
+PRESIGN UPLOAD @my_stage/path/to/file EXPIRE=7200 CONTENT_TYPE='application/octet-stream'
+---------- Output ---------
+PRESIGN UPLOAD @my_stage/path/to/file EXPIRE = 7200 CONTENT_TYPE = 'application/octet-stream'
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Upload,
+        location: StageLocation(
+            "my_stage/path/to/file",
+        ),
+        expire: 7200s,
+        content_type: Some(
+            "application/octet-stream",
+        ),
+    },
+)
+
+
+---------- Input ----------
+PRESIGN UPLOAD @my_stage/path/to/file CONTENT_TYPE='application/octet-stream' EXPIRE=7200
+---------- Output ---------
+PRESIGN UPLOAD @my_stage/path/to/file EXPIRE = 7200 CONTENT_TYPE = 'application/octet-stream'
+---------- AST ------------
+Presign(
+    PresignStmt {
+        action: Upload,
+        location: StageLocation(
+            "my_stage/path/to/file",
+        ),
+        expire: 7200s,
+        content_type: Some(
+            "application/octet-stream",
+        ),
+    },
+)
+
+
+---------- Input ----------
+VACUUM TABLE t;
+---------- Output ---------
+VACUUM TABLE t 
+---------- AST ------------
+VacuumTable(
+    VacuumTableStmt {
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                13..14,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        option: VacuumTableOption {
+            dry_run: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM TABLE t DRY RUN;
+---------- Output ---------
+VACUUM TABLE t DRY RUN
+---------- AST ------------
+VacuumTable(
+    VacuumTableStmt {
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                13..14,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        option: VacuumTableOption {
+            dry_run: Some(
+                false,
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM TABLE t DRY RUN SUMMARY;
+---------- Output ---------
+VACUUM TABLE t DRY RUN SUMMARY
+---------- AST ------------
+VacuumTable(
+    VacuumTableStmt {
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                13..14,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        option: VacuumTableOption {
+            dry_run: Some(
+                true,
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM DROP TABLE;
+---------- Output ---------
+VACUUM DROP TABLE 
+---------- AST ------------
+VacuumDropTable(
+    VacuumDropTableStmt {
+        database: None,
+        schema: None,
+        option: VacuumDropTableOption {
+            dry_run: None,
+            limit: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM DROP TABLE DRY RUN;
+---------- Output ---------
+VACUUM DROP TABLE DRY RUN
+---------- AST ------------
+VacuumDropTable(
+    VacuumDropTableStmt {
+        database: None,
+        schema: None,
+        option: VacuumDropTableOption {
+            dry_run: Some(
+                false,
+            ),
+            limit: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM DROP TABLE DRY RUN SUMMARY;
+---------- Output ---------
+VACUUM DROP TABLE DRY RUN SUMMARY
+---------- AST ------------
+VacuumDropTable(
+    VacuumDropTableStmt {
+        database: None,
+        schema: None,
+        option: VacuumDropTableOption {
+            dry_run: Some(
+                true,
+            ),
+            limit: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM DROP TABLE FROM db;
+---------- Output ---------
+VACUUM DROP TABLE FROM db 
+---------- AST ------------
+VacuumDropTable(
+    VacuumDropTableStmt {
+        database: None,
+        schema: Some(
+            Identifier {
+                span: Some(
+                    23..25,
+                ),
+                name: "db",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+        option: VacuumDropTableOption {
+            dry_run: None,
+            limit: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+VACUUM DROP TABLE FROM db LIMIT 10;
+---------- Output ---------
+VACUUM DROP TABLE FROM db  LIMIT 10
+---------- AST ------------
+VacuumDropTable(
+    VacuumDropTableStmt {
+        database: None,
+        schema: Some(
+            Identifier {
+                span: Some(
+                    23..25,
+                ),
+                name: "db",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+        option: VacuumDropTableOption {
+            dry_run: None,
+            limit: Some(
+                10,
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+SHOW WAREHOUSES
+---------- Output ---------
+SHOW WAREHOUSES
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..15,
+                ),
+                name: "WAREHOUSES",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+REMOVE @t;
+---------- Output ---------
+REMOVE @t
+---------- AST ------------
+RemoveStage {
+    location: "t",
+    pattern: "",
+}
+
+
+---------- Input ----------
+EXECUTE IMMEDIATE
+$$
+BEGIN
+    LOOP
+        RETURN 1;
+    END LOOP;
+END;
+$$
+---------- Output ---------
+EXECUTE IMMEDIATE 'BEGIN\n    LOOP\n        RETURN 1;\n    END LOOP;\nEND;'
+---------- AST ------------
+ExecuteImmediate(
+    ExecuteImmediateStmt {
+        script: Literal {
+            span: Some(
+                18..75,
+            ),
+            value: String(
+                "BEGIN\n    LOOP\n        RETURN 1;\n    END LOOP;\nEND;",
+            ),
+        },
+    },
+)
+
+

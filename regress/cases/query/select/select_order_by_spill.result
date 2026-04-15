@@ -1,0 +1,168 @@
+INSERT INTO order_spill_test VALUES
+    (1, 1, 10, 'payload_alpha_aaaaaaaaaaaaaaaa'),
+    (2, 1, 20, 'payload_beta_bbbbbbbbbbbbbbbb'),
+    (3, 2, 30, 'payload_gamma_cccccccccccccccc'),
+    (4, 2, 40, 'payload_delta_dddddddddddddddd'),
+    (5, 3, 50, 'payload_epsilon_eeeeeeeeeeeeeeee'),
+    (6, 3, 60, 'payload_zeta_ffffffffffffffff'),
+    (7, 4, 70, 'payload_eta_gggggggggggggggg'),
+    (8, 4, 80, 'payload_theta_hhhhhhhhhhhhhhhh');
+INSERT 0 8
+
+INSERT INTO order_spill_test
+SELECT id + 1000, k1 + 1, k2, payload || '_dup1' FROM order_spill_test;
+INSERT 0 8
+
+INSERT INTO order_spill_test
+SELECT id + 2000, k1 + 2, k2, payload || '_dup2' FROM order_spill_test;
+INSERT 0 16
+
+INSERT INTO order_spill_test
+SELECT id + 4000, k1 + 3, k2, payload || '_dup3' FROM order_spill_test;
+INSERT 0 32
+
+INSERT INTO order_spill_test
+SELECT id + 8000, k1 + 4, k2, payload || '_dup4' FROM order_spill_test;
+INSERT 0 64
+
+SET temp_directory = '/tmp/paro_regress_order_spill';
+SET
+
+SELECT id, k1, k2
+FROM order_spill_test
+ORDER BY k2 DESC, id ASC
+LIMIT 12;
+id	k1	k2
+8	4	80
+1008	5	80
+2008	6	80
+3008	7	80
+4008	7	80
+5008	8	80
+6008	9	80
+7008	10	80
+8008	8	80
+9008	9	80
+10008	10	80
+11008	11	80
+
+SET force_external = true;
+SET
+
+SELECT id, k1, k2
+FROM order_spill_test
+ORDER BY k2 DESC, id ASC
+LIMIT 12;
+id	k1	k2
+8	4	80
+1008	5	80
+2008	6	80
+3008	7	80
+4008	7	80
+5008	8	80
+6008	9	80
+7008	10	80
+8008	8	80
+9008	9	80
+10008	10	80
+11008	11	80
+
+SELECT id, payload
+FROM order_spill_test
+ORDER BY payload DESC, id ASC
+LIMIT 6;
+id	payload
+8006	payload_zeta_ffffffffffffffff_dup4
+12006	payload_zeta_ffffffffffffffff_dup3_dup4
+4006	payload_zeta_ffffffffffffffff_dup3
+10006	payload_zeta_ffffffffffffffff_dup2_dup4
+14006	payload_zeta_ffffffffffffffff_dup2_dup3_dup4
+6006	payload_zeta_ffffffffffffffff_dup2_dup3
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE SELECT id FROM order_spill_test ORDER BY id DESC, k1 ASC;
+QUERY PLAN
+PROJECTION  (rows=128) (actual time=2.397..2.410 rows=128 loops=1)
+  Output: id
+  ->  ORDER_BY  (rows=128) (actual time=0.430..2.436 rows=256 loops=7)
+        Sort Key: id DESC NULLS FIRST, k1 ASC NULLS LAST
+        Sort Method: external merge
+        Spilled: true
+        Peak Memory: 0 B
+        ->  PROJECTION  (rows=128) (actual time=0.399..1.471 rows=128 loops=5)
+              Output: id, id, k1
+              ->  ROWSET_SCAN on public.order_spill_test (actual time=0.261..1.607 rows=128 loops=6)
+                    Columns: id, k1
+Execution Time: 0.382 ms
+Rows Returned: 128
+
+SET force_external = DEFAULT;
+SET
+
+SET force_external = true;
+SET
+
+CREATE TABLE order_spill_smallmem_test (id INT, k1 INT);
+CREATE TABLE
+
+INSERT INTO order_spill_smallmem_test VALUES
+    (5, 1),
+    (2, 2),
+    (9, 3),
+    (1, 4),
+    (7, 5),
+    (3, 6);
+INSERT 0 6
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE SELECT id FROM order_spill_smallmem_test ORDER BY id ASC, k1 DESC;
+QUERY PLAN
+PROJECTION  (rows=6) (actual time=1.250..1.269 rows=6 loops=1)
+  Output: id
+  ->  ORDER_BY  (rows=6) (actual time=0.648..1.301 rows=12 loops=3)
+        Sort Key: id ASC NULLS LAST, k1 DESC NULLS FIRST
+        Sort Method: external merge
+        Spilled: true
+        Peak Memory: 0 B
+        ->  PROJECTION  (rows=6) (actual time=0.607..0.644 rows=6 loops=1)
+              Output: id, id, k1
+              ->  ROWSET_SCAN on public.order_spill_smallmem_test (actual time=0.349..0.769 rows=6 loops=2)
+                    Columns: id, k1
+Execution Time: 0.291 ms
+Rows Returned: 6
+
+SET force_external = DEFAULT;
+SET
+
+SET temp_directory = DEFAULT;
+SET
+
+DROP TABLE IF EXISTS order_spill_smallmem_test;
+DROP TABLE
+
+CREATE TABLE order_spill_null_test (id INT, a INT, b INT);
+CREATE TABLE
+
+INSERT INTO order_spill_null_test VALUES
+    (1, 1, 10),
+    (2, 1, NULL),
+    (3, NULL, 5),
+    (4, 2, 7),
+    (5, 1, 7),
+    (6, NULL, NULL),
+    (7, 2, NULL),
+    (8, 1, 10);
+INSERT 0 8
+
+SELECT id, a, b
+FROM order_spill_null_test
+ORDER BY a ASC NULLS LAST, b DESC NULLS FIRST, id ASC;
+id	a	b
+2	1	NULL
+1	1	10
+8	1	10
+5	1	7
+7	2	NULL
+4	2	7
+6	NULL	NULL
+3	NULL	5

@@ -1,0 +1,304 @@
+CREATE TABLE brc_person (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR,
+    age INT,
+    score INT,
+    city VARCHAR
+);
+CREATE TABLE
+
+CREATE TABLE brc_org (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR,
+    founded INT,
+    headcount INT
+);
+CREATE TABLE
+
+CREATE TABLE brc_knows (
+    src_id BIGINT,
+    dst_id BIGINT,
+    weight INT,
+    tag VARCHAR
+);
+CREATE TABLE
+
+CREATE TABLE brc_member (
+    person_id BIGINT,
+    org_id BIGINT,
+    role VARCHAR,
+    tenure INT
+);
+CREATE TABLE
+
+INSERT INTO brc_person VALUES
+    (1, 'Alice',   30, 95,  'NYC'),
+    (2, 'Bob',     25, 88,  'SF'),
+    (3, 'Charlie', 35, 72,  'NYC'),
+    (4, 'Diana',   28, 91,  'LA'),
+    (5, 'Eve',     40, 85,  'NYC'),
+    (6, 'Frank',   22, 60,  'SF'),
+    (7, 'Grace',   33, 78,  NULL),
+    (8, 'Hank',    45, NULL, 'LA');
+INSERT 0 8
+
+INSERT INTO brc_org VALUES
+    (100, 'AlphaCo', 2000, 500),
+    (200, 'BetaInc', 2010, 100),
+    (300, 'GammaTech', 2020, 50);
+INSERT 0 3
+
+INSERT INTO brc_knows VALUES
+    (1, 2, 9, 'friend'),
+    (1, 3, 8, 'colleague'),
+    (2, 3, 7, 'friend'),
+    (3, 4, 6, 'colleague'),
+    (4, 5, 5, 'friend'),
+    (1, 5, 4, 'colleague'),
+    (5, 6, 3, 'friend'),
+    (6, 1, 2, 'colleague'),
+    (7, 8, 1, 'friend'),
+    (8, 1, 10, 'colleague');
+INSERT 0 10
+
+INSERT INTO brc_member VALUES
+    (1, 100, 'Engineer', 5),
+    (2, 200, 'Manager',  3),
+    (3, 100, 'Designer', 7),
+    (4, 300, 'Analyst',  2),
+    (5, 100, 'CTO',      10),
+    (6, 200, 'Intern',   1),
+    (7, 300, 'Consultant', 4),
+    (8, 100, 'VP',       8);
+INSERT 0 8
+
+CREATE PROPERTY GRAPH brc_graph
+VERTEX TABLES (
+    brc_person LABEL Person,
+    brc_org    LABEL Org
+)
+EDGE TABLES (
+    brc_knows
+        SOURCE KEY (src_id) REFERENCES brc_person (id)
+        DESTINATION KEY (dst_id) REFERENCES brc_person (id)
+        LABEL Knows,
+    brc_member
+        SOURCE KEY (person_id) REFERENCES brc_person (id)
+        DESTINATION KEY (org_id) REFERENCES brc_org (id)
+        LABEL MemberOf
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, a.age AS src_age, a.score AS src_score, a.city AS src_city,
+             b.name AS dst, b.age AS dst_age, b.score AS dst_score, b.city AS dst_city)
+) gt
+ORDER BY src, dst;
+gt.src	gt.src_age	gt.src_score	gt.src_city	gt.dst	gt.dst_age	gt.dst_score	gt.dst_city
+Alice	30	95	NYC	Bob	25	88	SF
+Alice	30	95	NYC	Charlie	35	72	NYC
+Alice	30	95	NYC	Eve	40	85	NYC
+Bob	25	88	SF	Charlie	35	72	NYC
+Charlie	35	72	NYC	Diana	28	91	LA
+Diana	28	91	LA	Eve	40	85	NYC
+Eve	40	85	NYC	Frank	22	60	SF
+Frank	22	60	SF	Alice	30	95	NYC
+Grace	33	78	NULL	Hank	45	NULL	LA
+Hank	45	NULL	LA	Alice	30	95	NYC
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, k.weight AS w, k.tag AS tag)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.w	gt.tag
+Alice	Bob	9	friend
+Alice	Charlie	8	colleague
+Alice	Eve	4	colleague
+Bob	Charlie	7	friend
+Charlie	Diana	6	colleague
+Diana	Eve	5	friend
+Eve	Frank	3	friend
+Frank	Alice	2	colleague
+Grace	Hank	1	friend
+Hank	Alice	10	colleague
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (p:Person)-[m:MemberOf]->(o:Org)
+    COLUMNS (p.name AS person, p.age AS age, p.city AS city,
+             o.name AS org, o.founded AS founded, o.headcount AS hc,
+             m.role AS role, m.tenure AS tenure)
+) gt
+ORDER BY person;
+gt.person	gt.age	gt.city	gt.org	gt.founded	gt.hc	gt.role	gt.tenure
+Alice	30	NYC	AlphaCo	2000	500	Engineer	5
+Bob	25	SF	BetaInc	2010	100	Manager	3
+Charlie	35	NYC	AlphaCo	2000	500	Designer	7
+Diana	28	LA	GammaTech	2020	50	Analyst	2
+Eve	40	NYC	AlphaCo	2000	500	CTO	10
+Frank	22	SF	BetaInc	2010	100	Intern	1
+Grace	33	NULL	GammaTech	2020	50	Consultant	4
+Hank	45	LA	AlphaCo	2000	500	VP	8
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.name = 'Grace')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, a.city AS src_city, a.score AS src_score,
+             b.name AS dst, b.city AS dst_city, b.score AS dst_score)
+) gt
+ORDER BY dst;
+gt.src	gt.src_city	gt.src_score	gt.dst	gt.dst_city	gt.dst_score
+Grace	NULL	78	Hank	LA	NULL
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.name = 'Hank')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, a.score AS src_score, b.name AS dst, b.score AS dst_score)
+) gt
+ORDER BY dst;
+gt.src	gt.src_score	gt.dst	gt.dst_score
+Hank	NULL	Alice	95
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.age >= 30)-[k:Knows]->(b:Person WHERE b.age < 30)
+    COLUMNS (a.name AS src, a.age AS src_age, b.name AS dst, b.age AS dst_age,
+             k.weight AS w)
+) gt
+ORDER BY src, dst;
+gt.src	gt.src_age	gt.dst	gt.dst_age	gt.w
+Alice	30	Bob	25	9
+Charlie	35	Diana	28	6
+Eve	40	Frank	22	3
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (b:Person)<-[k:Knows]-(a:Person WHERE a.name = 'Charlie')
+    COLUMNS (a.name AS src, a.age AS src_age, b.name AS dst, b.age AS dst_age,
+             k.weight AS w, k.tag AS tag)
+) gt
+ORDER BY dst;
+gt.src	gt.src_age	gt.dst	gt.dst_age	gt.w	gt.tag
+Charlie	35	Diana	28	6	colleague
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->{1,2}(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age, b.city AS dst_city)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age	gt.dst_city
+Alice	Bob	25	SF
+Alice	Charlie	35	NYC
+Alice	Diana	28	LA
+Alice	Eve	40	NYC
+Alice	Frank	22	SF
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH ANY SHORTEST (a:Person WHERE a.name = 'Alice')-[k:Knows]->{1,3}(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age, b.city AS dst_city)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age	gt.dst_city
+Alice	Bob	25	SF
+Alice	Charlie	35	NYC
+Alice	Diana	28	LA
+Alice	Eve	40	NYC
+Alice	Frank	22	SF
+
+SELECT src, count(*) AS cnt, sum(dst_age) AS total_age, sum(w) AS total_weight
+FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.age AS dst_age, k.weight AS w)
+) gt
+GROUP BY src
+ORDER BY src;
+src	cnt	total_age	total_weight
+Alice	3	100	21
+Bob	1	35	7
+Charlie	1	28	6
+Diana	1	40	5
+Eve	1	22	3
+Frank	1	30	2
+Grace	1	45	1
+Hank	1	30	10
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Bob	25
+Alice	Charlie	35
+Alice	Eve	40
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.name = 'Bob')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age
+Bob	Charlie	35
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Bob	25
+Alice	Charlie	35
+Alice	Eve	40
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (b.name AS dst)
+) gt
+ORDER BY dst;
+gt.dst
+Alice
+Alice
+Bob
+Charlie
+Charlie
+Diana
+Eve
+Eve
+Frank
+Hank
+
+SELECT org, count(*) AS member_count, sum(tenure) AS total_tenure
+FROM GRAPH_TABLE(brc_graph
+    MATCH (p:Person)-[m:MemberOf]->(o:Org)
+    COLUMNS (o.name AS org, m.tenure AS tenure)
+) gt
+GROUP BY org
+ORDER BY org;
+org	member_count	total_tenure
+AlphaCo	4	30
+BetaInc	2	4
+GammaTech	2	6
+
+SELECT * FROM GRAPH_TABLE(brc_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, k.weight AS w, k.tag AS tag)
+) gt
+WHERE gt.w >= 7
+ORDER BY src, dst;
+gt.src	gt.dst	gt.w	gt.tag
+Alice	Bob	9	friend
+Alice	Charlie	8	colleague
+Bob	Charlie	7	friend
+Hank	Alice	10	colleague
+
+DROP PROPERTY GRAPH brc_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE brc_member;
+DROP TABLE
+
+DROP TABLE brc_knows;
+DROP TABLE
+
+DROP TABLE brc_org;
+DROP TABLE
+
+DROP TABLE brc_person;
+DROP TABLE

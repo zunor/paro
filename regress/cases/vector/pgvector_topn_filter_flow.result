@@ -1,0 +1,71 @@
+DROP TABLE IF EXISTS vector_topn_case;
+DROP TABLE
+
+CREATE TABLE vector_topn_case (
+    id INT PRIMARY KEY,
+    category VARCHAR,
+    emb VECTOR(3)
+);
+CREATE TABLE
+
+INSERT INTO vector_topn_case VALUES
+    (1, 'x', '[1,0,0]'),
+    (2, 'x', '[0,1,0]'),
+    (3, 'y', '[0,0,1]'),
+    (4, 'y', '[2,0,0]'),
+    (5, 'z', '[-1,0,0]');
+INSERT 0 5
+
+EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]' LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id
+  ->  ADAPTIVE_SCAN on public.vector_topn_case
+        Search Decision: DEFER_TO_RUNTIME sequential_cost=5.000 candidates=1
+
+SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]', id LIMIT 3;
+id
+1
+4
+2
+
+EXPLAIN SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: id
+  ->  ADAPTIVE_SCAN on public.vector_topn_case
+        Search Decision: DEFER_TO_RUNTIME sequential_cost=1.000 candidates=1
+
+SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]', id LIMIT 2;
+id
+1
+2
+
+EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]' LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id
+  ->  ADAPTIVE_SCAN on public.vector_topn_case
+        Search Decision: DEFER_TO_RUNTIME sequential_cost=5.000 candidates=1
+
+SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]', id LIMIT 3;
+id
+1
+4
+2
+
+EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]' LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id
+  ->  ADAPTIVE_SCAN on public.vector_topn_case
+        Search Decision: DEFER_TO_RUNTIME sequential_cost=5.000 candidates=1
+
+SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]', id LIMIT 3;
+id
+4
+1
+2
+
+DROP TABLE vector_topn_case;
+DROP TABLE

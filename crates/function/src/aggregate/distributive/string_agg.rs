@@ -1,0 +1,474 @@
+//! STRING_AGG aggregate function.
+//!
+//!
+//!
+//! ## Implementation Notes
+//! - `string_agg(expr)` uses `','` as default separator.
+//! - `string_agg(expr, sep)` uses row separator `sep` (NULL sep treated as empty separator).
+//! - NULL `expr` rows are ignored.
+
+use crate::aggregate::{
+    AggregateCombineType, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+};
+use paro_common::types::LogicalType;
+use paro_common::vector::Vector;
+use std::ptr;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct StringAggState {
+    result: String,
+    is_set: bool,
+    combine_separator: Option<String>,
+}
+
+#[inline]
+fn append_value(state: &mut StringAggState, value: &str, separator: &str) {
+    if state.is_set {
+        state.result.push_str(separator);
+    }
+    state.result.push_str(value);
+    state.is_set = true;
+}
+
+#[inline]
+fn combine_states(source: &StringAggState, target: &mut StringAggState) {
+    if !source.is_set {
+        return;
+    }
+    if !target.is_set {
+        target.result.clear();
+        target.result.push_str(&source.result);
+        target.is_set = true;
+        target.combine_separator = source.combine_separator.clone();
+        return;
+    }
+
+    let separator = target
+        .combine_separator
+        .as_deref()
+        .or(source.combine_separator.as_deref())
+        .unwrap_or("");
+    target.result.push_str(separator);
+    target.result.push_str(&source.result);
+
+    if target.combine_separator.is_none() {
+        target.combine_separator = source.combine_separator.clone();
+    }
+}
+
+mod string_agg_one_arg {
+    use super::*;
+
+    type State = StringAggState;
+
+    pub unsafe fn initialize(state: *mut u8) {
+        debug_assert_eq!(
+            (state as usize) % std::mem::align_of::<State>(),
+            0,
+            "string_agg state pointer is not properly aligned"
+        );
+        ptr::write(state as *mut State, State::default());
+    }
+
+    pub unsafe fn update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        states: &Vector,
+        count: usize,
+    ) {
+        let input = inputs[0];
+        debug_assert_eq!(
+            input.logical_type(),
+            &LogicalType::Varchar,
+            "string_agg(expr) expects VARCHAR input"
+        );
+        let state_ptrs = states.flat_data::<*mut u8>();
+
+        for i in 0..count {
+            if input.is_null(i) {
+                continue;
+            }
+            let Some(value) = input.get_string(i) else {
+                continue;
+            };
+            let state_ptr = *state_ptrs.add(i);
+            let state = &mut *(state_ptr as *mut State);
+            append_value(state, value, ",");
+            if state.combine_separator.is_none() {
+                state.combine_separator = Some(",".to_string());
+            }
+        }
+    }
+
+    pub unsafe fn simple_update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        state: *mut u8,
+        count: usize,
+    ) {
+        let input = inputs[0];
+        debug_assert_eq!(
+            input.logical_type(),
+            &LogicalType::Varchar,
+            "string_agg(expr) expects VARCHAR input"
+        );
+        let state = &mut *(state as *mut State);
+
+        for i in 0..count {
+            if input.is_null(i) {
+                continue;
+            }
+            let Some(value) = input.get_string(i) else {
+                continue;
+            };
+            append_value(state, value, ",");
+            if state.combine_separator.is_none() {
+                state.combine_separator = Some(",".to_string());
+            }
+        }
+    }
+
+    pub unsafe fn combine(
+        source: &Vector,
+        target: &Vector,
+        input_data: &AggregateInputData,
+        count: usize,
+    ) {
+        let source_ptrs = source.flat_data::<*mut u8>();
+        let target_ptrs = target.flat_data::<*mut u8>();
+        let allow_destructive = input_data.combine_type == AggregateCombineType::AllowDestructive;
+        for i in 0..count {
+            let source_state_ptr = (*source_ptrs.add(i)) as *mut State;
+            let target_state_ptr = (*target_ptrs.add(i)) as *mut State;
+
+            if allow_destructive {
+                let source_state = &mut *source_state_ptr;
+                let target_state = &mut *target_state_ptr;
+                if !source_state.is_set {
+                    continue;
+                }
+                if !target_state.is_set {
+                    std::mem::swap(target_state, source_state);
+                } else {
+                    combine_states(source_state, target_state);
+                    source_state.result.clear();
+                    source_state.is_set = false;
+                    source_state.combine_separator = None;
+                }
+            } else {
+                let source_state = &*source_state_ptr;
+                let target_state = &mut *target_state_ptr;
+                combine_states(source_state, target_state);
+            }
+        }
+    }
+
+    pub unsafe fn finalize(
+        states: &Vector,
+        _input_data: &AggregateInputData,
+        result: &mut Vector,
+        count: usize,
+    ) {
+        let state_ptrs = states.flat_data::<*mut u8>();
+        for i in 0..count {
+            let state = &*((*state_ptrs.add(i)) as *const State);
+            if !state.is_set {
+                result.set_null(i, true);
+            } else {
+                result.set_null(i, false);
+                result.set_string(i, &state.result);
+            }
+        }
+    }
+
+    pub unsafe fn destructor(states: &Vector, _input_data: &AggregateInputData, count: usize) {
+        let state_ptrs = states.flat_data::<*mut u8>();
+        for i in 0..count {
+            let state = (*state_ptrs.add(i)) as *mut State;
+            ptr::drop_in_place(state);
+        }
+    }
+}
+
+mod string_agg_two_args {
+    use super::*;
+
+    type State = StringAggState;
+
+    pub unsafe fn initialize(state: *mut u8) {
+        debug_assert_eq!(
+            (state as usize) % std::mem::align_of::<State>(),
+            0,
+            "string_agg state pointer is not properly aligned"
+        );
+        ptr::write(state as *mut State, State::default());
+    }
+
+    pub unsafe fn update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        states: &Vector,
+        count: usize,
+    ) {
+        let value_input = inputs[0];
+        let sep_input = inputs[1];
+        debug_assert_eq!(
+            value_input.logical_type(),
+            &LogicalType::Varchar,
+            "string_agg(expr, sep) expects VARCHAR expr"
+        );
+        debug_assert_eq!(
+            sep_input.logical_type(),
+            &LogicalType::Varchar,
+            "string_agg(expr, sep) expects VARCHAR separator"
+        );
+        let state_ptrs = states.flat_data::<*mut u8>();
+
+        for i in 0..count {
+            if value_input.is_null(i) {
+                continue;
+            }
+            let Some(value) = value_input.get_string(i) else {
+                continue;
+            };
+            let separator_is_null = sep_input.is_null(i);
+            let separator = if separator_is_null {
+                ""
+            } else {
+                sep_input.get_string(i).unwrap_or("")
+            };
+
+            let state_ptr = *state_ptrs.add(i);
+            let state = &mut *(state_ptr as *mut State);
+            append_value(state, value, separator);
+            if state.combine_separator.is_none() && !separator_is_null {
+                state.combine_separator = Some(separator.to_string());
+            }
+        }
+    }
+
+    pub unsafe fn simple_update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        state: *mut u8,
+        count: usize,
+    ) {
+        let value_input = inputs[0];
+        let sep_input = inputs[1];
+        debug_assert_eq!(
+            value_input.logical_type(),
+            &LogicalType::Varchar,
+            "string_agg(expr, sep) expects VARCHAR expr"
+        );
+        debug_assert_eq!(
+            sep_input.logical_type(),
+            &LogicalType::Varchar,
+            "string_agg(expr, sep) expects VARCHAR separator"
+        );
+        let state = &mut *(state as *mut State);
+
+        for i in 0..count {
+            if value_input.is_null(i) {
+                continue;
+            }
+            let Some(value) = value_input.get_string(i) else {
+                continue;
+            };
+            let separator_is_null = sep_input.is_null(i);
+            let separator = if separator_is_null {
+                ""
+            } else {
+                sep_input.get_string(i).unwrap_or("")
+            };
+
+            append_value(state, value, separator);
+            if state.combine_separator.is_none() && !separator_is_null {
+                state.combine_separator = Some(separator.to_string());
+            }
+        }
+    }
+
+    pub unsafe fn combine(
+        source: &Vector,
+        target: &Vector,
+        input_data: &AggregateInputData,
+        count: usize,
+    ) {
+        let source_ptrs = source.flat_data::<*mut u8>();
+        let target_ptrs = target.flat_data::<*mut u8>();
+        let allow_destructive = input_data.combine_type == AggregateCombineType::AllowDestructive;
+        for i in 0..count {
+            let source_state_ptr = (*source_ptrs.add(i)) as *mut State;
+            let target_state_ptr = (*target_ptrs.add(i)) as *mut State;
+            if allow_destructive {
+                let source_state = &mut *source_state_ptr;
+                let target_state = &mut *target_state_ptr;
+                if !source_state.is_set {
+                    continue;
+                }
+                if !target_state.is_set {
+                    std::mem::swap(target_state, source_state);
+                } else {
+                    combine_states(source_state, target_state);
+                    source_state.result.clear();
+                    source_state.is_set = false;
+                    source_state.combine_separator = None;
+                }
+            } else {
+                let source_state = &*source_state_ptr;
+                let target_state = &mut *target_state_ptr;
+                combine_states(source_state, target_state);
+            }
+        }
+    }
+
+    pub unsafe fn finalize(
+        states: &Vector,
+        _input_data: &AggregateInputData,
+        result: &mut Vector,
+        count: usize,
+    ) {
+        let state_ptrs = states.flat_data::<*mut u8>();
+        for i in 0..count {
+            let state = &*((*state_ptrs.add(i)) as *const State);
+            if !state.is_set {
+                result.set_null(i, true);
+            } else {
+                result.set_null(i, false);
+                result.set_string(i, &state.result);
+            }
+        }
+    }
+
+    pub unsafe fn destructor(states: &Vector, _input_data: &AggregateInputData, count: usize) {
+        let state_ptrs = states.flat_data::<*mut u8>();
+        for i in 0..count {
+            let state = (*state_ptrs.add(i)) as *mut State;
+            ptr::drop_in_place(state);
+        }
+    }
+}
+
+pub fn get_string_agg_function() -> AggregateFunctionSet {
+    let mut set = AggregateFunctionSet::new("string_agg".to_string());
+    let state_size = std::mem::size_of::<StringAggState>();
+
+    set.add_function(AggregateFunction::new(
+        "string_agg".to_string(),
+        vec![LogicalType::Varchar],
+        LogicalType::Varchar,
+        state_size,
+        string_agg_one_arg::initialize,
+        string_agg_one_arg::update,
+        string_agg_one_arg::combine,
+        string_agg_one_arg::finalize,
+        Some(string_agg_one_arg::simple_update),
+        Some(string_agg_one_arg::destructor),
+    ));
+    set.add_function(AggregateFunction::new(
+        "string_agg".to_string(),
+        vec![LogicalType::Varchar, LogicalType::Varchar],
+        LogicalType::Varchar,
+        state_size,
+        string_agg_two_args::initialize,
+        string_agg_two_args::update,
+        string_agg_two_args::combine,
+        string_agg_two_args::finalize,
+        Some(string_agg_two_args::simple_update),
+        Some(string_agg_two_args::destructor),
+    ));
+
+    set
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_common::allocator::{default_allocator, ArenaAllocator};
+    use std::sync::Arc;
+
+    fn test_arena() -> ArenaAllocator {
+        ArenaAllocator::new(Arc::new(default_allocator()))
+    }
+
+    fn preserve_input_data<'a>(
+        func: &'a AggregateFunction,
+        arena: &'a mut ArenaAllocator,
+    ) -> AggregateInputData<'a> {
+        AggregateInputData::new(
+            func.bind_data.as_deref(),
+            arena,
+            crate::aggregate::AggregateCombineType::PreserveInput,
+        )
+    }
+
+    unsafe fn finalize_single(
+        func: &AggregateFunction,
+        inputs: &[&Vector],
+        row_count: usize,
+    ) -> Vector {
+        let mut arena = test_arena();
+        let mut state_buf = vec![0u8; func.state_size];
+        let state_ptr = state_buf.as_mut_ptr();
+        (func.initialize)(state_ptr);
+
+        let simple_update = func
+            .simple_update
+            .expect("string_agg aggregate should provide simple_update");
+        {
+            let input_data = preserve_input_data(func, &mut arena);
+            simple_update(inputs, &input_data, state_ptr, row_count);
+        }
+
+        let mut result = Vector::new(LogicalType::Varchar);
+        result.set_count(1);
+        let mut states = Vector::new(LogicalType::BigInt);
+        states.set_count(1);
+        *states.flat_data_mut::<*mut u8>() = state_ptr;
+
+        {
+            let input_data = preserve_input_data(func, &mut arena);
+            (func.finalize)(&states, &input_data, &mut result, 1);
+        }
+        {
+            let input_data = preserve_input_data(func, &mut arena);
+            if let Some(destructor) = func.destructor {
+                destructor(&states, &input_data, 1);
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn string_agg_default_separator() {
+        let set = get_string_agg_function();
+        let (func, _) = set.bind(&[LogicalType::Varchar]).unwrap();
+        let input = Vector::from_strings(&["a", "b", "c"]);
+        let result = unsafe { finalize_single(&func, &[&input], 3) };
+        assert_eq!(result.get_string(0), Some("a,b,c"));
+    }
+
+    #[test]
+    fn string_agg_custom_separator() {
+        let set = get_string_agg_function();
+        let (func, _) = set
+            .bind(&[LogicalType::Varchar, LogicalType::Varchar])
+            .unwrap();
+        let values = Vector::from_strings(&["a", "b", "c"]);
+        let separators = Vector::from_strings(&["|", "|", "|"]);
+        let result = unsafe { finalize_single(&func, &[&values, &separators], 3) };
+        assert_eq!(result.get_string(0), Some("a|b|c"));
+    }
+
+    #[test]
+    fn string_agg_skips_null_values() {
+        let set = get_string_agg_function();
+        let (func, _) = set.bind(&[LogicalType::Varchar]).unwrap();
+        let mut input = Vector::from_strings(&["a", "", "c"]);
+        input.set_null(1, true);
+        let result = unsafe { finalize_single(&func, &[&input], 3) };
+        assert_eq!(result.get_string(0), Some("a,c"));
+    }
+}

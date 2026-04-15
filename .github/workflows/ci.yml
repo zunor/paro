@@ -1,0 +1,263 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      regress: ${{ steps.filter.outputs.regress }}
+      benchmark: ${{ steps.filter.outputs.benchmark }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'build.rs'
+              - '**/build.rs'
+            regress:
+              - 'regress/**'
+            benchmark:
+              - 'benchmark/**'
+            ci:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+              - 'Makefile'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - '.rustfmt.toml'
+              - 'clippy.toml'
+              - '.clippy.toml'
+              - '.cargo/**'
+
+  fmt:
+    name: rustfmt
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: unit tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - run: cargo test --workspace --locked
+
+  regress_unit:
+    name: regress harness unit
+    needs: changes
+    if: needs.changes.outputs.regress == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install regress dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r regress/requirements.txt
+      - run: make -C regress unit
+
+  build:
+    name: build (release)
+    needs: changes
+    if: |
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.regress == 'true' ||
+      needs.changes.outputs.benchmark == 'true' ||
+      needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - run: cargo build --release -p paro-server --bin parod --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parod-release
+          path: target/release/parod
+          retention-days: 1
+
+  regress:
+    name: regression
+    needs: [changes, build]
+    if: |
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.regress == 'true' ||
+      needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install regress dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r regress/requirements.txt
+      - id: start_parod
+        uses: ./.github/actions/start-parod
+        with:
+          artifact-name: parod-release
+          port: "6432"
+          health-timeout: "60"
+      - name: Run regression (CI mode)
+        env:
+          PARO_HOST: ${{ steps.start_parod.outputs.host }}
+          PARO_PORT: ${{ steps.start_parod.outputs.port }}
+        run: make -C regress ci
+      - name: Upload regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-report
+          if-no-files-found: warn
+          path: |
+            regress/report/report.txt
+            regress/report/error.txt
+            regress/report/regress.log
+            regress/report/actuals/**
+            .ci/parod.log
+      - name: Stop parod
+        if: always()
+        run: |
+          if [ -f .ci/parod.pid ]; then
+            kill "$(cat .ci/parod.pid)" || true
+            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
+          fi
+
+  benchmark:
+    name: benchmark
+    needs: [changes, build]
+    if: |
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.benchmark == 'true' ||
+      needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install benchmark dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmark/requirements.txt
+      - id: start_parod
+        uses: ./.github/actions/start-parod
+        with:
+          artifact-name: parod-release
+          port: "6432"
+          health-timeout: "60"
+      - name: Run benchmark (PR smoke, no baseline)
+        env:
+          PARO_HOST: ${{ steps.start_parod.outputs.host }}
+          PARO_PORT: ${{ steps.start_parod.outputs.port }}
+        run: make -C benchmark ci
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          if-no-files-found: warn
+          path: |
+            benchmark/report/result.json
+            benchmark/report/summary.md
+            .ci/parod.log
+      - name: Stop parod
+        if: always()
+        run: |
+          if [ -f .ci/parod.pid ]; then
+            kill "$(cat .ci/parod.pid)" || true
+            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
+          fi
+
+  ci_gate:
+    name: ci-gate
+    if: always()
+    needs: [changes, fmt, clippy, test, regress_unit, build, regress, benchmark]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify upstream results
+        run: |
+          check() {
+            local job="$1"
+            local result="$2"
+            if [ "$result" = "success" ] || [ "$result" = "skipped" ]; then
+              echo "$job: $result"
+            else
+              echo "$job: $result" >&2
+              exit 1
+            fi
+          }
+
+          check changes "${{ needs.changes.result }}"
+          check fmt "${{ needs.fmt.result }}"
+          check clippy "${{ needs.clippy.result }}"
+          check test "${{ needs.test.result }}"
+          check regress_unit "${{ needs.regress_unit.result }}"
+          check build "${{ needs.build.result }}"
+          check regress "${{ needs.regress.result }}"
+          check benchmark "${{ needs.benchmark.result }}"

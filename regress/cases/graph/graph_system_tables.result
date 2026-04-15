@@ -1,0 +1,126 @@
+CREATE TABLE person (id BIGINT PRIMARY KEY, name VARCHAR, age INT);
+CREATE TABLE
+
+CREATE TABLE company (id BIGINT PRIMARY KEY, name VARCHAR, city VARCHAR);
+CREATE TABLE
+
+CREATE TABLE knows (person1_id BIGINT, person2_id BIGINT, since DATE);
+CREATE TABLE
+
+CREATE TABLE works_at (person_id BIGINT, company_id BIGINT, role VARCHAR);
+CREATE TABLE
+
+INSERT INTO person VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35);
+INSERT 0 3
+
+INSERT INTO company VALUES (100, 'Acme', 'NYC'), (200, 'Beta', 'SF');
+INSERT 0 2
+
+INSERT INTO knows VALUES (1, 2, '2020-01-01'), (2, 3, '2021-06-15'), (1, 3, '2019-03-20');
+INSERT 0 3
+
+INSERT INTO works_at VALUES (1, 100, 'Engineer'), (2, 200, 'Manager'), (3, 100, 'Designer');
+INSERT 0 3
+
+SELECT * FROM paro_property_graphs();
+paro_property_graphs.graph_name	paro_property_graphs.vertex_tables	paro_property_graphs.edge_tables	paro_property_graphs.vertex_count	paro_property_graphs.edge_count	paro_property_graphs.state	paro_property_graphs.delta_size	paro_property_graphs.last_rebuild	paro_property_graphs.fingerprint	paro_property_graphs.index_size_bytes
+
+CREATE PROPERTY GRAPH social_network
+VERTEX TABLES (
+    person LABEL Person,
+    company LABEL Company
+)
+EDGE TABLES (
+    knows
+        SOURCE KEY (person1_id) REFERENCES person (id)
+        DESTINATION KEY (person2_id) REFERENCES person (id)
+        LABEL Knows,
+    works_at
+        SOURCE KEY (person_id) REFERENCES person (id)
+        DESTINATION KEY (company_id) REFERENCES company (id)
+        LABEL WorksAt
+);
+CREATE PROPERTY GRAPH
+
+SELECT
+    graph_name,
+    vertex_tables,
+    edge_tables,
+    vertex_count,
+    edge_count,
+    state,
+    delta_size,
+    (last_rebuild IS NOT NULL) AS has_last_rebuild,
+    (fingerprint <> '') AS has_fingerprint
+FROM paro_property_graphs();
+graph_name	vertex_tables	edge_tables	vertex_count	edge_count	state	delta_size	has_last_rebuild	has_fingerprint
+social_network	Person, Company	Knows, WorksAt	5	6	READY	0	true	true
+
+SELECT label, type, count FROM paro_graph_statistics('social_network') ORDER BY type, label;
+label	type	count
+Knows	edge	3
+WorksAt	edge	3
+Company	vertex	2
+Person	vertex	3
+
+SELECT label, type, count, avg_degree FROM paro_graph_statistics('social_network') WHERE type = 'edge' ORDER BY label;
+label	type	count	avg_degree
+Knows	edge	3	1.000000
+WorksAt	edge	3	1.000000
+
+SELECT * FROM paro_graph_statistics('nonexistent');
+paro_graph_statistics.label	paro_graph_statistics.type	paro_graph_statistics.count	paro_graph_statistics.avg_degree	paro_graph_statistics.index_size_bytes
+
+SELECT label, type, (index_size_bytes > 0) AS has_index FROM paro_graph_statistics('social_network') ORDER BY type, label;
+label	type	has_index
+Knows	edge	true
+WorksAt	edge	true
+Company	vertex	true
+Person	vertex	true
+
+INSERT INTO knows VALUES (3, 1, '2024-01-01');
+INSERT 0 1
+
+SELECT graph_name, state, delta_size, edge_count FROM paro_property_graphs();
+graph_name	state	delta_size	edge_count
+social_network	READY	1	7
+
+INSERT INTO person VALUES (4, 'Dora', 28);
+INSERT 0 1
+
+SELECT
+    graph_name,
+    (
+        (state = 'STALE' AND delta_size = 1 AND vertex_count = 5)
+        OR (state = 'READY' AND delta_size = 0 AND vertex_count = 6)
+    ) AS async_window_valid
+FROM paro_property_graphs();
+graph_name	async_window_valid
+social_network	true
+
+REFRESH PROPERTY GRAPH social_network;
+REFRESH PROPERTY GRAPH
+
+SELECT graph_name, state, delta_size, vertex_count, edge_count FROM paro_property_graphs();
+graph_name	state	delta_size	vertex_count	edge_count
+social_network	READY	0	6	7
+
+SELECT label, type, count, avg_degree FROM paro_graph_statistics('social_network') WHERE type = 'edge' ORDER BY label;
+label	type	count	avg_degree
+Knows	edge	4	1.000000
+WorksAt	edge	3	0.750000
+
+DROP PROPERTY GRAPH social_network;
+DROP PROPERTY GRAPH
+
+DROP TABLE works_at;
+DROP TABLE
+
+DROP TABLE knows;
+DROP TABLE
+
+DROP TABLE company;
+DROP TABLE
+
+DROP TABLE person;
+DROP TABLE

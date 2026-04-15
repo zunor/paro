@@ -1,0 +1,12 @@
+CREATE TABLE if_not_exists_test (id INT, name VARCHAR);
+CREATE TABLE
+
+INSERT INTO if_not_exists_test VALUES (1, 'first');
+INSERT 0 1
+
+CREATE TABLE IF NOT EXISTS if_not_exists_test (id INT, value DOUBLE);
+CREATE TABLE
+
+SELECT id, name FROM if_not_exists_test;
+id	name
+1	first

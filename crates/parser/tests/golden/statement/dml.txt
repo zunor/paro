@@ -1,0 +1,1452 @@
+---------- Input ----------
+replace into test on(c) select sum(c) as c from source group by v;
+---------- Output ---------
+REPLACE INTO test ON (c) SELECT sum(c) AS c FROM source GROUP BY v
+---------- AST ------------
+Replace(
+    ReplaceStmt {
+        hints: None,
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                13..17,
+            ),
+            name: "test",
+            quote: None,
+            ident_type: None,
+        },
+        is_conflict: false,
+        on_conflict_columns: [
+            Identifier {
+                span: Some(
+                    21..22,
+                ),
+                name: "c",
+                quote: None,
+                ident_type: None,
+            },
+        ],
+        columns: [],
+        source: Select {
+            query: Query {
+                span: Some(
+                    24..65,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            24..65,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            AliasedExpr {
+                                expr: FunctionCall {
+                                    span: Some(
+                                        31..37,
+                                    ),
+                                    func: FunctionCall {
+                                        distinct: false,
+                                        schema: None,
+                                        name: Identifier {
+                                            span: Some(
+                                                31..34,
+                                            ),
+                                            name: "sum",
+                                            quote: None,
+                                            ident_type: None,
+                                        },
+                                        args: [
+                                            ColumnRef {
+                                                span: Some(
+                                                    35..36,
+                                                ),
+                                                column: ColumnRef {
+                                                    schema: None,
+                                                    table: None,
+                                                    column: Name(
+                                                        Identifier {
+                                                            span: Some(
+                                                                35..36,
+                                                            ),
+                                                            name: "c",
+                                                            quote: None,
+                                                            ident_type: None,
+                                                        },
+                                                    ),
+                                                },
+                                            },
+                                        ],
+                                        params: [],
+                                        order_by: [],
+                                        filter: None,
+                                        window: None,
+                                        lambda: None,
+                                    },
+                                },
+                                alias: Some(
+                                    Identifier {
+                                        span: Some(
+                                            41..42,
+                                        ),
+                                        name: "c",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                ),
+                            },
+                        ],
+                        from: [
+                            Table {
+                                span: Some(
+                                    48..54,
+                                ),
+                                database: None,
+                                schema: None,
+                                table: Identifier {
+                                    span: Some(
+                                        48..54,
+                                    ),
+                                    name: "source",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: None,
+                                temporal: None,
+                                with_options: None,
+                                pivot: None,
+                                unpivot: None,
+                                sample: None,
+                            },
+                        ],
+                        selection: None,
+                        group_by: Some(
+                            Normal(
+                                [
+                                    ColumnRef {
+                                        span: Some(
+                                            64..65,
+                                        ),
+                                        column: ColumnRef {
+                                            schema: None,
+                                            table: None,
+                                            column: Name(
+                                                Identifier {
+                                                    span: Some(
+                                                        64..65,
+                                                    ),
+                                                    name: "v",
+                                                    quote: None,
+                                                    ident_type: None,
+                                                },
+                                            ),
+                                        },
+                                    },
+                                ],
+                            ),
+                        ),
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        },
+        delete_when: None,
+    },
+)
+
+
+---------- Input ----------
+insert into t (c1, c2) values (1, 2), (3, 4);
+---------- Output ---------
+INSERT INTO t (c1, c2) VALUES (1, 2), (3, 4)
+---------- AST ------------
+Insert(
+    InsertStmt {
+        hints: None,
+        with: None,
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                12..13,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        columns: [
+            Identifier {
+                span: Some(
+                    15..17,
+                ),
+                name: "c1",
+                quote: None,
+                ident_type: None,
+            },
+            Identifier {
+                span: Some(
+                    19..21,
+                ),
+                name: "c2",
+                quote: None,
+                ident_type: None,
+            },
+        ],
+        source: Values {
+            rows: [
+                [
+                    Literal {
+                        span: Some(
+                            31..32,
+                        ),
+                        value: UInt64(
+                            1,
+                        ),
+                    },
+                    Literal {
+                        span: Some(
+                            34..35,
+                        ),
+                        value: UInt64(
+                            2,
+                        ),
+                    },
+                ],
+                [
+                    Literal {
+                        span: Some(
+                            39..40,
+                        ),
+                        value: UInt64(
+                            3,
+                        ),
+                    },
+                    Literal {
+                        span: Some(
+                            42..43,
+                        ),
+                        value: UInt64(
+                            4,
+                        ),
+                    },
+                ],
+            ],
+        },
+        on_conflict: None,
+        overwrite: false,
+    },
+)
+
+
+---------- Input ----------
+insert into t (c1, c2) values (1, 2);
+---------- Output ---------
+INSERT INTO t (c1, c2) VALUES (1, 2)
+---------- AST ------------
+Insert(
+    InsertStmt {
+        hints: None,
+        with: None,
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                12..13,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        columns: [
+            Identifier {
+                span: Some(
+                    15..17,
+                ),
+                name: "c1",
+                quote: None,
+                ident_type: None,
+            },
+            Identifier {
+                span: Some(
+                    19..21,
+                ),
+                name: "c2",
+                quote: None,
+                ident_type: None,
+            },
+        ],
+        source: Values {
+            rows: [
+                [
+                    Literal {
+                        span: Some(
+                            31..32,
+                        ),
+                        value: UInt64(
+                            1,
+                        ),
+                    },
+                    Literal {
+                        span: Some(
+                            34..35,
+                        ),
+                        value: UInt64(
+                            2,
+                        ),
+                    },
+                ],
+            ],
+        },
+        on_conflict: None,
+        overwrite: false,
+    },
+)
+
+
+---------- Input ----------
+insert into table t select * from t2;
+---------- Output ---------
+INSERT INTO t SELECT * FROM t2
+---------- AST ------------
+Insert(
+    InsertStmt {
+        hints: None,
+        with: None,
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                18..19,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        columns: [],
+        source: Select {
+            query: Query {
+                span: Some(
+                    20..36,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            20..36,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            StarColumns {
+                                qualified: [
+                                    Star(
+                                        Some(
+                                            27..28,
+                                        ),
+                                    ),
+                                ],
+                                column_filter: None,
+                            },
+                        ],
+                        from: [
+                            Table {
+                                span: Some(
+                                    34..36,
+                                ),
+                                database: None,
+                                schema: None,
+                                table: Identifier {
+                                    span: Some(
+                                        34..36,
+                                    ),
+                                    name: "t2",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: None,
+                                temporal: None,
+                                with_options: None,
+                                pivot: None,
+                                unpivot: None,
+                                sample: None,
+                            },
+                        ],
+                        selection: None,
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        },
+        on_conflict: None,
+        overwrite: false,
+    },
+)
+
+
+---------- Input ----------
+insert overwrite into table t select * from t2;
+---------- Output ---------
+INSERT OVERWRITE t SELECT * FROM t2
+---------- AST ------------
+Insert(
+    InsertStmt {
+        hints: None,
+        with: None,
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                28..29,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        columns: [],
+        source: Select {
+            query: Query {
+                span: Some(
+                    30..46,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            30..46,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            StarColumns {
+                                qualified: [
+                                    Star(
+                                        Some(
+                                            37..38,
+                                        ),
+                                    ),
+                                ],
+                                column_filter: None,
+                            },
+                        ],
+                        from: [
+                            Table {
+                                span: Some(
+                                    44..46,
+                                ),
+                                database: None,
+                                schema: None,
+                                table: Identifier {
+                                    span: Some(
+                                        44..46,
+                                    ),
+                                    name: "t2",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: None,
+                                temporal: None,
+                                with_options: None,
+                                pivot: None,
+                                unpivot: None,
+                                sample: None,
+                            },
+                        ],
+                        selection: None,
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        },
+        on_conflict: None,
+        overwrite: true,
+    },
+)
+
+
+---------- Input ----------
+insert overwrite table t select * from t2;
+---------- Output ---------
+INSERT OVERWRITE t SELECT * FROM t2
+---------- AST ------------
+Insert(
+    InsertStmt {
+        hints: None,
+        with: None,
+        database: None,
+        schema: None,
+        table: Identifier {
+            span: Some(
+                23..24,
+            ),
+            name: "t",
+            quote: None,
+            ident_type: None,
+        },
+        columns: [],
+        source: Select {
+            query: Query {
+                span: Some(
+                    25..41,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            25..41,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            StarColumns {
+                                qualified: [
+                                    Star(
+                                        Some(
+                                            32..33,
+                                        ),
+                                    ),
+                                ],
+                                column_filter: None,
+                            },
+                        ],
+                        from: [
+                            Table {
+                                span: Some(
+                                    39..41,
+                                ),
+                                database: None,
+                                schema: None,
+                                table: Identifier {
+                                    span: Some(
+                                        39..41,
+                                    ),
+                                    name: "t2",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: None,
+                                temporal: None,
+                                with_options: None,
+                                pivot: None,
+                                unpivot: None,
+                                sample: None,
+                            },
+                        ],
+                        selection: None,
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        },
+        on_conflict: None,
+        overwrite: true,
+    },
+)
+
+
+---------- Input ----------
+INSERT ALL
+    WHEN c3 = 1 THEN
+      INTO t1
+    WHEN c3 = 3 THEN
+      INTO t2
+SELECT * from s;
+---------- Output ---------
+INSERT ALL WHEN c3 = 1 THEN INTO t1  WHEN c3 = 3 THEN INTO t2  SELECT * FROM s
+---------- AST ------------
+InsertMultiTable(
+    InsertMultiTableStmt {
+        overwrite: false,
+        is_first: false,
+        when_clauses: [
+            WhenClause {
+                condition: BinaryOp {
+                    span: Some(
+                        23..24,
+                    ),
+                    op: Eq,
+                    left: ColumnRef {
+                        span: Some(
+                            20..22,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        20..22,
+                                    ),
+                                    name: "c3",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                    right: Literal {
+                        span: Some(
+                            25..26,
+                        ),
+                        value: UInt64(
+                            1,
+                        ),
+                    },
+                },
+                into_clauses: [
+                    IntoClause {
+                        database: None,
+                        schema: None,
+                        table: Identifier {
+                            span: Some(
+                                43..45,
+                            ),
+                            name: "t1",
+                            quote: None,
+                            ident_type: None,
+                        },
+                        target_columns: [],
+                        source_columns: [],
+                    },
+                ],
+            },
+            WhenClause {
+                condition: BinaryOp {
+                    span: Some(
+                        58..59,
+                    ),
+                    op: Eq,
+                    left: ColumnRef {
+                        span: Some(
+                            55..57,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        55..57,
+                                    ),
+                                    name: "c3",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                    right: Literal {
+                        span: Some(
+                            60..61,
+                        ),
+                        value: UInt64(
+                            3,
+                        ),
+                    },
+                },
+                into_clauses: [
+                    IntoClause {
+                        database: None,
+                        schema: None,
+                        table: Identifier {
+                            span: Some(
+                                78..80,
+                            ),
+                            name: "t2",
+                            quote: None,
+                            ident_type: None,
+                        },
+                        target_columns: [],
+                        source_columns: [],
+                    },
+                ],
+            },
+        ],
+        else_clause: None,
+        into_clauses: [],
+        source: Query {
+            span: Some(
+                81..96,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        81..96,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        StarColumns {
+                            qualified: [
+                                Star(
+                                    Some(
+                                        88..89,
+                                    ),
+                                ),
+                            ],
+                            column_filter: None,
+                        },
+                    ],
+                    from: [
+                        Table {
+                            span: Some(
+                                95..96,
+                            ),
+                            database: None,
+                            schema: None,
+                            table: Identifier {
+                                span: Some(
+                                    95..96,
+                                ),
+                                name: "s",
+                                quote: None,
+                                ident_type: None,
+                            },
+                            alias: None,
+                            temporal: None,
+                            with_options: None,
+                            pivot: None,
+                            unpivot: None,
+                            sample: None,
+                        },
+                    ],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    },
+)
+
+
+---------- Input ----------
+INSERT overwrite ALL
+    WHEN c3 = 1 THEN
+      INTO t1
+    WHEN c3 = 3 THEN
+      INTO t2
+SELECT * from s;
+---------- Output ---------
+INSERT OVERWRITE ALL WHEN c3 = 1 THEN INTO t1  WHEN c3 = 3 THEN INTO t2  SELECT * FROM s
+---------- AST ------------
+InsertMultiTable(
+    InsertMultiTableStmt {
+        overwrite: true,
+        is_first: false,
+        when_clauses: [
+            WhenClause {
+                condition: BinaryOp {
+                    span: Some(
+                        33..34,
+                    ),
+                    op: Eq,
+                    left: ColumnRef {
+                        span: Some(
+                            30..32,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        30..32,
+                                    ),
+                                    name: "c3",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                    right: Literal {
+                        span: Some(
+                            35..36,
+                        ),
+                        value: UInt64(
+                            1,
+                        ),
+                    },
+                },
+                into_clauses: [
+                    IntoClause {
+                        database: None,
+                        schema: None,
+                        table: Identifier {
+                            span: Some(
+                                53..55,
+                            ),
+                            name: "t1",
+                            quote: None,
+                            ident_type: None,
+                        },
+                        target_columns: [],
+                        source_columns: [],
+                    },
+                ],
+            },
+            WhenClause {
+                condition: BinaryOp {
+                    span: Some(
+                        68..69,
+                    ),
+                    op: Eq,
+                    left: ColumnRef {
+                        span: Some(
+                            65..67,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        65..67,
+                                    ),
+                                    name: "c3",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                    right: Literal {
+                        span: Some(
+                            70..71,
+                        ),
+                        value: UInt64(
+                            3,
+                        ),
+                    },
+                },
+                into_clauses: [
+                    IntoClause {
+                        database: None,
+                        schema: None,
+                        table: Identifier {
+                            span: Some(
+                                88..90,
+                            ),
+                            name: "t2",
+                            quote: None,
+                            ident_type: None,
+                        },
+                        target_columns: [],
+                        source_columns: [],
+                    },
+                ],
+            },
+        ],
+        else_clause: None,
+        into_clauses: [],
+        source: Query {
+            span: Some(
+                91..106,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        91..106,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        StarColumns {
+                            qualified: [
+                                Star(
+                                    Some(
+                                        98..99,
+                                    ),
+                                ),
+                            ],
+                            column_filter: None,
+                        },
+                    ],
+                    from: [
+                        Table {
+                            span: Some(
+                                105..106,
+                            ),
+                            database: None,
+                            schema: None,
+                            table: Identifier {
+                                span: Some(
+                                    105..106,
+                                ),
+                                name: "s",
+                                quote: None,
+                                ident_type: None,
+                            },
+                            alias: None,
+                            temporal: None,
+                            with_options: None,
+                            pivot: None,
+                            unpivot: None,
+                            sample: None,
+                        },
+                    ],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    },
+)
+
+
+---------- Input ----------
+UPDATE db1.tb1 set a = a + 1, b = 2 WHERE c > 3;
+---------- Output ---------
+UPDATE db1.tb1 SET a = a + 1, b = 2 WHERE c > 3
+---------- AST ------------
+Update(
+    UpdateStmt {
+        hints: None,
+        database: None,
+        schema: Some(
+            Identifier {
+                span: Some(
+                    7..10,
+                ),
+                name: "db1",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+        table: Identifier {
+            span: Some(
+                11..14,
+            ),
+            name: "tb1",
+            quote: None,
+            ident_type: None,
+        },
+        table_alias: None,
+        update_list: [
+            MutationUpdateExpr {
+                table: None,
+                name: Identifier {
+                    span: Some(
+                        19..20,
+                    ),
+                    name: "a",
+                    quote: None,
+                    ident_type: None,
+                },
+                expr: BinaryOp {
+                    span: Some(
+                        25..26,
+                    ),
+                    op: Plus,
+                    left: ColumnRef {
+                        span: Some(
+                            23..24,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        23..24,
+                                    ),
+                                    name: "a",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                    right: Literal {
+                        span: Some(
+                            27..28,
+                        ),
+                        value: UInt64(
+                            1,
+                        ),
+                    },
+                },
+            },
+            MutationUpdateExpr {
+                table: None,
+                name: Identifier {
+                    span: Some(
+                        30..31,
+                    ),
+                    name: "b",
+                    quote: None,
+                    ident_type: None,
+                },
+                expr: Literal {
+                    span: Some(
+                        34..35,
+                    ),
+                    value: UInt64(
+                        2,
+                    ),
+                },
+            },
+        ],
+        from: None,
+        selection: Some(
+            BinaryOp {
+                span: Some(
+                    44..45,
+                ),
+                op: Gt,
+                left: ColumnRef {
+                    span: Some(
+                        42..43,
+                    ),
+                    column: ColumnRef {
+                        schema: None,
+                        table: None,
+                        column: Name(
+                            Identifier {
+                                span: Some(
+                                    42..43,
+                                ),
+                                name: "c",
+                                quote: None,
+                                ident_type: None,
+                            },
+                        ),
+                    },
+                },
+                right: Literal {
+                    span: Some(
+                        46..47,
+                    ),
+                    value: UInt64(
+                        3,
+                    ),
+                },
+            },
+        ),
+        with: None,
+    },
+)
+
+
+---------- Input ----------
+COPY mytable TO '/tmp/out.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', NULL 'N')
+---------- Output ---------
+COPY mytable TO '/tmp/out.csv' WITH (format 'csv', header true, delimiter ',', null 'N')
+---------- AST ------------
+Copy(
+    CopyStmt {
+        target: Table {
+            name: TableRef {
+                database: None,
+                schema: None,
+                table: Identifier {
+                    span: Some(
+                        5..12,
+                    ),
+                    name: "mytable",
+                    quote: None,
+                    ident_type: None,
+                },
+                with_options: None,
+            },
+            columns: None,
+        },
+        direction: To,
+        source: File(
+            "/tmp/out.csv",
+        ),
+        options: [
+            (
+                "format",
+                String(
+                    "csv",
+                ),
+            ),
+            (
+                "header",
+                Boolean(
+                    true,
+                ),
+            ),
+            (
+                "delimiter",
+                String(
+                    ",",
+                ),
+            ),
+            (
+                "null",
+                String(
+                    "N",
+                ),
+            ),
+        ],
+        where_clause: None,
+    },
+)
+
+
+---------- Input ----------
+COPY mytable (c1, c2) FROM '/tmp/in.csv' DELIMITER ',' NULL 'N' CSV HEADER
+---------- Output ---------
+COPY mytable (c1, c2) FROM '/tmp/in.csv' WITH (delimiter ',', null 'N', format 'csv', header true)
+---------- AST ------------
+Copy(
+    CopyStmt {
+        target: Table {
+            name: TableRef {
+                database: None,
+                schema: None,
+                table: Identifier {
+                    span: Some(
+                        5..12,
+                    ),
+                    name: "mytable",
+                    quote: None,
+                    ident_type: None,
+                },
+                with_options: None,
+            },
+            columns: Some(
+                [
+                    Identifier {
+                        span: Some(
+                            14..16,
+                        ),
+                        name: "c1",
+                        quote: None,
+                        ident_type: None,
+                    },
+                    Identifier {
+                        span: Some(
+                            18..20,
+                        ),
+                        name: "c2",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ],
+            ),
+        },
+        direction: From,
+        source: File(
+            "/tmp/in.csv",
+        ),
+        options: [
+            (
+                "delimiter",
+                String(
+                    ",",
+                ),
+            ),
+            (
+                "null",
+                String(
+                    "N",
+                ),
+            ),
+            (
+                "format",
+                String(
+                    "csv",
+                ),
+            ),
+            (
+                "header",
+                Boolean(
+                    true,
+                ),
+            ),
+        ],
+        where_clause: None,
+    },
+)
+
+
+---------- Input ----------
+COPY (SELECT id, name FROM t WHERE id > 1) TO STDOUT WITH (FORMAT text)
+---------- Output ---------
+COPY (SELECT id, name FROM t WHERE id > 1) TO STDOUT WITH (format 'text')
+---------- AST ------------
+Copy(
+    CopyStmt {
+        target: Query(
+            Query {
+                span: Some(
+                    6..41,
+                ),
+                with: None,
+                body: Select(
+                    SelectStmt {
+                        span: Some(
+                            6..41,
+                        ),
+                        hints: None,
+                        distinct: false,
+                        top_n: None,
+                        select_list: [
+                            AliasedExpr {
+                                expr: ColumnRef {
+                                    span: Some(
+                                        13..15,
+                                    ),
+                                    column: ColumnRef {
+                                        schema: None,
+                                        table: None,
+                                        column: Name(
+                                            Identifier {
+                                                span: Some(
+                                                    13..15,
+                                                ),
+                                                name: "id",
+                                                quote: None,
+                                                ident_type: None,
+                                            },
+                                        ),
+                                    },
+                                },
+                                alias: None,
+                            },
+                            AliasedExpr {
+                                expr: ColumnRef {
+                                    span: Some(
+                                        17..21,
+                                    ),
+                                    column: ColumnRef {
+                                        schema: None,
+                                        table: None,
+                                        column: Name(
+                                            Identifier {
+                                                span: Some(
+                                                    17..21,
+                                                ),
+                                                name: "name",
+                                                quote: None,
+                                                ident_type: None,
+                                            },
+                                        ),
+                                    },
+                                },
+                                alias: None,
+                            },
+                        ],
+                        from: [
+                            Table {
+                                span: Some(
+                                    27..28,
+                                ),
+                                database: None,
+                                schema: None,
+                                table: Identifier {
+                                    span: Some(
+                                        27..28,
+                                    ),
+                                    name: "t",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: None,
+                                temporal: None,
+                                with_options: None,
+                                pivot: None,
+                                unpivot: None,
+                                sample: None,
+                            },
+                        ],
+                        selection: Some(
+                            BinaryOp {
+                                span: Some(
+                                    38..39,
+                                ),
+                                op: Gt,
+                                left: ColumnRef {
+                                    span: Some(
+                                        35..37,
+                                    ),
+                                    column: ColumnRef {
+                                        schema: None,
+                                        table: None,
+                                        column: Name(
+                                            Identifier {
+                                                span: Some(
+                                                    35..37,
+                                                ),
+                                                name: "id",
+                                                quote: None,
+                                                ident_type: None,
+                                            },
+                                        ),
+                                    },
+                                },
+                                right: Literal {
+                                    span: Some(
+                                        40..41,
+                                    ),
+                                    value: UInt64(
+                                        1,
+                                    ),
+                                },
+                            },
+                        ),
+                        group_by: None,
+                        having: None,
+                        window_list: None,
+                        qualify: None,
+                    },
+                ),
+                order_by: [],
+                limit: [],
+                offset: None,
+                ignore_result: false,
+            },
+        ),
+        direction: To,
+        source: Stdout,
+        options: [
+            (
+                "format",
+                String(
+                    "text",
+                ),
+            ),
+        ],
+        where_clause: None,
+    },
+)
+
+
+---------- Input ----------
+COPY mytable FROM STDIN WITH (FORMAT csv, FORCE_QUOTE *, FORCE_NOT_NULL (c1, c2)) WHERE id > 10
+---------- Output ---------
+COPY mytable FROM STDIN WITH (format 'csv', force_quote *, force_not_null (c1, c2)) WHERE id > 10
+---------- AST ------------
+Copy(
+    CopyStmt {
+        target: Table {
+            name: TableRef {
+                database: None,
+                schema: None,
+                table: Identifier {
+                    span: Some(
+                        5..12,
+                    ),
+                    name: "mytable",
+                    quote: None,
+                    ident_type: None,
+                },
+                with_options: None,
+            },
+            columns: None,
+        },
+        direction: From,
+        source: Stdin,
+        options: [
+            (
+                "format",
+                String(
+                    "csv",
+                ),
+            ),
+            (
+                "force_quote",
+                Star,
+            ),
+            (
+                "force_not_null",
+                List(
+                    [
+                        "c1",
+                        "c2",
+                    ],
+                ),
+            ),
+        ],
+        where_clause: Some(
+            BinaryOp {
+                span: Some(
+                    91..92,
+                ),
+                op: Gt,
+                left: ColumnRef {
+                    span: Some(
+                        88..90,
+                    ),
+                    column: ColumnRef {
+                        schema: None,
+                        table: None,
+                        column: Name(
+                            Identifier {
+                                span: Some(
+                                    88..90,
+                                ),
+                                name: "id",
+                                quote: None,
+                                ident_type: None,
+                            },
+                        ),
+                    },
+                },
+                right: Literal {
+                    span: Some(
+                        93..95,
+                    ),
+                    value: UInt64(
+                        10,
+                    ),
+                },
+            },
+        ),
+    },
+)
+
+

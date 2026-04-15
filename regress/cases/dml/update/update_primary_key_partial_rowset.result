@@ -1,0 +1,76 @@
+DROP TABLE IF EXISTS dml_update_pk_partial_compact_case;
+DROP TABLE
+
+DROP TABLE IF EXISTS dml_update_pk_partial_restart_case;
+DROP TABLE
+
+CREATE TABLE dml_update_pk_partial_compact_case (
+    id INT PRIMARY KEY,
+    score INT,
+    note TEXT
+);
+CREATE TABLE
+
+INSERT INTO dml_update_pk_partial_compact_case VALUES
+    (1, 10, 'alpha'),
+    (2, 20, 'beta');
+INSERT 0 2
+
+UPDATE dml_update_pk_partial_compact_case
+SET note = 'alpha-after-update'
+WHERE id = 1;
+UPDATE 1
+
+SELECT id, score, note
+FROM dml_update_pk_partial_compact_case
+ORDER BY id;
+id	score	note
+1	10	alpha-after-update
+2	20	beta
+
+SELECT id, score, note
+FROM dml_update_pk_partial_compact_case
+ORDER BY id;
+id	score	note
+1	10	alpha-after-update
+2	20	beta
+
+CREATE TABLE dml_update_pk_partial_restart_case (
+    id INT PRIMARY KEY,
+    score INT,
+    note TEXT
+);
+CREATE TABLE
+
+INSERT INTO dml_update_pk_partial_restart_case VALUES
+    (1, 100, 'before-restart'),
+    (2, 200, 'stable');
+INSERT 0 2
+
+UPDATE dml_update_pk_partial_restart_case
+SET note = 'after-restart'
+WHERE id = 1;
+UPDATE 1
+
+SELECT id, score, note
+FROM dml_update_pk_partial_restart_case
+ORDER BY id;
+id	score	note
+1	100	after-restart
+2	200	stable
+
+CHECKPOINT;
+CHECKPOINT
+
+SELECT id, score, note
+FROM dml_update_pk_partial_restart_case
+ORDER BY id;
+id	score	note
+1	100	after-restart
+2	200	stable
+
+DROP TABLE IF EXISTS dml_update_pk_partial_compact_case;
+DROP TABLE
+
+DROP TABLE IF EXISTS dml_update_pk_partial_restart_case;
+DROP TABLE

@@ -1,0 +1,76 @@
+SELECT l.id, l.payload
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_unique AS r ON l.id = r.id
+ORDER BY l.id;
+l.id	l.payload
+1	left-1
+2	left-2
+3	left-3
+
+EXPLAIN
+SELECT l.id, l.payload
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id, payload
+  ->  ROWSET_SCAN on public.join_elim_left l
+        Columns: id, payload
+
+EXPLAIN
+SELECT l.id, r.note
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id, note
+  ->  HASH_JOIN  (rows=3)
+        Join Type: LEFT
+        Join Condition: id = id
+        ->  ROWSET_SCAN on public.join_elim_left l
+              Columns: id
+        ->  ROWSET_SCAN on public.join_elim_right_unique r
+              Columns: id, note
+
+SELECT r.id, r.note
+FROM join_elim_left_unique AS l
+RIGHT JOIN join_elim_right AS r ON l.id = r.id
+ORDER BY r.id, r.note;
+r.id	r.note
+2	right-only-2
+4	right-only-4
+
+EXPLAIN
+SELECT r.id, r.note
+FROM join_elim_left_unique AS l
+RIGHT JOIN join_elim_right AS r ON l.id = r.id;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id, note
+  ->  ROWSET_SCAN on public.join_elim_right r
+        Columns: id, note
+
+SELECT l.id
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_nonunique AS r ON l.id = r.id
+ORDER BY l.id;
+l.id
+1
+2
+2
+3
+
+EXPLAIN
+SELECT l.id
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_nonunique AS r ON l.id = r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id
+  ->  HASH_JOIN  (rows=3)
+        Join Type: LEFT
+        Join Condition: id = id
+        ->  ROWSET_SCAN on public.join_elim_left l
+              Columns: id
+        ->  ROWSET_SCAN on public.join_elim_right_nonunique r
+              Columns: id

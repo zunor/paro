@@ -1,0 +1,201 @@
+INSERT INTO dml_copy_to_file_case VALUES
+  (1, 'alpha', NULL),
+  (2, 'pipe|bar', 'quote "here"'),
+  (3, 'comma,space', 'simple');
+INSERT 0 3
+
+INSERT INTO dml_copy_to_file_large
+SELECT i, 'name_' || i::VARCHAR
+FROM generate_series(1, 50) AS t(i);
+INSERT 0 50
+
+COPY dml_copy_to_file_case TO '/tmp/paro_copy_t1_13_text.txt';
+COPY 3
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_text.txt';
+line
+1\talpha\t\\N
+2\tpipe|bar\tquote "here"
+3\tcomma,space\tsimple
+
+COPY dml_copy_to_file_case TO '/tmp/paro_copy_t1_13_csv.csv'
+  WITH (FORMAT csv, HEADER true, DELIMITER '|');
+COPY 3
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_csv.csv';
+line
+dml_copy_to_file_case.id|dml_copy_to_file_case.name|dml_copy_to_file_case.note
+1|alpha|
+2|"pipe|bar"|"quote ""here"""
+3|comma,space|simple
+
+COPY dml_copy_to_file_case TO '/tmp/paro_copy_t1_13_csv_null.csv'
+  WITH (FORMAT csv, HEADER true, NULL 'NULL');
+COPY 3
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_csv_null.csv';
+line
+dml_copy_to_file_case.id,dml_copy_to_file_case.name,dml_copy_to_file_case.note
+1,alpha,NULL
+2,pipe|bar,"quote ""here"""
+3,"comma,space",simple
+
+COPY dml_copy_to_file_case TO '/tmp/paro_copy_t1_13_force_quote.csv'
+  WITH (FORMAT csv, FORCE_QUOTE *);
+COPY 3
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_force_quote.csv';
+line
+"1","alpha",""
+"2","pipe|bar","quote ""here"""
+"3","comma,space","simple"
+
+COPY (
+  SELECT id, name
+  FROM dml_copy_to_file_case
+  WHERE id >= 2
+  ORDER BY id
+) TO '/tmp/paro_copy_t1_13_query.csv'
+  WITH (FORMAT csv);
+COPY 2
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_query.csv';
+line
+2,pipe|bar
+3,"comma,space"
+
+COPY dml_copy_to_file_empty TO '/tmp/paro_copy_t1_13_empty.csv'
+  WITH (FORMAT csv, HEADER true);
+COPY 0
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_empty.csv';
+line
+dml_copy_to_file_empty.id,dml_copy_to_file_empty.name
+
+COPY dml_copy_to_file_large TO '/tmp/paro_copy_t1_13_large.csv'
+  WITH (FORMAT csv, HEADER true);
+COPY 50
+
+-- @query file
+FILE '/tmp/paro_copy_t1_13_large.csv';
+line
+dml_copy_to_file_large.id,dml_copy_to_file_large.name
+1,name_1
+2,name_2
+3,name_3
+4,name_4
+5,name_5
+6,name_6
+7,name_7
+8,name_8
+9,name_9
+10,name_10
+11,name_11
+12,name_12
+13,name_13
+14,name_14
+15,name_15
+16,name_16
+17,name_17
+18,name_18
+19,name_19
+20,name_20
+21,name_21
+22,name_22
+23,name_23
+24,name_24
+25,name_25
+26,name_26
+27,name_27
+28,name_28
+29,name_29
+30,name_30
+31,name_31
+32,name_32
+33,name_33
+34,name_34
+35,name_35
+36,name_36
+37,name_37
+38,name_38
+39,name_39
+40,name_40
+41,name_41
+42,name_42
+43,name_43
+44,name_44
+45,name_45
+46,name_46
+47,name_47
+48,name_48
+49,name_49
+50,name_50
+
+COPY dml_copy_to_file_case TO '/tmp/paro_copy_t4_4_table.ndjson'
+  WITH (FORMAT ndjson);
+COPY 3
+
+-- @query file
+FILE '/tmp/paro_copy_t4_4_table.ndjson';
+line
+{"dml_copy_to_file_case.id":1,"dml_copy_to_file_case.name":"alpha","dml_copy_to_file_case.note":null}
+{"dml_copy_to_file_case.id":2,"dml_copy_to_file_case.name":"pipe|bar","dml_copy_to_file_case.note":"quote \\"here\\""}
+{"dml_copy_to_file_case.id":3,"dml_copy_to_file_case.name":"comma,space","dml_copy_to_file_case.note":"simple"}
+
+COPY (
+  SELECT id AS "ID", name, note
+  FROM dml_copy_to_file_case
+  ORDER BY id
+) TO '/tmp/paro_copy_t4_4_alias.json'
+  WITH (FORMAT json);
+COPY 3
+
+-- @query file
+FILE '/tmp/paro_copy_t4_4_alias.json';
+line
+{"ID":1,"name":"alpha","note":null}
+{"ID":2,"name":"pipe|bar","note":"quote \\"here\\""}
+{"ID":3,"name":"comma,space","note":"simple"}
+
+SET threads = 4;
+SET
+
+COPY (
+  SELECT i AS id, 'name_' || i::VARCHAR AS name
+  FROM generate_series(1, 20000) AS t(i)
+) TO '/tmp/paro_copy_t4_3_parallel.csv'
+  WITH (FORMAT csv, PER_THREAD_OUTPUT true);
+COPY 20000
+
+-- @normalize copy_rowcount
+COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_0.csv' WITH (FORMAT csv);
+COPY <rows>
+
+-- @normalize copy_rowcount
+COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_1.csv' WITH (FORMAT csv);
+COPY <rows>
+
+-- @normalize copy_rowcount
+COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_2.csv' WITH (FORMAT csv);
+COPY <rows>
+
+-- @normalize copy_rowcount
+COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_3.csv' WITH (FORMAT csv);
+COPY <rows>
+
+SELECT COUNT(*) AS copied_rows,
+       COUNT(DISTINCT id) AS distinct_ids,
+       MIN(id) AS min_id,
+       MAX(id) AS max_id
+FROM dml_copy_to_per_thread_verify;
+copied_rows	distinct_ids	min_id	max_id
+20000	20000	1	20000
+
+SET threads = DEFAULT;
+SET

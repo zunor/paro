@@ -1,0 +1,621 @@
+---------- Input ----------
+explain pipeline select a from b;
+---------- Output ---------
+EXPLAIN PIPELINE SELECT a FROM b
+---------- AST ------------
+Explain {
+    kind: Pipeline,
+    options: (
+        None,
+        [],
+    ),
+    query: Query(
+        Query {
+            span: Some(
+                17..32,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        17..32,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        AliasedExpr {
+                            expr: ColumnRef {
+                                span: Some(
+                                    24..25,
+                                ),
+                                column: ColumnRef {
+                                    schema: None,
+                                    table: None,
+                                    column: Name(
+                                        Identifier {
+                                            span: Some(
+                                                24..25,
+                                            ),
+                                            name: "a",
+                                            quote: None,
+                                            ident_type: None,
+                                        },
+                                    ),
+                                },
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: [
+                        Table {
+                            span: Some(
+                                31..32,
+                            ),
+                            database: None,
+                            schema: None,
+                            table: Identifier {
+                                span: Some(
+                                    31..32,
+                                ),
+                                name: "b",
+                                quote: None,
+                                ident_type: None,
+                            },
+                            alias: None,
+                            temporal: None,
+                            with_options: None,
+                            pivot: None,
+                            unpivot: None,
+                            sample: None,
+                        },
+                    ],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    ),
+}
+
+
+---------- Input ----------
+explain replace into test on(c) select sum(c) as c from source group by v;
+---------- Output ---------
+EXPLAIN REPLACE INTO test ON (c) SELECT sum(c) AS c FROM source GROUP BY v
+---------- AST ------------
+Explain {
+    kind: Plan,
+    options: (
+        None,
+        [],
+    ),
+    query: Replace(
+        ReplaceStmt {
+            hints: None,
+            database: None,
+            schema: None,
+            table: Identifier {
+                span: Some(
+                    21..25,
+                ),
+                name: "test",
+                quote: None,
+                ident_type: None,
+            },
+            is_conflict: false,
+            on_conflict_columns: [
+                Identifier {
+                    span: Some(
+                        29..30,
+                    ),
+                    name: "c",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            columns: [],
+            source: Select {
+                query: Query {
+                    span: Some(
+                        32..73,
+                    ),
+                    with: None,
+                    body: Select(
+                        SelectStmt {
+                            span: Some(
+                                32..73,
+                            ),
+                            hints: None,
+                            distinct: false,
+                            top_n: None,
+                            select_list: [
+                                AliasedExpr {
+                                    expr: FunctionCall {
+                                        span: Some(
+                                            39..45,
+                                        ),
+                                        func: FunctionCall {
+                                            distinct: false,
+                                            schema: None,
+                                            name: Identifier {
+                                                span: Some(
+                                                    39..42,
+                                                ),
+                                                name: "sum",
+                                                quote: None,
+                                                ident_type: None,
+                                            },
+                                            args: [
+                                                ColumnRef {
+                                                    span: Some(
+                                                        43..44,
+                                                    ),
+                                                    column: ColumnRef {
+                                                        schema: None,
+                                                        table: None,
+                                                        column: Name(
+                                                            Identifier {
+                                                                span: Some(
+                                                                    43..44,
+                                                                ),
+                                                                name: "c",
+                                                                quote: None,
+                                                                ident_type: None,
+                                                            },
+                                                        ),
+                                                    },
+                                                },
+                                            ],
+                                            params: [],
+                                            order_by: [],
+                                            filter: None,
+                                            window: None,
+                                            lambda: None,
+                                        },
+                                    },
+                                    alias: Some(
+                                        Identifier {
+                                            span: Some(
+                                                49..50,
+                                            ),
+                                            name: "c",
+                                            quote: None,
+                                            ident_type: None,
+                                        },
+                                    ),
+                                },
+                            ],
+                            from: [
+                                Table {
+                                    span: Some(
+                                        56..62,
+                                    ),
+                                    database: None,
+                                    schema: None,
+                                    table: Identifier {
+                                        span: Some(
+                                            56..62,
+                                        ),
+                                        name: "source",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                    alias: None,
+                                    temporal: None,
+                                    with_options: None,
+                                    pivot: None,
+                                    unpivot: None,
+                                    sample: None,
+                                },
+                            ],
+                            selection: None,
+                            group_by: Some(
+                                Normal(
+                                    [
+                                        ColumnRef {
+                                            span: Some(
+                                                72..73,
+                                            ),
+                                            column: ColumnRef {
+                                                schema: None,
+                                                table: None,
+                                                column: Name(
+                                                    Identifier {
+                                                        span: Some(
+                                                            72..73,
+                                                        ),
+                                                        name: "v",
+                                                        quote: None,
+                                                        ident_type: None,
+                                                    },
+                                                ),
+                                            },
+                                        },
+                                    ],
+                                ),
+                            ),
+                            having: None,
+                            window_list: None,
+                            qualify: None,
+                        },
+                    ),
+                    order_by: [],
+                    limit: [],
+                    offset: None,
+                    ignore_result: false,
+                },
+            },
+            delete_when: None,
+        },
+    ),
+}
+
+
+---------- Input ----------
+explain pipeline select a from t1 ignore_result;
+---------- Output ---------
+EXPLAIN PIPELINE SELECT a FROM t1 IGNORE_RESULT
+---------- AST ------------
+Explain {
+    kind: Pipeline,
+    options: (
+        None,
+        [],
+    ),
+    query: Query(
+        Query {
+            span: Some(
+                17..33,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        17..33,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        AliasedExpr {
+                            expr: ColumnRef {
+                                span: Some(
+                                    24..25,
+                                ),
+                                column: ColumnRef {
+                                    schema: None,
+                                    table: None,
+                                    column: Name(
+                                        Identifier {
+                                            span: Some(
+                                                24..25,
+                                            ),
+                                            name: "a",
+                                            quote: None,
+                                            ident_type: None,
+                                        },
+                                    ),
+                                },
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: [
+                        Table {
+                            span: Some(
+                                31..33,
+                            ),
+                            database: None,
+                            schema: None,
+                            table: Identifier {
+                                span: Some(
+                                    31..33,
+                                ),
+                                name: "t1",
+                                quote: None,
+                                ident_type: None,
+                            },
+                            alias: None,
+                            temporal: None,
+                            with_options: None,
+                            pivot: None,
+                            unpivot: None,
+                            sample: None,
+                        },
+                    ],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: true,
+        },
+    ),
+}
+
+
+---------- Input ----------
+explain(verbose, logical, optimized) select * from t where a = 1
+---------- Output ---------
+EXPLAIN(VERBOSE, LOGICAL, OPTIMIZED) SELECT * FROM t WHERE a = 1
+---------- AST ------------
+Explain {
+    kind: Plan,
+    options: (
+        Some(
+            7..36,
+        ),
+        [
+            Verbose,
+            Logical,
+            Optimized,
+        ],
+    ),
+    query: Query(
+        Query {
+            span: Some(
+                37..64,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        37..64,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        StarColumns {
+                            qualified: [
+                                Star(
+                                    Some(
+                                        44..45,
+                                    ),
+                                ),
+                            ],
+                            column_filter: None,
+                        },
+                    ],
+                    from: [
+                        Table {
+                            span: Some(
+                                51..52,
+                            ),
+                            database: None,
+                            schema: None,
+                            table: Identifier {
+                                span: Some(
+                                    51..52,
+                                ),
+                                name: "t",
+                                quote: None,
+                                ident_type: None,
+                            },
+                            alias: None,
+                            temporal: None,
+                            with_options: None,
+                            pivot: None,
+                            unpivot: None,
+                            sample: None,
+                        },
+                    ],
+                    selection: Some(
+                        BinaryOp {
+                            span: Some(
+                                61..62,
+                            ),
+                            op: Eq,
+                            left: ColumnRef {
+                                span: Some(
+                                    59..60,
+                                ),
+                                column: ColumnRef {
+                                    schema: None,
+                                    table: None,
+                                    column: Name(
+                                        Identifier {
+                                            span: Some(
+                                                59..60,
+                                            ),
+                                            name: "a",
+                                            quote: None,
+                                            ident_type: None,
+                                        },
+                                    ),
+                                },
+                            },
+                            right: Literal {
+                                span: Some(
+                                    63..64,
+                                ),
+                                value: UInt64(
+                                    1,
+                                ),
+                            },
+                        },
+                    ),
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    ),
+}
+
+
+---------- Input ----------
+EXPLAIN ANALYZE SELECT 1
+---------- Output ---------
+EXPLAIN ANALYZE SELECT 1
+---------- AST ------------
+ExplainAnalyze {
+    partial: false,
+    graphical: false,
+    query: Query(
+        Query {
+            span: Some(
+                16..24,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        16..24,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        AliasedExpr {
+                            expr: Literal {
+                                span: Some(
+                                    23..24,
+                                ),
+                                value: UInt64(
+                                    1,
+                                ),
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: [],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    ),
+}
+
+
+---------- Input ----------
+EXPLAIN ANALYZE PARTIAL SELECT 1
+---------- Output ---------
+EXPLAIN ANALYZE PARTIAL SELECT 1
+---------- AST ------------
+ExplainAnalyze {
+    partial: true,
+    graphical: false,
+    query: Query(
+        Query {
+            span: Some(
+                24..32,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        24..32,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        AliasedExpr {
+                            expr: Literal {
+                                span: Some(
+                                    31..32,
+                                ),
+                                value: UInt64(
+                                    1,
+                                ),
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: [],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    ),
+}
+
+
+---------- Input ----------
+EXPLAIN ANALYZE GRAPHICAL SELECT 1
+---------- Output ---------
+EXPLAIN ANALYZE GRAPHICAL SELECT 1
+---------- AST ------------
+ExplainAnalyze {
+    partial: false,
+    graphical: true,
+    query: Query(
+        Query {
+            span: Some(
+                26..34,
+            ),
+            with: None,
+            body: Select(
+                SelectStmt {
+                    span: Some(
+                        26..34,
+                    ),
+                    hints: None,
+                    distinct: false,
+                    top_n: None,
+                    select_list: [
+                        AliasedExpr {
+                            expr: Literal {
+                                span: Some(
+                                    33..34,
+                                ),
+                                value: UInt64(
+                                    1,
+                                ),
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: [],
+                    selection: None,
+                    group_by: None,
+                    having: None,
+                    window_list: None,
+                    qualify: None,
+                },
+            ),
+            order_by: [],
+            limit: [],
+            offset: None,
+            ignore_result: false,
+        },
+    ),
+}
+
+

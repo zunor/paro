@@ -1,0 +1,76 @@
+SELECT
+  EXISTS(
+    SELECT NULL
+    FROM subquery_exists_lookup
+    WHERE kind = 'open'
+  ) AS has_open_rows,
+  NOT EXISTS(
+    SELECT 1
+    FROM subquery_exists_empty
+  ) AS no_huge_quota;
+has_open_rows	no_huge_quota
+true	true
+
+SELECT id, label
+FROM subquery_exists_outer
+WHERE EXISTS(
+  SELECT 1
+  FROM subquery_exists_empty
+)
+ORDER BY id;
+id	label
+
+SELECT
+  o.id,
+  o.grp,
+  EXISTS(
+    SELECT 1
+    FROM subquery_exists_lookup AS l
+    WHERE l.grp = o.grp
+      AND l.kind = 'open'
+  ) AS has_open_match,
+  NOT EXISTS(
+    SELECT 1
+    FROM subquery_exists_lookup AS l
+    WHERE l.grp = o.grp
+      AND l.kind = 'blocked'
+  ) AS lacks_blocked_match
+FROM subquery_exists_outer AS o
+ORDER BY o.id;
+o.id	o.grp	has_open_match	lacks_blocked_match
+1	10	true	false
+2	20	false	true
+3	20	false	true
+4	30	true	true
+5	NULL	false	true
+6	40	false	true
+
+SELECT o.id, o.label
+FROM subquery_exists_outer AS o
+WHERE EXISTS(
+  SELECT 1
+  FROM (
+    SELECT grp, quota
+    FROM subquery_exists_lookup
+    WHERE kind <> 'blocked'
+  ) AS l
+  WHERE l.grp = o.grp
+    AND l.quota >= o.amt
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+3	gamma
+4	delta
+
+SELECT o.id, o.label
+FROM subquery_exists_outer AS o
+WHERE NOT EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+5	null_grp
+6	missing_grp

@@ -1,0 +1,48 @@
+# Build artifacts
+/target/
+/crates/*/target/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# In-memory test artifacts (should never be created, safety net)
+:memory:
+
+# Data
+/data
+/crates/session/data/
+
+# Local CI
+/.ci/
+
+# Local config
+.env
+.env.local
+
+# AI workflow
+.agents/
+.kiro/
+.gemini/
+.cursor/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+regress/.venv/
+/regress/report/
+benchmark/.venv/
+/benchmark/report/*
+!/benchmark/report/.gitkeep

@@ -1,0 +1,165 @@
+CREATE TABLE person (id BIGINT PRIMARY KEY, name VARCHAR, age INT);
+CREATE TABLE
+
+CREATE TABLE company (id BIGINT PRIMARY KEY, name VARCHAR, city VARCHAR);
+CREATE TABLE
+
+CREATE TABLE knows (person1_id BIGINT, person2_id BIGINT, since DATE);
+CREATE TABLE
+
+CREATE TABLE works_at (person_id BIGINT, company_id BIGINT, role VARCHAR);
+CREATE TABLE
+
+INSERT INTO person VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35), (4, 'Diana', 28);
+INSERT 0 4
+
+INSERT INTO company VALUES (100, 'Acme', 'NYC'), (200, 'Beta', 'SF');
+INSERT 0 2
+
+INSERT INTO knows VALUES (1, 2, '2020-01-01'), (2, 3, '2021-06-15'), (1, 3, '2019-03-20'), (3, 4, '2022-01-01'), (1, 4, '2023-05-10');
+INSERT 0 5
+
+INSERT INTO works_at VALUES (1, 100, 'Engineer'), (2, 200, 'Manager'), (3, 100, 'Designer'), (4, 200, 'Analyst');
+INSERT 0 4
+
+CREATE PROPERTY GRAPH social_network
+VERTEX TABLES (
+    person LABEL Person,
+    company LABEL Company
+)
+EDGE TABLES (
+    knows
+        SOURCE KEY (person1_id) REFERENCES person (id)
+        DESTINATION KEY (person2_id) REFERENCES person (id)
+        LABEL Knows,
+    works_at
+        SOURCE KEY (person_id) REFERENCES person (id)
+        DESTINATION KEY (company_id) REFERENCES company (id)
+        LABEL WorksAt
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS from_name, b.name AS to_name)
+) gt
+ORDER BY from_name, to_name;
+gt.from_name	gt.to_name
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+Bob	Charlie
+Charlie	Diana
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS from_name, b.name AS to_name)
+) gt
+ORDER BY to_name;
+gt.from_name	gt.to_name
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.age > 30)
+    COLUMNS (a.name AS from_name, b.name AS to_name, b.age AS to_age)
+) gt
+ORDER BY from_name, to_name;
+gt.from_name	gt.to_name	gt.to_age
+Alice	Charlie	35
+Bob	Charlie	35
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (p:Person)-[w:WorksAt]->(c:Company)
+    COLUMNS (p.name AS person_name, c.name AS company_name, w.role AS role_name)
+) gt
+ORDER BY person_name;
+gt.person_name	gt.company_name	gt.role_name
+Alice	Acme	Engineer
+Bob	Beta	Manager
+Charlie	Acme	Designer
+Diana	Beta	Analyst
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->{1,2}(b:Person)
+    COLUMNS (a.name AS from_name, b.name AS to_name)
+) gt
+ORDER BY to_name;
+gt.from_name	gt.to_name
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (b:Person)<-[k:Knows]-(a:Person)
+    COLUMNS (a.name AS src_name, b.name AS dst_name)
+) gt
+ORDER BY src_name, dst_name;
+gt.src_name	gt.dst_name
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+Bob	Charlie
+Charlie	Diana
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person WHERE a.name = 'Bob')-[k:Knows]-(b:Person)
+    COLUMNS (a.name AS left_name, b.name AS right_name)
+) gt
+ORDER BY right_name;
+gt.left_name	gt.right_name
+Bob	Alice
+Bob	Charlie
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person WHERE a.name = 'Charlie')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS from_name, b.name AS to_name)
+) gt
+ORDER BY to_name;
+gt.from_name	gt.to_name
+Charlie	Diana
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person WHERE a.name = 'Diana')-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS from_name, b.name AS to_name)
+) gt
+ORDER BY to_name;
+gt.from_name	gt.to_name
+
+SELECT * FROM GRAPH_TABLE(social_network
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->{1,3}(b:Person)
+    COLUMNS (a.name AS from_name, b.name AS to_name)
+) gt
+ORDER BY to_name;
+gt.from_name	gt.to_name
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+
+SELECT from_name, count(*) AS friend_count
+FROM GRAPH_TABLE(social_network
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS from_name)
+) gt
+GROUP BY from_name
+ORDER BY friend_count DESC, from_name;
+from_name	friend_count
+Alice	3
+Bob	1
+Charlie	1
+
+DROP PROPERTY GRAPH social_network;
+DROP PROPERTY GRAPH
+
+DROP TABLE works_at;
+DROP TABLE
+
+DROP TABLE knows;
+DROP TABLE
+
+DROP TABLE company;
+DROP TABLE
+
+DROP TABLE person;
+DROP TABLE

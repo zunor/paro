@@ -1,0 +1,289 @@
+---------- Input ----------
+CREATE PROPERTY GRAPH IF NOT EXISTS social_graph
+  VERTEX TABLES (
+    person AS p KEY (id) LABEL Person PROPERTIES (name AS person_name, age),
+    company KEY (id) PROPERTIES ALL
+  )
+  EDGE TABLES (
+    knows AS k KEY (id)
+      SOURCE KEY (src_id) REFERENCES person (id)
+      DESTINATION KEY (dst_id) REFERENCES person (id)
+      LABEL Knows
+      PROPERTIES NONE
+  )
+---------- Output ---------
+CREATE PROPERTY GRAPH IF NOT EXISTS social_graph VERTEX TABLES (person AS p KEY (id) LABEL Person PROPERTIES (name AS person_name, age), company KEY (id) PROPERTIES ALL) EDGE TABLES (knows AS k KEY (id) SOURCE KEY (src_id) REFERENCES person (id) DESTINATION KEY (dst_id) REFERENCES person (id) LABEL Knows PROPERTIES NONE)
+---------- AST ------------
+CreatePropertyGraph(
+    CreatePropertyGraphStmt {
+        if_not_exists: true,
+        graph_name: Identifier {
+            span: Some(
+                36..48,
+            ),
+            name: "social_graph",
+            quote: None,
+            ident_type: None,
+        },
+        vertex_tables: [
+            VertexTableDef {
+                table_name: Identifier {
+                    span: Some(
+                        71..77,
+                    ),
+                    name: "person",
+                    quote: None,
+                    ident_type: None,
+                },
+                alias: Some(
+                    Identifier {
+                        span: Some(
+                            81..82,
+                        ),
+                        name: "p",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                key_columns: Some(
+                    [
+                        Identifier {
+                            span: Some(
+                                88..90,
+                            ),
+                            name: "id",
+                            quote: None,
+                            ident_type: None,
+                        },
+                    ],
+                ),
+                label: Some(
+                    Identifier {
+                        span: Some(
+                            98..104,
+                        ),
+                        name: "Person",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                properties: Some(
+                    Columns(
+                        [
+                            PropertyDef {
+                                column_name: Identifier {
+                                    span: Some(
+                                        117..121,
+                                    ),
+                                    name: "name",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: Some(
+                                    Identifier {
+                                        span: Some(
+                                            125..136,
+                                        ),
+                                        name: "person_name",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                ),
+                            },
+                            PropertyDef {
+                                column_name: Identifier {
+                                    span: Some(
+                                        138..141,
+                                    ),
+                                    name: "age",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                alias: None,
+                            },
+                        ],
+                    ),
+                ),
+            },
+            VertexTableDef {
+                table_name: Identifier {
+                    span: Some(
+                        148..155,
+                    ),
+                    name: "company",
+                    quote: None,
+                    ident_type: None,
+                },
+                alias: None,
+                key_columns: Some(
+                    [
+                        Identifier {
+                            span: Some(
+                                161..163,
+                            ),
+                            name: "id",
+                            quote: None,
+                            ident_type: None,
+                        },
+                    ],
+                ),
+                label: None,
+                properties: Some(
+                    All,
+                ),
+            },
+        ],
+        edge_tables: [
+            EdgeTableDef {
+                table_name: Identifier {
+                    span: Some(
+                        204..209,
+                    ),
+                    name: "knows",
+                    quote: None,
+                    ident_type: None,
+                },
+                alias: Some(
+                    Identifier {
+                        span: Some(
+                            213..214,
+                        ),
+                        name: "k",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                key_columns: Some(
+                    [
+                        Identifier {
+                            span: Some(
+                                220..222,
+                            ),
+                            name: "id",
+                            quote: None,
+                            ident_type: None,
+                        },
+                    ],
+                ),
+                source: EdgeEndpointDef {
+                    key_columns: [
+                        Identifier {
+                            span: Some(
+                                242..248,
+                            ),
+                            name: "src_id",
+                            quote: None,
+                            ident_type: None,
+                        },
+                    ],
+                    references_table: Identifier {
+                        span: Some(
+                            261..267,
+                        ),
+                        name: "person",
+                        quote: None,
+                        ident_type: None,
+                    },
+                    references_columns: Some(
+                        [
+                            Identifier {
+                                span: Some(
+                                    269..271,
+                                ),
+                                name: "id",
+                                quote: None,
+                                ident_type: None,
+                            },
+                        ],
+                    ),
+                },
+                destination: EdgeEndpointDef {
+                    key_columns: [
+                        Identifier {
+                            span: Some(
+                                296..302,
+                            ),
+                            name: "dst_id",
+                            quote: None,
+                            ident_type: None,
+                        },
+                    ],
+                    references_table: Identifier {
+                        span: Some(
+                            315..321,
+                        ),
+                        name: "person",
+                        quote: None,
+                        ident_type: None,
+                    },
+                    references_columns: Some(
+                        [
+                            Identifier {
+                                span: Some(
+                                    323..325,
+                                ),
+                                name: "id",
+                                quote: None,
+                                ident_type: None,
+                            },
+                        ],
+                    ),
+                },
+                label: Some(
+                    Identifier {
+                        span: Some(
+                            339..344,
+                        ),
+                        name: "Knows",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                properties: Some(
+                    None,
+                ),
+            },
+        ],
+    },
+)
+
+
+---------- Input ----------
+DROP PROPERTY GRAPH IF EXISTS social_graph
+---------- Output ---------
+DROP PROPERTY GRAPH IF EXISTS social_graph
+---------- AST ------------
+DropPropertyGraph(
+    DropPropertyGraphStmt {
+        if_exists: true,
+        graph_name: Identifier {
+            span: Some(
+                30..42,
+            ),
+            name: "social_graph",
+            quote: None,
+            ident_type: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+REFRESH PROPERTY GRAPH social_graph
+---------- Output ---------
+REFRESH PROPERTY GRAPH social_graph
+---------- AST ------------
+RefreshPropertyGraph(
+    RefreshPropertyGraphStmt {
+        graph_name: Identifier {
+            span: Some(
+                23..35,
+            ),
+            name: "social_graph",
+            quote: None,
+            ident_type: None,
+        },
+    },
+)
+
+

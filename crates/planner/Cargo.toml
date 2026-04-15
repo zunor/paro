@@ -1,0 +1,34 @@
+[package]
+name = "paro-planner"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+too-many-arguments = "allow"
+replace-box = "allow"
+needless-range-loop = "allow"
+large-enum-variant = "allow"
+useless-conversion = "allow"
+type-complexity = "allow"
+vec-init-then-push = "allow"
+unwrap-or-default = "allow"
+unnecessary-to-owned = "allow"
+empty-docs = "allow"
+needless-borrow = "allow"
+field-reassign-with-default = "allow"
+derivable-impls = "allow"
+items-after-test-module = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-parser = { workspace = true }
+paro-catalog = { workspace = true }
+paro-context = { workspace = true }
+paro-function = { workspace = true }
+paro-storage = { workspace = true }
+ethnum = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+paro-context = { workspace = true, features = ["test-support"] }
+paro-instance = { workspace = true }

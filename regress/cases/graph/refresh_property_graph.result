@@ -1,0 +1,98 @@
+DROP PROPERTY GRAPH IF EXISTS refresh_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE IF EXISTS refresh_knows;
+DROP TABLE
+
+DROP TABLE IF EXISTS refresh_person;
+DROP TABLE
+
+CREATE TABLE refresh_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE refresh_knows (src_id BIGINT, dst_id BIGINT);
+CREATE TABLE
+
+INSERT INTO refresh_person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT 0 3
+
+INSERT INTO refresh_knows VALUES (1, 2);
+INSERT 0 1
+
+CREATE PROPERTY GRAPH refresh_graph
+VERTEX TABLES (
+    refresh_person LABEL Person
+)
+EDGE TABLES (
+    refresh_knows
+        SOURCE KEY (src_id) REFERENCES refresh_person (id)
+        DESTINATION KEY (dst_id) REFERENCES refresh_person (id)
+        LABEL Knows
+);
+CREATE PROPERTY GRAPH
+
+SELECT src, dst FROM GRAPH_TABLE(refresh_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+src	dst
+Alice	Bob
+
+INSERT INTO refresh_knows VALUES (2, 3);
+INSERT 0 1
+
+REFRESH PROPERTY GRAPH refresh_graph;
+REFRESH PROPERTY GRAPH
+
+SELECT src, dst FROM GRAPH_TABLE(refresh_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+src	dst
+Alice	Bob
+Bob	Carol
+
+DELETE FROM refresh_knows WHERE src_id = 1 AND dst_id = 2;
+DELETE 1
+
+REFRESH PROPERTY GRAPH refresh_graph;
+REFRESH PROPERTY GRAPH
+
+SELECT src, dst FROM GRAPH_TABLE(refresh_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+src	dst
+Bob	Carol
+
+INSERT INTO refresh_person VALUES (4, 'Dave');
+INSERT 0 1
+
+INSERT INTO refresh_knows VALUES (3, 4), (1, 3), (2, 4);
+INSERT 0 3
+
+REFRESH PROPERTY GRAPH refresh_graph;
+REFRESH PROPERTY GRAPH
+
+SELECT src, dst FROM GRAPH_TABLE(refresh_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+src	dst
+Alice	Carol
+Bob	Carol
+Bob	Dave
+Carol	Dave
+
+DROP PROPERTY GRAPH refresh_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE refresh_knows;
+DROP TABLE
+
+DROP TABLE refresh_person;
+DROP TABLE

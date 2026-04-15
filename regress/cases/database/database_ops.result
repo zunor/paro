@@ -1,0 +1,40 @@
+DROP DATABASE IF EXISTS active_db;
+DROP DATABASE
+
+DROP DATABASE IF EXISTS dup_db;
+DROP DATABASE
+
+DROP DATABASE IF EXISTS test_db1;
+DROP DATABASE
+
+CREATE DATABASE test_db1;
+CREATE DATABASE
+
+SELECT count(*) AS exists_count FROM paro_databases() WHERE database_name = 'test_db1';
+exists_count
+1
+
+CREATE DATABASE IF NOT EXISTS test_db1;
+CREATE DATABASE
+
+DROP DATABASE test_db1;
+DROP DATABASE
+
+SELECT count(*) AS exists_count FROM paro_databases() WHERE database_name = 'test_db1';
+exists_count
+0
+
+DROP DATABASE IF EXISTS test_db1;
+DROP DATABASE
+
+CREATE DATABASE dup_db;
+CREATE DATABASE
+
+CREATE DATABASE dup_db;
+ERROR: database "dup_db" already exists (SQLSTATE=42601)
+
+DROP DATABASE nonexistent_db;
+ERROR: Failed to detach database with name "nonexistent_db": database not found (SQLSTATE=42601)
+
+DROP DATABASE dup_db;
+DROP DATABASE

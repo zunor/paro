@@ -1,0 +1,136 @@
+SELECT
+  5 > ANY (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE quota IS NOT NULL
+  ) AS gt_any,
+  6 = ALL (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 30
+      AND kind = 'base'
+  ) AS eq_all,
+  2 <> SOME (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 10
+  ) AS ne_some;
+gt_any	eq_all	ne_some
+true	true	true
+
+SELECT
+  5 > ANY (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 999
+  ) AS gt_any_empty,
+  5 = ALL (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 999
+  ) AS eq_all_empty;
+gt_any_empty	eq_all_empty
+false	true
+
+SELECT
+  7 > ANY (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 20
+  ) AS gt_any_with_null_rhs,
+  3 = ALL (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 20
+  ) AS eq_all_with_null_rhs,
+  1 <> SOME (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 40
+  ) AS ne_some_only_null_rhs;
+gt_any_with_null_rhs	eq_all_with_null_rhs	ne_some_only_null_rhs
+true	false	NULL
+
+SELECT
+  7 > ANY (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp IN (10, 20)
+  ) AS int_vs_decimal_any,
+  6 = ALL (
+    SELECT quota
+    FROM subquery_any_all_lookup
+    WHERE grp = 30
+      AND kind = 'base'
+  ) AS int_vs_decimal_all;
+int_vs_decimal_any	int_vs_decimal_all
+true	true
+
+SELECT
+  o.id,
+  o.grp,
+  o.amt,
+  o.amt > ANY (
+    SELECT l.quota
+    FROM subquery_any_all_lookup AS l
+    WHERE l.grp = o.grp
+  ) AS gt_any_in_group,
+  o.amt = ALL (
+    SELECT l.quota
+    FROM (
+      SELECT grp, quota
+      FROM subquery_any_all_lookup
+      WHERE kind = 'base'
+    ) AS l
+    WHERE l.grp = o.grp
+  ) AS eq_all_base_quota,
+  o.amt <> SOME (
+    SELECT l.quota
+    FROM subquery_any_all_lookup AS l
+    WHERE l.grp = o.grp
+  ) AS ne_some_in_group
+FROM subquery_any_all_outer AS o
+ORDER BY o.id;
+o.id	o.grp	o.amt	gt_any_in_group	eq_all_base_quota	ne_some_in_group
+1	10	5	true	false	true
+2	20	7	true	false	true
+3	20	3	true	false	true
+4	30	6	false	true	true
+5	NULL	9	false	true	false
+6	40	1	NULL	true	NULL
+7	50	2	false	true	false
+
+SELECT o.id, o.label
+FROM subquery_any_all_outer AS o
+WHERE o.amt > ANY (
+  SELECT l.quota
+  FROM (
+    SELECT grp, quota
+    FROM subquery_any_all_lookup
+    WHERE kind <> 'nullable_only'
+  ) AS l
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+2	beta
+3	gamma
+
+SELECT o.id, o.label
+FROM subquery_any_all_outer AS o
+WHERE o.amt = ALL (
+  SELECT l.quota
+  FROM (
+    SELECT grp, quota
+    FROM subquery_any_all_lookup
+    WHERE kind = 'base'
+  ) AS l
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+4	delta
+5	null_grp
+6	nullable_only_grp
+7	missing_grp

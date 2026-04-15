@@ -1,0 +1,31 @@
+[meta]
+name = "graph"
+description = "SQL/PGQ graph pattern matching"
+
+[params]
+vertices = 100000
+edges = 1000000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "1_hop"
+file = "sql/q_1_hop.sql"
+validate = "scalar_equals"
+expected = 10
+plan_contains = ["GRAPH_SCAN", "GRAPH_EXPAND"]
+
+[[query]]
+id = "3_hop"
+file = "sql/q_3_hop.sql"
+validate = "scalar_gte"
+expected = 1
+
+[[query]]
+id = "any_shortest"
+file = "sql/q_any_shortest.sql"
+validate = "scalar_gte"
+expected = 1
+plan_contains = ["GRAPH_SHORTEST_PATH"]

@@ -1,0 +1,663 @@
+//! Query graph data structures used by the join-order optimizer.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+
+use paro_planner::expression::Expression;
+use paro_planner::operator::{ColumnBinding, JoinType};
+
+use crate::join_order::relation::JoinRelationSet;
+
+/// Information about a join filter.
+///
+/// This struct is used by the cardinality estimator to set the initial cardinality
+/// and is also eventually transformed into a query edge.
+///
+#[derive(Debug, Clone)]
+pub struct FilterInfo {
+    /// The filter expression.
+    pub filter: Expression,
+    /// The set of relations this filter references.
+    pub set: Arc<JoinRelationSet>,
+    /// Index of this filter in the filter list.
+    pub filter_index: usize,
+    /// The type of join this filter is part of.
+    pub join_type: JoinType,
+    /// The left side of the join (if applicable).
+    pub left_set: Option<Arc<JoinRelationSet>>,
+    /// The right side of the join (if applicable).
+    pub right_set: Option<Arc<JoinRelationSet>>,
+    /// Column binding from the left side (for equality joins).
+    pub left_binding: Option<ColumnBinding>,
+    /// Column binding from the right side (for equality joins).
+    pub right_binding: Option<ColumnBinding>,
+}
+
+impl FilterInfo {
+    /// Create a new FilterInfo.
+    pub fn new(
+        filter: Expression,
+        set: Arc<JoinRelationSet>,
+        filter_index: usize,
+        join_type: JoinType,
+    ) -> Self {
+        Self {
+            filter,
+            set,
+            filter_index,
+            join_type,
+            left_set: None,
+            right_set: None,
+            left_binding: None,
+            right_binding: None,
+        }
+    }
+
+    /// Create a new FilterInfo with default INNER join type.
+    pub fn new_inner(filter: Expression, set: Arc<JoinRelationSet>, filter_index: usize) -> Self {
+        Self::new(filter, set, filter_index, JoinType::Inner)
+    }
+
+    /// Set the left relation set.
+    pub fn set_left_set(&mut self, left_set: Arc<JoinRelationSet>) {
+        self.left_set = Some(left_set);
+    }
+
+    /// Set the right relation set.
+    pub fn set_right_set(&mut self, right_set: Arc<JoinRelationSet>) {
+        self.right_set = Some(right_set);
+    }
+
+    /// Set the left column binding.
+    pub fn set_left_binding(&mut self, binding: ColumnBinding) {
+        self.left_binding = Some(binding);
+    }
+
+    /// Set the right column binding.
+    pub fn set_right_binding(&mut self, binding: ColumnBinding) {
+        self.right_binding = Some(binding);
+    }
+}
+
+/// Information about a neighboring relation in the query graph.
+///
+#[derive(Debug, Clone)]
+pub struct NeighborInfo {
+    /// The neighboring relation set.
+    pub neighbor: Arc<JoinRelationSet>,
+    /// Filters connecting to this neighbor.
+    /// Empty filters indicate a cross product edge.
+    pub filters: Vec<Arc<FilterInfo>>,
+}
+
+impl NeighborInfo {
+    /// Create a new NeighborInfo.
+    pub fn new(neighbor: Arc<JoinRelationSet>) -> Self {
+        Self {
+            neighbor,
+            filters: Vec::new(),
+        }
+    }
+
+    /// Create a new NeighborInfo with a filter.
+    pub fn with_filter(neighbor: Arc<JoinRelationSet>, filter: Arc<FilterInfo>) -> Self {
+        Self {
+            neighbor,
+            filters: vec![filter],
+        }
+    }
+
+    /// Add a filter to this neighbor.
+    pub fn add_filter(&mut self, filter: Arc<FilterInfo>) {
+        self.filters.push(filter);
+    }
+
+    /// Check if this is a cross product edge (no filters).
+    pub fn is_cross_product(&self) -> bool {
+        self.filters.is_empty()
+    }
+}
+
+/// A node in the query edge tree.
+///
+/// The tree structure allows efficient lookup of edges for relation sets.
+#[derive(Debug, Default)]
+struct QueryEdge {
+    /// Neighbors at this node.
+    neighbors: Vec<NeighborInfo>,
+    /// Child edges indexed by relation index.
+    children: HashMap<usize, Box<QueryEdge>>,
+}
+
+impl QueryEdge {
+    fn new() -> Self {
+        Self {
+            neighbors: Vec::new(),
+            children: HashMap::new(),
+        }
+    }
+}
+
+/// The QueryGraphEdges contains edges between relations and allows edges to be created/queried.
+///
+#[derive(Debug, Default)]
+pub struct QueryGraphEdges {
+    /// Root of the edge tree.
+    root: QueryEdge,
+}
+
+impl QueryGraphEdges {
+    /// Create a new empty QueryGraphEdges.
+    pub fn new() -> Self {
+        Self {
+            root: QueryEdge::new(),
+        }
+    }
+
+    /// Create an edge between two relation sets.
+    ///
+    /// If `filter_info` is None, this creates a cross product edge.
+    pub fn create_edge(
+        &mut self,
+        left: &JoinRelationSet,
+        right: Arc<JoinRelationSet>,
+        filter_info: Option<Arc<FilterInfo>>,
+    ) {
+        debug_assert!(left.count() > 0 && right.count() > 0);
+
+        // Find or create the QueryEdge for the left set
+        let edge = self.get_or_create_query_edge(left);
+
+        // Check if neighbor already exists
+        for neighbor in &mut edge.neighbors {
+            if Arc::ptr_eq(&neighbor.neighbor, &right) {
+                // Neighbor exists, add filter if we have one
+                if let Some(filter) = filter_info {
+                    neighbor.add_filter(filter);
+                }
+                return;
+            }
+        }
+
+        // Neighbor doesn't exist, create it
+        let neighbor = if let Some(filter) = filter_info {
+            NeighborInfo::with_filter(right, filter)
+        } else {
+            NeighborInfo::new(right)
+        };
+        edge.neighbors.push(neighbor);
+    }
+
+    /// Get connections between two relation sets.
+    ///
+    /// Returns all NeighborInfo entries where the neighbor is a subset of `other`.
+    pub fn get_connections(
+        &self,
+        node: &JoinRelationSet,
+        other: &JoinRelationSet,
+    ) -> Vec<NeighborInfo> {
+        let mut connections = Vec::new();
+        self.enumerate_neighbors(node, |info| {
+            if JoinRelationSet::is_subset(other, &info.neighbor) {
+                connections.push(info.clone());
+            }
+            false // Continue enumeration
+        });
+        connections
+    }
+
+    /// Get neighbors of a node that are not in the exclusion set.
+    ///
+    /// Returns the smallest relation index from each valid neighbor.
+    pub fn get_neighbors(
+        &self,
+        node: &JoinRelationSet,
+        exclusion_set: &HashSet<usize>,
+    ) -> Vec<usize> {
+        let mut result = HashSet::new();
+        self.enumerate_neighbors(node, |info| {
+            if !Self::is_excluded(&info.neighbor, exclusion_set) {
+                // Add the smallest relation index from the neighbor
+                if let Some(&first) = info.neighbor.relations().first() {
+                    result.insert(first);
+                }
+            }
+            false // Continue enumeration
+        });
+        result.into_iter().collect()
+    }
+
+    /// Enumerate all neighbors of a given relation set.
+    ///
+    /// The callback returns true to stop enumeration early.
+    pub fn enumerate_neighbors<F>(&self, node: &JoinRelationSet, mut callback: F)
+    where
+        F: FnMut(&NeighborInfo) -> bool,
+    {
+        for j in 0..node.count() {
+            if let Some(child) = self.root.children.get(&node.relations()[j]) {
+                if self.enumerate_neighbors_dfs(node, child, j + 1, &mut callback) {
+                    return;
+                }
+            }
+        }
+    }
+    // Private helper methods
+
+    /// Get or create the QueryEdge for a relation set.
+    fn get_or_create_query_edge(&mut self, left: &JoinRelationSet) -> &mut QueryEdge {
+        debug_assert!(left.count() > 0);
+
+        let mut edge = &mut self.root;
+        for &rel in left.relations() {
+            edge = edge
+                .children
+                .entry(rel)
+                .or_insert_with(|| Box::new(QueryEdge::new()));
+        }
+        edge
+    }
+
+    /// DFS enumeration of neighbors.
+    fn enumerate_neighbors_dfs<F>(
+        &self,
+        node: &JoinRelationSet,
+        edge: &QueryEdge,
+        index: usize,
+        callback: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&NeighborInfo) -> bool,
+    {
+        // Process neighbors at this node
+        for neighbor in &edge.neighbors {
+            if callback(neighbor) {
+                return true;
+            }
+        }
+
+        // Continue DFS to children
+        for node_index in index..node.count() {
+            if let Some(child) = edge.children.get(&node.relations()[node_index]) {
+                if self.enumerate_neighbors_dfs(node, child, node_index + 1, callback) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if a relation set is excluded.
+    fn is_excluded(node: &JoinRelationSet, exclusion_set: &HashSet<usize>) -> bool {
+        if let Some(&first) = node.relations().first() {
+            exclusion_set.contains(&first)
+        } else {
+            false
+        }
+    }
+
+    /// Convert a QueryEdge to string representation.
+    fn query_edge_to_string(edge: &QueryEdge, prefix: &[usize]) -> String {
+        let mut result = String::new();
+
+        // Format source
+        let source = format!(
+            "[{}]",
+            prefix
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // Add neighbors
+        for neighbor in &edge.neighbors {
+            result.push_str(&format!("{} -> {}\n", source, neighbor.neighbor));
+        }
+
+        // Recurse to children
+        for (&rel, child) in &edge.children {
+            let mut new_prefix = prefix.to_vec();
+            new_prefix.push(rel);
+            result.push_str(&Self::query_edge_to_string(child, &new_prefix));
+        }
+
+        result
+    }
+}
+
+impl fmt::Display for QueryGraphEdges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", Self::query_edge_to_string(&self.root, &[]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::join_order::relation::JoinRelationSetManager;
+    use paro_common::runtime_value::Value;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::ConstantExpression;
+
+    fn create_dummy_filter(set: Arc<JoinRelationSet>, index: usize) -> Arc<FilterInfo> {
+        let expr = Expression::Constant(ConstantExpression {
+            value: Value::Boolean(true),
+            return_type: LogicalType::Boolean,
+        });
+        Arc::new(FilterInfo::new_inner(expr, set, index))
+    }
+
+    #[test]
+    fn test_filter_info_creation() {
+        let mut manager = JoinRelationSetManager::new();
+        let set = manager.get_relation_from_vec(vec![0, 1]);
+
+        let expr = Expression::Constant(ConstantExpression {
+            value: Value::Boolean(true),
+            return_type: LogicalType::Boolean,
+        });
+        let filter = FilterInfo::new_inner(expr, set.clone(), 0);
+
+        assert_eq!(filter.filter_index, 0);
+        assert_eq!(filter.join_type, JoinType::Inner);
+        assert!(filter.left_set.is_none());
+        assert!(filter.right_set.is_none());
+    }
+
+    #[test]
+    fn test_filter_info_with_sets() {
+        let mut manager = JoinRelationSetManager::new();
+        let set = manager.get_relation_from_vec(vec![0, 1]);
+        let left = manager.get_relation(0);
+        let right = manager.get_relation(1);
+
+        let expr = Expression::Constant(ConstantExpression {
+            value: Value::Boolean(true),
+            return_type: LogicalType::Boolean,
+        });
+        let mut filter = FilterInfo::new(expr, set, 0, JoinType::Left);
+        filter.set_left_set(left.clone());
+        filter.set_right_set(right.clone());
+        filter.set_left_binding(ColumnBinding::new(0, 0));
+        filter.set_right_binding(ColumnBinding::new(1, 0));
+
+        assert_eq!(filter.join_type, JoinType::Left);
+        assert!(filter.left_set.is_some());
+        assert!(filter.right_set.is_some());
+        assert!(filter.left_binding.is_some());
+        assert!(filter.right_binding.is_some());
+    }
+
+    #[test]
+    fn test_neighbor_info_creation() {
+        let mut manager = JoinRelationSetManager::new();
+        let neighbor = manager.get_relation(1);
+
+        let info = NeighborInfo::new(neighbor);
+        assert!(info.is_cross_product());
+        assert!(info.filters.is_empty());
+    }
+
+    #[test]
+    fn test_neighbor_info_with_filter() {
+        let mut manager = JoinRelationSetManager::new();
+        let set = manager.get_relation_from_vec(vec![0, 1]);
+        let neighbor = manager.get_relation(1);
+        let filter = create_dummy_filter(set, 0);
+
+        let info = NeighborInfo::with_filter(neighbor, filter);
+        assert!(!info.is_cross_product());
+        assert_eq!(info.filters.len(), 1);
+    }
+
+    #[test]
+    fn test_query_graph_create_edge() {
+        let mut manager = JoinRelationSetManager::new();
+        let left = manager.get_relation(0);
+        let right = manager.get_relation(1);
+        let set = manager.get_relation_from_vec(vec![0, 1]);
+        let filter = create_dummy_filter(set, 0);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&left, right.clone(), Some(filter));
+
+        let s = graph.to_string();
+        assert!(s.contains("[0] -> [1]"));
+    }
+
+    #[test]
+    fn test_query_graph_create_cross_product_edge() {
+        let mut manager = JoinRelationSetManager::new();
+        let left = manager.get_relation(0);
+        let right = manager.get_relation(1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&left, right.clone(), None);
+
+        let s = graph.to_string();
+        assert!(s.contains("[0] -> [1]"));
+    }
+
+    #[test]
+    fn test_query_graph_multiple_edges() {
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let r2 = manager.get_relation(2);
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+        let set12 = manager.get_relation_from_vec(vec![1, 2]);
+
+        let filter1 = create_dummy_filter(set01, 0);
+        let filter2 = create_dummy_filter(set12, 1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(filter1));
+        graph.create_edge(&r1, r2.clone(), Some(filter2));
+
+        let s = graph.to_string();
+        assert!(s.contains("[0] -> [1]"));
+        assert!(s.contains("[1] -> [2]"));
+    }
+
+    #[test]
+    fn test_query_graph_add_filter_to_existing_edge() {
+        let mut manager = JoinRelationSetManager::new();
+        let left = manager.get_relation(0);
+        let right = manager.get_relation(1);
+        let set = manager.get_relation_from_vec(vec![0, 1]);
+
+        let filter1 = create_dummy_filter(set.clone(), 0);
+        let filter2 = create_dummy_filter(set, 1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&left, right.clone(), Some(filter1));
+        graph.create_edge(&left, right.clone(), Some(filter2));
+
+        // Should only have one edge with two filters
+        let mut count = 0;
+        graph.enumerate_neighbors(&left, |info| {
+            count += 1;
+            assert_eq!(info.filters.len(), 2);
+            false
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_query_graph_get_neighbors() {
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let r2 = manager.get_relation(2);
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+        let set02 = manager.get_relation_from_vec(vec![0, 2]);
+
+        let filter1 = create_dummy_filter(set01, 0);
+        let filter2 = create_dummy_filter(set02, 1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(filter1));
+        graph.create_edge(&r0, r2.clone(), Some(filter2));
+
+        // Get neighbors of r0 with no exclusions
+        let neighbors = graph.get_neighbors(&r0, &HashSet::new());
+        assert_eq!(neighbors.len(), 2);
+        assert!(neighbors.contains(&1));
+        assert!(neighbors.contains(&2));
+
+        // Get neighbors of r0 excluding r1
+        let mut exclusion = HashSet::new();
+        exclusion.insert(1);
+        let neighbors = graph.get_neighbors(&r0, &exclusion);
+        assert_eq!(neighbors.len(), 1);
+        assert!(neighbors.contains(&2));
+    }
+
+    #[test]
+    fn test_query_graph_get_connections() {
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let r2 = manager.get_relation(2);
+        let r12 = manager.get_relation_from_vec(vec![1, 2]);
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+        let set02 = manager.get_relation_from_vec(vec![0, 2]);
+
+        let filter1 = create_dummy_filter(set01, 0);
+        let filter2 = create_dummy_filter(set02, 1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(filter1));
+        graph.create_edge(&r0, r2.clone(), Some(filter2));
+
+        // Get connections from r0 to r12 (should find both r1 and r2)
+        let connections = graph.get_connections(&r0, &r12);
+        assert_eq!(connections.len(), 2);
+    }
+
+    #[test]
+    fn test_query_graph_hyperedge() {
+        let mut manager = JoinRelationSetManager::new();
+        let r01 = manager.get_relation_from_vec(vec![0, 1]);
+        let r2 = manager.get_relation(2);
+        let set012 = manager.get_relation_from_vec(vec![0, 1, 2]);
+
+        let filter = create_dummy_filter(set012, 0);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r01, r2.clone(), Some(filter));
+
+        let s = graph.to_string();
+        assert!(s.contains("[0, 1] -> [2]"));
+    }
+
+    #[test]
+    fn test_query_graph_enumerate_neighbors() {
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let r2 = manager.get_relation(2);
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+        let set02 = manager.get_relation_from_vec(vec![0, 2]);
+
+        let filter1 = create_dummy_filter(set01, 0);
+        let filter2 = create_dummy_filter(set02, 1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(filter1));
+        graph.create_edge(&r0, r2.clone(), Some(filter2));
+
+        let mut neighbors = Vec::new();
+        graph.enumerate_neighbors(&r0, |info| {
+            neighbors.push(info.neighbor.clone());
+            false
+        });
+
+        assert_eq!(neighbors.len(), 2);
+    }
+
+    #[test]
+    fn test_query_graph_enumerate_early_stop() {
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let r2 = manager.get_relation(2);
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+        let set02 = manager.get_relation_from_vec(vec![0, 2]);
+
+        let filter1 = create_dummy_filter(set01, 0);
+        let filter2 = create_dummy_filter(set02, 1);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(filter1));
+        graph.create_edge(&r0, r2.clone(), Some(filter2));
+
+        let mut count = 0;
+        graph.enumerate_neighbors(&r0, |_| {
+            count += 1;
+            true // Stop after first
+        });
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_query_graph_display() {
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+
+        let filter = create_dummy_filter(set01, 0);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(filter));
+
+        let display = format!("{}", graph);
+        assert!(display.contains("[0] -> [1]"));
+    }
+
+    #[test]
+    fn test_query_graph_empty() {
+        let graph = QueryGraphEdges::new();
+        assert_eq!(graph.to_string(), "");
+    }
+
+    #[test]
+    fn test_query_graph_complex_structure() {
+        // Create a more complex graph:
+        // 0 -- 1
+        // 2 -- 3
+        let mut manager = JoinRelationSetManager::new();
+        let r0 = manager.get_relation(0);
+        let r1 = manager.get_relation(1);
+        let r2 = manager.get_relation(2);
+        let r3 = manager.get_relation(3);
+
+        let set01 = manager.get_relation_from_vec(vec![0, 1]);
+        let set02 = manager.get_relation_from_vec(vec![0, 2]);
+        let set13 = manager.get_relation_from_vec(vec![1, 3]);
+        let set23 = manager.get_relation_from_vec(vec![2, 3]);
+
+        let mut graph = QueryGraphEdges::new();
+        graph.create_edge(&r0, r1.clone(), Some(create_dummy_filter(set01, 0)));
+        graph.create_edge(&r0, r2.clone(), Some(create_dummy_filter(set02, 1)));
+        graph.create_edge(&r1, r3.clone(), Some(create_dummy_filter(set13, 2)));
+        graph.create_edge(&r2, r3.clone(), Some(create_dummy_filter(set23, 3)));
+
+        // Check neighbors of each node
+        let n0 = graph.get_neighbors(&r0, &HashSet::new());
+        assert_eq!(n0.len(), 2);
+
+        let n1 = graph.get_neighbors(&r1, &HashSet::new());
+        assert_eq!(n1.len(), 1);
+        assert!(n1.contains(&3));
+
+        let n2 = graph.get_neighbors(&r2, &HashSet::new());
+        assert_eq!(n2.len(), 1);
+        assert!(n2.contains(&3));
+    }
+}

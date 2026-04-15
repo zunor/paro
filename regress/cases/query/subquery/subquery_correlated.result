@@ -1,0 +1,93 @@
+SELECT
+  o.id,
+  o.grp,
+  (
+    SELECT d.score
+    FROM subquery_correlated_detail AS d
+    WHERE d.grp = o.grp
+    ORDER BY d.score DESC, d.seq
+    LIMIT 1
+  ) AS top_score
+FROM subquery_correlated_outer AS o
+ORDER BY o.id;
+o.id	o.grp	top_score
+1	10	9
+2	20	8
+3	20	8
+4	30	6
+5	NULL	NULL
+6	40	NULL
+
+SELECT
+  o.id,
+  o.grp,
+  (
+    SELECT d.score
+    FROM subquery_correlated_detail AS d
+    WHERE d.grp = o.grp
+    ORDER BY d.score DESC, d.seq
+    LIMIT 1 OFFSET 1
+  ) AS second_score
+FROM subquery_correlated_outer AS o
+ORDER BY o.id;
+o.id	o.grp	second_score
+1	10	7
+2	20	5
+3	20	5
+4	30	1
+5	NULL	NULL
+6	40	NULL
+
+SELECT
+  o.id,
+  o.label,
+  (
+    SELECT d.grp
+    FROM subquery_correlated_detail AS d
+    WHERE d.grp = o.grp
+    GROUP BY d.grp
+    HAVING COUNT(*) >= 3
+  ) AS dense_group
+FROM subquery_correlated_outer AS o
+ORDER BY o.id;
+o.id	o.label	dense_group
+1	alpha	10
+2	beta	20
+3	gamma	20
+4	delta	NULL
+5	null_grp	NULL
+6	missing_grp	NULL
+
+SELECT
+  o.id,
+  o.label,
+  (
+    SELECT d.grp
+    FROM subquery_correlated_detail AS d
+    WHERE d.grp = o.grp
+    GROUP BY d.grp
+    HAVING COUNT(*) >= 1
+  ) AS eq_group
+FROM subquery_correlated_outer AS o
+WHERE o.grp IS NULL
+ORDER BY o.id;
+o.id	o.label	eq_group
+5	null_grp	NULL
+
+SELECT
+  o.id,
+  (
+    SELECT MAX(x)
+    FROM (
+      SELECT o.id AS x
+    ) AS nested_rows
+  ) AS nested_value
+FROM subquery_correlated_outer AS o
+ORDER BY o.id;
+o.id	nested_value
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6

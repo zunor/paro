@@ -1,0 +1,81 @@
+DROP TABLE IF EXISTS agg_e_single;
+DROP TABLE
+
+DROP TABLE IF EXISTS agg_e_nulls;
+DROP TABLE
+
+CREATE TABLE agg_e_empty (x INT);
+CREATE TABLE
+
+CREATE TABLE agg_e_single (x INT, label VARCHAR);
+CREATE TABLE
+
+CREATE TABLE agg_e_nulls (grp INT, x INT);
+CREATE TABLE
+
+INSERT INTO agg_e_single VALUES (42, 'single');
+INSERT 0 1
+
+INSERT INTO agg_e_nulls VALUES
+    (1, NULL),
+    (1, NULL),
+    (2, NULL);
+INSERT 0 3
+
+SELECT
+    count(*) AS cnt_star,
+    count(x) AS cnt_x,
+    sum(x) AS sum_x,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_e_empty;
+cnt_star	cnt_x	sum_x	min_x	max_x
+0	0	NULL	NULL	NULL
+
+SELECT
+    grp,
+    sum(x) AS sum_x
+FROM (
+    SELECT 1 AS grp, x
+    FROM agg_e_empty
+) AS agg_e_empty_grouped
+GROUP BY grp
+ORDER BY grp;
+grp	sum_x
+
+SELECT
+    count(*) AS cnt_star,
+    sum(x) AS sum_x,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_e_single;
+cnt_star	sum_x	min_x	max_x
+1	42	42	42
+
+SELECT
+    count(*) AS cnt_star,
+    count(x) AS cnt_x,
+    sum(x) AS sum_x,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_e_nulls;
+cnt_star	cnt_x	sum_x	min_x	max_x
+3	0	NULL	NULL	NULL
+
+SELECT
+    grp,
+    count(*) AS cnt_star,
+    count(x) AS cnt_x,
+    sum(x) AS sum_x
+FROM agg_e_nulls
+GROUP BY grp
+ORDER BY grp;
+grp	cnt_star	cnt_x	sum_x
+1	2	0	NULL
+2	1	0	NULL
+
+DROP TABLE IF EXISTS agg_e_single;
+DROP TABLE
+
+DROP TABLE IF EXISTS agg_e_nulls;
+DROP TABLE

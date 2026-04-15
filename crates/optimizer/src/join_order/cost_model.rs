@@ -1,0 +1,480 @@
+//! Join-order cost model based on cardinality estimates.
+
+use std::sync::Arc;
+
+use crate::join_order::cardinality::CardinalityEstimator;
+use crate::join_order::query_graph::NeighborInfo;
+use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
+use crate::join_order::relation_manager::RelationStats;
+
+/// A node in the dynamic programming join plan.
+///
+#[derive(Debug, Clone)]
+pub struct DPJoinNode {
+    /// The set of relations in this node.
+    pub set: Arc<JoinRelationSet>,
+    /// The selected query-graph edge that connects the left and right children.
+    pub info: Option<NeighborInfo>,
+    /// Whether this is a leaf node (single relation).
+    pub is_leaf: bool,
+    /// The left child set (for non-leaf nodes).
+    pub left_set: Arc<JoinRelationSet>,
+    /// The right child set (for non-leaf nodes).
+    pub right_set: Arc<JoinRelationSet>,
+    /// The cost of this join node.
+    pub cost: f64,
+    /// The estimated cardinality of this node.
+    pub cardinality: usize,
+}
+
+impl DPJoinNode {
+    /// Create a leaf node (single relation).
+    ///
+    /// Leaf nodes have cost 0 since they represent base tables.
+    pub fn leaf(set: Arc<JoinRelationSet>) -> Self {
+        Self {
+            set: set.clone(),
+            info: None,
+            is_leaf: true,
+            left_set: set.clone(),
+            right_set: set,
+            cost: 0.0,
+            cardinality: 0,
+        }
+    }
+
+    /// Create an intermediate node (join of two relations).
+    pub fn intermediate(
+        set: Arc<JoinRelationSet>,
+        info: Option<NeighborInfo>,
+        left_set: Arc<JoinRelationSet>,
+        right_set: Arc<JoinRelationSet>,
+        cost: f64,
+        cardinality: usize,
+    ) -> Self {
+        Self {
+            set,
+            info,
+            is_leaf: false,
+            left_set,
+            right_set,
+            cost,
+            cardinality,
+        }
+    }
+}
+
+/// The CostModel computes the cost of join plans.
+///
+#[derive(Debug, Default)]
+pub struct CostModel {
+    /// Cardinality estimator used to calculate cost.
+    pub cardinality_estimator: CardinalityEstimator,
+}
+
+impl CostModel {
+    /// Create a new CostModel.
+    pub fn new() -> Self {
+        Self {
+            cardinality_estimator: CardinalityEstimator::new(),
+        }
+    }
+
+    /// Initialize the cost model with relation statistics.
+    ///
+    /// This should be called after all relations have been added to the
+    /// relation manager and before computing any costs.
+    pub fn init_cost_model(
+        &mut self,
+        set_manager: &mut JoinRelationSetManager,
+        relation_stats: &[RelationStats],
+    ) {
+        for (i, stats) in relation_stats.iter().enumerate() {
+            let set = set_manager.get_relation(i);
+            self.cardinality_estimator
+                .init_cardinality_estimator_props(&set, stats);
+        }
+    }
+
+    /// Compute the cost of joining two nodes.
+    ///
+    /// The cost is computed as:
+    /// cost = cardinality(left ⋈ right) + cost(left) + cost(right)
+    ///
+    /// This simple cost model assumes that the cost of producing a join result
+    /// is proportional to the number of output tuples.
+    pub fn compute_cost(
+        &mut self,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
+        set_manager: &mut JoinRelationSetManager,
+    ) -> f64 {
+        // Get the combined relation set
+        let combination = set_manager.union(&left.set, &right.set);
+
+        // Estimate the cardinality of the join
+        let join_cardinality = self
+            .cardinality_estimator
+            .estimate_cardinality(&combination);
+
+        // Total cost = join cardinality + cost of producing left + cost of producing right
+        join_cardinality + left.cost + right.cost
+    }
+
+    /// Compute the cost and create a new DPJoinNode.
+    pub fn compute_cost_and_create_node(
+        &mut self,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
+        set_manager: &mut JoinRelationSetManager,
+        info: Option<NeighborInfo>,
+    ) -> DPJoinNode {
+        let combination = set_manager.union(&left.set, &right.set);
+        let cost = self.compute_cost(left, right, set_manager);
+        let cardinality = self
+            .cardinality_estimator
+            .estimate_cardinality_idx(&combination);
+
+        DPJoinNode::intermediate(
+            combination,
+            info,
+            left.set.clone(),
+            right.set.clone(),
+            cost,
+            cardinality,
+        )
+    }
+
+    /// Get the estimated cardinality for a relation set.
+    pub fn get_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
+        self.cardinality_estimator.estimate_cardinality(set)
+    }
+
+    /// Get the estimated cardinality as an integer.
+    pub fn get_cardinality_idx(&mut self, set: &JoinRelationSet) -> usize {
+        self.cardinality_estimator.estimate_cardinality_idx(set)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::join_order::query_graph::FilterInfo;
+    use crate::join_order::relation_manager::DistinctCount;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
+    use paro_planner::operator::ColumnBinding;
+
+    fn create_column_ref(
+        table_index: usize,
+        column_index: usize,
+    ) -> paro_planner::expression::Expression {
+        paro_planner::expression::Expression::ColumnRef(ColumnRefExpression {
+            binding: paro_planner::operator::ColumnBinding {
+                table_index,
+                column_index,
+            },
+            depth: 0,
+            return_type: LogicalType::Integer,
+        })
+    }
+
+    fn create_equality_filter(
+        set_manager: &mut JoinRelationSetManager,
+        left_table: usize,
+        left_col: usize,
+        right_table: usize,
+        right_col: usize,
+        filter_index: usize,
+    ) -> Arc<FilterInfo> {
+        let expr = paro_planner::expression::Expression::Comparison(ComparisonExpression {
+            left: Box::new(create_column_ref(left_table, left_col)),
+            right: Box::new(create_column_ref(right_table, right_col)),
+            comparison_type: ComparisonType::Equal,
+        });
+
+        let set = set_manager.get_relation_from_vec(vec![left_table, right_table]);
+        let left_set = set_manager.get_relation(left_table);
+        let right_set = set_manager.get_relation(right_table);
+
+        let mut filter = FilterInfo::new_inner(expr, set, filter_index);
+        filter.set_left_set(left_set);
+        filter.set_right_set(right_set);
+        filter.set_left_binding(ColumnBinding::new(left_table, left_col));
+        filter.set_right_binding(ColumnBinding::new(right_table, right_col));
+
+        Arc::new(filter)
+    }
+
+    #[test]
+    fn test_cost_model_new() {
+        let mut cost_model = CostModel::new();
+        // Just verify it can be created
+        assert_eq!(cost_model.get_cardinality(&JoinRelationSet::empty()), 1.0);
+    }
+
+    #[test]
+    fn test_dp_join_node_leaf() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let set = set_manager.get_relation(0);
+
+        let node = DPJoinNode::leaf(set.clone());
+
+        assert!(node.is_leaf);
+        assert_eq!(node.cost, 0.0);
+        assert_eq!(node.cardinality, 0);
+        assert!(Arc::ptr_eq(&node.set, &set));
+    }
+
+    #[test]
+    fn test_dp_join_node_intermediate() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let left = set_manager.get_relation(0);
+        let right = set_manager.get_relation(1);
+        let combined = set_manager.union(&left, &right);
+
+        let node = DPJoinNode::intermediate(
+            combined.clone(),
+            None,
+            left.clone(),
+            right.clone(),
+            100.0,
+            50,
+        );
+
+        assert!(!node.is_leaf);
+        assert!(node.info.is_none());
+        assert_eq!(node.cost, 100.0);
+        assert_eq!(node.cardinality, 50);
+        assert!(Arc::ptr_eq(&node.left_set, &left));
+        assert!(Arc::ptr_eq(&node.right_set, &right));
+    }
+
+    #[test]
+    fn test_init_cost_model() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        let stats = vec![
+            RelationStats::with_cardinality(1000),
+            RelationStats::with_cardinality(500),
+        ];
+
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        // Check that cardinalities were initialized
+        let set0 = set_manager.get_relation(0);
+        let card0 = cost_model.get_cardinality(&set0);
+        assert_eq!(card0, 1000.0);
+
+        let set1 = set_manager.get_relation(1);
+        let card1 = cost_model.get_cardinality(&set1);
+        assert_eq!(card1, 500.0);
+    }
+
+    #[test]
+    fn test_compute_cost_leaf_nodes() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        // Initialize with join filter
+        let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        cost_model
+            .cardinality_estimator
+            .init_equivalent_relations(&[filter]);
+
+        // Initialize relation stats
+        let mut stats0 = RelationStats::with_cardinality(1000);
+        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+
+        let mut stats1 = RelationStats::with_cardinality(500);
+        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+
+        cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
+
+        // Create leaf nodes
+        let left = DPJoinNode::leaf(set_manager.get_relation(0));
+        let right = DPJoinNode::leaf(set_manager.get_relation(1));
+
+        // Compute cost
+        let cost = cost_model.compute_cost(&left, &right, &mut set_manager);
+
+        // Cost should be join cardinality + 0 + 0 (leaf costs are 0)
+        // Join cardinality = (1000 * 500) / max(100, 50) = 5000
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn test_compute_cost_with_existing_costs() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        // Initialize with join filter
+        let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        cost_model
+            .cardinality_estimator
+            .init_equivalent_relations(&[filter]);
+
+        // Initialize relation stats
+        let mut stats0 = RelationStats::with_cardinality(1000);
+        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+
+        let mut stats1 = RelationStats::with_cardinality(500);
+        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+
+        cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
+
+        // Create nodes with existing costs
+        let left_set = set_manager.get_relation(0);
+        let right_set = set_manager.get_relation(1);
+
+        let left = DPJoinNode {
+            set: left_set.clone(),
+            info: None,
+            is_leaf: false,
+            left_set: left_set.clone(),
+            right_set: left_set.clone(),
+            cost: 100.0,
+            cardinality: 1000,
+        };
+
+        let right = DPJoinNode {
+            set: right_set.clone(),
+            info: None,
+            is_leaf: false,
+            left_set: right_set.clone(),
+            right_set: right_set.clone(),
+            cost: 50.0,
+            cardinality: 500,
+        };
+
+        // Compute cost
+        let cost = cost_model.compute_cost(&left, &right, &mut set_manager);
+
+        // Cost should include left.cost + right.cost
+        assert!(cost >= 150.0); // At least the sum of child costs
+    }
+
+    #[test]
+    fn test_compute_cost_and_create_node() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        // Initialize with join filter
+        let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        cost_model
+            .cardinality_estimator
+            .init_equivalent_relations(&[filter]);
+
+        // Initialize relation stats
+        let mut stats0 = RelationStats::with_cardinality(1000);
+        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+
+        let mut stats1 = RelationStats::with_cardinality(500);
+        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+
+        cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
+
+        // Create leaf nodes
+        let left = DPJoinNode::leaf(set_manager.get_relation(0));
+        let right = DPJoinNode::leaf(set_manager.get_relation(1));
+
+        // Create join node
+        let join_node =
+            cost_model.compute_cost_and_create_node(&left, &right, &mut set_manager, None);
+
+        assert!(!join_node.is_leaf);
+        assert!(join_node.cost > 0.0);
+        assert!(join_node.cardinality > 0);
+        assert_eq!(join_node.set.count(), 2);
+    }
+
+    #[test]
+    fn test_get_cardinality() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        let stats = vec![RelationStats::with_cardinality(1000)];
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        let set = set_manager.get_relation(0);
+        let card = cost_model.get_cardinality(&set);
+        assert_eq!(card, 1000.0);
+    }
+
+    #[test]
+    fn test_get_cardinality_idx() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        let stats = vec![RelationStats::with_cardinality(1000)];
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        let set = set_manager.get_relation(0);
+        let card = cost_model.get_cardinality_idx(&set);
+        assert_eq!(card, 1000);
+    }
+
+    #[test]
+    fn test_three_way_join_cost() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        // Create filters for A-B and B-C joins
+        let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        let filter_bc = create_equality_filter(&mut set_manager, 1, 1, 2, 0, 1);
+        cost_model
+            .cardinality_estimator
+            .init_equivalent_relations(&[filter_ab, filter_bc]);
+
+        // Initialize relation stats
+        let mut stats0 = RelationStats::with_cardinality(1000);
+        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+
+        let mut stats1 = RelationStats::with_cardinality(500);
+        stats1.column_distinct_count =
+            vec![DistinctCount::new(50, true), DistinctCount::new(25, true)];
+
+        let mut stats2 = RelationStats::with_cardinality(200);
+        stats2.column_distinct_count = vec![DistinctCount::new(20, true)];
+
+        cost_model.init_cost_model(&mut set_manager, &[stats0, stats1, stats2]);
+
+        // Create leaf nodes
+        let a = DPJoinNode::leaf(set_manager.get_relation(0));
+        let b = DPJoinNode::leaf(set_manager.get_relation(1));
+        let c = DPJoinNode::leaf(set_manager.get_relation(2));
+
+        // Compare two join orders: (A ⋈ B) ⋈ C vs A ⋈ (B ⋈ C)
+        let ab = cost_model.compute_cost_and_create_node(&a, &b, &mut set_manager, None);
+        let ab_c = cost_model.compute_cost_and_create_node(&ab, &c, &mut set_manager, None);
+
+        let bc = cost_model.compute_cost_and_create_node(&b, &c, &mut set_manager, None);
+        let a_bc = cost_model.compute_cost_and_create_node(&a, &bc, &mut set_manager, None);
+
+        // Both should have valid costs
+        assert!(ab_c.cost > 0.0);
+        assert!(a_bc.cost > 0.0);
+    }
+
+    #[test]
+    fn test_cross_product_cost() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+
+        // No join filters - this will be a cross product
+        let stats = vec![
+            RelationStats::with_cardinality(100),
+            RelationStats::with_cardinality(50),
+        ];
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        let left = DPJoinNode::leaf(set_manager.get_relation(0));
+        let right = DPJoinNode::leaf(set_manager.get_relation(1));
+
+        let cost = cost_model.compute_cost(&left, &right, &mut set_manager);
+
+        // Cross product cost should be high (100 * 50 = 5000)
+        assert!(cost >= 5000.0);
+    }
+}

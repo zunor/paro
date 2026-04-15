@@ -1,0 +1,101 @@
+SELECT (SELECT value FROM subquery_scalar_cfg WHERE name = 'answer') AS answer;
+answer
+42
+
+SELECT id, label
+FROM subquery_scalar_outer
+WHERE amt < (SELECT value FROM subquery_scalar_cfg WHERE name = 'threshold')
+ORDER BY id;
+id	label
+1	alpha
+3	gamma
+6	missing_grp
+
+SELECT (SELECT value FROM subquery_scalar_cfg WHERE name = 'missing') AS missing_value;
+missing_value
+NULL
+
+SELECT SUM((SELECT value FROM subquery_scalar_cfg WHERE name = 'bonus')) AS repeated_bonus
+FROM (
+  SELECT id
+  FROM subquery_scalar_outer
+  WHERE id <= 3
+) AS base;
+repeated_bonus
+6
+
+SELECT
+  o.id,
+  o.grp,
+  o.amt,
+  (
+    SELECT l.quota
+    FROM subquery_scalar_lookup AS l
+    WHERE l.grp = o.grp
+  ) AS quota
+FROM subquery_scalar_outer AS o
+ORDER BY o.id;
+o.id	o.grp	o.amt	quota
+1	10	5	8
+2	20	7	4
+3	20	3	4
+4	30	6	6
+5	NULL	9	NULL
+6	40	1	NULL
+
+SELECT o.id, o.label
+FROM subquery_scalar_outer AS o
+WHERE o.amt < (
+  SELECT l.quota
+  FROM subquery_scalar_lookup AS l
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+3	gamma
+
+SELECT o.id, o.label
+FROM subquery_scalar_outer AS o
+ORDER BY
+  COALESCE(
+    (
+      SELECT l.ord
+      FROM subquery_scalar_lookup AS l
+      WHERE l.grp = o.grp
+    ),
+    999
+  ),
+  o.id;
+o.id	o.label
+2	beta
+3	gamma
+4	delta
+1	alpha
+5	null_grp
+6	missing_grp
+
+SELECT
+  o.grp,
+  SUM(
+    COALESCE(
+      (
+        SELECT l.quota
+        FROM subquery_scalar_lookup AS l
+        WHERE l.grp = o.grp
+      ),
+      0
+    )
+  ) AS quota_sum
+FROM subquery_scalar_outer AS o
+GROUP BY o.grp
+ORDER BY o.grp;
+o.grp	quota_sum
+10	8
+20	8
+30	6
+40	0
+NULL	0
+
+SELECT (SELECT v FROM subquery_scalar_multi) AS should_fail;
+ERROR: More than one row returned by a subquery used as an expression (SQLSTATE=XX000)

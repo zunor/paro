@@ -1,0 +1,205 @@
+---------- Input ----------
+BEGIN
+---------- Output ---------
+BEGIN
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Begin,
+    },
+)
+
+
+---------- Input ----------
+BEGIN TRANSACTION
+---------- Output ---------
+BEGIN
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Begin,
+    },
+)
+
+
+---------- Input ----------
+START TRANSACTION
+---------- Output ---------
+START TRANSACTION
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Start,
+    },
+)
+
+
+---------- Input ----------
+SAVEPOINT sp1
+---------- Output ---------
+SAVEPOINT sp1
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Savepoint(
+            Identifier {
+                span: Some(
+                    10..13,
+                ),
+                name: "sp1",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+RELEASE SAVEPOINT sp1
+---------- Output ---------
+RELEASE SAVEPOINT sp1
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: ReleaseSavepoint(
+            Identifier {
+                span: Some(
+                    18..21,
+                ),
+                name: "sp1",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+RELEASE sp1
+---------- Output ---------
+RELEASE SAVEPOINT sp1
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: ReleaseSavepoint(
+            Identifier {
+                span: Some(
+                    8..11,
+                ),
+                name: "sp1",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+ROLLBACK TO SAVEPOINT sp1
+---------- Output ---------
+ROLLBACK TO SAVEPOINT sp1
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: RollbackToSavepoint(
+            Identifier {
+                span: Some(
+                    22..25,
+                ),
+                name: "sp1",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+ROLLBACK TO sp1
+---------- Output ---------
+ROLLBACK TO SAVEPOINT sp1
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: RollbackToSavepoint(
+            Identifier {
+                span: Some(
+                    12..15,
+                ),
+                name: "sp1",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+COMMIT PREPARED 'gid'
+---------- Output ---------
+COMMIT PREPARED 'gid'
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: CommitPrepared(
+            "gid",
+        ),
+    },
+)
+
+
+---------- Input ----------
+ROLLBACK PREPARED 'gid'
+---------- Output ---------
+ROLLBACK PREPARED 'gid'
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: RollbackPrepared(
+            "gid",
+        ),
+    },
+)
+
+
+---------- Input ----------
+COMMIT
+---------- Output ---------
+COMMIT
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Commit,
+    },
+)
+
+
+---------- Input ----------
+ROLLBACK
+---------- Output ---------
+ROLLBACK
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Rollback,
+    },
+)
+
+
+---------- Input ----------
+ABORT
+---------- Output ---------
+ROLLBACK
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Rollback,
+    },
+)
+
+

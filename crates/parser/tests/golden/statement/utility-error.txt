@@ -1,0 +1,12 @@
+---------- Input ----------
+PRESIGN INVALID @my_stage/path/to/file
+---------- Output ---------
+error: 
+  --> SQL:1:9
+  |
+1 | PRESIGN INVALID @my_stage/path/to/file
+  | ------- ^^^^^^^ unexpected `INVALID`, expecting `DOWNLOAD`, <LiteralString>, `UPLOAD`, or `LiteralAtString`
+  | |        
+  | while parsing `PRESIGN [{DOWNLOAD | UPLOAD}] <location> [EXPIRE = 3600]`
+
+

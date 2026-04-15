@@ -1,0 +1,47 @@
+[meta]
+name = "memory"
+description = "Memory observability workload for operator profiles, tag deltas, and spill metrics"
+
+[params]
+order_rows = 10000
+window_rows = 10000
+agg_rows = 50000
+join_rows = 20000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "order_by_memory"
+file = "sql/q_order_by_memory.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3], [4], [5], [6], [7], [8], [9], [10], [11], [12]]
+plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "hash_agg_memory"
+file = "sql/q_hash_agg_memory.sql"
+validate = "scalar_equals"
+expected = 50000
+plan_contains = ["HASH_GROUP_BY"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "hash_join_memory"
+file = "sql/q_hash_join_memory.sql"
+validate = "scalar_equals"
+expected = 20000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "window_memory_plan"
+file = "sql/q_window_memory.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true

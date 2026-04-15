@@ -1,0 +1,16 @@
+INSERT INTO types_encoding_escape_case VALUES (
+  1,
+  NULL,
+  '',
+  'NULL',
+  '(empty)',
+  'a	b',
+  'line1
+line2'
+);
+INSERT 0 1
+
+SELECT id, c_null, c_empty, c_literal_null, c_literal_empty, c_tab, c_newline
+FROM types_encoding_escape_case ORDER BY id;
+id	c_null	c_empty	c_literal_null	c_literal_empty	c_tab	c_newline
+1	NULL	(empty)	\NULL	\(empty)	a\tb	line1\nline2

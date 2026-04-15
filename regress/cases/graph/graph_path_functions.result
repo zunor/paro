@@ -1,0 +1,143 @@
+CREATE TABLE pf_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE pf_follows (src_id BIGINT, dst_id BIGINT, weight INT);
+CREATE TABLE
+
+INSERT INTO pf_person VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D'), (5, 'E');
+INSERT 0 5
+
+INSERT INTO pf_follows VALUES
+    (1, 2, 10),
+    (2, 3, 20),
+    (3, 4, 30),
+    (4, 5, 40),
+    (1, 3, 50),
+    (2, 4, 60);
+INSERT 0 6
+
+CREATE PROPERTY GRAPH pf_graph
+VERTEX TABLES (
+    pf_person LABEL Node
+)
+EDGE TABLES (
+    pf_follows
+        SOURCE KEY (src_id) REFERENCES pf_person (id)
+        DESTINATION KEY (dst_id) REFERENCES pf_person (id)
+        LABEL Follows
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+A	B	1
+A	C	1
+A	D	2
+A	E	3
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = (a:Node WHERE a.name = 'B')-[e:Follows]->{1,3}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+B	C	1
+B	D	1
+B	E	2
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->+(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+A	B	1
+A	C	1
+A	D	2
+A	E	3
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+A	B	1
+A	C	1
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'E')-[e:Follows]->{1,3}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ALL SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst, hops;
+gt.src	gt.dst	gt.hops
+A	B	1
+A	C	1
+A	D	2
+A	D	2
+A	E	3
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY hops, dst;
+gt.src	gt.dst	gt.hops
+A	B	1
+A	C	1
+A	D	2
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{2,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+A	D	2
+A	E	3
+
+SELECT dst, array_length(verts, 1) AS vertex_count, verts IS NULL AS is_null
+FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (b.name AS dst, vertices(p) AS verts)
+) gt;
+dst	vertex_count	is_null
+B	2	false
+C	2	false
+D	3	false
+
+SELECT dst, array_length(rels, 1) AS edge_count, rels IS NULL AS is_null
+FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (b.name AS dst, edges(p) AS rels)
+) gt;
+dst	edge_count	is_null
+B	1	false
+C	1	false
+D	2	false
+
+SELECT * FROM GRAPH_TABLE(pf_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (element_id(p) AS eid)
+) gt;
+ERROR: element_id() is only valid for vertex or edge variables, not for a path variable is not yet implemented (SQLSTATE=0A000; HINT=This feature may be added in a future release.)
+
+DROP PROPERTY GRAPH pf_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE pf_follows;
+DROP TABLE
+
+DROP TABLE pf_person;
+DROP TABLE

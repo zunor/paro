@@ -1,0 +1,51 @@
+COMMIT;
+COMMIT
+
+ROLLBACK;
+ROLLBACK
+
+BEGIN;
+BEGIN
+
+CREATE TABLE txn_finalization_explicit_ddl (id INT PRIMARY KEY, note VARCHAR);
+CREATE TABLE
+
+INSERT INTO txn_finalization_explicit_ddl VALUES (1, 'explicit-commit');
+INSERT 0 1
+
+COMMIT;
+COMMIT
+
+SELECT id, note
+FROM txn_finalization_explicit_ddl
+ORDER BY id;
+id	note
+1	explicit-commit
+
+BEGIN;
+BEGIN
+
+INSERT INTO txn_finalization_explicit_ddl VALUES (2, 'rolled-back');
+INSERT 0 1
+
+ROLLBACK;
+ROLLBACK
+
+SELECT id, note
+FROM txn_finalization_explicit_ddl
+ORDER BY id;
+id	note
+1	explicit-commit
+
+INSERT INTO txn_finalization_explicit_ddl VALUES (3, 'auto-commit');
+INSERT 0 1
+
+SELECT id, note
+FROM txn_finalization_explicit_ddl
+ORDER BY id;
+id	note
+1	explicit-commit
+3	auto-commit
+
+DROP TABLE txn_finalization_explicit_ddl;
+DROP TABLE

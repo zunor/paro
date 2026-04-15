@@ -1,0 +1,17 @@
+[package]
+name = "paro-context"
+version = { workspace = true }
+edition = { workspace = true }
+
+[features]
+test-support = []
+
+[dependencies]
+paro-common = { workspace = true }
+paro-storage = { workspace = true }
+paro-catalog = { workspace = true }
+paro-function = { workspace = true }
+paro-scheduler = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]

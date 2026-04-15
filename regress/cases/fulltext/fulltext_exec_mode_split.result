@@ -1,0 +1,59 @@
+CREATE TABLE ft_exec_mode_split (
+    id INT,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO ft_exec_mode_split VALUES
+    (1, 'vector database vector'),
+    (2, 'vector database'),
+    (3, 'database vector'),
+    (4, 'vector'),
+    (5, 'noise');
+INSERT 0 5
+
+CREATE INDEX idx_ft_exec_mode_split ON ft_exec_mode_split USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+EXPLAIN
+SELECT id
+FROM ft_exec_mode_split
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database');
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: id
+  ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=5)
+
+EXPLAIN
+SELECT id
+FROM ft_exec_mode_split
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(
+    to_tsvector('simple', content),
+    plainto_tsquery('simple', 'vector database')
+) DESC
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: id
+  ->  TOP_N  (rows=1)
+        Sort Key: TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector database')) DESC NULLS FIRST
+        Limit: 2
+        ->  PROJECTION  (rows=1)
+              Output: id, TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector database'))
+              ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=5)
+
+SELECT id
+FROM ft_exec_mode_split
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY id;
+id
+1
+2
+3
+
+DROP INDEX IF EXISTS idx_ft_exec_mode_split;
+DROP INDEX
+
+DROP TABLE ft_exec_mode_split;
+DROP TABLE

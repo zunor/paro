@@ -1,0 +1,28 @@
+[meta]
+name = "vector"
+description = "Vector TopK search"
+
+[params]
+rows = 1000
+dim = 3
+categories = 10
+k = 10
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "topk_l2"
+file = "sql/q_topk_l2.sql"
+validate = "ordered_rows"
+expected = [[100], [200], [300], [400], [500], [600], [700], [800], [900], [1000]]
+
+[[query]]
+id = "topk_l2_filtered"
+file = "sql/q_topk_l2_filtered.sql"
+validate = "row_count"
+expected = 10

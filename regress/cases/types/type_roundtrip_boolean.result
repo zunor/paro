@@ -1,0 +1,20 @@
+CREATE TABLE type_roundtrip_boolean (
+  id INT,
+  b BOOLEAN
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_boolean VALUES
+  (1, true),
+  (2, false),
+  (3, NULL);
+INSERT 0 3
+
+-- @query rowsort
+SELECT id, b
+FROM type_roundtrip_boolean
+ORDER BY id;
+id	b
+1	true
+2	false
+3	NULL

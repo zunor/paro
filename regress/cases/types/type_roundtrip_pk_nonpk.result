@@ -1,0 +1,58 @@
+DROP TABLE IF EXISTS type_roundtrip_nonpk;
+DROP TABLE
+
+CREATE TABLE type_roundtrip_pk (
+  id INT PRIMARY KEY,
+  b BOOLEAN,
+  i INT,
+  u UINT,
+  f FLOAT,
+  d DOUBLE,
+  v VARCHAR,
+  dt DATE,
+  ts TIMESTAMP
+);
+CREATE TABLE
+
+CREATE TABLE type_roundtrip_nonpk (
+  id INT,
+  b BOOLEAN,
+  i INT,
+  u UINT,
+  f FLOAT,
+  d DOUBLE,
+  v VARCHAR,
+  dt DATE,
+  ts TIMESTAMP
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_pk VALUES
+  (1, true, 42, 4000000000, 1.5, 2.25, 'alpha', '2024-01-01', '2024-01-01 12:00:00'),
+  (2, false, -7, 0, 0, -3.5, '', '1970-01-01', '1970-01-01 00:00:00'),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT 0 3
+
+INSERT INTO type_roundtrip_nonpk VALUES
+  (1, true, 42, 4000000000, 1.5, 2.25, 'alpha', '2024-01-01', '2024-01-01 12:00:00'),
+  (2, false, -7, 0, 0, -3.5, '', '1970-01-01', '1970-01-01 00:00:00'),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT 0 3
+
+-- @query approx(0.0001)
+SELECT 'pk' AS path, id, b, i, u, f, d, v, dt, ts
+FROM type_roundtrip_pk
+UNION ALL
+SELECT 'nonpk' AS path, id, b, i, u, f, d, v, dt, ts
+FROM type_roundtrip_nonpk
+ORDER BY path, id;
+path	id	b	i	u	f	d	v	dt	ts
+pk	1	true	42	4000000000	1.500000	2.250000	alpha	2024-01-01 00:00:00	2024-01-01 12:00:00
+pk	2	false	-7	0	0.000000	-3.500000	(empty)	1970-01-01 00:00:00	1970-01-01 00:00:00
+pk	3	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+nonpk	1	true	42	4000000000	1.500000	2.250000	alpha	2024-01-01 00:00:00	2024-01-01 12:00:00
+nonpk	2	false	-7	0	0.000000	-3.500000	(empty)	1970-01-01 00:00:00	1970-01-01 00:00:00
+nonpk	3	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+DROP TABLE IF EXISTS type_roundtrip_nonpk;
+DROP TABLE

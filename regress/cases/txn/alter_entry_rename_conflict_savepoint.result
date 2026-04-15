@@ -1,0 +1,51 @@
+DROP TABLE IF EXISTS alter_regress_conflict_a_v2;
+DROP TABLE
+
+DROP TABLE IF EXISTS alter_regress_conflict_b;
+DROP TABLE
+
+DROP TABLE IF EXISTS alter_regress_conflict_a;
+DROP TABLE
+
+CREATE TABLE alter_regress_conflict_a (
+    id BIGINT PRIMARY KEY,
+    v BIGINT
+);
+CREATE TABLE
+
+CREATE TABLE alter_regress_conflict_b (
+    id BIGINT PRIMARY KEY,
+    v BIGINT
+);
+CREATE TABLE
+
+INSERT INTO alter_regress_conflict_a VALUES (1, 10);
+INSERT 0 1
+
+BEGIN;
+BEGIN
+
+SAVEPOINT before_conflict;
+SAVEPOINT
+
+RENAME TABLE alter_regress_conflict_a TO alter_regress_conflict_b;
+ERROR: Could not rename "alter_regress_conflict_a" to "alter_regress_conflict_b": another entry with this name already exists! (SQLSTATE=XX000)
+
+ROLLBACK TO SAVEPOINT before_conflict;
+ERROR: savepoint "before_conflict" does not exist (SQLSTATE=25000)
+
+RENAME TABLE alter_regress_conflict_a TO alter_regress_conflict_a_v2;
+ALTER TABLE
+
+COMMIT;
+COMMIT
+
+SELECT COUNT(*) FROM alter_regress_conflict_a_v2;
+COUNT(*)
+1
+
+DROP TABLE alter_regress_conflict_a_v2;
+DROP TABLE
+
+DROP TABLE alter_regress_conflict_b;
+DROP TABLE

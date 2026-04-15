@@ -1,0 +1,18 @@
+CREATE TABLE integer_types_test (
+    t TINYINT,
+    s SMALLINT,
+    i INT,
+    b BIGINT,
+    f FLOAT,
+    d DOUBLE,
+    PRIMARY KEY (t)
+);
+CREATE TABLE
+
+INSERT INTO integer_types_test VALUES (1, 10, 100, 1000, 1.1, 2.2);
+INSERT 0 1
+
+-- @query rowsort
+SELECT * FROM integer_types_test;
+integer_types_test.t	integer_types_test.s	integer_types_test.i	integer_types_test.b	integer_types_test.f	integer_types_test.d
+1	10	100	1000	1.100000	2.200000

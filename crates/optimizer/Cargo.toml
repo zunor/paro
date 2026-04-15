@@ -1,0 +1,35 @@
+[package]
+name = "paro-optimizer"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+empty-line-after-doc-comments = "allow"
+int-plus-one = "allow"
+redundant-closure = "allow"
+replace-box = "allow"
+new-without-default = "allow"
+let-and-return = "allow"
+iter-with-drain = "allow"
+field-reassign-with-default = "allow"
+unused-enumerate-index = "allow"
+ptr-arg = "allow"
+question-mark = "allow"
+cloned-ref-to-slice-refs = "allow"
+inherent-to-string = "allow"
+needless-range-loop = "allow"
+collapsible-if = "allow"
+module-inception = "allow"
+single-match = "allow"
+match-like-matches-macro = "allow"
+needless-lifetimes = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-catalog = { workspace = true }
+paro-context = { workspace = true, features = ["test-support"] }
+paro-function = { workspace = true }
+paro-parser = { workspace = true }
+paro-planner = { workspace = true }
+paro-storage = { workspace = true }
+tracing = { workspace = true }

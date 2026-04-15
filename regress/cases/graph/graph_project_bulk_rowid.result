@@ -1,0 +1,191 @@
+CREATE TABLE gp_person (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR,
+    age INT,
+    city VARCHAR
+);
+CREATE TABLE
+
+CREATE TABLE gp_org (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR,
+    founded INT
+);
+CREATE TABLE
+
+CREATE TABLE gp_friend (
+    src_id BIGINT,
+    dst_id BIGINT,
+    since INT,
+    strength INT
+);
+CREATE TABLE
+
+CREATE TABLE gp_member (
+    person_id BIGINT,
+    org_id BIGINT,
+    role VARCHAR,
+    years INT
+);
+CREATE TABLE
+
+INSERT INTO gp_person VALUES
+    (1, 'Alice',   30, 'NYC'),
+    (2, 'Bob',     25, 'SF'),
+    (3, 'Charlie', 35, 'LA'),
+    (4, 'Diana',   28, 'NYC'),
+    (5, 'Eve',     40, NULL);
+INSERT 0 5
+
+INSERT INTO gp_org VALUES
+    (10, 'AlphaCo', 2000),
+    (20, 'BetaInc', 2015);
+INSERT 0 2
+
+INSERT INTO gp_friend VALUES
+    (1, 2, 2020, 9),
+    (1, 3, 2019, 7),
+    (2, 4, 2021, 8),
+    (3, 5, 2022, 5),
+    (4, 1, 2023, 6);
+INSERT 0 5
+
+INSERT INTO gp_member VALUES
+    (1, 10, 'Engineer', 5),
+    (2, 20, 'Manager',  3),
+    (3, 10, 'Designer', 7),
+    (4, 20, 'Analyst',  2),
+    (5, 10, 'CTO',      10);
+INSERT 0 5
+
+CREATE PROPERTY GRAPH gp_graph
+VERTEX TABLES (
+    gp_person LABEL Person,
+    gp_org    LABEL Org
+)
+EDGE TABLES (
+    gp_friend
+        SOURCE KEY (src_id) REFERENCES gp_person (id)
+        DESTINATION KEY (dst_id) REFERENCES gp_person (id)
+        LABEL Friend,
+    gp_member
+        SOURCE KEY (person_id) REFERENCES gp_person (id)
+        DESTINATION KEY (org_id) REFERENCES gp_org (id)
+        LABEL MemberOf
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[f:Friend]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+Alice	Bob
+Alice	Charlie
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[f:Friend]->(b:Person)
+    COLUMNS (a.name AS src, a.age AS src_age, b.name AS dst, b.age AS dst_age, b.city AS dst_city)
+) gt
+ORDER BY dst;
+gt.src	gt.src_age	gt.dst	gt.dst_age	gt.dst_city
+Alice	30	Bob	25	SF
+Alice	30	Charlie	35	LA
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person)-[f:Friend]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, f.since AS since, f.strength AS strength)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.since	gt.strength
+Alice	Bob	2020	9
+Alice	Charlie	2019	7
+Bob	Diana	2021	8
+Charlie	Eve	2022	5
+Diana	Alice	2023	6
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (p:Person)-[m:MemberOf]->(o:Org)
+    COLUMNS (p.name AS person, p.age AS age, o.name AS org, o.founded AS founded, m.role AS role, m.years AS years)
+) gt
+ORDER BY person;
+gt.person	gt.age	gt.org	gt.founded	gt.role	gt.years
+Alice	30	AlphaCo	2000	Engineer	5
+Bob	25	BetaInc	2015	Manager	3
+Charlie	35	AlphaCo	2000	Designer	7
+Diana	28	BetaInc	2015	Analyst	2
+Eve	40	AlphaCo	2000	CTO	10
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person)-[f:Friend]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.city AS dst_city)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.dst_city
+Alice	Bob	SF
+Alice	Charlie	LA
+Bob	Diana	NYC
+Charlie	Eve	NULL
+Diana	Alice	NYC
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[f:Friend]->{1,2}(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Bob	25
+Alice	Charlie	35
+Alice	Diana	28
+Alice	Eve	40
+
+SELECT src, count(*) AS cnt, sum(dst_age) AS total_age
+FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person)-[f:Friend]->(b:Person)
+    COLUMNS (a.name AS src, b.age AS dst_age)
+) gt
+GROUP BY src
+ORDER BY src;
+src	cnt	total_age
+Alice	2	60
+Bob	1	28
+Charlie	1	40
+Diana	1	30
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH (a:Person)-[f:Friend]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, f.strength AS strength)
+) gt
+WHERE gt.strength >= 7
+ORDER BY src, dst;
+gt.src	gt.dst	gt.strength
+Alice	Bob	9
+Alice	Charlie	7
+Bob	Diana	8
+
+SELECT * FROM GRAPH_TABLE(gp_graph
+    MATCH ANY SHORTEST (a:Person WHERE a.name = 'Alice')-[f:Friend]->{1,3}(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.city AS dst_city)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_city
+Alice	Bob	SF
+Alice	Charlie	LA
+Alice	Diana	NYC
+Alice	Eve	NULL
+
+DROP PROPERTY GRAPH gp_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE gp_member;
+DROP TABLE
+
+DROP TABLE gp_friend;
+DROP TABLE
+
+DROP TABLE gp_org;
+DROP TABLE
+
+DROP TABLE gp_person;
+DROP TABLE

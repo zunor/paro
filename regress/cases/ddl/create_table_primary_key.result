@@ -1,0 +1,16 @@
+CREATE TABLE pk_test (
+    id INT PRIMARY KEY,
+    name TEXT
+);
+CREATE TABLE
+
+INSERT INTO pk_test VALUES (1, 'alice'), (2, 'bob');
+INSERT 0 2
+
+SELECT * FROM pk_test ORDER BY id;
+pk_test.id	pk_test.name
+1	alice
+2	bob
+
+DROP TABLE pk_test;
+DROP TABLE

@@ -1,0 +1,82 @@
+DROP PROPERTY GRAPH IF EXISTS gt_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE IF EXISTS gt_edge;
+DROP TABLE
+
+DROP TABLE IF EXISTS gt_person;
+DROP TABLE
+
+CREATE TABLE gt_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE gt_edge (src_id BIGINT, dst_id BIGINT);
+CREATE TABLE
+
+INSERT INTO gt_person
+SELECT i, 'P' || i::VARCHAR
+FROM generate_series(1, 5000) AS t(i);
+INSERT 0 5000
+
+INSERT INTO gt_edge
+SELECT i, i FROM generate_series(1, 5000) AS t(i);
+INSERT 0 5000
+
+INSERT INTO gt_edge
+SELECT 1, i FROM generate_series(1, 5000) AS t(i);
+INSERT 0 5000
+
+CREATE PROPERTY GRAPH gt_graph
+VERTEX TABLES (
+    gt_person LABEL Person
+)
+EDGE TABLES (
+    gt_edge
+        SOURCE KEY (src_id) REFERENCES gt_person (id)
+        DESTINATION KEY (dst_id) REFERENCES gt_person (id)
+        LABEL Link
+);
+CREATE PROPERTY GRAPH
+
+SET threads = 1;
+SET
+
+SELECT count(*) AS total,
+       count(DISTINCT src) AS distinct_src,
+       count(DISTINCT dst) AS distinct_dst,
+       min(src) AS min_src,
+       max(src) AS max_src,
+       min(dst) AS min_dst,
+       max(dst) AS max_dst
+FROM GRAPH_TABLE(gt_graph
+    MATCH (a:Person)-[e:Link]->(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst)
+) gt;
+total	distinct_src	distinct_dst	min_src	max_src	min_dst	max_dst
+10000	5000	5000	1	5000	1	5000
+
+SET threads = 4;
+SET
+
+SELECT count(*) AS total,
+       count(DISTINCT src) AS distinct_src,
+       count(DISTINCT dst) AS distinct_dst,
+       min(src) AS min_src,
+       max(src) AS max_src,
+       min(dst) AS min_dst,
+       max(dst) AS max_dst
+FROM GRAPH_TABLE(gt_graph
+    MATCH (a:Person)-[e:Link]->(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst)
+) gt;
+total	distinct_src	distinct_dst	min_src	max_src	min_dst	max_dst
+10000	5000	5000	1	5000	1	5000
+
+DROP PROPERTY GRAPH gt_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE gt_edge;
+DROP TABLE
+
+DROP TABLE gt_person;
+DROP TABLE

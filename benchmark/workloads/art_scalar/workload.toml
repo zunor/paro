@@ -1,0 +1,28 @@
+[meta]
+name = "art_scalar"
+description = "Single-column ART point and range lookups"
+
+[params]
+rows = 20000
+point_key = 12000
+range_start = 12000
+range_end = 12999
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "point_lookup"
+file = "sql/q_point_lookup.sql"
+validate = "ordered_rows"
+expected = [[120000]]
+
+[[query]]
+id = "range_count"
+file = "sql/q_range_count.sql"
+validate = "scalar_equals"
+expected = 1000

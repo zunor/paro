@@ -1,0 +1,87 @@
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+SEMI JOIN join_semi_right AS r ON l.id = r.id;
+l.id	l.grp	l.amount	l.tag
+1	10	50	l1
+2	10	75	l2
+3	20	60	l3
+3	20	65	l3_dup
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+ANTI JOIN join_semi_right AS r ON l.id = r.id;
+l.id	l.grp	l.amount	l.tag
+4	20	90	l4
+5	30	100	l5
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+SEMI JOIN (
+  SELECT id
+  FROM join_semi_right
+  WHERE budget >= 1500
+) AS r ON l.id = r.id;
+l.id	l.grp	l.amount	l.tag
+3	20	60	l3
+3	20	65	l3_dup
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+ANTI JOIN join_semi_right AS r
+  ON l.id = r.id AND l.amount + r.budget > 1100;
+l.id	l.grp	l.amount	l.tag
+1	10	50	l1
+2	10	75	l2
+4	20	90	l4
+5	30	100	l5
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+SEMI JOIN join_semi_empty_right AS r ON l.id = r.id;
+l.id	l.grp	l.amount	l.tag
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+ANTI JOIN join_semi_empty_right AS r ON l.id = r.id;
+l.id	l.grp	l.amount	l.tag
+1	10	50	l1
+2	10	75	l2
+3	20	60	l3
+3	20	65	l3_dup
+4	20	90	l4
+5	30	100	l5
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+ANTI JOIN join_semi_cover_right AS r ON l.id = r.id;
+l.id	l.grp	l.amount	l.tag
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+RIGHT SEMI JOIN join_semi_right AS r ON l.id = r.id;
+r.id	r.grp	r.budget	r.flag
+1	10	1000	r1
+2	10	900	r2
+3	20	1500	r3
+3	20	1600	r3_dup
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+RIGHT ANTI JOIN join_semi_right AS r ON l.id = r.id;
+r.id	r.grp	r.budget	r.flag
+6	30	500	r6
+
+-- @query rowsort
+SELECT *
+FROM join_semi_left AS l
+RIGHT ANTI JOIN join_semi_cover_right_full AS r ON l.id = r.id;
+r.id	r.grp	r.budget	r.flag

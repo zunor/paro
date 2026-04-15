@@ -1,0 +1,96 @@
+SELECT
+  CAST(true AS INTEGER) AS bool_to_int_true,
+  CAST(false AS INTEGER) AS bool_to_int_false,
+  CAST(1 AS BOOLEAN) AS int_to_bool_true,
+  CAST(0 AS BOOLEAN) AS int_to_bool_false;
+bool_to_int_true	bool_to_int_false	int_to_bool_true	int_to_bool_false
+1	0	true	false
+
+SELECT CAST('2024-01-31' AS DATE) AS d;
+d
+2024-01-31 00:00:00
+
+SELECT CAST('2024-01-31 09:10:11.123456' AS TIMESTAMP) AS ts;
+ts
+2024-01-31 09:10:11
+
+SELECT CAST('09:10:11.123456' AS TIME) AS t;
+t
+09:10:11.123456
+
+SELECT
+  CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID) AS u,
+  CAST(CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID) AS VARCHAR) AS u_text;
+u	u_text
+550e8400-e29b-41d4-a716-446655440000	550e8400-e29b-41d4-a716-446655440000
+
+SELECT
+  CAST('{"a":1,"b":[true,false,null]}' AS JSON) AS j,
+  CAST('{"a":1,"b":[true,false,null]}' AS JSONB) AS jb;
+j	jb
+{'a': 1, 'b': [True, False, None]}	{'a': 1, 'b': [True, False, None]}
+
+SELECT
+  CAST(CAST('{"a":1,"b":[true,false,null]}' AS JSON) AS VARCHAR) AS j_text,
+  CAST(CAST('{"a":1,"b":[true,false,null]}' AS JSONB) AS VARCHAR) AS jb_text;
+j_text	jb_text
+{"a":1,"b":[true,false,null]}	{"a":1,"b":[true,false,null]}
+
+SELECT
+  TRY_CAST('{"a":1}' AS JSON) IS NULL AS json_valid_is_null,
+  TRY_CAST('{bad json' AS JSON) IS NULL AS json_invalid_is_null,
+  TRY_CAST('{"a":1}' AS JSONB) IS NULL AS jsonb_valid_is_null,
+  TRY_CAST('{bad json' AS JSONB) IS NULL AS jsonb_invalid_is_null;
+json_valid_is_null	json_invalid_is_null	jsonb_valid_is_null	jsonb_invalid_is_null
+false	true	false	true
+
+SELECT
+  CAST(123 AS DECIMAL(5,2)) AS int_to_dec,
+  CAST(-7 AS DECIMAL(4,1)) AS int_to_dec_neg;
+int_to_dec	int_to_dec_neg
+123.00	-7.0
+
+SELECT
+  CAST('123.40' AS DECIMAL(6,2)) AS str_to_dec,
+  CAST('-0.50' AS DECIMAL(4,2)) AS str_to_dec_neg;
+str_to_dec	str_to_dec_neg
+123.40	-0.50
+
+SELECT
+  CAST(1.25 AS DECIMAL(4,2)) AS float_to_dec,
+  CAST(12.0 AS DECIMAL(4,0)) AS float_to_dec_scale0;
+float_to_dec	float_to_dec_scale0
+1.25	12
+
+SELECT
+  CAST(CAST('123.00' AS DECIMAL(6,2)) AS INTEGER) AS dec_to_int,
+  CAST(CAST('456.00' AS DECIMAL(6,2)) AS BIGINT) AS dec_to_bigint;
+dec_to_int	dec_to_bigint
+123	456
+
+SELECT
+  CAST(CAST('12.5' AS DECIMAL(4,1)) AS DOUBLE) AS dec_to_double;
+dec_to_double
+12.500000
+
+SELECT
+  TRY_CAST('not-a-number' AS DECIMAL(6,2)) IS NULL AS dec_invalid_is_null;
+dec_invalid_is_null
+true
+
+SELECT
+  CAST(CAST('1.235' AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS dec_scale_down_round,
+  CAST(CAST('1.2' AS DECIMAL(4,1)) AS DECIMAL(6,3)) AS dec_scale_up;
+dec_scale_down_round	dec_scale_up
+1.24	1.200
+
+SELECT
+  CAST(CAST('12.5' AS DECIMAL(4,1)) AS INTEGER) AS dec_round_to_int,
+  CAST(CAST('-12.5' AS DECIMAL(4,1)) AS INTEGER) AS dec_round_to_int_neg;
+dec_round_to_int	dec_round_to_int_neg
+13	-13
+
+SELECT
+  TRY_CAST('10000' AS DECIMAL(4,0)) IS NULL AS dec_overflow_is_null;
+dec_overflow_is_null
+true

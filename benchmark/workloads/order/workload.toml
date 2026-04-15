@@ -1,0 +1,47 @@
+[meta]
+name = "order"
+description = "ORDER BY and TopN benchmarks covering in-memory sort, variable keys, and fallback plans"
+
+[params]
+numeric_rows = 12000
+payload_rows = 5000
+string_rows = 4000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "in_memory_numeric"
+file = "sql/q_in_memory_numeric.sql"
+validate = "row_count"
+expected = 12000
+plan_contains = ["ORDER_BY"]
+
+[[query]]
+id = "multi_column_payload"
+file = "sql/q_multi_column_payload.sql"
+validate = "ordered_rows"
+expected = [[90002], [90001], [90003], [90004], [90005], [90006], [90007], [90008], [90009], [90010], [90011], [90012]]
+plan_contains = ["TOP_N"]
+
+[[query]]
+id = "variable_key"
+file = "sql/q_variable_key.sql"
+validate = "ordered_rows"
+expected = [[91001], [91002], [91003], [91004], [91005], [91006], [91007]]
+plan_contains = ["TOP_N"]
+
+[[query]]
+id = "topn_small"
+file = "sql/q_topn_small.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3], [4], [5], [6], [7], [8]]
+plan_contains = ["TOP_N"]
+
+[[query]]
+id = "topn_large_fallback"
+file = "sql/q_topn_large_fallback.sql"
+validate = "ordered_rows"
+expected = [[6001], [6002], [6003], [6004], [6005]]
+plan_contains = ["STREAMING_LIMIT", "ORDER_BY"]

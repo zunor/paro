@@ -1,0 +1,92 @@
+[package]
+name = "paro-execution"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+too-many-arguments = "allow"
+useless-vec = "allow"
+needless-range-loop = "allow"
+type-complexity = "allow"
+large-enum-variant = "allow"
+redundant-closure = "allow"
+unnecessary-map-or = "allow"
+manual-range-contains = "allow"
+single-match = "allow"
+collapsible-if = "allow"
+needless-borrow = "allow"
+let-and-return = "allow"
+unnecessary-cast = "allow"
+useless-conversion = "allow"
+manual-unwrap-or = "allow"
+manual-flatten = "allow"
+unwrap-or-default = "allow"
+derivable-impls = "allow"
+items-after-test-module = "allow"
+get-first = "allow"
+default-constructed-unit-structs = "allow"
+module-inception = "allow"
+bool-assert-comparison = "allow"
+manual-div-ceil = "allow"
+new-without-default = "allow"
+new-ret-no-self = "allow"
+needless-lifetimes = "allow"
+unnecessary-to-owned = "allow"
+manual-clamp = "allow"
+unnecessary-unwrap = "allow"
+empty-line-after-doc-comments = "allow"
+int-plus-one = "allow"
+not-unsafe-ptr-arg-deref = "allow"
+manual-is-multiple-of = "allow"
+len-without-is-empty = "allow"
+redundant-pattern-matching = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-storage = { workspace = true }
+paro-function = { workspace = true }
+paro-catalog = { workspace = true }
+paro-context = { workspace = true, features = ["test-support"] }
+paro-scheduler = { workspace = true }
+paro-parser = { version = "0.1.0", path = "../parser" }
+paro-planner = { version = "0.1.0", path = "../planner" }
+paro-optimizer = { version = "0.1.0", path = "../optimizer" }
+tracing = { workspace = true }
+parking_lot = "0.12"
+num_cpus = "1.16"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+name = "expression_executor_cache"
+harness = false
+
+[[bench]]
+name = "join_executor_cache"
+harness = false
+
+[[bench]]
+name = "vector_view"
+harness = false
+
+[[bench]]
+name = "scalar_bind_specialization"
+harness = false
+
+[[bench]]
+name = "fixed_width_executor"
+harness = false
+
+[[bench]]
+name = "varlen_dispatch"
+harness = false
+
+[[bench]]
+name = "storage_dictionary_cache"
+harness = false
+
+[[bench]]
+name = "complex_type_dispatch"
+harness = false

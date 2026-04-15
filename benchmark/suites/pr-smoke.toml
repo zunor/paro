@@ -1,0 +1,18 @@
+name = "pr-smoke"
+description = "Fast benchmark validation for pull requests"
+
+[[include]]
+workload = "agg"
+queries = ["count_star"]
+
+[[include]]
+workload = "vector"
+queries = ["topk_l2"]
+
+[[include]]
+workload = "graph"
+queries = ["1_hop"]
+
+[[include]]
+workload = "fulltext_pg"
+queries = ["plain_match"]

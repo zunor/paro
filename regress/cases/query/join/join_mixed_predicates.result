@@ -1,0 +1,82 @@
+SELECT l.id, l.ts AS left_ts, l.payload, r.ts AS right_ts, r.tag
+FROM join_mixed_left AS l
+JOIN join_mixed_right AS r ON l.id = r.id AND l.ts < r.ts
+ORDER BY l.id, left_ts, right_ts;
+l.id	left_ts	l.payload	right_ts	r.tag
+1	10	l1_10	12	r1_12
+1	10	l1_10	18	r1_18
+1	10	l1_10	30	r1_30
+1	20	l1_20	30	r1_30
+2	15	l2_15	20	r2_20
+2	15	l2_15	28	r2_28
+2	25	l2_25	28	r2_28
+3	30	l3_30	35	r3_35
+
+SELECT l.id, l.ts AS left_ts, COUNT(*) AS match_count
+FROM join_mixed_left AS l
+JOIN join_mixed_right AS r ON l.id = r.id AND l.ts < r.ts
+GROUP BY l.id, left_ts
+ORDER BY l.id, left_ts;
+l.id	left_ts	match_count
+1	10	3
+1	20	1
+2	15	2
+2	25	1
+3	30	1
+
+SELECT l.id, l.payload, l.amount, r.tag, r.budget
+FROM join_mixed_left AS l
+JOIN join_mixed_right AS r
+  ON l.id = r.id
+ AND l.ts < r.ts
+ AND l.amount < r.budget
+ORDER BY l.id, l.payload, r.tag;
+l.id	l.payload	l.amount	r.tag	r.budget
+1	l1_10	50	r1_12	100
+1	l1_10	50	r1_30	90
+1	l1_20	70	r1_30	90
+2	l2_15	40	r2_28	60
+3	l3_30	60	r3_35	70
+
+SELECT l.id, l.ts AS left_ts, l.amount, r.ts AS right_ts, r.budget
+FROM join_mixed_left AS l
+JOIN join_mixed_right AS r
+  ON l.id = r.id
+ AND l.ts < r.ts
+ AND l.amount < r.budget
+ AND l.grp + r.grp >= 3
+ORDER BY l.id, left_ts, right_ts;
+l.id	left_ts	l.amount	right_ts	r.budget
+1	20	70	30	90
+2	15	40	28	60
+3	30	60	35	70
+
+SELECT l.id, l.payload, r.tag
+FROM (
+  SELECT id, ts, amount, grp, payload
+  FROM join_mixed_left
+  WHERE id <= 3 AND amount >= 50
+) AS l
+JOIN (
+  SELECT id, ts, budget, grp, tag
+  FROM join_mixed_right
+  WHERE id <= 3 AND budget >= 60
+) AS r
+  ON l.id = r.id
+ AND l.ts < r.ts
+ AND l.amount < r.budget
+ORDER BY l.id, l.payload, r.tag;
+l.id	l.payload	r.tag
+1	l1_10	r1_12
+1	l1_10	r1_30
+1	l1_20	r1_30
+3	l3_30	r3_35
+
+SELECT COUNT(*) AS zero_after_residual
+FROM join_mixed_left AS l
+JOIN join_mixed_right AS r
+  ON l.id = r.id
+ AND l.ts < r.ts
+ AND l.amount > r.budget + 100;
+zero_after_residual
+0

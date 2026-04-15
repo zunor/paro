@@ -1,0 +1,15 @@
+[package]
+name = "paro-catalog"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+unwrap-or-default = "allow"
+needless-range-loop = "allow"
+should-implement-trait = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-parser = { workspace = true }
+paro-storage = { workspace = true }
+paro-function = { workspace = true }

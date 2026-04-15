@@ -1,0 +1,19 @@
+[meta]
+name = "fulltext_native"
+description = "Native fulltext_match + bm25 path"
+
+[params]
+rows = 20000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "bm25_match"
+file = "sql/q_bm25_match.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3]]

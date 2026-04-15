@@ -1,0 +1,18 @@
+INSERT INTO dml_insert_primary_key_bulk_case
+SELECT i, i * 10
+FROM generate_series(1, 100000) AS t(i);
+INSERT 0 100000
+
+SELECT COUNT(*), MIN(id), MAX(id)
+FROM dml_insert_primary_key_bulk_case;
+COUNT(*)	MIN(id)	MAX(id)
+100000	1	100000
+
+SELECT id, v
+FROM dml_insert_primary_key_bulk_case
+WHERE id IN (1, 50000, 100000)
+ORDER BY id;
+id	v
+1	10
+50000	500000
+100000	1000000

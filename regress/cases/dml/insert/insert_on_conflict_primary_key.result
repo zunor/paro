@@ -1,0 +1,36 @@
+INSERT INTO dml_insert_on_conflict_pk_case VALUES (1, 10, 100), (2, 20, 200);
+INSERT 0 2
+
+INSERT INTO dml_insert_on_conflict_pk_case VALUES (2, 999, 999), (3, 30, 300)
+ON CONFLICT (id) DO NOTHING;
+INSERT 0 1
+
+-- @query rowsort
+SELECT id, price, stock FROM dml_insert_on_conflict_pk_case;
+id	price	stock
+1	10	100
+2	20	200
+3	30	300
+
+INSERT INTO dml_insert_on_conflict_pk_case VALUES (2, 25, 250), (4, 40, 400)
+ON CONFLICT (id) DO UPDATE SET stock = EXCLUDED.stock;
+INSERT 0 2
+
+-- @query rowsort
+SELECT id, price, stock FROM dml_insert_on_conflict_pk_case;
+id	price	stock
+1	10	100
+2	20	250
+3	30	300
+4	40	400
+
+UPDATE dml_insert_on_conflict_pk_case SET stock = 251 WHERE id = 2;
+UPDATE 1
+
+-- @query rowsort
+SELECT id, price, stock FROM dml_insert_on_conflict_pk_case;
+id	price	stock
+1	10	100
+2	20	251
+3	30	300
+4	40	400

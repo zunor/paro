@@ -1,0 +1,24 @@
+INSERT INTO dml_update_basic_case VALUES (1, 'apple', 10), (2, 'banana', 20);
+INSERT 0 2
+
+UPDATE dml_update_basic_case SET price = 15 WHERE id = 1;
+UPDATE 1
+
+SELECT id, name, price FROM dml_update_basic_case WHERE id = 1;
+id	name	price
+1	apple	15
+
+UPDATE dml_update_basic_case SET name = 'cherry', price = 30 WHERE id = 2;
+UPDATE 1
+
+SELECT id, name, price FROM dml_update_basic_case WHERE id = 2;
+id	name	price
+2	cherry	30
+
+UPDATE dml_update_basic_case SET price = price + 1;
+UPDATE 2
+
+SELECT id, name, price FROM dml_update_basic_case ORDER BY id;
+id	name	price
+1	apple	16
+2	cherry	31

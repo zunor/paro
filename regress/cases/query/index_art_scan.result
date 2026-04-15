@@ -1,0 +1,54 @@
+DROP INDEX IF EXISTS idx_art_metrics_metric_key;
+DROP INDEX
+
+DROP TABLE IF EXISTS art_metrics;
+DROP TABLE
+
+CREATE TABLE art_metrics (
+    id INT PRIMARY KEY,
+    metric_key INT,
+    metric_value INT
+);
+CREATE TABLE
+
+INSERT INTO art_metrics
+SELECT i, i * 10, i * 100
+FROM generate_series(1, 12) AS t(i);
+INSERT 0 12
+
+CREATE INDEX idx_art_metrics_metric_key ON art_metrics (metric_key);
+CREATE INDEX
+
+SELECT metric_value
+FROM art_metrics
+WHERE metric_key = 70;
+metric_value
+700
+
+SELECT id
+FROM art_metrics
+WHERE metric_key BETWEEN 40 AND 90
+ORDER BY id;
+id
+4
+5
+6
+7
+8
+9
+
+SELECT COUNT(*)
+FROM art_metrics
+WHERE metric_key >= 100;
+COUNT(*)
+3
+
+SELECT index_name, build_state
+FROM paro_indexes()
+WHERE table_name = 'art_metrics'
+ORDER BY index_name;
+index_name	build_state
+idx_art_metrics_metric_key	READY
+
+DROP TABLE art_metrics;
+DROP TABLE

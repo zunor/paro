@@ -1,0 +1,67 @@
+CREATE TABLE agg_u_t (
+    id INT,
+    x INT,
+    y INT,
+    label VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO agg_u_t VALUES
+    (1, 1, 10, 'a'),
+    (2, 2, 20, 'b'),
+    (3, 2, 30, 'c'),
+    (4, 4, NULL, 'd'),
+    (5, NULL, 50, 'e');
+INSERT 0 5
+
+SELECT
+    count(*) AS cnt_star,
+    count(x) AS cnt_x,
+    sum(x) AS sum_x,
+    avg(x) AS avg_x,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_u_t;
+cnt_star	cnt_x	sum_x	avg_x	min_x	max_x
+5	4	9	2.250000	1	4
+
+SELECT
+    min(y) AS min_y,
+    max(y) AS max_y,
+    sum(y) AS sum_y,
+    avg(y) AS avg_y
+FROM agg_u_t;
+min_y	max_y	sum_y	avg_y
+10	50	110	27.500000
+
+EXPLAIN SELECT
+    count(*) AS cnt_star,
+    sum(x) AS sum_x
+FROM (
+    VALUES (1),
+           (2),
+           (3),
+           (NULL)
+) AS agg_u_values(x);
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: count_star, sum
+  ->  UNGROUPED_AGGREGATE  (rows=1)
+        Aggregates: COUNT_STAR(*), SUM(col0)
+        ->  PROJECTION
+              Output: col0
+              ->  PROJECTION  (rows=4)
+                    Output: col0
+                    ->  EXPRESSION_SCAN  (rows=4)
+
+SELECT
+    count(*) AS cnt_star,
+    sum(x) AS sum_x
+FROM (
+    VALUES (1),
+           (2),
+           (3),
+           (NULL)
+) AS agg_u_values(x);
+cnt_star	sum_x
+4	6

@@ -1,0 +1,31 @@
+INSERT INTO dml_delete_primary_key_case VALUES
+  (1, 10, 'a'),
+  (2, 20, 'b'),
+  (3, 30, 'c');
+INSERT 0 3
+
+DELETE FROM dml_delete_primary_key_case WHERE id = 2;
+DELETE 1
+
+-- @query rowsort
+SELECT id, score, note FROM dml_delete_primary_key_case;
+id	score	note
+1	10	a
+3	30	c
+
+INSERT INTO dml_delete_primary_key_case VALUES (2, 222, 'reinserted');
+INSERT 0 1
+
+-- @query rowsort
+SELECT id, score, note FROM dml_delete_primary_key_case;
+id	score	note
+1	10	a
+2	222	reinserted
+3	30	c
+
+DELETE FROM dml_delete_primary_key_case;
+DELETE 3
+
+-- @query rowsort
+SELECT id, score, note FROM dml_delete_primary_key_case;
+id	score	note

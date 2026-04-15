@@ -1,0 +1,22 @@
+CREATE TABLE type_roundtrip_vector (
+  id INT,
+  v VECTOR(3)
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_vector VALUES
+  (1, '[1,2,3]'),
+  (2, '[0,0,0]'),
+  (3, '[-1.5, 2.25, 0]'),
+  (4, NULL);
+INSERT 0 4
+
+-- @query rowsort
+SELECT id, v
+FROM type_roundtrip_vector
+ORDER BY id;
+id	v
+1	[1.000000, 2.000000, 3.000000]
+2	[0.000000, 0.000000, 0.000000]
+3	[-1.500000, 2.250000, 0.000000]
+4	NULL

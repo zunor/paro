@@ -1,0 +1,94 @@
+INSERT INTO order_test VALUES (3, 'C', 70), (1, 'A', 90), (2, 'B', 80);
+INSERT 0 3
+
+SELECT * FROM order_test ORDER BY id;
+order_test.id	order_test.name	order_test.score
+1	A	90
+2	B	80
+3	C	70
+
+SELECT * FROM order_test ORDER BY score DESC;
+order_test.id	order_test.name	order_test.score
+1	A	90
+2	B	80
+3	C	70
+
+SELECT * FROM order_test ORDER BY name;
+order_test.id	order_test.name	order_test.score
+1	A	90
+2	B	80
+3	C	70
+
+CREATE TABLE order_null_test (id INT, grp INT, label VARCHAR);
+CREATE TABLE
+
+INSERT INTO order_null_test VALUES
+    (1, 1, 'alpha'),
+    (2, 1, NULL),
+    (3, 2, 'beta'),
+    (4, NULL, 'delta'),
+    (5, 1, 'gamma'),
+    (6, NULL, NULL),
+    (7, 2, 'beta'),
+    (8, 1, 'alpha');
+INSERT 0 8
+
+SELECT id, grp, label
+FROM order_null_test
+ORDER BY grp ASC NULLS LAST, label DESC NULLS FIRST, id ASC;
+id	grp	label
+2	1	NULL
+5	1	gamma
+1	1	alpha
+8	1	alpha
+3	2	beta
+7	2	beta
+6	NULL	NULL
+4	NULL	delta
+
+SELECT id, grp, label
+FROM order_null_test
+ORDER BY grp DESC NULLS FIRST, label ASC NULLS LAST, id DESC;
+id	grp	label
+4	NULL	delta
+6	NULL	NULL
+7	2	beta
+3	2	beta
+8	1	alpha
+1	1	alpha
+5	1	gamma
+2	1	NULL
+
+CREATE TABLE order_payload_test (id INT, category INT, sort_key VARCHAR, payload VARCHAR);
+CREATE TABLE
+
+INSERT INTO order_payload_test VALUES
+    (1, 10, 'pear', 'payload_short'),
+    (2, 10, 'banana', 'payload_medium_bbbbb'),
+    (3, 20, 'banana', 'payload_long_cccccccccccccc'),
+    (4, 20, 'zebra', 'payload_x'),
+    (5, 10, 'apple', 'payload_very_long_dddddddddddddddddd'),
+    (6, 30, 'banana', NULL);
+INSERT 0 6
+
+SELECT id, category, sort_key, payload
+FROM order_payload_test
+ORDER BY sort_key ASC NULLS LAST, id DESC;
+id	category	sort_key	payload
+5	10	apple	payload_very_long_dddddddddddddddddd
+6	30	banana	NULL
+3	20	banana	payload_long_cccccccccccccc
+2	10	banana	payload_medium_bbbbb
+1	10	pear	payload_short
+4	20	zebra	payload_x
+
+SELECT id, category, sort_key
+FROM order_payload_test
+ORDER BY category ASC, sort_key DESC NULLS LAST, id ASC;
+id	category	sort_key
+1	10	pear
+2	10	banana
+5	10	apple
+4	20	zebra
+3	20	banana
+6	30	banana

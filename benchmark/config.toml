@@ -1,0 +1,18 @@
+[connection]
+host = "localhost"
+port = 6432
+database = "postgres"
+user = "postgres"
+password = ""
+
+[defaults]
+iterations = 5
+warmup = 1
+timeout_seconds = 120
+collect_memory = true
+collect_explain_profile = false
+
+[regression]
+enabled = false
+threshold_percent = 15
+baseline_file = ""

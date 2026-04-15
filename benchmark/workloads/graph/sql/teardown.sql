@@ -1,0 +1,3 @@
+DROP PROPERTY GRAPH IF EXISTS bench_graph;
+DROP TABLE IF EXISTS bench_edge;
+DROP TABLE IF EXISTS bench_person;

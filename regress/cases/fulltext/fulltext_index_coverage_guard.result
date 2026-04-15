@@ -1,0 +1,56 @@
+CREATE TABLE ft_coverage_guard (id INT, content VARCHAR);
+CREATE TABLE
+
+CREATE INDEX idx_ft_coverage_guard ON ft_coverage_guard USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+INSERT INTO ft_coverage_guard VALUES
+    (1, 'vector after index'),
+    (2, 'noise');
+INSERT 0 2
+
+EXPLAIN
+SELECT id
+FROM ft_coverage_guard
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
+ORDER BY id;
+QUERY PLAN
+PROJECTION  (rows=0)
+  Output: id
+  ->  ORDER_BY  (rows=0)
+        Sort Key: id ASC NULLS LAST
+        ->  PROJECTION  (rows=0)
+              Output: id, id
+              ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+
+EXPLAIN
+SELECT id
+FROM ft_coverage_guard
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
+ORDER BY ts_rank(
+    to_tsvector('simple', content),
+    plainto_tsquery('simple', 'vector')
+) DESC
+LIMIT 5;
+QUERY PLAN
+PROJECTION  (rows=0)
+  Output: id
+  ->  TOP_N  (rows=0)
+        Sort Key: TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector')) DESC NULLS FIRST
+        Limit: 5
+        ->  PROJECTION  (rows=0)
+              Output: id, TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector'))
+              ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+
+SELECT id
+FROM ft_coverage_guard
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
+ORDER BY id;
+id
+1
+
+DROP INDEX IF EXISTS idx_ft_coverage_guard;
+DROP INDEX
+
+DROP TABLE ft_coverage_guard;
+DROP TABLE

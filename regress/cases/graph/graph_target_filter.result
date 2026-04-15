@@ -1,0 +1,208 @@
+CREATE TABLE tf_person (id BIGINT PRIMARY KEY, name VARCHAR, age INT, city VARCHAR);
+CREATE TABLE
+
+CREATE TABLE tf_company (id BIGINT PRIMARY KEY, name VARCHAR, city VARCHAR, size INT);
+CREATE TABLE
+
+CREATE TABLE tf_knows (person1_id BIGINT, person2_id BIGINT, since DATE, weight DOUBLE);
+CREATE TABLE
+
+CREATE TABLE tf_works_at (person_id BIGINT, company_id BIGINT, role VARCHAR);
+CREATE TABLE
+
+INSERT INTO tf_person VALUES
+    (1, 'Alice', 30, 'NYC'),
+    (2, 'Bob', 25, 'SF'),
+    (3, 'Charlie', 35, 'NYC'),
+    (4, 'Diana', 28, 'LA'),
+    (5, 'Eve', 40, 'NYC'),
+    (6, 'Frank', 22, 'SF');
+INSERT 0 6
+
+INSERT INTO tf_company VALUES
+    (100, 'Acme', 'NYC', 500),
+    (200, 'Beta', 'SF', 100),
+    (300, 'Gamma', 'LA', 50);
+INSERT 0 3
+
+INSERT INTO tf_knows VALUES
+    (1, 2, '2020-01-01', 0.9),
+    (1, 3, '2019-03-20', 0.8),
+    (2, 3, '2021-06-15', 0.7),
+    (3, 4, '2022-01-01', 0.6),
+    (4, 5, '2023-05-10', 0.5),
+    (1, 5, '2023-08-01', 0.4),
+    (5, 6, '2024-01-01', 0.3),
+    (6, 1, '2024-02-01', 0.2);
+INSERT 0 8
+
+INSERT INTO tf_works_at VALUES
+    (1, 100, 'Engineer'), (2, 200, 'Manager'),
+    (3, 100, 'Designer'), (4, 300, 'Analyst'),
+    (5, 100, 'CTO'), (6, 200, 'Intern');
+INSERT 0 6
+
+CREATE PROPERTY GRAPH tf_graph
+VERTEX TABLES (
+    tf_person LABEL Person,
+    tf_company LABEL Company
+)
+EDGE TABLES (
+    tf_knows
+        SOURCE KEY (person1_id) REFERENCES tf_person (id)
+        DESTINATION KEY (person2_id) REFERENCES tf_person (id)
+        LABEL Knows,
+    tf_works_at
+        SOURCE KEY (person_id) REFERENCES tf_person (id)
+        DESTINATION KEY (company_id) REFERENCES tf_company (id)
+        LABEL WorksAt
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.age < 30)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Bob	25
+Charlie	Diana	28
+Eve	Frank	22
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.city = 'NYC')
+    COLUMNS (a.name AS src, b.name AS dst, b.city AS dst_city)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.dst_city
+Alice	Charlie	NYC
+Alice	Eve	NYC
+Bob	Charlie	NYC
+Diana	Eve	NYC
+Frank	Alice	NYC
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.name = 'Charlie')
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src;
+gt.src	gt.dst
+Alice	Charlie
+Bob	Charlie
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person WHERE a.age >= 30)-[k:Knows]->(b:Person WHERE b.age < 30)
+    COLUMNS (a.name AS src, a.age AS src_age, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY src, dst;
+gt.src	gt.src_age	gt.dst	gt.dst_age
+Alice	30	Bob	25
+Charlie	35	Diana	28
+Eve	40	Frank	22
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.name = 'Nobody')
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src;
+gt.src	gt.dst
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.age > 0)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst
+Alice	Bob
+Alice	Charlie
+Alice	Eve
+Bob	Charlie
+Charlie	Diana
+Diana	Eve
+Eve	Frank
+Frank	Alice
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (p:Person)-[w:WorksAt]->(c:Company WHERE c.city = 'NYC')
+    COLUMNS (p.name AS person_name, c.name AS company_name)
+) gt
+ORDER BY person_name;
+gt.person_name	gt.company_name
+Alice	Acme
+Charlie	Acme
+Eve	Acme
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (p:Person)-[w:WorksAt]->(c:Company WHERE c.size > 100)
+    COLUMNS (p.name AS person_name, c.name AS company_name, c.size AS company_size)
+) gt
+ORDER BY person_name;
+gt.person_name	gt.company_name	gt.company_size
+Alice	Acme	500
+Charlie	Acme	500
+Eve	Acme	500
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person WHERE b.age >= 25 AND b.city = 'SF')
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age, b.city AS dst_city)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.dst_age	gt.dst_city
+Alice	Bob	25	SF
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[k:Knows]->{1,2}(b:Person WHERE b.city = 'LA')
+    COLUMNS (a.name AS src, b.name AS dst, b.city AS dst_city)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_city
+Alice	Diana	LA
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (b:Person)<-[k:Knows]-(a:Person WHERE a.age > 30)
+    COLUMNS (a.name AS src, a.age AS src_age, b.name AS dst)
+) gt
+ORDER BY src, dst;
+gt.src	gt.src_age	gt.dst
+Charlie	35	Diana
+Eve	40	Frank
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst
+Alice	Bob
+Alice	Charlie
+Alice	Eve
+Bob	Charlie
+Charlie	Diana
+Diana	Eve
+Eve	Frank
+Frank	Alice
+
+SELECT * FROM GRAPH_TABLE(tf_graph
+    MATCH (a:Person WHERE a.city = 'NYC')-[k:Knows]->(b:Person WHERE b.age < 30)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Bob	25
+Charlie	Diana	28
+Eve	Frank	22
+
+DROP PROPERTY GRAPH tf_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE tf_works_at;
+DROP TABLE
+
+DROP TABLE tf_knows;
+DROP TABLE
+
+DROP TABLE tf_company;
+DROP TABLE
+
+DROP TABLE tf_person;
+DROP TABLE

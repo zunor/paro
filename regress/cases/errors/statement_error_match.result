@@ -1,0 +1,5 @@
+SELECT * FROM statement_error_missing_case;
+ERROR: Table or view 'statement_error_missing_case' not found (SQLSTATE=42601)
+
+SELECT * FROM statement_error_missing_case;
+ERROR: Table or view 'statement_error_missing_case' not found (SQLSTATE=42601)

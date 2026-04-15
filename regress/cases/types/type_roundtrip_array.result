@@ -1,0 +1,23 @@
+CREATE TABLE type_roundtrip_array (
+  id INT,
+  ints ARRAY(INTEGER),
+  words ARRAY(VARCHAR)
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_array VALUES
+  (1, [1, 2, 3], ['alpha', 'beta']),
+  (2, [42, -7], ['hello', '']),
+  (3, NULL, NULL),
+  (4, [0, 1, 2, 3], ['x', 'y', 'z']);
+INSERT 0 4
+
+-- @query rowsort
+SELECT id, ints, words
+FROM type_roundtrip_array
+ORDER BY id;
+id	ints	words
+1	[1.000000, 2.000000, 3.000000]	['alpha', 'beta']
+2	[42.000000, -7.000000]	['hello', '']
+3	NULL	NULL
+4	[0.000000, 1.000000, 2.000000, 3.000000]	['x', 'y', 'z']

@@ -1,0 +1,61 @@
+SELECT
+  o.id,
+  EXISTS(
+    SELECT 1
+    FROM subquery_phase45_detail AS d
+    WHERE d.grp = o.grp
+      AND d.score >= o.threshold
+  ) AS has_match
+FROM subquery_phase45_outer AS o
+ORDER BY o.id;
+o.id	has_match
+1	true
+2	true
+3	true
+4	true
+5	false
+6	false
+
+SELECT
+  o.id,
+  EXISTS(
+    SELECT DISTINCT d.score
+    FROM subquery_phase45_detail AS d
+    WHERE d.grp = o.grp
+  ) AS has_distinct
+FROM subquery_phase45_outer AS o
+ORDER BY o.id;
+o.id	has_distinct
+1	true
+2	true
+3	true
+4	true
+5	false
+6	false
+
+SELECT o.grp, COUNT(*) AS outer_rows
+FROM subquery_phase45_outer AS o
+GROUP BY o.grp
+HAVING EXISTS(
+  SELECT 1
+  FROM subquery_phase45_detail AS d
+  WHERE d.grp = o.grp
+)
+ORDER BY o.grp;
+o.grp	outer_rows
+
+SELECT o.id, p.note
+FROM subquery_phase45_outer AS o
+JOIN subquery_phase45_probe AS p
+  ON p.id = o.id
+ AND EXISTS(
+   SELECT 1
+   FROM subquery_phase45_detail AS d
+   WHERE d.grp = o.grp
+     AND d.score >= o.threshold
+ )
+ORDER BY o.id;
+o.id	p.note
+1	p1
+2	p2
+4	p4

@@ -1,0 +1,88 @@
+CREATE TABLE gh_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE gh_knows (src_id BIGINT, dst_id BIGINT, note VARCHAR);
+CREATE TABLE
+
+INSERT INTO gh_person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT 0 3
+
+INSERT INTO gh_knows VALUES (1, 2, 'ab');
+INSERT 0 1
+
+CREATE PROPERTY GRAPH gh_graph
+VERTEX TABLES (
+    gh_person LABEL Node
+)
+EDGE TABLES (
+    gh_knows
+        SOURCE KEY (src_id) REFERENCES gh_person (id)
+        DESTINATION KEY (dst_id) REFERENCES gh_person (id)
+        LABEL Knows
+);
+CREATE PROPERTY GRAPH
+
+SELECT graph_name, vertex_count, edge_count
+FROM paro_property_graphs()
+WHERE graph_name = 'gh_graph';
+graph_name	vertex_count	edge_count
+gh_graph	3	1
+
+INSERT INTO gh_knows VALUES (2, 3, 'bc');
+INSERT 0 1
+
+SELECT * FROM GRAPH_TABLE(gh_graph
+    MATCH (a:Node)-[k:Knows]->(b:Node)
+    COLUMNS (a.name AS src_name, b.name AS dst_name)
+) gt
+ORDER BY src_name, dst_name;
+gt.src_name	gt.dst_name
+Alice	Bob
+Bob	Charlie
+
+SELECT graph_name, vertex_count, edge_count
+FROM paro_property_graphs()
+WHERE graph_name = 'gh_graph';
+graph_name	vertex_count	edge_count
+gh_graph	3	2
+
+UPDATE gh_knows
+SET dst_id = 1
+WHERE src_id = 2 AND dst_id = 3;
+UPDATE 1
+
+SELECT * FROM GRAPH_TABLE(gh_graph
+    MATCH (a:Node)-[k:Knows]->(b:Node)
+    COLUMNS (a.name AS src_name, b.name AS dst_name)
+) gt
+ORDER BY src_name, dst_name;
+gt.src_name	gt.dst_name
+Alice	Bob
+Bob	Alice
+
+DELETE FROM gh_knows
+WHERE src_id = 1 AND dst_id = 2;
+DELETE 1
+
+SELECT * FROM GRAPH_TABLE(gh_graph
+    MATCH (a:Node)-[k:Knows]->(b:Node)
+    COLUMNS (a.name AS src_name, b.name AS dst_name)
+) gt
+ORDER BY src_name, dst_name;
+gt.src_name	gt.dst_name
+Bob	Alice
+
+SELECT graph_name, vertex_count, edge_count
+FROM paro_property_graphs()
+WHERE graph_name = 'gh_graph';
+graph_name	vertex_count	edge_count
+gh_graph	3	1
+
+DROP PROPERTY GRAPH gh_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE gh_knows;
+DROP TABLE
+
+DROP TABLE gh_person;
+DROP TABLE

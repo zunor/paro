@@ -1,0 +1,99 @@
+CREATE TABLE agg_grp_t (
+    region VARCHAR,
+    city VARCHAR,
+    sales INT
+);
+CREATE TABLE
+
+INSERT INTO agg_grp_t VALUES
+    ('east', 'shanghai', 10),
+    ('east', 'shanghai', 20),
+    ('east', 'hangzhou', 15),
+    ('west', 'chengdu', 30),
+    ('west', NULL, 5),
+    (NULL, NULL, 8);
+INSERT 0 6
+
+SELECT
+    GROUPING(region) AS g_region,
+    region,
+    sum(sales) AS sum_sales
+FROM agg_grp_t
+GROUP BY GROUPING SETS ((region), ())
+ORDER BY g_region, region;
+g_region	region	sum_sales
+0	east	45
+0	west	35
+0	NULL	8
+1	NULL	88
+
+SELECT
+    GROUPING(region) AS g_region,
+    GROUPING(city) AS g_city,
+    region,
+    city,
+    count(*) AS cnt
+FROM agg_grp_t
+GROUP BY ROLLUP(region, city)
+ORDER BY g_region, g_city, region, city;
+g_region	g_city	region	city	cnt
+0	0	east	hangzhou	1
+0	0	east	shanghai	2
+0	0	west	chengdu	1
+0	0	west	NULL	1
+0	0	NULL	NULL	1
+0	1	east	NULL	3
+0	1	west	NULL	2
+0	1	NULL	NULL	1
+1	1	NULL	NULL	6
+
+SELECT
+    GROUPING(region) AS g_region,
+    GROUPING(city) AS g_city,
+    region,
+    city,
+    sum(sales) AS sum_sales
+FROM agg_grp_t
+GROUP BY CUBE(region, city)
+ORDER BY g_region, g_city, region, city;
+g_region	g_city	region	city	sum_sales
+0	0	east	hangzhou	15
+0	0	east	shanghai	30
+0	0	west	chengdu	30
+0	0	west	NULL	5
+0	0	NULL	NULL	8
+0	1	east	NULL	45
+0	1	west	NULL	35
+0	1	NULL	NULL	8
+1	0	NULL	chengdu	30
+1	0	NULL	hangzhou	15
+1	0	NULL	shanghai	30
+1	0	NULL	NULL	13
+1	1	NULL	NULL	88
+
+EXPLAIN SELECT
+    GROUPING(region) AS g_region,
+    region,
+    sum(sales) AS sum_sales
+FROM (
+    VALUES ('east', 10),
+           ('west', 20),
+           ('west', 30)
+) AS agg_grp_values(region, sales)
+GROUP BY GROUPING SETS ((region), ())
+ORDER BY g_region, region;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: g_region, region, sum_sales
+  ->  ORDER_BY  (rows=3)
+        Sort Key: grouping_1 ASC NULLS LAST, ref_1 ASC NULLS LAST
+        ->  PROJECTION  (rows=3)
+              Output: grouping_1, ref_1, sum, ref_1
+              ->  HASH_GROUP_BY  (rows=3)
+                    Group Key: col0
+                    Aggregates: SUM(col1)
+                    ->  PROJECTION
+                          Output: col0, col1
+                          ->  PROJECTION  (rows=3)
+                                Output: col0, col1
+                                ->  EXPRESSION_SCAN  (rows=3)

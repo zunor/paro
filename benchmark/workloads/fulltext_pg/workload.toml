@@ -1,0 +1,31 @@
+[meta]
+name = "fulltext_pg"
+description = "PostgreSQL-compatible fulltext queries"
+
+[params]
+rows = 20000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "plain_match"
+file = "sql/q_plain_match.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [5]]
+
+[[query]]
+id = "phrase_match"
+file = "sql/q_phrase_match.sql"
+validate = "ordered_rows"
+expected = [[1], [2]]
+
+[[query]]
+id = "rank_topk"
+file = "sql/q_rank_topk.sql"
+validate = "ordered_rows"
+expected = [[1], [2]]

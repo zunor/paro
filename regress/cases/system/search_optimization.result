@@ -1,0 +1,68 @@
+DROP TABLE IF EXISTS search_opt_docs;
+DROP TABLE
+
+CREATE TABLE search_opt_docs (
+    id INT PRIMARY KEY,
+    category VARCHAR,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO search_opt_docs VALUES
+    (1, 'tech', 'graph database systems and query planning'),
+    (2, 'tech', 'graph traversal with database statistics'),
+    (3, 'life', 'mountain hiking and travel journal'),
+    (4, 'tech', 'vector search and graph database hybrid');
+INSERT 0 4
+
+CREATE INDEX idx_search_opt_docs_fts
+ON search_opt_docs USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+EXPLAIN (VERBOSE)
+SELECT id
+FROM search_opt_docs
+WHERE fulltext_match(content, 'graph database')
+ORDER BY bm25(content, 'graph database') DESC, id
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=0)
+  Output: id
+  Cardinality: [0, 0, 1]
+  Output Schema: id INTEGER
+  ->  TOP_N  (rows=0)
+        Sort Key: BM25(content, 'graph database') DESC NULLS FIRST, id ASC NULLS LAST
+        Limit: 2
+        Cardinality: [0, 0, 1]
+        Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
+        ->  PROJECTION  (rows=0)
+              Output: id, BM25(content, 'graph database'), id
+              Cardinality: [0, 0, 1]
+              Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
+              ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+                    Output Schema: id INTEGER, content VARCHAR
+
+SELECT id
+FROM search_opt_docs
+WHERE fulltext_match(content, 'graph database')
+ORDER BY bm25(content, 'graph database') DESC, id
+LIMIT 2;
+id
+1
+2
+
+EXPLAIN (VERBOSE)
+SELECT id
+FROM search_opt_docs
+WHERE fulltext_match(content, 'graph database')
+  AND category = 'tech';
+QUERY PLAN
+PROJECTION  (rows=0)
+  Output: id
+  Cardinality: [0, 0, 1]
+  Output Schema: id INTEGER
+  ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+        Output Schema: id INTEGER, category VARCHAR, content VARCHAR
+
+DROP TABLE search_opt_docs;
+DROP TABLE

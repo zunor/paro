@@ -1,0 +1,53 @@
+[meta]
+name = "row_hash_join_phase0"
+description = "Phase 0 row-store hash join baseline covering short chains, long chains, found flags, and external spill"
+
+[params]
+short_rows = 2000
+long_rows = 2048
+long_key_space = 16
+found_left_rows = 1000
+found_right_rows = 1100
+external_rows = 2000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "short_chain_left_probe"
+file = "sql/q_short_chain_left_probe.sql"
+validate = "scalar_equals"
+expected = 2000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "long_chain_left_probe"
+file = "sql/q_long_chain_left_probe.sql"
+validate = "scalar_equals"
+expected = 262144
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "found_flag_right_anti"
+file = "sql/q_found_flag_right_anti.sql"
+validate = "scalar_equals"
+expected = 100
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "external_spill_left"
+file = "sql/q_external_spill_left.sql"
+setup = "sql/setup_external.sql"
+teardown = "sql/teardown_external.sql"
+validate = "scalar_equals"
+expected = 2000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true

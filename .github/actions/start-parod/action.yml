@@ -1,0 +1,111 @@
+name: Start parod
+description: Download parod artifact and start the server
+
+inputs:
+  artifact-name:
+    description: Artifact name containing the parod binary
+    default: parod-release
+  port:
+    description: TCP port to bind parod on
+    default: "6432"
+  health-timeout:
+    description: Seconds to wait for the listener to become reachable
+    default: "60"
+
+outputs:
+  host:
+    description: IPv4 loopback host for downstream jobs
+    value: "127.0.0.1"
+  port:
+    description: TCP port for downstream jobs
+    value: ${{ inputs.port }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download parod artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: .ci/bin
+
+    - name: Mark parod executable
+      shell: bash
+      run: chmod +x .ci/bin/parod
+
+    - name: Start parod
+      shell: bash
+      run: |
+        mkdir -p .ci
+        rm -rf .ci/parod-data
+        mkdir -p .ci/parod-data
+        .ci/bin/parod \
+          --listen 127.0.0.1:${{ inputs.port }} \
+          --data-dir .ci/parod-data \
+          > .ci/parod.log 2>&1 &
+        echo $! > .ci/parod.pid
+
+    - name: Wait for parod
+      shell: bash
+      env:
+        PAROD_HOST: 127.0.0.1
+        PAROD_PORT: ${{ inputs.port }}
+        PAROD_TIMEOUT: ${{ inputs.health-timeout }}
+      run: |
+        python3 - <<'PY'
+        import os
+        import pathlib
+        import socket
+        import sys
+        import time
+
+        host = os.environ["PAROD_HOST"]
+        port = int(os.environ["PAROD_PORT"])
+        timeout = int(os.environ["PAROD_TIMEOUT"])
+        pid = int(pathlib.Path(".ci/parod.pid").read_text(encoding="utf-8").strip())
+        status_path = pathlib.Path(f"/proc/{pid}/status")
+
+        def tail_log_and_exit(message: str) -> None:
+            print(message, file=sys.stderr)
+            log_path = pathlib.Path(".ci/parod.log")
+            if log_path.exists():
+                print("--- parod.log (tail) ---", file=sys.stderr)
+                print(
+                    "".join(
+                        log_path.read_text(encoding="utf-8", errors="replace").splitlines(True)[-80:]
+                    ),
+                    file=sys.stderr,
+                    end="",
+                )
+            sys.exit(1)
+
+        def is_zombie(path: pathlib.Path) -> bool:
+            if not path.exists():
+                return False
+            try:
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("State:"):
+                        return "\tZ" in line or " zombie" in line.lower()
+            except OSError:
+                return False
+            return False
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                tail_log_and_exit("parod exited before becoming ready")
+
+            if is_zombie(status_path):
+                tail_log_and_exit("parod became a zombie before becoming ready")
+
+            try:
+                with socket.create_connection((host, port), timeout=1):
+                    print(f"parod is ready on {host}:{port}")
+                    break
+            except OSError:
+                time.sleep(1)
+        else:
+            tail_log_and_exit("parod health check failed")
+        PY

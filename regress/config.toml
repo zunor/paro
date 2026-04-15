@@ -1,0 +1,11 @@
+[connection]
+host = "localhost"
+port = 6432
+database = "postgres"
+password = ""
+
+[test]
+float_precision = 6
+write_actual = true
+update = false
+jobs = 1

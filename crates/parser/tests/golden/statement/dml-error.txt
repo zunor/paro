@@ -1,0 +1,141 @@
+---------- Input ----------
+insert table t select * from t2;
+---------- Output ---------
+error: 
+  --> SQL:1:1
+  |
+1 | insert table t select * from t2;
+  | ^^^^^^
+  | |
+  | INSERT statement must be followed by 'overwrite' or 'into'
+  | while parsing `INSERT INTO [TABLE] <table> [(<column>, ...)] (VALUES <values> | <query>)`
+
+
+---------- Input ----------
+insert into t format
+---------- Output ---------
+error: 
+  --> SQL:1:15
+  |
+1 | insert into t format
+  | ------        ^^^^^^ unexpected `format`. it's reserved keyword, you may avoid using it, expecting `FROM`, `ORDER`, `LIMIT`, `OFFSET`, `IGNORE_RESULT`, `WITH`, `VALUES`, `EXCEPT`, `SELECT`, `INTERSECT`, `(`, `UNION`, or `.`
+  | |              
+  | while parsing `INSERT INTO [TABLE] <table> [(<column>, ...)] (VALUES <values> | <query>)`
+
+
+---------- Input ----------
+COPY mytable FROM '/tmp/bucket' CONECTION= ();
+---------- Output ---------
+error: 
+  --> SQL:1:33
+  |
+1 | COPY mytable FROM '/tmp/bucket' CONECTION= ();
+  |                                 ^^^^^^^^^ unexpected `CONECTION`, expecting `ENCODING`, `FORMAT`, `QUOTE`, `FORCE`, `CSV`, `NULL`, `WITH`, `DELIMITER`, `WHERE`, `HEADER`, `BINARY`, `FREEZE`, `ESCAPE`, or `;`
+
+
+---------- Input ----------
+COPY mytable FROM @mystage CONNECTION = ();
+---------- Output ---------
+error: 
+  --> SQL:1:19
+  |
+1 | COPY mytable FROM @mystage CONNECTION = ();
+  |                   ^^^^^^^^ unexpected `@mystage`, expecting `STDIN`, `STDOUT`, <LiteralString>, or `PROGRAM`
+
+
+---------- Input ----------
+copy t1 from '' FILE
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | copy t1 from '' FILE
+  |                 ^^^^ unexpected `FILE`. it's reserved keyword, you may avoid using it, expecting `FORCE`, `FREEZE`, `NULL`, `WITH`, `QUOTE`, `WHERE`, `HEADER`, `ESCAPE`, `BINARY`, `FORMAT`, `DELIMITER`, `ENCODING`, `CSV`, or `;`
+
+
+---------- Input ----------
+copy t1 from '' FILE_FORMAT
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | copy t1 from '' FILE_FORMAT
+  |                 ^^^^^^^^^^^ unexpected `FILE_FORMAT`. it's reserved keyword, you may avoid using it, expecting `FORMAT`, `FORCE`, `DELIMITER`, `WHERE`, `HEADER`, `BINARY`, `FREEZE`, `ENCODING`, `NULL`, `WITH`, `ESCAPE`, `QUOTE`, `CSV`, or `;`
+
+
+---------- Input ----------
+copy t1 from '' FILE_FORMAT =
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | copy t1 from '' FILE_FORMAT =
+  |                 ^^^^^^^^^^^ unexpected `FILE_FORMAT`. it's reserved keyword, you may avoid using it, expecting `FORMAT`, `FORCE`, `DELIMITER`, `WHERE`, `HEADER`, `BINARY`, `FREEZE`, `ENCODING`, `NULL`, `WITH`, `ESCAPE`, `QUOTE`, `CSV`, or `;`
+
+
+---------- Input ----------
+copy t1 from '' FILE_FORMAT = (
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | copy t1 from '' FILE_FORMAT = (
+  |                 ^^^^^^^^^^^ unexpected `FILE_FORMAT`. it's reserved keyword, you may avoid using it, expecting `FORMAT`, `FORCE`, `DELIMITER`, `WHERE`, `HEADER`, `BINARY`, `FREEZE`, `ENCODING`, `NULL`, `WITH`, `ESCAPE`, `QUOTE`, `CSV`, or `;`
+
+
+---------- Input ----------
+copy t1 from '' FILE_FORMAT = (TYPE
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | copy t1 from '' FILE_FORMAT = (TYPE
+  |                 ^^^^^^^^^^^ unexpected `FILE_FORMAT`. it's reserved keyword, you may avoid using it, expecting `FORMAT`, `FORCE`, `DELIMITER`, `WHERE`, `HEADER`, `BINARY`, `FREEZE`, `ENCODING`, `NULL`, `WITH`, `ESCAPE`, `QUOTE`, `CSV`, or `;`
+
+
+---------- Input ----------
+copy t1 from '' FILE_FORMAT = (TYPE =
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | copy t1 from '' FILE_FORMAT = (TYPE =
+  |                 ^^^^^^^^^^^ unexpected `FILE_FORMAT`. it's reserved keyword, you may avoid using it, expecting `FORMAT`, `FORCE`, `DELIMITER`, `WHERE`, `HEADER`, `BINARY`, `FREEZE`, `ENCODING`, `NULL`, `WITH`, `ESCAPE`, `QUOTE`, `CSV`, or `;`
+
+
+---------- Input ----------
+COPY t1 FROM '' PATTERN = '.*[.]csv' FILE_FORMAT = (type = TSV field_delimiter = '\t' skip_headerx = 0);
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | COPY t1 FROM '' PATTERN = '.*[.]csv' FILE_FORMAT = (type = TSV field_delimiter = '\t' skip_headerx = 0);
+  |                 ^^^^^^^ unexpected `PATTERN`. it's reserved keyword, you may avoid using it, expecting `QUOTE`, `WHERE`, `ENCODING`, `HEADER`, `BINARY`, `DELIMITER`, `WITH`, `FORCE`, `ESCAPE`, `FREEZE`, `FORMAT`, `NULL`, `CSV`, or `;`
+
+
+---------- Input ----------
+COPY mytable
+FROM @my_stage
+FILE_FORMAT = (
+    type = CSV,
+    error_on_column_count_mismatch = 1
+)
+---------- Output ---------
+error: 
+  --> SQL:2:6
+  |
+1 | COPY mytable
+2 | FROM @my_stage
+  |      ^^^^^^^^^ unexpected `@my_stage`, expecting `STDIN`, <LiteralString>, `STDOUT`, or `PROGRAM`
+
+
+---------- Input ----------
+copy t1 from (select a from t where a = 1)
+---------- Output ---------
+error: 
+  --> SQL:1:14
+  |
+1 | copy t1 from (select a from t where a = 1)
+  |              ^ unexpected `(`, expecting `PROGRAM`, `STDIN`, `STDOUT`, or <LiteralString>
+
+

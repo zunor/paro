@@ -1,0 +1,81 @@
+CREATE TABLE agg_d_t (
+    grp INT,
+    x INT,
+    y INT
+);
+CREATE TABLE
+
+INSERT INTO agg_d_t VALUES
+    (1, 1, 10),
+    (1, 1, 10),
+    (1, 2, 20),
+    (1, NULL, 30),
+    (2, 2, 20),
+    (2, 3, 20),
+    (2, 3, NULL),
+    (2, NULL, NULL);
+INSERT 0 8
+
+SELECT
+    count(DISTINCT x) AS cd_x,
+    sum(DISTINCT x) AS sd_x,
+    count(DISTINCT y) AS cd_y
+FROM agg_d_t;
+cd_x	sd_x	cd_y
+3	6	3
+
+SELECT
+    grp,
+    count(DISTINCT x) AS cd_x,
+    sum(DISTINCT x) AS sd_x,
+    count(DISTINCT y) AS cd_y
+FROM agg_d_t
+GROUP BY grp
+ORDER BY grp;
+grp	cd_x	sd_x	cd_y
+1	2	3	3
+2	2	5	1
+
+SELECT
+    grp,
+    sum(x) AS sum_all,
+    sum(DISTINCT x) AS sum_distinct,
+    count(*) AS cnt_star,
+    count(DISTINCT x) AS cnt_distinct
+FROM agg_d_t
+GROUP BY grp
+ORDER BY grp;
+grp	sum_all	sum_distinct	cnt_star	cnt_distinct
+1	4	3	4	2
+2	8	5	4	2
+
+EXPLAIN SELECT
+    grp,
+    count(DISTINCT x) AS cd_x,
+    sum(DISTINCT y) AS sd_y
+FROM (
+    VALUES (1, 1, 10),
+           (1, 1, 10),
+           (1, 2, 20),
+           (2, 2, 20),
+           (2, 3, 20),
+           (2, 3, NULL)
+) AS agg_d_values(grp, x, y)
+GROUP BY grp
+ORDER BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: grp, cd_x, sd_y
+  ->  ORDER_BY  (rows=3)
+        Sort Key: ref_1 ASC NULLS LAST
+        ->  PROJECTION  (rows=3)
+              Output: ref_1, count, sum, ref_1
+              ->  HASH_GROUP_BY  (rows=3)
+                    Group Key: col0
+                    Aggregates: COUNT(DISTINCT col1), SUM(DISTINCT col2)
+                    Key Mode: INLINE_KEY_4B
+                    ->  PROJECTION
+                          Output: col0, col1, col2
+                          ->  PROJECTION  (rows=6)
+                                Output: col0, col1, col2
+                                ->  EXPRESSION_SCAN  (rows=6)

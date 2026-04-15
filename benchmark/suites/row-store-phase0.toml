@@ -1,0 +1,8 @@
+name = "row-store-phase0"
+description = "Phase 0 row-store refactor baselines for sorting and hash join"
+
+[[include]]
+workload = "row_sort_phase0"
+
+[[include]]
+workload = "row_hash_join_phase0"

@@ -1,0 +1,45 @@
+[meta]
+name = "row_sort_phase0"
+description = "Phase 0 row-store sort baseline covering fixed-key full sort, variable-key TopN, and external full sort"
+
+[params]
+fixed_rows = 50000
+variable_rows = 30000
+external_rows = 10000
+result_rows = 64
+fixed_offset = 20000
+variable_offset = 500
+external_offset = 4000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "fixed_key_in_memory"
+file = "sql/q_fixed_key_in_memory.sql"
+validate = "row_count"
+expected = 64
+plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "variable_key_topn"
+file = "sql/q_variable_key_topn.sql"
+validate = "row_count"
+expected = 64
+plan_contains = ["TOP_N"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fixed_key_external"
+file = "sql/q_fixed_key_external.sql"
+setup = "sql/setup_external.sql"
+teardown = "sql/teardown_external.sql"
+validate = "row_count"
+expected = 64
+plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+collect_explain_profile = true
+allow_reexecute = true

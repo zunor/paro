@@ -1,0 +1,72 @@
+DROP TABLE IF EXISTS obs_docs;
+DROP TABLE
+
+CREATE TABLE obs_docs (
+    id INT PRIMARY KEY,
+    title VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO obs_docs VALUES
+    (1, 'graph database systems'),
+    (2, 'vector database systems'),
+    (3, NULL);
+INSERT 0 3
+
+CREATE INDEX idx_obs_docs_title_fts
+ON obs_docs USING GIN (to_tsvector('simple', title));
+CREATE INDEX
+
+SELECT table_name, estimated_rows, estimated_size_bytes >= 0 AS has_size
+FROM paro_tables()
+WHERE table_name = 'obs_docs';
+table_name	estimated_rows	has_size
+obs_docs	3	true
+
+SELECT index_name, index_type, build_state, entry_count, position('column_names' IN extra_info) > 0 AS has_columns
+FROM paro_indexes()
+WHERE table_name = 'obs_docs'
+ORDER BY index_name;
+ERROR: Expression not supported: Position { span: Some(57..95), substr_expr: Literal { span: Some(66..80), value: String("column_names") }, str_expr: ColumnRef { span: Some(84..94), column: ColumnRef { schema: None, table: None, column: Name(Identifier { span: Some(84..94), name: "extra_info", quote: None, ident_type: None }) } } } is not yet implemented (SQLSTATE=0A000; HINT=This feature may be added in a future release.)
+
+SELECT column_name, num_rows, null_count, distinct_count, has_fulltext_index
+FROM paro_storage_info('obs_docs')
+WHERE column_name IN ('id', 'title')
+ORDER BY column_name, segment_id;
+column_name	num_rows	null_count	distinct_count	has_fulltext_index
+id	3	0	3	false
+title	3	1	2	true
+
+SELECT name, enabled, invocation_count >= 0 AS has_invocations
+FROM paro_optimizers()
+WHERE name IN ('search_optimization', 'statistics_gathering')
+ORDER BY name;
+name	enabled	has_invocations
+search_optimization	true	true
+statistics_gathering	true	true
+
+EXPLAIN (VERBOSE)
+SELECT id
+FROM obs_docs
+WHERE fulltext_match(title, 'graph')
+ORDER BY bm25(title, 'graph') DESC, id
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=0)
+  Output: id
+  Cardinality: [0, 0, 1]
+  Output Schema: id INTEGER
+  ->  TOP_N  (rows=0)
+        Sort Key: BM25(title, 'graph') DESC NULLS FIRST, id ASC NULLS LAST
+        Limit: 2
+        Cardinality: [0, 0, 1]
+        Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
+        ->  PROJECTION  (rows=0)
+              Output: id, BM25(title, 'graph'), id
+              Cardinality: [0, 0, 1]
+              Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
+              ->  FULLTEXT_SCAN on public.obs_docs  (rows=3)
+                    Output Schema: id INTEGER, title VARCHAR
+
+DROP TABLE obs_docs;
+DROP TABLE

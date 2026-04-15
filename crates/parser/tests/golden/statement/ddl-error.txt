@@ -1,0 +1,414 @@
+---------- Input ----------
+create table a.b (c integer not null 1, b float(10))
+---------- Output ---------
+error: 
+  --> SQL:1:38
+  |
+1 | create table a.b (c integer not null 1, b float(10))
+  | ------                               ^ unexpected `1`, expecting `)`, `NULL`, `NOT`, `PRIMARY`, `DEFAULT`, `GENERATED`, `AS`, `CHECK`, `AUTOINCREMENT`, `IDENTITY`, `COMMENT`, or `,`
+  | |                                     
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+create table a (c float(10))
+---------- Output ---------
+error: 
+  --> SQL:1:24
+  |
+1 | create table a (c float(10))
+  | ------                 ^ unexpected `(`, expecting `)`, `NULL`, `NOT`, `PRIMARY`, `DEFAULT`, `GENERATED`, `AS`, `CHECK`, `AUTOINCREMENT`, `IDENTITY`, `COMMENT`, or `,`
+  | |                       
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+create table a (c varch)
+---------- Output ---------
+error: 
+  --> SQL:1:19
+  |
+1 | create table a (c varch)
+  | ------          - ^^^^^ unexpected `varch`, expecting `VARCHAR`, `CHAR`, `VARIANT`, `CHARACTER`, `VARBINARY`, `ARRAY`, `STRUCT`, `BINARY`, `VECTOR`, `TSVECTOR`, `GEOGRAPHY`, `STAGE_LOCATION`, `MAP`, `DATE`, `STRING`, `HUGEINT`, `FLOAT32`, `FLOAT64`, `DECIMAL`, `NUMERIC`, `SMALLINT`, `UHUGEINT`, `DATETIME`, `INTERVAL`, `NULLABLE`, `TIMESTAMP_TZ`, `REAL`, `BOOLEAN`, `BOOL`, `UINT8`, `TINYINT`, `UINT16`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `FLOAT`, `DOUBLE`, `LIST`, `BITMAP`, `TUPLE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`, `BLOB`, `UUID`, `TEXT`, `TSQUERY`, `JSON`, or 2 more ...
+  | |               |  
+  | |               while parsing `<column name> <type> [PRIMARY KEY] [DEFAULT <expr>] [AS (<expr>) VIRTUAL] [AS (<expr>) STORED] [CHECK (<expr>)] [COMMENT '<comment>']`
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+create table a (c tuple())
+---------- Output ---------
+error: 
+  --> SQL:1:25
+  |
+1 | create table a (c tuple())
+  | ------          - ----- ^ unexpected `)`, expecting `BOOLEAN`, `BOOL`, `UINT8`, `TINYINT`, `UINT16`, `SMALLINT`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `UHUGEINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `HUGEINT`, `FLOAT32`, `FLOAT`, `REAL`, `FLOAT64`, `DOUBLE`, `DECIMAL`, `ARRAY`, `LIST`, `MAP`, `BITMAP`, `TUPLE`, `STRUCT`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMPTZ`, `DATETIME`, `INTERVAL`, `NUMERIC`, `BINARY`, `VARBINARY`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`, `BLOB`, `UUID`, `CHAR`, `CHARACTER`, `STRING`, `VARCHAR`, `TEXT`, `TSVECTOR`, `TSQUERY`, `JSON`, `JSONB`, `VARIANT`, `GEOMETRY`, `GEOGRAPHY`, `NULLABLE`, or 5 more ...
+  | |               | |      
+  | |               | while parsing type name
+  | |               while parsing `<column name> <type> [PRIMARY KEY] [DEFAULT <expr>] [AS (<expr>) VIRTUAL] [AS (<expr>) STORED] [CHECK (<expr>)] [COMMENT '<comment>']`
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+create table a (b tuple(c int, uint64));
+---------- Output ---------
+error: 
+  --> SQL:1:38
+  |
+1 | create table a (b tuple(c int, uint64));
+  | ------          - -----              ^ unexpected `)`, expecting `BOOLEAN`, `BOOL`, `UINT8`, `TINYINT`, `UINT16`, `SMALLINT`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `UHUGEINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `HUGEINT`, `FLOAT32`, `FLOAT`, `REAL`, `FLOAT64`, `DOUBLE`, `DECIMAL`, `ARRAY`, `LIST`, `MAP`, `BITMAP`, `TUPLE`, `STRUCT`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMPTZ`, `DATETIME`, `INTERVAL`, `NUMERIC`, `BINARY`, `VARBINARY`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`, `BLOB`, `UUID`, `CHAR`, `CHARACTER`, `STRING`, `VARCHAR`, `TEXT`, `TSVECTOR`, `TSQUERY`, `JSON`, `JSONB`, `VARIANT`, `GEOMETRY`, `GEOGRAPHY`, `NULLABLE`, or 2 more ...
+  | |               | |                   
+  | |               | while parsing TUPLE/STRUCT(<name> <type>, ...)
+  | |               | while parsing type name
+  | |               while parsing `<column name> <type> [PRIMARY KEY] [DEFAULT <expr>] [AS (<expr>) VIRTUAL] [AS (<expr>) STORED] [CHECK (<expr>)] [COMMENT '<comment>']`
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+CREATE TABLE t(c1 NULLABLE(int) NOT NULL);
+---------- Output ---------
+error: 
+  --> SQL:1:19
+  |
+1 | CREATE TABLE t(c1 NULLABLE(int) NOT NULL);
+  | ------         -- ^^^^^^^^ ambiguous NOT NULL constraint
+  | |              |   
+  | |              while parsing `<column name> <type> [PRIMARY KEY] [DEFAULT <expr>] [AS (<expr>) VIRTUAL] [AS (<expr>) STORED] [CHECK (<expr>)] [COMMENT '<comment>']`
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+create table a (c1 decimal(38), c2 int) partition by ();
+---------- Output ---------
+error: 
+  --> SQL:1:55
+  |
+1 | create table a (c1 decimal(38), c2 int) partition by ();
+  | ------                                                ^ unexpected `)`, expecting <Ident>, <LiteralString>, or `IDENTIFIER`
+  | |                                                      
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+CREATE TABLE t(c1 int, c2 int) partition by (c1, c2) PROPERTIES ("read.split.target-size"='134217728', "read.split.metadata-target-size"=33554432);
+---------- Output ---------
+error: 
+  --> SQL:1:138
+  |
+1 | CREATE TABLE t(c1 int, c2 int) partition by (c1, c2) PROPERTIES ("read.split.target-size"='134217728', "read.split.metadata-target-size"=33554432);
+  | ------                                                                                                                                   ^^^^^^^^ unexpected `33554432`, expecting `)` or <LiteralString>
+  | |                                                                                                                                         
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+drop table if a.b
+---------- Output ---------
+error: 
+  --> SQL:1:15
+  |
+1 | drop table if a.b
+  | ----          ^ unexpected `a`, expecting `EXISTS`
+  | |              
+  | while parsing `DROP TABLE [IF EXISTS] [<database>.]<table>`
+
+
+---------- Input ----------
+create database ctl type=hive connection=(url='<hive-meta-store>' thrift_protocol='binary' warehouse='default');
+---------- Output ---------
+error: 
+  --> SQL:1:21
+  |
+1 | create database ctl type=hive connection=(url='<hive-meta-store>' thrift_protocol='binary' warehouse='default');
+  |                     ^^^^ unexpected `type`. it's reserved keyword, you may avoid using it, expecting `FORMAT` or `;`
+
+
+---------- Input ----------
+create table if test
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | create table if test
+  | ------          ^^^^ unexpected `test`, expecting `NOT`
+  | |                
+  | while parsing `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] [<database>.]<table> [<source>] [<table_options>]`
+
+
+---------- Input ----------
+truncate table a.b.c.d
+---------- Output ---------
+error: 
+  --> SQL:1:21
+  |
+1 | truncate table a.b.c.d
+  |                     ^ unexpected `.`, expecting `FORMAT` or `;`
+
+
+---------- Input ----------
+truncate a
+---------- Output ---------
+error: 
+  --> SQL:1:10
+  |
+1 | truncate a
+  | -------- ^ unexpected `a`, expecting `TABLE`
+  | |         
+  | while parsing `TRUNCATE TABLE [<database>.]<table>`
+
+
+---------- Input ----------
+drop a
+---------- Output ---------
+error: 
+  --> SQL:1:6
+  |
+1 | drop a
+  |      ^ unexpected `a`, expecting `TASK`, `TABLE`, `MASKING`, `DATABASE`, `PASSWORD`, `WAREHOUSE`, `WORKLOAD`, `SCHEMA`, `DICTIONARY`, `VIEW`, `INDEX`, `INVERTED`, `NGRAM`, `VECTOR`, `STAGE`, `TAG`, `FILE`, `PIPE`, `NOTIFICATION`, `CONNECTION`, `ROW`, `USER`, `ROLE`, `FUNCTION`, `NETWORK`, `PROCEDURE`, `STREAM`, `PROPERTY`, or `SEQUENCE`
+
+
+---------- Input ----------
+alter schema system x rename to db
+---------- Output ---------
+error: 
+  --> SQL:1:21
+  |
+1 | alter schema system x rename to db
+  | -----               ^ unexpected `x`, expecting `RENAME`, `REFRESH`, or `.`
+  | |                    
+  | while parsing `ALTER SCHEMA [IF EXISTS] <action>`
+
+
+---------- Input ----------
+show columns from db1.t from ctl.db
+---------- Output ---------
+error: 
+  --> SQL:1:14
+  |
+1 | show columns from db1.t from ctl.db
+  |              ^^^^ unexpected `from`. Did you mean `SHOW COLUMNS`?
+
+
+---------- Input ----------
+CREATE CONNECTION IF NOT EXISTS my_conn
+---------- Output ---------
+error: 
+  --> SQL:1:40
+  |
+1 | CREATE CONNECTION IF NOT EXISTS my_conn
+  | ------                                 ^ unexpected end of input, expecting `STORAGE_TYPE`
+  | |                                      
+  | while parsing `CREATE [OR REPLACE] CONNECTION [IF NOT EXISTS] <connection_name> STORAGE_TYPE = <type> <storage_configs>`
+
+
+---------- Input ----------
+CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p)
+---------- Output ---------
+error: 
+  --> SQL:1:51
+  |
+1 | CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p)
+  | ------                                   --       ^^^
+  | |                                        |        |
+  | |                                        |        expecting an operand
+  | |                                        |        while parsing expression
+  | |                                        while parsing AS (<parameter [parameter type]>, ...) -> <definition expr>
+  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`
+
+
+---------- Input ----------
+CREATE FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript HANDLER = 'my_agg' ADDRESS = 'http://0.0.0.0:8815';
+---------- Output ---------
+error: 
+  --> SQL:1:85
+  |
+1 | CREATE FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript HANDLER = 'my_agg' ADDRESS = 'http://0.0.0.0:8815';
+  | ------                 -                                                            ^^^^^^^ unexpected `HANDLER`. it's reserved keyword, you may avoid using it, expecting `HEADERS`, `ADDRESS`, `PACKAGES`, `AS`, or `IMPORTS`
+  | |                      |                                                             
+  | |                      while parsing (<[arg_name] arg_type>, ...) STATE {<state_field>, ...} RETURNS <return_type> LANGUAGE <language> { ADDRESS=<udf_server_address> | AS <language_codes> } 
+  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`
+
+
+---------- Input ----------
+CREATE FUNCTION my_agg (INT) STATE { s STRIN } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';
+---------- Output ---------
+error: 
+  --> SQL:1:40
+  |
+1 | CREATE FUNCTION my_agg (INT) STATE { s STRIN } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';
+  | ------                 -               ^^^^^ unexpected `STRIN`, expecting `STRING`, `SIGNED`, `STRUCT`, `INTERVAL`, `TINYINT`, `VARIANT`, `SMALLINT`, `TINYBLOB`, `VARBINARY`, `INT8`, `UINT`, `TIME`, `JSON`, `INT16`, `INT32`, `INT64`, `UINT8`, `JSONB`, `BIGINT`, `UINT16`, `UINT32`, `UINT64`, `BINARY`, `HUGEINT`, `INTEGER`, `UHUGEINT`, `DATETIME`, `NUMERIC`, `TIMESTAMP`, `UNSIGNED`, `STAGE_LOCATION`, `TIMESTAMPTZ`, `TIMESTAMP_TZ`, `REAL`, `LIST`, `DATE`, `UUID`, `CHAR`, `TEXT`, `ARRAY`, `TUPLE`, `VECTOR`, `BOOLEAN`, `DECIMAL`, `VARCHAR`, `LONGBLOB`, `NULLABLE`, `CHARACTER`, `GEOGRAPHY`, `MEDIUMBLOB`, `BITMAP`, `TSQUERY`, `TSVECTOR`, `}`, `BOOL`, `INT`, `FLOAT32`, `FLOAT`, `FLOAT64`, `DOUBLE`, or 3 more ...
+  | |                      |                
+  | |                      while parsing (<[arg_name] arg_type>, ...) STATE {<state_field>, ...} RETURNS <return_type> LANGUAGE <language> { ADDRESS=<udf_server_address> | AS <language_codes> } 
+  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`
+
+
+---------- Input ----------
+drop table :a
+---------- Output ---------
+error: 
+  --> SQL:1:12
+  |
+1 | drop table :a
+  | ----       ^ unexpected `:`, expecting <Ident>, <LiteralString>, `IDENTIFIER`, or `IF`
+  | |           
+  | while parsing `DROP TABLE [IF EXISTS] [<database>.]<table>`
+
+
+---------- Input ----------
+drop table IDENTIFIER(a)
+---------- Output ---------
+error: 
+  --> SQL:1:23
+  |
+1 | drop table IDENTIFIER(a)
+  | ----                  ^ unexpected `a`, expecting `IdentVariable` or `:`
+  | |                      
+  | while parsing `DROP TABLE [IF EXISTS] [<database>.]<table>`
+
+
+---------- Input ----------
+drop table IDENTIFIER(:a)
+---------- Output ---------
+error: 
+  --> SQL:1:23
+  |
+1 | drop table IDENTIFIER(:a)
+  | ----                  ^ variable is only available in SQL template
+  | |                      
+  | while parsing `DROP TABLE [IF EXISTS] [<database>.]<table>`
+
+
+---------- Input ----------
+CREATE OR REPLACE DICTIONARY my_catalog.my_database.my_dictionary
+(
+    user_name String,
+    age Int16
+);
+---------- Output ---------
+error: 
+  --> SQL:5:2
+  |
+1 | CREATE OR REPLACE DICTIONARY my_catalog.my_database.my_dictionary
+  | ------ while parsing `CREATE [OR REPLACE] DICTIONARY [IF NOT EXISTS] <dictionary_name> [(<column>, ...)] PRIMARY KEY [<primary_key>, ...] SOURCE (<source_name> ([<source_options>])) [COMMENT <comment>] `
+2 | (
+3 |     user_name String,
+4 |     age Int16
+5 | );
+  |  ^ unexpected `;`, expecting `PRIMARY`
+
+
+---------- Input ----------
+CREATE OR REPLACE DICTIONARY my_catalog.my_database.my_dictionary
+(
+    user_name tuple(),
+    age Int16
+)
+PRIMARY KEY username
+SOURCE ()
+COMMENT 'This is a comment';
+---------- Output ---------
+error: 
+  --> SQL:3:21
+  |
+1 | CREATE OR REPLACE DICTIONARY my_catalog.my_database.my_dictionary
+  | ------ while parsing `CREATE [OR REPLACE] DICTIONARY [IF NOT EXISTS] <dictionary_name> [(<column>, ...)] PRIMARY KEY [<primary_key>, ...] SOURCE (<source_name> ([<source_options>])) [COMMENT <comment>] `
+2 | (
+3 |     user_name tuple(),
+  |     --------- ----- ^ unexpected `)`, expecting `BOOLEAN`, `BOOL`, `UINT8`, `TINYINT`, `UINT16`, `SMALLINT`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `UHUGEINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `HUGEINT`, `FLOAT32`, `FLOAT`, `REAL`, `FLOAT64`, `DOUBLE`, `DECIMAL`, `ARRAY`, `LIST`, `MAP`, `BITMAP`, `TUPLE`, `STRUCT`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMPTZ`, `DATETIME`, `INTERVAL`, `NUMERIC`, `BINARY`, `VARBINARY`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`, `BLOB`, `UUID`, `CHAR`, `CHARACTER`, `STRING`, `VARCHAR`, `TEXT`, `TSVECTOR`, `TSQUERY`, `JSON`, `JSONB`, `VARIANT`, `GEOMETRY`, `GEOGRAPHY`, `NULLABLE`, or 5 more ...
+  |     |         |      
+  |     |         while parsing type name
+  |     while parsing `<column name> <type> [PRIMARY KEY] [DEFAULT <expr>] [AS (<expr>) VIRTUAL] [AS (<expr>) STORED] [CHECK (<expr>)] [COMMENT '<comment>']`
+
+
+---------- Input ----------
+desc procedure p1
+---------- Output ---------
+error: 
+  --> SQL:1:18
+  |
+1 | desc procedure p1
+  | ----             ^ unexpected end of input, expecting `(`
+  | |                
+  | while parsing `DESC PROCEDURE <procedure_name>()`
+
+
+---------- Input ----------
+desc procedure p1(array, c int)
+---------- Output ---------
+error: 
+  --> SQL:1:24
+  |
+1 | desc procedure p1(array, c int)
+  | ----             ------^ unexpected `,`, expecting `(`
+  | |                ||     
+  | |                |while parsing type name
+  | |                while parsing (<type_name>, ...)
+  | while parsing `DESC PROCEDURE <procedure_name>()`
+
+
+---------- Input ----------
+drop procedure p1
+---------- Output ---------
+error: 
+  --> SQL:1:18
+  |
+1 | drop procedure p1
+  | ----             ^ unexpected end of input, expecting `(`
+  | |                
+  | while parsing `DROP PROCEDURE <procedure_name>()`
+
+
+---------- Input ----------
+drop procedure p1(a int)
+---------- Output ---------
+error: 
+  --> SQL:1:19
+  |
+1 | drop procedure p1(a int)
+  | ----              ^ unexpected `a`, expecting `DATE`, `ARRAY`, `VARCHAR`, `VARIANT`, `SMALLINT`, `DATETIME`, `VARBINARY`, `CHARACTER`, `STAGE_LOCATION`, `)`, `BOOLEAN`, `BOOL`, `UINT8`, `TINYINT`, `UINT16`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `UHUGEINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `HUGEINT`, `FLOAT32`, `FLOAT`, `REAL`, `FLOAT64`, `DOUBLE`, `DECIMAL`, `LIST`, `MAP`, `BITMAP`, `TUPLE`, `STRUCT`, `TIME`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMPTZ`, `INTERVAL`, `NUMERIC`, `BINARY`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`, `BLOB`, `UUID`, `CHAR`, `STRING`, `TEXT`, `TSVECTOR`, `TSQUERY`, `JSON`, `JSONB`, `GEOMETRY`, or 3 more ...
+  | |                  
+  | while parsing `DROP PROCEDURE <procedure_name>()`
+
+
+---------- Input ----------
+create PROCEDURE p1() returns table(string not null, int null) language sql comment = 'test' as $$
+BEGIN
+    LET sum := 0;
+    FOR x IN SELECT * FROM numbers(100) DO
+        sum := sum + x.number;
+    END FOR;
+    RETURN sum;
+END;
+$$;
+---------- Output ---------
+error: 
+  --> SQL:1:44
+  |
+1 | create PROCEDURE p1() returns table(string not null, int null) language sql comment = 'test' as $$
+  | ------                        -----        ^^^ unexpected `not`. it's reserved keyword, you may avoid using it, expecting `INT8`, `INT16`, `INT32`, `INT64`, `UINT16`, `UINT32`, `UINT64`, `INTEGER`, `FLOAT32`, `FLOAT64`, `INTERVAL`, `GEOMETRY`, `INT`, `BOOL`, `UINT`, `LIST`, `DATE`, `TIME`, `BLOB`, `TEXT`, `JSON`, `UINT8`, `FLOAT`, `TUPLE`, `JSONB`, `DOUBLE`, `BITMAP`, `STRUCT`, `BINARY`, `STRING`, `VECTOR`, `BOOLEAN`, `NUMERIC`, `TSQUERY`, `UNSIGNED`, `DATETIME`, `TSVECTOR`, `NULLABLE`, `TIMESTAMP`, `GEOGRAPHY`, `TIMESTAMPTZ`, `TIMESTAMP_TZ`, `TINYINT`, `LONGBLOB`, `TINYBLOB`, `STAGE_LOCATION`, `SMALLINT`, `BIGINT`, `UHUGEINT`, `SIGNED`, `HUGEINT`, `REAL`, `DECIMAL`, `ARRAY`, `MAP`, `VARBINARY`, `MEDIUMBLOB`, `UUID`, `CHAR`, `CHARACTER`, or 2 more ...
+  | |                             |             
+  | |                             while parsing TABLE(<var_name> <type_name>, ...)
+  | while parsing `CREATE [ OR REPLACE ] PROCEDURE <procedure_name>() RETURNS { <result_data_type> [ NOT NULL ] | TABLE(<var_name> <data_type>, ...)} LANGUAGE SQL [ COMMENT = '<string_literal>' ] AS <procedure_definition>`
+
+
+---------- Input ----------
+create PROCEDURE p1(int, string) returns table(string not null, int null) language sql comment = 'test' as $$
+BEGIN
+    LET sum := 0;
+    FOR x IN SELECT * FROM numbers(100) DO
+        sum := sum + x.number;
+    END FOR;
+    RETURN sum;
+END;
+$$;
+---------- Output ---------
+error: 
+  --> SQL:1:24
+  |
+1 | create PROCEDURE p1(int, string) returns table(string not null, int null) language sql comment = 'test' as $$
+  | ------             -   ^ unexpected `,`, expecting `BOOLEAN`, `BOOL`, `UINT8`, `TINYINT`, `UINT16`, `SMALLINT`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `UHUGEINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `HUGEINT`, `FLOAT32`, `FLOAT`, `REAL`, `FLOAT64`, `DOUBLE`, `DECIMAL`, `ARRAY`, `LIST`, `MAP`, `BITMAP`, `TUPLE`, `STRUCT`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMPTZ`, `DATETIME`, `INTERVAL`, `NUMERIC`, `BINARY`, `VARBINARY`, `LONGBLOB`, `MEDIUMBLOB`, `TINYBLOB`, `BLOB`, `UUID`, `CHAR`, `CHARACTER`, `STRING`, `VARCHAR`, `TEXT`, `TSVECTOR`, `TSQUERY`, `JSON`, `JSONB`, `VARIANT`, `GEOMETRY`, `GEOGRAPHY`, `NULLABLE`, or 2 more ...
+  | |                  |    
+  | |                  while parsing (<var_name> <type_name>, ...)
+  | while parsing `CREATE [ OR REPLACE ] PROCEDURE <procedure_name>() RETURNS { <result_data_type> [ NOT NULL ] | TABLE(<var_name> <data_type>, ...)} LANGUAGE SQL [ COMMENT = '<string_literal>' ] AS <procedure_definition>`
+
+

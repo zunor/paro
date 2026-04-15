@@ -1,0 +1,650 @@
+---------- Input ----------
+SET SECONDARY ROLES ALL
+---------- Output ---------
+SET SECONDARY ROLES ALL
+---------- AST ------------
+SetSecondaryRoles {
+    option: All,
+}
+
+
+---------- Input ----------
+SET SECONDARY ROLES NONE
+---------- Output ---------
+SET SECONDARY ROLES NONE
+---------- AST ------------
+SetSecondaryRoles {
+    option: None,
+}
+
+
+---------- Input ----------
+SET SECONDARY ROLES role1, role2
+---------- Output ---------
+SET SECONDARY ROLES role1, role2
+---------- AST ------------
+SetSecondaryRoles {
+    option: SpecifyRole(
+        [
+            "role1",
+            "role2",
+        ],
+    ),
+}
+
+
+---------- Input ----------
+SET ROLE `test-user`;
+---------- Output ---------
+SET ROLE 'test-user'
+---------- AST ------------
+SetRole {
+    is_default: false,
+    role_name: "test-user",
+}
+
+
+---------- Input ----------
+SET ROLE 'test-user';
+---------- Output ---------
+SET ROLE 'test-user'
+---------- AST ------------
+SetRole {
+    is_default: false,
+    role_name: "test-user",
+}
+
+
+---------- Input ----------
+SET ROLE ROLE1;
+---------- Output ---------
+SET ROLE 'ROLE1'
+---------- AST ------------
+SetRole {
+    is_default: false,
+    role_name: "ROLE1",
+}
+
+
+---------- Input ----------
+SET max_threads = 10;
+---------- Output ---------
+SET SESSION max_threads = 10
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Set,
+        settings: Settings {
+            set_type: SettingsSession,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        4..15,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: Expr(
+                [
+                    Literal {
+                        span: Some(
+                            18..20,
+                        ),
+                        value: UInt64(
+                            10,
+                        ),
+                    },
+                ],
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+SET max_threads = 10*2;
+---------- Output ---------
+SET SESSION max_threads = 10 * 2
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Set,
+        settings: Settings {
+            set_type: SettingsSession,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        4..15,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: Expr(
+                [
+                    BinaryOp {
+                        span: Some(
+                            20..21,
+                        ),
+                        op: Multiply,
+                        left: Literal {
+                            span: Some(
+                                18..20,
+                            ),
+                            value: UInt64(
+                                10,
+                            ),
+                        },
+                        right: Literal {
+                            span: Some(
+                                21..22,
+                            ),
+                            value: UInt64(
+                                2,
+                            ),
+                        },
+                    },
+                ],
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+SET global (max_threads, max_memory_usage) = (10*2, 10*4);
+---------- Output ---------
+SET GLOBAL (max_threads, max_memory_usage) = (10 * 2, 10 * 4)
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Set,
+        settings: Settings {
+            set_type: SettingsGlobal,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        12..23,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+                Identifier {
+                    span: Some(
+                        25..41,
+                    ),
+                    name: "max_memory_usage",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: Expr(
+                [
+                    BinaryOp {
+                        span: Some(
+                            48..49,
+                        ),
+                        op: Multiply,
+                        left: Literal {
+                            span: Some(
+                                46..48,
+                            ),
+                            value: UInt64(
+                                10,
+                            ),
+                        },
+                        right: Literal {
+                            span: Some(
+                                49..50,
+                            ),
+                            value: UInt64(
+                                2,
+                            ),
+                        },
+                    },
+                    BinaryOp {
+                        span: Some(
+                            54..55,
+                        ),
+                        op: Multiply,
+                        left: Literal {
+                            span: Some(
+                                52..54,
+                            ),
+                            value: UInt64(
+                                10,
+                            ),
+                        },
+                        right: Literal {
+                            span: Some(
+                                55..56,
+                            ),
+                            value: UInt64(
+                                4,
+                            ),
+                        },
+                    },
+                ],
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+UNSET max_threads;
+---------- Output ---------
+RESET SESSION max_threads
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Reset,
+        settings: Settings {
+            set_type: SettingsSession,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        6..17,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+UNSET session max_threads;
+---------- Output ---------
+RESET SESSION max_threads
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Reset,
+        settings: Settings {
+            set_type: SettingsSession,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        14..25,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+UNSET (max_threads, sql_dialect);
+---------- Output ---------
+RESET SESSION (max_threads, sql_dialect)
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Reset,
+        settings: Settings {
+            set_type: SettingsSession,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        7..18,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+                Identifier {
+                    span: Some(
+                        20..31,
+                    ),
+                    name: "sql_dialect",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+UNSET session (max_threads, sql_dialect);
+---------- Output ---------
+RESET SESSION (max_threads, sql_dialect)
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Reset,
+        settings: Settings {
+            set_type: SettingsSession,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        15..26,
+                    ),
+                    name: "max_threads",
+                    quote: None,
+                    ident_type: None,
+                },
+                Identifier {
+                    span: Some(
+                        28..39,
+                    ),
+                    name: "sql_dialect",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: None,
+        },
+    },
+)
+
+
+---------- Input ----------
+SET variable a = 3
+---------- Output ---------
+SET VARIABLE a = 3
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Set,
+        settings: Settings {
+            set_type: Variable,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        13..14,
+                    ),
+                    name: "a",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: Expr(
+                [
+                    Literal {
+                        span: Some(
+                            17..18,
+                        ),
+                        value: UInt64(
+                            3,
+                        ),
+                    },
+                ],
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+SET variable a = select 3
+---------- Output ---------
+SET VARIABLE a = SELECT 3
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Set,
+        settings: Settings {
+            set_type: Variable,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        13..14,
+                    ),
+                    name: "a",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: Query(
+                Query {
+                    span: Some(
+                        17..25,
+                    ),
+                    with: None,
+                    body: Select(
+                        SelectStmt {
+                            span: Some(
+                                17..25,
+                            ),
+                            hints: None,
+                            distinct: false,
+                            top_n: None,
+                            select_list: [
+                                AliasedExpr {
+                                    expr: Literal {
+                                        span: Some(
+                                            24..25,
+                                        ),
+                                        value: UInt64(
+                                            3,
+                                        ),
+                                    },
+                                    alias: None,
+                                },
+                            ],
+                            from: [],
+                            selection: None,
+                            group_by: None,
+                            having: None,
+                            window_list: None,
+                            qualify: None,
+                        },
+                    ),
+                    order_by: [],
+                    limit: [],
+                    offset: None,
+                    ignore_result: false,
+                },
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+SET variable a = (select max(number) from numbers(10))
+---------- Output ---------
+SET VARIABLE a = (SELECT max(number) FROM numbers(10))
+---------- AST ------------
+VariableSet(
+    VariableSetStmt {
+        kind: Set,
+        settings: Settings {
+            set_type: Variable,
+            identifiers: [
+                Identifier {
+                    span: Some(
+                        13..14,
+                    ),
+                    name: "a",
+                    quote: None,
+                    ident_type: None,
+                },
+            ],
+            values: Expr(
+                [
+                    Subquery {
+                        span: Some(
+                            17..54,
+                        ),
+                        modifier: None,
+                        subquery: Query {
+                            span: Some(
+                                18..53,
+                            ),
+                            with: None,
+                            body: Select(
+                                SelectStmt {
+                                    span: Some(
+                                        18..53,
+                                    ),
+                                    hints: None,
+                                    distinct: false,
+                                    top_n: None,
+                                    select_list: [
+                                        AliasedExpr {
+                                            expr: FunctionCall {
+                                                span: Some(
+                                                    25..36,
+                                                ),
+                                                func: FunctionCall {
+                                                    distinct: false,
+                                                    schema: None,
+                                                    name: Identifier {
+                                                        span: Some(
+                                                            25..28,
+                                                        ),
+                                                        name: "max",
+                                                        quote: None,
+                                                        ident_type: None,
+                                                    },
+                                                    args: [
+                                                        ColumnRef {
+                                                            span: Some(
+                                                                29..35,
+                                                            ),
+                                                            column: ColumnRef {
+                                                                schema: None,
+                                                                table: None,
+                                                                column: Name(
+                                                                    Identifier {
+                                                                        span: Some(
+                                                                            29..35,
+                                                                        ),
+                                                                        name: "number",
+                                                                        quote: None,
+                                                                        ident_type: None,
+                                                                    },
+                                                                ),
+                                                            },
+                                                        },
+                                                    ],
+                                                    params: [],
+                                                    order_by: [],
+                                                    filter: None,
+                                                    window: None,
+                                                    lambda: None,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ],
+                                    from: [
+                                        TableFunction {
+                                            span: Some(
+                                                42..53,
+                                            ),
+                                            lateral: false,
+                                            name: Identifier {
+                                                span: Some(
+                                                    42..49,
+                                                ),
+                                                name: "numbers",
+                                                quote: None,
+                                                ident_type: None,
+                                            },
+                                            params: [
+                                                Literal {
+                                                    span: Some(
+                                                        50..52,
+                                                    ),
+                                                    value: UInt64(
+                                                        10,
+                                                    ),
+                                                },
+                                            ],
+                                            named_params: [],
+                                            alias: None,
+                                            with_ordinality: false,
+                                            sample: None,
+                                        },
+                                    ],
+                                    selection: None,
+                                    group_by: None,
+                                    having: None,
+                                    window_list: None,
+                                    qualify: None,
+                                },
+                            ),
+                            order_by: [],
+                            limit: [],
+                            offset: None,
+                            ignore_result: false,
+                        },
+                    },
+                ],
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+show all
+---------- Output ---------
+SHOW ALL
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: All,
+    },
+)
+
+
+---------- Input ----------
+show max_memory_usage
+---------- Output ---------
+SHOW max_memory_usage
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..21,
+                ),
+                name: "max_memory_usage",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+USE WAREHOUSE my_wh
+---------- Output ---------
+USE WAREHOUSE my_wh
+---------- AST ------------
+UseWarehouse(
+    UseWarehouseStmt {
+        warehouse: Identifier {
+            span: Some(
+                14..19,
+            ),
+            name: "my_wh",
+            quote: None,
+            ident_type: None,
+        },
+    },
+)
+
+

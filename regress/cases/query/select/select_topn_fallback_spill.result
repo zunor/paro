@@ -1,0 +1,102 @@
+INSERT INTO topn_fallback_spill_case
+SELECT g, 7001 - g
+FROM generate_series(1, 7000) AS t(g);
+INSERT 0 7000
+
+EXPLAIN
+SELECT id
+FROM topn_fallback_spill_case
+ORDER BY score DESC
+LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id
+  ->  TOP_N  (rows=3)
+        Sort Key: score DESC NULLS FIRST
+        Limit: 3
+        ->  PROJECTION  (rows=7000)
+              Output: id, score
+              ->  ROWSET_SCAN on public.topn_fallback_spill_case
+                    Columns: id, score
+
+SELECT id
+FROM topn_fallback_spill_case
+ORDER BY score DESC
+LIMIT 3;
+id
+1
+2
+3
+
+EXPLAIN
+SELECT id
+FROM topn_fallback_spill_case
+ORDER BY id
+LIMIT 5 OFFSET 6000;
+QUERY PLAN
+PROJECTION  (rows=5)
+  Output: id
+  ->  STREAMING_LIMIT
+        Limit: 5
+        Offset: 6000
+        ->  ORDER_BY
+              Sort Key: id ASC NULLS LAST
+              ->  PROJECTION  (rows=7000)
+                    Output: id, id
+                    ->  ROWSET_SCAN on public.topn_fallback_spill_case
+                          Columns: id
+
+SELECT id
+FROM topn_fallback_spill_case
+ORDER BY id
+LIMIT 5 OFFSET 6000;
+id
+6001
+6002
+6003
+6004
+6005
+
+SET temp_directory = '/tmp/paro_regress_topn_spill';
+SET
+
+SET force_external = true;
+SET
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT id
+FROM topn_fallback_spill_case
+ORDER BY score DESC
+LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3) (actual time=24.199..24.205 rows=3 loops=1)
+  Output: id
+  ->  STREAMING_LIMIT (actual time=24.188..25.996 rows=3 loops=4)
+        Limit: 3
+        ->  ORDER_BY (actual time=10.494..26.003 rows=14000 loops=7)
+              Sort Key: score DESC NULLS FIRST
+              Sort Method: external merge
+              Spilled: true
+              Peak Memory: 0 B
+              ->  PROJECTION  (rows=7000) (actual time=10.481..13.281 rows=7000 loops=2)
+                    Output: id, score
+                    ->  ROWSET_SCAN on public.topn_fallback_spill_case (actual time=0.148..15.051 rows=7000 loops=3)
+                          Columns: id, score
+Execution Time: 3.659 ms
+Rows Returned: 3
+
+SELECT id
+FROM topn_fallback_spill_case
+ORDER BY score DESC
+LIMIT 3;
+id
+1
+2
+3
+
+SET force_external = DEFAULT;
+SET
+
+SET temp_directory = DEFAULT;
+SET

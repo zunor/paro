@@ -1,0 +1,10 @@
+---------- Input ----------
+SET SECONDARY ROLES
+---------- Output ---------
+error: 
+  --> SQL:1:20
+  |
+1 | SET SECONDARY ROLES
+  |                    ^ unexpected end of input, expecting `ALL`, `NONE`, <Ident>, <LiteralString>, or `IDENTIFIER`
+
+

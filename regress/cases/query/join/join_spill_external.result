@@ -1,0 +1,205 @@
+INSERT INTO join_spill_l VALUES
+  (1, 1, 10, 5),
+  (2, 1, 20, 7),
+  (3, 2, 30, 9),
+  (4, 3, 40, 11),
+  (5, NULL, 50, 13),
+  (6, 4, 60, 15);
+INSERT 0 6
+
+INSERT INTO join_spill_r VALUES
+  (10, 1, 10, 6, 'r10'),
+  (11, 1, 20, 8, 'r11'),
+  (12, 2, 30, 10, 'r12'),
+  (13, 2, 99, 12, 'r13'),
+  (14, 3, 40, 9, 'r14'),
+  (15, NULL, 50, 20, 'r15_null'),
+  (16, 5, 70, 30, 'r16');
+INSERT 0 7
+
+SET temp_directory = '/tmp/paro_regress_join_spill';
+SET
+
+SET max_temp_directory_size = '256MB';
+SET
+
+SET force_external = true;
+SET
+
+SET threads = 1;
+SET
+
+SELECT l.id, r.payload
+FROM join_spill_l l
+INNER JOIN join_spill_r r
+  ON l.k1 = r.k1 AND l.k2 = r.k2
+ORDER BY l.id;
+l.id	r.payload
+1	r10
+2	r11
+3	r12
+4	r14
+
+SELECT l.id AS l_id, r.id AS r_id, r.payload
+FROM join_spill_l l
+LEFT JOIN join_spill_r r
+  ON l.k1 = r.k1 AND l.k2 = r.k2
+ORDER BY l.id;
+l_id	r_id	r.payload
+1	10	r10
+2	11	r11
+3	12	r12
+4	14	r14
+5	NULL	NULL
+6	NULL	NULL
+
+SELECT l.id AS l_id, r.id AS r_id, r.payload
+FROM join_spill_l l
+RIGHT JOIN join_spill_r r
+  ON l.k1 = r.k1 AND l.k2 = r.k2
+ORDER BY r.id;
+l_id	r_id	r.payload
+1	10	r10
+2	11	r11
+3	12	r12
+NULL	13	r13
+4	14	r14
+NULL	15	r15_null
+NULL	16	r16
+
+SELECT l.id AS l_id, r.id AS r_id, r.payload
+FROM join_spill_l l
+FULL JOIN join_spill_r r
+  ON l.k1 = r.k1 AND l.k2 = r.k2
+ORDER BY COALESCE(l.id, 1000000), COALESCE(r.id, 1000000);
+l_id	r_id	r.payload
+1	10	r10
+2	11	r11
+3	12	r12
+4	14	r14
+5	NULL	NULL
+6	NULL	NULL
+NULL	13	r13
+NULL	15	r15_null
+NULL	16	r16
+
+SELECT l.id AS l_id, r.id AS r_id
+FROM join_spill_l l
+JOIN join_spill_r r
+  ON l.k1 = r.k1 AND l.k2 = r.k2 AND l.v < r.v
+ORDER BY l.id;
+l_id	r_id
+1	10
+2	11
+3	12
+
+SELECT l.id
+FROM join_spill_l l
+SEMI JOIN join_spill_r r
+  ON l.k1 = r.k1
+ORDER BY l.id;
+l.id
+1
+2
+3
+4
+
+SELECT l.id
+FROM join_spill_l l
+ANTI JOIN join_spill_r r
+  ON l.k1 = r.k1
+ORDER BY l.id;
+l.id
+5
+6
+
+SELECT l.id, l.k1 IN (SELECT r.k1 FROM join_spill_r r) AS in_rhs
+FROM join_spill_l l
+ORDER BY l.id;
+l.id	in_rhs
+1	true
+2	true
+3	true
+4	true
+5	NULL
+6	NULL
+
+SELECT r.id
+FROM join_spill_l l
+RIGHT SEMI JOIN join_spill_r r
+  ON l.k1 = r.k1
+ORDER BY r.id;
+r.id
+10
+11
+12
+13
+14
+
+SELECT r.id
+FROM join_spill_l l
+RIGHT ANTI JOIN join_spill_r r
+  ON l.k1 = r.k1
+ORDER BY r.id;
+r.id
+15
+16
+
+CREATE TABLE join_spill_skew_l(k INT, v INT);
+CREATE TABLE
+
+CREATE TABLE join_spill_skew_r(k INT, v INT);
+CREATE TABLE
+
+INSERT INTO join_spill_skew_l
+SELECT
+  CASE WHEN g <= 2000 THEN 1 ELSE g END,
+  g
+FROM generate_series(1, 3000) AS t(g);
+INSERT 0 3000
+
+INSERT INTO join_spill_skew_r
+SELECT
+  CASE WHEN g <= 1500 THEN 1 ELSE g END,
+  g
+FROM generate_series(1, 3000) AS t(g);
+INSERT 0 3000
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT count(r.v)
+FROM join_spill_skew_l l
+LEFT JOIN join_spill_skew_r r
+  ON l.k = r.k;
+QUERY PLAN
+PROJECTION  (rows=1) (actual time=2125.496..2125.501 rows=1 loops=1)
+  Output: count
+  ->  UNGROUPED_AGGREGATE  (rows=1) (actual time=307.358..2125.508 rows=3001001 loops=1518)
+        Aggregates: COUNT(v)
+        Peak Memory: 80 B
+        ->  PROJECTION (actual time=307.347..2124.104 rows=3001000 loops=1516)
+              Output: v
+              ->  HASH_JOIN  (rows=900000) (actual time=5.278..2125.378 rows=3004000 loops=1519)
+                    Join Type: LEFT
+                    Join Condition: k = k
+                    Spilled: true
+                    Peak Memory: 57.6 MB
+                    Temp Storage: 128 B
+                    ->  ROWSET_SCAN on public.join_spill_skew_l l (actual time=297.026..307.392 rows=3000 loops=2)
+                          Columns: k
+                    ->  ROWSET_SCAN on public.join_spill_skew_r r (actual time=0.216..9.374 rows=3000 loops=2)
+                          Columns: k, v
+Execution Time: 0.066 ms
+Rows Returned: 1
+
+SET force_external = DEFAULT;
+SET
+
+SET threads = DEFAULT;
+SET
+
+SET max_temp_directory_size = DEFAULT;
+SET
+
+SET temp_directory = DEFAULT;
+SET

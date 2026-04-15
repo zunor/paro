@@ -1,0 +1,168 @@
+SELECT
+  o.id,
+  o.grp,
+  EXISTS(
+    SELECT 1
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.grp = o.grp
+      AND d.bucket IN ('A', 'B')
+      AND l.kind <> 'blocked'
+  ) AS has_join_match
+FROM join_subquery_outer AS o
+ORDER BY o.id;
+o.id	o.grp	has_join_match
+1	10	true
+2	20	true
+3	20	true
+4	30	true
+5	NULL	false
+6	40	false
+7	50	false
+
+SELECT
+  o.id,
+  o.amt IN (
+    SELECT l.quota
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.grp = o.grp
+      AND d.bucket <> 'C'
+  ) AS amt_in_joined_lookup,
+  o.amt NOT IN (
+    SELECT l.quota
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.grp = o.grp
+      AND d.bucket <> 'C'
+  ) AS amt_not_in_joined_lookup
+FROM join_subquery_outer AS o
+ORDER BY o.id;
+o.id	amt_in_joined_lookup	amt_not_in_joined_lookup
+1	true	false
+2	true	false
+3	true	false
+4	true	false
+5	false	true
+6	false	true
+7	false	true
+
+SELECT
+  o.id,
+  o.amt > ANY (
+    SELECT l.quota
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.grp = o.grp
+      AND d.bucket IN ('A', 'B')
+      AND l.quota IS NOT NULL
+  ) AS gt_any_quota,
+  o.amt = ALL (
+    SELECT l.quota
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.grp = o.grp
+      AND d.bucket IN ('A', 'B')
+      AND l.kind = 'keep'
+  ) AS eq_all_keep_quota
+FROM join_subquery_outer AS o
+ORDER BY o.id;
+o.id	gt_any_quota	eq_all_keep_quota
+1	false	true
+2	true	false
+3	false	true
+4	false	true
+5	false	true
+6	false	true
+7	false	true
+
+SELECT o.id, o.label
+FROM join_subquery_outer AS o
+WHERE EXISTS(
+  SELECT 1
+  FROM (
+    SELECT l.grp AS grp, l.quota AS quota
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.kind IN ('keep', 'alt')
+  ) AS rhs(grp, quota)
+  WHERE rhs.grp = o.grp
+    AND rhs.quota >= o.amt
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+3	gamma
+4	delta
+
+SELECT o.id, o.label
+FROM join_subquery_outer AS o
+WHERE NOT EXISTS(
+  SELECT 1
+  FROM join_subquery_lookup AS l
+  JOIN join_subquery_dim AS d ON d.grp = l.grp
+  WHERE l.grp = o.grp
+    AND d.bucket = 'A'
+    AND l.kind = 'keep'
+)
+ORDER BY o.id;
+o.id	o.label
+4	delta
+5	null_grp
+6	nullable_only_grp
+7	missing_grp
+
+SELECT o.id, p.note
+FROM join_subquery_outer AS o
+JOIN join_subquery_probe AS p ON p.id = o.id
+WHERE o.amt IN (
+  SELECT l.quota
+  FROM join_subquery_lookup AS l
+  JOIN join_subquery_dim AS d ON d.grp = l.grp
+  WHERE l.grp = o.grp
+    AND d.bucket IN ('A', 'B')
+    AND l.kind = 'keep'
+)
+ORDER BY o.id, p.note;
+o.id	p.note
+1	p1
+3	p3
+
+SELECT o.id, o.label
+FROM join_subquery_outer AS o
+WHERE o.amt = ALL (
+  SELECT l.quota
+  FROM join_subquery_lookup AS l
+  JOIN join_subquery_dim AS d ON d.grp = l.grp
+  WHERE l.grp = o.grp
+    AND d.bucket = 'A'
+    AND l.kind = 'keep'
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+3	gamma
+4	delta
+5	null_grp
+6	nullable_only_grp
+7	missing_grp
+
+SELECT
+  o.id,
+  o.amt > ANY (
+    SELECT l.quota
+    FROM join_subquery_lookup AS l
+    JOIN join_subquery_dim AS d ON d.grp = l.grp
+    WHERE l.grp = o.grp
+      AND d.bucket = 'C'
+  ) AS gt_any_bucket_c
+FROM join_subquery_outer AS o
+ORDER BY o.id;
+o.id	gt_any_bucket_c
+1	false
+2	false
+3	false
+4	false
+5	false
+6	NULL
+7	false

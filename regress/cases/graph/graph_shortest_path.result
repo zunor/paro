@@ -1,0 +1,294 @@
+CREATE TABLE sp_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE sp_follows (src_id BIGINT, dst_id BIGINT, weight INT);
+CREATE TABLE
+
+INSERT INTO sp_person VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D'), (5, 'E');
+INSERT 0 5
+
+INSERT INTO sp_follows VALUES
+    (1, 2, 10),
+    (2, 3, 20),
+    (3, 4, 30),
+    (4, 5, 40),
+    (1, 3, 50),
+    (2, 4, 60);
+INSERT 0 6
+
+CREATE PROPERTY GRAPH sp_graph
+VERTEX TABLES (
+    sp_person LABEL Node
+)
+EDGE TABLES (
+    sp_follows
+        SOURCE KEY (src_id) REFERENCES sp_person (id)
+        DESTINATION KEY (dst_id) REFERENCES sp_person (id)
+        LABEL Follows
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+A	E
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name = 'B')-[e:Follows]->{1,3}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+B	C
+B	D
+B	E
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name = 'E')-[e:Follows]->{1,3}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ALL SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+A	D
+A	E
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->+(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+A	E
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ALL SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{2,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	D
+A	E
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.name IN ('A', 'B'))-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+B	C
+B	D
+B	E
+
+SET temp_directory = '/tmp/paro_regress_graph_spill';
+SET
+
+SET force_external = true;
+SET
+
+SELECT * FROM GRAPH_TABLE(sp_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node WHERE b.name = 'E')
+    COLUMNS (a.name AS src, b.name AS dst, path_length(p) AS hops)
+) gt;
+gt.src	gt.dst	gt.hops
+A	E	3
+
+SET force_external = DEFAULT;
+SET
+
+SET temp_directory = DEFAULT;
+SET
+
+CREATE TABLE sp_dense_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE sp_dense_follows (src_id BIGINT, dst_id BIGINT);
+CREATE TABLE
+
+INSERT INTO sp_dense_person VALUES
+    (1, 'N1'), (2, 'N2'), (3, 'N3'), (4, 'N4'), (5, 'N5'), (6, 'N6'), (7, 'N7'), (8, 'N8'),
+    (9, 'N9'), (10, 'N10'), (11, 'N11'), (12, 'N12'), (13, 'N13'), (14, 'N14'), (15, 'N15'),
+    (16, 'N16'), (17, 'N17'), (18, 'N18'), (19, 'N19'), (20, 'N20'), (21, 'N21'), (22, 'N22'),
+    (23, 'N23'), (24, 'N24'), (25, 'N25'), (26, 'N26'), (27, 'N27'), (28, 'N28'), (29, 'N29'),
+    (30, 'N30'), (31, 'N31'), (32, 'N32'), (33, 'N33'), (34, 'N34'), (35, 'N35'), (36, 'N36'),
+    (37, 'N37'), (38, 'N38'), (39, 'N39'), (40, 'N40'), (41, 'N41'), (42, 'N42'), (43, 'N43'),
+    (44, 'N44'), (45, 'N45'), (46, 'N46'), (47, 'N47'), (48, 'N48'), (49, 'N49'), (50, 'N50'),
+    (51, 'N51'), (52, 'N52'), (53, 'N53'), (54, 'N54'), (55, 'N55'), (56, 'N56'), (57, 'N57'),
+    (58, 'N58'), (59, 'N59'), (60, 'N60'), (61, 'N61'), (62, 'N62'), (63, 'N63'), (64, 'N64');
+INSERT 0 64
+
+INSERT INTO sp_dense_follows VALUES
+    (1, 2),
+    (1, 3),
+    (2, 4);
+INSERT 0 3
+
+CREATE PROPERTY GRAPH sp_dense_graph
+VERTEX TABLES (
+    sp_dense_person LABEL Node
+)
+EDGE TABLES (
+    sp_dense_follows
+        SOURCE KEY (src_id) REFERENCES sp_dense_person (id)
+        DESTINATION KEY (dst_id) REFERENCES sp_dense_person (id)
+        LABEL Follows
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(sp_dense_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.id = 1)-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.hops
+1	2	1
+1	3	1
+1	4	2
+
+DROP PROPERTY GRAPH sp_dense_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE sp_dense_follows;
+DROP TABLE
+
+DROP TABLE sp_dense_person;
+DROP TABLE
+
+CREATE TABLE sp_batch_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE sp_batch_follows (src_id BIGINT, dst_id BIGINT);
+CREATE TABLE
+
+INSERT INTO sp_batch_person
+SELECT i, 'B' || i::VARCHAR
+FROM generate_series(1, 2051) AS t(i);
+INSERT 0 2051
+
+INSERT INTO sp_batch_follows
+SELECT 1, i
+FROM generate_series(2, 2051) AS t(i);
+INSERT 0 2050
+
+CREATE PROPERTY GRAPH sp_batch_graph
+VERTEX TABLES (
+    sp_batch_person LABEL Node
+)
+EDGE TABLES (
+    sp_batch_follows
+        SOURCE KEY (src_id) REFERENCES sp_batch_person (id)
+        DESTINATION KEY (dst_id) REFERENCES sp_batch_person (id)
+        LABEL Follows
+);
+CREATE PROPERTY GRAPH
+
+SELECT count(*) AS total_rows, min(dst) AS min_dst, max(dst) AS max_dst
+FROM GRAPH_TABLE(sp_batch_graph
+    MATCH ANY SHORTEST (a:Node WHERE a.id = 1)-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (b.id AS dst)
+) gt;
+total_rows	min_dst	max_dst
+2050	2	2051
+
+SELECT count(*) AS total_rows, min(hops) AS min_hops, max(hops) AS max_hops
+FROM GRAPH_TABLE(sp_batch_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.id = 1)-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (b.id AS dst, path_length(p) AS hops)
+) gt;
+total_rows	min_hops	max_hops
+2050	1	1
+
+SELECT count(*) AS total_rows, min(dst) AS min_dst, max(dst) AS max_dst
+FROM GRAPH_TABLE(sp_batch_graph
+    MATCH ALL SHORTEST (a:Node WHERE a.id = 1)-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (b.id AS dst)
+) gt;
+total_rows	min_dst	max_dst
+2050	2	2051
+
+SET temp_directory = '/tmp/paro_regress_graph_spill';
+SET
+
+SET force_external = true;
+SET
+
+SELECT count(*) AS total_rows, min(hops) AS min_hops, max(hops) AS max_hops
+FROM GRAPH_TABLE(sp_batch_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.id = 1)-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (b.id AS dst, path_length(p) AS hops)
+) gt;
+total_rows	min_hops	max_hops
+2050	1	1
+
+SET force_external = DEFAULT;
+SET
+
+SET temp_directory = DEFAULT;
+SET
+
+DROP PROPERTY GRAPH sp_batch_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE sp_batch_follows;
+DROP TABLE
+
+DROP TABLE sp_batch_person;
+DROP TABLE
+
+DROP PROPERTY GRAPH sp_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE sp_follows;
+DROP TABLE
+
+DROP TABLE sp_person;
+DROP TABLE

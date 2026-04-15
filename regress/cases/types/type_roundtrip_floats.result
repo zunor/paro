@@ -1,0 +1,27 @@
+CREATE TABLE type_roundtrip_floats (
+  id INT,
+  f FLOAT,
+  d DOUBLE
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_floats VALUES
+  (1, 0.0, 0.0),
+  (2, -0.0, -0.0),
+  (3, 1.5, 2.25),
+  (4, CAST('nan' AS FLOAT), CAST('nan' AS DOUBLE)),
+  (5, CAST('inf' AS FLOAT), CAST('-inf' AS DOUBLE)),
+  (6, NULL, NULL);
+INSERT 0 6
+
+-- @query rowsort
+SELECT id, f, d
+FROM type_roundtrip_floats
+ORDER BY id;
+id	f	d
+1	0.000000	0.000000
+2	0.000000	0.000000
+3	1.500000	2.250000
+4	nan	nan
+5	inf	-inf
+6	NULL	NULL

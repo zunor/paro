@@ -1,0 +1,61 @@
+INSERT INTO dml_copy_explain_src VALUES
+  (1, 'alpha'),
+  (2, 'beta'),
+  (3, 'gamma');
+INSERT 0 3
+
+EXPLAIN COPY dml_copy_explain_src
+TO '/tmp/paro_copy_t4_6_explain.csv'
+WITH (FORMAT csv, HEADER true);
+QUERY PLAN
+COPY_TO_FILE  (rows=1)
+  File: /tmp/paro_copy_t4_6_explain.csv
+  PerThreadOutput: false
+  ->  PROJECTION  (rows=3)
+        Output: id, name
+        ->  ROWSET_SCAN on public.dml_copy_explain_src
+              Columns: id, name
+
+COPY dml_copy_explain_src
+TO '/tmp/paro_copy_t4_6_explain.csv'
+WITH (FORMAT csv, HEADER true);
+COPY 3
+
+EXPLAIN COPY dml_copy_explain_dst
+FROM '/tmp/paro_copy_t4_6_explain.csv'
+WITH (FORMAT csv, HEADER true);
+QUERY PLAN
+INSERT  (rows=1)
+  Table: dml_copy_explain_dst
+  Column Mapping: input#0->id, input#1->name
+  ->  TABLE_FUNCTION_SCAN  (rows=100)
+
+EXPLAIN COPY dml_copy_explain_dst
+FROM '/tmp/paro_copy_t4_6_explain.csv'
+WITH (FORMAT csv, HEADER true)
+WHERE id >= 2;
+QUERY PLAN
+INSERT  (rows=1)
+  Table: dml_copy_explain_dst
+  Column Mapping: input#0->id, input#1->name
+  ->  FILTER  (rows=30)
+        Filter: (id >= 2)
+        ->  TABLE_FUNCTION_SCAN  (rows=100)
+
+SELECT COUNT(*) AS copied_rows
+FROM dml_copy_explain_dst;
+copied_rows
+0
+
+COPY dml_copy_explain_dst
+FROM '/tmp/paro_copy_t4_6_explain.csv'
+WITH (FORMAT csv, HEADER true)
+WHERE id >= 2;
+COPY 2
+
+SELECT COUNT(*) AS copied_rows,
+       MIN(id) AS min_id,
+       MAX(id) AS max_id
+FROM dml_copy_explain_dst;
+copied_rows	min_id	max_id
+2	2	3

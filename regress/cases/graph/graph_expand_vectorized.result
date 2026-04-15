@@ -1,0 +1,175 @@
+CREATE TABLE ev_person (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR,
+    age INT
+);
+CREATE TABLE
+
+CREATE TABLE ev_knows (
+    src_id BIGINT,
+    dst_id BIGINT,
+    weight INT
+);
+CREATE TABLE
+
+INSERT INTO ev_person VALUES
+    (1, 'Alice',   30),
+    (2, 'Bob',     25),
+    (3, 'Charlie', 35),
+    (4, 'Diana',   28),
+    (5, 'Eve',     40);
+INSERT 0 5
+
+INSERT INTO ev_knows VALUES
+    (1, 2, 10),
+    (1, 3, 20),
+    (2, 4, 30),
+    (3, 5, 40),
+    (4, 5, 50);
+INSERT 0 5
+
+CREATE PROPERTY GRAPH ev_graph
+VERTEX TABLES (
+    ev_person LABEL Person
+)
+EDGE TABLES (
+    ev_knows
+        SOURCE KEY (src_id) REFERENCES ev_person (id)
+        DESTINATION KEY (dst_id) REFERENCES ev_person (id)
+        LABEL Knows
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(ev_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[e:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Bob	25
+Alice	Charlie	35
+
+SELECT * FROM GRAPH_TABLE(ev_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst
+Alice	Bob
+Alice	Charlie
+Bob	Diana
+Charlie	Eve
+Diana	Eve
+
+SELECT * FROM GRAPH_TABLE(ev_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person WHERE b.age > 30)
+    COLUMNS (a.name AS src, b.name AS dst, b.age AS dst_age)
+) gt
+ORDER BY src, dst;
+gt.src	gt.dst	gt.dst_age
+Alice	Charlie	35
+Charlie	Eve	40
+Diana	Eve	40
+
+SELECT * FROM GRAPH_TABLE(ev_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[e:Knows]->{1,2}(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+Alice	Eve
+
+SELECT * FROM GRAPH_TABLE(ev_graph
+    MATCH (a:Person WHERE a.name = 'Alice')-[e:Knows]->{1,3}(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+Alice	Bob
+Alice	Charlie
+Alice	Diana
+Alice	Eve
+
+DROP PROPERTY GRAPH ev_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE ev_knows;
+DROP TABLE
+
+DROP TABLE ev_person;
+DROP TABLE
+
+CREATE TABLE ev_hub (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR
+);
+CREATE TABLE
+
+CREATE TABLE ev_leaf (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR
+);
+CREATE TABLE
+
+CREATE TABLE ev_star_edge (
+    hub_id BIGINT,
+    leaf_id BIGINT
+);
+CREATE TABLE
+
+INSERT INTO ev_hub VALUES (1, 'Hub');
+INSERT 0 1
+
+INSERT INTO ev_leaf
+SELECT i, 'Leaf' || i::VARCHAR FROM generate_series(1, 100) AS t(i);
+INSERT 0 100
+
+INSERT INTO ev_star_edge
+SELECT 1, i FROM generate_series(1, 100) AS t(i);
+INSERT 0 100
+
+CREATE PROPERTY GRAPH ev_star_graph
+VERTEX TABLES (
+    ev_hub LABEL Hub,
+    ev_leaf LABEL Leaf
+)
+EDGE TABLES (
+    ev_star_edge
+        SOURCE KEY (hub_id) REFERENCES ev_hub (id)
+        DESTINATION KEY (leaf_id) REFERENCES ev_leaf (id)
+        LABEL StarEdge
+);
+CREATE PROPERTY GRAPH
+
+SELECT COUNT(*) AS edge_count FROM GRAPH_TABLE(ev_star_graph
+    MATCH (h:Hub)-[e:StarEdge]->(l:Leaf)
+    COLUMNS (h.name AS hub, l.name AS leaf)
+) gt;
+edge_count
+100
+
+SELECT * FROM GRAPH_TABLE(ev_star_graph
+    MATCH (h:Hub)-[e:StarEdge]->(l:Leaf)
+    COLUMNS (h.name AS hub, l.name AS leaf)
+) gt
+WHERE gt.leaf IN ('Leaf1', 'Leaf50', 'Leaf100')
+ORDER BY gt.leaf;
+gt.hub	gt.leaf
+Hub	Leaf1
+Hub	Leaf100
+Hub	Leaf50
+
+DROP PROPERTY GRAPH ev_star_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE ev_star_edge;
+DROP TABLE
+
+DROP TABLE ev_leaf;
+DROP TABLE
+
+DROP TABLE ev_hub;
+DROP TABLE

@@ -1,0 +1,31 @@
+[package]
+name = "paro-server"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+manual-slice-fill = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-catalog = { workspace = true }
+paro-session = { workspace = true }
+paro-instance = { workspace = true }
+paro-execution = { workspace = true }
+paro-parser = { workspace = true }
+paro-function = { workspace = true }
+paro-storage = { workspace = true }
+pgwire = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+bytesize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+serial_test = { workspace = true }

@@ -1,0 +1,25 @@
+CREATE TABLE type_roundtrip_list (
+  id INT,
+  ints LIST(INTEGER),
+  words LIST(VARCHAR),
+  nums LIST(DOUBLE),
+  flags LIST(BOOLEAN)
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_list VALUES
+  (1, [1, 2, 3], ['alpha', 'beta'], [1.5, 2.5], [true, false, NULL]),
+  (2, [42, -7], ['hello', ''], [0.0], NULL),
+  (3, NULL, NULL, NULL, []),
+  (4, [0, 1, 2, 3], ['x', 'y', 'z'], [3.14, -2.0], [NULL, true]);
+INSERT 0 4
+
+-- @query rowsort
+SELECT id, ints, words, nums, flags
+FROM type_roundtrip_list
+ORDER BY id;
+id	ints	words	nums	flags
+1	[1.000000, 2.000000, 3.000000]	['alpha', 'beta']	[1.500000, 2.500000]	[True, False, None]
+2	[42.000000, -7.000000]	['hello', '']	[0.000000]	NULL
+3	NULL	NULL	NULL	[]
+4	[0.000000, 1.000000, 2.000000, 3.000000]	['x', 'y', 'z']	[3.140000, -2.000000]	[None, True]

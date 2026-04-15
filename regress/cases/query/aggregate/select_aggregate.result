@@ -1,0 +1,1051 @@
+CREATE TABLE agg_phase0 (
+    grp INT,
+    x INT,
+    y INT,
+    flag BOOLEAN,
+    label VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO agg_phase0 VALUES
+    (1, 1, 1, true, 'a'),
+    (1, 2, 2, false, 'b'),
+    (1, 2, 3, true, 'c'),
+    (2, 3, 1, true, 'd'),
+    (2, 4, 4, false, 'e'),
+    (2, NULL, 5, true, 'f');
+INSERT 0 6
+
+SELECT count(*) FROM agg_phase0;
+COUNT(*)
+6
+
+SELECT sum(x) FROM agg_phase0;
+sum(x)
+12
+
+SELECT count(*) + sum(x) FROM agg_phase0;
+COUNT(*) + sum(x)
+18
+
+SELECT count(DISTINCT x) FROM agg_phase0;
+count(DISTINCT x)
+4
+
+SELECT sum(x) FILTER (WHERE flag) FROM agg_phase0;
+sum(x) FILTER (WHERE flag)
+6
+
+SELECT grp + 10 AS g, sum(x * 2) FILTER (WHERE y >= 2) AS filtered_sum
+FROM agg_phase0
+GROUP BY grp + 10
+ORDER BY g;
+g	filtered_sum
+11	8
+12	8
+
+EXPLAIN SELECT grp + 10 AS g, sum(x * 2) FILTER (WHERE y >= 2) AS filtered_sum
+FROM (
+    VALUES (1, 1, 1),
+           (1, 2, 2),
+           (1, 2, 3),
+           (2, 3, 1),
+           (2, 4, 4),
+           (2, NULL, 5)
+) AS agg_values(grp, x, y)
+GROUP BY grp + 10;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: +, sum
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: +(col0, 10)
+        Aggregates: SUM(*(col1, 2)) FILTER (WHERE (col2 >= 2))
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: +(col0, 10), *(col1, 2), (col2 >= 2)
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+EXPLAIN SELECT first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST)
+FROM (
+    VALUES (1, 1),
+           (2, 2),
+           (3, 3)
+) AS ordered_values(x, y);
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: first
+  ->  UNGROUPED_AGGREGATE  (rows=1)
+        Aggregates: FIRST(col0) WITHIN GROUP (ORDER BY col1 DESC NULLS LAST)
+        ->  PROJECTION
+              Output: col0, col1
+              ->  PROJECTION  (rows=3)
+                    Output: col0, col1
+                    ->  EXPRESSION_SCAN  (rows=3)
+
+SELECT
+    grp,
+    sum(x) AS sum_all,
+    count(x) AS cnt_x,
+    count(*) AS cnt_star,
+    count(x) FILTER (WHERE flag) AS count_true
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	sum_all	cnt_x	cnt_star	count_true
+1	5	3	3	2
+2	7	2	3	1
+
+SELECT
+    grp,
+    min(x) AS min_x,
+    max(x) AS max_x,
+    sum(x) FILTER (WHERE y >= 3) AS sum_y_ge_3
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	min_x	max_x	sum_y_ge_3
+1	1	2	2
+2	3	4	4
+
+SELECT
+    grp,
+    sum(x) AS sum_all,
+    sum(DISTINCT x) AS sum_distinct_x,
+    count(DISTINCT y) AS count_distinct_y
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	sum_all	sum_distinct_x	count_distinct_y
+1	5	3	3
+2	7	7	3
+
+SELECT
+    count(DISTINCT x) AS cd_x,
+    sum(DISTINCT x) AS sd_x,
+    sum(x) FILTER (WHERE y >= 3) AS sum_y_ge_3,
+    count(x) FILTER (WHERE NOT flag) AS cnt_not_flag
+FROM agg_phase0;
+cd_x	sd_x	sum_y_ge_3	cnt_not_flag
+4	10	6	2
+
+EXPLAIN SELECT grp,
+       sum(x) AS sum_all,
+       sum(DISTINCT x) AS sum_distinct_x,
+       count(DISTINCT y) AS count_distinct_y
+FROM (
+    VALUES (1, 1, 1),
+           (1, 2, 2),
+           (1, 2, 3),
+           (2, 3, 1),
+           (2, 4, 4),
+           (2, NULL, 5)
+) AS agg_values_distinct(grp, x, y)
+GROUP BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: ref_1, sum, sum, count
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: col0
+        Aggregates: SUM(col1), SUM(DISTINCT col1), COUNT(DISTINCT col2)
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: col0, col1, col1, col2
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+EXPLAIN SELECT grp + 10 AS g,
+       sum(x) AS sum_x,
+       count(x) FILTER (WHERE y >= 2) AS count_filtered
+FROM (
+    VALUES (1, 1, 1),
+           (1, 2, 2),
+           (1, 2, 3),
+           (2, 3, 1),
+           (2, 4, 4),
+           (2, NULL, 5)
+) AS agg_values2(grp, x, y)
+GROUP BY grp + 10;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: +, sum, count
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: +(col0, 10)
+        Aggregates: SUM(col1), COUNT(col1) FILTER (WHERE (col2 >= 2))
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: +(col0, 10), col1, col1, (col2 >= 2)
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+SELECT sum(x) FILTER (WHERE x > 2) AS sum_x_gt_2
+FROM agg_phase0;
+sum_x_gt_2
+7
+
+SELECT
+    sum(x) FILTER (WHERE flag) AS sum_flag_true,
+    sum(x) FILTER (WHERE NOT flag) AS sum_flag_false,
+    sum(y) FILTER (WHERE x IS NULL) AS sum_y_x_null,
+    count(x) FILTER (WHERE x >= 2) AS cnt_x_ge_2
+FROM agg_phase0;
+sum_flag_true	sum_flag_false	sum_y_x_null	cnt_x_ge_2
+6	6	5	4
+
+SELECT
+    grp,
+    sum(x) FILTER (WHERE y >= 2) AS sum_y_ge_2,
+    sum(x) FILTER (WHERE y >= 4) AS sum_y_ge_4,
+    sum(y) FILTER (WHERE x IS NULL) AS sum_y_x_null,
+    count(x) FILTER (WHERE x >= 2) AS cnt_x_ge_2
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	sum_y_ge_2	sum_y_ge_4	sum_y_x_null	cnt_x_ge_2
+1	4	NULL	NULL	2
+2	4	4	5	2
+
+SELECT
+    grp,
+    sum(x) FILTER (WHERE flag) AS sum_flag_true,
+    sum(DISTINCT x) FILTER (WHERE y >= 2) AS sum_distinct_y_ge_2,
+    count(DISTINCT y) FILTER (WHERE x >= 2) AS count_distinct_y_x_ge_2
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	sum_flag_true	sum_distinct_y_ge_2	count_distinct_y_x_ge_2
+1	3	2	2
+2	3	4	2
+
+EXPLAIN SELECT grp,
+       sum(x) FILTER (WHERE y >= 2) AS sum_y_ge_2,
+       sum(x) FILTER (WHERE y >= 4) AS sum_y_ge_4,
+       count(x) FILTER (WHERE x >= 2) AS cnt_x_ge_2
+FROM (
+    VALUES (1, 1, 1),
+           (1, 2, 2),
+           (1, 2, 3),
+           (2, 3, 1),
+           (2, 4, 4),
+           (2, NULL, 5)
+) AS agg_values_filter(grp, x, y)
+GROUP BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: ref_1, sum, sum, count
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: col0
+        Aggregates: SUM(col1) FILTER (WHERE (col2 >= 2)), SUM(col1) FILTER (WHERE (col2 >= 4)), COUNT(col1) FILTER (WHERE (col1 >= 2))
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: col0, col1, (col2 >= 2), col1, (col2 >= 4), col1, (col1 >= 2)
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+SELECT
+    first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS first_desc,
+    last(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS last_desc
+FROM agg_phase0;
+first_desc	last_desc
+4	3
+
+SELECT first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) FILTER (WHERE y < 4) AS first_desc_y_lt_4
+FROM agg_phase0;
+first_desc_y_lt_4
+2
+
+SELECT
+    grp,
+    first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS first_desc,
+    last(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS last_desc,
+    sum(x) AS sum_all
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	first_desc	last_desc	sum_all
+1	2	1	5
+2	4	3	7
+
+SELECT
+    first(v) WITHIN GROUP (ORDER BY k DESC NULLS FIRST) AS first_nulls_first,
+    first(v) WITHIN GROUP (ORDER BY k DESC NULLS LAST) AS first_nulls_last
+FROM (
+    VALUES (10, NULL),
+           (20, 1),
+           (30, 2)
+) AS ordered_nulls(v, k);
+first_nulls_first	first_nulls_last
+10	30
+
+EXPLAIN SELECT grp,
+       first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS first_desc,
+       last(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS last_desc
+FROM (
+    VALUES (1, 1, 1),
+           (1, 2, 2),
+           (1, 2, 3),
+           (2, 3, 1),
+           (2, 4, 4),
+           (2, NULL, 5)
+) AS agg_values_ordered(grp, x, y)
+GROUP BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: ref_1, first, last
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: col0
+        Aggregates: FIRST(col1) WITHIN GROUP (ORDER BY col2 DESC NULLS LAST), LAST(col1) WITHIN GROUP (ORDER BY col2 DESC NULLS LAST)
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: col0, col1, col2, col1, col2
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+SELECT
+    GROUPING(grp) AS grp_g,
+    grp,
+    sum(x) AS sum_x
+FROM agg_phase0
+GROUP BY GROUPING SETS ((grp), ())
+ORDER BY grp_g, grp;
+grp_g	grp	sum_x
+0	1	5
+0	2	7
+1	NULL	12
+
+SELECT
+    GROUPING(grp) AS g_grp,
+    GROUPING(flag) AS g_flag,
+    grp,
+    flag,
+    count(*) AS cnt
+FROM agg_phase0
+GROUP BY ROLLUP (grp, flag)
+ORDER BY g_grp, g_flag, grp, flag;
+g_grp	g_flag	grp	flag	cnt
+0	0	1	false	1
+0	0	1	true	2
+0	0	2	false	1
+0	0	2	true	2
+0	1	1	NULL	3
+0	1	2	NULL	3
+1	1	NULL	NULL	6
+
+SELECT
+    GROUPING(grp) AS g_grp,
+    GROUPING(flag) AS g_flag,
+    grp,
+    flag,
+    count(*) AS cnt
+FROM agg_phase0
+GROUP BY CUBE (grp, flag)
+ORDER BY g_grp, g_flag, grp, flag;
+g_grp	g_flag	grp	flag	cnt
+0	0	1	false	1
+0	0	1	true	2
+0	0	2	false	1
+0	0	2	true	2
+0	1	1	NULL	3
+0	1	2	NULL	3
+1	0	NULL	false	2
+1	0	NULL	true	4
+1	1	NULL	NULL	6
+
+EXPLAIN SELECT GROUPING(grp) AS grp_g,
+       grp,
+       sum(x) AS sum_x
+FROM (
+    VALUES (1, 1),
+           (1, 2),
+           (1, 2),
+           (2, 3),
+           (2, 4),
+           (2, NULL)
+) AS agg_values_grouping(grp, x)
+GROUP BY GROUPING SETS ((grp), ());
+QUERY PLAN
+PROJECTION  (rows=6)
+  Output: grouping_1, ref_1, sum
+  ->  HASH_GROUP_BY  (rows=6)
+        Group Key: col0
+        Aggregates: SUM(col1)
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: col0, col1
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+SELECT
+    first_value(x) WITHIN GROUP (ORDER BY y ASC NULLS LAST) AS first_value_asc,
+    last_value(x) WITHIN GROUP (ORDER BY y ASC NULLS LAST) AS last_value_asc
+FROM agg_phase0;
+first_value_asc	last_value_asc
+1	4
+
+SELECT
+    grp,
+    first_value(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS first_value_desc,
+    last_value(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS last_value_desc
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	first_value_desc	last_value_desc
+1	2	1
+2	4	3
+
+SELECT string_agg(label) AS labels_default_sep
+FROM agg_phase0;
+labels_default_sep
+a,b,c,d,e,f
+
+SELECT string_agg(label, '|') FILTER (WHERE grp = 1) AS labels_grp1
+FROM agg_phase0;
+labels_grp1
+a|b|c
+
+SELECT
+    grp,
+    string_agg(label, '|') WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS labels_desc
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	labels_desc
+1	c|b|a
+2	f|e|d
+
+SELECT array_agg(x) AS xs_all
+FROM agg_phase0;
+xs_all
+[1, 2, 2, 3, 4, None]
+
+SELECT array_agg(x) FILTER (WHERE x >= 2) AS xs_ge_2
+FROM agg_phase0;
+xs_ge_2
+[2.000000, 2.000000, 3.000000, 4.000000]
+
+SELECT
+    grp,
+    array_agg(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS xs_desc
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	xs_desc
+1	[2.000000, 2.000000, 1.000000]
+2	[None, 4, 3]
+
+SELECT
+    bool_and(flag) AS all_true,
+    bool_or(flag) AS any_true
+FROM agg_phase0;
+all_true	any_true
+false	true
+
+SELECT
+    grp,
+    bool_and(flag) FILTER (WHERE y <= 3) AS all_true_y_le_3,
+    bool_or(flag) FILTER (WHERE y <= 3) AS any_true_y_le_3
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	all_true_y_le_3	any_true_y_le_3
+1	false	true
+2	true	true
+
+SELECT
+    bool_and(flag) FILTER (WHERE y > 100) AS all_true_empty,
+    bool_or(flag) FILTER (WHERE y > 100) AS any_true_empty
+FROM agg_phase0;
+all_true_empty	any_true_empty
+NULL	NULL
+
+SELECT
+    round(var_pop(x), 6) AS var_pop_x,
+    round(var_samp(x), 6) AS var_samp_x,
+    round(variance(x), 6) AS variance_x,
+    round(stddev_pop(x), 6) AS stddev_pop_x,
+    round(stddev_samp(x), 6) AS stddev_samp_x,
+    round(stddev(x), 6) AS stddev_x
+FROM agg_phase0;
+var_pop_x	var_samp_x	variance_x	stddev_pop_x	stddev_samp_x	stddev_x
+1.040000	1.300000	1.300000	1.019804	1.140175	1.140175
+
+SELECT
+    grp,
+    round(var_pop(x), 6) AS var_pop_x,
+    round(stddev_samp(x), 6) AS stddev_samp_x
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	var_pop_x	stddev_samp_x
+1	0.222222	0.577350
+2	0.250000	0.707107
+
+SELECT
+    sum(DISTINCT x) FILTER (WHERE grp = 1) AS sum_distinct_grp1,
+    count(DISTINCT y) FILTER (WHERE flag) AS count_distinct_y_flag
+FROM agg_phase0;
+sum_distinct_grp1	count_distinct_y_flag
+3	3
+
+SELECT
+    grp,
+    sum(DISTINCT x) FILTER (WHERE flag) AS sum_distinct_x_flag,
+    count(DISTINCT y) FILTER (WHERE NOT flag) AS count_distinct_y_not_flag
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	sum_distinct_x_flag	count_distinct_y_not_flag
+1	3	1
+2	3	1
+
+EXPLAIN SELECT grp,
+       string_agg(label, '|') WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS labels_desc,
+       array_agg(x) FILTER (WHERE x >= 2) AS xs_ge_2,
+       stddev(x) AS stddev_x
+FROM (
+    VALUES (1, 1, 1, 'a'),
+           (1, 2, 2, 'b'),
+           (1, 2, 3, 'c'),
+           (2, 3, 1, 'd'),
+           (2, 4, 4, 'e'),
+           (2, NULL, 5, 'f')
+) AS agg_values_t25(grp, x, y, label)
+GROUP BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: ref_1, string_agg, array_agg, stddev
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: col0
+        Aggregates: STRING_AGG(col3, '|') WITHIN GROUP (ORDER BY col2 DESC NULLS LAST), ARRAY_AGG(col1) FILTER (WHERE (col1 >= 2)), STDDEV(col1)
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: col0, col3, '|', col2, col1, (col1 >= 2), col1
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1, col2, col3
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+DROP TABLE IF EXISTS agg_phase3;
+DROP TABLE
+
+CREATE TABLE agg_phase3 (
+    g_tiny TINYINT,
+    h_tiny TINYINT,
+    x INT,
+    flag BOOLEAN
+);
+CREATE TABLE
+
+INSERT INTO agg_phase3 VALUES
+    (1, 1, 10, true),
+    (1, 1, 20, false),
+    (1, 2, 30, true),
+    (2, 1, 40, false),
+    (2, 2, 50, true),
+    (2, 2, 60, false),
+    (NULL, 1, 70, true),
+    (NULL, NULL, 80, false);
+INSERT 0 8
+
+SELECT
+    g_tiny,
+    sum(x) AS sum_x
+FROM agg_phase3
+GROUP BY g_tiny
+ORDER BY g_tiny;
+g_tiny	sum_x
+1	60
+2	150
+NULL	150
+
+EXPLAIN SELECT
+    g_tiny,
+    sum(x) AS sum_x
+FROM (
+    VALUES (1::TINYINT, 1::TINYINT, 10, true),
+           (1::TINYINT, 1::TINYINT, 20, false),
+           (1::TINYINT, 2::TINYINT, 30, true),
+           (2::TINYINT, 1::TINYINT, 40, false),
+           (2::TINYINT, 2::TINYINT, 50, true),
+           (2::TINYINT, 2::TINYINT, 60, false),
+           (NULL::TINYINT, 1::TINYINT, 70, true),
+           (NULL::TINYINT, NULL::TINYINT, 80, false)
+) AS agg_phase3_values(g_tiny, h_tiny, x, flag)
+GROUP BY g_tiny;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: ref_1, sum
+  ->  PERFECT_HASH_GROUP_BY  (rows=3)
+        Group Key: col0
+        Aggregates: SUM(col1)
+        ->  PROJECTION
+              Output: col0, col1
+              ->  PROJECTION  (rows=8)
+                    Output: col0, col1
+                    ->  EXPRESSION_SCAN  (rows=8)
+
+SELECT
+    g_tiny,
+    h_tiny,
+    count(*) AS cnt,
+    sum(x) FILTER (WHERE flag) AS sum_flag_true
+FROM agg_phase3
+GROUP BY g_tiny, h_tiny
+ORDER BY g_tiny, h_tiny;
+g_tiny	h_tiny	cnt	sum_flag_true
+1	1	2	10
+1	2	1	30
+2	1	1	NULL
+2	2	2	50
+NULL	1	1	70
+NULL	NULL	1	NULL
+
+EXPLAIN SELECT
+    g_tiny,
+    h_tiny,
+    count(*) AS cnt,
+    sum(x) FILTER (WHERE flag) AS sum_flag_true
+FROM (
+    VALUES (1::TINYINT, 1::TINYINT, 10, true),
+           (1::TINYINT, 1::TINYINT, 20, false),
+           (1::TINYINT, 2::TINYINT, 30, true),
+           (2::TINYINT, 1::TINYINT, 40, false),
+           (2::TINYINT, 2::TINYINT, 50, true),
+           (2::TINYINT, 2::TINYINT, 60, false),
+           (NULL::TINYINT, 1::TINYINT, 70, true),
+           (NULL::TINYINT, NULL::TINYINT, 80, false)
+) AS agg_phase3_values(g_tiny, h_tiny, x, flag)
+GROUP BY g_tiny, h_tiny;
+QUERY PLAN
+PROJECTION  (rows=8)
+  Output: ref_1, ref_2, count_star, sum
+  ->  PERFECT_HASH_GROUP_BY  (rows=8)
+        Group Key: col0, col1
+        Aggregates: COUNT_STAR(*), SUM(col2) FILTER (WHERE col3)
+        ->  PROJECTION
+              Output: col0, col1, col2, col3
+              ->  PROJECTION  (rows=8)
+                    Output: col0, col1, col2, col3
+                    ->  EXPRESSION_SCAN  (rows=8)
+
+EXPLAIN SELECT
+    g_tiny,
+    count(DISTINCT x) AS cd_x
+FROM (
+    VALUES (1::TINYINT, 1::TINYINT, 10, true),
+           (1::TINYINT, 1::TINYINT, 20, false),
+           (1::TINYINT, 2::TINYINT, 30, true),
+           (2::TINYINT, 1::TINYINT, 40, false),
+           (2::TINYINT, 2::TINYINT, 50, true),
+           (2::TINYINT, 2::TINYINT, 60, false),
+           (NULL::TINYINT, 1::TINYINT, 70, true),
+           (NULL::TINYINT, NULL::TINYINT, 80, false)
+) AS agg_phase3_values(g_tiny, h_tiny, x, flag)
+GROUP BY g_tiny;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: ref_1, count
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: col0
+        Aggregates: COUNT(DISTINCT col1)
+        Key Mode: INLINE_KEY_1B
+        ->  PROJECTION
+              Output: col0, col1
+              ->  PROJECTION  (rows=8)
+                    Output: col0, col1
+                    ->  EXPRESSION_SCAN  (rows=8)
+
+EXPLAIN SELECT
+    g_tiny,
+    sum(x) AS sum_x
+FROM (
+    VALUES (1::TINYINT, 1::TINYINT, 10, true),
+           (1::TINYINT, 1::TINYINT, 20, false),
+           (1::TINYINT, 2::TINYINT, 30, true),
+           (2::TINYINT, 1::TINYINT, 40, false),
+           (2::TINYINT, 2::TINYINT, 50, true),
+           (2::TINYINT, 2::TINYINT, 60, false),
+           (NULL::TINYINT, 1::TINYINT, 70, true),
+           (NULL::TINYINT, NULL::TINYINT, 80, false)
+) AS agg_phase3_values(g_tiny, h_tiny, x, flag)
+GROUP BY GROUPING SETS ((g_tiny), ());
+QUERY PLAN
+PROJECTION  (rows=6)
+  Output: ref_1, sum
+  ->  HASH_GROUP_BY  (rows=6)
+        Group Key: col0
+        Aggregates: SUM(col1)
+        Key Mode: INLINE_KEY_1B
+        ->  PROJECTION
+              Output: col0, col1
+              ->  PROJECTION  (rows=8)
+                    Output: col0, col1
+                    ->  EXPRESSION_SCAN  (rows=8)
+
+SELECT
+    (k_int + (tag * 3000000)) AS inline_key,
+    count(*) AS cnt
+FROM (
+    VALUES (1, 0),
+           (1, 1),
+           (2, 0),
+           (2, 1),
+           (3, 0),
+           (3, 1)
+) AS agg_phase32_single(k_int, tag)
+GROUP BY (k_int + (tag * 3000000))
+ORDER BY inline_key;
+inline_key	cnt
+1	1
+2	1
+3	1
+3000001	1
+3000002	1
+3000003	1
+
+EXPLAIN SELECT
+    (k_int + (tag * 3000000)) AS inline_key,
+    count(*) AS cnt
+FROM (
+    VALUES (1, 0),
+           (1, 1),
+           (2, 0),
+           (2, 1),
+           (3, 0),
+           (3, 1)
+) AS agg_phase32_single(k_int, tag)
+GROUP BY (k_int + (tag * 3000000));
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: +, count_star
+  ->  HASH_GROUP_BY  (rows=3)
+        Group Key: +(col0, *(col1, 3000000))
+        Aggregates: COUNT_STAR(*)
+        Key Mode: INLINE_KEY_4B
+        ->  PROJECTION
+              Output: +(col0, *(col1, 3000000))
+              ->  PROJECTION  (rows=6)
+                    Output: col0, col1
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+EXPLAIN SELECT
+    (k_int + (tag * 3000000)) AS k_inline_int,
+    k_small,
+    k_tiny,
+    sum(v) AS sum_v
+FROM (
+    VALUES (1, 1::SMALLINT, 1::TINYINT, 0, 10),
+           (1, 1::SMALLINT, 1::TINYINT, 1, 20),
+           (2, 2::SMALLINT, 2::TINYINT, 0, 30),
+           (2, 2::SMALLINT, 2::TINYINT, 1, 40)
+) AS agg_phase32_multi(k_int, k_small, k_tiny, tag, v)
+GROUP BY (k_int + (tag * 3000000)), k_small, k_tiny;
+QUERY PLAN
+PROJECTION  (rows=4)
+  Output: +, ref_2, ref_3, sum
+  ->  HASH_GROUP_BY  (rows=4)
+        Group Key: +(col0, *(col3, 3000000)), col1, col2
+        Aggregates: SUM(col4)
+        Key Mode: INLINE_KEY_7B
+        Partitioning: RADIX_PARTITIONS=4
+        ->  PROJECTION
+              Output: +(col0, *(col3, 3000000)), col1, col2, col4
+              ->  PROJECTION  (rows=4)
+                    Output: col0, col1, col2, col3, col4
+                    ->  EXPRESSION_SCAN  (rows=4)
+
+EXPLAIN SELECT
+    (k_big + (tag::BIGINT * 30000000000::BIGINT)) AS k_big_range,
+    k_int,
+    sum(v) AS sum_v
+FROM (
+    VALUES (1::BIGINT, 1, 0, 10),
+           (1::BIGINT, 1, 1, 20),
+           (2::BIGINT, 2, 0, 30),
+           (2::BIGINT, 2, 1, 40)
+) AS agg_phase32_wide(k_big, k_int, tag, v)
+GROUP BY (k_big + (tag::BIGINT * 30000000000::BIGINT)), k_int;
+QUERY PLAN
+PROJECTION  (rows=4)
+  Output: +, ref_2, sum
+  ->  HASH_GROUP_BY  (rows=4)
+        Group Key: +(col0, *(CAST(col2 AS BIGINT), 30000000000)), col1
+        Aggregates: SUM(col3)
+        Partitioning: RADIX_PARTITIONS=4
+        ->  PROJECTION
+              Output: +(col0, *(CAST(col2 AS BIGINT), 30000000000)), col1, col3
+              ->  PROJECTION  (rows=4)
+                    Output: col0, col1, col2, col3
+                    ->  EXPRESSION_SCAN  (rows=4)
+
+EXPLAIN SELECT
+    k_big,
+    k_int,
+    sum(v) AS sum_v
+FROM (
+    VALUES (1::BIGINT, 1, 10),
+           (5000000000::BIGINT, 1, 20),
+           (5000000001::BIGINT, 2, 30),
+           (9000000000::BIGINT, 2, 40)
+) AS agg_phase34(k_big, k_int, v)
+GROUP BY k_big, k_int;
+QUERY PLAN
+PROJECTION  (rows=4)
+  Output: ref_1, ref_2, sum
+  ->  HASH_GROUP_BY  (rows=4)
+        Group Key: col0, col1
+        Aggregates: SUM(col2)
+        Partitioning: RADIX_PARTITIONS=4
+        ->  PROJECTION
+              Output: col0, col1, col2
+              ->  PROJECTION  (rows=4)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=4)
+
+EXPLAIN SELECT
+    k_big,
+    k_int,
+    sum(v) AS sum_v
+FROM (
+    VALUES (1::BIGINT, 1, 10),
+           (5000000000::BIGINT, 1, 20),
+           (5000000001::BIGINT, 2, 30),
+           (9000000000::BIGINT, 2, 40)
+) AS agg_phase34(k_big, k_int, v)
+GROUP BY GROUPING SETS ((k_big, k_int), ());
+QUERY PLAN
+PROJECTION  (rows=4)
+  Output: ref_1, ref_2, sum
+  ->  HASH_GROUP_BY  (rows=4)
+        Group Key: col0, col1
+        Aggregates: SUM(col2)
+        ->  PROJECTION
+              Output: col0, col1, col2
+              ->  PROJECTION  (rows=4)
+                    Output: col0, col1, col2
+                    ->  EXPRESSION_SCAN  (rows=4)
+
+SET threads = 1;
+SET
+
+SET use_new_agg_spill = true;
+SET
+
+DROP TABLE IF EXISTS agg_phase35_spill;
+DROP TABLE
+
+CREATE TABLE agg_phase35_spill(k_unique BIGINT, k_repeat BIGINT, tag VARCHAR, v BIGINT);
+CREATE TABLE
+
+INSERT INTO agg_phase35_spill
+SELECT
+    (rep::BIGINT * 1000000::BIGINT) + k::BIGINT AS k_unique,
+    k::BIGINT AS k_repeat,
+    CASE WHEN rep % 2 = 0 THEN 'even' ELSE 'odd' END AS tag,
+    1::BIGINT AS v
+FROM generate_series(1, 80) AS rep_series(rep)
+CROSS JOIN generate_series(0, 3999) AS key_series(k);
+INSERT 0 320000
+
+SELECT count(*) AS g_cnt
+FROM (
+    SELECT k_unique, tag, sum(v) AS s
+    FROM agg_phase35_spill
+    GROUP BY k_unique, tag
+) AS agg_phase35_unique;
+g_cnt
+320000
+
+SELECT
+    min(cnt) AS min_cnt,
+    max(cnt) AS max_cnt,
+    count(*) AS group_cnt
+FROM (
+    SELECT k_repeat, tag, count(*) AS cnt
+    FROM agg_phase35_spill
+    GROUP BY k_repeat, tag
+) AS agg_phase35_overlap;
+min_cnt	max_cnt	group_cnt
+40	40	8000
+
+SELECT
+    count(*) AS hot_group_cnt,
+    min(cnt) AS min_cnt,
+    max(cnt) AS max_cnt
+FROM (
+    SELECT k_repeat, count(*) AS cnt
+    FROM agg_phase35_spill
+    GROUP BY k_repeat
+    HAVING count(*) > 70
+) AS agg_phase35_having;
+hot_group_cnt	min_cnt	max_cnt
+4000	80	80
+
+DROP TABLE IF EXISTS agg_phase35_spill;
+DROP TABLE
+
+RESET use_new_agg_spill;
+RESET
+
+SET threads = DEFAULT;
+SET
+
+EXPLAIN SELECT
+    sum(x) AS s1,
+    sum(x) + 1 AS s2,
+    sum(x) + count(*) AS s3
+FROM (
+    VALUES (1),
+           (2),
+           (3)
+) AS agg_phase41(x);
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: sum, +(sum, 1), +(sum, count_star)
+  ->  UNGROUPED_AGGREGATE  (rows=1)
+        Aggregates: SUM(col0), COUNT_STAR(*)
+        ->  PROJECTION
+              Output: col0
+              ->  PROJECTION  (rows=3)
+                    Output: col0
+                    ->  EXPRESSION_SCAN  (rows=3)
+
+EXPLAIN SELECT
+    grp,
+    sum(x) AS sx,
+    sum(x) + 1 AS sx_plus_1,
+    sum(x) + count(*) AS sx_plus_cnt
+FROM (
+    VALUES (1, 1),
+           (1, 2),
+           (1, 2),
+           (2, 3),
+           (2, 4),
+           (2, NULL)
+) AS agg_phase41_grouped(grp, x)
+GROUP BY grp
+ORDER BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: grp, sx, sx_plus_1, sx_plus_cnt
+  ->  ORDER_BY  (rows=3)
+        Sort Key: ref_1 ASC NULLS LAST
+        ->  PROJECTION  (rows=3)
+              Output: ref_1, sum, +(sum, 1), +(sum, count_star), ref_1
+              ->  HASH_GROUP_BY  (rows=3)
+                    Group Key: col0
+                    Aggregates: SUM(col1), COUNT_STAR(*)
+                    Key Mode: INLINE_KEY_4B
+                    ->  PROJECTION
+                          Output: col0, col1
+                          ->  PROJECTION  (rows=6)
+                                Output: col0, col1
+                                ->  EXPRESSION_SCAN  (rows=6)
+
+SELECT
+    grp,
+    sum(x) AS sx,
+    sum(x) + 1 AS sx_plus_1,
+    sum(x) + count(*) AS sx_plus_cnt
+FROM agg_phase0
+GROUP BY grp
+ORDER BY grp;
+grp	sx	sx_plus_1	sx_plus_cnt
+1	5	6	8
+2	7	8	10
+
+EXPLAIN SELECT
+    count(*) AS cnt_star,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_phase0;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: agg_0, agg_1, agg_2
+  ->  EXPRESSION_SCAN  (rows=1)
+
+SELECT
+    count(*) AS cnt_star,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_phase0;
+cnt_star	min_x	max_x
+6	1	4
+
+EXPLAIN SELECT
+    min(px) AS min_px,
+    max(px) AS max_px
+FROM (
+    SELECT x AS px
+    FROM agg_phase0
+) AS agg_phase42_proj;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: agg_0, agg_1
+  ->  EXPRESSION_SCAN  (rows=1)
+
+SELECT
+    min(px) AS min_px,
+    max(px) AS max_px
+FROM (
+    SELECT x AS px
+    FROM agg_phase0
+) AS agg_phase42_proj;
+min_px	max_px
+1	4
+
+EXPLAIN SELECT
+    min(y) AS min_y,
+    max(y) AS max_y
+FROM agg_phase0;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: agg_0, agg_1
+  ->  EXPRESSION_SCAN  (rows=1)
+
+SELECT
+    min(y) AS min_y,
+    max(y) AS max_y
+FROM agg_phase0;
+min_y	max_y
+1	5
+
+EXPLAIN SELECT min(x) FILTER (WHERE x > 2) AS min_filtered
+FROM (
+    VALUES (1),
+           (2),
+           (2),
+           (3),
+           (4),
+           (NULL)
+) AS agg_phase42_filter(x);
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: min
+  ->  UNGROUPED_AGGREGATE  (rows=1)
+        Aggregates: MIN(col0) FILTER (WHERE (col0 > 2))
+        ->  PROJECTION
+              Output: col0, (col0 > 2)
+              ->  PROJECTION  (rows=6)
+                    Output: col0
+                    ->  EXPRESSION_SCAN  (rows=6)
+
+SELECT min(x) FILTER (WHERE x > 2) AS min_filtered
+FROM (
+    VALUES (1),
+           (2),
+           (2),
+           (3),
+           (4),
+           (NULL)
+) AS agg_phase42_filter(x);
+min_filtered
+3
+
+DROP TABLE IF EXISTS agg_phase3;
+DROP TABLE

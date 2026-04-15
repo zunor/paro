@@ -1,0 +1,40 @@
+[meta]
+name = "primary_key_dml"
+description = "Primary-key DML end-to-end benchmark with bulk load and delete"
+
+[params]
+rows = 100000
+deleted_id = 50000
+hot_id = 77777
+cold_id = 12345
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "row_count_after_delete"
+file = "sql/q_row_count.sql"
+validate = "scalar_equals"
+expected = 90000
+
+[[query]]
+id = "hot_row_survives_delete"
+file = "sql/q_hot_row.sql"
+validate = "ordered_rows"
+expected = [[77777, 777770]]
+
+[[query]]
+id = "cold_row_keeps_original_value"
+file = "sql/q_cold_row.sql"
+validate = "ordered_rows"
+expected = [[12345, 123450]]
+
+[[query]]
+id = "deleted_row_stays_invisible"
+file = "sql/q_deleted_row.sql"
+validate = "scalar_equals"
+expected = 0

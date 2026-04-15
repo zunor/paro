@@ -1,0 +1,3 @@
+psycopg[binary]>=3.2,<4
+# Optional for future peak RSS sampling (--pid).
+psutil>=5.9,<8

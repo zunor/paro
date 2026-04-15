@@ -1,0 +1,30 @@
+[package]
+name = "paro-instance"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+empty-line-after-doc-comments = "allow"
+field-reassign-with-default = "allow"
+derivable-impls = "allow"
+needless-borrows-for-generic-args = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-scheduler = { workspace = true }
+paro-catalog = { workspace = true }
+paro-storage = { workspace = true }
+paro-function = { workspace = true }
+paro-parser = { workspace = true }
+
+anyhow = { workspace = true }
+crc32fast = "1"
+fs2 = "0.4"
+parking_lot = "0.12"
+rand = "0.8"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = "3.8"
+tracing = { workspace = true }
+
+[dev-dependencies]

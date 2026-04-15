@@ -1,0 +1,75 @@
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_left AS l
+LEFT JOIN join_outer_right AS r ON l.id = r.id
+ORDER BY COALESCE(l.id, r.id), COALESCE(l.label, ''), COALESCE(r.descr, '');
+left_id	l.label	right_id	r.descr
+1	l1	NULL	NULL
+2	l2	2	r2
+4	l4	4	r4
+
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_left AS l
+RIGHT JOIN join_outer_right AS r ON l.id = r.id;
+left_id	l.label	right_id	r.descr
+2	l2	2	r2
+4	l4	4	r4
+NULL	NULL	3	r3
+
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_left AS l
+FULL JOIN join_outer_right AS r ON l.id = r.id;
+left_id	l.label	right_id	r.descr
+2	l2	2	r2
+4	l4	4	r4
+1	l1	NULL	NULL
+NULL	NULL	3	r3
+
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_empty_left AS l
+LEFT JOIN join_outer_empty_right AS r ON l.id = r.id
+ORDER BY l.id;
+left_id	l.label	right_id	r.descr
+10	el10	NULL	NULL
+20	el20	NULL	NULL
+
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_no_left_rows AS l
+RIGHT JOIN join_outer_right AS r ON l.id = r.id;
+left_id	l.label	right_id	r.descr
+NULL	NULL	2	r2
+NULL	NULL	3	r3
+NULL	NULL	4	r4
+
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_empty_left AS l
+FULL JOIN join_outer_empty_right AS r ON l.id = r.id;
+left_id	l.label	right_id	r.descr
+10	el10	NULL	NULL
+20	el20	NULL	NULL
+
+SELECT l.id AS left_id, l.label, r.id AS right_id, r.descr
+FROM join_outer_no_left_rows AS l
+FULL JOIN join_outer_right AS r ON l.id = r.id;
+left_id	l.label	right_id	r.descr
+NULL	NULL	2	r2
+NULL	NULL	3	r3
+NULL	NULL	4	r4
+
+SELECT l.id AS left_id, l.payload, r.tag
+FROM join_outer_large_left AS l
+LEFT JOIN join_outer_small_right AS r ON l.id = r.id
+ORDER BY l.id;
+left_id	l.payload	r.tag
+1	big-1	NULL
+2	big-2	small-2
+3	big-3	NULL
+4	big-4	small-4
+
+SELECT l.id AS left_id, l.payload, r.tag
+FROM join_outer_small_right AS r
+RIGHT JOIN join_outer_large_left AS l ON l.id = r.id;
+left_id	l.payload	r.tag
+2	big-2	small-2
+4	big-4	small-4
+1	big-1	NULL
+3	big-3	NULL

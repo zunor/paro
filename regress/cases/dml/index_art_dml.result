@@ -1,0 +1,67 @@
+DROP INDEX IF EXISTS idx_art_accounts_account_no;
+DROP INDEX
+
+DROP TABLE IF EXISTS art_accounts;
+DROP TABLE
+
+CREATE TABLE art_accounts (
+    row_id INT PRIMARY KEY,
+    account_no INT,
+    balance INT
+);
+CREATE TABLE
+
+INSERT INTO art_accounts VALUES
+    (1, 100, 500),
+    (2, 200, 600),
+    (3, 300, 700);
+INSERT 0 3
+
+CREATE INDEX idx_art_accounts_account_no ON art_accounts (account_no);
+CREATE INDEX
+
+INSERT INTO art_accounts VALUES
+    (4, 400, 800),
+    (5, 500, 900);
+INSERT 0 2
+
+UPDATE art_accounts
+SET account_no = 330, balance = 730
+WHERE row_id = 3;
+UPDATE 1
+
+DELETE FROM art_accounts
+WHERE row_id = 2;
+DELETE 1
+
+SELECT row_id, balance
+FROM art_accounts
+WHERE account_no = 330
+ORDER BY row_id;
+row_id	balance
+3	730
+
+SELECT COUNT(*) AS deleted_old_key
+FROM art_accounts
+WHERE account_no = 300;
+deleted_old_key
+0
+
+SELECT row_id
+FROM art_accounts
+WHERE account_no BETWEEN 330 AND 500
+ORDER BY row_id;
+row_id
+3
+4
+5
+
+SELECT index_name, entry_count
+FROM paro_indexes()
+WHERE table_name = 'art_accounts'
+ORDER BY index_name;
+index_name	entry_count
+idx_art_accounts_account_no	6
+
+DROP TABLE art_accounts;
+DROP TABLE

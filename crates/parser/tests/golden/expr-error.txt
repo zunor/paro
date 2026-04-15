@@ -1,0 +1,362 @@
+---------- Input ----------
+5 * (a and ) 1
+---------- Output ---------
+error: 
+  --> SQL:1:3
+  |
+1 | 5 * (a and ) 1
+  | - ^ expecting an operand
+  | |  
+  | while parsing expression
+
+
+---------- Input ----------
+a + +
+---------- Output ---------
+error: 
+  --> SQL:1:5
+  |
+1 | a + +
+  | -   ^ expecting an operand
+  | |    
+  | while parsing expression
+
+
+---------- Input ----------
+CAST(col1 AS foo)
+---------- Output ---------
+error: 
+  --> SQL:1:14
+  |
+1 | CAST(col1 AS foo)
+  | ----         ^^^ unexpected `foo`, expecting `BOOL`, `FLOAT`, `BOOLEAN`, `FLOAT32`, `FLOAT64`, `BLOB`, `JSON`, `JSONB`, `DOUBLE`, `VECTOR`, `LONGBLOB`, `GEOMETRY`, `GEOGRAPHY`, `STAGE_LOCATION`, <Ident>, <LiteralString>, `IDENTIFIER`, `UINT8`, `TINYINT`, `UINT16`, `SMALLINT`, `UINT`, `UINT32`, `INT`, `INTEGER`, `UINT64`, `UNSIGNED`, `BIGINT`, `UHUGEINT`, `INT8`, `INT16`, `INT32`, `INT64`, `SIGNED`, `HUGEINT`, `REAL`, `DECIMAL`, `ARRAY`, `LIST`, `MAP`, `BITMAP`, `TUPLE`, `STRUCT`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMPTZ`, `DATETIME`, `INTERVAL`, `NUMERIC`, `BINARY`, `VARBINARY`, `MEDIUMBLOB`, `TINYBLOB`, `UUID`, `CHAR`, `CHARACTER`, `STRING`, `VARCHAR`, or 5 more ...
+  | |             
+  | while parsing `function(... [ , x -> ... ] ) [ (...) ] [ WITHIN GROUP ( ORDER BY <expr>, ... ) ] [ FILTER ( WHERE <expr> ) ] [ OVER ([ PARTITION BY <expr>, ... ] [ ORDER BY <expr>, ... ] [ <window frame> ]) ]`
+  | while parsing expression
+
+
+---------- Input ----------
+1 a
+---------- Output ---------
+error: 
+  --> SQL:1:3
+  |
+1 | 1 a
+  |   ^ unexpected `a`
+
+
+---------- Input ----------
+CAST(col1)
+---------- Output ---------
+error: 
+  --> SQL:1:10
+  |
+1 | CAST(col1)
+  | ----     ^ expecting `<LiteralString>`, '<LiteralCodeString>', '<LiteralInteger>', '<LiteralFloat>', 'TRUE', 'FALSE', or more ...
+  | |         
+  | while parsing `function(... [ , x -> ... ] ) [ (...) ] [ WITHIN GROUP ( ORDER BY <expr>, ... ) ] [ FILTER ( WHERE <expr> ) ] [ OVER ([ PARTITION BY <expr>, ... ] [ ORDER BY <expr>, ... ] [ <window frame> ]) ]`
+  | while parsing expression
+
+
+---------- Input ----------
+a.add(b)
+---------- Output ---------
+a.add(b)
+---------- AST ------------
+FunctionCall {
+    span: Some(
+        1..8,
+    ),
+    func: FunctionCall {
+        distinct: false,
+        schema: Some(
+            Identifier {
+                span: Some(
+                    0..1,
+                ),
+                name: "a",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+        name: Identifier {
+            span: Some(
+                2..5,
+            ),
+            name: "add",
+            quote: None,
+            ident_type: None,
+        },
+        args: [
+            ColumnRef {
+                span: Some(
+                    6..7,
+                ),
+                column: ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: Name(
+                        Identifier {
+                            span: Some(
+                                6..7,
+                            ),
+                            name: "b",
+                            quote: None,
+                            ident_type: None,
+                        },
+                    ),
+                },
+            },
+        ],
+        params: [],
+        order_by: [],
+        filter: None,
+        window: None,
+        lambda: None,
+    },
+}
+
+
+---------- Input ----------
+$ abc + 3
+---------- Output ---------
+error: 
+  --> SQL:1:1
+  |
+1 | $ abc + 3
+  | ^
+  | |
+  | expecting `<LiteralString>`, '<LiteralCodeString>', '<LiteralInteger>', '<LiteralFloat>', 'TRUE', 'FALSE', or more ...
+  | while parsing expression
+
+
+---------- Input ----------
+[ x * 100 FOR x in [1,2,3] if x % 2 = 0 ]
+---------- Output ---------
+array_map(array_filter([1, 2, 3], x -> x % 2 = 0), x -> x * 100)
+---------- AST ------------
+FunctionCall {
+    span: Some(
+        0..41,
+    ),
+    func: FunctionCall {
+        distinct: false,
+        schema: None,
+        name: Identifier {
+            span: Some(
+                0..41,
+            ),
+            name: "array_map",
+            quote: None,
+            ident_type: None,
+        },
+        args: [
+            FunctionCall {
+                span: Some(
+                    0..41,
+                ),
+                func: FunctionCall {
+                    distinct: false,
+                    schema: None,
+                    name: Identifier {
+                        span: Some(
+                            0..41,
+                        ),
+                        name: "array_filter",
+                        quote: None,
+                        ident_type: None,
+                    },
+                    args: [
+                        Array {
+                            span: Some(
+                                19..26,
+                            ),
+                            exprs: [
+                                Literal {
+                                    span: Some(
+                                        20..21,
+                                    ),
+                                    value: UInt64(
+                                        1,
+                                    ),
+                                },
+                                Literal {
+                                    span: Some(
+                                        22..23,
+                                    ),
+                                    value: UInt64(
+                                        2,
+                                    ),
+                                },
+                                Literal {
+                                    span: Some(
+                                        24..25,
+                                    ),
+                                    value: UInt64(
+                                        3,
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                    params: [],
+                    order_by: [],
+                    filter: None,
+                    window: None,
+                    lambda: Some(
+                        Lambda {
+                            params: [
+                                Identifier {
+                                    span: Some(
+                                        14..15,
+                                    ),
+                                    name: "x",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ],
+                            expr: BinaryOp {
+                                span: Some(
+                                    36..37,
+                                ),
+                                op: Eq,
+                                left: BinaryOp {
+                                    span: Some(
+                                        32..33,
+                                    ),
+                                    op: Modulo,
+                                    left: ColumnRef {
+                                        span: Some(
+                                            30..31,
+                                        ),
+                                        column: ColumnRef {
+                                            schema: None,
+                                            table: None,
+                                            column: Name(
+                                                Identifier {
+                                                    span: Some(
+                                                        30..31,
+                                                    ),
+                                                    name: "x",
+                                                    quote: None,
+                                                    ident_type: None,
+                                                },
+                                            ),
+                                        },
+                                    },
+                                    right: Literal {
+                                        span: Some(
+                                            34..35,
+                                        ),
+                                        value: UInt64(
+                                            2,
+                                        ),
+                                    },
+                                },
+                                right: Literal {
+                                    span: Some(
+                                        38..39,
+                                    ),
+                                    value: UInt64(
+                                        0,
+                                    ),
+                                },
+                            },
+                        },
+                    ),
+                },
+            },
+        ],
+        params: [],
+        order_by: [],
+        filter: None,
+        window: None,
+        lambda: Some(
+            Lambda {
+                params: [
+                    Identifier {
+                        span: Some(
+                            14..15,
+                        ),
+                        name: "x",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ],
+                expr: BinaryOp {
+                    span: Some(
+                        4..5,
+                    ),
+                    op: Multiply,
+                    left: ColumnRef {
+                        span: Some(
+                            2..3,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        2..3,
+                                    ),
+                                    name: "x",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                    right: Literal {
+                        span: Some(
+                            6..9,
+                        ),
+                        value: UInt64(
+                            100,
+                        ),
+                    },
+                },
+            },
+        ),
+    },
+}
+
+
+---------- Input ----------
+G.E.B IS NOT NULL
+AND col1 NOT BETWEEN col2 AND
+AND 1 + col3 DIV sum(col4)
+---------- Output ---------
+error: 
+  --> SQL:3:1
+  |
+1 | G.E.B IS NOT NULL
+2 | AND col1 NOT BETWEEN col2 AND
+3 | AND 1 + col3 DIV sum(col4)
+  | ^^^ expected more tokens for expression
+
+
+---------- Input ----------
+CAST(1 AS STRING) ESCAPE '$'
+---------- Output ---------
+error: 
+  --> SQL:1:19
+  |
+1 | CAST(1 AS STRING) ESCAPE '$'
+  | ----              ^^^^^^ escape clause must be after LIKE/NOT LIKE/LIKE ANY binary expr
+  | |                  
+  | while parsing expression
+
+
+---------- Input ----------
+1 + 1 ESCAPE '$'
+---------- Output ---------
+error: 
+  --> SQL:1:7
+  |
+1 | 1 + 1 ESCAPE '$'
+  | -     ^^^^^^ escape clause must be after LIKE/NOT LIKE/LIKE ANY binary expr
+  | |      
+  | while parsing expression
+
+

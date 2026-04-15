@@ -1,0 +1,22 @@
+CREATE TABLE multirow_test (id INT PRIMARY KEY, name VARCHAR, score INT);
+CREATE TABLE
+
+INSERT INTO multirow_test VALUES (1, 'Alice', 90), (2, 'Bob', 85), (3, 'Charlie', 95);
+INSERT 0 3
+
+SELECT * FROM multirow_test ORDER BY id;
+multirow_test.id	multirow_test.name	multirow_test.score
+1	Alice	90
+2	Bob	85
+3	Charlie	95
+
+INSERT INTO multirow_test VALUES (4, 'Diana', 88);
+INSERT 0 1
+
+-- @query rowsort
+SELECT id, name, score FROM multirow_test;
+id	name	score
+1	Alice	90
+2	Bob	85
+3	Charlie	95
+4	Diana	88

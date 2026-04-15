@@ -1,0 +1,114 @@
+SELECT
+  NULL IS NOT DISTINCT FROM NULL AS null_eq_null,
+  NULL IS DISTINCT FROM NULL AS null_neq_null,
+  1 IS NOT DISTINCT FROM NULL AS one_eq_null,
+  1 IS DISTINCT FROM NULL AS one_neq_null,
+  1 IS NOT DISTINCT FROM 1 AS one_eq_one;
+null_eq_null	null_neq_null	one_eq_null	one_neq_null	one_eq_one
+true	false	false	true	true
+
+-- @query rowsort
+SELECT
+  label,
+  k IS NOT DISTINCT FROM NULL AS key_is_null,
+  k IS DISTINCT FROM NULL AS key_is_not_null
+FROM join_null_left
+ORDER BY label;
+label	key_is_null	key_is_not_null
+l1	false	true
+l2	false	true
+l_null_a	true	false
+l_null_b	true	false
+
+-- @query rowsort
+SELECT l.k, l.label, r.tag
+FROM join_null_left AS l
+JOIN join_null_right AS r ON l.k = r.k;
+l.k	l.label	r.tag
+1	l1	r1
+
+-- @query rowsort
+SELECT l.k, l.label, r.tag
+FROM (SELECT k, label FROM join_null_left) AS l
+JOIN (SELECT k, tag FROM join_null_right) AS r ON l.k IS NOT DISTINCT FROM r.k;
+l.k	l.label	r.tag
+1	l1	r1
+NULL	l_null_a	r_null_1
+NULL	l_null_a	r_null_2
+NULL	l_null_b	r_null_1
+NULL	l_null_b	r_null_2
+
+-- @query rowsort
+SELECT l.k, l.label, r.tag
+FROM join_null_left AS l
+LEFT JOIN join_null_right AS r ON l.k = r.k;
+l.k	l.label	r.tag
+1	l1	r1
+2	l2	NULL
+NULL	l_null_a	NULL
+NULL	l_null_b	NULL
+
+-- @query rowsort
+SELECT l.k, l.label, r.tag
+FROM (SELECT k, label FROM join_null_left) AS l
+LEFT JOIN (SELECT k, tag FROM join_null_right) AS r ON l.k IS NOT DISTINCT FROM r.k;
+l.k	l.label	r.tag
+1	l1	r1
+2	l2	NULL
+NULL	l_null_a	r_null_1
+NULL	l_null_a	r_null_2
+NULL	l_null_b	r_null_1
+NULL	l_null_b	r_null_2
+
+-- @query rowsort
+SELECT *
+FROM join_null_left AS l
+ANTI JOIN join_null_right AS r ON l.k = r.k;
+l.k	l.label
+2	l2
+NULL	l_null_a
+NULL	l_null_b
+
+-- @query rowsort
+SELECT *
+FROM (SELECT k, label FROM join_null_left) AS l
+ANTI JOIN (SELECT k, tag FROM join_null_right) AS r ON l.k IS NOT DISTINCT FROM r.k;
+l.k	l.label
+2	l2
+
+-- @query rowsort
+SELECT 2 INTERSECT SELECT 2;
+2
+2
+
+-- @query rowsort
+SELECT 2 EXCEPT SELECT 2;
+2
+
+-- @query rowsort
+SELECT NULL INTERSECT SELECT NULL;
+NULL
+NULL
+
+-- @query rowsort
+SELECT NULL EXCEPT SELECT NULL;
+NULL
+
+-- @query rowsort
+SELECT v
+FROM (SELECT v FROM setop_null_left) AS l
+INTERSECT
+SELECT v
+FROM (SELECT v FROM setop_null_right) AS r;
+v
+2
+NULL
+
+-- @query rowsort
+SELECT v
+FROM (SELECT v FROM setop_null_left) AS l
+EXCEPT
+SELECT v
+FROM (SELECT v FROM setop_null_right) AS r;
+v
+1

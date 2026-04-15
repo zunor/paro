@@ -1,0 +1,324 @@
+INSERT INTO join_explain_piecewise_l VALUES (1), (3), (5);
+INSERT 0 3
+
+INSERT INTO join_explain_piecewise_r VALUES (2), (4), (6);
+INSERT 0 3
+
+EXPLAIN
+SELECT l.id, r.id
+FROM join_explain_piecewise_l AS l
+JOIN join_explain_piecewise_r AS r ON l.id < r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id, id
+  ->  PIECEWISE_MERGE_JOIN  (rows=0)
+        Join Type: INNER
+        Join Condition: id < id
+        ->  ROWSET_SCAN on public.join_explain_piecewise_l l
+              Columns: id
+        ->  ROWSET_SCAN on public.join_explain_piecewise_r r
+              Columns: id
+
+EXPLAIN (VERBOSE)
+SELECT l.id, r.id
+FROM join_explain_piecewise_l AS l
+JOIN join_explain_piecewise_r AS r ON l.id < r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: id, id
+  Cardinality: [1, 3, 4]
+  Output Schema: l.id INTEGER, r.id INTEGER
+  ->  PIECEWISE_MERGE_JOIN  (rows=0)
+        Join Type: INNER
+        Join Condition: id < id
+        Cardinality: [0, 0, 0]
+        Output Schema: id INTEGER, id INTEGER
+        ->  ROWSET_SCAN on public.join_explain_piecewise_l l
+              Columns: id
+              Output Schema: id INTEGER
+        ->  ROWSET_SCAN on public.join_explain_piecewise_r r
+              Columns: id
+              Output Schema: id INTEGER
+
+-- @query json
+EXPLAIN
+SELECT l.id, r.id
+FROM join_explain_piecewise_l AS l
+JOIN join_explain_piecewise_r AS r ON l.id < r.id
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "plan",\n  "plan": {\n    "children": [\n      {\n        "children": [\n          {\n            "alias": "l",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "id"\n            ],\n            "properties": {\n              "Columns": [\n                "id"\n              ]\n            },\n            "relation": "public.join_explain_piecewise_l"\n          },\n          {\n            "alias": "r",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "id"\n            ],\n            "properties": {\n              "Columns": [\n                "id"\n              ]\n            },\n            "relation": "public.join_explain_piecewise_r"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 0,\n          "max": 0,\n          "min": 0\n        },\n        "estimated_rows": 0,\n        "node_id": 3,\n        "operator": "PIECEWISE_MERGE_JOIN",\n        "output_names": [\n          "id",\n          "id"\n        ],\n        "properties": {\n          "Join Condition": [\n            "id < id"\n          ],\n          "Join Type": "INNER"\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 3,\n      "max": 4,\n      "min": 1\n    },\n    "estimated_rows": 3,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "id",\n      "id"\n    ],\n    "properties": {\n      "Output": [\n        "id",\n        "id"\n      ]\n    }\n  }\n}
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.id, r.id
+FROM join_explain_piecewise_l AS l
+JOIN join_explain_piecewise_r AS r ON l.id < r.id;
+QUERY PLAN
+PROJECTION  (rows=3) (actual time=1.801..1.830 rows=6 loops=1)
+  Output: id, id
+  ->  PIECEWISE_MERGE_JOIN  (rows=0) (actual time=0.918..1.800 rows=9 loops=2)
+        Join Type: INNER
+        Join Condition: id < id
+        Spilled: false
+        Peak Memory: 780 B
+        ->  ROWSET_SCAN on public.join_explain_piecewise_l l (actual time=1.421..1.854 rows=3 loops=2)
+              Columns: id
+        ->  ROWSET_SCAN on public.join_explain_piecewise_r r (actual time=0.440..1.132 rows=3 loops=2)
+              Columns: id
+Execution Time: 0.645 ms
+Rows Returned: 6
+
+-- @query json
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.id, r.id
+FROM join_explain_piecewise_l AS l
+JOIN join_explain_piecewise_r AS r ON l.id < r.id
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 1,\n      "rows": 6,\n      "startup_time_ms": 1.177125,\n      "total_time_ms": 1.207125\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 2,\n          "peak_memory_bytes": 780,\n          "rows": 9,\n          "spilled": false,\n          "startup_time_ms": 0.597458,\n          "total_time_ms": 1.175791\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 3,\n              "startup_time_ms": 0.916125,\n              "total_time_ms": 1.232458\n            },\n            "alias": "l",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "id"\n            ],\n            "properties": {\n              "Columns": [\n                "id"\n              ]\n            },\n            "relation": "public.join_explain_piecewise_l"\n          },\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 3,\n              "startup_time_ms": 0.371,\n              "total_time_ms": 0.7194579999999999\n            },\n            "alias": "r",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "id"\n            ],\n            "properties": {\n              "Columns": [\n                "id"\n              ]\n            },\n            "relation": "public.join_explain_piecewise_r"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 0,\n          "max": 0,\n          "min": 0\n        },\n        "estimated_rows": 0,\n        "node_id": 3,\n        "operator": "PIECEWISE_MERGE_JOIN",\n        "output_names": [\n          "id",\n          "id"\n        ],\n        "properties": {\n          "Join Condition": [\n            "id < id"\n          ],\n          "Join Type": "INNER",\n          "Peak Memory": 780,\n          "Spilled": false\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 3,\n      "max": 4,\n      "min": 1\n    },\n    "estimated_rows": 3,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "id",\n      "id"\n    ],\n    "properties": {\n      "Output": [\n        "id",\n        "id"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "0.483 ms",\n    "Rows Returned": 6\n  }\n}
+
+INSERT INTO join_explain_ie_l VALUES (2), (5), (9);
+INSERT 0 3
+
+INSERT INTO join_explain_ie_r VALUES (1, 3), (4, 6), (7, 10);
+INSERT 0 3
+
+EXPLAIN
+SELECT l.x, r.lo, r.hi
+FROM join_explain_ie_l AS l
+JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: x, lo, hi
+  ->  IE_JOIN  (rows=0)
+        Join Type: INNER
+        Join Condition: lo <= x, hi >= x
+        ->  ROWSET_SCAN on public.join_explain_ie_r r
+              Columns: lo, hi
+        ->  ROWSET_SCAN on public.join_explain_ie_l l
+              Columns: x
+
+EXPLAIN (VERBOSE)
+SELECT l.x, r.lo, r.hi
+FROM join_explain_ie_l AS l
+JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: x, lo, hi
+  Cardinality: [0, 1, 1]
+  Output Schema: l.x INTEGER, r.lo INTEGER, r.hi INTEGER
+  ->  IE_JOIN  (rows=0)
+        Join Type: INNER
+        Join Condition: lo <= x, hi >= x
+        Cardinality: [0, 0, 0]
+        Output Schema: lo INTEGER, hi INTEGER, x INTEGER
+        ->  ROWSET_SCAN on public.join_explain_ie_r r
+              Columns: lo, hi
+              Output Schema: lo INTEGER, hi INTEGER
+        ->  ROWSET_SCAN on public.join_explain_ie_l l
+              Columns: x
+              Output Schema: x INTEGER
+
+-- @query json
+EXPLAIN
+SELECT l.x, r.lo, r.hi
+FROM join_explain_ie_l AS l
+JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "plan",\n  "plan": {\n    "children": [\n      {\n        "children": [\n          {\n            "alias": "r",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "lo",\n              "hi"\n            ],\n            "properties": {\n              "Columns": [\n                "lo",\n                "hi"\n              ]\n            },\n            "relation": "public.join_explain_ie_r"\n          },\n          {\n            "alias": "l",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "x"\n            ],\n            "properties": {\n              "Columns": [\n                "x"\n              ]\n            },\n            "relation": "public.join_explain_ie_l"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 0,\n          "max": 0,\n          "min": 0\n        },\n        "estimated_rows": 0,\n        "node_id": 3,\n        "operator": "IE_JOIN",\n        "output_names": [\n          "lo",\n          "hi",\n          "x"\n        ],\n        "properties": {\n          "Join Condition": [\n            "lo <= x",\n            "hi >= x"\n          ],\n          "Join Type": "INNER"\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 1,\n      "max": 1,\n      "min": 0\n    },\n    "estimated_rows": 1,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "x",\n      "lo",\n      "hi"\n    ],\n    "properties": {\n      "Output": [\n        "x",\n        "lo",\n        "hi"\n      ]\n    }\n  }\n}
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.x, r.lo, r.hi
+FROM join_explain_ie_l AS l
+JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi;
+QUERY PLAN
+PROJECTION  (rows=1) (actual time=0.931..0.966 rows=3 loops=1)
+  Output: x, lo, hi
+  ->  IE_JOIN  (rows=0) (actual time=0.418..0.930 rows=6 loops=2)
+        Join Type: INNER
+        Join Condition: lo <= x, hi >= x
+        Peak Memory: 660 B
+        ->  ROWSET_SCAN on public.join_explain_ie_r r (actual time=0.641..0.999 rows=3 loops=2)
+              Columns: lo, hi
+        ->  ROWSET_SCAN on public.join_explain_ie_l l (actual time=0.246..0.461 rows=3 loops=2)
+              Columns: x
+Execution Time: 0.533 ms
+Rows Returned: 3
+
+-- @query json
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.x, r.lo, r.hi
+FROM join_explain_ie_l AS l
+JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 1,\n      "rows": 3,\n      "startup_time_ms": 0.736625,\n      "total_time_ms": 0.763042\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 2,\n          "peak_memory_bytes": 660,\n          "rows": 6,\n          "startup_time_ms": 0.355792,\n          "total_time_ms": 0.735792\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 3,\n              "startup_time_ms": 0.555333,\n              "total_time_ms": 0.788417\n            },\n            "alias": "r",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "lo",\n              "hi"\n            ],\n            "properties": {\n              "Columns": [\n                "lo",\n                "hi"\n              ]\n            },\n            "relation": "public.join_explain_ie_r"\n          },\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 3,\n              "startup_time_ms": 0.24516700000000002,\n              "total_time_ms": 0.3885\n            },\n            "alias": "l",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "x"\n            ],\n            "properties": {\n              "Columns": [\n                "x"\n              ]\n            },\n            "relation": "public.join_explain_ie_l"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 0,\n          "max": 0,\n          "min": 0\n        },\n        "estimated_rows": 0,\n        "node_id": 3,\n        "operator": "IE_JOIN",\n        "output_names": [\n          "lo",\n          "hi",\n          "x"\n        ],\n        "properties": {\n          "Join Condition": [\n            "lo <= x",\n            "hi >= x"\n          ],\n          "Join Type": "INNER",\n          "Peak Memory": 660\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 1,\n      "max": 1,\n      "min": 0\n    },\n    "estimated_rows": 1,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "x",\n      "lo",\n      "hi"\n    ],\n    "properties": {\n      "Output": [\n        "x",\n        "lo",\n        "hi"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "0.389 ms",\n    "Rows Returned": 3\n  }\n}
+
+INSERT INTO join_explain_hash_l VALUES
+  (5, 'l5'),
+  (10, 'l10'),
+  (15, 'l15'),
+  (20, 'l20'),
+  (NULL, 'lnull');
+INSERT 0 5
+
+INSERT INTO join_explain_hash_r VALUES
+  (10, 'r10'),
+  (15, 'r15');
+INSERT 0 2
+
+EXPLAIN (VERBOSE)
+SELECT l.k, r.payload
+FROM join_explain_hash_l AS l
+LEFT JOIN join_explain_hash_r AS r ON l.k = r.k;
+QUERY PLAN
+PROJECTION  (rows=5)
+  Output: k, payload
+  Cardinality: [5, 5, 5]
+  Output Schema: l.k INTEGER, r.payload VARCHAR
+  ->  HASH_JOIN  (rows=5)
+        Join Type: LEFT
+        Join Condition: k = k
+        Join Filter Kind: MIN/MAX + BLOOM
+        Join Filter Target: k
+        Cardinality: [5, 5, 5]
+        Output Schema: k INTEGER, k INTEGER, payload VARCHAR
+        ->  ROWSET_SCAN on public.join_explain_hash_l l
+              Columns: k
+              Output Schema: k INTEGER
+        ->  ROWSET_SCAN on public.join_explain_hash_r r
+              Columns: k, payload
+              Output Schema: k INTEGER, payload VARCHAR
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.k, r.payload
+FROM join_explain_hash_l AS l
+LEFT JOIN join_explain_hash_r AS r ON l.k = r.k;
+QUERY PLAN
+PROJECTION  (rows=5) (actual time=1.593..1.686 rows=5 loops=2)
+  Output: k, payload
+  ->  HASH_JOIN  (rows=5) (actual time=0.622..1.734 rows=7 loops=4)
+        Join Type: LEFT
+        Join Condition: k = k
+        Join Filter Kind: MIN/MAX + BLOOM
+        Join Filter Target: k
+        Join Filter Prune Ratio: 0.600
+        Spilled: false
+        Peak Memory: 57.6 MB
+        Temp Storage: 128 B
+        ->  ROWSET_SCAN on public.join_explain_hash_l l (actual time=1.225..1.702 rows=5 loops=2)
+              Columns: k
+        ->  ROWSET_SCAN on public.join_explain_hash_r r (actual time=0.353..0.815 rows=2 loops=2)
+              Columns: k, payload
+Execution Time: 0.854 ms
+Rows Returned: 5
+
+-- @query json
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.k, r.payload
+FROM join_explain_hash_l AS l
+LEFT JOIN join_explain_hash_r AS r ON l.k = r.k
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 2,\n      "rows": 5,\n      "startup_time_ms": 1.2204169999999999,\n      "total_time_ms": 1.293375\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 4,\n          "peak_memory_bytes": 60397977,\n          "rows": 7,\n          "spilled": false,\n          "startup_time_ms": 0.49345900000000004,\n          "temp_storage_bytes": 128,\n          "total_time_ms": 1.3358750000000001\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 5,\n              "startup_time_ms": 0.963834,\n              "total_time_ms": 1.307625\n            },\n            "alias": "l",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "k"\n            ],\n            "properties": {\n              "Columns": [\n                "k"\n              ]\n            },\n            "relation": "public.join_explain_hash_l"\n          },\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 2,\n              "startup_time_ms": 0.30725,\n              "total_time_ms": 0.638625\n            },\n            "alias": "r",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "k",\n              "payload"\n            ],\n            "properties": {\n              "Columns": [\n                "k",\n                "payload"\n              ]\n            },\n            "relation": "public.join_explain_hash_r"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 5,\n          "max": 5,\n          "min": 5\n        },\n        "estimated_rows": 5,\n        "node_id": 3,\n        "operator": "HASH_JOIN",\n        "output_names": [\n          "k",\n          "k",\n          "payload"\n        ],\n        "properties": {\n          "Join Condition": [\n            "k = k"\n          ],\n          "Join Filter Kind": "MIN/MAX + BLOOM",\n          "Join Filter Prune Ratio": 0.6,\n          "Join Filter Target": [\n            "k"\n          ],\n          "Join Type": "LEFT",\n          "Peak Memory": 60397977,\n          "Spilled": false,\n          "Temp Storage": 128\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 5,\n      "max": 5,\n      "min": 5\n    },\n    "estimated_rows": 5,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "k",\n      "payload"\n    ],\n    "properties": {\n      "Output": [\n        "k",\n        "payload"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "0.660 ms",\n    "Rows Returned": 5\n  }\n}
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.k
+FROM join_explain_hash_l AS l
+SEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k;
+QUERY PLAN
+PROJECTION  (rows=1) (actual time=0.602..0.613 rows=2 loops=1)
+  Output: k
+  ->  NESTED_LOOP_JOIN  (rows=1) (actual time=0.339..0.601 rows=4 loops=2)
+        Join Type: SEMI
+        Join Condition: k IS NOT DISTINCT FROM k
+        Peak Memory: 16 B
+        ->  ROWSET_SCAN on public.join_explain_hash_l l (actual time=0.482..0.633 rows=5 loops=2)
+              Columns: k
+        ->  ROWSET_SCAN on public.join_explain_hash_r r (actual time=0.236..0.371 rows=2 loops=2)
+              Columns: k
+Execution Time: 0.243 ms
+Rows Returned: 2
+
+-- @query json
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.k
+FROM join_explain_hash_l AS l
+SEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 1,\n      "rows": 2,\n      "startup_time_ms": 0.532167,\n      "total_time_ms": 0.5435\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 2,\n          "peak_memory_bytes": 16,\n          "rows": 4,\n          "startup_time_ms": 0.292959,\n          "total_time_ms": 0.531459\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 5,\n              "startup_time_ms": 0.426209,\n              "total_time_ms": 0.563667\n            },\n            "alias": "l",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "k"\n            ],\n            "properties": {\n              "Columns": [\n                "k"\n              ]\n            },\n            "relation": "public.join_explain_hash_l"\n          },\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 2,\n              "startup_time_ms": 0.202292,\n              "total_time_ms": 0.31625000000000003\n            },\n            "alias": "r",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "k"\n            ],\n            "properties": {\n              "Columns": [\n                "k"\n              ]\n            },\n            "relation": "public.join_explain_hash_r"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 1,\n          "max": 1,\n          "min": 1\n        },\n        "estimated_rows": 1,\n        "node_id": 3,\n        "operator": "NESTED_LOOP_JOIN",\n        "output_names": [\n          "k"\n        ],\n        "properties": {\n          "Join Condition": [\n            "k IS NOT DISTINCT FROM k"\n          ],\n          "Join Type": "SEMI",\n          "Peak Memory": 16\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 1,\n      "max": 5,\n      "min": 0\n    },\n    "estimated_rows": 1,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "k"\n    ],\n    "properties": {\n      "Output": [\n        "k"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "0.232 ms",\n    "Rows Returned": 2\n  }\n}
+
+INSERT INTO join_explain_spill_l
+SELECT g
+FROM generate_series(1, 512) AS t(g);
+INSERT 0 512
+
+INSERT INTO join_explain_spill_r
+SELECT g
+FROM generate_series(1, 512) AS t(g);
+INSERT 0 512
+
+SET temp_directory = '/tmp/paro_regress_join_explain_advanced';
+SET
+
+SET max_temp_directory_size = '256MB';
+SET
+
+SET force_external = true;
+SET
+
+SET threads = 1;
+SET
+
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.k
+FROM join_explain_spill_l AS l
+LEFT JOIN join_explain_spill_r AS r ON l.k = r.k;
+QUERY PLAN
+PROJECTION  (rows=26214) (actual time=184.698..316.722 rows=512 loops=16)
+  Output: k
+  ->  HASH_JOIN  (rows=26214) (actual time=1.263..317.855 rows=1024 loops=19)
+        Join Type: LEFT
+        Join Condition: k = k
+        Spilled: true
+        Peak Memory: 57.6 MB
+        Temp Storage: 128 B
+        ->  ROWSET_SCAN on public.join_explain_spill_l l (actual time=178.392..184.731 rows=512 loops=2)
+              Columns: k
+        ->  ROWSET_SCAN on public.join_explain_spill_r r (actual time=0.307..2.533 rows=512 loops=2)
+              Columns: k
+Execution Time: 139.643 ms
+Rows Returned: 512
+
+-- @query json
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT l.k
+FROM join_explain_spill_l AS l
+LEFT JOIN join_explain_spill_r AS r ON l.k = r.k
+FORMAT JSON;
+QUERY PLAN
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 16,\n      "rows": 512,\n      "startup_time_ms": 150.454083,\n      "total_time_ms": 280.96883299999996\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 19,\n          "peak_memory_bytes": 60397977,\n          "rows": 1024,\n          "spilled": true,\n          "startup_time_ms": 0.625416,\n          "temp_storage_bytes": 128,\n          "total_time_ms": 281.813875\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 512,\n              "startup_time_ms": 144.12275,\n              "total_time_ms": 150.48183300000002\n            },\n            "alias": "l",\n            "node_id": 1,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "k"\n            ],\n            "properties": {\n              "Columns": [\n                "k"\n              ]\n            },\n            "relation": "public.join_explain_spill_l"\n          },\n          {\n            "actual": {\n              "loops": 2,\n              "rows": 512,\n              "startup_time_ms": 0.183166,\n              "total_time_ms": 1.1863329999999999\n            },\n            "alias": "r",\n            "node_id": 2,\n            "operator": "ROWSET_SCAN",\n            "output_names": [\n              "k"\n            ],\n            "properties": {\n              "Columns": [\n                "k"\n              ]\n            },\n            "relation": "public.join_explain_spill_r"\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 26214,\n          "max": 39322,\n          "min": 512\n        },\n        "estimated_rows": 26214,\n        "node_id": 3,\n        "operator": "HASH_JOIN",\n        "output_names": [\n          "k",\n          "k"\n        ],\n        "properties": {\n          "Join Condition": [\n            "k = k"\n          ],\n          "Join Type": "LEFT",\n          "Peak Memory": 60397977,\n          "Spilled": true,\n          "Temp Storage": 128\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 26214,\n      "max": 39322,\n      "min": 512\n    },\n    "estimated_rows": 26214,\n    "node_id": 4,\n    "operator": "PROJECTION",\n    "output_names": [\n      "k"\n    ],\n    "properties": {\n      "Output": [\n        "k"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "137.868 ms",\n    "Rows Returned": 512\n  }\n}
+
+SET force_external = DEFAULT;
+SET
+
+SET threads = DEFAULT;
+SET
+
+SET max_temp_directory_size = DEFAULT;
+SET
+
+SET temp_directory = DEFAULT;
+SET

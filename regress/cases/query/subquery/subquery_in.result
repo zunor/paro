@@ -1,0 +1,85 @@
+SELECT
+  5 IN (
+    SELECT quota
+    FROM subquery_in_lookup
+    WHERE quota IS NOT NULL
+  ) AS in_present,
+  7 NOT IN (
+    SELECT quota
+    FROM subquery_in_lookup
+    WHERE quota IS NOT NULL
+  ) AS not_in_absent;
+in_present	not_in_absent
+true	true
+
+SELECT
+  7 IN (SELECT quota FROM subquery_in_lookup) AS in_with_null_rhs,
+  3 IN (SELECT quota FROM subquery_in_lookup) AS in_match_despite_null,
+  7 NOT IN (SELECT quota FROM subquery_in_lookup) AS not_in_with_null_rhs,
+  3 NOT IN (SELECT quota FROM subquery_in_lookup) AS not_in_match;
+in_with_null_rhs	in_match_despite_null	not_in_with_null_rhs	not_in_match
+NULL	true	NULL	false
+
+SELECT
+  o.id,
+  o.grp,
+  o.amt,
+  o.amt IN (
+    SELECT l.quota
+    FROM subquery_in_lookup AS l
+    WHERE l.grp = o.grp
+  ) AS amt_in_group_quota,
+  o.amt NOT IN (
+    SELECT l.quota
+    FROM subquery_in_lookup AS l
+    WHERE l.grp = o.grp
+  ) AS amt_not_in_group_quota
+FROM subquery_in_outer AS o
+ORDER BY o.id;
+o.id	o.grp	o.amt	amt_in_group_quota	amt_not_in_group_quota
+1	10	5	true	false
+2	20	7	NULL	NULL
+3	20	3	true	false
+4	30	6	true	false
+5	NULL	9	false	true
+6	40	1	NULL	NULL
+
+SELECT o.id, o.label
+FROM subquery_in_outer AS o
+WHERE o.amt IN (
+  SELECT l.quota
+  FROM subquery_in_lookup AS l
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+3	gamma
+4	delta
+
+SELECT o.id, o.label
+FROM subquery_in_outer AS o
+WHERE o.amt NOT IN (
+  SELECT l.quota
+  FROM subquery_in_lookup AS l
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+5	null_grp
+
+SELECT
+  (10, 5) IN (
+    SELECT grp, quota
+    FROM subquery_in_lookup
+  ) AS pair_match,
+  (20, 7) IN (
+    SELECT grp, quota
+    FROM subquery_in_lookup
+  ) AS pair_miss,
+  (40, 1) IN (
+    SELECT grp, quota
+    FROM subquery_in_lookup
+  ) AS pair_null_sensitive;
+pair_match	pair_miss	pair_null_sensitive
+true	NULL	NULL

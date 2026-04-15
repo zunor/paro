@@ -1,0 +1,38 @@
+[package]
+name = "paro-function"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+too-many-arguments = "allow"
+module-inception = "allow"
+type-complexity = "allow"
+should-implement-trait = "allow"
+multiple-bound-locations = "allow"
+collapsible-if = "allow"
+needless-borrow = "allow"
+cast-abs-to-unsigned = "allow"
+manual-strip = "allow"
+from-str-radix-10 = "allow"
+needless-range-loop = "allow"
+match-like-matches-macro = "allow"
+needless-lifetimes = "allow"
+len-zero = "allow"
+manual-unwrap-or = "allow"
+unwrap-or-default = "allow"
+get-first = "allow"
+manual-clamp = "allow"
+unnecessary-to-owned = "allow"
+default-constructed-unit-structs = "allow"
+unnecessary-map-or = "allow"
+unnecessary-cast = "allow"
+redundant-closure = "allow"
+manual-range-contains = "allow"
+approx-constant = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-parser = { workspace = true }
+paro-storage = { workspace = true }
+regex = "1"
+serde_json = { workspace = true }

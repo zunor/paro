@@ -1,0 +1,67 @@
+CREATE TABLE memory_dummy (x INT);
+CREATE TABLE
+
+INSERT INTO memory_dummy VALUES (1);
+INSERT 0 1
+
+SELECT 1;
+1
+1
+
+SELECT count(*) FROM memory_dummy;
+COUNT(*)
+1
+
+SET memory_limit = '1GB';
+SET
+
+SELECT current_setting('memory_limit') FROM memory_dummy;
+current_setting('memory_limit')
+1GB
+
+SET temp_directory = './paro_temp';
+SET
+
+SELECT current_setting('temp_directory') FROM memory_dummy;
+current_setting('temp_directory')
+./paro_temp
+
+SET max_temp_directory_size = '512MB';
+SET
+
+SELECT current_setting('max_temp_directory_size') FROM memory_dummy;
+current_setting('max_temp_directory_size')
+512MB
+
+SELECT count(*) >= 0 FROM paro_memory();
+COUNT(*) >= 0
+true
+
+SELECT count(*) >= 0 FROM pragma_database_size();
+COUNT(*) >= 0
+true
+
+SELECT count(*) >= 0 FROM paro_temporary_files();
+COUNT(*) >= 0
+true
+
+SET memory_limit = DEFAULT;
+SET
+
+SELECT current_setting('memory_limit') FROM memory_dummy;
+current_setting('memory_limit')
+1073741824
+
+SET temp_directory = DEFAULT;
+SET
+
+SELECT current_setting('temp_directory') FROM memory_dummy;
+current_setting('temp_directory')
+(empty)
+
+SET max_temp_directory_size = DEFAULT;
+SET
+
+SELECT current_setting('max_temp_directory_size') FROM memory_dummy;
+current_setting('max_temp_directory_size')
+unlimited

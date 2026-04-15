@@ -1,0 +1,287 @@
+---------- Input ----------
+create user 'test-e' identified bi 'password';
+---------- Output ---------
+error: 
+  --> SQL:1:33
+  |
+1 | create user 'test-e' identified bi 'password';
+  |                                 ^^ unexpected `bi`, expecting `BY`, `WITH`, `FORMAT`, or `;`
+
+
+---------- Input ----------
+create user 'test-e'@'localhost' identified by 'password';
+---------- Output ---------
+error: 
+  --> SQL:1:22
+  |
+1 | create user 'test-e'@'localhost' identified by 'password';
+  | ------               ^^^^^^^^^^^ unexpected `'localhost'`, expecting `'%'` or `IDENTIFIED`
+  | |                     
+  | while parsing `CREATE [OR REPLACE] USER [IF NOT EXISTS] '<username>' IDENTIFIED [WITH <auth_type>] [BY <password>] [WITH <user_option>, ...]`
+
+
+---------- Input ----------
+drop usar if exists 'test-j';
+---------- Output ---------
+error: 
+  --> SQL:1:6
+  |
+1 | drop usar if exists 'test-j';
+  |      ^^^^ unexpected `usar`, expecting `USER`, `STREAM`, `STAGE`, `PASSWORD`, `WAREHOUSE`, `TAG`, `ROLE`, `TABLE`, `SCHEMA`, `VECTOR`, `NETWORK`, `DATABASE`, `WORKLOAD`, `INVERTED`, `FUNCTION`, `PROPERTY`, `PROCEDURE`, `TASK`, `NOTIFICATION`, `NGRAM`, `MASKING`, `SEQUENCE`, `DICTIONARY`, `VIEW`, `INDEX`, `FILE`, `PIPE`, `CONNECTION`, or `ROW`
+
+
+---------- Input ----------
+alter user 'test-e' identifies by 'new-password';
+---------- Output ---------
+error: 
+  --> SQL:1:21
+  |
+1 | alter user 'test-e' identifies by 'new-password';
+  |                     ^^^^^^^^^^ unexpected `identifies`, expecting `IDENTIFIED`, `WITH`, `FORMAT`, `@`, or `;`
+
+
+---------- Input ----------
+create role 'test'@'%';
+---------- Output ---------
+error: 
+  --> SQL:1:19
+  |
+1 | create role 'test'@'%';
+  |                   ^ unexpected `@`, expecting `COMMENT`, `FORMAT`, or `;`
+
+
+---------- Input ----------
+drop role 'test'@'%';
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | drop role 'test'@'%';
+  |                 ^ unexpected `@`, expecting `FORMAT` or `;`
+
+
+---------- Input ----------
+create role `a"a`
+---------- Output ---------
+error: 
+  --> SQL:1:13
+  |
+1 | create role `a"a`
+  | ------      ^^^^^
+  | |           |
+  | |           ' or " or \f or \b are not allowed in role name
+  | |           while parsing <role_name>
+  | while parsing `CREATE ROLE [IF NOT EXISTS] <role_name> [COMMENT ='<string_literal>']`
+
+
+---------- Input ----------
+create role `a'a`
+---------- Output ---------
+error: 
+  --> SQL:1:13
+  |
+1 | create role `a'a`
+  | ------      ^^^^^
+  | |           |
+  | |           ' or " or \f or \b are not allowed in role name
+  | |           while parsing <role_name>
+  | while parsing `CREATE ROLE [IF NOT EXISTS] <role_name> [COMMENT ='<string_literal>']`
+
+
+---------- Input ----------
+create role `a\ba`
+---------- Output ---------
+error: 
+  --> SQL:1:13
+  |
+1 | create role `a\ba`
+  | ------      ^^^^^^
+  | |           |
+  | |           ' or " or \f or \b are not allowed in role name
+  | |           while parsing <role_name>
+  | while parsing `CREATE ROLE [IF NOT EXISTS] <role_name> [COMMENT ='<string_literal>']`
+
+
+---------- Input ----------
+create role `a\fa`
+---------- Output ---------
+error: 
+  --> SQL:1:13
+  |
+1 | create role `a\fa`
+  | ------      ^^^^^^
+  | |           |
+  | |           ' or " or \f or \b are not allowed in role name
+  | |           while parsing <role_name>
+  | while parsing `CREATE ROLE [IF NOT EXISTS] <role_name> [COMMENT ='<string_literal>']`
+
+
+---------- Input ----------
+drop role `a\fa`
+---------- Output ---------
+error: 
+  --> SQL:1:11
+  |
+1 | drop role `a\fa`
+  | ----      ^^^^^^
+  | |         |
+  | |         ' or " or \f or \b are not allowed in role name
+  | |         while parsing <role_name>
+  | while parsing `DROP ROLE [IF EXISTS] <role_name>`
+
+
+---------- Input ----------
+SHOW GRANT FOR ROLE 'role1';
+---------- Output ---------
+error: 
+  --> SQL:1:6
+  |
+1 | SHOW GRANT FOR ROLE 'role1';
+  |      ^^^^^ unexpected `GRANT`. it's reserved keyword, you may avoid using it, expecting `GRANTS`, `CREATE`, <Ident>, `VIRTUAL`, `NETWORK`, `STREAMS`, `DATABASES`, `FUNCTIONS`, `IDENTIFIER`, `CONNECTIONS`, <LiteralString>, `TABLE_FUNCTIONS`, `ALL`, `TAGS`, `DROP`, `TASKS`, `TABLE`, `ROLES`, `ONLINE`, `INDEXES`, `COLUMNS`, `WORKLOAD`, `PASSWORD`, `SEQUENCES`, `PROCEDURES`, `PROCESSLIST`, `TABLES`, `STAGES`, `DICTIONARIES`, `METRICS`, `ENGINES`, `SETTINGS`, `VARIABLES`, `WAREHOUSES`, `STATISTICS`, `SCHEMAS`, `USER`, `LOCKS`, `FIELDS`, `VIEWS`, `USERS`, `FILE`, or `FULL`
+
+
+---------- Input ----------
+GRANT ROLE 'test' TO ROLE test-user;
+---------- Output ---------
+error: 
+  --> SQL:1:31
+  |
+1 | GRANT ROLE 'test' TO ROLE test-user;
+  |                               ^ unexpected `-`, expecting `FORMAT` or `;`
+
+
+---------- Input ----------
+GRANT SELECT, ALL PRIVILEGES, CREATE ON * TO 'test-grant';
+---------- Output ---------
+error: 
+  --> SQL:1:15
+  |
+1 | GRANT SELECT, ALL PRIVILEGES, CREATE ON * TO 'test-grant';
+  | ----- ------  ^^^ unexpected `ALL`. it's reserved keyword, you may avoid using it, expecting `ALTER`, `APPLY`, `SELECT`, `DELETE`, `ACCESS`, `USAGE`, `INSERT`, `UPDATE`, `SUPER`, `CREATE`, `DROP`, `GRANT`, or `SET`
+  | |     |        
+  | |     while parsing <privileges> ON <privileges_level>
+  | while parsing `GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+GRANT SELECT, CREATE ON *.c TO 'test-grant';
+---------- Output ---------
+error: 
+  --> SQL:1:27
+  |
+1 | GRANT SELECT, CREATE ON *.c TO 'test-grant';
+  | -----                     ^ unexpected `c`, expecting `TO` or `*`
+  | |                          
+  | while parsing `GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+GRANT select ON UDF a TO 'test-grant';
+---------- Output ---------
+error: 
+  --> SQL:1:17
+  |
+1 | GRANT select ON UDF a TO 'test-grant';
+  | ----- ------    ^^^ unexpected `UDF`. it's reserved keyword, you may avoid using it, expecting `IDENTIFIER`, <Ident>, `FALSE`, `*`, <LiteralString>, <LiteralInteger>, <MySQLLiteralHex>, <PGLiteralHex>, `TRUE`, `MASKING`, or `ROW`
+  | |     |          
+  | |     while parsing <privileges> ON <privileges_level>
+  | while parsing `GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+REVOKE SELECT, CREATE, ALL PRIVILEGES ON * FROM 'test-grant';
+---------- Output ---------
+error: 
+  --> SQL:1:24
+  |
+1 | REVOKE SELECT, CREATE, ALL PRIVILEGES ON * FROM 'test-grant';
+  | ------ ------          ^^^ unexpected `ALL`. it's reserved keyword, you may avoid using it, expecting `ALTER`, `APPLY`, `SELECT`, `DELETE`, `ACCESS`, `USAGE`, `INSERT`, `UPDATE`, `SUPER`, `CREATE`, `DROP`, `GRANT`, or `SET`
+  | |      |                
+  | |      while parsing <privileges> ON <privileges_level>
+  | while parsing `REVOKE { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } FROM { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+REVOKE SELECT, CREATE ON * TO 'test-grant';
+---------- Output ---------
+error: 
+  --> SQL:1:28
+  |
+1 | REVOKE SELECT, CREATE ON * TO 'test-grant';
+  | ------                     ^^ unexpected `TO`. it's reserved keyword, you may avoid using it, expecting `FROM` or `.`
+  | |                           
+  | while parsing `REVOKE { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } FROM { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+GRANT OWNERSHIP, SELECT ON d20_0014.* TO ROLE 'd20_0015_owner';
+---------- Output ---------
+error: 
+  --> SQL:1:16
+  |
+1 | GRANT OWNERSHIP, SELECT ON d20_0014.* TO ROLE 'd20_0015_owner';
+  | -----          ^ unexpected `,`, expecting `ON`
+  | |               
+  | while parsing GRANT OWNERSHIP ON <privileges_level> TO ROLE <role_name>
+
+
+---------- Input ----------
+GRANT OWNERSHIP ON d20_0014.* TO USER A;
+---------- Output ---------
+error: 
+  --> SQL:1:34
+  |
+1 | GRANT OWNERSHIP ON d20_0014.* TO USER A;
+  | -----                            ^^^^ unexpected `USER`. it's reserved keyword, you may avoid using it, expecting `ROLE`
+  | |                                 
+  | while parsing GRANT OWNERSHIP ON <privileges_level> TO ROLE <role_name>
+
+
+---------- Input ----------
+REVOKE OWNERSHIP, SELECT ON d20_0014.* FROM ROLE 'd20_0015_owner';
+---------- Output ---------
+error: 
+  --> SQL:1:8
+  |
+1 | REVOKE OWNERSHIP, SELECT ON d20_0014.* FROM ROLE 'd20_0015_owner';
+  | ------ ^^^^^^^^^ unexpected `OWNERSHIP`. it's reserved keyword, you may avoid using it, expecting `INSERT`, `ALTER`, `SUPER`, `ROLE`, `ACCESS`, `WRITE`, `SET`, `SELECT`, `UPDATE`, `DELETE`, `DROP`, `READ`, `USAGE`, `GRANT`, `CREATE`, `ALL`, or `APPLY`
+  | |       
+  | while parsing `REVOKE { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } FROM { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+REVOKE OWNERSHIP ON d20_0014.* FROM USER A;
+---------- Output ---------
+error: 
+  --> SQL:1:8
+  |
+1 | REVOKE OWNERSHIP ON d20_0014.* FROM USER A;
+  | ------ ^^^^^^^^^ unexpected `OWNERSHIP`. it's reserved keyword, you may avoid using it, expecting `INSERT`, `ALTER`, `SUPER`, `ROLE`, `ACCESS`, `WRITE`, `SET`, `SELECT`, `UPDATE`, `DELETE`, `DROP`, `READ`, `USAGE`, `GRANT`, `CREATE`, `ALL`, or `APPLY`
+  | |       
+  | while parsing `REVOKE { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } FROM { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+REVOKE OWNERSHIP ON d20_0014.* FROM ROLE A;
+---------- Output ---------
+error: 
+  --> SQL:1:8
+  |
+1 | REVOKE OWNERSHIP ON d20_0014.* FROM ROLE A;
+  | ------ ^^^^^^^^^ unexpected `OWNERSHIP`. it's reserved keyword, you may avoid using it, expecting `INSERT`, `ALTER`, `SUPER`, `ROLE`, `ACCESS`, `WRITE`, `SET`, `SELECT`, `UPDATE`, `DELETE`, `DROP`, `READ`, `USAGE`, `GRANT`, `CREATE`, `ALL`, or `APPLY`
+  | |       
+  | while parsing `REVOKE { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } FROM { [ROLE <role_name>] | [USER] <user> }`
+
+
+---------- Input ----------
+GRANT OWNERSHIP ON *.* TO ROLE 'd20_0015_owner';
+---------- Output ---------
+error: 
+  --> SQL:1:21
+  |
+1 | GRANT OWNERSHIP ON *.* TO ROLE 'd20_0015_owner';
+  | -----               ^ unexpected `.`, expecting `TO`
+  | |                    
+  | while parsing GRANT OWNERSHIP ON <privileges_level> TO ROLE <role_name>
+
+

@@ -1,0 +1,279 @@
+INSERT INTO dml_copy_from_src VALUES
+  (1, 'alpha'),
+  (2, 'pipe|bar'),
+  (3, NULL),
+  (4, 'comma,space'),
+  (5, 'quote "here"');
+INSERT 0 5
+
+COPY dml_copy_from_src TO '/tmp/paro_copy_from_text.txt';
+COPY 5
+
+COPY dml_copy_from_text FROM '/tmp/paro_copy_from_text.txt';
+COPY 5
+
+-- @query rowsort
+SELECT id, name FROM dml_copy_from_text;
+id	name
+1	alpha
+2	pipe|bar
+3	NULL
+4	comma,space
+5	quote "here"
+
+COPY (
+  SELECT *
+  FROM (
+    VALUES
+      (10, 'plain'::TEXT),
+      (11, 'hex\\x41value'),
+      (12, 'oct\\101value'),
+      (13, 'slash\\\\path'),
+      (14, '\\\\N'),
+      (15, NULL::TEXT)
+  ) AS v(id, name)
+  ORDER BY id
+) TO '/tmp/paro_copy_from_text_defaults.txt';
+COPY 6
+
+COPY dml_copy_from_text_defaults FROM '/tmp/paro_copy_from_text_defaults.txt';
+COPY 6
+
+SELECT id, name
+FROM dml_copy_from_text_defaults
+ORDER BY id;
+id	name
+10	plain
+11	hexAvalue
+12	octAvalue
+13	slash\\path
+14	\\N
+15	NULL
+
+COPY dml_copy_from_src TO '/tmp/paro_copy_from_csv.csv' WITH (FORMAT csv, HEADER true);
+COPY 5
+
+COPY dml_copy_from_csv FROM '/tmp/paro_copy_from_csv.csv' WITH (FORMAT csv, HEADER true);
+COPY 5
+
+-- @query rowsort
+SELECT id, name FROM dml_copy_from_csv;
+id	name
+1	alpha
+2	pipe|bar
+3	NULL
+4	comma,space
+5	quote "here"
+
+COPY dml_copy_from_src TO '/tmp/paro_copy_from_where.csv' WITH (FORMAT csv, HEADER true);
+COPY 5
+
+COPY dml_copy_from_where_csv
+FROM '/tmp/paro_copy_from_where.csv'
+WITH (FORMAT csv, HEADER true)
+WHERE id >= 2 AND name IS NOT NULL;
+COPY 3
+
+-- @query rowsort
+SELECT id, name FROM dml_copy_from_where_csv;
+id	name
+2	pipe|bar
+4	comma,space
+5	quote "here"
+
+COPY dml_copy_from_src TO '/tmp/paro_copy_from_where.ndjson' WITH (FORMAT ndjson);
+COPY 5
+
+COPY dml_copy_from_where_ndjson
+FROM '/tmp/paro_copy_from_where.ndjson'
+WITH (FORMAT ndjson)
+WHERE dml_copy_from_where_ndjson.id >= 4;
+COPY 2
+
+-- @query rowsort
+SELECT id, name FROM dml_copy_from_where_ndjson;
+id	name
+4	comma,space
+5	quote "here"
+
+COPY dml_copy_from_where_csv
+FROM '/tmp/paro_copy_from_where.csv'
+WITH (FORMAT csv, HEADER true)
+WHERE not_exists > 0;
+ERROR: Column not found: not_exists (SQLSTATE=42601)
+
+COPY (
+  SELECT name, id
+  FROM dml_copy_from_src
+  ORDER BY id
+) TO '/tmp/paro_copy_from_map.csv' WITH (FORMAT csv);
+COPY 5
+
+COPY dml_copy_from_map (name, id) FROM '/tmp/paro_copy_from_map.csv' WITH (FORMAT csv);
+COPY 5
+
+-- @query rowsort
+SELECT id, name FROM dml_copy_from_map;
+id	name
+1	alpha
+2	pipe|bar
+3	NULL
+4	comma,space
+5	quote "here"
+
+INSERT INTO dml_copy_from_large_src
+SELECT i, 'name_' || i::VARCHAR
+FROM generate_series(1, 1000) AS t(i);
+INSERT 0 1000
+
+COPY dml_copy_from_large_src TO '/tmp/paro_copy_from_large.csv' WITH (FORMAT csv);
+COPY 1000
+
+SET copy_buffer_size = 257;
+SET
+
+SET copy_flush_threads = 2;
+SET
+
+COPY dml_copy_from_large_dst FROM '/tmp/paro_copy_from_large.csv' WITH (FORMAT csv);
+COPY 1000
+
+SELECT COUNT(*) AS copied_rows, MIN(id) AS min_id, MAX(id) AS max_id
+FROM dml_copy_from_large_dst;
+copied_rows	min_id	max_id
+1000	1	1000
+
+SELECT current_setting('copy_buffer_size') AS copy_buffer_size,
+       current_setting('copy_flush_threads') AS copy_flush_threads;
+copy_buffer_size	copy_flush_threads
+257	2
+
+SET copy_buffer_size = DEFAULT;
+SET
+
+SET copy_flush_threads = DEFAULT;
+SET
+
+COPY (
+  SELECT i, 'parallel_' || i::VARCHAR
+  FROM generate_series(1, 20000) AS t(i)
+) TO '/tmp/paro_copy_from_parallel.csv' WITH (FORMAT csv);
+COPY 20000
+
+SET threads = 4;
+SET
+
+COPY dml_copy_from_parallel_dst FROM '/tmp/paro_copy_from_parallel.csv'
+  WITH (FORMAT csv, PARALLEL true, PARALLEL_WORKERS 4);
+COPY 20000
+
+SELECT COUNT(*) AS copied_rows,
+       COUNT(DISTINCT id) AS distinct_ids,
+       MIN(id) AS min_id,
+       MAX(id) AS max_id
+FROM dml_copy_from_parallel_dst;
+copied_rows	distinct_ids	min_id	max_id
+20000	20000	1	20000
+
+SET threads = DEFAULT;
+SET
+
+COPY (
+  SELECT id,
+         name,
+         CASE WHEN id % 2 = 0 THEN 'even' ELSE NULL::TEXT END AS note
+  FROM dml_copy_from_src
+  ORDER BY id
+) TO '/tmp/paro_copy_from_ndjson.json' WITH (FORMAT ndjson);
+COPY 5
+
+COPY dml_copy_from_ndjson
+FROM '/tmp/paro_copy_from_ndjson.json'
+WITH (FORMAT ndjson);
+COPY 5
+
+-- @query rowsort
+SELECT id, name, note
+FROM dml_copy_from_ndjson;
+id	name	note
+1	alpha	NULL
+2	pipe|bar	even
+3	NULL	NULL
+4	comma,space	even
+5	quote "here"	NULL
+
+COPY dml_copy_from_src TO '/tmp/paro_copy_from_ndjson_table.json'
+  WITH (FORMAT ndjson);
+COPY 5
+
+COPY dml_copy_from_ndjson_alias
+FROM '/tmp/paro_copy_from_ndjson_table.json'
+WITH (FORMAT json);
+COPY 5
+
+-- @query rowsort
+SELECT id, name
+FROM dml_copy_from_ndjson_alias;
+id	name
+1	alpha
+2	pipe|bar
+3	NULL
+4	comma,space
+5	quote "here"
+
+COPY (
+  SELECT i AS id, 'json_' || i::VARCHAR AS name
+  FROM generate_series(1, 5000) AS t(i)
+) TO '/tmp/paro_copy_from_ndjson_large.json' WITH (FORMAT ndjson);
+COPY 5000
+
+COPY dml_copy_from_ndjson_large
+FROM '/tmp/paro_copy_from_ndjson_large.json'
+WITH (FORMAT ndjson);
+COPY 5000
+
+SELECT COUNT(*) AS copied_rows, MIN(id) AS min_id, MAX(id) AS max_id
+FROM dml_copy_from_ndjson_large;
+copied_rows	min_id	max_id
+5000	1	5000
+
+COPY (
+  SELECT 1 AS id
+) TO '/tmp/paro_copy_from_bad_ndjson.txt' WITH (FORMAT text);
+COPY 1
+
+COPY dml_copy_from_ndjson_alias
+FROM '/tmp/paro_copy_from_bad_ndjson.txt'
+WITH (FORMAT ndjson);
+ERROR: Invalid NDJSON record at row 1: expected a JSON object (SQLSTATE=XX000)
+
+COPY (
+  SELECT 'abc' AS id, 'bad' AS name
+) TO '/tmp/paro_copy_from_bad_ndjson_type.json' WITH (FORMAT ndjson);
+COPY 1
+
+COPY dml_copy_from_ndjson_alias
+FROM '/tmp/paro_copy_from_bad_ndjson_type.json'
+WITH (FORMAT ndjson);
+ERROR: invalid input syntax for type read_ndjson row 1: "invalid integer value: abc" (SQLSTATE=XX000)
+
+COPY (
+  SELECT id
+  FROM dml_copy_from_src
+  ORDER BY id
+) TO '/tmp/paro_copy_from_bad_columns.csv' WITH (FORMAT csv);
+COPY 5
+
+COPY dml_copy_from_text FROM '/tmp/paro_copy_from_bad_columns.csv' WITH (FORMAT csv);
+ERROR: invalid input syntax for type CSV row has incorrect column count: "expected 2, got 1 at row 1" (SQLSTATE=XX000)
+
+COPY (
+  SELECT 'abc' AS id, 'bad' AS name
+) TO '/tmp/paro_copy_from_type_mismatch.csv' WITH (FORMAT csv);
+COPY 1
+
+COPY dml_copy_from_text FROM '/tmp/paro_copy_from_type_mismatch.csv' WITH (FORMAT csv);
+ERROR: invalid input syntax for type BIGINT: "abc" (SQLSTATE=XX000)
+
+COPY dml_copy_from_text FROM '/tmp/paro_copy_from_missing.csv' WITH (FORMAT csv);
+ERROR: Failed to open CSV file '/tmp/paro_copy_from_missing.csv': No such file or directory (os error 2) (SQLSTATE=58030)

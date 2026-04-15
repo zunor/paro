@@ -1,0 +1,11 @@
+[package]
+name = "paro-scheduler"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+paro-common = { workspace = true }
+parking_lot = "0.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t_const;
+DROP TABLE
+
+CREATE TABLE t_const (x INT);
+CREATE TABLE
+
+INSERT INTO t_const VALUES (1);
+INSERT 0 1
+
+SELECT 1;
+1
+1
+
+SELECT 42;
+42
+42
+
+SELECT 42 AS answer;
+answer
+42
+
+SELECT 1 + 0;
+1 + 0
+1
+
+SELECT count(*) FROM t_const;
+COUNT(*)
+1
+
+DROP TABLE IF EXISTS t_const;
+DROP TABLE

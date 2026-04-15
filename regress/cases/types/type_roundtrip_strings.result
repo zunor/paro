@@ -1,0 +1,26 @@
+CREATE TABLE type_roundtrip_strings (
+  id INT,
+  v VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_strings VALUES
+  (1, 'hello'),
+  (2, ''),
+  (3, NULL),
+  (4, 'Hello, 世界'),
+  (5, 'long_string_abcdefghijklmnopqrstuvwxyz_0123456789'),
+  (6, 'O''Reilly');
+INSERT 0 6
+
+-- @query rowsort
+SELECT id, v
+FROM type_roundtrip_strings
+ORDER BY id;
+id	v
+1	hello
+2	(empty)
+3	NULL
+4	Hello, 世界
+5	long_string_abcdefghijklmnopqrstuvwxyz_0123456789
+6	O'Reilly

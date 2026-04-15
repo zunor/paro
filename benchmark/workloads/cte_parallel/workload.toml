@@ -1,0 +1,23 @@
+[meta]
+name = "cte_parallel"
+description = "Materialized CTE scan workload covering parallel single-scan and double-scan consumers"
+
+[params]
+scan_rows = 8192
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "materialized_scan_count"
+file = "sql/q_materialized_scan_count.sql"
+validate = "scalar_equals"
+expected = 8192
+plan_contains = ["CTE_SCAN"]
+
+[[query]]
+id = "materialized_double_scan_count"
+file = "sql/q_materialized_double_scan_count.sql"
+validate = "scalar_equals"
+expected = 8192

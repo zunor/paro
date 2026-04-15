@@ -1,0 +1,23 @@
+CREATE TABLE type_roundtrip_json (
+  id INT,
+  j JSON,
+  jb JSONB
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_json VALUES
+  (1, '{"a":1,"b":[true,false,null]}', '{"a":1,"b":[true,false,null]}'),
+  (2, '["x","y","z"]', '["x","y","z"]'),
+  (3, NULL, NULL),
+  (4, '{"nested":{"k":"v"}}', '{"k":[1,2,3]}');
+INSERT 0 4
+
+-- @query rowsort
+SELECT id, j, jb
+FROM type_roundtrip_json
+ORDER BY id;
+id	j	jb
+1	{'a': 1, 'b': [True, False, None]}	{'a': 1, 'b': [True, False, None]}
+2	['x', 'y', 'z']	['x', 'y', 'z']
+3	NULL	NULL
+4	{'nested': {'k': 'v'}}	{'k': [1, 2, 3]}

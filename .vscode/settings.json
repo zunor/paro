@@ -1,0 +1,21 @@
+{
+  // Editor UX: disable all inlay hints (globally).
+  "editor.inlayHints.enabled": "off",
+
+  // Rust Analyzer: disable specific hint categories.
+  "rust-analyzer.inlayHints.typeHints.enable": false,
+  "rust-analyzer.inlayHints.parameterHints.enable": false,
+  "rust-analyzer.inlayHints.chainingHints.enable": false,
+  "rust-analyzer.inlayHints.closingBraceHints.enable": false,
+
+  // Rust Analyzer: optional quality-of-life toggles.
+  // "rust-analyzer.checkOnSave.command": "clippy",
+  // "rust-analyzer.checkOnSave.allTargets": true,
+  // "rust-analyzer.procMacro.enable": true,
+
+  // File associations: treat regress expected outputs as SQL for highlighting.
+  "files.associations": {
+    "regress/cases/**/*.result": "sql",
+    "*.result": "sql"
+  }
+}

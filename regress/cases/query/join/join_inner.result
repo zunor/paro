@@ -1,0 +1,89 @@
+SELECT l.id AS id, l.label, r.descr
+FROM join_inner_basic_left AS l
+JOIN join_inner_basic_right AS r ON l.id = r.id
+ORDER BY l.id;
+id	l.label	r.descr
+2	l2	r2
+4	l4	r4
+
+SELECT l.id AS id, l.label, r.descr
+FROM (
+  SELECT id, label
+  FROM join_inner_basic_left
+  WHERE id >= 2
+) AS l
+JOIN (
+  SELECT id, descr
+  FROM join_inner_basic_right
+  WHERE id <= 4
+) AS r ON l.id = r.id
+ORDER BY l.id;
+id	l.label	r.descr
+2	l2	r2
+4	l4	r4
+
+SELECT l.k, l.left_tag, r.right_tag
+FROM join_inner_dup_left AS l
+JOIN join_inner_dup_right AS r ON l.k = r.k
+ORDER BY l.k, l.left_tag, r.right_tag;
+l.k	l.left_tag	r.right_tag
+1	a	x
+1	a	y
+1	b	x
+1	b	y
+
+SELECT l.k, COUNT(*) AS match_count
+FROM join_inner_repeat_left AS l
+JOIN join_inner_repeat_right AS r ON l.k = r.k
+GROUP BY l.k
+ORDER BY l.k;
+l.k	match_count
+1	12
+2	2
+
+SELECT l.a, l.b, l.payload, r.flag
+FROM join_inner_multi_left AS l
+JOIN join_inner_multi_right AS r ON l.a = r.a AND l.b = r.b
+ORDER BY l.a, l.b;
+l.a	l.b	l.payload	r.flag
+1	10	m1	hit_110
+2	10	m3	hit_210
+3	30	m4	hit_330
+
+SELECT
+  l.id,
+  l.c1,
+  l.c2,
+  l.c3,
+  l.c4,
+  r.d1,
+  r.d2,
+  r.d3,
+  r.d4
+FROM join_inner_wide_left AS l
+JOIN join_inner_wide_right AS r ON l.id = r.id
+ORDER BY l.id;
+l.id	l.c1	l.c2	l.c3	l.c4	r.d1	r.d2	r.d3	r.d4
+10	left-alpha	100	left-extra-a	1000	right-alpha	11	right-extra-a	111
+30	left-gamma	300	left-extra-c	3000	right-gamma	33	right-extra-c	333
+
+SELECT COUNT(*) AS empty_left_count
+FROM join_inner_empty_left AS l
+JOIN join_inner_empty_right AS r ON l.id = r.id;
+empty_left_count
+0
+
+SELECT COUNT(*) AS empty_right_count
+FROM join_inner_empty_right AS r
+JOIN join_inner_empty_left AS l ON r.id = l.id;
+empty_right_count
+0
+
+SELECT a.id, a.a_val, b.b_val, c.c_val
+FROM join_inner_chain_a AS a
+JOIN join_inner_chain_b AS b ON a.id = b.id
+JOIN join_inner_chain_c AS c ON b.id = c.id
+ORDER BY a.id;
+a.id	a.a_val	b.b_val	c.c_val
+3	a3	b3	c3
+5	a5	b5	c5

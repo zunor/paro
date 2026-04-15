@@ -1,0 +1,58 @@
+CREATE TABLE gco_person (
+    tenant_id BIGINT,
+    person_code VARCHAR,
+    name VARCHAR
+);
+CREATE TABLE
+
+CREATE TABLE gco_knows (
+    src_tenant BIGINT,
+    src_code VARCHAR,
+    dst_tenant BIGINT,
+    dst_code VARCHAR,
+    since INT
+);
+CREATE TABLE
+
+INSERT INTO gco_person VALUES
+    (1, 'alice', 'Alice'),
+    (1, 'bob', 'Bob'),
+    (2, 'alice', 'Alice T2'),
+    (2, 'bob', 'Bob T2');
+INSERT 0 4
+
+INSERT INTO gco_knows VALUES
+    (1, 'alice', 1, 'bob', 2020),
+    (2, 'alice', 2, 'bob', 2030);
+INSERT 0 2
+
+CREATE PROPERTY GRAPH gco_graph
+VERTEX TABLES (
+    gco_person LABEL Person PROPERTIES (name) KEY (tenant_id, person_code)
+)
+EDGE TABLES (
+    gco_knows
+        SOURCE KEY (src_tenant, src_code) REFERENCES gco_person (tenant_id, person_code)
+        DESTINATION KEY (dst_tenant, dst_code) REFERENCES gco_person (tenant_id, person_code)
+        LABEL Knows
+        PROPERTIES (since)
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(gco_graph
+    MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst, k.since AS since)
+) gt
+ORDER BY src, dst, since;
+gt.src	gt.dst	gt.since
+Alice	Bob	2020
+Alice T2	Bob T2	2030
+
+DROP PROPERTY GRAPH gco_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE gco_knows;
+DROP TABLE
+
+DROP TABLE gco_person;
+DROP TABLE

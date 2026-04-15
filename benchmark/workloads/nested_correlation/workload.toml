@@ -1,0 +1,28 @@
+[meta]
+name = "nested_correlation"
+description = "Planner-facing nested correlated subquery benchmarks using EXPLAIN-only queries"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "three_level_scalar_explain"
+file = "sql/q_three_level_scalar_explain.sql"
+validate = "text_contains_all"
+expected = [
+  "Aggregates: FIRST((SELECT (SELECT d.score",
+  "Join Condition: col1 IS NOT DISTINCT FROM ref_1",
+  "Filter: (col0 = delim_1)",
+]
+
+[[query]]
+id = "four_level_exists_explain"
+file = "sql/q_four_level_exists_explain.sql"
+validate = "text_contains_all"
+expected = [
+  "Join Type: MARK",
+  "Join Condition: col1 IS NOT DISTINCT FROM delim_1, col2 IS NOT DISTINCT FROM delim_2",
+  "Filter: (first >= ref_2)",
+  "Aggregates: FIRST(d.score)",
+]

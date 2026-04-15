@@ -1,0 +1,64 @@
+DROP TABLE IF EXISTS vector_ops_case;
+DROP TABLE
+
+CREATE TABLE vector_ops_case (
+    id INT PRIMARY KEY,
+    emb VECTOR(3)
+);
+CREATE TABLE
+
+INSERT INTO vector_ops_case VALUES
+    (1, '[1,0,0]'),
+    (2, '[0,1,0]'),
+    (3, '[-1,0,0]'),
+    (4, '[0,0,0]');
+INSERT 0 4
+
+SELECT
+    id,
+    emb <-> '[1,0,0]' AS op_l2,
+    l2_distance(emb, '[1,0,0]') AS fn_l2,
+    emb <+> '[1,0,0]' AS op_l1,
+    l1_distance(emb, '[1,0,0]') AS fn_l1,
+    emb <=> '[1,0,0]' AS op_cos,
+    cosine_distance(emb, '[1,0,0]') AS fn_cos,
+    emb <#> '[1,0,0]' AS op_neg_ip,
+    neg_inner_product(emb, '[1,0,0]') AS fn_neg_ip
+FROM vector_ops_case
+ORDER BY id;
+id	op_l2	fn_l2	op_l1	fn_l1	op_cos	fn_cos	op_neg_ip	fn_neg_ip
+1	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	-1.000000	-1.000000
+2	1.414214	1.414214	2.000000	2.000000	1.000000	1.000000	0.000000	0.000000
+3	2.000000	2.000000	2.000000	2.000000	2.000000	2.000000	1.000000	1.000000
+4	1.000000	1.000000	1.000000	1.000000	1.000000	1.000000	0.000000	0.000000
+
+SELECT id FROM vector_ops_case ORDER BY emb <-> '[1,0,0]', id LIMIT 4;
+id
+1
+4
+2
+3
+
+SELECT id FROM vector_ops_case ORDER BY emb <+> '[1,0,0]', id LIMIT 4;
+id
+1
+4
+2
+3
+
+SELECT id FROM vector_ops_case ORDER BY emb <=> '[1,0,0]', id LIMIT 4;
+id
+1
+2
+4
+3
+
+SELECT id FROM vector_ops_case ORDER BY emb <#> '[1,0,0]', id LIMIT 4;
+id
+1
+2
+4
+3
+
+DROP TABLE vector_ops_case;
+DROP TABLE

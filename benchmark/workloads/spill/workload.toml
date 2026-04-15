@@ -1,0 +1,54 @@
+[meta]
+name = "spill"
+description = "Spill observability workload for ORDER BY / WINDOW / HASH AGG / HASH JOIN"
+
+[params]
+order_rows = 10000
+window_rows = 10000
+agg_rows = 50000
+join_rows = 20000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "order_by_external_shape"
+file = "sql/q_order_by_spill.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3], [4], [5], [6], [7], [8], [9], [10], [11], [12]]
+plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "order_by_external_payload"
+file = "sql/q_order_by_payload_spill.sql"
+validate = "ordered_rows"
+expected = [["zzzz_payload_1"], ["zzzz_payload_2"], ["zzzz_payload_3"], ["zzzz_payload_4"], ["zzzz_payload_5"], ["zzzz_payload_6"]]
+plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "window_spill_plan"
+file = "sql/q_window_spill.sql"
+validate = "none"
+
+[[query]]
+id = "hash_agg_external_shape"
+file = "sql/q_hash_agg_spill.sql"
+validate = "scalar_equals"
+expected = 50000
+plan_contains = ["HASH_GROUP_BY"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "hash_join_spill_plan"
+file = "sql/q_hash_join_spill.sql"
+validate = "scalar_equals"
+expected = 20000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true

@@ -1,0 +1,20 @@
+CREATE TABLE vec_append_test (id INT, embedding VECTOR(3));
+CREATE TABLE
+
+INSERT INTO vec_append_test VALUES (1, '[1,2,3]'), (2, '[4,5,6]');
+INSERT 0 2
+
+SELECT * FROM vec_append_test ORDER BY id;
+vec_append_test.id	vec_append_test.embedding
+1	[1.000000, 2.000000, 3.000000]
+2	[4.000000, 5.000000, 6.000000]
+
+INSERT INTO vec_append_test VALUES (3, '[7,8,9]'), (4, '[10,11,12]');
+INSERT 0 2
+
+SELECT * FROM vec_append_test ORDER BY id;
+vec_append_test.id	vec_append_test.embedding
+1	[1.000000, 2.000000, 3.000000]
+2	[4.000000, 5.000000, 6.000000]
+3	[7.000000, 8.000000, 9.000000]
+4	[10.000000, 11.000000, 12.000000]

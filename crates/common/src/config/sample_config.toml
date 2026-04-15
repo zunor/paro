@@ -1,0 +1,101 @@
+# Paro Database Configuration
+#
+# Configuration file search paths (in order):
+#   1. /etc/paro/paro.toml (system-wide)
+#   2. ~/.config/paro/paro.toml (user)
+#   3. ./paro.toml (current directory)
+#   4. --config <path> (command line)
+#
+# Environment variables can override any setting:
+#   PARO_SERVER__PORT=6432
+#   PARO_LOGGING__LEVEL=debug
+#
+# Values are merged in order, later values override earlier ones.
+
+[server]
+# Listen address
+host = "0.0.0.0"
+# Listen port (PostgreSQL default is 6432, Paro default is 6432)
+port = 6432
+# Maximum number of connections (0 = unlimited)
+max_connections = 100
+# Allow plaintext startup even when [server.tls] is present.
+# This must stay false in production until TLS support lands.
+allow_plaintext = false
+# Optional cap for buffered COPY FROM STDIN payloads.
+# Defaults to min(cluster.max_memory / 4, 1GiB).
+# copy_stdin_memory_limit = "256MiB"
+
+# TLS configuration (optional, NOT YET SUPPORTED)
+# [server.tls]
+# cert = "/path/to/server.crt"
+# key = "/path/to/server.key"
+
+[cluster]
+# Maximum memory for the buffer pool and query execution
+# Supports human-readable format: "2GiB", "512MiB", "1024" (bytes)
+# Note: Use GiB/MiB for binary units (1024-based), GB/MB for SI units (1000-based)
+max_memory = "1GiB"
+
+# Number of worker threads (omit or set to null for auto-detection)
+# num_threads = 8
+
+# Worker thread pinning strategy: "off", "on", "auto"
+pin_threads = "auto"
+
+# Default database name
+default_database = "postgres"
+
+# Access mode: "read_write" or "read_only"
+access_mode = "read_write"
+
+# Enable external file system and network access
+enable_external_access = true
+
+[logging]
+# Log level: "trace", "debug", "info", "warn", "error"
+level = "info"
+
+# Log format: "pretty", "json", "compact"
+format = "pretty"
+
+# Log file path (omit for console only)
+# file = "/var/log/paro/paro.log"
+
+# Show target (module path) in log output
+with_target = true
+
+# Show file location in log output
+with_file = false
+
+# Show line number in log output
+with_line_number = false
+
+# Use ANSI colors (console only)
+ansi = true
+
+# Log rotation configuration (only applies when file is set)
+# [logging.rotation]
+# policy = "daily"  # "never", "daily", "hourly"
+# max_files = 7
+
+[storage]
+# Data directory path
+data_dir = "./data"
+
+# Temporary directory (omit to use system temp directory)
+# temp_dir = "/tmp/paro"
+
+[storage.wal]
+# Enable Write-Ahead Logging
+enabled = true
+
+# Checkpoint threshold (trigger checkpoint when WAL exceeds this size)
+checkpoint_threshold = "10MiB"
+
+# Checkpoint interval (trigger checkpoint after this duration)
+checkpoint_interval = "5m"
+
+[storage.buffer_pool]
+# Buffer pool size
+size = "512MiB"

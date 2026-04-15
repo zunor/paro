@@ -1,0 +1,22 @@
+INSERT INTO dml_delete_basic_case VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT 0 3
+
+SELECT id, name FROM dml_delete_basic_case ORDER BY id;
+id	name
+1	a
+2	b
+3	c
+
+DELETE FROM dml_delete_basic_case WHERE id = 2;
+DELETE 1
+
+SELECT id, name FROM dml_delete_basic_case ORDER BY id;
+id	name
+1	a
+3	c
+
+DELETE FROM dml_delete_basic_case;
+DELETE 2
+
+SELECT id, name FROM dml_delete_basic_case ORDER BY id;
+id	name

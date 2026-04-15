@@ -1,0 +1,34 @@
+[package]
+name = "paro-session"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+len-zero = "allow"
+needless-borrow = "allow"
+redundant-closure = "allow"
+default-constructed-unit-structs = "allow"
+bool-comparison = "allow"
+clone-on-copy = "allow"
+useless-vec = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-catalog = { workspace = true }
+paro-context = { workspace = true }
+paro-compiler = { workspace = true }
+paro-parser = { workspace = true }
+paro-planner = { workspace = true }
+paro-execution = { workspace = true }
+paro-function = { workspace = true }
+paro-storage = { workspace = true }
+paro-instance = { workspace = true }
+paro-scheduler = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+serial_test = { workspace = true }

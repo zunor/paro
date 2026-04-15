@@ -1,0 +1,105 @@
+SELECT l.id AS l_id, l.x, r.id AS r_id, r.y
+FROM join_nonequal_left AS l
+JOIN join_nonequal_right AS r ON l.x < r.y
+ORDER BY l.id, r.id;
+l_id	l.x	r_id	r.y
+1	1	10	2
+1	1	11	4
+1	1	12	6
+1	1	13	8
+1	1	15	12
+2	3	11	4
+2	3	12	6
+2	3	13	8
+2	3	15	12
+3	5	12	6
+3	5	13	8
+3	5	15	12
+4	7	13	8
+4	7	15	12
+6	9	15	12
+7	11	15	12
+
+SELECT l.id AS l_id, l.x, r.id AS r_id, r.lo, r.hi
+FROM join_nonequal_left AS l
+JOIN join_nonequal_right AS r ON l.x BETWEEN r.lo AND r.hi
+ORDER BY l.id, r.id;
+l_id	l.x	r_id	r.lo	r.hi
+1	1	10	1	2
+2	3	11	3	5
+3	5	11	3	5
+3	5	12	5	7
+4	7	12	5	7
+4	7	13	7	9
+6	9	13	7	9
+6	9	14	9	11
+7	11	14	9	11
+7	11	15	10	12
+
+SELECT l.id AS l_id, r.id AS r_id, l.x, r.y
+FROM join_nonequal_left AS l
+JOIN join_nonequal_right AS r
+  ON (l.x * 2) BETWEEN (r.y - 1) AND (r.y + 2)
+ AND (l.id + r.id) % 2 = 1
+ORDER BY l.id, r.id;
+l_id	r_id	l.x	r.y
+1	10	1	2
+2	11	3	4
+4	15	7	12
+
+SELECT l.id AS l_id, l.x, r.id AS r_id, r.y
+FROM join_nonequal_left AS l
+JOIN (
+  SELECT id, y, cls
+  FROM join_nonequal_right
+  WHERE cls IN ('r2', 'r3', 'r4')
+) AS r ON l.x + 1 <= r.y
+ORDER BY l.id, r.id;
+l_id	l.x	r_id	r.y
+1	1	11	4
+1	1	12	6
+1	1	13	8
+2	3	11	4
+2	3	12	6
+2	3	13	8
+3	5	12	6
+3	5	13	8
+4	7	13	8
+
+-- @query rowsort
+SELECT *
+FROM join_nonequal_left AS l
+SEMI JOIN join_nonequal_right AS r ON l.x < r.y;
+l.id	l.x	l.lo	l.hi	l.tag
+1	1	0	2	l1
+2	3	2	4	l2
+3	5	4	6	l3
+4	7	6	8	l4
+6	9	NULL	10	l_null_lo
+7	11	10	12	l7
+
+-- @query rowsort
+SELECT *
+FROM join_nonequal_left AS l
+ANTI JOIN join_nonequal_right AS r ON l.x < r.y;
+l.id	l.x	l.lo	l.hi	l.tag
+5	NULL	1	3	l_null_x
+
+SELECT l.id, l.tag, r.id AS r_id
+FROM join_nonequal_left AS l
+LEFT JOIN join_nonequal_right_empty AS r ON l.x < r.y
+ORDER BY l.id;
+l.id	l.tag	r_id
+1	l1	NULL
+2	l2	NULL
+3	l3	NULL
+4	l4	NULL
+5	l_null_x	NULL
+6	l_null_lo	NULL
+7	l7	NULL
+
+SELECT COUNT(*) AS neq_pairs
+FROM join_nonequal_left AS l
+JOIN join_nonequal_right AS r ON l.x <> r.y;
+neq_pairs
+30

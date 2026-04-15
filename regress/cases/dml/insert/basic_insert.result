@@ -1,0 +1,12 @@
+INSERT INTO dml_insert_basic_case VALUES (1, 'one');
+INSERT 0 1
+
+INSERT INTO dml_insert_basic_case VALUES (2, 'two'), (3, 'three');
+INSERT 0 2
+
+-- @query rowsort
+SELECT id, name FROM dml_insert_basic_case;
+id	name
+1	one
+2	two
+3	three

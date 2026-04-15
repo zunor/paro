@@ -1,0 +1,113 @@
+CREATE TABLE pm_person (id BIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE
+
+CREATE TABLE pm_follows (src_id BIGINT, dst_id BIGINT, weight INT);
+CREATE TABLE
+
+INSERT INTO pm_person VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D'), (5, 'E');
+INSERT 0 5
+
+INSERT INTO pm_follows VALUES
+    (1, 2, 10),
+    (2, 3, 20),
+    (3, 4, 30),
+    (4, 5, 40),
+    (1, 3, 50);
+INSERT 0 5
+
+CREATE PROPERTY GRAPH pm_graph
+VERTEX TABLES (
+    pm_person LABEL Node
+)
+EDGE TABLES (
+    pm_follows
+        SOURCE KEY (src_id) REFERENCES pm_person (id)
+        DESTINATION KEY (dst_id) REFERENCES pm_person (id)
+        LABEL Follows
+);
+CREATE PROPERTY GRAPH
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH (a:Node WHERE a.name = 'A')-[e:Follows]->+(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+A	E
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH (a:Node WHERE a.name = 'E')-[e:Follows]->+(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH (a:Node WHERE a.name = 'C')-[e:Follows]->+(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+C	D
+C	E
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+A	E
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH p = (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH p = ANY SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+A	D
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH ANY (a:Node WHERE a.name = 'B')-[e:Follows]->{1,2}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+B	C
+B	D
+
+SELECT * FROM GRAPH_TABLE(pm_graph
+    MATCH ALL SHORTEST (a:Node WHERE a.name = 'A')-[e:Follows]->{1,1}(b:Node)
+    COLUMNS (a.name AS src, b.name AS dst)
+) gt
+ORDER BY dst;
+gt.src	gt.dst
+A	B
+A	C
+
+DROP PROPERTY GRAPH pm_graph;
+DROP PROPERTY GRAPH
+
+DROP TABLE pm_follows;
+DROP TABLE
+
+DROP TABLE pm_person;
+DROP TABLE

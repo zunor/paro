@@ -1,0 +1,12 @@
+pub mod pk_publish;
+pub mod publisher;
+pub mod record;
+pub mod validator;
+
+pub use publisher::CompactionPublisher;
+pub use record::{
+    CompactionPublishConflict, CompactionPublishConflictReason, CompactionPublishRecord,
+    CompactionPublishRequest, PkIndexUpsertCandidate, PkPublishDelta, RetiredInput,
+    SegmentDeleteDelta,
+};
+pub use validator::CompactionValidator;

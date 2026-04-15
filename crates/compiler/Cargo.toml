@@ -1,0 +1,13 @@
+[package]
+name = "paro-compiler"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+paro-common = { workspace = true }
+paro-context = { workspace = true }
+paro-parser = { workspace = true }
+paro-planner = { workspace = true }
+paro-optimizer = { workspace = true }
+paro-execution = { workspace = true }
+tracing = { workspace = true }

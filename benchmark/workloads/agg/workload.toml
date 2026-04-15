@@ -1,0 +1,157 @@
+[meta]
+name = "agg"
+description = "Aggregation benchmarks"
+
+[params]
+rows = 200000
+groups = 1000
+rows_small = 100000
+rows_large = 400000
+card_low = 10
+card_high = 1000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "count_star"
+file = "sql/q_count_star.sql"
+validate = "scalar_equals"
+expected = 200000
+
+[[query]]
+id = "group_by_low_card"
+file = "sql/q_group_by_low.sql"
+validate = "row_count"
+expected = 10
+plan_contains = ["HASH_GROUP_BY"]
+
+[[query]]
+id = "group_by_low_card_perfect"
+file = "sql/q_group_by_low_perfect.sql"
+validate = "row_count"
+expected = 10
+plan_contains = ["PERFECT_HASH_GROUP_BY"]
+
+[[query]]
+id = "group_by_high_card"
+file = "sql/q_group_by_high.sql"
+validate = "row_count"
+expected = 1000
+
+[[query]]
+id = "group_by_single_int_inline"
+file = "sql/q_group_by_single_int_inline.sql"
+validate = "row_count"
+expected = 1000
+plan_contains = ["HASH_GROUP_BY", "INLINE_KEY_4B"]
+
+[[query]]
+id = "group_by_multi_key_radix"
+file = "sql/q_group_by_multi_key_radix.sql"
+validate = "row_count"
+expected = 1000
+plan_contains = ["HASH_GROUP_BY", "RADIX_PARTITIONS=4"]
+
+[[query]]
+id = "count_distinct"
+file = "sql/q_count_distinct.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r100k_c10_single_1agg"
+file = "sql/q_matrix_r100k_c10_single_1agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r100k_c10_single_4agg"
+file = "sql/q_matrix_r100k_c10_single_4agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r100k_c10_multi_1agg"
+file = "sql/q_matrix_r100k_c10_multi_1agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r100k_c10_multi_4agg"
+file = "sql/q_matrix_r100k_c10_multi_4agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r100k_c1000_single_1agg"
+file = "sql/q_matrix_r100k_c1000_single_1agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r100k_c1000_single_4agg"
+file = "sql/q_matrix_r100k_c1000_single_4agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r100k_c1000_multi_1agg"
+file = "sql/q_matrix_r100k_c1000_multi_1agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r100k_c1000_multi_4agg"
+file = "sql/q_matrix_r100k_c1000_multi_4agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r400k_c10_single_1agg"
+file = "sql/q_matrix_r400k_c10_single_1agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r400k_c10_single_4agg"
+file = "sql/q_matrix_r400k_c10_single_4agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r400k_c10_multi_1agg"
+file = "sql/q_matrix_r400k_c10_multi_1agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r400k_c10_multi_4agg"
+file = "sql/q_matrix_r400k_c10_multi_4agg.sql"
+validate = "scalar_equals"
+expected = 10
+
+[[query]]
+id = "matrix_r400k_c1000_single_1agg"
+file = "sql/q_matrix_r400k_c1000_single_1agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r400k_c1000_single_4agg"
+file = "sql/q_matrix_r400k_c1000_single_4agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r400k_c1000_multi_1agg"
+file = "sql/q_matrix_r400k_c1000_multi_1agg.sql"
+validate = "scalar_equals"
+expected = 1000
+
+[[query]]
+id = "matrix_r400k_c1000_multi_4agg"
+file = "sql/q_matrix_r400k_c1000_multi_4agg.sql"
+validate = "scalar_equals"
+expected = 1000

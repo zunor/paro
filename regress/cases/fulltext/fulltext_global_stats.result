@@ -1,0 +1,46 @@
+CREATE TABLE ft_global_stats_docs (id INT, content VARCHAR);
+CREATE TABLE
+
+INSERT INTO ft_global_stats_docs VALUES (100, 'vector');
+INSERT 0 1
+
+INSERT INTO ft_global_stats_docs VALUES
+    (1, 'vector'),
+    (2, 'filler'),
+    (3, 'filler'),
+    (4, 'filler'),
+    (5, 'filler'),
+    (6, 'filler'),
+    (7, 'filler'),
+    (8, 'filler'),
+    (9, 'filler'),
+    (10, 'filler'),
+    (11, 'filler'),
+    (12, 'filler'),
+    (13, 'filler'),
+    (14, 'filler'),
+    (15, 'filler'),
+    (16, 'filler'),
+    (17, 'filler'),
+    (18, 'filler'),
+    (19, 'filler'),
+    (20, 'filler');
+INSERT 0 20
+
+CREATE INDEX idx_ft_global_stats_docs ON ft_global_stats_docs USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+SELECT id
+FROM ft_global_stats_docs
+WHERE fulltext_match(content, 'vector')
+ORDER BY bm25(content, 'vector') DESC, id
+LIMIT 2;
+id
+1
+100
+
+DROP INDEX IF EXISTS idx_ft_global_stats_docs;
+DROP INDEX
+
+DROP TABLE ft_global_stats_docs;
+DROP TABLE

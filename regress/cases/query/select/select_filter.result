@@ -1,0 +1,15 @@
+INSERT INTO filter_test VALUES (1, 'A', 90), (2, 'B', 85), (3, 'C', 95);
+INSERT 0 3
+
+SELECT * FROM filter_test WHERE id = 2;
+filter_test.id	filter_test.name	filter_test.score
+2	B	85
+
+SELECT * FROM filter_test WHERE score > 88 ORDER BY id;
+filter_test.id	filter_test.name	filter_test.score
+1	A	90
+3	C	95
+
+SELECT * FROM filter_test WHERE name = 'A';
+filter_test.id	filter_test.name	filter_test.score
+1	A	90

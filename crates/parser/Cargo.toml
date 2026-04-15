@@ -1,0 +1,51 @@
+[package]
+name = "paro-parser"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "paro_parser"
+path = "src/lib.rs"
+
+[features]
+internal-testing = []
+
+[dependencies]
+derive-visitor = { workspace = true }
+educe = { workspace = true }
+enum-as-inner = { workspace = true }
+ethnum = { workspace = true }
+fast-float2 = { workspace = true }
+fastrace = { workspace = true }
+indent = { workspace = true }
+itertools = { workspace = true }
+logos = { workspace = true }
+nom = { workspace = true }
+nom-rule = { workspace = true }
+ordered-float = { workspace = true }
+percent-encoding = { workspace = true }
+pratt = { workspace = true }
+# Used by debug-only round-trip assertions in the parser driver.
+pretty_assertions = { workspace = true }
+recursive = { workspace = true }
+stacker = { workspace = true }
+rspack-codespan-reporting = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strsim = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+unindent = { workspace = true }
+url = { workspace = true }
+paro-common = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+goldenfile = { workspace = true }
+paro-parser = { path = ".", features = ["internal-testing"] }
+
+# Workspace dependencies
+
+[[bench]]
+name = "bench"
+harness = false

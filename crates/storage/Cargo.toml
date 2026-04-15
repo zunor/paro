@@ -1,0 +1,88 @@
+[package]
+name = "paro-storage"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints.clippy]
+too-many-arguments = "allow"
+module-inception = "allow"
+new-ret-no-self = "allow"
+large-enum-variant = "allow"
+type-complexity = "allow"
+should-implement-trait = "allow"
+new-without-default = "allow"
+derivable-impls = "allow"
+len-without-is-empty = "allow"
+missing-safety-doc = "allow"
+manual-flatten = "allow"
+collapsible-else-if = "allow"
+manual-repeat-n = "allow"
+needless-range-loop = "allow"
+useless-asref = "allow"
+useless-conversion = "allow"
+iter-cloned-collect = "allow"
+useless-vec = "allow"
+needless-borrows-for-generic-args = "allow"
+cloned-ref-to-slice-refs = "allow"
+manual-range-contains = "allow"
+manual-div-ceil = "allow"
+manual-is-multiple-of = "allow"
+unnecessary-cast = "allow"
+unnecessary-lazy-evaluations = "allow"
+single-match = "allow"
+collapsible-if = "allow"
+unwrap-or-default = "allow"
+get-first = "allow"
+map-entry = "allow"
+unnecessary-map-or = "allow"
+let-and-return = "allow"
+manual-slice-size-calculation = "allow"
+unnecessary-sort-by = "allow"
+items-after-test-module = "allow"
+bool-assert-comparison = "allow"
+assertions-on-constants = "allow"
+approx-constant = "allow"
+
+[dependencies]
+paro-common = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+crossbeam = "0.8"
+rand = "0.8"
+zstd = "0.13"
+lz4_flex = "0.11"
+crc32c = "0.6"
+roaring = "0.10"
+bitvec = "1.0"
+rayon = "1"
+arc-swap = "1.7"
+seahash = "4"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
+memmap2 = "0.9.9"
+smallvec = "1.13"
+paro-scheduler = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+divan = { workspace = true }
+serial_test = { workspace = true }
+
+[[bench]]
+name = "buffer_observability"
+harness = false
+
+[[bench]]
+name = "primary_index"
+harness = false
+
+[[bench]]
+name = "persistent_index"
+harness = false
+
+[[bench]]
+name = "primary_key_dml"
+harness = false

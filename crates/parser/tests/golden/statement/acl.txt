@@ -1,0 +1,2397 @@
+---------- Input ----------
+show users
+---------- Output ---------
+SHOW users
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..10,
+                ),
+                name: "users",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+show roles
+---------- Output ---------
+SHOW roles
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..10,
+                ),
+                name: "roles",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+create role role1 comment='test';
+---------- Output ---------
+CREATE ROLE 'role1' COMMENT = 'test'
+---------- AST ------------
+CreateRole {
+    create_option: Create,
+    role_name: "role1",
+    comment: Some(
+        "test",
+    ),
+}
+
+
+---------- Input ----------
+alter role role1 set comment='test';
+---------- Output ---------
+ALTER ROLE role1 SET COMMENT = 'test'
+---------- AST ------------
+AlterRole(
+    AlterRoleStmt {
+        if_exists: false,
+        name: "role1",
+        action: Comment(
+            Some(
+                "test",
+            ),
+        ),
+    },
+)
+
+
+---------- Input ----------
+alter role role1 unset comment;
+---------- Output ---------
+ALTER ROLE role1 UNSET COMMENT
+---------- AST ------------
+AlterRole(
+    AlterRoleStmt {
+        if_exists: false,
+        name: "role1",
+        action: Comment(
+            None,
+        ),
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 IDENTIFIED BY '123456';
+---------- Output ---------
+ALTER USER 'u1'@'%' IDENTIFIED BY '123456'
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: Some(
+            AuthOption {
+                auth_type: None,
+                password: Some(
+                    "123456",
+                ),
+            },
+        ),
+        user_options: [],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH disabled = false;
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH DISABLED = false
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            Disabled(
+                false,
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH default_role = role1;
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH DEFAULT_ROLE = 'role1'
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            DefaultRole(
+                "role1",
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH DEFAULT_ROLE = role1, DISABLED=true, TENANTSETTING;
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH DEFAULT_ROLE = 'role1', DISABLED = true, TENANTSETTING
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            DefaultRole(
+                "role1",
+            ),
+            Disabled(
+                true,
+            ),
+            TenantSetting(
+                true,
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH SET NETWORK POLICY = 'policy1';
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH SET NETWORK POLICY = 'policy1'
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            SetNetworkPolicy(
+                "policy1",
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH UNSET NETWORK POLICY;
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH UNSET NETWORK POLICY
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            UnsetNetworkPolicy,
+        ],
+    },
+)
+
+
+---------- Input ----------
+CREATE USER u1 IDENTIFIED BY '123456' WITH SET WORKLOAD GROUP='W1'
+---------- Output ---------
+CREATE USER 'u1'@'%' IDENTIFIED BY '123456' WITH SET WORKLOAD GROUP = 'W1'
+---------- AST ------------
+CreateUser(
+    CreateUserStmt {
+        create_option: Create,
+        user: UserIdentity {
+            username: "u1",
+            hostname: "%",
+        },
+        auth_option: AuthOption {
+            auth_type: None,
+            password: Some(
+                "123456",
+            ),
+        },
+        user_options: [
+            SetWorkloadGroup(
+                "W1",
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH SET WORKLOAD GROUP = 'W1';
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH SET WORKLOAD GROUP = 'W1'
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            SetWorkloadGroup(
+                "W1",
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+ALTER USER u1 WITH UNSET WORKLOAD GROUP;
+---------- Output ---------
+ALTER USER 'u1'@'%' WITH UNSET WORKLOAD GROUP
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+        auth_option: None,
+        user_options: [
+            UnsetWorkloadGroup,
+        ],
+    },
+)
+
+
+---------- Input ----------
+CREATE USER u1 IDENTIFIED BY '123456' WITH DEFAULT_ROLE='role123', TENANTSETTING
+---------- Output ---------
+CREATE USER 'u1'@'%' IDENTIFIED BY '123456' WITH DEFAULT_ROLE = 'role123', TENANTSETTING
+---------- AST ------------
+CreateUser(
+    CreateUserStmt {
+        create_option: Create,
+        user: UserIdentity {
+            username: "u1",
+            hostname: "%",
+        },
+        auth_option: AuthOption {
+            auth_type: None,
+            password: Some(
+                "123456",
+            ),
+        },
+        user_options: [
+            DefaultRole(
+                "role123",
+            ),
+            TenantSetting(
+                true,
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+CREATE USER u1 IDENTIFIED BY '123456' WITH SET NETWORK POLICY='policy1'
+---------- Output ---------
+CREATE USER 'u1'@'%' IDENTIFIED BY '123456' WITH SET NETWORK POLICY = 'policy1'
+---------- AST ------------
+CreateUser(
+    CreateUserStmt {
+        create_option: Create,
+        user: UserIdentity {
+            username: "u1",
+            hostname: "%",
+        },
+        auth_option: AuthOption {
+            auth_type: None,
+            password: Some(
+                "123456",
+            ),
+        },
+        user_options: [
+            SetNetworkPolicy(
+                "policy1",
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+CREATE USER u1 IDENTIFIED BY '123456' WITH disabled=true
+---------- Output ---------
+CREATE USER 'u1'@'%' IDENTIFIED BY '123456' WITH DISABLED = true
+---------- AST ------------
+CreateUser(
+    CreateUserStmt {
+        create_option: Create,
+        user: UserIdentity {
+            username: "u1",
+            hostname: "%",
+        },
+        auth_option: AuthOption {
+            auth_type: None,
+            password: Some(
+                "123456",
+            ),
+        },
+        user_options: [
+            Disabled(
+                true,
+            ),
+        ],
+    },
+)
+
+
+---------- Input ----------
+create user 'test-e' identified by 'password';
+---------- Output ---------
+CREATE USER 'test-e'@'%' IDENTIFIED BY 'password'
+---------- AST ------------
+CreateUser(
+    CreateUserStmt {
+        create_option: Create,
+        user: UserIdentity {
+            username: "test-e",
+            hostname: "%",
+        },
+        auth_option: AuthOption {
+            auth_type: None,
+            password: Some(
+                "password",
+            ),
+        },
+        user_options: [],
+    },
+)
+
+
+---------- Input ----------
+drop user if exists 'test-j';
+---------- Output ---------
+DROP USER IF EXISTS 'test-j'@'%'
+---------- AST ------------
+DropUser {
+    if_exists: true,
+    user: UserIdentity {
+        username: "test-j",
+        hostname: "%",
+    },
+}
+
+
+---------- Input ----------
+alter user 'test-e' identified by 'new-password';
+---------- Output ---------
+ALTER USER 'test-e'@'%' IDENTIFIED BY 'new-password'
+---------- AST ------------
+AlterUser(
+    AlterUserStmt {
+        user: Some(
+            UserIdentity {
+                username: "test-e",
+                hostname: "%",
+            },
+        ),
+        auth_option: Some(
+            AuthOption {
+                auth_type: None,
+                password: Some(
+                    "new-password",
+                ),
+            },
+        ),
+        user_options: [],
+    },
+)
+
+
+---------- Input ----------
+create role test
+---------- Output ---------
+CREATE ROLE 'test'
+---------- AST ------------
+CreateRole {
+    create_option: Create,
+    role_name: "test",
+    comment: None,
+}
+
+
+---------- Input ----------
+create role 'test'
+---------- Output ---------
+CREATE ROLE 'test'
+---------- AST ------------
+CreateRole {
+    create_option: Create,
+    role_name: "test",
+    comment: None,
+}
+
+
+---------- Input ----------
+create user `a'a` identified by '123'
+---------- Output ---------
+CREATE USER 'a\'a'@'%' IDENTIFIED BY '123'
+---------- AST ------------
+CreateUser(
+    CreateUserStmt {
+        create_option: Create,
+        user: UserIdentity {
+            username: "a'a",
+            hostname: "%",
+        },
+        auth_option: AuthOption {
+            auth_type: None,
+            password: Some(
+                "123",
+            ),
+        },
+        user_options: [],
+    },
+)
+
+
+---------- Input ----------
+drop role if exists test
+---------- Output ---------
+DROP ROLE IF EXISTS 'test'
+---------- AST ------------
+DropRole {
+    if_exists: true,
+    role_name: "test",
+}
+
+
+---------- Input ----------
+drop role if exists 'test'
+---------- Output ---------
+DROP ROLE IF EXISTS 'test'
+---------- AST ------------
+DropRole {
+    if_exists: true,
+    role_name: "test",
+}
+
+
+---------- Input ----------
+GRANT CREATE, CREATE USER ON * TO 'test-grant';
+---------- Output ---------
+GRANT CREATE, CREATE USER ON  * TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Create,
+                CreateUser,
+            ],
+            level: Database(
+                None,
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT access connection, create connection ON *.*  TO 'test-grant';
+---------- Output ---------
+GRANT ACCESS CONNECTION, CREATE CONNECTION ON  *.* TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                AccessConnection,
+                CreateConnection,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT access connection on connection c1  TO 'test-grant';
+---------- Output ---------
+GRANT ACCESS CONNECTION ON  CONNECTION c1 TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                AccessConnection,
+            ],
+            level: Connection(
+                "c1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT all on connection c1  TO 'test-grant';
+---------- Output ---------
+GRANT ACCESS CONNECTION ON  CONNECTION c1 TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                AccessConnection,
+            ],
+            level: Connection(
+                "c1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT OWNERSHIP on connection c1  TO role r1;
+---------- Output ---------
+GRANT OWNERSHIP ON  CONNECTION c1 TO ROLE 'r1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Ownership,
+            ],
+            level: Connection(
+                "c1",
+            ),
+        },
+        principal: Role(
+            "r1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT OWNERSHIP on masking policy m1  TO role r1;
+---------- Output ---------
+GRANT OWNERSHIP ON  MASKING POLICY m1 TO ROLE 'r1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Ownership,
+            ],
+            level: MaskingPolicy(
+                "m1",
+            ),
+        },
+        principal: Role(
+            "r1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT access sequence, create sequence ON *.*  TO 'test-grant';
+---------- Output ---------
+GRANT ACCESS SEQUENCE, CREATE SEQUENCE ON  *.* TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                AccessSequence,
+                CreateSequence,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT access sequence on sequence s1  TO 'test-grant';
+---------- Output ---------
+GRANT ACCESS SEQUENCE ON  SEQUENCE s1 TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                AccessSequence,
+            ],
+            level: Sequence(
+                "s1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT all on sequence s1  TO 'test-grant';
+---------- Output ---------
+GRANT ACCESS SEQUENCE ON  SEQUENCE s1 TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                AccessSequence,
+            ],
+            level: Sequence(
+                "s1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT OWNERSHIP on sequence s1  TO role r1;
+---------- Output ---------
+GRANT OWNERSHIP ON  SEQUENCE s1 TO ROLE 'r1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Ownership,
+            ],
+            level: Sequence(
+                "s1",
+            ),
+        },
+        principal: Role(
+            "r1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT, CREATE ON * TO 'test-grant';
+---------- Output ---------
+GRANT SELECT, CREATE ON  * TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+                Create,
+            ],
+            level: Database(
+                None,
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT, CREATE ON *.* TO 'test-grant';
+---------- Output ---------
+GRANT SELECT, CREATE ON  *.* TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+                Create,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT, CREATE ON * TO USER 'test-grant';
+---------- Output ---------
+GRANT SELECT, CREATE ON  * TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+                Create,
+            ],
+            level: Database(
+                None,
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT, CREATE ON * TO ROLE role1;
+---------- Output ---------
+GRANT SELECT, CREATE ON  * TO ROLE 'role1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+                Create,
+            ],
+            level: Database(
+                None,
+            ),
+        },
+        principal: Role(
+            "role1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ALL ON *.* TO 'test-grant';
+---------- Output ---------
+GRANT ALL PRIVILEGES ON  *.* TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: ALL {
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ALL ON *.* TO ROLE role2;
+---------- Output ---------
+GRANT ALL PRIVILEGES ON  *.* TO ROLE 'role2'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: ALL {
+            level: Global,
+        },
+        principal: Role(
+            "role2",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ALL PRIVILEGES ON * TO 'test-grant';
+---------- Output ---------
+GRANT ALL PRIVILEGES ON  * TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: ALL {
+            level: Database(
+                None,
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ALL PRIVILEGES ON * TO ROLE role3;
+---------- Output ---------
+GRANT ALL PRIVILEGES ON  * TO ROLE 'role3'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: ALL {
+            level: Database(
+                None,
+            ),
+        },
+        principal: Role(
+            "role3",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ROLE test TO 'test-user';
+---------- Output ---------
+GRANT ROLE 'test' TO USER 'test-user'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Role {
+            role: "test",
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-user",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ROLE test TO USER 'test-user';
+---------- Output ---------
+GRANT ROLE 'test' TO USER 'test-user'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Role {
+            role: "test",
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-user",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ROLE test TO ROLE `test-user`;
+---------- Output ---------
+GRANT ROLE 'test' TO ROLE 'test-user'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Role {
+            role: "test",
+        },
+        principal: Role(
+            "test-user",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON db01.* TO 'test-grant';
+---------- Output ---------
+GRANT SELECT ON  db01.* TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Database(
+                Some(
+                    "db01",
+                ),
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON db01.* TO USER 'test-grant';
+---------- Output ---------
+GRANT SELECT ON  db01.* TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Database(
+                Some(
+                    "db01",
+                ),
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON db01.* TO ROLE role1
+---------- Output ---------
+GRANT SELECT ON  db01.* TO ROLE 'role1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Database(
+                Some(
+                    "db01",
+                ),
+            ),
+        },
+        principal: Role(
+            "role1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON db01.tb1 TO 'test-grant';
+---------- Output ---------
+GRANT SELECT ON  db01.tb1 TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Table(
+                Some(
+                    "db01",
+                ),
+                "tb1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON db01.tb1 TO USER 'test-grant';
+---------- Output ---------
+GRANT SELECT ON  db01.tb1 TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Table(
+                Some(
+                    "db01",
+                ),
+                "tb1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON db01.tb1 TO ROLE role1;
+---------- Output ---------
+GRANT SELECT ON  db01.tb1 TO ROLE 'role1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Table(
+                Some(
+                    "db01",
+                ),
+                "tb1",
+            ),
+        },
+        principal: Role(
+            "role1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT SELECT ON tb1 TO ROLE role1;
+---------- Output ---------
+GRANT SELECT ON  tb1 TO ROLE 'role1'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Table(
+                None,
+                "tb1",
+            ),
+        },
+        principal: Role(
+            "role1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ALL ON tb1 TO 'u1';
+---------- Output ---------
+GRANT ALL PRIVILEGES ON  tb1 TO USER 'u1'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: ALL {
+            level: Table(
+                None,
+                "tb1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT CREATE MASKING POLICY ON *.* TO USER a;
+---------- Output ---------
+GRANT CREATE MASKING POLICY ON  *.* TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                CreateMaskingPolicy,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT APPLY MASKING POLICY ON *.* TO USER a;
+---------- Output ---------
+GRANT APPLY MASKING POLICY ON  *.* TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                ApplyMaskingPolicy,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT APPLY ON MASKING POLICY ssn_mask TO ROLE human_resources;
+---------- Output ---------
+GRANT APPLY ON MASKING POLICY ssn_mask TO ROLE 'human_resources'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                ApplyMaskingPolicy,
+            ],
+            level: MaskingPolicy(
+                "ssn_mask",
+            ),
+        },
+        principal: Role(
+            "human_resources",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT OWNERSHIP ON MASKING POLICY mask_phone TO ROLE role_mask_apply;
+---------- Output ---------
+GRANT OWNERSHIP ON  MASKING POLICY mask_phone TO ROLE 'role_mask_apply'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Ownership,
+            ],
+            level: MaskingPolicy(
+                "mask_phone",
+            ),
+        },
+        principal: Role(
+            "role_mask_apply",
+        ),
+    },
+)
+
+
+---------- Input ----------
+SHOW GRANTS;
+---------- Output ---------
+SHOW GRANTS
+---------- AST ------------
+VariableShow(
+    VariableShowStmt {
+        target: Name(
+            Identifier {
+                span: Some(
+                    5..11,
+                ),
+                name: "GRANTS",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE SELECT, CREATE ON * FROM 'test-grant';
+---------- Output ---------
+REVOKE SELECT, CREATE ON  * FROM USER 'test-grant'@'%'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Select,
+                Create,
+            ],
+            level: Database(
+                None,
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE SELECT ON tb1 FROM ROLE role1;
+---------- Output ---------
+REVOKE SELECT ON  tb1 FROM ROLE 'role1'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Table(
+                None,
+                "tb1",
+            ),
+        },
+        principal: Role(
+            "role1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE SELECT ON tb1 FROM ROLE 'role1';
+---------- Output ---------
+REVOKE SELECT ON  tb1 FROM ROLE 'role1'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Select,
+            ],
+            level: Table(
+                None,
+                "tb1",
+            ),
+        },
+        principal: Role(
+            "role1",
+        ),
+    },
+)
+
+
+---------- Input ----------
+drop role 'role1';
+---------- Output ---------
+DROP ROLE 'role1'
+---------- AST ------------
+DropRole {
+    if_exists: false,
+    role_name: "role1",
+}
+
+
+---------- Input ----------
+GRANT ROLE test TO ROLE 'test-user';
+---------- Output ---------
+GRANT ROLE 'test' TO ROLE 'test-user'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Role {
+            role: "test",
+        },
+        principal: Role(
+            "test-user",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT ROLE test TO ROLE `test-user`;
+---------- Output ---------
+GRANT ROLE 'test' TO ROLE 'test-user'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Role {
+            role: "test",
+        },
+        principal: Role(
+            "test-user",
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE ALL ON tb1 FROM 'u1';
+---------- Output ---------
+REVOKE ALL PRIVILEGES ON  tb1 FROM USER 'u1'@'%'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: ALL {
+            level: Table(
+                None,
+                "tb1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "u1",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT all ON stage s1 TO a;
+---------- Output ---------
+GRANT ALL PRIVILEGES ON  STAGE s1 TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: ALL {
+            level: Stage(
+                "s1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT read ON stage s1 TO a;
+---------- Output ---------
+GRANT Read ON  STAGE s1 TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Read,
+            ],
+            level: Stage(
+                "s1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT write ON stage s1 TO a;
+---------- Output ---------
+GRANT Write ON  STAGE s1 TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Write,
+            ],
+            level: Stage(
+                "s1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE write ON stage s1 FROM a;
+---------- Output ---------
+REVOKE Write ON  STAGE s1 FROM USER 'a'@'%'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Write,
+            ],
+            level: Stage(
+                "s1",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT all ON UDF a TO 'test-grant';
+---------- Output ---------
+GRANT USAGE ON  UDF a TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: UDF(
+                "a",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT usage ON UDF a TO 'test-grant';
+---------- Output ---------
+GRANT USAGE ON  UDF a TO USER 'test-grant'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: UDF(
+                "a",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE usage ON UDF a FROM 'test-grant';
+---------- Output ---------
+REVOKE USAGE ON  UDF a FROM USER 'test-grant'@'%'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: UDF(
+                "a",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE all ON UDF a FROM 'test-grant';
+---------- Output ---------
+REVOKE USAGE ON  UDF a FROM USER 'test-grant'@'%'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: UDF(
+                "a",
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT all ON warehouse a TO role 'test-grant';
+---------- Output ---------
+GRANT USAGE ON  WAREHOUSE a TO ROLE 'test-grant'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: Warehouse(
+                "a",
+            ),
+        },
+        principal: Role(
+            "test-grant",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT usage ON warehouse a TO role 'test-grant';
+---------- Output ---------
+GRANT USAGE ON  WAREHOUSE a TO ROLE 'test-grant'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: Warehouse(
+                "a",
+            ),
+        },
+        principal: Role(
+            "test-grant",
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE usage ON warehouse a FROM role 'test-grant';
+---------- Output ---------
+REVOKE USAGE ON  WAREHOUSE a FROM ROLE 'test-grant'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: Warehouse(
+                "a",
+            ),
+        },
+        principal: Role(
+            "test-grant",
+        ),
+    },
+)
+
+
+---------- Input ----------
+REVOKE all ON warehouse a FROM role 'test-grant';
+---------- Output ---------
+REVOKE USAGE ON  WAREHOUSE a FROM ROLE 'test-grant'
+---------- AST ------------
+Revoke(
+    RevokeStmt {
+        source: Privs {
+            privileges: [
+                Usage,
+            ],
+            level: Warehouse(
+                "a",
+            ),
+        },
+        principal: Role(
+            "test-grant",
+        ),
+    },
+)
+
+
+---------- Input ----------
+CREATE MASKING POLICY email_mask AS (val STRING) RETURNS STRING -> CASE WHEN current_role() IN ('ANALYST') THEN VAL ELSE '*********'END comment = 'this is a masking policy'
+---------- Output ---------
+CREATE MASKING POLICY email_mask AS (val STRING) RETURNS STRING -> CASE WHEN current_role() IN('ANALYST') THEN VAL ELSE '*********' END COMMENT = 'this is a masking policy'
+---------- AST ------------
+CreateDatamaskPolicy(
+    CreateDatamaskPolicyStmt {
+        if_not_exists: false,
+        name: "email_mask",
+        policy: DataMaskPolicy {
+            args: [
+                DataMaskArg {
+                    arg_name: "val",
+                    arg_type: String,
+                },
+            ],
+            return_type: String,
+            body: Case {
+                span: Some(
+                    67..135,
+                ),
+                operand: None,
+                conditions: [
+                    InList {
+                        span: Some(
+                            92..106,
+                        ),
+                        expr: FunctionCall {
+                            span: Some(
+                                77..91,
+                            ),
+                            func: FunctionCall {
+                                distinct: false,
+                                schema: None,
+                                name: Identifier {
+                                    span: Some(
+                                        77..89,
+                                    ),
+                                    name: "current_role",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                args: [],
+                                params: [],
+                                order_by: [],
+                                filter: None,
+                                window: None,
+                                lambda: None,
+                            },
+                        },
+                        list: [
+                            Literal {
+                                span: Some(
+                                    96..105,
+                                ),
+                                value: String(
+                                    "ANALYST",
+                                ),
+                            },
+                        ],
+                        not: false,
+                    },
+                ],
+                results: [
+                    ColumnRef {
+                        span: Some(
+                            112..115,
+                        ),
+                        column: ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Name(
+                                Identifier {
+                                    span: Some(
+                                        112..115,
+                                    ),
+                                    name: "VAL",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                            ),
+                        },
+                    },
+                ],
+                else_result: Some(
+                    Literal {
+                        span: Some(
+                            121..132,
+                        ),
+                        value: String(
+                            "*********",
+                        ),
+                    },
+                ),
+            },
+            comment: Some(
+                "this is a masking policy",
+            ),
+        },
+    },
+)
+
+
+---------- Input ----------
+DESC MASKING POLICY email_mask
+---------- Output ---------
+DESCRIBE MASKING POLICY email_mask
+---------- AST ------------
+DescDatamaskPolicy(
+    DescDatamaskPolicyStmt {
+        name: "email_mask",
+    },
+)
+
+
+---------- Input ----------
+DROP MASKING POLICY IF EXISTS email_mask
+---------- Output ---------
+DROP MASKING POLICY IF EXISTS email_mask
+---------- AST ------------
+DropDatamaskPolicy(
+    DropDatamaskPolicyStmt {
+        if_exists: true,
+        name: "email_mask",
+    },
+)
+
+
+---------- Input ----------
+CREATE NETWORK POLICY mypolicy ALLOWED_IP_LIST=('192.168.10.0/24') BLOCKED_IP_LIST=('192.168.10.99') COMMENT='test'
+---------- Output ---------
+CREATE NETWORK POLICY mypolicy ALLOWED_IP_LIST = ('192.168.10.0/24') BLOCKED_IP_LIST = ('192.168.10.99') COMMENT = 'test'
+---------- AST ------------
+CreateNetworkPolicy(
+    CreateNetworkPolicyStmt {
+        create_option: Create,
+        name: "mypolicy",
+        allowed_ip_list: [
+            "192.168.10.0/24",
+        ],
+        blocked_ip_list: Some(
+            [
+                "192.168.10.99",
+            ],
+        ),
+        comment: Some(
+            "test",
+        ),
+    },
+)
+
+
+---------- Input ----------
+CREATE OR REPLACE NETWORK POLICY mypolicy ALLOWED_IP_LIST=('192.168.10.0/24') BLOCKED_IP_LIST=('192.168.10.99') COMMENT='test'
+---------- Output ---------
+CREATE OR REPLACE NETWORK POLICY mypolicy ALLOWED_IP_LIST = ('192.168.10.0/24') BLOCKED_IP_LIST = ('192.168.10.99') COMMENT = 'test'
+---------- AST ------------
+CreateNetworkPolicy(
+    CreateNetworkPolicyStmt {
+        create_option: CreateOrReplace,
+        name: "mypolicy",
+        allowed_ip_list: [
+            "192.168.10.0/24",
+        ],
+        blocked_ip_list: Some(
+            [
+                "192.168.10.99",
+            ],
+        ),
+        comment: Some(
+            "test",
+        ),
+    },
+)
+
+
+---------- Input ----------
+ALTER NETWORK POLICY mypolicy SET ALLOWED_IP_LIST=('192.168.10.0/24','192.168.255.1') BLOCKED_IP_LIST=('192.168.1.99') COMMENT='test'
+---------- Output ---------
+ALTER NETWORK POLICY mypolicy SET  ALLOWED_IP_LIST = ('192.168.10.0/24','192.168.255.1') BLOCKED_IP_LIST = ('192.168.1.99') COMMENT = 'test'
+---------- AST ------------
+AlterNetworkPolicy(
+    AlterNetworkPolicyStmt {
+        if_exists: false,
+        name: "mypolicy",
+        allowed_ip_list: Some(
+            [
+                "192.168.10.0/24",
+                "192.168.255.1",
+            ],
+        ),
+        blocked_ip_list: Some(
+            [
+                "192.168.1.99",
+            ],
+        ),
+        comment: Some(
+            "test",
+        ),
+    },
+)
+
+
+---------- Input ----------
+create row access policy rap_it as (empl_id varchar) returns boolean ->
+case
+    when 'it_admin' = current_role() then true
+    else false
+end
+---------- Output ---------
+CREATE ROW ACCESS POLICY rap_it AS (empl_id STRING) RETURNS BOOLEAN -> CASE WHEN 'it_admin' = current_role() THEN TRUE ELSE FALSE END
+---------- AST ------------
+CreateRowAccessPolicy(
+    CreateRowAccessPolicyStmt {
+        if_not_exists: false,
+        name: Identifier {
+            span: Some(
+                25..31,
+            ),
+            name: "rap_it",
+            quote: None,
+            ident_type: None,
+        },
+        description: None,
+        definition: RowAccessPolicyDefinition {
+            parameters: [
+                RowAccessPolicyType {
+                    name: "empl_id",
+                    data_type: String,
+                },
+            ],
+            definition: Case {
+                span: Some(
+                    72..142,
+                ),
+                operand: None,
+                conditions: [
+                    BinaryOp {
+                        span: Some(
+                            97..98,
+                        ),
+                        op: Eq,
+                        left: Literal {
+                            span: Some(
+                                86..96,
+                            ),
+                            value: String(
+                                "it_admin",
+                            ),
+                        },
+                        right: FunctionCall {
+                            span: Some(
+                                99..113,
+                            ),
+                            func: FunctionCall {
+                                distinct: false,
+                                schema: None,
+                                name: Identifier {
+                                    span: Some(
+                                        99..111,
+                                    ),
+                                    name: "current_role",
+                                    quote: None,
+                                    ident_type: None,
+                                },
+                                args: [],
+                                params: [],
+                                order_by: [],
+                                filter: None,
+                                window: None,
+                                lambda: None,
+                            },
+                        },
+                    },
+                ],
+                results: [
+                    Literal {
+                        span: Some(
+                            119..123,
+                        ),
+                        value: Boolean(
+                            true,
+                        ),
+                    },
+                ],
+                else_result: Some(
+                    Literal {
+                        span: Some(
+                            133..138,
+                        ),
+                        value: Boolean(
+                            false,
+                        ),
+                    },
+                ),
+            },
+        },
+    },
+)
+
+
+---------- Input ----------
+create row access policy if not exists rap_sales_manager_regions_1 as (sales_region varchar) returns boolean ->
+    'sales_executive_role' = current_role()
+      or exists (
+            select 1 from salesmanagerregions
+              where sales_manager = current_role()
+                and region = sales_region
+)
+---------- Output ---------
+CREATE ROW ACCESS POLICY IF NOT EXISTS rap_sales_manager_regions_1 AS (sales_region STRING) RETURNS BOOLEAN -> 'sales_executive_role' = current_role() OR EXISTS (SELECT 1 FROM salesmanagerregions WHERE sales_manager = current_role() AND region = sales_region)
+---------- AST ------------
+CreateRowAccessPolicy(
+    CreateRowAccessPolicyStmt {
+        if_not_exists: true,
+        name: Identifier {
+            span: Some(
+                39..66,
+            ),
+            name: "rap_sales_manager_regions_1",
+            quote: None,
+            ident_type: None,
+        },
+        description: None,
+        definition: RowAccessPolicyDefinition {
+            parameters: [
+                RowAccessPolicyType {
+                    name: "sales_region",
+                    data_type: String,
+                },
+            ],
+            definition: BinaryOp {
+                span: Some(
+                    162..164,
+                ),
+                op: Or,
+                left: BinaryOp {
+                    span: Some(
+                        139..140,
+                    ),
+                    op: Eq,
+                    left: Literal {
+                        span: Some(
+                            116..138,
+                        ),
+                        value: String(
+                            "sales_executive_role",
+                        ),
+                    },
+                    right: FunctionCall {
+                        span: Some(
+                            141..155,
+                        ),
+                        func: FunctionCall {
+                            distinct: false,
+                            schema: None,
+                            name: Identifier {
+                                span: Some(
+                                    141..153,
+                                ),
+                                name: "current_role",
+                                quote: None,
+                                ident_type: None,
+                            },
+                            args: [],
+                            params: [],
+                            order_by: [],
+                            filter: None,
+                            window: None,
+                            lambda: None,
+                        },
+                    },
+                },
+                right: Exists {
+                    span: Some(
+                        165..314,
+                    ),
+                    not: false,
+                    subquery: Query {
+                        span: Some(
+                            186..312,
+                        ),
+                        with: None,
+                        body: Select(
+                            SelectStmt {
+                                span: Some(
+                                    186..312,
+                                ),
+                                hints: None,
+                                distinct: false,
+                                top_n: None,
+                                select_list: [
+                                    AliasedExpr {
+                                        expr: Literal {
+                                            span: Some(
+                                                193..194,
+                                            ),
+                                            value: UInt64(
+                                                1,
+                                            ),
+                                        },
+                                        alias: None,
+                                    },
+                                ],
+                                from: [
+                                    Table {
+                                        span: Some(
+                                            200..219,
+                                        ),
+                                        database: None,
+                                        schema: None,
+                                        table: Identifier {
+                                            span: Some(
+                                                200..219,
+                                            ),
+                                            name: "salesmanagerregions",
+                                            quote: None,
+                                            ident_type: None,
+                                        },
+                                        alias: None,
+                                        temporal: None,
+                                        with_options: None,
+                                        pivot: None,
+                                        unpivot: None,
+                                        sample: None,
+                                    },
+                                ],
+                                selection: Some(
+                                    BinaryOp {
+                                        span: Some(
+                                            287..290,
+                                        ),
+                                        op: And,
+                                        left: BinaryOp {
+                                            span: Some(
+                                                254..255,
+                                            ),
+                                            op: Eq,
+                                            left: ColumnRef {
+                                                span: Some(
+                                                    240..253,
+                                                ),
+                                                column: ColumnRef {
+                                                    schema: None,
+                                                    table: None,
+                                                    column: Name(
+                                                        Identifier {
+                                                            span: Some(
+                                                                240..253,
+                                                            ),
+                                                            name: "sales_manager",
+                                                            quote: None,
+                                                            ident_type: None,
+                                                        },
+                                                    ),
+                                                },
+                                            },
+                                            right: FunctionCall {
+                                                span: Some(
+                                                    256..270,
+                                                ),
+                                                func: FunctionCall {
+                                                    distinct: false,
+                                                    schema: None,
+                                                    name: Identifier {
+                                                        span: Some(
+                                                            256..268,
+                                                        ),
+                                                        name: "current_role",
+                                                        quote: None,
+                                                        ident_type: None,
+                                                    },
+                                                    args: [],
+                                                    params: [],
+                                                    order_by: [],
+                                                    filter: None,
+                                                    window: None,
+                                                    lambda: None,
+                                                },
+                                            },
+                                        },
+                                        right: BinaryOp {
+                                            span: Some(
+                                                298..299,
+                                            ),
+                                            op: Eq,
+                                            left: ColumnRef {
+                                                span: Some(
+                                                    291..297,
+                                                ),
+                                                column: ColumnRef {
+                                                    schema: None,
+                                                    table: None,
+                                                    column: Name(
+                                                        Identifier {
+                                                            span: Some(
+                                                                291..297,
+                                                            ),
+                                                            name: "region",
+                                                            quote: None,
+                                                            ident_type: None,
+                                                        },
+                                                    ),
+                                                },
+                                            },
+                                            right: ColumnRef {
+                                                span: Some(
+                                                    300..312,
+                                                ),
+                                                column: ColumnRef {
+                                                    schema: None,
+                                                    table: None,
+                                                    column: Name(
+                                                        Identifier {
+                                                            span: Some(
+                                                                300..312,
+                                                            ),
+                                                            name: "sales_region",
+                                                            quote: None,
+                                                            ident_type: None,
+                                                        },
+                                                    ),
+                                                },
+                                            },
+                                        },
+                                    },
+                                ),
+                                group_by: None,
+                                having: None,
+                                window_list: None,
+                                qualify: None,
+                            },
+                        ),
+                        order_by: [],
+                        limit: [],
+                        offset: None,
+                        ignore_result: false,
+                    },
+                },
+            },
+        },
+    },
+)
+
+
+---------- Input ----------
+DROP row access policy IF EXISTS r1
+---------- Output ---------
+DROP ROW ACCESS POLICY IF EXISTS r1
+---------- AST ------------
+DropRowAccessPolicy(
+    DropRowAccessPolicyStmt {
+        if_exists: true,
+        name: "r1",
+    },
+)
+
+
+---------- Input ----------
+desc row access policy r1
+---------- Output ---------
+DESCRIBE ROW ACCESS POLICY r1
+---------- AST ------------
+DescRowAccessPolicy(
+    DescRowAccessPolicyStmt {
+        name: "r1",
+    },
+)
+
+
+---------- Input ----------
+GRANT CREATE ROW ACCESS POLICY ON *.* TO USER a;
+---------- Output ---------
+GRANT CREATE ROW ACCESS POLICY ON  *.* TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                CreateRowAccessPolicy,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT APPLY ROW ACCESS POLICY ON *.* TO USER a;
+---------- Output ---------
+GRANT APPLY ROW ACCESS POLICY ON  *.* TO USER 'a'@'%'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                ApplyRowAccessPolicy,
+            ],
+            level: Global,
+        },
+        principal: User(
+            UserIdentity {
+                username: "a",
+                hostname: "%",
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT APPLY ON ROW ACCESS POLICY ssn_mask TO ROLE 'human_resources'
+---------- Output ---------
+GRANT APPLY ON ROW ACCESS POLICY ssn_mask TO ROLE 'human_resources'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                ApplyRowAccessPolicy,
+            ],
+            level: RowAccessPolicy(
+                "ssn_mask",
+            ),
+        },
+        principal: Role(
+            "human_resources",
+        ),
+    },
+)
+
+
+---------- Input ----------
+GRANT OWNERSHIP ON  ROW ACCESS POLICY mask_phone TO ROLE 'role_mask_apply'
+---------- Output ---------
+GRANT OWNERSHIP ON  ROW ACCESS POLICY mask_phone TO ROLE 'role_mask_apply'
+---------- AST ------------
+Grant(
+    GrantStmt {
+        source: Privs {
+            privileges: [
+                Ownership,
+            ],
+            level: RowAccessPolicy(
+                "mask_phone",
+            ),
+        },
+        principal: Role(
+            "role_mask_apply",
+        ),
+    },
+)
+
+

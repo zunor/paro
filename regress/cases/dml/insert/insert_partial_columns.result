@@ -1,0 +1,17 @@
+CREATE TABLE partial_col_test (id INT, name VARCHAR, value INT);
+CREATE TABLE
+
+INSERT INTO partial_col_test (id, name) VALUES (1, 'Alice');
+INSERT 0 1
+
+INSERT INTO partial_col_test (id, value) VALUES (2, 42);
+INSERT 0 1
+
+INSERT INTO partial_col_test VALUES (3, 'Charlie', 99);
+INSERT 0 1
+
+SELECT * FROM partial_col_test ORDER BY id;
+partial_col_test.id	partial_col_test.name	partial_col_test.value
+1	Alice	0
+2	(empty)	42
+3	Charlie	99

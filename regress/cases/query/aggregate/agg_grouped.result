@@ -1,0 +1,89 @@
+CREATE TABLE agg_g_t (
+    grp INT,
+    subgrp INT,
+    x INT,
+    y INT
+);
+CREATE TABLE
+
+INSERT INTO agg_g_t VALUES
+    (1, 1, 10, 1),
+    (1, 1, 20, 2),
+    (1, 2, NULL, 3),
+    (2, 1, 30, 4),
+    (2, NULL, 40, 5),
+    (NULL, 1, 50, 6),
+    (NULL, NULL, NULL, 7);
+INSERT 0 7
+
+SELECT
+    grp,
+    count(*) AS cnt_star,
+    count(x) AS cnt_x,
+    sum(x) AS sum_x,
+    min(x) AS min_x,
+    max(x) AS max_x
+FROM agg_g_t
+GROUP BY grp
+ORDER BY grp;
+grp	cnt_star	cnt_x	sum_x	min_x	max_x
+1	3	2	30	10	20
+2	2	2	70	30	40
+NULL	2	1	50	50	50
+
+SELECT
+    grp,
+    subgrp,
+    count(*) AS cnt_star,
+    count(x) AS cnt_x,
+    sum(x) AS sum_x
+FROM agg_g_t
+GROUP BY grp, subgrp
+ORDER BY grp, subgrp;
+grp	subgrp	cnt_star	cnt_x	sum_x
+1	1	2	2	30
+1	2	1	0	NULL
+2	1	1	1	30
+2	NULL	1	1	40
+NULL	1	1	1	50
+NULL	NULL	1	0	NULL
+
+SELECT
+    coalesce(grp, -1) AS grp_key,
+    sum(coalesce(x, 0)) AS sum_x
+FROM agg_g_t
+GROUP BY coalesce(grp, -1)
+ORDER BY grp_key;
+grp_key	sum_x
+-1	50
+1	30
+2	70
+
+EXPLAIN SELECT
+    grp,
+    sum(x) AS sum_x
+FROM (
+    VALUES (1, 10),
+           (1, 20),
+           (2, 30),
+           (2, NULL),
+           (NULL, 40)
+) AS agg_g_values(grp, x)
+GROUP BY grp
+ORDER BY grp;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: grp, sum_x
+  ->  ORDER_BY  (rows=3)
+        Sort Key: ref_1 ASC NULLS LAST
+        ->  PROJECTION  (rows=3)
+              Output: ref_1, sum, ref_1
+              ->  HASH_GROUP_BY  (rows=3)
+                    Group Key: col0
+                    Aggregates: SUM(col1)
+                    Key Mode: INLINE_KEY_4B
+                    ->  PROJECTION
+                          Output: col0, col1
+                          ->  PROJECTION  (rows=5)
+                                Output: col0, col1
+                                ->  EXPRESSION_SCAN  (rows=5)

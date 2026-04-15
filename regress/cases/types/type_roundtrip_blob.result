@@ -1,0 +1,22 @@
+CREATE TABLE type_roundtrip_blob (
+  id INT,
+  b BLOB
+);
+CREATE TABLE
+
+INSERT INTO type_roundtrip_blob VALUES
+  (1, 'hello'),
+  (2, ''),
+  (3, 'binary_data_0123456789'),
+  (4, NULL);
+INSERT 0 4
+
+-- @query rowsort
+SELECT id, b
+FROM type_roundtrip_blob
+ORDER BY id;
+id	b
+1	b'BLOB[5]'
+2	b'BLOB[0]'
+3	b'BLOB[22]'
+4	NULL

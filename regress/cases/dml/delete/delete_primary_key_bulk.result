@@ -1,0 +1,19 @@
+INSERT INTO dml_delete_primary_key_bulk_case
+SELECT i, i * 10
+FROM generate_series(1, 20000) AS t(i);
+INSERT 0 20000
+
+DELETE FROM dml_delete_primary_key_bulk_case
+WHERE id % 10 = 0;
+DELETE 2000
+
+SELECT COUNT(*), MIN(id), MAX(id)
+FROM dml_delete_primary_key_bulk_case;
+COUNT(*)	MIN(id)	MAX(id)
+18000	1	20000
+
+SELECT COUNT(*)
+FROM dml_delete_primary_key_bulk_case
+WHERE id = 10000;
+COUNT(*)
+0

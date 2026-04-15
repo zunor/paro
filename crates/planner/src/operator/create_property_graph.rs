@@ -1,0 +1,15 @@
+//! Logical Create Property Graph Operator
+
+use crate::binder::ir::statement::BoundCreatePropertyGraphInfo;
+
+/// CreatePropertyGraph represents a CREATE PROPERTY GRAPH operation.
+#[derive(Debug, Clone)]
+pub struct CreatePropertyGraph {
+    pub info: BoundCreatePropertyGraphInfo,
+}
+
+impl CreatePropertyGraph {
+    pub fn new(info: BoundCreatePropertyGraphInfo) -> Self {
+        Self { info }
+    }
+}

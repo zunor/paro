@@ -1,0 +1,29 @@
+INSERT INTO dml_update_primary_key_case VALUES
+  (1, 10, 100),
+  (2, 20, 200),
+  (3, 30, 300);
+INSERT 0 3
+
+UPDATE dml_update_primary_key_case
+SET price = 25
+WHERE id = 2;
+UPDATE 1
+
+-- @query rowsort
+SELECT id, price, stock FROM dml_update_primary_key_case;
+id	price	stock
+1	10	100
+2	25	200
+3	30	300
+
+UPDATE dml_update_primary_key_case
+SET stock = stock + 5
+WHERE id = 3;
+UPDATE 1
+
+-- @query rowsort
+SELECT id, price, stock FROM dml_update_primary_key_case;
+id	price	stock
+1	10	100
+2	25	200
+3	30	305

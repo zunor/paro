@@ -1,0 +1,49 @@
+INSERT INTO dml_copy_protocol_src VALUES
+  (1, 'alpha', NULL),
+  (2, 'comma,space', 'quote "here"'),
+  (3, 'pipe|bar', 'plain'),
+  (4, 'slash\\path', 'csv'),
+  (5, 'tail', 'done');
+INSERT 0 5
+
+-- @copy out
+COPY dml_copy_protocol_src TO STDOUT WITH (FORMAT csv, HEADER true);
+-- @copydata
+id,name,note
+1,alpha,
+2,"comma,space","quote ""here"""
+3,pipe|bar,plain
+4,slash\path,csv
+5,tail,done
+
+-- @copy in
+COPY dml_copy_protocol_dst FROM STDIN WITH (FORMAT csv, HEADER true);
+-- @copydata
+id,name,note
+10,stdin-a,
+11,"stdin,comma","quote ""again"""
+12,stdin-c,plain
+13,stdin-d,"slash\\path"
+
+SELECT id, name, note
+FROM dml_copy_protocol_dst
+ORDER BY id;
+id	name	note
+10	stdin-a	NULL
+11	stdin,comma	quote "again"
+12	stdin-c	plain
+13	stdin-d	slash\\\\path
+
+-- @copy in
+COPY dml_copy_protocol_dst FROM STDIN WITH (FORMAT csv);
+-- @copydata
+20,should-not-land,abort
+21,should-not-land-2,abort
+-- @copyfail client abort from regress
+-- @copystatus
+ERROR: COPY from stdin aborted by client: error from Python: _ClientCopyAbort - client abort from regress (SQLSTATE=XX000)
+
+SELECT COUNT(*) AS copied_rows
+FROM dml_copy_protocol_dst;
+copied_rows
+4

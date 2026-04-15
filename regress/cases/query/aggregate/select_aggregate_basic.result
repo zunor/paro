@@ -1,0 +1,17 @@
+CREATE TABLE agg_test (x INT);
+CREATE TABLE
+
+INSERT INTO agg_test VALUES (1), (2), (3);
+INSERT 0 3
+
+SELECT count(*) FROM agg_test;
+COUNT(*)
+3
+
+SELECT sum(x) FROM agg_test;
+sum(x)
+6
+
+SELECT count(*) + sum(x) FROM agg_test;
+COUNT(*) + sum(x)
+9

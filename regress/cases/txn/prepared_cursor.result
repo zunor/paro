@@ -1,0 +1,122 @@
+CREATE TABLE prepared_cursor_t (v INT);
+CREATE TABLE
+
+INSERT INTO prepared_cursor_t VALUES (1), (2), (3);
+INSERT 0 3
+
+PREPARE stmt1 AS SELECT v FROM prepared_cursor_t ORDER BY v;
+PREPARE
+
+EXECUTE stmt1;
+SELECT 3
+
+SELECT COUNT(*) AS prepared_count
+FROM pg_catalog.pg_prepared_statements
+WHERE name = 'stmt1';
+prepared_count
+1
+
+DEALLOCATE stmt1;
+DEALLOCATE
+
+SELECT COUNT(*) AS prepared_count
+FROM pg_catalog.pg_prepared_statements
+WHERE name = 'stmt1';
+prepared_count
+0
+
+PREPARE stmt1 AS SELECT v FROM prepared_cursor_t ORDER BY v;
+PREPARE
+
+PREPARE stmt1 AS SELECT v + 1 FROM prepared_cursor_t ORDER BY v;
+ERROR: prepared statement "stmt1" already exists (SQLSTATE=42601)
+
+DEALLOCATE stmt1;
+DEALLOCATE
+
+DECLARE c_outside CURSOR FOR SELECT v FROM prepared_cursor_t ORDER BY v;
+ERROR: DECLARE CURSOR can only be used in transaction blocks (SQLSTATE=25000)
+
+BEGIN;
+BEGIN
+
+DECLARE c1 CURSOR FOR SELECT v FROM prepared_cursor_t ORDER BY v;
+DECLARE CURSOR
+
+SELECT COUNT(*) AS cursor_count
+FROM pg_catalog.pg_cursors
+WHERE name = 'c1';
+cursor_count
+1
+
+FETCH 2 FROM c1;
+FETCH 2
+
+MOVE 1 FROM c1;
+MOVE 1
+
+COMMIT;
+COMMIT
+
+FETCH NEXT FROM c1;
+ERROR: cursor "c1" does not exist (SQLSTATE=42601)
+
+BEGIN;
+BEGIN
+
+DECLARE c_hold CURSOR WITH HOLD FOR SELECT v FROM prepared_cursor_t ORDER BY v;
+DECLARE CURSOR
+
+COMMIT;
+COMMIT
+
+FETCH NEXT FROM c_hold;
+FETCH 1
+
+FETCH 2 FROM c_hold;
+FETCH 2
+
+CLOSE c_hold;
+CLOSE CURSOR
+
+SELECT COUNT(*) AS cursor_count
+FROM pg_catalog.pg_cursors
+WHERE name = 'c_hold';
+cursor_count
+0
+
+BEGIN;
+BEGIN
+
+DECLARE c_rollback CURSOR WITH HOLD FOR SELECT v FROM prepared_cursor_t ORDER BY v;
+DECLARE CURSOR
+
+ROLLBACK;
+ROLLBACK
+
+FETCH NEXT FROM c_rollback;
+ERROR: cursor "c_rollback" does not exist (SQLSTATE=42601)
+
+BEGIN;
+BEGIN
+
+DECLARE c_scroll CURSOR FOR SELECT v FROM prepared_cursor_t ORDER BY v;
+DECLARE CURSOR
+
+FETCH 2 FROM c_scroll;
+FETCH 2
+
+FETCH PRIOR FROM c_scroll;
+FETCH 1
+
+DECLARE c_no_scroll NO SCROLL CURSOR FOR SELECT v FROM prepared_cursor_t ORDER BY v;
+DECLARE CURSOR
+
+FETCH 2 FROM c_no_scroll;
+FETCH 2
+
+FETCH PRIOR FROM c_no_scroll;
+ERROR: cursor can only scan forward (SQLSTATE=42601)
+
+ROLLBACK;
+ROLLBACK

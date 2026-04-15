@@ -1,0 +1,106 @@
+SELECT
+  o.id,
+  o.grp,
+  picked.kind,
+  picked.score
+FROM subquery_lateral_outer AS o
+CROSS JOIN LATERAL (
+  SELECT d.kind AS kind, d.score AS score
+  FROM subquery_lateral_detail AS d
+  WHERE d.grp = o.grp
+  ORDER BY d.score DESC, d.seq
+  LIMIT 1
+) AS picked
+ORDER BY o.id;
+o.id	o.grp	picked.kind	picked.score
+1	10	peak	9
+2	20	peak	8
+3	20	peak	8
+4	30	solo	6
+
+SELECT
+  o.id,
+  picked.kind,
+  picked.score
+FROM subquery_lateral_outer AS o
+CROSS JOIN LATERAL (
+  SELECT
+    d.kind AS kind,
+    d.score AS score
+  FROM subquery_lateral_detail AS d
+  WHERE d.grp = o.grp
+    AND d.score >= o.threshold
+  ORDER BY d.score DESC, d.seq
+  LIMIT 1
+) AS picked
+ORDER BY o.id;
+o.id	picked.kind	picked.score
+1	peak	9
+2	peak	8
+4	solo	6
+
+SELECT
+  o.id,
+  o.threshold,
+  candidate.kind,
+  candidate.score
+FROM subquery_lateral_outer AS o
+JOIN LATERAL (
+  SELECT d.kind AS kind, d.score AS score
+  FROM subquery_lateral_detail AS d
+  WHERE d.grp = o.grp
+    AND d.score >= o.threshold
+) AS candidate
+ON true
+ORDER BY o.id, candidate.score;
+o.id	o.threshold	candidate.kind	candidate.score
+1	8	peak	9
+2	6	trail	6
+2	6	peak	8
+4	5	solo	6
+
+SELECT
+  o.id,
+  o.label,
+  picked.kind,
+  picked.score
+FROM subquery_lateral_outer AS o
+LEFT JOIN LATERAL (
+  SELECT d.kind AS kind, d.score AS score
+  FROM subquery_lateral_detail AS d
+  WHERE d.grp = o.grp
+  ORDER BY d.score DESC, d.seq
+  LIMIT 1
+) AS picked
+ON true
+ORDER BY o.id;
+o.id	o.label	picked.kind	picked.score
+1	alpha	peak	9
+2	beta	peak	8
+3	gamma	peak	8
+4	delta	solo	6
+5	null_grp	NULL	NULL
+6	missing_grp	NULL	NULL
+
+SELECT
+  o.id,
+  o.threshold,
+  picked.kind,
+  picked.score
+FROM subquery_lateral_outer AS o
+LEFT JOIN LATERAL (
+  SELECT d.kind AS kind, d.score AS score
+  FROM subquery_lateral_detail AS d
+  WHERE d.grp = o.grp
+  ORDER BY d.score DESC, d.seq
+  LIMIT 1
+) AS picked
+ON picked.score >= o.threshold
+ORDER BY o.id;
+o.id	o.threshold	picked.kind	picked.score
+1	8	peak	9
+2	6	peak	8
+3	9	NULL	NULL
+4	5	solo	6
+5	1	NULL	NULL
+6	3	NULL	NULL
