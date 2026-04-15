@@ -340,6 +340,7 @@ impl PipelineExecutor {
             }
         }
 
+        self.thread.flush_profiler();
         Ok(PipelineExecuteResult::Finished)
     }
 
@@ -613,5 +614,167 @@ impl PipelineExecutor {
 impl Drop for PipelineExecutor {
     fn drop(&mut self) {
         self.thread.flush_profiler();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use paro_common::chunk::Chunk;
+    use paro_common::error::Result;
+    use paro_common::types::LogicalType;
+    use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+
+    use super::{PipelineExecuteResult, PipelineExecutor};
+    use crate::execution_context::ExecutionContext;
+    use crate::explain::profiler::ExplainProfiler;
+    use crate::operator::state::OperatorSourceInput;
+    use crate::operator::PhysicalOperator;
+    use crate::operator_type::PhysicalOperatorType;
+    use crate::pipeline::pipeline::Pipeline;
+    use crate::result_type::{SinkResultType, SourceResultType};
+
+    fn test_session() -> Arc<StatementContext> {
+        TestStatementContextBuilder::minimal().build()
+    }
+
+    #[derive(Debug)]
+    struct ProfilingSource {
+        emitted: AtomicBool,
+        profiler: Arc<ExplainProfiler>,
+        types: Vec<LogicalType>,
+    }
+
+    impl ProfilingSource {
+        fn new(profiler: Arc<ExplainProfiler>) -> Self {
+            Self {
+                emitted: AtomicBool::new(false),
+                profiler,
+                types: vec![LogicalType::Integer],
+            }
+        }
+    }
+
+    impl PhysicalOperator for ProfilingSource {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::RowsetScan
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn explain_node_id(&self) -> Option<u64> {
+            Some(1)
+        }
+
+        fn explain_profiler(&self) -> Option<Arc<ExplainProfiler>> {
+            Some(self.profiler.clone())
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            chunk: &mut Chunk,
+            _input: &mut OperatorSourceInput,
+        ) -> Result<SourceResultType> {
+            if self.emitted.swap(true, Ordering::SeqCst) {
+                chunk.set_cardinality(0);
+                return Ok(SourceResultType::Finished);
+            }
+
+            let output = chunk.column_mut(0).expect("profiling source output column");
+            output.set_i32(0, 42);
+            chunk.set_cardinality(1);
+            Ok(SourceResultType::HaveMoreOutput)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct PassthroughSink {
+        types: Vec<LogicalType>,
+    }
+
+    impl PassthroughSink {
+        fn new() -> Self {
+            Self { types: Vec::new() }
+        }
+    }
+
+    impl PhysicalOperator for PassthroughSink {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::ResultCollector
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            _chunk: &Chunk,
+            _input: &mut crate::operator::state::OperatorSinkInput,
+        ) -> Result<SinkResultType> {
+            Ok(SinkResultType::NeedMoreInput)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn flushes_explain_profiler_before_executor_returns_finished() {
+        let session = test_session();
+        let profiler = ExplainProfiler::new();
+        let source = Arc::new(ProfilingSource::new(profiler.clone())) as Arc<dyn PhysicalOperator>;
+        let sink = Arc::new(PassthroughSink::new()) as Arc<dyn PhysicalOperator>;
+        let pipeline = Arc::new(Pipeline::new());
+        pipeline.set_source(source);
+        pipeline.set_sink(sink);
+
+        let mut executor =
+            PipelineExecutor::new(session, 0, 1, pipeline).expect("create pipeline executor");
+
+        loop {
+            match executor.execute().expect("execute pipeline") {
+                PipelineExecuteResult::Finished => break,
+                PipelineExecuteResult::Blocked => panic!("test pipeline should not block"),
+                PipelineExecuteResult::Interrupted => {
+                    panic!("test pipeline should not be interrupted")
+                }
+                PipelineExecuteResult::NotFinished => {}
+            }
+        }
+
+        let stats = profiler
+            .node_stats(1)
+            .expect("profiler stats should be flushed before drop");
+        assert_eq!(stats.output_rows, 1);
+        assert_eq!(stats.loops, 2);
     }
 }
