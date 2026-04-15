@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binder-owned logical plan deep-copy and binding remap helpers.
 
 use std::collections::HashMap;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Global and per-producer task error collection for shared schedulers.
 
 use parking_lot::Mutex;

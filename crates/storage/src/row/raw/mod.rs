@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Internal raw row-format backend for execution-time row storage.
 //!
 //! `storage::row` wraps these lower-level building blocks with the sealed

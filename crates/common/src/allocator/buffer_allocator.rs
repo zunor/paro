@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! BufferAllocator - Allocator that integrates with BufferManager.
 //!
 //! This allocator wraps a `BufferManager` so callers can allocate tracked

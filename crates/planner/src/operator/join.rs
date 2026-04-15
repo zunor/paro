@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Inner/outer/cross/semi/anti joins and comparison or general join conditions.
 //! Mark/single/asof joins and dedup columns are modeled elsewhere or not yet.
 

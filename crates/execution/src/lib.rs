@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical operators and the pipeline-based query execution engine.
 //!
 //! Import types from their submodules; this crate does not expose crate-root re-exports.

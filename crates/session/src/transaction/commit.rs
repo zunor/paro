@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::ddl_changes::PreparedCatalogOp;
 use super::session_transaction::FrozenTransaction;
 use crate::session::Session;

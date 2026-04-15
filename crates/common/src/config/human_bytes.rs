@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Human-readable byte size serialization/deserialization.
 //!
 //! Supports formats like "2GB", "512MB", "64KB", or plain numbers.

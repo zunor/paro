@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- LATERAL coverage focused on explicit join syntax.
 -- The matrix is intentionally progressive:
 -- 1) CROSS JOIN LATERAL for the explicit equivalent of `FROM t, LATERAL (...)`

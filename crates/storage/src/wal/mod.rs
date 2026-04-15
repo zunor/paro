@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Write-ahead logging, replay state tracking, and crash recovery.
 //!
 //! The WAL layer owns record encoding, buffered I/O, checkpoint handoff, and

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Build/version metadata shared across crates.
 
 pub const PG_COMPAT_SERVER_VERSION_NUM: &str = "150000";

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph scan operator for vertex tables.
 //!
 //! Without a filter it streams all vertices from the `VertexIdMap`. With a

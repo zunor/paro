@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! SSE SIMD optimized implementations of vector distance functions.
 //!
 //! These implementations use SSE instructions available on x86/x86_64 processors.

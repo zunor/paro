@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - BaseStatistics is the core statistics class
 //! - Uses a union (StatsData enum in Rust) for type-specific stats

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wraps a [`Task`] and notifies the bound [`Event`] when the inner task finishes successfully.
 
 use crate::event::Event;

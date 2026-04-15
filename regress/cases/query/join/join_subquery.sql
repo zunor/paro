@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- Subquery/mark-join coverage in join matrix
 -- The matrix is intentionally progressive:
 -- 1) correlated EXISTS with joined RHS projected as boolean

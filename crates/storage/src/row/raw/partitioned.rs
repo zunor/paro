@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PartitionedRawRow - partitioned row spill substrate.
 //!
 //! This module provides the shared row-partition substrate used by external

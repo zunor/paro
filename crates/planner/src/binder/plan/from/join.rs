@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::binder::bind::from::join_utils::{
     collect_table_bindings, convert_join_type, create_join_operator, extract_join_condition,
     split_conjunction,

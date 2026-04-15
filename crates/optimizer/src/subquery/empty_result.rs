@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Empty-result pullup optimizer.
 //!
 //! Keep `EmptyResult` as a schema-preserving marker and bubble it upward

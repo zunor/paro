@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Vectorized Cast Framework
 //!
 //! This module implements the core infrastructure for vectorized type casting,

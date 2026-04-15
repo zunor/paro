@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph Start Selection Optimizer
 //!
 //! Selects the optimal starting vertex for graph pattern traversal using

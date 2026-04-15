@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Registration for built-in scalar, aggregate, table, and system functions.
 
 use crate::builtin::table_functions::BuiltinTableFunctions;

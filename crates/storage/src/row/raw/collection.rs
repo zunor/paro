@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Raw segmented storage backing execution-time row stores.
 
 use std::sync::Arc;

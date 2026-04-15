@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Push filter predicates as close to data sources as semantics allow.
 
 use std::collections::HashSet;

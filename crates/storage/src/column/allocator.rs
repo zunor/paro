@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ColumnDataAllocator - allocation/pinning helpers for column data storage.
 
 use std::collections::hash_map::Entry;

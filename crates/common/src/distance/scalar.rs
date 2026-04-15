@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scalar (non-SIMD) implementations of vector distance functions.
 //!
 //! These are the baseline implementations used when SIMD is not available

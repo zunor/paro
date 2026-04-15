@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Boolean Aggregate Functions (bool_and, bool_or)
 //!
 //!

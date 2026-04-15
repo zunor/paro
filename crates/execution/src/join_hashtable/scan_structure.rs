@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Iteration state for hash join probe results (pointer chains, outer/semi/mark paths).
 //!
 //! Tracks pointers into the hash table, collision chains, and match flags for outer joins.

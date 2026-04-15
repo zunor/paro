@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Instance-level runtime for shared resources and managed databases.
 
 use std::sync::Arc;

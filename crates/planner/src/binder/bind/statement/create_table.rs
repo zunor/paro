@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::binder::bind::type_name::bind_logical_type;
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;

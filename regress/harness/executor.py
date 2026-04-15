@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Execution engine for parsed SQL test blocks."""
 
 from __future__ import annotations

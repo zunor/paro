@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! State objects used by the raw row append/scan substrate.
 
 use crate::buffer::{BlockId, BufferHandle};

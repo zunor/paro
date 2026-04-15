@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared graph cardinality estimation helpers for EXPLAIN and planning diagnostics.
 
 use paro_catalog::entry::VertexTableInfo;

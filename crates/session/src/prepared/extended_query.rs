@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Session-owned extended query protocol handling shared by SQL prepared state and pgwire.
 
 use async_trait::async_trait;

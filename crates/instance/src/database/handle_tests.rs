@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::database::catalog_checkpoint::{
     CatalogCheckpoint, CATALOG_CHECKPOINT_ID_KEY, CATALOG_CHECKPOINT_KEY,

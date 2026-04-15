@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Task scheduling, worker pool, events, and coordinator helpers for parallel execution.
 
 pub mod coordinator;

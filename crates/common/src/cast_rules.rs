@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Known Limitations
 //! - Only implements core numeric cast rules (20 rules for MVP)
 //! - No nested type casts (STRUCT, LIST, ARRAY)

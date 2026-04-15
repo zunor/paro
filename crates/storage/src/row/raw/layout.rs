@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Raw physical row layout used by the execution-time row substrate.
 
 use paro_common::types::LogicalType;

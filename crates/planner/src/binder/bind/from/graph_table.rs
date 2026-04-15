@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::binder::bind::expr::bind_expression;
 use crate::binder::bind::graph::{BoundPatternElement, GraphBindContext};
 use crate::binder::ir::{BoundFromGraphTable, BoundFromItem, BoundGraphColumn, BoundGraphPattern};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Move constants into a canonical position in expressions.
 //!
 //! Supported rewrites include:

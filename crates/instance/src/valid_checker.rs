@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tracks the validity state of a database instance.
 
 use parking_lot::Mutex;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Parallel decompression helpers for page bodies.
 //!
 //! This module provides a small utility to decompress multiple page bodies in

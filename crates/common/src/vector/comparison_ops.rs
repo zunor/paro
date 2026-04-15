@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Vector Comparison Operations
 //! ## Design Notes
 //! - Returns Boolean Vector with result of comparison

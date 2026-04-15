@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical Graph Expand Operator
 //!
 //! Expands from a set of source vertices along edges to their neighbors.

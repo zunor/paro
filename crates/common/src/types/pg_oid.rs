@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PostgreSQL OID (Object Identifier) mappings for LogicalType.
 //!
 //! This module provides mappings from Paro's LogicalType to PostgreSQL's

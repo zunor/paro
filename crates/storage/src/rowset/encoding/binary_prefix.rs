@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Binary Prefix Page Encoding
 //!
 //! Prefix compression for sorted strings. Stores shared prefix length

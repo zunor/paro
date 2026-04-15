@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # IndexSet - Table Index Collection
 //!
 //! Manages a collection of indexes attached to a table.

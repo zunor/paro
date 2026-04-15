@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cleanup helpers for committed undo-buffer entries.
 
 use crate::transaction::commit_state::{IndexDataRemover, IndexRemovalType};

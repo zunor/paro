@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical Aggregate Operator
 //!
 //! Represents a GROUP BY and aggregation in the query plan.

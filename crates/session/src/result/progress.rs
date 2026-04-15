@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Progress tracking and optional terminal rendering for long-running queries.
 
 use std::io::{self, Write};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Immutable graph runtime generations and read snapshots.
 
 use std::collections::HashMap;

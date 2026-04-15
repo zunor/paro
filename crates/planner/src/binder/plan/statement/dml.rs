@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plans `INSERT`, `DELETE`, `UPDATE`. No `RETURNING`, no `DELETE … USING`, no `UPDATE … FROM`, no bound constraints yet.
 
 use crate::binder::ir::statement::{BoundDeleteInfo, BoundInsertInfo, BoundUpdateInfo};

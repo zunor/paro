@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ArenaAllocator - batch allocation with single deallocation.
 //!
 //! This allocator is optimized for batch allocation patterns where individual

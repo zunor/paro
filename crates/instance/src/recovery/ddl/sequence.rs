@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::recovery::replay_handler::CatalogReplayHandler;
 use paro_catalog::collection::InstallMode;
 use paro_catalog::entry::CatalogObjectId;

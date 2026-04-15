@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Statement-time context model shared by planning, optimization, and execution.
 
 mod attached_databases;

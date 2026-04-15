@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Catalog Entry Base Types
 //!
 //! This module defines the core catalog entry traits and shared metadata types.

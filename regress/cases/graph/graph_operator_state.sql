@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- T5.4.0 Operator State Redesign Regression Tests
 -- Verifies that GraphScan and GraphExpand operators work correctly
 -- after state redesign (cached index handles, new state structs).

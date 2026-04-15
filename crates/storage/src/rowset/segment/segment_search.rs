@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::segment::Segment;
 use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::text_index::GlobalFullTextStats;

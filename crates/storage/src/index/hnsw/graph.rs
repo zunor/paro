@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # HNSW Graph Layers
 //!
 //! Read-only HNSW graph structure for efficient searching. Supporting both

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PersistentIndex - on-disk primary index with current-format WAL + immutable L1/L2 files.
 
 use crate::metrics::storage_metrics;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! read_ndjson Table Function
 //!
 //! Provides NDJSON reader for COPY FROM... WITH (FORMAT ndjson/json).

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 #[path = "common/exec_ok.rs"]
 mod exec_ok;
 #[path = "common/graph.rs"]

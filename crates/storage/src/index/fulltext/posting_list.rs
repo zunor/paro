@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Full-Text Posting List
 //!
 //! Stores per-term postings with document IDs, term frequencies, and positions.

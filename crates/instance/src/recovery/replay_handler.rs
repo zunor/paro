@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bridges storage-level WAL replay with catalog and runtime recovery.
 
 use super::consistency_report::{

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! NEON SIMD optimized implementations of vector distance functions.
 //!
 //! These implementations use NEON instructions available on ARM64 (aarch64) processors.

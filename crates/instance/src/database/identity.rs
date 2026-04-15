@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::database::handle::{AttachVisibility, RecoveryMode};
 pub use paro_common::identity::DatabaseType;
 use std::collections::HashMap;

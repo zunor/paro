@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binds `WITH` (CTE) definitions. Recursive CTEs need a top-level `UNION`/`UNION ALL`. `MATERIALIZED` is parsed only.
 
 use std::sync::Arc;

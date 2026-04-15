@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 DROP TABLE IF EXISTS agg_phasee_spill;
 
 CREATE TABLE agg_phasee_spill(k1 INT, k2 INT, v INT);

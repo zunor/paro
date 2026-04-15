@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pipeline construction, scheduling, and execution primitives.
 //!
 //! The high-level query coordinator lives in `crate::query_executor`.

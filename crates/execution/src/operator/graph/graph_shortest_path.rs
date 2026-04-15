@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical Graph Shortest Path Operator
 //!
 //! BFS-based shortest path operator for SQL/PGQ `ANY SHORTEST` and

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Implementation Notes
 //! - 16-byte string type with inline optimization
 //! - Strings ≤12 bytes are stored inline (no heap allocation)

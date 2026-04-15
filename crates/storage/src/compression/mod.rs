@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Compression Module
 //!
 //! Provides block compression algorithms for columnar storage.

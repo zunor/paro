@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph projection index manager.
 //!
 //! Manages in-memory references to all loaded graph projection indexes.

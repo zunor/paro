@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- Graph workset spill regression tests (I2.7)
 -- Covers:
 -- 1. force_external correctness for multi-hop expand

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Class 42 - Syntax Error or Access Rule Violation (and related)
 use crate::error::SqlState;
 

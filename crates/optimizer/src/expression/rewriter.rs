@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Apply expression-level rewrite rules to a logical plan.
 
 use std::ops::ControlFlow;

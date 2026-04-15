@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- Semi/anti join coverage
 -- @setup
 DROP TABLE IF EXISTS join_semi_left;

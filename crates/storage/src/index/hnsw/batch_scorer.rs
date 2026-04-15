@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # HNSW Batch Scorer
 //!
 //! Chunked multi-query scorer used by the plain/full-scan path.

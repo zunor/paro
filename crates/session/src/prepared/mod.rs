@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 pub mod binary_codec;
 pub mod extended_query;
 pub(crate) mod materialization;

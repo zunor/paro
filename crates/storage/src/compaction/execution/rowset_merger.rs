@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::execution::primary_key_merger::PrimaryKeyMerger;
 use crate::compaction::execution::statistics_merge::merge_rowset_statistics;
 use crate::compaction::execution::workspace::{

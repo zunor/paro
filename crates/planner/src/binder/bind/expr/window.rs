@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binds window functions, partition/order, and frames. Named windows and `EXCLUDE` are not supported yet.
 
 use crate::binder::bind::expr;

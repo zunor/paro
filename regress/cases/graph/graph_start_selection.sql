@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 CREATE TABLE ssp_person (id BIGINT PRIMARY KEY, name VARCHAR);
 CREATE TABLE ssp_company (id BIGINT PRIMARY KEY, name VARCHAR);
 CREATE TABLE ssp_city (id BIGINT PRIMARY KEY, name VARCHAR);

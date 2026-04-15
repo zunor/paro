@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_planner::operator::{ExplainMode, ExplainSpec};
 use paro_planner::plan::CardinalityEstimate;
 use serde_json::{Map, Value as JsonValue};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Predefined logging targets for Paro.
 //!
 //! Use these targets to categorize and filter logs:

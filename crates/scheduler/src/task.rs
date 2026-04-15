@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! [`Task`] trait, producer tokens, and interrupt / blocking helpers.
 
 use parking_lot::{Condvar, Mutex as ParkingMutex};

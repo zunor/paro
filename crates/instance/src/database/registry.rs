@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime database registry for the current process.
 //!
 //! Durable database membership and lifecycle state live in the instance

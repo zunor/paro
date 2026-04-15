@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::cleanup::staging;
 use crate::compaction::plan::types::{CompactionJobId, CompactionPlan};
 use crate::rowset::{RowsetId, RowsetMeta, RowsetSharedPtr};

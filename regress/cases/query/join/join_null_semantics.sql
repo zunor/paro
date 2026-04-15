@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- Join/set operation NULL semantics coverage
 -- @setup
 DROP TABLE IF EXISTS join_null_left;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! File Opener
 //!
 //! Abstract interface for providing client-specific context to FileSystem.

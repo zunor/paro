@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Lower logical `Get` operators to physical rowset scans.
 
 use paro_common::error::{self as paro_error, Result};

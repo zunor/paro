@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::database::catalog_checkpoint::CatalogCheckpoint;
 use crate::database::compaction_driver::{CompactionDriver, CompactionSuspendGuard};
 use crate::database::storage::DEFAULT_CHECKPOINT_WAL_SIZE;

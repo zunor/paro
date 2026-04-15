@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # ART (Adaptive Radix Tree) runtime predicate index
 //!
 //! ART now serves as a segment-local, single-column scalar predicate index.

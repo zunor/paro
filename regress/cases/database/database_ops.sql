@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 DROP DATABASE IF EXISTS active_db;
 DROP DATABASE IF EXISTS dup_db;
 DROP DATABASE IF EXISTS test_db1;

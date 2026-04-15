@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binder Implementation
 //!
 //! The Binder converts semantic-less AST nodes into semantic-aware bound nodes.

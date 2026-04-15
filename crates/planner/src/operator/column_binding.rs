@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Column Binding
 //!
 //! Represents a binding to a specific column in a specific table.

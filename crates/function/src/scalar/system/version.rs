@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! version() Function
 //!
 //! PostgreSQL-compatible function that returns the database version string.

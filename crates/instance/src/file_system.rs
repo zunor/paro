@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! File system abstraction for database operations.
 //!
 //! Supports both local disk access and in-memory test doubles.

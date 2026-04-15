@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Random Engine
 //!
 //! Session-level random number generator for SQL `random()` and `setseed()` functions.

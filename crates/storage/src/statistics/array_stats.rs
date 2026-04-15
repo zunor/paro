@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - ArrayStats operates on BaseStatistics for fixed-size array types
 //! - Contains a single child_stats for the element type

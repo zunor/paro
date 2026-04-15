@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-task execution context passed to physical operators.
 
 use crate::pipeline::pipeline::Pipeline;

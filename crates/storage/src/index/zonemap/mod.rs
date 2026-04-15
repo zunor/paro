@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # ZoneMap Index Module
 //!
 //! ZoneMap index stores min/max/has_null statistics per page for predicate pushdown.

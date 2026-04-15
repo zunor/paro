@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Task wrapper for [`Pipeline`](super::pipeline::Pipeline) execution in the
 //! [`TaskScheduler`](paro_scheduler::scheduler::TaskScheduler).
 //!

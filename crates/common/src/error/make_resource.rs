@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Resource-related error constructors (Class 53).
 
 use crate::error::{codes, ErrorData, ParoError, Severity};

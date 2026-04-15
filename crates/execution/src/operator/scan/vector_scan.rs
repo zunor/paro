@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical vector scan operator.
 //!
 //! Performs Approximate Nearest Neighbor (ANN) search using HNSW index

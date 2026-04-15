@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! `DISTINCT` and `DISTINCT ON` (ordering picks the surviving row per group).
 
 use paro_common::types::LogicalType;

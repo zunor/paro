@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - StructStats is a static method struct that operates on BaseStatistics
 //! - Contains child_stats array for each struct field

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PartitionedColumnData - partitioned column spill substrate.
 //!
 //! This module provides a partitioned spill substrate for column data:

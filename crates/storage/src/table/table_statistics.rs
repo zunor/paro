@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::table_handle::{FullTextIndexCoverage, TableHandle};
 use crate::statistics::{
     BaseStatistics, ColumnStatistics, FullTextIndexStatistics, HnswIndexStatistics,

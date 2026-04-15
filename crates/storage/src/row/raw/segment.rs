@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Segment/chunk organization for the raw row backend.
 
 use std::sync::{Arc, Mutex};

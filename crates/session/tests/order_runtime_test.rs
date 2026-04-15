@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_common::runtime_value::Value;
 use paro_instance::{Instance, InstanceConfig};
 use paro_session::{CollectingSink, Session};

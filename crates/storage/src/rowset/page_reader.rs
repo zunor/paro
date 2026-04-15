@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PageReader - unified page read path with PageCache integration.
 //!
 //! PageReader replaces direct PageIO::read_and_decompress_page calls and

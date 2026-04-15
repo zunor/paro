@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use self::runtime_resources::RuntimeResources;
 use crate::database::default_recovery_hooks;
 use crate::file_system::DatabaseFileSystem;

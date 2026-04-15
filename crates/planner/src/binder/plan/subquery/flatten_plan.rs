@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Flatten dependent joins in a logical plan tree.
 
 use crate::binder::plan::subquery::flatten_dependent_join;

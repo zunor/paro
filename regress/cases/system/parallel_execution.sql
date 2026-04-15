@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- @setup
 DROP TABLE IF EXISTS parallel_execution_case;
 CREATE TABLE parallel_execution_case (id INT, bucket INT, value INT);

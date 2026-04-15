@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical `DROP` for tables, schemas, indexes, views, etc. Cascade/restrict behavior is incomplete in execution.
 
 use crate::binder::ir::statement::{BoundDropInfo, DropType};

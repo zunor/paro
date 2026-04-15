@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ParoError - the main error type for Paro operations.
 
 use super::{ErrorData, SqlState};

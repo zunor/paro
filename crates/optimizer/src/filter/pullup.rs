@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pull filter predicates upward so later passes can combine or reposition them.
 //!
 //! This is useful for:

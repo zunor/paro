@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! String heap - arena allocator for strings.
 //!
 //! Uses an arena allocator to provide stable backing storage for out-of-line

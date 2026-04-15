@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- @setup
 DROP TABLE IF EXISTS dml_delete_primary_key_case;
 

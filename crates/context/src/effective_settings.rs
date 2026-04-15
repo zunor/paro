@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_common::config::format_setting_value;
 use paro_common::runtime_value::Value;
 use std::collections::hash_map::DefaultHasher;

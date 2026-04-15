@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Instance-level startup recovery orchestration.
 //!
 //! This module decides which durable database records should be reconciled,

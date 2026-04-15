@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Full-Text Query Parser
 //!
 //! Supports legacy MATCH syntax (`AND`/`OR` + quoted phrase) and PostgreSQL-style

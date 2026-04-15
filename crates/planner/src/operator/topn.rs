@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! `ORDER BY` + `LIMIT` (+ optional `OFFSET`) fused for top-N evaluation without full sort.
 
 use crate::binder::ir::OrderByNode;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! current_database() Function
 //!
 //! PostgreSQL-compatible function that returns the current database name.

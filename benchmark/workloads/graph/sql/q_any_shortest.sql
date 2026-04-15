@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 SELECT count(*)
 FROM GRAPH_TABLE(bench_graph
     MATCH ANY SHORTEST (a:Person WHERE a.id = 1)-[e:Link]->{1,6}(b:Person)

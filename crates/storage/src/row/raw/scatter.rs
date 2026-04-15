@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scatter columnar chunks into the raw row backend.
 
 use paro_common::chunk::Chunk;

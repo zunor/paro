@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime context adapters for scalar function execution.
 
 use paro_common::config::format_setting_value;

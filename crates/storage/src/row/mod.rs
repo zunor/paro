@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Execution-time row storage.
 //!
 //! This module is the sealed row-buffer kernel used by operators while a query is

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Storage-level lightweight metrics (counters + gauges) for observability.
 //!
 //! Requirement: expose PrimaryIndex hit/conflict counters, L0→L1

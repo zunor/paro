@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Prefetcher - async/batched page prefetch into PageCache.
 //!
 //! Prefetch is a best-effort optimization. It uses TemporaryMemoryState

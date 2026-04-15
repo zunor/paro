@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - ColumnStatistics combines BaseStatistics with optional DistinctStatistics
 //! - DistinctStatistics is only created for supported types (not nested/boolean)

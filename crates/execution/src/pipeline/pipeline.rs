@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pipeline graph node: source, optional intermediate operators, and optional sink.
 
 use std::collections::BTreeSet;

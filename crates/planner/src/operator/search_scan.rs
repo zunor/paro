@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical operators for search-path rewrites.
 
 use paro_common::types::LogicalType;

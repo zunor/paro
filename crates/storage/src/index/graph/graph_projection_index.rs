@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph projection index combines vertex id maps and edge adjacency.
 
 use super::{AdjacencyCSR, GraphStatistics, VertexIdMap, VertexKey};

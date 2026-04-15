@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # HNSW Basic Types
 //!
 //! Core types for the HNSW (Hierarchical Navigable Small World) index.

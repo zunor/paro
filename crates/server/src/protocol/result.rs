@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Result sinks and shared row/error encoding helpers for PostgreSQL wire messages.
 
 use async_trait::async_trait;

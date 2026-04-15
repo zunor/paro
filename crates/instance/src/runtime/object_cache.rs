@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! A generic cache for storing objects by key.
 
 use parking_lot::Mutex;

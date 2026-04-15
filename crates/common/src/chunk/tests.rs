@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::runtime_value::Value;
 use crate::types::LogicalType;

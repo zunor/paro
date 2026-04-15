@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Instance bootstrap.
 //!
 //! This stage ensures the system database and durable instance catalog exist.

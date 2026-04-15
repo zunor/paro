@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::execution::job_orchestrator::run_job_with_lifecycle;
 use crate::compaction::plan::types::{CompactionJobId, CompactionLifecycleState, CompactionPlan};
 use crate::tablet::Tablet;

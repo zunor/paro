@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 EXPLAIN
 SELECT o.id
 FROM (VALUES (1, 10, 6), (2, 20, 5), (3, 30, 2)) AS o(id, grp, threshold)

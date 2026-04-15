@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{AllocationSet, VectorBuffer};
 use crate::allocator::{default_allocator, Allocator};
 use crate::vector::{SelectionVector, VECTOR_SIZE};

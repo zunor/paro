@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Remove columns that are not required by ancestor operators.
 
 use std::collections::HashMap;

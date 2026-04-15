@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::codec::{column_decoder::decode_varlen_cell, vector_decoder};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binds expressions in `CREATE INDEX`: column refs only; rejects aggregates, subqueries, and window functions.
 //! Expression indexes (e.g. on `lower(name)`) are not supported yet.
 

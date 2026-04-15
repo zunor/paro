@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 /// Maximum number of row blocks addressable inside one row region.
 pub const MAX_BLOCKS_PER_REGION: usize = 1 << 16;
 /// Maximum number of rows addressable inside one row region by dense ordinal metadata.

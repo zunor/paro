@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Traits and result types for expression rewrite rules.
 
 use paro_planner::expression::Expression;

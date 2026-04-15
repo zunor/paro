@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Sparse Vector Index Components
 //!
 //! Building blocks for sparse vector indexing (posting lists, inverted index, etc.).

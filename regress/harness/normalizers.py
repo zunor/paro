@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Text-level normalizers for non-deterministic output."""
 
 from __future__ import annotations

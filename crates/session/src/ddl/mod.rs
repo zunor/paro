@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_catalog::dependency::{DependencyDelta, DependencyGraph};
 use paro_catalog::entry::{
     AlterEntryAction, AlterEntryInfo, CatalogEntryEnum, CatalogObjectId, CatalogObjectRef,

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::execution::workspace::CompactionBuildOutput;
 use crate::compaction::plan::types::{CompactionJobId, CompactionPlanId, CumulativePointAction};
 use crate::primary_key::DeleteVector;

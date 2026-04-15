@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::prepared::store::PortalStoreMark;
 use paro_context::WriteClass;
 use paro_storage::transaction::txn::StorageSavepointMark;

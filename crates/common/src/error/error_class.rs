@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Error class enumeration for matching SQLSTATE categories.
 //!
 //! This provides a Rust-friendly way to match error categories using pattern matching,

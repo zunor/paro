@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 -- T5.4.2.3 GraphProject Bulk Rowid Regression Tests
 -- Verifies that PhysicalGraphProject::execute uses TabletReader::get_by_rowids
 -- for O(n log n) bulk rowid lookup instead of O(table_size) full-table scan.
