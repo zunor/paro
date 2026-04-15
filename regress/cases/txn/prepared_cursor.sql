@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 CREATE TABLE prepared_cursor_t (v INT);
 INSERT INTO prepared_cursor_t VALUES (1), (2), (3);

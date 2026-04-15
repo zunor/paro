@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- T5.4.2.1 / T5.4.2.2 Bulk Rowid Lookup Regression Tests
 -- Verifies that:

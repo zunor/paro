@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- T5.4.3.3 / T5.4.3.4 Multi-hop Vectorized Expansion Regression Tests
 -- Verifies that:

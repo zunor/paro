@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- ExpandInto and bound-target shortest-path regression tests (Phase 6.3)
 

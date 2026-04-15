@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 CREATE TABLE sk_person (id VARCHAR PRIMARY KEY, name VARCHAR);
 CREATE TABLE sk_knows (src_id VARCHAR, dst_id VARCHAR, since INT);

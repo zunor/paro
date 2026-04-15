@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- Correlated subquery coverage beyond the basic scalar/exists/any-all matrix
 -- The matrix is intentionally progressive:

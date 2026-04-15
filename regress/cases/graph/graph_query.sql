@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- Setup: create tables and insert data (same as Phase 1)
 CREATE TABLE person (id BIGINT PRIMARY KEY, name VARCHAR, age INT);

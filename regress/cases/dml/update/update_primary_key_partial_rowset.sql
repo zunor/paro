@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 DROP TABLE IF EXISTS dml_update_pk_partial_compact_case;
 DROP TABLE IF EXISTS dml_update_pk_partial_restart_case;

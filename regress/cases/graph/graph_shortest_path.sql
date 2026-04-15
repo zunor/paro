@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- PhysicalGraphShortestPath regression tests (Task 4.2)
 -- Tests: ANY SHORTEST and ALL SHORTEST path modes with BFS shortest path operator.

@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- DeltaAdjacency regression tests (Task 5.1)
 -- Tests: incremental graph index updates after INSERT/DELETE on edge tables.

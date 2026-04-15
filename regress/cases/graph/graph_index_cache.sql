@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- T5.4.0.3 / T5.4.0.4 Operator State & Index Cache Regression Tests
 -- Verifies that:

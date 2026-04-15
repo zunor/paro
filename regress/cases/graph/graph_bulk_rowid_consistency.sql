@@ -1,5 +1,5 @@
-# Copyright 2024-2026 Zunor
-# SPDX-License-Identifier: Apache-2.0
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
 
 -- T5.4.6.2 Bulk Rowid Consistency Regression Tests
 -- Verifies that Segment::read_by_rowids and TabletReader::get_by_rowids
