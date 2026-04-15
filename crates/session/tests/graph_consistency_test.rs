@@ -10,16 +10,19 @@ mod query_string_pairs;
 mod unique_test_dir;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use exec_ok::exec_ok;
 use graph::graph_runtime_key;
 use instance_persistent::create_persistent_instance;
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::runtime_value::Value;
+use paro_execution::operator::ddl::refresh_property_graph::mark_property_graph_stale;
 use paro_instance::DatabaseCloseAction;
 use paro_session::{CollectingSink, Session};
 use paro_storage::index::graph::VertexKey;
 use query_string_pairs::query_string_pairs;
+use tokio::time::sleep;
 use unique_test_dir::create_unique_test_dir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +134,52 @@ async fn restart_recovers_stale_graph_back_to_ready() {
             "INSERT INTO restart_person VALUES (7, 'Grace')",
         )
         .await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            exec_ok(
+                &mut session,
+                &mut sink,
+                "SELECT state, delta_size, vertex_count, edge_count \
+                 FROM paro_property_graphs() WHERE graph_name = 'restart_ready_graph'",
+            )
+            .await;
+            let graph_meta = query_graph_meta(&sink);
+            if graph_meta
+                == (GraphMetaRow {
+                    state: "READY".to_string(),
+                    delta_size: 0,
+                    vertex_count: 7,
+                    edge_count: 6,
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background rebuild did not finish in time before forcing stale: {:?}",
+                graph_meta
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let txn = CatalogSnapshot::default();
+        let graph_entry = session
+            .current_database
+            .catalog()
+            .scan_property_graphs(&txn)
+            .into_iter()
+            .find(|graph| graph.info.graph_name == graph_name)
+            .expect("graph catalog entry should exist before restart");
+        let graph_manager = instance.graph_manager();
+        mark_property_graph_stale(
+            session.current_database.catalog().as_ref(),
+            graph_manager.as_ref(),
+            graph_manager.as_ref(),
+            graph_entry.as_ref(),
+        )
+        .expect("forcing graph manifest to STALE should succeed");
+
         exec_ok(
             &mut session,
             &mut sink,
@@ -142,8 +191,8 @@ async fn restart_recovers_stale_graph_back_to_ready() {
             query_graph_meta(&sink),
             GraphMetaRow {
                 state: "STALE".to_string(),
-                delta_size: 1,
-                vertex_count: 6,
+                delta_size: 0,
+                vertex_count: 7,
                 edge_count: 6,
             }
         );
