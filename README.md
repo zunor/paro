@@ -102,8 +102,9 @@ Contributions are welcome. Please open an issue to discuss significant changes b
 
 Before submitting a pull request:
 
-1. Run the full regression suite — `make ci-local`
-2. Consider using an AI assistant to review your changes before submitting
+1. Run the static checks — `make static`
+2. Run the full local CI pipeline — `make ci-local`
+3. Consider using an AI assistant to review your changes before submitting
 
 ## License
 

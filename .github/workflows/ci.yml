@@ -25,6 +25,7 @@ jobs:
     name: detect changes
     runs-on: ubuntu-latest
     outputs:
+      header: ${{ steps.filter.outputs.header }}
       rust: ${{ steps.filter.outputs.rust }}
       regress: ${{ steps.filter.outputs.regress }}
       benchmark: ${{ steps.filter.outputs.benchmark }}
@@ -37,6 +38,13 @@ jobs:
         id: filter
         with:
           filters: |
+            header:
+              - 'crates/**'
+              - 'benchmark/**'
+              - 'regress/**'
+              - '.github/**'
+              - 'Makefile'
+              - 'tools/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
@@ -57,6 +65,37 @@ jobs:
               - 'clippy.toml'
               - '.clippy.toml'
               - '.cargo/**'
+
+  header:
+    name: header
+    needs: changes
+    if: needs.changes.outputs.header == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 tools/ci/check_headers.py
+
+  actionlint:
+    name: actionlint
+    needs: changes
+    if: needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ACTIONLINT_VERSION: 1.7.11
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install actionlint /usr/local/bin/actionlint
+      - run: actionlint
 
   fmt:
     name: rustfmt
@@ -246,7 +285,7 @@ jobs:
   ci_gate:
     name: ci-gate
     if: always()
-    needs: [changes, fmt, clippy, test, regress_unit, build, regress, benchmark]
+    needs: [changes, header, actionlint, fmt, clippy, test, regress_unit, build, regress, benchmark]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -264,6 +303,8 @@ jobs:
           }
 
           check changes "${{ needs.changes.result }}"
+          check header "${{ needs.header.result }}"
+          check actionlint "${{ needs.actionlint.result }}"
           check fmt "${{ needs.fmt.result }}"
           check clippy "${{ needs.clippy.result }}"
           check test "${{ needs.test.result }}"

@@ -1,7 +1,7 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build release run test check fmt clippy clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-setup bench-clean bench-ping
+.PHONY: build release run test check header fmt fmt-check clippy actionlint static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-setup bench-clean bench-ping
 
 # Build the project
 build:
@@ -23,20 +23,47 @@ test:
 check:
 	cargo check
 
+# Validate repository-wide license headers
+header:
+	python3 tools/ci/check_headers.py
+
 # Format code
 fmt:
 	cargo fmt --all
 
+# Check formatting without modifying files
+fmt-check:
+	cargo fmt --all --check
+
 # Run clippy linter
 clippy:
 	cargo clippy --workspace --all-targets --locked -- -D warnings
+
+# Lint GitHub Actions workflows when actionlint is installed locally
+actionlint:
+	@if command -v actionlint >/dev/null 2>&1; then \
+		actionlint; \
+	else \
+		echo "actionlint not found, skipping"; \
+	fi
+
+# Run the static checks used at the front of CI
+static:
+	@echo "══════ [1/4] header ══════"
+	$(MAKE) header
+	@echo "══════ [2/4] rustfmt ══════"
+	$(MAKE) fmt-check
+	@echo "══════ [3/4] clippy ══════"
+	$(MAKE) clippy
+	@echo "══════ [4/4] actionlint ══════"
+	$(MAKE) actionlint
 
 # Clean build artifacts
 clean:
 	cargo clean
 
 # Run all quality checks
-qa: fmt clippy test
+qa: static test
 
 # ── Local CI (mirrors GitHub Actions pipeline) ───────────────
 PARO_HOST   ?= 127.0.0.1
@@ -47,16 +74,13 @@ CI_DATA_DIR ?= .ci/parod-data
 CI_LOG      ?= .ci/parod.log
 CI_PID      ?= .ci/parod.pid
 
-ci-local: ## Run the full CI pipeline locally (fmt → clippy → build → test → regress unit → regress → benchmark)
-	@echo "══════ [1/7] rustfmt ══════"
-	cargo fmt --all --check
-	@echo "══════ [2/7] clippy ══════"
-	cargo clippy --workspace --all-targets --locked -- -D warnings
-	@echo "══════ [3/7] build (release) ══════"
+ci-local: ## Run the full CI pipeline locally (static → build → test → regress unit → regress → benchmark)
+	@$(MAKE) static
+	@echo "══════ [1/5] build (release) ══════"
 	cargo build --release -p paro-server --bin parod --locked
-	@echo "══════ [4/7] unit tests ══════"
+	@echo "══════ [2/5] unit tests ══════"
 	cargo test --workspace --locked
-	@echo "══════ [5/7] regress harness unit ══════"
+	@echo "══════ [3/5] regress harness unit ══════"
 	$(MAKE) -C regress unit
 	@echo "══════ starting parod for regress + benchmark ══════"
 	@set -e; \
@@ -84,9 +108,9 @@ ci-local: ## Run the full CI pipeline locally (fmt → clippy → build → test
 		fi; \
 		sleep 1; \
 	done; \
-	echo "══════ [6/7] regression ══════"; \
+	echo "══════ [4/5] regression ══════"; \
 	PARO_HOST=$(CI_HOST) PARO_PORT=$(CI_PORT) $(MAKE) -C regress ci; \
-	echo "══════ [7/7] benchmark ══════"; \
+	echo "══════ [5/5] benchmark ══════"; \
 	PARO_HOST=$(CI_HOST) PARO_PORT=$(CI_PORT) $(MAKE) -C benchmark ci; \
 	trap - EXIT INT TERM; \
 	cleanup; \
