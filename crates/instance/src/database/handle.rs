@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Represents a single database attached to the Paro instance.
 
 use crate::database::checkpointer::{CheckpointContext, Checkpointer};

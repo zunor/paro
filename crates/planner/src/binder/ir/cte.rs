@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binder-owned CTE IR and shared bind state.
 
 use std::sync::{Arc, Mutex, OnceLock};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Join filter pushdown optimizer.
 //!
 //! This pass derives conservative min/max filters from build-side table

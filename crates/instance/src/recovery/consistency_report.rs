@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;

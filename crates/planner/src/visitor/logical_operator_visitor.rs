@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Visitor trait over [`crate::operator::LogicalOperator`] and expressions.
 
 use std::ops::ControlFlow;

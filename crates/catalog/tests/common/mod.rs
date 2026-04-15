@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared helpers for `paro-catalog` integration tests.
 //!
 //! Each integration test binary is a separate crate; not every test uses every helper.

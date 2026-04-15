@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Chunk - a collection of vectors representing a batch of rows.
 //!
 //! Chunk is the unit of data processing in Paro's execution engine.

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Constraint violation error constructors.
 
 use crate::error::{codes, ErrorData, ParoError, Severity};

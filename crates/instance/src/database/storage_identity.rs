@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_storage::wal::wal_entry::{WalHeaderMetadata, WAL_DB_IDENTIFIER_LEN};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};

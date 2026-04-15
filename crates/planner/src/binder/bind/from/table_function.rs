@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binds table functions in `FROM` (`generate_series`, aliases, named args, `WITH ORDINALITY`, table in/out).
 //! Non-constant arguments still require constant folding before bind.
 

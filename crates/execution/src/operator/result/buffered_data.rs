@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded result buffering with backpressure for streaming execution.
 
 use std::collections::VecDeque;

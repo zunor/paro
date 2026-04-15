@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_catalog::search_path::CatalogSearchEntry;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

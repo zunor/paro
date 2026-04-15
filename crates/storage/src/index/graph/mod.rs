@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph index primitives for SQL/PGQ support.
 
 pub mod adjacency_csr;

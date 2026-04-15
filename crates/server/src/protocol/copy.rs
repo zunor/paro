@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PgWire COPY protocol adapters.
 //!
 //! This module keeps pgwire message choreography in the server crate while the

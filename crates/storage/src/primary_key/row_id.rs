@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unified 64-bit RowID for primary-key and row-id based paths.
 
 const RSSID_SHIFT: u64 = 32;

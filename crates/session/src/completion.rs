@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Statement completion metadata used by the session/front-end layer.
 
 use paro_parser::ast::DiscardTarget;

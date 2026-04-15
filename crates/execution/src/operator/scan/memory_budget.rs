@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scan-side memory budgeting and adaptive tuning.
 //!
 //! This module derives operator-level budgets from query-level limits (via TMM),

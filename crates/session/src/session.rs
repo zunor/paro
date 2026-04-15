@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Live session state, `StatementContext` integration, and front-end entry points.
 
 use crate::active_query::{ActiveQueryContext, QueryProgress};

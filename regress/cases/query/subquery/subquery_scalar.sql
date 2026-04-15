@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- Scalar subquery coverage
 -- The matrix is intentionally progressive:
 -- 1) uncorrelated single-row contract

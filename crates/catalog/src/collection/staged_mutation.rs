@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{with_ordered_collection_maps, CatalogCollection, CatalogEntryMap};
 use crate::entry::CatalogEntryEnum;
 use crate::mvcc::VersionedEntry;

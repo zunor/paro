@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::execution::workspace::{CompactionBuildOutput, StagedArtifact};
 use crate::compaction::plan::types::CompactionJobId;
 use crate::compaction::publish::pk_publish::apply_pk_publish;

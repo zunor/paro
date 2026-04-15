@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! TemporaryFileManager - Manages temporary files for spill-to-disk.
 //!
 //! - Manages temporary files for buffer spill-to-disk

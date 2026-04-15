@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - NumericValueUnion: Union type for storing min/max values of different numeric types
 //! - NumericStatsData: Contains has_min, has_max flags and min/max values

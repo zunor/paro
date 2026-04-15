@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Predicate Builder - Build PredicateTree from Expression
 //!
 //! Shared by plan_topn and plan_filter to push down predicates to RowsetScan.

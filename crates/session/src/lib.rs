@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PostgreSQL-style session/front-end routing, prepared state, and transaction-aware execution.
 
 mod active_query;

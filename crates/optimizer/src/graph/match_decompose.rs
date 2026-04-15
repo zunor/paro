@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph Match Decompose Optimizer
 //!
 //! Decomposes `GraphMatch` into a chain of `GraphScan` +

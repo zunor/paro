@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- @setup
 DROP TABLE IF EXISTS agg_m_fact;
 DROP TABLE IF EXISTS agg_m_dim;

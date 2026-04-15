@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Struct Cast Functions
 //!
 //! Implements Struct -> Struct casting by casting each field by position.

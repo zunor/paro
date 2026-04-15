@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! BlockHandle - manages a single block in memory.
 //!
 //! - Reference counting via pin_count

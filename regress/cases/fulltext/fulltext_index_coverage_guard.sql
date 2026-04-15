@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 CREATE TABLE ft_coverage_guard (id INT, content VARCHAR);
 
 CREATE INDEX idx_ft_coverage_guard ON ft_coverage_guard USING GIN (to_tsvector('simple', content));

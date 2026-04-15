@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::generator::PhysicalPlanGenerator;
 use crate::operator::ddl::create_sequence::CreateSequence;
 use crate::operator::PhysicalOperator;

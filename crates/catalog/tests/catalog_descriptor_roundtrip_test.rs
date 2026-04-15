@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 mod common;
 
 use common::{create_table, create_table_from_specs};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Join Filter Pushdown
 //!
 //! Filter pushdown for join operations. This allows pushing filters derived from the

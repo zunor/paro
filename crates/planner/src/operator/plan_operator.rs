@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical Operator
 //!
 //! The core enum representing nodes in the logical query plan.

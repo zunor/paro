@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # BM25 Scoring
 //!
 //! Implements BM25 scoring with configurable parameters.

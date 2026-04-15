@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ColumnDataConsumer - destructive scan helper for column data collections.
 
 use std::collections::HashSet;

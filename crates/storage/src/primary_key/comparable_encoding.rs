@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Comparable primary-key encoding utilities.
 //!
 //! The encoded byte representation preserves the logical sort order under

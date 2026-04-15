@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Configuration for an instance and its built-in registries.
 
 use crate::database::handle::AccessMode;

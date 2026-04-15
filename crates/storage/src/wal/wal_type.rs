@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # WAL Entry Types
 //!
 //! On-disk type bytes for the supported WAL protocol. Historical per-DDL catalog opcodes

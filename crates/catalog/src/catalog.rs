@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Abstract [`Catalog`] trait implemented by catalog backends (e.g. [`crate::database_catalog::ParoCatalog`]).
 
 use crate::dependency::DependencyGraph;

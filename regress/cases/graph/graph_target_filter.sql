@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- T5.4.1.2 / T5.4.1.3 Target Filter Pushdown & Edge Filter Deferred Regression Tests
 -- Verifies that:
 -- 1. Target vertex predicates are correctly evaluated via BitSet pre-filtering in GraphExpand

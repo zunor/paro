@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! TableStorageDescriptor - persistent storage handle for catalog entries.
 //!
 //! The descriptor intentionally stores only stable metadata required to

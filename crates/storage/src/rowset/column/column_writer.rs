@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Column Writer
 //!
 //! Writes column data with automatic encoding selection, page building, and index generation.

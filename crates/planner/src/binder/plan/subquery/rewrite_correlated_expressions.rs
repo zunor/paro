@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rewrites correlated column references to plain column refs against the duplicated outer scan.
 
 use std::collections::HashMap;

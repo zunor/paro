@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Short Key Index Implementation
 //!
 //! Short key index for fast row block location using binary search.

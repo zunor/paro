@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Flat linear-probing grouped aggregate hash table.
 
 use std::mem::size_of;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Buffered WAL reading with checksum verification and torn-write detection.
 
 use std::fs::File;

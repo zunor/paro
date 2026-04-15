@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Names for optimizer passes that can be toggled or reported.
 
 use std::fmt;

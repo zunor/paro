@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # ART Leaf Nodes - Leaf node types for storing row IDs
 //!
 //! ## Design

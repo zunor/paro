@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 CREATE TABLE ft_t022_english_docs (
     id INT,
     content VARCHAR

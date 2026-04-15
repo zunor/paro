@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plans subqueries: uncorrelated (cross product, aggregates, mark joins) and correlated (`DependentJoin` + decorrelation).
 
 use crate::binder::Binder;

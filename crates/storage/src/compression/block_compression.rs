@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Block Compression Codec
 //!
 //! Defines the `BlockCompressionCodec` trait for page-level compression.

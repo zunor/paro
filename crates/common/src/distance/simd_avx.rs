@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! AVX SIMD optimized implementations of vector distance functions.
 //!
 //! These implementations use AVX and FMA instructions available on x86_64 processors.

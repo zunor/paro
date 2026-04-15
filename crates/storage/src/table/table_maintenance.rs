@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::table_handle::TableHandle;
 use crate::compaction::compaction_manager::allocate_compaction_job_id;
 use crate::compaction::execution::job_orchestrator::run_job;

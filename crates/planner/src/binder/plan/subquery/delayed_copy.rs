@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::binder::context::BindSnapshot;
 use crate::binder::deep_copy::{
     deep_copy_operator_shallow_subqueries, deep_copy_plan_shallow_subqueries,

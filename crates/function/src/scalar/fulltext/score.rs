@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::scalar::ExpressionState;
 use crate::{ScalarFunction, ScalarFunctionSet};
 use paro_common::chunk::Chunk;

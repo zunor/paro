@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-memory log storage for SQL querying.
 //!
 //! Provides a ring buffer for storing log entries that can be queried

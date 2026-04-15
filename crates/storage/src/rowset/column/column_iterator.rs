@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Column Iterator
 //!
 //! Iterates over column values with support for seeking and batch reading.

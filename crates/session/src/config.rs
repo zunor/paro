@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Session-level configuration knobs used while planning and executing queries.
 
 use std::collections::HashMap;

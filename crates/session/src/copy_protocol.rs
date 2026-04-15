@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use async_trait::async_trait;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};

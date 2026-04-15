@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 DROP PROPERTY GRAPH IF EXISTS refresh_graph;
 DROP TABLE IF EXISTS refresh_knows;
 DROP TABLE IF EXISTS refresh_person;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! EvictionQueue - manages eviction of unpinned blocks with dead node purging.
 //!
 //! - Concurrent lock-free queue for eviction nodes

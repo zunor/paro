@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_catalog::catalog::Catalog;
 use paro_catalog::entry::{CatalogType, ColumnDefinition};
 use paro_catalog::mvcc::CatalogSnapshot;

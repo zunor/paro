@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Custom tracing layer for capturing logs to memory storage.
 
 use crate::config::LogLevel;

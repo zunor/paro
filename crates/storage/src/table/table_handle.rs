@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! TableHandle - adapter between Catalog and Tablet storage.
 //!
 //! Route table operations to Tablet/Rowset pipeline.

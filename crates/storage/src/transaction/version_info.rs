@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 // Version information for a row or group of rows.
 
 use std::sync::atomic::{AtomicU64, Ordering};

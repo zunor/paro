@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ColumnBatch → columnar storage encoding (compaction / merge path).
 
 use crate::rowset::column::ColumnBatch;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Ternary Executor
 //!
 //! Optimized vectorized execution for ternary operators (e.g., BETWEEN).

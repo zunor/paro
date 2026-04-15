@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Propagate column statistics through the logical plan.
 
 use crate::filter::propagate_result::FilterPropagateResult;

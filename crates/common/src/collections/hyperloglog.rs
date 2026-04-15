@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Implementation Notes
 //! - Algorithms from "New cardinality estimation algorithms for HyperLogLog sketches"
 //!   by Otmar Ertl, arXiv:1702.01284

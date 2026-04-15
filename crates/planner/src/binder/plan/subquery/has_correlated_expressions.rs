@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Detects correlated column references in expressions and operator trees at a given lateral depth.
 
 use crate::binder::CorrelatedColumnInfo;

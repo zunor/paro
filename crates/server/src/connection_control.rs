@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Server-owned connection control-plane state and limit tracking.
 
 use paro_instance::{ConnectionId, ManagedConnection};

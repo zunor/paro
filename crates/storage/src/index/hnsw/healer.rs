@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # HNSW Graph Healer
 //!
 //! Reuses links from an existing graph and repairs edges that point to deleted

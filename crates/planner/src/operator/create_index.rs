@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical operator for `CREATE INDEX`. Ser/de and `ALTER TABLE … ADD CONSTRAINT` integration are incomplete.
 
 use crate::binder::ir::statement::BoundCreateIndexInfo;

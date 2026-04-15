@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- GraphScan parallel source regression (T5.4.5.1)
 -- Ensures parallel scan partitions do not drop or duplicate vertices.
 

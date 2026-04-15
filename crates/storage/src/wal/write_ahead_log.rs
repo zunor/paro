@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Main WAL handle used by transactions and checkpoint coordination.
 
 use crate::wal::wal_entry::WalHeaderMetadata;

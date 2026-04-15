@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # HNSW Build Distance Cache
 //!
 //! A tiny direct-mapped cache used by heuristic link selection during graph build.

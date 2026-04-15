@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Build/probe-side optimizer.
 //!
 //! `build_probe_side_optimizer.cpp`. For Paro we only need enough cost

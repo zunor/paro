@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unified simple-query protocol sink with optional COPY adapters.
 
 use async_trait::async_trait;

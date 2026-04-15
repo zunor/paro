@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # HNSW Index
 //!
 //! Hierarchical Navigable Small World (HNSW) index for dense vector search.

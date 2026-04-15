@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Extended-query protocol responder implementations.
 
 use async_trait::async_trait;

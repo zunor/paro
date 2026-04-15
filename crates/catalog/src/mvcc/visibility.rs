@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use paro_storage::transaction::manager::TRANSACTION_ID_START;
 
 pub fn is_permanent(timestamp: u64) -> bool {

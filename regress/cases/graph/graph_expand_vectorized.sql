@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- T5.4.3.1 / T5.4.3.2 GraphExpand Vectorized Output Regression Tests
 -- Verifies that:
 -- 1. GraphExpand uses Chunk buffer instead of Vec<Vec<u64>>

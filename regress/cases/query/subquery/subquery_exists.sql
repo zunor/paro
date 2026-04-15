@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- EXISTS / NOT EXISTS coverage
 -- The matrix is intentionally progressive:
 -- 1) uncorrelated EXISTS / NOT EXISTS scalar booleans

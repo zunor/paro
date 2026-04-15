@@ -25,35 +25,23 @@ Paro is a multi-model analytical database written in Rust. It unifies relational
 
 ## Quick Start
 
-Clone the repository and enter the project directory, then start `parod` bound to localhost only:
+Clone the repository and enter the project directory, then:
 
 ```bash
-cargo run -p paro-server --bin parod -- --listen 127.0.0.1:6432
+make run
 ```
 
-Run the full example from another terminal:
-
-```bash
-psql -h 127.0.0.1 -p 6432 -d postgres -f regress/cases/example/quickstart.sql
-```
-
-This script creates the schema, loads sample data, builds indexes, runs the hybrid query shown below, and cleans up afterward.
-
-To explore interactively instead, connect with `psql`:
+From another terminal, connect with `psql`:
 
 ```bash
 psql -h 127.0.0.1 -p 6432 -d postgres
 ```
 
-Then run:
-
-```sql
-\i regress/cases/example/quickstart.sql
-```
+`make run` compiles and starts `parod` on `127.0.0.1:6432` by default.
 
 > Requires Rust ≥ 1.85. `psql` ≥ 14 is recommended; older versions may work but are not regularly tested.
 >
-> `make run` currently starts `parod` on `0.0.0.0:6432`. Authentication is not implemented yet, so do not expose Paro to untrusted networks.
+> Override the listen address with `PARO_HOST` / `PARO_PORT` if needed, for example `make run PARO_HOST=0.0.0.0`. Authentication is not implemented yet, so do not expose Paro to untrusted networks.
 
 ## Query Example
 
@@ -96,7 +84,11 @@ LIMIT 10;
 
 One engine, one query — three retrieval models working together.
 
-> Full runnable setup with schema and sample data: [`regress/cases/example/quickstart.sql`](regress/cases/example/quickstart.sql)
+To run the full example locally, load [`regress/cases/example/quickstart.sql`](regress/cases/example/quickstart.sql):
+
+```sql
+\i regress/cases/example/quickstart.sql
+```
 
 ## Roadmap
 

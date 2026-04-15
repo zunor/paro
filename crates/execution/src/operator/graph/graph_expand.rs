@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph expand operator built on CSR adjacency.
 //!
 //! The operator appends `[edge_rowid, dst_local_id, dst_rowid]` for each hop.

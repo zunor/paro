@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! WAL replay, torn-write repair, and checkpoint file recovery.
 
 use std::fs::{File, OpenOptions};

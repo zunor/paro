@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use self::instance_catalog_store::InstanceCatalogStore;
 use self::instance_layout::InstanceLayout;
 use self::instance_owner::InstanceOwnerGuard;

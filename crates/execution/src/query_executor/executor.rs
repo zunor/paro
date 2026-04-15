@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Query executor that builds, schedules, and coordinates pipelines.
 
 use std::collections::{HashMap, HashSet};

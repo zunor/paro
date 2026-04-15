@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Class 53 - Insufficient Resources
 use crate::error::SqlState;
 

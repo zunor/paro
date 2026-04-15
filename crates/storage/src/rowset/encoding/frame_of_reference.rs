@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Frame-of-Reference Page Encoding
 //!
 //! Delta encoding with min value reference for numeric types.

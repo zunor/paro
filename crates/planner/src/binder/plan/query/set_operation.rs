@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plans `UNION`/`INTERSECT`/`EXCEPT` (with `ALL` where applicable), inserting casts when column types differ.
 
 use crate::binder::ir::{BoundQuery, BoundSetOperation, SetOperationType};

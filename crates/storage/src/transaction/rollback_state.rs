@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rollback helpers for undo-buffer entries.
 
 use crate::transaction::txn::Transaction;

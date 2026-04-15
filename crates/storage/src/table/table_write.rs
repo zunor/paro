@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::table_handle::{InsertOnConflictAction, TableHandle};
 use crate::mutation;
 use crate::transaction::txn::Transaction;

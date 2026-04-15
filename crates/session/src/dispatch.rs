@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Classification of parsed statements into query, prepared, and utility routes.
 
 use paro_parser::ast::{

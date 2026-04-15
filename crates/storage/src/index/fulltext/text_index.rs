@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Full-Text Index
 //!
 //! Combines tokenizer and inverted index with basic configuration.

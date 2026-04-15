@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared encoding/decoding between logical chunks, column batches, and storage column data.
 
 pub(crate) mod batch_encoder;

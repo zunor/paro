@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bitwise Aggregate Functions (bit_and, bit_or, bit_xor)
 //!
 //!

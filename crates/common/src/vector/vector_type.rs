@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! VectorType enum - how data is physically stored.
 
 /// How the vector data is physically stored.

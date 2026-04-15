@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! WAL write session handle.
 //!
 //! Database catalog and mixed transactions commit through the unified `Txn*` journal on

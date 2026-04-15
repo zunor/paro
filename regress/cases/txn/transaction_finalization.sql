@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- ============================================================
 -- Transaction finalization regression
 -- Covers no-op COMMIT/ROLLBACK, explicit commit/rollback, and auto-commit.

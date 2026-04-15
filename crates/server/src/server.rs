@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Server - TCP accept loop.
 
 use paro_common::config::ParoConfig;

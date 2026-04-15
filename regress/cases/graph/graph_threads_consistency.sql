@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- Graph query single/multi-thread consistency (T5.4.5.1)
 -- Verifies GraphScan parallelization yields identical results under threads=1 vs threads=4.
 

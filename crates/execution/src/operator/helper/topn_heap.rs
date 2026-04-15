@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Heap implementation used by [`super::topn::TopN`].
 
 use std::cmp::Ordering;

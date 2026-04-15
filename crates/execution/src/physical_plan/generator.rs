@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical plan generation from logical operators.
 
 use crate::column_binding_resolver::ColumnBindingResolver;

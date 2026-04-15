@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- Nested outer-correlation regressions with real executable results.
 -- Focus:
 -- 1) current-layer EXISTS / DISTINCT / HAVING / JOIN ON black-box coverage

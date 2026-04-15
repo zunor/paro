@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};

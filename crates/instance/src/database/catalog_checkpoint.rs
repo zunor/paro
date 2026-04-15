@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::storage_manager::StorageManager;
 use crc32fast::hash as crc32;
 use paro_catalog::collection::InstallMode;

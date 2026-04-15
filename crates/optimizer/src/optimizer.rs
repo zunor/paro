@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unified pipeline runner for logical-plan rewrites.
 
 use std::collections::HashSet;

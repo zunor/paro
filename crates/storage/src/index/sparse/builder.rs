@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Sparse Index Builder
 //!
 //! Builds a sparse vector index from sparse vectors or column files.

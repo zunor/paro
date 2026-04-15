@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Prefix/Suffix Functions
 //!
 //! Prefix and suffix matching functions: `prefix`, `suffix`, `starts_with`, `ends_with`.

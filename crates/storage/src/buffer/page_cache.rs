@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PageCache - caching for storage pages with single-flight loading.
 //!
 //! This cache maps a PageKey (location + version isolation) to cached page

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - StringStatsData: Contains min/max (truncated to 8 bytes), unicode flag, max_string_length
 //! - Min/max are stored as fixed-size byte arrays for efficient comparison

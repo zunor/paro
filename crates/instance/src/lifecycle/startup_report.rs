@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{DatabaseRecordState, RecoveryHookIssueKind, RecoveryHookResult, RecoveryReport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

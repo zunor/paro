@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Binary Dictionary Page Encoding
 //!
 //! Dictionary encoding for string columns. Maps distinct values to integer codes.

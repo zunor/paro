@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Infer front-end completion semantics from AST + execution row counts.
 
 use crate::completion::{DiscardCommand, StatementCompletion};

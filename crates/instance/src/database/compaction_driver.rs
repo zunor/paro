@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::database::identity::DatabaseType;
 use parking_lot::RwLock;
 use paro_catalog::database_catalog::ParoCatalog;

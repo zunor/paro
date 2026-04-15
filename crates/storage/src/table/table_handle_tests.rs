@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::compaction::compaction_manager::CompactionManager;
 use crate::compaction::compaction_task::{CompactionTask, HorizontalCompactionTask};

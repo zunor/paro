@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 DROP PROPERTY GRAPH IF EXISTS hybrid_social_graph;
 DROP INDEX IF EXISTS idx_hybrid_docs_embedding;
 DROP INDEX IF EXISTS idx_hybrid_docs_fts;

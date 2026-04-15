@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Fold constant expressions at rewrite time.
 //!
 //! Examples: `2 + 3` → `5`, `1 = 1` → `true`, `'a' || 'b'` → `'ab'`.

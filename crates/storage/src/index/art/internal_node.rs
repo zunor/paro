@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # ART Internal Nodes - Node4, Node16, Node48, Node256
 //!
 //! ## Design

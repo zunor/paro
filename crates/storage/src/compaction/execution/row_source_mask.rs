@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! RowSourceMask tracks the source of each row during vertical compaction.
 
 use bytes::BufMut;

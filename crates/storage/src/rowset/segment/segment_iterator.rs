@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::segment::{Segment, SegmentOptions};
 use super::segment_predicate::PredicateEvaluator;
 use crate::buffer::{BufferPool, Prefetcher};

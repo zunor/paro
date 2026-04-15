@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{GlobalSchemaMap, MetadataOp, MetadataStore, StorageManifest};
 use crate::primary_key::DeleteVector;
 use crate::rowset::{RowsetId, RowsetMeta, RowsetState};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compressed sparse row adjacency index for graph traversal.
 
 use memmap2::Mmap;

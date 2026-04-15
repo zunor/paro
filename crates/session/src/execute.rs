@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! SQL execution entry points for simple-query front-end routing.
 
 use crate::completion::StatementCompletion;

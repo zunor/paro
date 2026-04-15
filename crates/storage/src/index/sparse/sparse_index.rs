@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Sparse Vector Index
 //!
 //! Integrates inverted index with dynamic dimension ID mapping.

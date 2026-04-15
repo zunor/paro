@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::buffer::BufferPool;
 use crate::compaction::compaction_executor::CompactionExecutor;
 use crate::compaction::compaction_task::{

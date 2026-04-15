@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Correlated subquery planning: build [`DependentJoin`] and related helpers.
 //!
 //! Decorrelation lives in [`crate::binder::plan::subquery::decorrelate`].

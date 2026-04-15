@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! MemTable - in-memory write buffer with PRIMARY_KEYS insert-time dedup.
 //!
 //! Minimal implementation:

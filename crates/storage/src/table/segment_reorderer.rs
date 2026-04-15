@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Segment Reorderer
 //!
 //! Optimization for ORDER BY and LIMIT by reordering segments based on statistics.

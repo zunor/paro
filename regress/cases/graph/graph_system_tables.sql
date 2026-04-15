@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- ============================================================
 -- Graph System Tables / Introspection Functions
 -- Task 5.3: paro_property_graphs() and paro_graph_statistics()

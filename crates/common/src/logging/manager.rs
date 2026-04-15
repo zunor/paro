@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Log manager for dynamic configuration at runtime.
 //!
 //! Provides the ability to modify logging configuration (level, filters)

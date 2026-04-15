@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Schedules pipeline execution through an event chain.
 //!
 //! Pipeline execution is coordinated through a chain of events:

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compaction framework (primary-key aware).
 //!
 //! Provides planning, execution, and conflict resolution for rowset compaction.

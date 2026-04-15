@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - StatisticsType determines which type-specific statistics to use
 //! - StatsInfo controls null/valid value flags

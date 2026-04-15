@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 WITH RECURSIVE cnt(x) AS (
     VALUES (1)
     UNION ALL

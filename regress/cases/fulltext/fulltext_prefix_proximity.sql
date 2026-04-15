@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 CREATE TABLE ft_t023_prefix_proximity (
     id INT,
     content VARCHAR

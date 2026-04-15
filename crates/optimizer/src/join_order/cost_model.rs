@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Join-order cost model based on cardinality estimates.
 
 use std::sync::Arc;

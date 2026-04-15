@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Output projection metadata for sorted key and payload columns.
 
 /// Mapping from key/payload layout columns to output columns.

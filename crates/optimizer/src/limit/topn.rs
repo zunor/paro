@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rewrite `ORDER BY ... LIMIT/OFFSET` into `TopN`.
 
 use paro_planner::expression::Expression;

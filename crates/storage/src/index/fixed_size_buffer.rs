@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Fixed Size Buffer
 //!
 //! A fixed-size buffer holds fixed-size segments of data for index nodes.

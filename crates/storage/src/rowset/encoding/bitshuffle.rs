@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # BitShuffle Page Encoding
 //!
 //! Bit-level shuffling combined with LZ4 compression for numeric types.

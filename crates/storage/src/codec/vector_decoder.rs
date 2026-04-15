@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::codec::{nested_payload_codec, physical_layout};
 use crate::rowset::column::{ColumnBatch, StorageDictionaryBatch};
 use crate::rowset::encoding::BinaryPlainPageDecoder;

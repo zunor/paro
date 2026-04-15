@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Buffer Pool Management
 //!
 //! This module provides buffer pool management for Paro's storage engine.

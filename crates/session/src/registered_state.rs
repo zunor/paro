@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Extensible session-local state shared across query and transaction lifecycles.
 
 use std::any::Any;

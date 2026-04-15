@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{DistanceMetric, HnswConfig, HnswIndex, VectorStorage};
 use paro_common::error::Result;
 use std::fmt;

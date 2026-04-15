@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 DROP PROPERTY GRAPH IF EXISTS bad_string_key;
 DROP PROPERTY GRAPH IF EXISTS bad_composite_key;
 DROP TABLE IF EXISTS knows_str;

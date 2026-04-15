@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 .PHONY: build release run test check fmt clippy clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-setup bench-clean bench-ping
 
 # Build the project
@@ -10,7 +13,7 @@ release:
 
 # Run the server
 run:
-	RUST_BACKTRACE=1 RUST_LOG=info cargo run -p paro-server --bin parod
+	RUST_BACKTRACE=1 RUST_LOG=info cargo run -p paro-server --bin parod -- --listen $(PARO_HOST):$(PARO_PORT)
 
 # Run all tests
 test:

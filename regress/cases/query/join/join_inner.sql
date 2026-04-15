@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- Single-key, unique-match inner join coverage
 -- @setup
 DROP TABLE IF EXISTS join_inner_basic_left;

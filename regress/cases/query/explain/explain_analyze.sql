@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- @normalize explain_operator_timing,explain_summary_timing
 EXPLAIN ANALYZE SELECT 1;
 

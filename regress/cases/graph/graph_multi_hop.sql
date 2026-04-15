@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- Multi-hop expand (BFS) regression tests
 -- Tests bounded path quantifier {min,max} with various scenarios
 

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical cross product (CROSS JOIN): Cartesian product of left and right inputs.
 //!
 //! The sink materializes the right (build) side; the operator streams the left and

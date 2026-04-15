@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Probe-side spill orchestration for external hash join.
 //!
 //! - thread-local append into partitioned row stores

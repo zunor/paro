@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::replay_handler::CatalogReplayHandler;
 use paro_catalog::entry::IndexType;
 use paro_common::effect::{

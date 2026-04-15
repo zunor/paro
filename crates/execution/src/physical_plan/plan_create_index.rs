@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical plan generation for `CREATE INDEX`.
 //!
 //! Current supported CREATE INDEX types are metadata-only, so the common shape

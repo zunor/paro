@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Vector module - columnar data storage.
 //!
 //! The vector layer provides the core columnar primitives used by execution:

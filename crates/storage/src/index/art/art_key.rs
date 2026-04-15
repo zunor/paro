@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # ARTKey - Radix-encoded keys for ART index
 //!
 //! ## Design

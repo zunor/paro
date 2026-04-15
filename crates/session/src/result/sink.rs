@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ResultSink Trait
 //!
 //! This module defines the `ResultSink` trait, which is the core abstraction for

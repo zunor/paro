@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::execution::rowset_merger::RowsetMerger;
 use crate::compaction::execution::workspace::{CompactionBuildOutput, CompactionWorkspace};
 use crate::compaction::plan::types::CompactionPlan;

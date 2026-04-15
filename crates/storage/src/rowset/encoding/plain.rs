@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Plain Page Encoding
 //!
 //! Simple encoding for fixed-width types. Values are stored contiguously

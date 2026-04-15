@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 DROP INDEX IF EXISTS idx_art_orders_customer_id;
 DROP TABLE IF EXISTS art_orders;
 

@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 SELECT
   CAST(true AS INTEGER) AS bool_to_int_true,
   CAST(false AS INTEGER) AS bool_to_int_false,

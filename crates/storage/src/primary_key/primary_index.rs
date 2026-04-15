@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! PrimaryIndex - in-memory L0 primary key map.
 //!
 //! Responsibilities:

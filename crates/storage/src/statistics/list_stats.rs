@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! ## Design
 //! - ListStats is a static method struct that operates on BaseStatistics
 //! - Contains a single child_stats for the element type

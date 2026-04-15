@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Graph statistics collected for property graph planning and introspection.
 
 use std::collections::HashMap;

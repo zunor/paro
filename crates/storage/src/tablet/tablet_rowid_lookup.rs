@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::tablet_reader::TabletReader;
 use crate::rowid_resolver;
 use crate::tablet::ColumnId;

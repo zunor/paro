@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::compaction::plan::types::{CompactionReason, CumulativePointAction, PolicyKind};
 use crate::rowset::RowsetSharedPtr;
 use crate::tablet::Tablet;

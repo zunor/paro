@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! SQLSTATE constants organized by error class.
 
 pub mod connection;

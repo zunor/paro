@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Visited Pool
 //!
 //! Thread-safe pool of visited-point trackers for HNSW search.

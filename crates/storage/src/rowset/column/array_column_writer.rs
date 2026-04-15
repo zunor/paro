@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Array Column Writer
 //!
 //! Writes array column data as three sub-columns: offsets, elements, and nulls.

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Column Module
 //!
 //! Column reader and writer for the Segment V2 format.

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Perfect-hash aggregate hash table with direct array indexing.
 
 use std::mem::size_of;

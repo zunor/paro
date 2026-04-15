@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! pg_get_userbyid Function
 //!
 //! PostgreSQL-compatible function that returns the username for a given OID.

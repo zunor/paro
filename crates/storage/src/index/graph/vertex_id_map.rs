@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Vertex key/local-id/rowid mapping for graph projection indexes.
 
 use paro_common::error as paro_error;

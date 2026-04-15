@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 CREATE TABLE ft_global_stats_docs (id INT, content VARCHAR);
 
 -- Segment A: a tiny segment with one matching row.

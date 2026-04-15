@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 DROP INDEX IF EXISTS idx_art_types_is_active;
 DROP INDEX IF EXISTS idx_art_types_code;
 DROP INDEX IF EXISTS idx_art_types_name;

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests for CREATE TABLE visibility and constraints.
 
 mod common;

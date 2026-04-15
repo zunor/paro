@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 SET temp_directory = '/tmp/paro_regress_recursive_cte_spill';
 SET memory_limit = '8MB';
 

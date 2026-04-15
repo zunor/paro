@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Dependent-join decorrelation: flattener dispatch and per-shape flattening.
 
 use crate::binder::bind::from::join_utils::{

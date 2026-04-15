@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! # FixedBitSet
 //!
 //! A simple fixed-size bitset backed by `Vec<u64>`, optimized for

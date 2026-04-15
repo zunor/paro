@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::binder::ir::BoundFromSubquery;
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};

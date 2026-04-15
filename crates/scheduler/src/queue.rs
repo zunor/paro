@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Priority-aware per-producer task queue with worker wakeups.
 
 use crate::task::Task;

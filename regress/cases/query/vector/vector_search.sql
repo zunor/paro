@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 -- Create table with vector column
 CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3));
 

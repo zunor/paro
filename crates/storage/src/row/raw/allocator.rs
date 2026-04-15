@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Raw block allocator backing execution-time row storage.
 
 use std::sync::{Arc, Mutex};

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Planner verification helpers.
 //!
 //! These checks enforce the contract between planner/subquery-flattening and

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical Drop Property Graph Operator
 //!
 //! Executes DROP PROPERTY GRAPH DDL by recording a typed drop op plus deferred

@@ -1,3 +1,6 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
 DROP TABLE IF EXISTS alter_regress_conflict_a_v2;
 DROP TABLE IF EXISTS alter_regress_conflict_b;
 DROP TABLE IF EXISTS alter_regress_conflict_a;
