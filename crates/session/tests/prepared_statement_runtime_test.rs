@@ -15,11 +15,51 @@ mod unique_test_dir;
 use exec_err::exec_err;
 use exec_ok::exec_ok;
 use instance_persistent::create_persistent_instance;
+use paro_context::{StatementCancelReason, StatementTimeoutDriver};
 use paro_instance::{DatabaseCloseAction, Instance};
-use paro_session::{CollectingSink, Session, StatementCompletion};
+use paro_session::{CollectingSink, Session, StatementCompletion, TestSessionBuilder};
 use query_i64_col::query_i64_col;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use unique_test_dir::create_unique_test_dir;
+
+#[derive(Default)]
+struct ToggleTimeoutDriver {
+    enabled: AtomicBool,
+}
+
+impl ToggleTimeoutDriver {
+    fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+}
+
+impl StatementTimeoutDriver for ToggleTimeoutDriver {
+    fn arm(
+        &self,
+        statement_token: &CancellationToken,
+        cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
+        _timeout_lifetime: &Arc<CancellationToken>,
+        _timeout: Duration,
+    ) {
+        if self.enabled.load(Ordering::SeqCst) {
+            let _ = cancel_reason.set(StatementCancelReason::StatementTimeout);
+            statement_token.cancel();
+        }
+    }
+}
+
+fn create_test_session_with_timeout_driver(driver: Arc<dyn StatementTimeoutDriver>) -> Session {
+    TestSessionBuilder::minimal()
+        .with_timeout_driver(driver)
+        .build()
+}
 
 #[tokio::test]
 async fn prepare_execute_deallocate_updates_metadata() {
@@ -219,38 +259,6 @@ async fn declare_cursor_requires_transaction_block_without_hold() {
 }
 
 #[tokio::test]
-async fn cursor_fetch_honors_portal_cancellation() {
-    let instance = Instance::new_in_memory();
-    let mut session = Session::new(1, instance);
-    let mut sink = CollectingSink::new();
-
-    exec_ok(
-        &mut session,
-        &mut sink,
-        "CREATE TABLE cursor_cancel_t (v INT)",
-    )
-    .await;
-    exec_ok(
-        &mut session,
-        &mut sink,
-        "INSERT INTO cursor_cancel_t VALUES (1), (2)",
-    )
-    .await;
-
-    exec_ok(&mut session, &mut sink, "BEGIN").await;
-    exec_ok(
-        &mut session,
-        &mut sink,
-        "DECLARE c_cancel CURSOR FOR SELECT v FROM cursor_cancel_t ORDER BY v",
-    )
-    .await;
-
-    session.interrupt();
-    let err = exec_err(&mut session, &mut sink, "FETCH 1 FROM c_cancel").await;
-    assert!(err.to_ascii_lowercase().contains("cancel"));
-}
-
-#[tokio::test]
 async fn declare_cursor_rejects_duplicate_name() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
@@ -308,6 +316,94 @@ async fn cursor_defaults_to_scroll_but_no_scroll_rejects_backward_fetch() {
     exec_ok(&mut session, &mut sink, "FETCH 2 FROM c_no_scroll").await;
     let err = exec_err(&mut session, &mut sink, "FETCH PRIOR FROM c_no_scroll").await;
     assert!(err.contains("cursor can only scan forward"));
+}
+
+#[tokio::test]
+async fn cancelled_declare_cursor_does_not_poison_future_cursor_scope() {
+    let driver = Arc::new(ToggleTimeoutDriver::default());
+    let mut session = create_test_session_with_timeout_driver(driver.clone());
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE cursor_cancel_t (v INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO cursor_cancel_t VALUES (1), (2), (3)",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "SET statement_timeout = 1").await;
+
+    driver.enable();
+    let err = exec_err(
+        &mut session,
+        &mut sink,
+        "DECLARE c_hold CURSOR WITH HOLD FOR SELECT v FROM cursor_cancel_t ORDER BY v",
+    )
+    .await;
+    driver.disable();
+    assert!(err.contains("canceling statement due to statement timeout"));
+
+    let err = exec_err(&mut session, &mut sink, "FETCH NEXT FROM c_hold").await;
+    assert!(err.contains("cursor \"c_hold\" does not exist"));
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "DECLARE c_hold CURSOR WITH HOLD FOR SELECT v FROM cursor_cancel_t ORDER BY v",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "FETCH NEXT FROM c_hold").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1]);
+}
+
+#[tokio::test]
+async fn cancelled_fetch_keeps_cursor_cleanup_paths_usable() {
+    let driver = Arc::new(ToggleTimeoutDriver::default());
+    let mut session = create_test_session_with_timeout_driver(driver.clone());
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE cursor_fetch_cancel_t (v INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO cursor_fetch_cancel_t VALUES (1), (2), (3)",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "SET statement_timeout = 1").await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "DECLARE c_hold CURSOR WITH HOLD FOR SELECT v FROM cursor_fetch_cancel_t ORDER BY v",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "PREPARE stmt_cleanup AS SELECT 1").await;
+
+    driver.enable();
+    let err = exec_err(&mut session, &mut sink, "FETCH NEXT FROM c_hold").await;
+    driver.disable();
+    assert!(err.contains("canceling statement due to statement timeout"));
+
+    exec_ok(&mut session, &mut sink, "CLOSE c_hold").await;
+    assert_eq!(
+        sink.assert_single_result().completion,
+        StatementCompletion::CloseCursor { all: false }
+    );
+
+    exec_ok(&mut session, &mut sink, "DEALLOCATE stmt_cleanup").await;
+    assert_eq!(
+        sink.assert_single_result().completion,
+        StatementCompletion::Deallocate { all: false }
+    );
 }
 
 #[tokio::test]

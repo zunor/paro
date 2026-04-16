@@ -3,7 +3,7 @@
 
 //! Server-owned connection control-plane state and limit tracking.
 
-use paro_instance::{ConnectionId, ManagedConnection};
+use paro_instance::{ConnectionHandle, ConnectionId};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -111,7 +111,7 @@ impl ServerConnectionControl {
     }
 }
 
-impl ManagedConnection for ServerConnectionControl {
+impl ConnectionHandle for ServerConnectionControl {
     fn connection_id(&self) -> ConnectionId {
         self.connection_id
     }
@@ -122,7 +122,7 @@ impl ManagedConnection for ServerConnectionControl {
 
     fn description(&self) -> String {
         format!(
-            "client_connection(id={}, peer_addr={}, handshake_complete={}, draining={}, force_close_requested={}, in_flight={})",
+            "connection(id={}, peer_addr={}, handshake_complete={}, draining={}, force_close_requested={}, in_flight={})",
             self.connection_id,
             self.peer_addr,
             self.handshake_complete.load(Ordering::Acquire),
@@ -180,7 +180,7 @@ mod tests {
         control.deactivate();
         assert!(
             !control.is_active(),
-            "deactivate should mark the control inactive for ConnectionManager cleanup"
+            "deactivate should mark the control inactive for ConnectionRegistry cleanup"
         );
     }
 

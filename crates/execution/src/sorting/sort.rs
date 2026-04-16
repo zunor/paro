@@ -215,6 +215,7 @@ impl Sort {
         global_state: &dyn GlobalSinkState,
         local_state: &mut dyn LocalSinkState,
     ) -> Result<SinkResultType> {
+        ctx.check_cancelled()?;
         let gstate = global_state
             .as_any()
             .downcast_ref::<SortGlobalSinkState>()
@@ -251,6 +252,7 @@ impl Sort {
         gstate: &SortGlobalSinkState,
         lstate: &mut SortLocalSinkState,
     ) -> Result<bool> {
+        ctx.check_cancelled()?;
         let Some(run_builder) = lstate.run_builder.as_ref() else {
             return Ok(false);
         };
@@ -402,11 +404,12 @@ impl Sort {
 
     pub fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         chunk: &mut Chunk,
         global_state: &dyn GlobalSourceState,
         local_state: &mut dyn LocalSourceState,
     ) -> Result<SourceResultType> {
+        ctx.check_cancelled()?;
         let gstate = global_state
             .as_any()
             .downcast_ref::<SortGlobalSourceState>()

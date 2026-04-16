@@ -11,13 +11,16 @@ use paro_storage::buffer::{
 };
 use std::sync::Arc;
 
-pub mod connection_manager;
+pub mod connection_registry;
 pub mod object_cache;
 pub mod runtime_tuning;
+pub mod session_registry;
+pub mod shutdown_reason;
 
-use self::connection_manager::ConnectionManager;
+use self::connection_registry::ConnectionRegistry;
 use self::object_cache::ObjectCache;
 use self::runtime_tuning::RuntimeTuning;
+use self::session_registry::SessionExecutionRegistry;
 
 /// Runtime-only instance resources shared across sessions and managed databases.
 #[derive(Debug)]
@@ -26,7 +29,8 @@ pub struct InstanceRuntime {
     buffer_manager: Arc<dyn BufferManager>,
     scheduler: Arc<TaskScheduler>,
     temporary_memory_manager: Arc<TemporaryMemoryManager>,
-    connection_manager: Arc<ConnectionManager>,
+    connection_registry: Arc<ConnectionRegistry>,
+    session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
     db_file_system: Arc<DatabaseFileSystem>,
     tuning: RuntimeTuning,
@@ -37,7 +41,8 @@ pub(crate) struct InstanceRuntimeResources {
     pub(crate) buffer_manager: Arc<dyn BufferManager>,
     pub(crate) scheduler: Arc<TaskScheduler>,
     pub(crate) temporary_memory_manager: Arc<TemporaryMemoryManager>,
-    pub(crate) connection_manager: Arc<ConnectionManager>,
+    pub(crate) connection_registry: Arc<ConnectionRegistry>,
+    pub(crate) session_registry: Arc<SessionExecutionRegistry>,
     pub(crate) object_cache: Arc<ObjectCache>,
     pub(crate) db_file_system: Arc<DatabaseFileSystem>,
 }
@@ -49,7 +54,8 @@ impl InstanceRuntime {
             buffer_manager,
             scheduler,
             temporary_memory_manager,
-            connection_manager,
+            connection_registry,
+            session_registry,
             object_cache,
             db_file_system,
         } = resources;
@@ -58,7 +64,8 @@ impl InstanceRuntime {
             buffer_manager,
             scheduler,
             temporary_memory_manager,
-            connection_manager,
+            connection_registry,
+            session_registry,
             object_cache,
             db_file_system,
             tuning,
@@ -81,8 +88,12 @@ impl InstanceRuntime {
         &self.temporary_memory_manager
     }
 
-    pub fn connection_manager(&self) -> &Arc<ConnectionManager> {
-        &self.connection_manager
+    pub fn connection_registry(&self) -> &Arc<ConnectionRegistry> {
+        &self.connection_registry
+    }
+
+    pub fn session_registry(&self) -> &Arc<SessionExecutionRegistry> {
+        &self.session_registry
     }
 
     pub fn object_cache(&self) -> &Arc<ObjectCache> {
@@ -114,7 +125,10 @@ impl InstanceRuntime {
         let options = self.tuning.snapshot();
         let memory_limit = self.buffer_manager.get_max_memory();
         let num_threads = session_threads.unwrap_or_else(|| options.effective_max_threads());
-        let num_connections = self.connection_manager.get_active_connection_count().max(1);
+        let num_connections = self
+            .connection_registry
+            .get_active_connection_count()
+            .max(1);
         let has_temp_dir =
             options.use_temporary_directory && self.buffer_pool.has_temporary_directory();
 
@@ -177,8 +191,12 @@ impl Instance {
         self.runtime.scheduler()
     }
 
-    pub fn get_connection_manager(&self) -> &Arc<ConnectionManager> {
-        self.runtime.connection_manager()
+    pub fn get_connection_registry(&self) -> &Arc<ConnectionRegistry> {
+        self.runtime.connection_registry()
+    }
+
+    pub fn get_session_registry(&self) -> &Arc<SessionExecutionRegistry> {
+        self.runtime.session_registry()
     }
 
     pub fn get_object_cache(&self) -> &Arc<ObjectCache> {

@@ -4,7 +4,8 @@
 use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
     QueryResources, RuntimeLimits, SessionMetadataProvider, StatementCancellation,
-    StatementEnvironment, StatementOptions, StatementView, TxnAdmissionState, WriteGuard,
+    StatementEnvironment, StatementExecutionTracker, StatementOptions, StatementView,
+    TxnAdmissionState, WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -34,6 +35,7 @@ pub struct StatementContext {
     pub databases: Arc<AttachedDatabaseDirectory>,
     pub limits: RuntimeLimits,
     pub cancellation: StatementCancellation,
+    pub execution_tracker: Option<Arc<dyn StatementExecutionTracker>>,
     pub services: Arc<QueryResources>,
     pub graph_registry: Arc<dyn crate::GraphRegistry>,
     pub session_metadata: Arc<dyn SessionMetadataProvider>,
@@ -69,6 +71,15 @@ impl StatementContext {
 
     pub fn is_interrupted(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    pub fn bind_execution_coordinator(
+        &self,
+        coordinator: Arc<paro_scheduler::coordinator::EventCoordinator>,
+    ) {
+        if let Some(tracker) = &self.execution_tracker {
+            tracker.bind_coordinator(coordinator);
+        }
     }
 
     pub fn catalog(&self) -> Arc<ParoCatalog> {

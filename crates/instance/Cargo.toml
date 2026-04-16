@@ -11,6 +11,7 @@ needless-borrows-for-generic-args = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-context = { workspace = true }
 paro-scheduler = { workspace = true }
 paro-catalog = { workspace = true }
 paro-storage = { workspace = true }

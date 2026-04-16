@@ -14,20 +14,30 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFormat, CopyOptions, ForceQuoteOption};
 use paro_session::{
-    CopyInSpec, CopyProtocolSink, CopyProtocolSource, ResultSink, StatementCompletion,
+    CopyInSpec, CopyProtocolSink, CopyProtocolSource, ResultSink, SessionExecutionControl,
+    StatementCompletion,
 };
 use pgwire::messages::copy::{CopyData, CopyDone, CopyInResponse, CopyOutResponse};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_util::bytes::Bytes;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
-use crate::client_connection::PgCodec;
+use crate::connection::PgCodec;
 use crate::protocol::result::{
     build_error_response, format_pg_array, value_to_pg_text, PgWireResultSink,
 };
 
 const COPY_TEXT_FORMAT_CODE: i8 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFrontendMode {
+    SimpleQuery,
+    ExtendedQuery,
+}
 
 pub struct PgWireCopyOutSink<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
@@ -337,12 +347,27 @@ impl<'a> ResultSink for PgWireCopyOutSink<'a> {
 
 pub struct PgWireCopyInSink<'a> {
     sink: PgWireResultSink<'a>,
+    receiver: CopyFrontendReceiver<'a>,
 }
 
 impl<'a> PgWireCopyInSink<'a> {
-    pub fn new(socket: &'a mut Framed<TcpStream, PgCodec>) -> Self {
+    pub fn new(
+        socket: &'a mut Framed<TcpStream, PgCodec>,
+        execution_control: Arc<SessionExecutionControl>,
+        drain_token: CancellationToken,
+        force_close_token: CancellationToken,
+        pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
+        mode: CopyFrontendMode,
+    ) -> Self {
         Self {
             sink: PgWireResultSink::new(socket),
+            receiver: CopyFrontendReceiver::new(
+                execution_control,
+                drain_token,
+                force_close_token,
+                pending_frontend_messages,
+                mode,
+            ),
         }
     }
 
@@ -359,6 +384,108 @@ impl<'a> PgWireCopyInSink<'a> {
     }
 }
 
+struct CopyFrontendReceiver<'a> {
+    execution_control: Arc<SessionExecutionControl>,
+    drain_token: CancellationToken,
+    force_close_token: CancellationToken,
+    pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
+    mode: CopyFrontendMode,
+    _marker: std::marker::PhantomData<&'a mut ()>,
+}
+
+impl<'a> CopyFrontendReceiver<'a> {
+    fn new(
+        execution_control: Arc<SessionExecutionControl>,
+        drain_token: CancellationToken,
+        force_close_token: CancellationToken,
+        pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
+        mode: CopyFrontendMode,
+    ) -> Self {
+        Self {
+            execution_control,
+            drain_token,
+            force_close_token,
+            pending_frontend_messages,
+            mode,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn active_statement(&self) -> Result<std::sync::Arc<paro_session::ActiveStatementControl>> {
+        self.execution_control.active_statement().ok_or_else(|| {
+            paro_error::internal("COPY FROM STDIN requires an active statement scope")
+        })
+    }
+
+    async fn next_message(
+        &self,
+        socket: &mut Framed<TcpStream, PgCodec>,
+    ) -> Result<PgWireFrontendMessage> {
+        let active_statement = self.active_statement()?;
+        let cancellation = active_statement.cancellation();
+        let statement_token = active_statement.statement_token();
+
+        tokio::select! {
+            biased;
+            _ = self.force_close_token.cancelled() => {
+                Err(paro_error::internal(
+                    "connection force-closed during COPY FROM STDIN".to_string(),
+                ))
+            }
+            _ = self.drain_token.cancelled() => {
+                Err(paro_error::internal(
+                    "connection drained during COPY FROM STDIN".to_string(),
+                ))
+            }
+            _ = statement_token.cancelled() => {
+                cancellation.check()?;
+                Err(paro_error::query_canceled())
+            }
+            message = socket.next() => {
+                match message {
+                    Some(Ok(message)) => Ok(message),
+                    Some(Err(error)) => Err(paro_error::internal(error.to_string())),
+                    None => Err(paro_error::internal(
+                        "connection closed during COPY FROM STDIN".to_string(),
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn drain_until_copy_terminator(&self, socket: &mut Framed<TcpStream, PgCodec>) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.force_close_token.cancelled() => break,
+                _ = self.drain_token.cancelled() => break,
+                message = socket.next() => {
+                    match message {
+                        Some(Ok(PgWireFrontendMessage::CopyData(_)))
+                        | Some(Ok(PgWireFrontendMessage::Flush(_)))
+                        => continue,
+                        Some(Ok(message @ PgWireFrontendMessage::Sync(_)))
+                        | Some(Ok(message @ PgWireFrontendMessage::Terminate(_))) => {
+                            if matches!(self.mode, CopyFrontendMode::ExtendedQuery) {
+                                self.pending_frontend_messages
+                                    .lock()
+                                    .expect("pending frontend queue")
+                                    .push_back(message);
+                            }
+                            break;
+                        }
+                        Some(Ok(PgWireFrontendMessage::CopyDone(_)))
+                        | Some(Ok(PgWireFrontendMessage::CopyFail(_)))
+                        | Some(Ok(_))
+                        | Some(Err(_))
+                        | None => break,
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
     async fn begin_copy_in(&mut self, spec: &CopyInSpec) -> Result<()> {
@@ -368,13 +495,13 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
 
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
         loop {
-            let msg = match self.sink.socket_mut().next().await {
-                Some(Ok(msg)) => msg,
-                Some(Err(e)) => return Err(paro_error::internal(e.to_string())),
-                None => {
-                    return Err(paro_error::internal(
-                        "connection closed during COPY FROM STDIN".to_string(),
-                    ))
+            let msg = match self.receiver.next_message(self.sink.socket_mut()).await {
+                Ok(msg) => msg,
+                Err(err) => {
+                    self.receiver
+                        .drain_until_copy_terminator(self.sink.socket_mut())
+                        .await;
+                    return Err(err);
                 }
             };
 
@@ -400,9 +527,13 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
                     ))
                 }
                 _ => {
-                    return Err(paro_error::protocol_violation(
+                    let err = paro_error::protocol_violation(
                         "unexpected frontend message during COPY FROM STDIN".to_string(),
-                    ))
+                    );
+                    self.receiver
+                        .drain_until_copy_terminator(self.sink.socket_mut())
+                        .await;
+                    return Err(err);
                 }
             }
         }
@@ -477,8 +608,20 @@ pub fn create_copy_out_sink<'a>(
 
 pub fn create_copy_in_source<'a>(
     socket: &'a mut Framed<TcpStream, PgCodec>,
+    execution_control: Arc<SessionExecutionControl>,
+    drain_token: CancellationToken,
+    force_close_token: CancellationToken,
+    pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
+    mode: CopyFrontendMode,
 ) -> Result<Box<dyn CopyProtocolSource + 'a>> {
-    Ok(Box::new(PgWireCopyInSink::new(socket)))
+    Ok(Box::new(PgWireCopyInSink::new(
+        socket,
+        execution_control,
+        drain_token,
+        force_close_token,
+        pending_frontend_messages,
+        mode,
+    )))
 }
 
 #[cfg(test)]

@@ -160,6 +160,7 @@ impl PhysicalOperator for PhysicalSparseVectorScan {
         ctx: &ExecutionContext,
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
+        ctx.check_cancelled()?;
         let mut state = SparseVectorScanGlobalState::new();
         let allocator = ctx.allocator(MemoryTag::VectorIndex);
         state.result_chunks = self
@@ -180,10 +181,11 @@ impl PhysicalOperator for PhysicalSparseVectorScan {
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
+        ctx.check_cancelled()?;
         let gstate = input
             .global_state
             .as_any()

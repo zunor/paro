@@ -28,6 +28,8 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = "1.7"
 
 [dev-dependencies]
 serde_json = { workspace = true }

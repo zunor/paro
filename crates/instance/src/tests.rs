@@ -4,9 +4,9 @@
 use crate::lifecycle::bootstrap::InstanceBootstrap;
 use crate::lifecycle::recovery::InstanceRecovery;
 use crate::{
-    ConnectionId, DatabaseStartupStatus, Instance, InstanceBuilder, InstanceConfig,
-    InstanceDdlOwner, InstanceLifecycleState, InstanceQuiesceProof, InstanceShutdownMode,
-    ManagedConnection,
+    ConnectionHandle, ConnectionId, DatabaseStartupStatus, Instance, InstanceBuilder,
+    InstanceConfig, InstanceDdlOwner, InstanceLifecycleState, InstanceQuiesceProof,
+    InstanceShutdownMode,
 };
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -225,12 +225,12 @@ fn test_persistent_instance_catalog_and_run_state_share_metadata_store() {
     );
 }
 
-struct TestManagedConnection {
+struct TestConnectionHandle {
     id: ConnectionId,
     active: std::sync::atomic::AtomicBool,
 }
 
-impl TestManagedConnection {
+impl TestConnectionHandle {
     fn new(id: ConnectionId) -> Self {
         Self {
             id,
@@ -239,7 +239,7 @@ impl TestManagedConnection {
     }
 }
 
-impl ManagedConnection for TestManagedConnection {
+impl ConnectionHandle for TestConnectionHandle {
     fn connection_id(&self) -> ConnectionId {
         self.id
     }
@@ -249,7 +249,7 @@ impl ManagedConnection for TestManagedConnection {
     }
 
     fn description(&self) -> String {
-        format!("TestManagedConnection({})", self.id)
+        format!("TestConnectionHandle({})", self.id)
     }
 }
 
@@ -274,11 +274,10 @@ fn test_verify_quiesced_for_clean_shutdown_sets_gate_and_blocks_new_work() {
 #[test]
 fn test_verify_quiesced_for_clean_shutdown_rejects_active_tracked_connections() {
     let instance = Instance::new_in_memory();
-    let connection_id = instance.get_connection_manager().assign_connection_id();
-    let connection: Arc<dyn ManagedConnection> =
-        Arc::new(TestManagedConnection::new(connection_id));
+    let connection_id = instance.get_connection_registry().assign_connection_id();
+    let connection: Arc<dyn ConnectionHandle> = Arc::new(TestConnectionHandle::new(connection_id));
     instance
-        .get_connection_manager()
+        .get_connection_registry()
         .add_connection(Arc::clone(&connection));
 
     let err = instance

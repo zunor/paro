@@ -410,6 +410,8 @@ impl PhysicalOperator for PhysicalRowsetScan {
             .ok_or_else(|| paro_error::internal("Invalid local source state".to_string()))?;
 
         loop {
+            ctx.check_cancelled()?;
+
             if lstate.reader.is_none() {
                 let segment_idx = gstate.next_segment.fetch_add(1, Ordering::SeqCst);
                 if segment_idx >= gstate.segments.len() {

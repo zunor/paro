@@ -255,10 +255,13 @@ async fn execute_bind<R: ExtendedQueryResponder>(
             parameter_env: parameter_env.clone(),
         },
         StatementClass::Query => {
-            let snapshot = session.freeze_statement_context(StatementOptions {
-                source: StatementSource::ExtendedQuery,
-                ..StatementOptions::default()
-            });
+            let snapshot = session.freeze_statement_context(
+                StatementOptions {
+                    source: StatementSource::ExtendedQuery,
+                    ..StatementOptions::default()
+                },
+                session.compile_scope_cancellation(),
+            );
             PortalKind::Compiled(Box::new(build_query_plan(
                 snapshot,
                 statement.raw_stmt.clone(),
@@ -360,7 +363,7 @@ async fn execute_portal<R: ExtendedQueryResponder>(
     }
 
     let query_str = portal.source_sql.clone();
-    session.begin_query_internal(&query_str);
+    session.begin_statement_scope(&query_str);
 
     let portal_kind = portal.kind.clone();
     if should_begin_implicit_transaction_for_portal(session, &portal_kind) {
@@ -384,7 +387,7 @@ async fn execute_portal<R: ExtendedQueryResponder>(
 
     match &result {
         Ok(PortalProgress::Complete(completion)) => {
-            session.end_query_internal(true);
+            session.finish_statement_scope(true);
             if !completion.is_transaction_control() {
                 session.command_counter_increment();
             }
@@ -392,11 +395,11 @@ async fn execute_portal<R: ExtendedQueryResponder>(
             session.refresh_session_metadata();
         }
         Ok(PortalProgress::Suspended) => {
-            session.end_query_internal(true);
+            session.finish_statement_scope(true);
             overwrite_portal_entry(session, message.name.as_deref(), portal);
             session.refresh_session_metadata();
         }
-        Err(error) => session.end_query_internal_with_error(error),
+        Err(error) => session.finish_statement_scope_with_error(error),
     }
 
     result.map(|_| ())
@@ -440,10 +443,13 @@ fn build_parse_artifacts(
     match route {
         FrontendRoute::Query(_) => {
             let parameter_types = resolve_parse_parameter_types(stmt, type_oids)?;
-            let snapshot = session.freeze_statement_context(StatementOptions {
-                source: StatementSource::ExtendedQuery,
-                ..StatementOptions::default()
-            });
+            let snapshot = session.freeze_statement_context(
+                StatementOptions {
+                    source: StatementSource::ExtendedQuery,
+                    ..StatementOptions::default()
+                },
+                session.compile_scope_cancellation(),
+            );
             if parameter_types.is_empty() {
                 let compiled = compile_statement(snapshot, stmt.clone())?;
                 Ok((compiled.result_schema.clone(), Some(compiled)))
@@ -578,21 +584,26 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
     }
 
     if matches!(portal.execution_state, PortalExecutionState::Ready) {
-        let snapshot = session.freeze_statement_context(StatementOptions {
-            source: StatementSource::ExtendedQuery,
-            ..StatementOptions::default()
-        });
+        let snapshot = session.freeze_statement_context(
+            StatementOptions {
+                source: StatementSource::ExtendedQuery,
+                ..StatementOptions::default()
+            },
+            session
+                .current_statement_cancellation()
+                .expect("portal execution requires an active statement scope"),
+        );
         let materialized =
             materialize_compiled_statement(session, snapshot.clone(), compiled).await?;
         portal.execution_state = PortalExecutionState::Active(PortalCursor {
             position: -1,
             execution: ExecutionCursorHandle::materialized(materialized),
-            cancellation: snapshot.cancellation.clone(),
         });
     }
 
     match &mut portal.execution_state {
         PortalExecutionState::Active(cursor) => {
+            session.check_active_statement_cancellation()?;
             let direction = if message.max_rows <= 0 {
                 paro_parser::ast::FetchDirection::ForwardAll
             } else {
@@ -682,10 +693,15 @@ fn run_non_row_compiled_statement(
     stmt: &Statement,
     compiled: CompiledStatement,
 ) -> Result<StatementCompletion> {
-    let snapshot = session.freeze_statement_context(StatementOptions {
-        source: StatementSource::ExtendedQuery,
-        ..StatementOptions::default()
-    });
+    let snapshot = session.freeze_statement_context(
+        StatementOptions {
+            source: StatementSource::ExtendedQuery,
+            ..StatementOptions::default()
+        },
+        session
+            .current_statement_cancellation()
+            .expect("portal execution requires an active statement scope"),
+    );
     let executor = Executor::new(snapshot);
     session.set_executor(executor);
 

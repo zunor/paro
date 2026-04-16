@@ -18,22 +18,41 @@ use pgwire::messages::extendedquery::{
     BindComplete, CloseComplete, ParseComplete, PortalSuspended,
 };
 use pgwire::messages::response::EmptyQueryResponse;
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
-use crate::client_connection::PgCodec;
+use crate::connection::PgCodec;
 
-use super::copy::{create_copy_in_source, create_copy_out_sink};
+use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
 use super::result::{build_error_response, field_description_with_format, send_chunk_rows};
 
 pub struct PgWireExtendedQueryResponder<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
+    execution_control: Arc<paro_session::SessionExecutionControl>,
+    drain_token: CancellationToken,
+    force_close_token: CancellationToken,
+    pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
 }
 
 impl<'a> PgWireExtendedQueryResponder<'a> {
-    pub fn new(socket: &'a mut Framed<TcpStream, PgCodec>) -> Self {
-        Self { socket }
+    pub fn new(
+        socket: &'a mut Framed<TcpStream, PgCodec>,
+        execution_control: Arc<paro_session::SessionExecutionControl>,
+        drain_token: CancellationToken,
+        force_close_token: CancellationToken,
+        pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
+    ) -> Self {
+        Self {
+            socket,
+            execution_control,
+            drain_token,
+            force_close_token,
+            pending_frontend_messages,
+        }
     }
 }
 
@@ -180,6 +199,13 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
     }
 
     fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
-        create_copy_in_source(self.socket)
+        create_copy_in_source(
+            self.socket,
+            Arc::clone(&self.execution_control),
+            self.drain_token.clone(),
+            self.force_close_token.clone(),
+            Arc::clone(&self.pending_frontend_messages),
+            CopyFrontendMode::ExtendedQuery,
+        )
     }
 }

@@ -417,6 +417,7 @@ pub(super) fn execute_external_probe(
     input: &Chunk,
     chunk: &mut Chunk,
 ) -> Result<OperatorResultType> {
+    ctx.check_cancelled()?;
     let ht = &gsink.hash_table;
     let hashes = compute_hashes_for_keys(&state.probe_keys, None, input.size());
     let (current_partitions, radix_bits) = {

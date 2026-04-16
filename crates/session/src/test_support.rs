@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Session;
+use paro_context::StatementTimeoutDriver;
 use paro_instance::Instance;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ pub struct TestSessionBuilder {
     session_id: u64,
     user_name: String,
     instance: Option<Arc<Instance>>,
+    statement_timeout_driver: Option<Arc<dyn StatementTimeoutDriver>>,
 }
 
 impl TestSessionBuilder {
@@ -19,6 +21,7 @@ impl TestSessionBuilder {
             session_id: 1,
             user_name: "paro".to_string(),
             instance: None,
+            statement_timeout_driver: None,
         }
     }
 
@@ -37,6 +40,14 @@ impl TestSessionBuilder {
         self
     }
 
+    pub fn with_timeout_driver(
+        mut self,
+        statement_timeout_driver: Arc<dyn StatementTimeoutDriver>,
+    ) -> Self {
+        self.statement_timeout_driver = Some(statement_timeout_driver);
+        self
+    }
+
     pub fn build_instance(&self) -> Arc<Instance> {
         self.instance
             .clone()
@@ -45,12 +56,32 @@ impl TestSessionBuilder {
 
     pub fn build(self) -> Session {
         let instance = self.instance.unwrap_or_else(Instance::new_in_memory);
-        Session::with_user(self.session_id, instance, self.user_name)
+        let execution_control = self
+            .statement_timeout_driver
+            .map(crate::SessionExecutionControl::with_timeout_driver)
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(crate::SessionExecutionControl::new()));
+        Session::with_user_and_execution_control(
+            self.session_id,
+            instance,
+            self.user_name,
+            execution_control,
+        )
     }
 
     pub fn build_with_instance(self) -> (Arc<Instance>, Session) {
         let instance = self.instance.unwrap_or_else(Instance::new_in_memory);
-        let session = Session::with_user(self.session_id, Arc::clone(&instance), self.user_name);
+        let execution_control = self
+            .statement_timeout_driver
+            .map(crate::SessionExecutionControl::with_timeout_driver)
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(crate::SessionExecutionControl::new()));
+        let session = Session::with_user_and_execution_control(
+            self.session_id,
+            Arc::clone(&instance),
+            self.user_name,
+            execution_control,
+        );
         (instance, session)
     }
 }

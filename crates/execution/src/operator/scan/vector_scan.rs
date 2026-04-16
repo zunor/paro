@@ -235,6 +235,7 @@ impl PhysicalOperator for PhysicalVectorScan {
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
+        ctx.check_cancelled()?;
         let gstate = input
             .global_state
             .as_any()
@@ -242,6 +243,7 @@ impl PhysicalOperator for PhysicalVectorScan {
             .unwrap();
 
         let search_result = gstate.search_result.get_or_init(|| {
+            ctx.check_cancelled().map_err(|err| err.to_string())?;
             let allocator = ctx.allocator(MemoryTag::VectorIndex);
             self.execute_search()
                 .map(|chunks| {

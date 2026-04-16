@@ -4,7 +4,6 @@
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_context::StatementCancellation;
 use paro_parser::ast::FetchDirection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +189,6 @@ impl ExecutionCursorHandle {
 pub struct PortalCursor {
     pub position: i64,
     pub execution: ExecutionCursorHandle,
-    pub cancellation: StatementCancellation,
 }
 
 #[derive(Debug, Clone)]

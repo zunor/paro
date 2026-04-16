@@ -3,6 +3,7 @@
 
 //! Instance-level runtime for shared resources and managed databases.
 
+pub use paro_context::StatementCancelReason;
 use std::sync::Arc;
 
 pub mod builder;
@@ -76,9 +77,13 @@ pub use recovery::consistency_report::{
 pub use recovery::replay_handler::{
     needs_recovery, recover_database, recover_database_with_checkpoint, CatalogReplayHandler,
 };
-pub use runtime::connection_manager::{ConnectionId, ConnectionManager, ManagedConnection};
+pub use runtime::connection_registry::{ConnectionHandle, ConnectionId, ConnectionRegistry};
 pub use runtime::object_cache::{ObjectCache, ObjectCacheEntry};
 pub use runtime::runtime_tuning::{RuntimeTuning, RuntimeTuningSnapshot};
+pub use runtime::session_registry::{
+    RegistryKey, SessionExecutionHandle, SessionExecutionRegistry,
+};
+pub use runtime::shutdown_reason::ConnectionShutdownReason;
 pub use runtime::InstanceRuntime;
 pub use storage_manager::{CheckpointOptions, DatabaseSize, MetadataBlockInfo, StorageManager};
 pub use valid_checker::ValidChecker;

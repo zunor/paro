@@ -12,6 +12,7 @@ mod copy_protocol;
 mod ddl;
 mod dispatch;
 mod execute;
+mod execution_control;
 mod prepared;
 mod registered_state;
 pub mod result;
@@ -33,6 +34,9 @@ pub use ddl::SessionDdlBridge;
 pub use dispatch::{
     classify_statement, dispatch_statement, utility_command_from_statement, FrontendRoute,
     PreparedCommand, StatementClass, UtilityCommand,
+};
+pub use execution_control::{
+    ActiveStatementControl, ConnectionShutdownReason, SessionExecutionControl,
 };
 pub use prepared::binary_codec::{
     decode_binary_param, encode_binary_value, is_binary_recv_supported, is_binary_send_supported,

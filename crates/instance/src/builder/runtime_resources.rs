@@ -1,9 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::runtime::connection_manager::ConnectionManager;
+use crate::runtime::connection_registry::ConnectionRegistry;
 use crate::runtime::object_cache::ObjectCache;
 use crate::runtime::runtime_tuning::RuntimeTuning;
+use crate::runtime::session_registry::SessionExecutionRegistry;
 use crate::runtime::{InstanceRuntime, InstanceRuntimeResources};
 use crate::{BootConfig, DatabaseFileSystem, InstanceConfig};
 use paro_function::register_system_buffer_manager;
@@ -15,7 +16,8 @@ pub(crate) struct RuntimeResources {
     buffer_manager: Arc<dyn BufferManager>,
     scheduler: Arc<TaskScheduler>,
     temporary_memory_manager: Arc<TemporaryMemoryManager>,
-    connection_manager: Arc<ConnectionManager>,
+    connection_registry: Arc<ConnectionRegistry>,
+    session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
     db_file_system: Arc<DatabaseFileSystem>,
 }
@@ -47,7 +49,8 @@ impl RuntimeResources {
             temporary_memory_manager: Arc::new(TemporaryMemoryManager::with_buffer_pool(
                 Arc::downgrade(&boot_config.buffer_pool),
             )),
-            connection_manager: Arc::new(ConnectionManager::new()),
+            connection_registry: Arc::new(ConnectionRegistry::new()),
+            session_registry: Arc::new(SessionExecutionRegistry::new()),
             object_cache: Arc::new(ObjectCache::new()),
             db_file_system,
         }
@@ -64,7 +67,8 @@ impl RuntimeResources {
                 buffer_manager: self.buffer_manager,
                 scheduler: self.scheduler,
                 temporary_memory_manager: self.temporary_memory_manager,
-                connection_manager: self.connection_manager,
+                connection_registry: self.connection_registry,
+                session_registry: self.session_registry,
                 object_cache: self.object_cache,
                 db_file_system: self.db_file_system,
             },
