@@ -5,6 +5,7 @@
 //!
 //! Cost estimators for vector and full-text search operations.
 
+use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
@@ -119,40 +120,51 @@ impl FullTextScanCostModel {
     /// Estimated cost for filter mode: O(sum posting_list_len(term_i)).
     pub fn estimate_filter_cost(
         stats: &FullTextIndexStatistics,
-        query_terms: usize,
+        query_stats: &FullTextQueryStats,
         filter_selectivity: f64,
     ) -> f64 {
-        let df_est = estimate_term_df(stats, query_terms);
-        let base = query_terms.max(1) as f64 * df_est;
+        let query_terms = weighted_query_terms(query_stats);
+        let df_est = estimate_term_df(stats, query_terms.ceil() as usize);
+        let branch_factor = query_stats.or_branch_count.max(1) as f64;
+        let base = query_terms.max(1.0) * df_est * branch_factor;
         base * clamp_selectivity(filter_selectivity).max(0.01)
     }
 
     /// Estimated cost for BM25 mode: O(match_count * query_terms).
     pub fn estimate_bm25_cost(
         stats: &FullTextIndexStatistics,
-        query_terms: usize,
+        query_stats: &FullTextQueryStats,
+        score_mode: FullTextScoreMode,
         filter_selectivity: f64,
     ) -> f64 {
+        let query_terms = weighted_query_terms(query_stats);
         let total_docs = stats.total_docs.max(1) as f64;
         let term_selectivity = if stats.total_docs == 0 {
             0.0
         } else {
-            (estimate_term_df(stats, query_terms) / total_docs).clamp(0.0, 1.0)
+            (estimate_term_df(stats, query_terms.ceil() as usize) / total_docs).clamp(0.0, 1.0)
         };
+        let branch_factor = query_stats.or_branch_count.max(1) as f64;
         let combined_selectivity = clamp_selectivity(filter_selectivity)
-            * term_selectivity.powi(query_terms.max(1) as i32);
-        let match_count = total_docs * combined_selectivity;
-        match_count * query_terms.max(1) as f64
+            * term_selectivity.powi(query_terms.max(1.0).ceil() as i32);
+        let match_count = total_docs * combined_selectivity * branch_factor;
+        let score_mode_factor = match score_mode {
+            FullTextScoreMode::Bm25 => 1.0,
+            FullTextScoreMode::CoverDensity => 1.25,
+        };
+        match_count * query_terms.max(1.0) * score_mode_factor
     }
 
     /// Choose the cheaper strategy between filter and BM25 modes.
     pub fn choose_strategy(
         stats: &FullTextIndexStatistics,
-        query_terms: usize,
+        query_stats: &FullTextQueryStats,
+        score_mode: FullTextScoreMode,
         filter_selectivity: f64,
     ) -> (SearchStrategy, f64) {
-        let filter_cost = Self::estimate_filter_cost(stats, query_terms, filter_selectivity);
-        let bm25_cost = Self::estimate_bm25_cost(stats, query_terms, filter_selectivity);
+        let filter_cost = Self::estimate_filter_cost(stats, query_stats, filter_selectivity);
+        let bm25_cost =
+            Self::estimate_bm25_cost(stats, query_stats, score_mode, filter_selectivity);
         if filter_cost <= bm25_cost {
             (SearchStrategy::FullTextFilter, filter_cost)
         } else {
@@ -173,4 +185,12 @@ fn estimate_term_df(stats: &FullTextIndexStatistics, query_terms: usize) -> f64 
     } else {
         avg_df.max(1.0)
     }
+}
+
+fn weighted_query_terms(query_stats: &FullTextQueryStats) -> f64 {
+    let base = query_stats.effective_query_terms() as f64;
+    let phrase_bonus = query_stats.phrase_count as f64 * 0.75;
+    let proximity_bonus = query_stats.proximity_count as f64 * 1.0;
+    let prefix_bonus = query_stats.prefix_count as f64 * 1.5;
+    base + phrase_bonus + proximity_bonus + prefix_bonus
 }

@@ -17,7 +17,7 @@ use crate::operator::state::{GlobalSourceState, LocalSourceState, OperatorSource
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
 use crate::result_type::SourceResultType;
-
+use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::fulltext::query_parser::{
     parse_phraseto_tsquery, parse_plainto_tsquery, parse_query, parse_to_tsquery,
     parse_websearch_to_tsquery, ParsedQuery,
@@ -58,6 +58,8 @@ pub struct FullTextScanBindData {
     pub query_kind: FullTextQueryKind,
     pub mode: FullTextExecMode,
     pub config: String,
+    pub score_mode: FullTextScoreMode,
+    pub query_stats: FullTextQueryStats,
     pub emit_score: bool,
 }
 
@@ -79,6 +81,8 @@ impl FullTextScanBindData {
             query_kind: FullTextQueryKind::Legacy,
             mode: FullTextExecMode::ScoreTopK,
             config: SIMPLE_CONFIG.to_string(),
+            score_mode: FullTextScoreMode::default(),
+            query_stats: FullTextQueryStats::new(1),
             emit_score: false,
         }
     }
@@ -91,6 +95,16 @@ impl FullTextScanBindData {
     pub fn with_query_options(mut self, query_kind: FullTextQueryKind, config: String) -> Self {
         self.query_kind = query_kind;
         self.config = config;
+        self
+    }
+
+    pub fn with_score_mode(mut self, score_mode: FullTextScoreMode) -> Self {
+        self.score_mode = score_mode;
+        self
+    }
+
+    pub fn with_query_stats(mut self, query_stats: FullTextQueryStats) -> Self {
+        self.query_stats = query_stats;
         self
     }
 
@@ -195,6 +209,7 @@ impl PhysicalFullTextScan {
                     predicate,
                     projected_columns,
                     global_stats.as_ref(),
+                    self.bind_data.score_mode,
                     emit_score,
                 )
             }
@@ -325,6 +340,7 @@ mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
+    use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
     use std::collections::BTreeSet;
@@ -428,5 +444,22 @@ mod tests {
         for pair in scores.windows(2) {
             assert!(pair[0] >= pair[1]);
         }
+    }
+
+    #[test]
+    fn bind_data_preserves_score_mode_and_query_stats() {
+        let table = setup_fulltext_table();
+        let scan = PhysicalFullTextScan::new(
+            FullTextScanBindData::new(table, "vector database".to_string(), 10, 1, vec![0])
+                .with_exec_mode(FullTextExecMode::ScoreTopK)
+                .with_score_mode(FullTextScoreMode::CoverDensity)
+                .with_query_stats(FullTextQueryStats::new(2)),
+        );
+
+        assert!(matches!(
+            scan.bind_data.score_mode,
+            FullTextScoreMode::CoverDensity
+        ));
+        assert_eq!(scan.bind_data.query_stats.effective_query_terms(), 2);
     }
 }

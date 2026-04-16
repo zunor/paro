@@ -480,11 +480,25 @@ impl PhysicalPlanGenerator {
         match search_type {
             SearchType::HnswVector { column_id } => format!("HNSW(column_id={column_id})"),
             SearchType::SparseVector { column_id } => format!("SPARSE(column_id={column_id})"),
-            SearchType::FullTextTopK { column_id } => {
-                format!("FULLTEXT_TOPK(column_id={column_id})")
+            SearchType::FullTextTopK {
+                column_id,
+                score_mode,
+                query_stats,
+            } => {
+                format!(
+                    "FULLTEXT_TOPK(column_id={column_id}, score_mode={}, query_terms={})",
+                    score_mode.as_str(),
+                    query_stats.effective_query_terms()
+                )
             }
-            SearchType::FullTextFilter { column_id } => {
-                format!("FULLTEXT_FILTER(column_id={column_id})")
+            SearchType::FullTextFilter {
+                column_id,
+                query_stats,
+            } => {
+                format!(
+                    "FULLTEXT_FILTER(column_id={column_id}, query_terms={})",
+                    query_stats.effective_query_terms()
+                )
             }
         }
     }

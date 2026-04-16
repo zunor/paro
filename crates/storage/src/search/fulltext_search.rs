@@ -4,6 +4,7 @@
 use std::collections::BinaryHeap;
 
 use crate::index::fulltext::query_parser::ParsedQuery;
+use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::GlobalFullTextStats;
 use crate::index::PredicateTree;
 use crate::search::row_projection::{materialize_results, snapshot_epoch, ScoredRowRef};
@@ -48,6 +49,7 @@ pub(crate) fn fulltext_search(
                 snapshot_epoch,
                 predicate,
                 global_stats,
+                FullTextScoreMode::Bm25,
             )?;
 
             for point in results {
@@ -124,6 +126,7 @@ pub(crate) fn fulltext_search_parsed(
     predicate: Option<&PredicateTree>,
     projected_columns: &[usize],
     global_stats: Option<&GlobalFullTextStats>,
+    score_mode: FullTextScoreMode,
     emit_score: bool,
 ) -> Result<Vec<Chunk>> {
     let version = tablet.max_version();
@@ -142,6 +145,7 @@ pub(crate) fn fulltext_search_parsed(
                 snapshot_epoch,
                 predicate,
                 global_stats,
+                score_mode,
             )?;
 
             for point in results {

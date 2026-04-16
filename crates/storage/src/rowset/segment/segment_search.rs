@@ -3,6 +3,7 @@
 
 use super::segment::Segment;
 use crate::index::fulltext::query_parser::ParsedQuery;
+use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::GlobalFullTextStats;
 use crate::index::hnsw::{PreparedQuery, ScoredPoint, SearchParams};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
@@ -175,6 +176,7 @@ impl Segment {
         top_k: usize,
         predicate_tree: Option<&PredicateTree>,
         global_stats: Option<&GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
     ) -> Result<Vec<ScoredPoint>> {
         self.fulltext_search_with_epoch(
             column_id,
@@ -183,6 +185,7 @@ impl Segment {
             self.rowset_gen,
             predicate_tree,
             global_stats,
+            score_mode,
         )
     }
 
@@ -195,6 +198,7 @@ impl Segment {
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
         global_stats: Option<&GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
             .fulltext_index(column_id)
@@ -205,7 +209,13 @@ impl Segment {
                 return Ok(Vec::new());
             }
         }
-        Ok(index.search(query, top_k, filter_bitmap.as_ref(), global_stats))
+        Ok(index.search(
+            query,
+            top_k,
+            filter_bitmap.as_ref(),
+            global_stats,
+            score_mode,
+        ))
     }
 
     /// Parse and perform a full-text search on this segment.
@@ -224,6 +234,7 @@ impl Segment {
             self.rowset_gen,
             predicate_tree,
             global_stats,
+            FullTextScoreMode::Bm25,
         )
     }
 
@@ -236,6 +247,7 @@ impl Segment {
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
         global_stats: Option<&GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
             .fulltext_index(column_id)
@@ -248,6 +260,7 @@ impl Segment {
             snapshot_epoch,
             predicate_tree,
             global_stats,
+            score_mode,
         )
     }
 

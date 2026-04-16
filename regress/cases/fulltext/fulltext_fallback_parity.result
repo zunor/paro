@@ -1,0 +1,192 @@
+CREATE TABLE ft_t025_simple (
+    id INT,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO ft_t025_simple VALUES
+    (1, 'vector database vector'),
+    (2, 'vector x database'),
+    (3, 'vectors everywhere'),
+    (4, 'graph');
+INSERT 0 4
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY id;
+id
+1
+2
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ to_tsquery('simple', 'vec:*')
+ORDER BY id;
+id
+1
+2
+3
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ phraseto_tsquery('simple', 'vector database')
+ORDER BY id;
+id
+1
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ to_tsquery('simple', 'vector <2> database')
+ORDER BY id;
+id
+2
+
+CREATE INDEX idx_ft_t025_simple_fts
+ON ft_t025_simple USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY id;
+id
+1
+2
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ to_tsquery('simple', 'vec:*')
+ORDER BY id;
+id
+1
+2
+3
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ phraseto_tsquery('simple', 'vector database')
+ORDER BY id;
+id
+1
+
+SELECT id
+FROM ft_t025_simple
+WHERE to_tsvector('simple', content) @@ to_tsquery('simple', 'vector <2> database')
+ORDER BY id;
+id
+2
+
+DROP INDEX IF EXISTS idx_ft_t025_simple_fts;
+DROP INDEX
+
+DROP TABLE ft_t025_simple;
+DROP TABLE
+
+CREATE TABLE ft_t025_english (
+    id INT,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO ft_t025_english VALUES
+    (1, 'The databases are running quickly'),
+    (2, 'database operations'),
+    (3, 'runs quickly');
+INSERT 0 3
+
+SELECT id
+FROM ft_t025_english
+WHERE to_tsvector('english', content) @@ plainto_tsquery('english', 'database run quick')
+ORDER BY id;
+id
+1
+
+CREATE INDEX idx_ft_t025_english_fts
+ON ft_t025_english USING GIN (to_tsvector('english', content));
+CREATE INDEX
+
+SELECT id
+FROM ft_t025_english
+WHERE to_tsvector('english', content) @@ plainto_tsquery('english', 'database run quick')
+ORDER BY id;
+id
+1
+
+DROP INDEX IF EXISTS idx_ft_t025_english_fts;
+DROP INDEX
+
+DROP TABLE ft_t025_english;
+DROP TABLE
+
+CREATE TABLE ft_t025_chinese (
+    id INT,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO ft_t025_chinese VALUES
+    (1, '向量'),
+    (2, '数据库');
+INSERT 0 2
+
+SELECT id
+FROM ft_t025_chinese
+WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '向')
+ORDER BY id;
+id
+1
+
+CREATE INDEX idx_ft_t025_chinese_fts
+ON ft_t025_chinese USING GIN (to_tsvector('chinese', content));
+CREATE INDEX
+
+SELECT id
+FROM ft_t025_chinese
+WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '向')
+ORDER BY id;
+id
+1
+
+DROP INDEX IF EXISTS idx_ft_t025_chinese_fts;
+DROP INDEX
+
+DROP TABLE ft_t025_chinese;
+DROP TABLE
+
+CREATE TABLE ft_t025_japanese (
+    id INT,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO ft_t025_japanese VALUES
+    (1, 'ベクトル'),
+    (2, 'データベース');
+INSERT 0 2
+
+SELECT id
+FROM ft_t025_japanese
+WHERE to_tsvector('japanese', content) @@ plainto_tsquery('japanese', 'ベ')
+ORDER BY id;
+id
+1
+2
+
+CREATE INDEX idx_ft_t025_japanese_fts
+ON ft_t025_japanese USING GIN (to_tsvector('japanese', content));
+CREATE INDEX
+
+SELECT id
+FROM ft_t025_japanese
+WHERE to_tsvector('japanese', content) @@ plainto_tsquery('japanese', 'ベ')
+ORDER BY id;
+id
+1
+2
+
+DROP INDEX IF EXISTS idx_ft_t025_japanese_fts;
+DROP INDEX
+
+DROP TABLE ft_t025_japanese;
+DROP TABLE

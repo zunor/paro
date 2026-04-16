@@ -1,0 +1,55 @@
+CREATE TABLE ft_t024_rank_cd (
+    id INT,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO ft_t024_rank_cd VALUES
+    (1, 'alpha beta'),
+    (2, 'alpha x beta'),
+    (3, 'beta alpha'),
+    (4, 'alpha beta beta'),
+    (5, 'gamma delta');
+INSERT 0 5
+
+CREATE INDEX idx_ft_t024_rank_cd_fts
+ON ft_t024_rank_cd USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+SELECT id,
+       ts_rank(to_tsvector('simple', content), plainto_tsquery('simple', 'alpha beta')) AS rank,
+       ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', 'alpha beta')) AS rank_cd
+FROM ft_t024_rank_cd
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'alpha beta')
+ORDER BY id;
+id	rank	rank_cd
+1	2.000000	2.000000
+2	2.000000	1.000000
+3	2.000000	2.000000
+4	2.375000	2.000000
+
+EXPLAIN
+SELECT id
+FROM ft_t024_rank_cd
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'alpha beta')
+ORDER BY ts_rank_cd(
+    to_tsvector('simple', content),
+    plainto_tsquery('simple', 'alpha beta')
+) DESC,
+id
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: id
+  ->  TOP_N  (rows=1)
+        Sort Key: TS_RANK_CD(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'alpha beta')) DESC NULLS FIRST, id ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=1)
+              Output: id, TS_RANK_CD(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'alpha beta')), id
+              ->  FULLTEXT_SCAN on public.ft_t024_rank_cd  (rows=5)
+
+DROP INDEX IF EXISTS idx_ft_t024_rank_cd_fts;
+DROP INDEX
+
+DROP TABLE ft_t024_rank_cd;
+DROP TABLE

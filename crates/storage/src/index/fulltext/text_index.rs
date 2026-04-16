@@ -5,7 +5,6 @@
 //!
 //! Combines tokenizer and inverted index with basic configuration.
 
-use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -15,7 +14,9 @@ use roaring::RoaringBitmap;
 use super::bm25::Bm25;
 use super::inverted_index::InvertedIndex;
 use super::posting_list::{DocId, PostingList};
+use super::query_eval::positions_following_by_distance;
 use super::query_parser::{parse_query, ParsedQuery};
+use super::scoring::{score_document_from_index, FullTextScoreMode};
 use super::tokenizer::{tokenizer_from_kind, Token, Tokenizer, TokenizerKind};
 use crate::index::hnsw::{FixedLengthPriorityQueue, PointOffset, ScoredPoint};
 use crate::statistics::FullTextSearchTelemetry;
@@ -168,13 +169,14 @@ impl FullTextIndex {
         match_bitmap
     }
 
-    /// Search mode: compute BM25 scores for matching documents.
+    /// Search mode: compute ranked scores for matching documents.
     pub fn search(
         &self,
         query: &ParsedQuery,
         top_k: usize,
         filter_bitmap: Option<&RoaringBitmap>,
         global_stats: Option<&GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
     ) -> Vec<ScoredPoint> {
         if top_k == 0 {
             return Vec::new();
@@ -199,7 +201,6 @@ impl FullTextIndex {
             return Vec::new();
         }
 
-        let terms = self.collect_unique_terms(query);
         let stats = global_stats.copied().unwrap_or_else(|| {
             GlobalFullTextStats::from_totals(
                 self.inverted_index.total_docs(),
@@ -234,11 +235,13 @@ impl FullTextIndex {
 
         let mut topk = FixedLengthPriorityQueue::new(effective_top_k);
         for doc_id in match_bitmap.iter() {
-            let score = self.bm25_score(
+            let score = score_document_from_index(
+                score_mode,
+                &self.inverted_index,
+                &self.bm25,
+                query,
                 doc_id as DocId,
-                &terms,
-                stats.total_docs,
-                stats.avg_doc_length,
+                stats,
             );
             if score >= 0.0 {
                 topk.push(ScoredPoint {
@@ -410,54 +413,6 @@ impl FullTextIndex {
         Some(candidates)
     }
 
-    fn collect_unique_terms(&self, query: &ParsedQuery) -> Vec<String> {
-        let mut terms = Vec::new();
-        collect_terms(query, &mut terms);
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for term in terms {
-            if seen.insert(term.clone()) {
-                out.push(term);
-            }
-        }
-        out
-    }
-
-    fn bm25_score(&self, doc_id: DocId, terms: &[String], total_docs: u32, avgdl: f32) -> f32 {
-        if total_docs == 0 || avgdl == 0.0 {
-            return 0.0;
-        }
-        let Some(doc_len) = self.inverted_index.doc_length(doc_id) else {
-            return 0.0;
-        };
-        if doc_len == 0 {
-            return 0.0;
-        }
-
-        let dl = doc_len as f32;
-        let total_docs_f = total_docs as f32;
-
-        let mut score = 0.0f32;
-        for term in terms {
-            let Some(list) = self.inverted_index.get_posting_list(term) else {
-                continue;
-            };
-            let df = list.len() as f32;
-            if df == 0.0 {
-                continue;
-            }
-            let tf = list
-                .get(doc_id)
-                .map(|elem| elem.term_frequency as f32)
-                .unwrap_or(0.0);
-            if tf == 0.0 {
-                continue;
-            }
-            score += self.bm25.score(tf, dl, avgdl, df, total_docs_f);
-        }
-        score
-    }
-
     fn is_token_len_valid(&self, term: &str) -> bool {
         let len = term.chars().count();
         if len < self.config.min_token_len {
@@ -490,52 +445,6 @@ fn extract_followed_by_terms(items: &[ParsedQuery], distance: u32) -> Option<Vec
         }
     }
     Some(out)
-}
-
-fn positions_following_by_distance(
-    left_positions: &[u32],
-    right_positions: &[u32],
-    distance: u32,
-) -> Vec<u32> {
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut out = Vec::new();
-
-    while i < left_positions.len() && j < right_positions.len() {
-        let Some(target) = left_positions[i].checked_add(distance) else {
-            break;
-        };
-        let right = right_positions[j];
-        if right < target {
-            j += 1;
-        } else if right > target {
-            i += 1;
-        } else {
-            out.push(right);
-            i += 1;
-            j += 1;
-        }
-    }
-    out
-}
-
-fn collect_terms(query: &ParsedQuery, out: &mut Vec<String>) {
-    match query {
-        ParsedQuery::Term(term) => out.push(term.clone()),
-        ParsedQuery::Phrase(terms) => out.extend(terms.iter().cloned()),
-        ParsedQuery::Not(item) => collect_terms(item, out),
-        ParsedQuery::FollowedBy(items, _) => {
-            for item in items {
-                collect_terms(item, out);
-            }
-        }
-        ParsedQuery::Prefix(prefix) => out.push(prefix.clone()),
-        ParsedQuery::And(items) | ParsedQuery::Or(items) => {
-            for item in items {
-                collect_terms(item, out);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -579,7 +488,7 @@ mod tests {
         index.add_document(2, "hello hello world").unwrap();
 
         let query = index.parse_query("hello").unwrap();
-        let results = index.search(&query, 2, None, None);
+        let results = index.search(&query, 2, None, None, FullTextScoreMode::Bm25);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].idx, 2);
     }
@@ -622,10 +531,27 @@ mod tests {
         index.add_document(2, "hello hello world").unwrap();
 
         let query = index.parse_query("hello").unwrap();
-        let results = index.search(&query, 2, None, None);
+        let results = index.search(&query, 2, None, None, FullTextScoreMode::Bm25);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].idx, 2);
         assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn test_cover_density_prefers_tighter_window() {
+        let mut index = FullTextIndex::new_default();
+        index.add_document(1, "alpha beta x x").unwrap();
+        index.add_document(2, "alpha x beta x").unwrap();
+
+        let query = index.parse_query("alpha beta").unwrap();
+        let results = index.search(&query, 2, None, None, FullTextScoreMode::CoverDensity);
+        assert_eq!(results.len(), 2);
+
+        let mut scores = std::collections::HashMap::new();
+        for point in results {
+            scores.insert(point.idx, point.score);
+        }
+        assert!(scores[&1] > scores[&2]);
     }
 
     #[test]
@@ -657,8 +583,8 @@ mod tests {
         let query_small = seg_small.parse_query("vector").unwrap();
         let query_large = seg_large.parse_query("vector").unwrap();
 
-        let local_small = seg_small.search(&query_small, 1, None, None);
-        let local_large = seg_large.search(&query_large, 1, None, None);
+        let local_small = seg_small.search(&query_small, 1, None, None, FullTextScoreMode::Bm25);
+        let local_large = seg_large.search(&query_large, 1, None, None, FullTextScoreMode::Bm25);
         assert_eq!(local_small.len(), 1);
         assert_eq!(local_large.len(), 1);
         assert_ne!(
@@ -667,8 +593,20 @@ mod tests {
         );
 
         let global = GlobalFullTextStats::from_totals(201, 201);
-        let global_small = seg_small.search(&query_small, 1, None, Some(&global));
-        let global_large = seg_large.search(&query_large, 1, None, Some(&global));
+        let global_small = seg_small.search(
+            &query_small,
+            1,
+            None,
+            Some(&global),
+            FullTextScoreMode::Bm25,
+        );
+        let global_large = seg_large.search(
+            &query_large,
+            1,
+            None,
+            Some(&global),
+            FullTextScoreMode::Bm25,
+        );
         assert_eq!(global_small.len(), 1);
         assert_eq!(global_large.len(), 1);
 

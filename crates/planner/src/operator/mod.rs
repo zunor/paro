@@ -83,7 +83,9 @@ pub use order::Order;
 pub use projection::Projection;
 pub use refresh_property_graph::RefreshPropertyGraph;
 pub use search_scan::{
-    Confidence, FullTextFilterScan, SearchCandidate, SearchDecision, SearchScan, SearchType,
+    analyze_fulltext_query_stats, build_fulltext_query_stats, Confidence, FullTextFilterScan,
+    FullTextQueryStats, FullTextQueryStatsKind, FullTextScoreMode, SearchCandidate, SearchDecision,
+    SearchScan, SearchType,
 };
 pub use set_operation::{SetOpType, SetOperation};
 pub use table_function::TableFunctionGet;

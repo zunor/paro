@@ -3,18 +3,176 @@
 
 //! Logical operators for search-path rewrites.
 
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
+use paro_storage::index::fulltext::query_parser::{
+    parse_phraseto_tsquery, parse_plainto_tsquery, parse_query, parse_to_tsquery,
+    parse_websearch_to_tsquery, ParsedQuery,
+};
+pub use paro_storage::index::fulltext::scoring::FullTextScoreMode;
+use paro_storage::index::fulltext::tokenizer::tokenizer_from_config;
 
 use crate::expression::Expression;
 
 use super::Get;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FullTextQueryStats {
+    pub term_count: usize,
+    pub positive_term_count: usize,
+    pub phrase_count: usize,
+    pub proximity_count: usize,
+    pub prefix_count: usize,
+    pub not_count: usize,
+    pub or_branch_count: usize,
+}
+
+impl FullTextQueryStats {
+    pub fn new(term_count: usize) -> Self {
+        Self {
+            term_count,
+            positive_term_count: term_count,
+            ..Self::default()
+        }
+    }
+
+    pub fn effective_query_terms(&self) -> usize {
+        self.positive_term_count.max(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTextQueryStatsKind {
+    Legacy,
+    TsQuery,
+    Plain,
+    Phrase,
+    WebSearch,
+}
+
+pub fn analyze_fulltext_query_stats(query: &ParsedQuery) -> FullTextQueryStats {
+    fn walk(query: &ParsedQuery, negated: bool, stats: &mut FullTextQueryStats) {
+        match query {
+            ParsedQuery::Term(_) => {
+                stats.term_count += 1;
+                if negated {
+                    stats.not_count += 1;
+                } else {
+                    stats.positive_term_count += 1;
+                }
+            }
+            ParsedQuery::Prefix(_) => {
+                stats.term_count += 1;
+                stats.prefix_count += 1;
+                if negated {
+                    stats.not_count += 1;
+                } else {
+                    stats.positive_term_count += 1;
+                }
+            }
+            ParsedQuery::Phrase(items) => {
+                stats.phrase_count += 1;
+                stats.term_count += items.len();
+                if negated {
+                    stats.not_count += items.len();
+                } else {
+                    stats.positive_term_count += items.len();
+                }
+            }
+            ParsedQuery::FollowedBy(items, _) => {
+                stats.proximity_count += 1;
+                for item in items {
+                    walk(item, negated, stats);
+                }
+            }
+            ParsedQuery::Not(child) => walk(child, !negated, stats),
+            ParsedQuery::And(items) => {
+                for item in items {
+                    walk(item, negated, stats);
+                }
+            }
+            ParsedQuery::Or(items) => {
+                stats.or_branch_count += items.len();
+                for item in items {
+                    walk(item, negated, stats);
+                }
+            }
+        }
+    }
+
+    let mut stats = FullTextQueryStats::default();
+    walk(query, false, &mut stats);
+    if stats.term_count == 0 {
+        stats.term_count = stats.positive_term_count;
+    }
+    if stats.positive_term_count == 0 && stats.term_count > 0 {
+        stats.positive_term_count = 1;
+    }
+    stats
+}
+
+pub fn build_fulltext_query_stats(
+    query_text: &str,
+    config: &str,
+    query_kind: FullTextQueryStatsKind,
+) -> Result<FullTextQueryStats> {
+    let (_kind, tokenizer) = tokenizer_from_config(config)?;
+    let parsed = match query_kind {
+        FullTextQueryStatsKind::Legacy => parse_query(query_text, tokenizer.as_ref(), 1, None)?,
+        FullTextQueryStatsKind::TsQuery => {
+            parse_to_tsquery(query_text, tokenizer.as_ref(), 1, None)?
+        }
+        FullTextQueryStatsKind::Plain => {
+            parse_plainto_tsquery(query_text, tokenizer.as_ref(), 1, None)?
+        }
+        FullTextQueryStatsKind::Phrase => {
+            parse_phraseto_tsquery(query_text, tokenizer.as_ref(), 1, None)?
+        }
+        FullTextQueryStatsKind::WebSearch => {
+            parse_websearch_to_tsquery(query_text, tokenizer.as_ref(), 1, None)?
+        }
+    };
+    Ok(analyze_fulltext_query_stats(&parsed))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchType {
-    HnswVector { column_id: u32 },
-    SparseVector { column_id: u32 },
-    FullTextTopK { column_id: u32 },
-    FullTextFilter { column_id: u32 },
+    HnswVector {
+        column_id: u32,
+    },
+    SparseVector {
+        column_id: u32,
+    },
+    FullTextTopK {
+        column_id: u32,
+        score_mode: FullTextScoreMode,
+        query_stats: FullTextQueryStats,
+    },
+    FullTextFilter {
+        column_id: u32,
+        query_stats: FullTextQueryStats,
+    },
+}
+
+impl SearchType {
+    pub fn fulltext_topk(
+        column_id: u32,
+        score_mode: FullTextScoreMode,
+        query_stats: FullTextQueryStats,
+    ) -> Self {
+        Self::FullTextTopK {
+            column_id,
+            score_mode,
+            query_stats,
+        }
+    }
+
+    pub fn fulltext_filter(column_id: u32, query_stats: FullTextQueryStats) -> Self {
+        Self::FullTextFilter {
+            column_id,
+            query_stats,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

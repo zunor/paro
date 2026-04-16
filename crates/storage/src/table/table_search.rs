@@ -3,6 +3,7 @@
 
 use super::table_handle::TableHandle;
 use crate::index::fulltext::query_parser::ParsedQuery;
+use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::GlobalFullTextStats;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::PredicateTree;
@@ -129,6 +130,7 @@ impl TableHandle {
         predicate: Option<&PredicateTree>,
         projected_columns: &[usize],
         global_stats: Option<&GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
         emit_score: bool,
     ) -> Result<Vec<Chunk>> {
         fulltext_search::fulltext_search_parsed(
@@ -140,6 +142,7 @@ impl TableHandle {
             predicate,
             projected_columns,
             global_stats,
+            score_mode,
             emit_score,
         )
     }
