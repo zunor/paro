@@ -1,0 +1,16 @@
+[meta]
+name = "fulltext_pg_long"
+description = "Long-document ts_rank_cd stress case"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "rank_cd_long_topk"
+file = "sql/q_rank_cd_topk.sql"
+validate = "ordered_rows"
+expected = [[1]]

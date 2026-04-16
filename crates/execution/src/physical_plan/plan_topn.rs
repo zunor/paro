@@ -33,7 +33,10 @@ use paro_planner::expression::{
     ConjunctionExpression, ConjunctionType, Expression, OperatorType, ReferenceExpression,
 };
 use paro_planner::operator::TopN as LogicalTopN;
-use paro_planner::operator::{Get, LogicalOperator};
+use paro_planner::operator::{
+    build_fulltext_query_stats as build_planner_fulltext_query_stats, FullTextQueryStats,
+    FullTextQueryStatsKind, FullTextScoreMode, Get, LogicalOperator,
+};
 use paro_planner::plan::LogicalPlan;
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
 use paro_storage::index::hnsw::types::{AcornParams, SearchParams, ACORN_MAX_SELECTIVITY_DEFAULT};
@@ -50,6 +53,8 @@ pub(crate) struct FullTextScoreInfo {
     pub(crate) text_column_id: usize,
     pub(crate) query_text: String,
     pub(crate) query_kind: FullTextQueryKind,
+    pub(crate) score_mode: FullTextScoreMode,
+    pub(crate) query_stats: FullTextQueryStats,
     pub(crate) config: String,
 }
 
@@ -855,10 +860,11 @@ pub(crate) fn extract_fulltext_score(
         return Ok(None);
     }
     match name.as_str() {
-        "bm25" => extract_legacy_fulltext_score(func, get),
-        "bm25_score_internal" | "ts_rank" | "ts_rank_cd" => {
-            extract_internal_fulltext_score(func, get)
+        "bm25" => extract_legacy_fulltext_score(func, get, FullTextScoreMode::Bm25),
+        "bm25_score_internal" | "ts_rank" => {
+            extract_internal_fulltext_score(func, get, FullTextScoreMode::Bm25)
         }
+        "ts_rank_cd" => extract_internal_fulltext_score(func, get, FullTextScoreMode::CoverDensity),
         _ => Ok(None),
     }
 }
@@ -873,6 +879,7 @@ fn is_fulltext_score_function(name: &str) -> bool {
 fn extract_legacy_fulltext_score(
     func: &paro_planner::expression::FunctionExpression,
     get: &Get,
+    score_mode: FullTextScoreMode,
 ) -> Result<Option<FullTextScoreInfo>> {
     if func.children.len() != 2 {
         return Ok(None);
@@ -880,20 +887,34 @@ fn extract_legacy_fulltext_score(
     let (left, right) = (&func.children[0], &func.children[1]);
     if let Some(text_column_id) = resolve_fulltext_column(get, extract_scan_col_idx(left)) {
         if let Some(query) = extract_query_string(right)? {
+            let query_stats = build_fulltext_query_stats(
+                query.as_str(),
+                SIMPLE_CONFIG,
+                FullTextQueryKind::Legacy,
+            )?;
             return Ok(Some(FullTextScoreInfo {
                 text_column_id,
                 query_text: query,
                 query_kind: FullTextQueryKind::Legacy,
+                score_mode,
+                query_stats,
                 config: SIMPLE_CONFIG.to_string(),
             }));
         }
     }
     if let Some(text_column_id) = resolve_fulltext_column(get, extract_scan_col_idx(right)) {
         if let Some(query) = extract_query_string(left)? {
+            let query_stats = build_fulltext_query_stats(
+                query.as_str(),
+                SIMPLE_CONFIG,
+                FullTextQueryKind::Legacy,
+            )?;
             return Ok(Some(FullTextScoreInfo {
                 text_column_id,
                 query_text: query,
                 query_kind: FullTextQueryKind::Legacy,
+                score_mode,
+                query_stats,
                 config: SIMPLE_CONFIG.to_string(),
             }));
         }
@@ -904,6 +925,7 @@ fn extract_legacy_fulltext_score(
 fn extract_internal_fulltext_score(
     func: &paro_planner::expression::FunctionExpression,
     get: &Get,
+    score_mode: FullTextScoreMode,
 ) -> Result<Option<FullTextScoreInfo>> {
     if func.children.len() != 2 {
         return Ok(None);
@@ -919,10 +941,13 @@ fn extract_internal_fulltext_score(
     if !tsv_config.eq_ignore_ascii_case(&tsq_config) {
         return Ok(None);
     }
+    let query_stats = build_fulltext_query_stats(query_text.as_str(), &tsq_config, query_kind)?;
     Ok(Some(FullTextScoreInfo {
         text_column_id,
         query_text,
         query_kind,
+        score_mode,
+        query_stats,
         config: tsv_config,
     }))
 }
@@ -994,6 +1019,24 @@ fn extract_tsquery_source(
     };
 
     Ok(Some((query_text, query_kind, config)))
+}
+
+fn build_fulltext_query_stats(
+    query_text: &str,
+    config: &str,
+    query_kind: FullTextQueryKind,
+) -> Result<FullTextQueryStats> {
+    build_planner_fulltext_query_stats(query_text, config, map_query_stats_kind(query_kind))
+}
+
+fn map_query_stats_kind(query_kind: FullTextQueryKind) -> FullTextQueryStatsKind {
+    match query_kind {
+        FullTextQueryKind::Legacy => FullTextQueryStatsKind::Legacy,
+        FullTextQueryKind::TsQuery => FullTextQueryStatsKind::TsQuery,
+        FullTextQueryKind::Plain => FullTextQueryStatsKind::Plain,
+        FullTextQueryKind::Phrase => FullTextQueryStatsKind::Phrase,
+        FullTextQueryKind::WebSearch => FullTextQueryStatsKind::WebSearch,
+    }
 }
 
 fn extract_query_string(expr: &Expression) -> Result<Option<String>> {
@@ -1112,6 +1155,8 @@ mod tests {
                 text_column_id: 0,
                 query_text: "query".to_string(),
                 query_kind: FullTextQueryKind::Legacy,
+                score_mode: FullTextScoreMode::Bm25,
+                query_stats: FullTextQueryStats::new(1),
                 config: "simple".to_string(),
             })
         );
@@ -1225,6 +1270,11 @@ mod tests {
             assert_eq!(info.text_column_id, 0);
             assert_eq!(info.query_text, "query");
             assert_eq!(info.query_kind, FullTextQueryKind::Plain);
+            match name {
+                "ts_rank_cd" => assert_eq!(info.score_mode, FullTextScoreMode::CoverDensity),
+                _ => assert_eq!(info.score_mode, FullTextScoreMode::Bm25),
+            }
+            assert_eq!(info.query_stats.effective_query_terms(), 1);
             assert_eq!(info.config, "simple");
         }
     }
@@ -1299,6 +1349,16 @@ mod tests {
                 text_column_id: 0,
                 query_text: "vector & !spam".to_string(),
                 query_kind: FullTextQueryKind::TsQuery,
+                score_mode: FullTextScoreMode::Bm25,
+                query_stats: FullTextQueryStats {
+                    term_count: 2,
+                    positive_term_count: 1,
+                    phrase_count: 0,
+                    proximity_count: 0,
+                    prefix_count: 0,
+                    not_count: 1,
+                    or_branch_count: 0,
+                },
                 config: "simple".to_string(),
             })
         );

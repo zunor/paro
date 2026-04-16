@@ -198,6 +198,7 @@ impl FullTextIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::fulltext::scoring::FullTextScoreMode;
 
     #[test]
     fn fulltext_index_roundtrip() {
@@ -209,7 +210,7 @@ mod tests {
         let restored = FullTextIndex::deserialize(&bytes).unwrap();
 
         let query = restored.parse_query("hello").unwrap();
-        let results = restored.search(&query, 10, None, None);
+        let results = restored.search(&query, 10, None, None, FullTextScoreMode::Bm25);
         assert_eq!(results.len(), 2);
     }
 
@@ -226,7 +227,7 @@ mod tests {
 
         assert_eq!(restored.tokenizer().kind(), TokenizerKind::Chinese);
         let query = restored.parse_query("数据库").unwrap();
-        let results = restored.search(&query, 10, None, None);
+        let results = restored.search(&query, 10, None, None, FullTextScoreMode::Bm25);
         assert_eq!(results.len(), 1);
     }
 }

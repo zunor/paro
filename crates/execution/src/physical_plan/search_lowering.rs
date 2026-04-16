@@ -173,6 +173,8 @@ impl PhysicalPlanGenerator {
             scan.get.column_ids.clone(),
         )
         .with_query_options(match_info.query_kind, match_info.config)
+        .with_query_stats(match_info.query_stats)
+        .with_score_mode(match_info.score_mode)
         .with_exec_mode(FullTextExecMode::Filter);
         if let Some(tree) = predicate_tree {
             bind = bind.with_predicates(tree);
@@ -332,6 +334,8 @@ impl PhysicalPlanGenerator {
             get.column_ids.clone(),
         )
         .with_query_options(score_info.query_kind, score_info.config)
+        .with_query_stats(score_info.query_stats)
+        .with_score_mode(score_info.score_mode)
         .with_exec_mode(FullTextExecMode::ScoreTopK)
         .with_emit_score(true);
         if let Some(tree) = predicate_tree {
@@ -459,8 +463,19 @@ fn describe_search_type(search_type: &SearchType) -> String {
     match search_type {
         SearchType::HnswVector { .. } => "hnsw_vector".to_string(),
         SearchType::SparseVector { .. } => "sparse_vector".to_string(),
-        SearchType::FullTextTopK { .. } => "fulltext_topk".to_string(),
-        SearchType::FullTextFilter { .. } => "fulltext_filter".to_string(),
+        SearchType::FullTextTopK {
+            score_mode,
+            query_stats,
+            ..
+        } => format!(
+            "fulltext_topk(score_mode={}, query_terms={})",
+            score_mode.as_str(),
+            query_stats.effective_query_terms()
+        ),
+        SearchType::FullTextFilter { query_stats, .. } => format!(
+            "fulltext_filter(query_terms={})",
+            query_stats.effective_query_terms()
+        ),
     }
 }
 

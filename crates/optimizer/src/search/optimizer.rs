@@ -11,8 +11,9 @@ use paro_context::StatementContext;
 use paro_planner::binder::deep_copy::deep_copy_plan;
 use paro_planner::expression::{Expression, OperatorType};
 use paro_planner::operator::{
-    Confidence, Filter, FullTextFilterScan, Get, LogicalOperator, Projection, SearchCandidate,
-    SearchDecision, SearchScan, SearchType, TopN,
+    build_fulltext_query_stats as build_planner_fulltext_query_stats, Confidence, Filter,
+    FullTextFilterScan, FullTextQueryStats, FullTextQueryStatsKind, FullTextScoreMode, Get,
+    LogicalOperator, Projection, SearchCandidate, SearchDecision, SearchScan, SearchType, TopN,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::statistics::{
@@ -202,18 +203,17 @@ impl SearchOptimizer {
                 &candidate_filters,
                 &ctx.column_stats,
             );
-            let threshold = compute_fulltext_threshold(&stats, info.query_terms);
+            let threshold = compute_fulltext_threshold(&stats, &info.query_stats);
 
             let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
             let estimated_cost = FullTextScanCostModel::estimate_bm25_cost(
                 &stats,
-                info.query_terms,
+                &info.query_stats,
+                info.score_mode,
                 filter_selectivity,
             );
             let decision = build_decision(
-                SearchType::FullTextTopK {
-                    column_id: info.column_id as u32,
-                },
+                SearchType::fulltext_topk(info.column_id as u32, info.score_mode, info.query_stats),
                 filtered,
                 threshold,
                 estimated_cost,
@@ -271,16 +271,14 @@ impl SearchOptimizer {
                 &candidate_filters,
                 &ctx.column_stats,
             );
-            let threshold = compute_fulltext_threshold(&stats, info.query_terms);
+            let threshold = compute_fulltext_threshold(&stats, &info.query_stats);
             let estimated_cost = FullTextScanCostModel::estimate_filter_cost(
                 &stats,
-                info.query_terms,
+                &info.query_stats,
                 estimate_selectivity(base_rows, filtered.expected),
             );
             let decision = build_decision(
-                SearchType::FullTextFilter {
-                    column_id: info.column_id as u32,
-                },
+                SearchType::fulltext_filter(info.column_id as u32, info.query_stats),
                 filtered,
                 threshold,
                 estimated_cost,
@@ -385,7 +383,10 @@ fn compute_sparse_threshold(stats: &SparseIndexStatistics, query_nnz: usize) -> 
         .max(1)
 }
 
-fn compute_fulltext_threshold(stats: &FullTextIndexStatistics, query_terms: usize) -> u64 {
+fn compute_fulltext_threshold(
+    stats: &FullTextIndexStatistics,
+    query_stats: &FullTextQueryStats,
+) -> u64 {
     let total_docs = stats.total_docs.max(1) as u64;
     let avg_posting = if stats.unique_terms == 0 {
         1
@@ -393,7 +394,7 @@ fn compute_fulltext_threshold(stats: &FullTextIndexStatistics, query_terms: usiz
         (stats.total_postings / stats.unique_terms as u64).max(1)
     };
     total_docs
-        .min(avg_posting.saturating_mul(query_terms.max(1) as u64))
+        .min(avg_posting.saturating_mul(query_stats.effective_query_terms() as u64))
         .max(1)
 }
 
@@ -670,8 +671,18 @@ fn extract_query_sparse_vector_nnz(expr: &Expression) -> Result<Option<usize>> {
 #[derive(Clone)]
 struct FullTextQueryInfo {
     column_id: usize,
-    query_terms: usize,
+    score_mode: FullTextScoreMode,
+    query_stats: FullTextQueryStats,
     config: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullTextQueryKind {
+    Legacy,
+    TsQuery,
+    Plain,
+    Phrase,
+    WebSearch,
 }
 
 fn extract_fulltext_score_info(expr: &Expression, get: &Get) -> Result<Option<FullTextQueryInfo>> {
@@ -688,8 +699,17 @@ fn extract_fulltext_score_info(expr: &Expression, get: &Get) -> Result<Option<Fu
         return Ok(None);
     }
     match name.as_str() {
-        "bm25" => extract_fulltext_query_from_column_and_string(func, get),
-        _ => extract_internal_fulltext_query(func, get),
+        "bm25" => extract_fulltext_query_from_column_and_string(
+            func,
+            get,
+            FullTextQueryKind::Legacy,
+            FullTextScoreMode::Bm25,
+        ),
+        "bm25_score_internal" | "ts_rank" => {
+            extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25)
+        }
+        "ts_rank_cd" => extract_internal_fulltext_query(func, get, FullTextScoreMode::CoverDensity),
+        _ => Ok(None),
     }
 }
 
@@ -704,14 +724,21 @@ fn extract_fulltext_match_info(expr: &Expression, get: &Get) -> Result<Option<Fu
         return Ok(None);
     }
     match name.as_str() {
-        "fulltext_match" => extract_fulltext_query_from_column_and_string(func, get),
-        _ => extract_internal_fulltext_query(func, get),
+        "fulltext_match" => extract_fulltext_query_from_column_and_string(
+            func,
+            get,
+            FullTextQueryKind::Legacy,
+            FullTextScoreMode::Bm25,
+        ),
+        _ => extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25),
     }
 }
 
 fn extract_fulltext_query_from_column_and_string(
     func: &paro_planner::expression::FunctionExpression,
     get: &Get,
+    query_kind: FullTextQueryKind,
+    score_mode: FullTextScoreMode,
 ) -> Result<Option<FullTextQueryInfo>> {
     if func.children.len() != 2 {
         return Ok(None);
@@ -719,18 +746,22 @@ fn extract_fulltext_query_from_column_and_string(
     let (left, right) = (&func.children[0], &func.children[1]);
     if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(left)) {
         if let Some(query_text) = extract_query_string(right)? {
+            let query_stats = build_fulltext_query_stats(&query_text, SIMPLE_CONFIG, query_kind)?;
             return Ok(Some(FullTextQueryInfo {
                 column_id,
-                query_terms: count_query_terms(&query_text),
+                score_mode,
+                query_stats,
                 config: SIMPLE_CONFIG.to_string(),
             }));
         }
     }
     if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(right)) {
         if let Some(query_text) = extract_query_string(left)? {
+            let query_stats = build_fulltext_query_stats(&query_text, SIMPLE_CONFIG, query_kind)?;
             return Ok(Some(FullTextQueryInfo {
                 column_id,
-                query_terms: count_query_terms(&query_text),
+                score_mode,
+                query_stats,
                 config: SIMPLE_CONFIG.to_string(),
             }));
         }
@@ -741,6 +772,7 @@ fn extract_fulltext_query_from_column_and_string(
 fn extract_internal_fulltext_query(
     func: &paro_planner::expression::FunctionExpression,
     get: &Get,
+    score_mode: FullTextScoreMode,
 ) -> Result<Option<FullTextQueryInfo>> {
     if func.children.len() != 2 {
         return Ok(None);
@@ -748,15 +780,18 @@ fn extract_internal_fulltext_query(
     let Some((column_id, tsv_config)) = extract_tsvector_source(&func.children[0], get)? else {
         return Ok(None);
     };
-    let Some((query_text, tsq_config)) = extract_tsquery_source(&func.children[1])? else {
+    let Some((query_text, tsq_config, query_kind)) = extract_tsquery_source(&func.children[1])?
+    else {
         return Ok(None);
     };
     if !tsv_config.eq_ignore_ascii_case(&tsq_config) {
         return Ok(None);
     }
+    let query_stats = build_fulltext_query_stats(&query_text, &tsq_config, query_kind)?;
     Ok(Some(FullTextQueryInfo {
         column_id,
-        query_terms: count_query_terms(&query_text),
+        score_mode,
+        query_stats,
         config: tsv_config,
     }))
 }
@@ -794,7 +829,9 @@ fn extract_tsvector_source(expr: &Expression, get: &Get) -> Result<Option<(usize
     Ok(Some((column_id, config)))
 }
 
-fn extract_tsquery_source(expr: &Expression) -> Result<Option<(String, String)>> {
+fn extract_tsquery_source(
+    expr: &Expression,
+) -> Result<Option<(String, String, FullTextQueryKind)>> {
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
@@ -826,7 +863,14 @@ fn extract_tsquery_source(expr: &Expression) -> Result<Option<(String, String)>>
     let Some(query_text) = extract_query_string(query_expr)? else {
         return Ok(None);
     };
-    Ok(Some((query_text, config)))
+    let query_kind = match name.as_str() {
+        "to_tsquery" => FullTextQueryKind::TsQuery,
+        "plainto_tsquery" => FullTextQueryKind::Plain,
+        "phraseto_tsquery" => FullTextQueryKind::Phrase,
+        "websearch_to_tsquery" => FullTextQueryKind::WebSearch,
+        _ => return Ok(None),
+    };
+    Ok(Some((query_text, config, query_kind)))
 }
 
 fn normalize_fulltext_config(config: &str) -> Option<String> {
@@ -834,8 +878,22 @@ fn normalize_fulltext_config(config: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn count_query_terms(query_text: &str) -> usize {
-    query_text.split_whitespace().count().max(1)
+fn build_fulltext_query_stats(
+    query_text: &str,
+    config: &str,
+    query_kind: FullTextQueryKind,
+) -> Result<FullTextQueryStats> {
+    build_planner_fulltext_query_stats(query_text, config, map_query_stats_kind(query_kind))
+}
+
+fn map_query_stats_kind(query_kind: FullTextQueryKind) -> FullTextQueryStatsKind {
+    match query_kind {
+        FullTextQueryKind::Legacy => FullTextQueryStatsKind::Legacy,
+        FullTextQueryKind::TsQuery => FullTextQueryStatsKind::TsQuery,
+        FullTextQueryKind::Plain => FullTextQueryStatsKind::Plain,
+        FullTextQueryKind::Phrase => FullTextQueryStatsKind::Phrase,
+        FullTextQueryKind::WebSearch => FullTextQueryStatsKind::WebSearch,
+    }
 }
 
 fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<usize> {
@@ -1026,7 +1084,9 @@ mod tests {
 
         let info = extract_fulltext_match_info(&expr, &get).unwrap().unwrap();
         assert_eq!(info.column_id, 0);
-        assert_eq!(info.query_terms, 2);
+        assert_eq!(info.score_mode, FullTextScoreMode::Bm25);
+        assert_eq!(info.query_stats.term_count, 2);
+        assert_eq!(info.query_stats.effective_query_terms(), 2);
     }
 
     #[test]
@@ -1034,7 +1094,11 @@ mod tests {
         let search = SearchScan::new(
             Get::new_without_table(1, vec!["v".to_string()], vec![LogicalType::Varchar]),
             SearchDecision::IndexScan {
-                search_type: SearchType::FullTextTopK { column_id: 0 },
+                search_type: SearchType::fulltext_topk(
+                    0,
+                    FullTextScoreMode::Bm25,
+                    FullTextQueryStats::new(1),
+                ),
                 estimated_cost: 1.0,
                 confidence: Confidence::High,
             },

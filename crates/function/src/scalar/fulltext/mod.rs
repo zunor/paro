@@ -3,31 +3,35 @@
 
 //! Full-text search functions.
 
-mod eval;
-mod highlight;
-mod pg;
-mod score;
+mod fallback;
+mod headline;
+mod matching;
+mod query;
+mod rank;
+mod tokenize;
 
-pub use highlight::*;
-pub use pg::*;
-pub use score::*;
+pub use headline::*;
+pub use matching::*;
+pub use query::*;
+pub use rank::*;
+pub use tokenize::*;
 
 use crate::ScalarFunctionSet;
 
 /// Register all full-text functions.
 pub fn register_fulltext_functions() -> Vec<ScalarFunctionSet> {
     vec![
-        get_bm25_functions(),
-        get_fulltext_match_functions(),
-        get_bm25_score_internal_functions(),
-        get_fulltext_match_internal_functions(),
-        get_to_tsvector_functions(),
-        get_to_tsquery_functions(),
-        get_plainto_tsquery_functions(),
-        get_phraseto_tsquery_functions(),
-        get_websearch_to_tsquery_functions(),
-        get_ts_rank_functions(),
-        get_ts_rank_cd_functions(),
-        get_ts_headline_functions(),
+        rank::get_bm25_functions(),
+        matching::get_fulltext_match_functions(),
+        rank::get_bm25_score_internal_functions(),
+        matching::get_fulltext_match_internal_functions(),
+        tokenize::get_to_tsvector_functions(),
+        query::get_to_tsquery_functions(),
+        query::get_plainto_tsquery_functions(),
+        query::get_phraseto_tsquery_functions(),
+        query::get_websearch_to_tsquery_functions(),
+        rank::get_ts_rank_functions(),
+        rank::get_ts_rank_cd_functions(),
+        headline::get_ts_headline_functions(),
     ]
 }

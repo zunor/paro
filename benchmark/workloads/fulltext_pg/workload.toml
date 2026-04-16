@@ -29,3 +29,15 @@ id = "rank_topk"
 file = "sql/q_rank_topk.sql"
 validate = "ordered_rows"
 expected = [[1], [2]]
+
+[[query]]
+id = "rank_cd_topk"
+file = "sql/q_rank_cd_topk.sql"
+validate = "ordered_rows"
+expected = [[1], [2]]
+
+[[query]]
+id = "headline"
+file = "sql/q_headline.sql"
+validate = "ordered_rows"
+expected = [["<b>vector</b> <b>database</b> <b>vector</b>"], ["<b>vector</b> <b>database</b>"], ["vector"]]

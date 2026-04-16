@@ -100,7 +100,7 @@ WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector databa
 ORDER BY rank DESC, id
 LIMIT 2;
 id	rank
-1	2.000000
+1	2.375000
 2	2.000000
 
 DROP INDEX IF EXISTS idx_ft_docs_fts;
