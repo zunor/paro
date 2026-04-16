@@ -20,7 +20,7 @@ use tokio::net::TcpStream;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::Framed;
 
-use crate::client_connection::PgCodec;
+use crate::connection::PgCodec;
 
 const FORMAT_CODE_TEXT: i16 = 0;
 const NO_TABLE_ID: i32 = 0;

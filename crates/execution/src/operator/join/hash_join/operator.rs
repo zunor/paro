@@ -873,6 +873,7 @@ impl PhysicalOperator for HashJoin {
         chunk: &Chunk,
         input: &mut OperatorSinkInput,
     ) -> Result<SinkResultType> {
+        ctx.check_cancelled()?;
         let lstate = input
             .local_state
             .as_any_mut()

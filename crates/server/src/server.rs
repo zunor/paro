@@ -11,17 +11,18 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Notify};
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::client_connection::{Connection, ConnectionInit, PgFrontendMessageLimits};
+use crate::connection::{Connection, ConnectionInit, PgFrontendMessageLimits};
 use crate::connection_control::{ServerConnectionControl, ServerConnectionHandle, ServerLimits};
 
 const CONNECTION_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const FORCE_CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const PRE_AUTH_CANCEL_PEEK_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Server configuration (derived from ParoConfig).
 #[derive(Debug, Clone)]
@@ -163,15 +164,15 @@ impl Server {
                 Err(error) => break Err(error.into()),
             };
 
-            if self.limits.pre_auth_limit_reached() {
+            if self.limits.pre_auth_limit_reached()
+                && !socket_looks_like_cancel_request(&socket).await
+            {
                 tracing::warn!(
                     target: targets::SERVER,
                     peer_addr = %peer,
                     max_connections = self.config.max_connections,
                     "Connection rejected before handshake because max_connections was reached"
                 );
-                // Keep a small TODO here: once CancelRequest is implemented, reserve a few
-                // slots or inspect the startup packet before rejecting pre-auth sockets.
                 drop(socket);
                 continue;
             }
@@ -189,7 +190,7 @@ impl Server {
 
             let connection_id = self
                 .instance
-                .get_connection_manager()
+                .get_connection_registry()
                 .assign_connection_id();
 
             tracing::info!(
@@ -233,7 +234,7 @@ impl Server {
                     force_close_token: connection_force_close_token,
                 });
                 conn.run().await;
-                // `Connection::cleanup()` removes the ConnectionManager observability mirror.
+                // `Connection::cleanup()` removes the ConnectionRegistry observability mirror.
                 // This unregister removes the authoritative server-owned drain handle.
                 server.unregister_connection(connection_id);
             });
@@ -288,7 +289,10 @@ impl Server {
             handle.control.request_force_close();
             handle.control.deactivate();
             self.instance
-                .get_connection_manager()
+                .get_session_registry()
+                .unregister(handle.connection_id);
+            self.instance
+                .get_connection_registry()
                 .remove_connection(handle.connection_id);
             handle.force_close_token.cancel();
             handle.join_handle.abort();
@@ -431,15 +435,41 @@ impl Server {
     }
 }
 
+async fn socket_looks_like_cancel_request(socket: &TcpStream) -> bool {
+    let deadline = Instant::now() + PRE_AUTH_CANCEL_PEEK_TIMEOUT;
+    let mut header = [0_u8; 8];
+
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+
+        match timeout(remaining, socket.readable()).await {
+            Ok(Ok(())) => match socket.peek(&mut header).await {
+                Ok(read) if read >= header.len() => {
+                    return pgwire::messages::cancel::CancelRequest::is_cancel_request_packet(
+                        &header[..read],
+                    );
+                }
+                Ok(_) => continue,
+                Err(_) => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use paro_instance::InstanceShutdownDisposition;
     use paro_instance::{InstanceLayout, InstanceLifecycleState, InstanceRunStateStore};
     use paro_storage::meta::{FileMetadataStore, MetadataStore};
+    use pgwire::messages::cancel::CancelRequest;
     use pgwire::messages::copy::{CopyData, CopyDone};
     use pgwire::messages::extendedquery::{Bind, Execute, Parse, Sync};
     use pgwire::messages::simplequery::Query;
+    use pgwire::messages::startup::SecretKey;
     use pgwire::messages::PgWireFrontendMessage;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -502,6 +532,13 @@ mod tests {
         let mut buf = tokio_util::bytes::BytesMut::new();
         message.encode(&mut buf).expect("encode frontend message");
         buf.to_vec()
+    }
+
+    fn encode_cancel_request(pid: i32, secret_key: i32) -> Vec<u8> {
+        encode_frontend_message(PgWireFrontendMessage::CancelRequest(CancelRequest::new(
+            pid,
+            SecretKey::I32(secret_key),
+        )))
     }
 
     fn encode_copy_fail_message(message: &str) -> Vec<u8> {
@@ -600,6 +637,12 @@ mod tests {
         Some((name, value))
     }
 
+    fn backend_key_data(payload: &[u8]) -> Option<(i32, i32)> {
+        let pid = i32::from_be_bytes(payload.get(0..4)?.try_into().ok()?);
+        let secret = i32::from_be_bytes(payload.get(4..8)?.try_into().ok()?);
+        Some((pid, secret))
+    }
+
     fn error_field(payload: &[u8], tag: u8) -> Option<String> {
         let mut index = 0;
         while index < payload.len() {
@@ -619,6 +662,10 @@ mod tests {
             index = end + 1;
         }
         None
+    }
+
+    fn ready_for_query_status(payload: &[u8]) -> Option<char> {
+        payload.first().copied().map(char::from)
     }
 
     fn test_server_with_in_memory_instance() -> Arc<Server> {
@@ -869,7 +916,54 @@ mod tests {
                 .map(String::as_str),
             Some("")
         );
+        assert!(messages
+            .iter()
+            .any(|(tag, payload)| { *tag == b'K' && backend_key_data(payload).is_some() }));
         assert!(messages.iter().any(|(tag, _)| *tag == b'Z'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_request_bypasses_pre_auth_limit_and_leaves_idle_target_usable() {
+        let (server, run_task, addr) = spawn_test_server(1).await;
+        let mut target = TcpStream::connect(addr).await.expect("target connection");
+        let startup_messages = complete_startup(&mut target).await;
+        let (pid, secret) = startup_messages
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .expect("startup should include backend key data");
+
+        let mut cancel = TcpStream::connect(addr).await.expect("cancel connection");
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .expect("write cancel request");
+
+        let mut eof = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+            .await
+            .expect("cancel connection should close quickly")
+            .expect("read cancel EOF");
+        assert_eq!(
+            read, 0,
+            "CancelRequest connections should close without a response"
+        );
+
+        let roundtrip = run_simple_query_roundtrip(&mut target, "SELECT 1").await;
+        assert!(
+            !roundtrip.iter().any(|(tag, _)| *tag == b'E'),
+            "idle target should remain usable after CancelRequest"
+        );
+        assert_eq!(roundtrip.last().map(|(tag, _)| *tag), Some(b'Z'));
 
         server
             .shutdown(Duration::from_secs(5))
@@ -1148,6 +1242,420 @@ mod tests {
         assert!(
             !probe.iter().any(|(tag, _)| *tag == b'E'),
             "connection should recover after Sync"
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simple_query_cancel_skips_remaining_statements_in_batch() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        let startup_messages = complete_startup(&mut client).await;
+        let (pid, secret) = startup_messages
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .expect("startup should include backend key data");
+
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE simple_copy_cancel_t (v INT)").await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY simple_copy_cancel_t FROM STDIN WITH (FORMAT csv); SELECT 42".to_string(),
+                ),
+            )))
+            .await
+            .expect("write simple COPY batch");
+
+        let setup_messages = read_available_messages(&mut client).await;
+        assert!(setup_messages.iter().any(|(tag, _)| *tag == b'G'));
+        assert!(!setup_messages.iter().any(|(tag, _)| *tag == b'Z'));
+
+        let mut cancel = TcpStream::connect(addr).await.expect("cancel connection");
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .expect("write cancel request");
+        let mut eof = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+            .await
+            .expect("cancel connection should close")
+            .expect("read cancel EOF");
+        assert_eq!(read, 0);
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyDone(
+                CopyDone::new(),
+            )))
+            .await
+            .expect("write copy done");
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|(tag, payload)| {
+                    *tag == b'E' && error_field(payload, b'C').as_deref() == Some("57014")
+                })
+                .count(),
+            1,
+            "cancelled batch should surface one query_canceled error"
+        );
+        assert!(
+            !messages.iter().any(|(tag, payload)| {
+                *tag == b'C'
+                    && command_complete_tag(payload)
+                        .map(|tag| tag == "COPY 0" || tag.starts_with("SELECT "))
+                        .unwrap_or(false)
+            }),
+            "remaining simple-query statements must be skipped after cancel"
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+
+        let probe =
+            run_simple_query_roundtrip(&mut client, "SELECT COUNT(*) FROM simple_copy_cancel_t")
+                .await;
+        assert!(
+            probe.iter().any(|(tag, payload)| {
+                *tag == b'D'
+                    || (*tag == b'C'
+                        && command_complete_tag(payload).as_deref() == Some("SELECT 1"))
+            }),
+            "connection should remain usable after cancel"
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extended_query_cancel_marks_explicit_transaction_failed_until_sync() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        let startup_messages = complete_startup(&mut client).await;
+        let (pid, secret) = startup_messages
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .expect("startup should include backend key data");
+
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE ext_cancel_t (v INT)").await;
+        let begin_messages = run_simple_query_roundtrip(&mut client, "BEGIN").await;
+        assert_eq!(
+            begin_messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('T')
+        );
+
+        for message in [
+            PgWireFrontendMessage::Parse(Parse::new(
+                Some("copy_stmt".to_string()),
+                "COPY ext_cancel_t FROM STDIN WITH (FORMAT csv)".to_string(),
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Bind(Bind::new(
+                Some("copy_portal".to_string()),
+                Some("copy_stmt".to_string()),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Execute(Execute::new(Some("copy_portal".to_string()), 0)),
+        ] {
+            client
+                .write_all(&encode_frontend_message(message))
+                .await
+                .expect("write extended COPY setup");
+        }
+
+        let setup_messages = read_available_messages(&mut client).await;
+        assert!(setup_messages.iter().any(|(tag, _)| *tag == b'G'));
+
+        let mut cancel = TcpStream::connect(addr).await.expect("cancel connection");
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .expect("write cancel request");
+        let mut eof = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+            .await
+            .expect("cancel connection should close")
+            .expect("read cancel EOF");
+        assert_eq!(read, 0);
+
+        for message in [
+            PgWireFrontendMessage::CopyDone(CopyDone::new()),
+            PgWireFrontendMessage::Sync(Sync::new()),
+        ] {
+            client
+                .write_all(&encode_frontend_message(message))
+                .await
+                .expect("write cancel recovery sequence");
+        }
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|(tag, payload)| {
+                    *tag == b'E' && error_field(payload, b'C').as_deref() == Some("57014")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('E'),
+            "explicit transaction should remain aborted after cancel until Sync"
+        );
+
+        let aborted = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert_eq!(
+            aborted
+                .iter()
+                .filter(|(tag, payload)| {
+                    *tag == b'E' && error_field(payload, b'C').as_deref() == Some("25P02")
+                })
+                .count(),
+            1,
+            "statements inside the failed transaction should return transaction_aborted"
+        );
+        assert_eq!(
+            aborted
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('E')
+        );
+
+        let rollback_messages = run_simple_query_roundtrip(&mut client, "ROLLBACK").await;
+        assert_eq!(
+            rollback_messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_to_stdout_cancel_returns_query_canceled_and_recovers_connection() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        let startup_messages = complete_startup(&mut client).await;
+        let (pid, secret) = startup_messages
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .expect("startup should include backend key data");
+
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE copy_out_cancel_t (v INT)").await;
+        run_simple_query_roundtrip(
+            &mut client,
+            "INSERT INTO copy_out_cancel_t SELECT * FROM range(0, 50000)",
+        )
+        .await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new("COPY copy_out_cancel_t TO STDOUT WITH (FORMAT csv)".to_string()),
+            )))
+            .await
+            .expect("write copy out query");
+
+        let mut saw_copy_out_response = false;
+        loop {
+            let (tag, _payload) = read_backend_message(&mut client).await;
+            match tag {
+                b'H' => saw_copy_out_response = true,
+                b'd' => break,
+                other => panic!(
+                    "expected CopyOutResponse/CopyData before cancel, saw tag {}",
+                    other as char
+                ),
+            }
+        }
+
+        assert!(
+            saw_copy_out_response,
+            "COPY TO STDOUT should enter copy-out mode"
+        );
+
+        let mut cancel = TcpStream::connect(addr).await.expect("cancel connection");
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .expect("write cancel request");
+        let mut eof = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+            .await
+            .expect("cancel connection should close")
+            .expect("read cancel EOF");
+        assert_eq!(read, 0);
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|(tag, payload)| {
+                    *tag == b'E' && error_field(payload, b'C').as_deref() == Some("57014")
+                })
+                .count(),
+            1,
+            "cancelled COPY TO STDOUT should surface one query_canceled error"
+        );
+        assert!(
+            !messages.iter().any(|(tag, payload)| {
+                *tag == b'C'
+                    && command_complete_tag(payload)
+                        .map(|tag| tag.starts_with("COPY "))
+                        .unwrap_or(false)
+            }),
+            "cancelled COPY TO STDOUT must not emit a COPY command completion"
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(
+            !probe.iter().any(|(tag, _)| *tag == b'E'),
+            "connection should remain usable after COPY TO STDOUT cancel"
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn statement_timeout_cancels_copy_from_stdin_and_recovers_connection() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE timeout_copy_t (v INT)").await;
+        run_simple_query_roundtrip(&mut client, "SET statement_timeout = 50").await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new("COPY timeout_copy_t FROM STDIN WITH (FORMAT csv)".to_string()),
+            )))
+            .await
+            .expect("write COPY query");
+
+        let setup_messages = read_available_messages(&mut client).await;
+        assert!(setup_messages.iter().any(|(tag, _)| *tag == b'G'));
+
+        sleep(Duration::from_millis(120)).await;
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyDone(
+                CopyDone::new(),
+            )))
+            .await
+            .expect("write copy done after timeout");
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|(tag, payload)| {
+                    *tag == b'E'
+                        && error_field(payload, b'M').as_deref()
+                            == Some("canceling statement due to statement timeout")
+                })
+                .count(),
+            1,
+            "statement_timeout should surface its dedicated error message"
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(
+            !probe.iter().any(|(tag, _)| *tag == b'E'),
+            "connection should stay usable after statement timeout"
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_close_does_not_leak_terminal_query_error_or_ready_for_query() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE force_close_t (v INT)").await;
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new("COPY force_close_t FROM STDIN WITH (FORMAT csv)".to_string()),
+            )))
+            .await
+            .expect("write COPY query");
+
+        let setup_messages = read_available_messages(&mut client).await;
+        assert!(setup_messages.iter().any(|(tag, _)| *tag == b'G'));
+
+        server.broadcast_force_close();
+
+        let mut buf = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("force-closed connection should resolve read")
+            .expect("read after force close");
+        assert_eq!(
+            read, 0,
+            "force close should terminate the socket without protocol epilogue"
         );
 
         server

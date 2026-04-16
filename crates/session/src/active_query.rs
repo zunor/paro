@@ -3,6 +3,7 @@
 
 //! State for the query currently executing in a session.
 
+use crate::execution_control::ActiveStatementControl;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -75,13 +76,13 @@ impl QueryProgress {
 ///
 /// This structure holds all state related to the query that is currently
 /// being executed in a session. It tracks the query string, prepared
-/// statement data, coordinator, and progress information.
+/// statement data, cancellation control, and progress information.
 ///
 ///
 /// # Lifecycle
-/// 1. Created when a query begins (`Session::begin_query_internal`)
+/// 1. Created when a statement begins (`Session::begin_statement_scope`)
 /// 2. Holds coordinator and progress bar during execution
-/// 3. Destroyed when query ends (`Session::end_query_internal`)
+/// 3. Destroyed when the statement ends (`Session::finish_statement_scope`)
 ///
 /// # Thread Safety
 /// This structure is not thread-safe by itself. Access should be
@@ -98,12 +99,12 @@ pub struct ActiveQueryContext {
     /// Query start time for timing.
     start_time: Instant,
 
+    /// Shared cancellation/control-plane handle for the running statement.
+    control: Arc<ActiveStatementControl>,
+
     /// The currently open result (raw pointer for tracking).
     /// This is used to check if a result is still active.
     open_result_id: Option<u64>,
-
-    /// Event coordinator for the running pipeline.
-    coordinator: Option<Arc<EventCoordinator>>,
 
     /// The executor is created per-query and destroyed when the query ends.
     executor: Option<Executor>,
@@ -116,8 +117,8 @@ impl std::fmt::Debug for ActiveQueryContext {
             .field("query", &self.query)
             .field("prepared_name", &self.prepared_name)
             .field("start_time", &self.start_time)
+            .field("control", &self.control)
             .field("open_result_id", &self.open_result_id)
-            .field("has_coordinator", &self.coordinator.is_some())
             .field("has_executor", &self.executor.is_some())
             .finish()
     }
@@ -125,37 +126,45 @@ impl std::fmt::Debug for ActiveQueryContext {
 
 impl ActiveQueryContext {
     /// Creates a new ActiveQueryContext for the given query.
-    pub fn new(query: impl Into<String>) -> Self {
+    pub fn new(query: impl Into<String>, control: Arc<ActiveStatementControl>) -> Self {
         Self {
             query: query.into(),
             prepared_name: None,
             start_time: Instant::now(),
+            control,
             open_result_id: None,
-            coordinator: None,
             executor: None,
         }
     }
 
     /// Creates a context that already owns an executor.
-    pub fn with_executor(query: impl Into<String>, executor: Executor) -> Self {
+    pub fn with_executor(
+        query: impl Into<String>,
+        control: Arc<ActiveStatementControl>,
+        executor: Executor,
+    ) -> Self {
         Self {
             query: query.into(),
             prepared_name: None,
             start_time: Instant::now(),
+            control,
             open_result_id: None,
-            coordinator: None,
             executor: Some(executor),
         }
     }
 
     /// Creates a new ActiveQueryContext with a prepared statement name.
-    pub fn with_prepared(query: impl Into<String>, prepared_name: impl Into<String>) -> Self {
+    pub fn with_prepared(
+        query: impl Into<String>,
+        prepared_name: impl Into<String>,
+        control: Arc<ActiveStatementControl>,
+    ) -> Self {
         Self {
             query: query.into(),
             prepared_name: Some(prepared_name.into()),
             start_time: Instant::now(),
+            control,
             open_result_id: None,
-            coordinator: None,
             executor: None,
         }
     }
@@ -182,6 +191,11 @@ impl ActiveQueryContext {
     #[inline]
     pub fn elapsed(&self) -> std::time::Duration {
         self.start_time.elapsed()
+    }
+
+    #[inline]
+    pub fn control(&self) -> &Arc<ActiveStatementControl> {
+        &self.control
     }
 
     /// Sets the open result ID.
@@ -214,29 +228,15 @@ impl ActiveQueryContext {
     /// # Arguments
     /// * `coordinator` - The event coordinator managing pipeline execution
     pub fn set_coordinator(&mut self, coordinator: Arc<EventCoordinator>) {
-        self.coordinator = Some(coordinator);
+        self.control.set_coordinator(coordinator);
     }
 
     /// Returns a reference to the event coordinator, if any.
     ///
     /// Returns `None` if no query is currently executing or if the
     /// coordinator has not been set.
-    pub fn coordinator(&self) -> Option<&Arc<EventCoordinator>> {
-        self.coordinator.as_ref()
-    }
-
-    /// Cancels the currently executing query.
-    ///
-    /// This method cancels all pending pipeline tasks and marks the
-    /// execution as cancelled. If no coordinator is set, this is a no-op.
-    ///
-    /// # Thread Safety
-    /// This method is safe to call from any thread, as the coordinator
-    /// handles synchronization internally.
-    pub fn cancel(&mut self) {
-        if let Some(ref coordinator) = self.coordinator {
-            coordinator.cancel();
-        }
+    pub fn coordinator(&self) -> Option<Arc<EventCoordinator>> {
+        self.control.coordinator()
     }
 
     /// Checks if a query is currently executing.
@@ -249,9 +249,9 @@ impl ActiveQueryContext {
     /// - No coordinator is set, OR
     /// - The coordinator has completed all events
     pub fn is_executing(&self) -> bool {
-        self.coordinator
-            .as_ref()
-            .map(|c| !c.is_complete())
+        self.control
+            .coordinator()
+            .map(|coordinator| !coordinator.is_complete())
             .unwrap_or(false)
     }
 
@@ -260,7 +260,7 @@ impl ActiveQueryContext {
     /// This should be called when query execution finishes (either
     /// successfully or with an error).
     pub fn clear_coordinator(&mut self) {
-        self.coordinator = None;
+        self.control.clear_coordinator();
     }
 
     // ========================================================================
@@ -312,6 +312,11 @@ impl ActiveQueryContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_control() -> Arc<ActiveStatementControl> {
+        Arc::new(ActiveStatementControl::new(&CancellationToken::new(), None))
+    }
 
     // ------------------------------------------------------------------------
     // QueryProgress Tests
@@ -363,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_active_query_context_new() {
-        let ctx = ActiveQueryContext::new("SELECT 1");
+        let ctx = ActiveQueryContext::new("SELECT 1", test_control());
         assert_eq!(ctx.query(), "SELECT 1");
         assert!(ctx.prepared_name().is_none());
         assert!(!ctx.has_open_result());
@@ -371,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_active_query_context_with_prepared() {
-        let ctx = ActiveQueryContext::with_prepared("SELECT 1", "stmt1");
+        let ctx = ActiveQueryContext::with_prepared("SELECT 1", "stmt1", test_control());
 
         assert_eq!(ctx.query(), "SELECT 1");
         assert_eq!(ctx.prepared_name(), Some("stmt1"));
@@ -379,14 +384,14 @@ mod tests {
 
     #[test]
     fn test_active_query_context_elapsed() {
-        let ctx = ActiveQueryContext::new("SELECT 1");
+        let ctx = ActiveQueryContext::new("SELECT 1", test_control());
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(ctx.elapsed().as_millis() >= 10);
     }
 
     #[test]
     fn test_active_query_context_open_result() {
-        let mut ctx = ActiveQueryContext::new("SELECT 1");
+        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control());
 
         assert!(!ctx.has_open_result());
         assert!(!ctx.is_open_result(42));
@@ -408,7 +413,7 @@ mod tests {
     fn test_active_query_context_coordinator() {
         use paro_scheduler::scheduler::TaskScheduler;
 
-        let mut ctx = ActiveQueryContext::new("SELECT 1");
+        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control());
 
         // Initially no coordinator
         assert!(ctx.coordinator().is_none());
@@ -420,8 +425,8 @@ mod tests {
         ctx.set_coordinator(coordinator.clone());
 
         // Now has coordinator
-        assert!(ctx.coordinator().is_some());
-        assert!(Arc::ptr_eq(ctx.coordinator().unwrap(), &coordinator));
+        let stored = ctx.coordinator().expect("coordinator should be present");
+        assert!(Arc::ptr_eq(&stored, &coordinator));
 
         // Clear coordinator
         ctx.clear_coordinator();
@@ -433,7 +438,7 @@ mod tests {
         use paro_scheduler::event::Event;
         use paro_scheduler::scheduler::TaskScheduler;
 
-        let mut ctx = ActiveQueryContext::new("SELECT 1");
+        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control());
 
         // Not executing initially
         assert!(!ctx.is_executing());
@@ -458,30 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn test_active_query_context_cancel() {
-        use paro_scheduler::scheduler::TaskScheduler;
-
-        let mut ctx = ActiveQueryContext::new("SELECT 1");
-
-        // Cancel without coordinator is a no-op
-        ctx.cancel();
-
-        // Set coordinator
-        let scheduler = Arc::new(TaskScheduler::new());
-        let coordinator = Arc::new(EventCoordinator::new(scheduler));
-        ctx.set_coordinator(coordinator.clone());
-
-        // Cancel should work
-        ctx.cancel();
-
-        // Coordinator should be cancelled (we can't directly check this,
-        // but we can verify the method doesn't panic)
-        assert!(ctx.coordinator().is_some());
-    }
-
-    #[test]
     fn test_active_query_context_debug() {
-        let ctx = ActiveQueryContext::new("SELECT 1");
+        let ctx = ActiveQueryContext::new("SELECT 1", test_control());
         let debug_str = format!("{:?}", ctx);
         assert!(debug_str.contains("ActiveQueryContext"));
         assert!(debug_str.contains("SELECT 1"));

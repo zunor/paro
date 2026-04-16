@@ -6,6 +6,7 @@
 use crate::pipeline::pipeline::Pipeline;
 use crate::thread_context::ThreadContext;
 use paro_common::allocator::{Allocator, ArenaAllocator, BufferAllocator, MemoryTag};
+use paro_common::error::Result;
 use paro_context::StatementContext;
 use std::sync::Arc;
 
@@ -78,6 +79,11 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn is_interrupted(&self) -> bool {
         self.session.is_interrupted()
+    }
+
+    #[inline]
+    pub fn check_cancelled(&self) -> Result<()> {
+        self.session.cancellation.check()
     }
 
     /// Get the current database name.

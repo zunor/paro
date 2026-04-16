@@ -6,6 +6,7 @@
 use crate::active_query::{ActiveQueryContext, QueryProgress};
 use crate::config::SessionConfig;
 use crate::ddl::SessionDdlBridge;
+use crate::execution_control::{ConnectionShutdownReason, SessionExecutionControl};
 use crate::prepared::store::{parameter_types_to_pg_array, PortalStoreMark};
 use crate::registered_state::{RegisteredStateManager, SessionContextState};
 use crate::state::session_metadata::SharedSessionMetadataState;
@@ -27,8 +28,9 @@ use paro_common::version::{pg_compat_server_version, PG_COMPAT_SERVER_VERSION_NU
 use paro_context::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, CompileEnvironmentKey, CursorSummary,
     DatabaseSnapshotIdentity, EffectiveSettings, ExecutionResources, PreparedStatementSummary,
-    QueryResources, RuntimeLimits, SessionMetadataRows, StatementCancellation, StatementContext,
-    StatementEnvironment, StatementOptions, StatementSource, StatementView,
+    QueryResources, RuntimeLimits, SessionMetadataRows, StatementCancelReason,
+    StatementCancellation, StatementContext, StatementEnvironment, StatementOptions,
+    StatementSource, StatementView,
 };
 use paro_execution::operator::ddl::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
@@ -39,7 +41,6 @@ use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::metrics::storage_metrics;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio_util::sync::CancellationToken;
 
 const STARTUP_SERVER_ENCODING: &str = "UTF8";
 const STARTUP_CLIENT_ENCODING: &str = "UTF8";
@@ -66,8 +67,8 @@ pub struct Session {
     pub session_metadata: Arc<SharedSessionMetadataState>,
     /// Data for the currently running transaction
     pub transaction: SessionTransaction,
-    /// Whether or not the query is interrupted
-    pub cancel_token: CancellationToken,
+    /// Shared execution control separating connection shutdown from statement cancellation.
+    execution_control: Arc<SessionExecutionControl>,
     /// The current attached database this session is pointing to
     pub current_database: Arc<DatabaseHandle>,
     /// Per-query execution state owned by the currently running front-end statement.
@@ -109,7 +110,11 @@ impl Session {
         self.transaction.active_transaction().ok()
     }
 
-    pub fn freeze_statement_context(&self, options: StatementOptions) -> Arc<StatementContext> {
+    pub fn freeze_statement_context(
+        &self,
+        options: StatementOptions,
+        cancellation: StatementCancellation,
+    ) -> Arc<StatementContext> {
         let settings = Arc::new(EffectiveSettings::new(self.effective_settings.clone()));
         let runtime_tuning = self.instance.runtime_tuning().snapshot();
         let scheduler_threads = self.instance.get_scheduler().number_of_threads().max(1) as usize;
@@ -188,10 +193,11 @@ impl Session {
                 databases,
             )),
             limits,
-            cancellation: StatementCancellation::new(
-                self.cancel_token.clone(),
-                settings.statement_timeout(),
-            ),
+            cancellation,
+            execution_tracker: self
+                .execution_control
+                .active_statement()
+                .map(|statement| statement as Arc<dyn paro_context::StatementExecutionTracker>),
             services: Arc::new(QueryResources {
                 infra: Arc::new(ExecutionResources {
                     scheduler: self.instance.get_scheduler().clone(),
@@ -211,17 +217,23 @@ impl Session {
     }
 
     pub fn freeze_query_context(&self) -> Arc<StatementContext> {
-        self.freeze_statement_context(StatementOptions {
-            source: StatementSource::SimpleQuery,
-            ..StatementOptions::default()
-        })
+        self.freeze_statement_context(
+            StatementOptions {
+                source: StatementSource::SimpleQuery,
+                ..StatementOptions::default()
+            },
+            self.compile_scope_cancellation(),
+        )
     }
 
     pub fn freeze_internal_statement_context(&self) -> Arc<StatementContext> {
-        self.freeze_statement_context(StatementOptions {
-            source: StatementSource::Internal,
-            ..StatementOptions::default()
-        })
+        self.freeze_statement_context(
+            StatementOptions {
+                source: StatementSource::Internal,
+                ..StatementOptions::default()
+            },
+            self.compile_scope_cancellation(),
+        )
     }
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
@@ -230,6 +242,20 @@ impl Session {
 
     /// Create a new session with a specific user name.
     pub fn with_user(id: u64, instance: Arc<Instance>, user_name: impl Into<String>) -> Self {
+        Self::with_user_and_execution_control(
+            id,
+            instance,
+            user_name,
+            Arc::new(SessionExecutionControl::new()),
+        )
+    }
+
+    pub(crate) fn with_user_and_execution_control(
+        id: u64,
+        instance: Arc<Instance>,
+        user_name: impl Into<String>,
+        execution_control: Arc<SessionExecutionControl>,
+    ) -> Self {
         let current_database = instance
             .database_registry()
             .default_database()
@@ -247,7 +273,7 @@ impl Session {
             state: SessionState::new(&default_db_name, &user_name),
             session_metadata: Arc::new(SharedSessionMetadataState::default()),
             transaction: SessionTransaction::new(),
-            cancel_token: CancellationToken::new(),
+            execution_control,
             current_database,
             active_query: None,
             query_progress: QueryProgress::default(),
@@ -351,14 +377,17 @@ impl Session {
         self.config = SessionConfig::default();
         self.state.reset(self.current_database.name());
         self.transaction = SessionTransaction::new();
-        self.cancel_token = CancellationToken::new();
+        if let Some(active) = self.active_query.take() {
+            self.execution_control.finish_statement(active.control());
+        }
+        self.query_progress = QueryProgress::default();
         reconcile_effective_settings(self)
             .expect("builtin session settings must reconcile on session reset");
         self.refresh_session_metadata();
     }
 
-    pub fn interrupt(&self) {
-        self.cancel_token.cancel();
+    pub fn execution_control(&self) -> &Arc<SessionExecutionControl> {
+        &self.execution_control
     }
 
     pub fn copy_stdin_memory_limit(&self) -> usize {
@@ -472,16 +501,24 @@ impl Session {
     ///
     /// Creates ActiveQueryContext but NOT the Executor.
     /// The Executor is created later when actually executing (in execute_statement).
-    pub fn begin_query_internal(&mut self, query: &str) {
+    pub fn begin_statement_scope(&mut self, query: &str) {
         let buffer_pool = self.instance.get_buffer_pool();
         self.refresh_temporary_memory_configuration();
         storage_metrics().set_memory_usage_snapshot(&buffer_pool.get_memory_usage_info());
 
-        let ctx = ActiveQueryContext::new(query);
+        let control = self
+            .execution_control
+            .begin_statement(self.current_statement_timeout());
+        let ctx = ActiveQueryContext::new(query, control);
         self.active_query = Some(ctx);
         self.query_progress.initialize();
         self.registered_state.notify_query_begin();
-        tracing::trace!(target: targets::QUERY, session_id = self.id, query, "query started");
+        tracing::trace!(
+            target: targets::QUERY,
+            session_id = self.id,
+            query,
+            "statement scope started"
+        );
     }
 
     /// Refresh temporary memory manager configuration using current session + instance runtime settings.
@@ -497,40 +534,40 @@ impl Session {
     /// This should be called when query execution completes (success or failure).
     ///
     /// - `ClientContext::EndQueryInternal()`
-    pub fn end_query_internal(&mut self, success: bool) {
+    pub fn finish_statement_scope(&mut self, success: bool) {
         self.registered_state.notify_query_end(None);
 
-        if let Some(ref ctx) = self.active_query {
+        if let Some(ctx) = self.active_query.take() {
             let elapsed = ctx.elapsed();
+            self.execution_control.finish_statement(ctx.control());
             tracing::trace!(
                 target: targets::QUERY,
                 session_id = self.id,
                 success,
                 elapsed_ms = elapsed.as_millis(),
-                "query ended"
+                "statement scope finished"
             );
         }
-        self.active_query = None;
         self.query_progress = QueryProgress::default();
     }
 
     /// Ends the current query context with an error.
     ///
     /// This variant allows passing the actual error to registered states.
-    pub fn end_query_internal_with_error(&mut self, error: &ParoError) {
+    pub fn finish_statement_scope_with_error(&mut self, error: &ParoError) {
         self.registered_state.notify_query_end(Some(error));
 
-        if let Some(ref ctx) = self.active_query {
+        if let Some(ctx) = self.active_query.take() {
             let elapsed = ctx.elapsed();
+            self.execution_control.finish_statement(ctx.control());
             tracing::trace!(
                 target: targets::QUERY,
                 session_id = self.id,
                 success = false,
                 elapsed_ms = elapsed.as_millis(),
-                "query ended with error"
+                "statement scope finished with error"
             );
         }
-        self.active_query = None;
         self.query_progress = QueryProgress::default();
     }
 
@@ -565,32 +602,44 @@ impl Session {
 
     /// Cancels the current query if one is active.
     ///
-    /// This sets the cancellation token and marks the query as cancelled.
-    /// The actual cancellation is cooperative - execution code must check
-    /// `is_interrupted()` periodically.
-    ///
-    /// - `ClientContext::Interrupt()`
-    pub fn cancel_query(&self) {
-        if self.has_active_query() {
-            tracing::info!(target: targets::QUERY, session_id = self.id, "cancelling active query");
-            self.cancel_token.cancel();
+    /// Requests cancellation of the current active statement.
+    pub fn cancel_active_statement(&self) {
+        if self
+            .execution_control
+            .cancel_active_statement(StatementCancelReason::UserRequest)
+        {
+            tracing::info!(
+                target: targets::QUERY,
+                session_id = self.id,
+                "cancelling active statement"
+            );
         }
     }
 
-    /// Checks if the current query should be cancelled.
-    ///
-    /// This should be called periodically during query execution to
-    /// support cooperative cancellation.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Err(ParoError::Interrupt)` if the query was cancelled,
-    /// `Ok(())` otherwise.
-    pub fn check_cancelled(&self) -> Result<()> {
-        if self.cancel_token.is_cancelled() {
-            Err(paro_error::query_canceled())
-        } else {
-            Ok(())
+    pub fn request_connection_shutdown(&self, reason: ConnectionShutdownReason) {
+        self.execution_control.request_connection_shutdown(reason);
+    }
+
+    pub fn current_statement_cancellation(&self) -> Option<StatementCancellation> {
+        self.execution_control
+            .active_statement()
+            .map(|statement| statement.cancellation())
+    }
+
+    pub fn current_statement_execution_attempt(&self) -> Option<StatementCancellation> {
+        self.current_statement_cancellation()
+            .map(|cancellation| cancellation.child_execution_attempt())
+    }
+
+    pub fn compile_scope_cancellation(&self) -> StatementCancellation {
+        self.execution_control
+            .compile_scope_cancellation(self.current_statement_timeout())
+    }
+
+    pub fn check_active_statement_cancellation(&self) -> Result<()> {
+        match self.current_statement_cancellation() {
+            Some(cancellation) => cancellation.check(),
+            None => Ok(()),
         }
     }
 
@@ -620,7 +669,7 @@ impl Session {
     /// Panics if there is no active query or if the executor has not been initialized.
     ///
     /// The Executor is owned by `ActiveQueryContext` and created when execution starts
-    /// (not in `begin_query_internal()`). This ensures proper cleanup when queries end.
+    /// (not in `begin_statement_scope()`). This ensures proper cleanup when queries end.
     pub fn get_executor(&self) -> &Executor {
         self.active_query
             .as_ref()
@@ -642,7 +691,7 @@ impl Session {
 
     /// Sets the executor for the current active query.
     ///
-    /// This should be called when execution starts, after `begin_query_internal()`.
+    /// This should be called when execution starts, after `begin_statement_scope()`.
     ///
     /// # Panics
     ///
@@ -770,8 +819,12 @@ impl Session {
 
     /// Returns whether the query has been interrupted.
     #[inline]
-    pub fn is_interrupted(&self) -> bool {
-        self.cancel_token.is_cancelled()
+    pub fn connection_shutdown_requested(&self) -> bool {
+        self.execution_control.connection_shutdown_requested()
+    }
+
+    fn current_statement_timeout(&self) -> Option<std::time::Duration> {
+        EffectiveSettings::new(self.effective_settings.clone()).statement_timeout()
     }
 
     // ============================================================

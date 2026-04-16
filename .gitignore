@@ -1,12 +1,15 @@
-# Build artifacts
+# Rust / Cargo
 /target/
 /crates/*/target/
+**/*.rs.bk
 
-# IDE
+# IDE / Editor
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
+*.iml
 
 # OS
 .DS_Store
@@ -15,34 +18,36 @@ Thumbs.db
 # Logs
 *.log
 
-# In-memory test artifacts (should never be created, safety net)
-:memory:
+# Environment / Local config
+.env
+.env.*
 
-# Data
-/data
+# Data (runtime / test)
+/data/
 /crates/session/data/
+:memory:
 
 # Local CI
 /.ci/
-
-# Local config
-.env
-.env.local
 
 # AI workflow
 .agents/
 .kiro/
 .gemini/
 .cursor/
-.claude/
 
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
 .pytest_cache/
 .venv/
-regress/.venv/
+
+# Regression suite
 /regress/report/
-benchmark/.venv/
+/regress/.venv/
+
+# Benchmark
 /benchmark/report/*
 !/benchmark/report/.gitkeep
+/benchmark/.venv/

@@ -3,8 +3,9 @@
 
 //! PostgreSQL protocol-compatible network server.
 
-mod client_connection;
+mod cancel;
 mod command_line;
+mod connection;
 mod connection_control;
 mod protocol;
 mod server;

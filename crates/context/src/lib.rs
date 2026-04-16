@@ -7,6 +7,7 @@ mod attached_databases;
 mod ddl;
 mod effective_settings;
 mod execution_resources;
+mod execution_tracker;
 mod query_resources;
 mod runtime_limits;
 mod session_metadata;
@@ -28,6 +29,7 @@ pub use attached_databases::{
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use effective_settings::EffectiveSettings;
 pub use execution_resources::ExecutionResources;
+pub use execution_tracker::StatementExecutionTracker;
 pub use query_resources::{
     ConnectionInfoProvider, ConnectionInfoSnapshot, GraphIndexProvider, GraphRegistry,
     QueryResourceGovernance, QueryResources, SharedPlanCacheHandle,
@@ -38,7 +40,8 @@ pub use session_metadata::{
     SettingRow,
 };
 pub use statement_cancellation::{
-    NoopStatementTimeoutDriver, StatementCancellation, StatementTimeoutDriver,
+    NoopStatementTimeoutDriver, StatementCancelReason, StatementCancellation,
+    StatementTimeoutDriver,
 };
 pub use statement_context::{CompileEnvironmentKey, StatementContext};
 pub use statement_environment::{StatementAuthContext, StatementEnvironment};

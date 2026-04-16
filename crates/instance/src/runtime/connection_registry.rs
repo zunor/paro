@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Manages active client connections to the database instance.
+//! Tracks active client connections to the database instance.
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -11,8 +11,8 @@ use std::sync::{Arc, Weak};
 /// Unique identifier for a connection.
 pub type ConnectionId = u64;
 
-/// Trait for objects that can be managed by the ConnectionManager.
-pub trait ManagedConnection: Send + Sync {
+/// Trait for objects that can be tracked by the connection registry.
+pub trait ConnectionHandle: Send + Sync {
     /// Get the unique connection ID.
     fn connection_id(&self) -> ConnectionId;
 
@@ -23,17 +23,17 @@ pub trait ManagedConnection: Send + Sync {
     fn description(&self) -> String;
 }
 
-/// Manages active client connections to the database instance.
+/// Tracks active client connections to the database instance.
 ///
 /// It tracks all active connections and provides methods to:
 /// - Add/remove connections
 /// - List all connections
 /// - Assign unique connection IDs
-pub struct ConnectionManager {
+pub struct ConnectionRegistry {
     /// Map of connection ID to weak reference of the connection.
     /// Using weak references allows connections to be dropped when
     /// no longer in use, while still being tracked here.
-    connections: RwLock<HashMap<ConnectionId, Weak<dyn ManagedConnection>>>,
+    connections: RwLock<HashMap<ConnectionId, Weak<dyn ConnectionHandle>>>,
 
     /// Lock for connection modifications.
     connections_lock: Mutex<()>,
@@ -45,14 +45,14 @@ pub struct ConnectionManager {
     next_connection_id: AtomicU64,
 }
 
-impl Default for ConnectionManager {
+impl Default for ConnectionRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ConnectionManager {
-    /// Create a new ConnectionManager.
+impl ConnectionRegistry {
+    /// Create a new connection registry.
     pub fn new() -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
@@ -73,7 +73,7 @@ impl ConnectionManager {
     }
 
     /// Add a connection to the manager.
-    pub fn add_connection(&self, connection: Arc<dyn ManagedConnection>) {
+    pub fn add_connection(&self, connection: Arc<dyn ConnectionHandle>) {
         let _guard = self.connections_lock.lock();
         let id = connection.connection_id();
         let mut connections = self.connections.write();
@@ -97,7 +97,7 @@ impl ConnectionManager {
     ///
     /// This cleans up stale (dropped) connections and returns
     /// only the ones that are still alive.
-    pub fn get_connection_list(&self) -> Vec<Arc<dyn ManagedConnection>> {
+    pub fn get_connection_list(&self) -> Vec<Arc<dyn ConnectionHandle>> {
         let connections = self.connections.read();
         let mut result = Vec::new();
         let mut stale_ids = Vec::new();
@@ -146,10 +146,7 @@ impl ConnectionManager {
     }
 
     /// Get a specific connection by ID.
-    pub fn get_connection(
-        &self,
-        connection_id: ConnectionId,
-    ) -> Option<Arc<dyn ManagedConnection>> {
+    pub fn get_connection(&self, connection_id: ConnectionId) -> Option<Arc<dyn ConnectionHandle>> {
         let connections = self.connections.read();
         connections
             .get(&connection_id)
@@ -158,9 +155,9 @@ impl ConnectionManager {
     }
 }
 
-impl std::fmt::Debug for ConnectionManager {
+impl std::fmt::Debug for ConnectionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectionManager")
+        f.debug_struct("ConnectionRegistry")
             .field("connection_count", &self.get_connection_count())
             .field("next_connection_id", &self.current_connection_id())
             .finish()
@@ -189,7 +186,7 @@ mod tests {
         }
     }
 
-    impl ManagedConnection for TestConnection {
+    impl ConnectionHandle for TestConnection {
         fn connection_id(&self) -> ConnectionId {
             self.id
         }
@@ -204,8 +201,8 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_manager_basic() {
-        let manager = ConnectionManager::new();
+    fn test_connection_registry_basic() {
+        let manager = ConnectionRegistry::new();
 
         // Assign IDs
         let id1 = manager.assign_connection_id();
@@ -225,8 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_manager_remove() {
-        let manager = ConnectionManager::new();
+    fn test_connection_registry_remove() {
+        let manager = ConnectionRegistry::new();
 
         let id = manager.assign_connection_id();
         let conn = Arc::new(TestConnection::new(id));
@@ -242,8 +239,8 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_manager_stale_cleanup() {
-        let manager = ConnectionManager::new();
+    fn test_connection_registry_stale_cleanup() {
+        let manager = ConnectionRegistry::new();
 
         let id1 = manager.assign_connection_id();
         let id2 = manager.assign_connection_id();
@@ -264,8 +261,8 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_manager_get_connection() {
-        let manager = ConnectionManager::new();
+    fn test_connection_registry_get_connection() {
+        let manager = ConnectionRegistry::new();
 
         let id = manager.assign_connection_id();
         let conn = Arc::new(TestConnection::new(id));
@@ -282,8 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_manager_weak_reference() {
-        let manager = ConnectionManager::new();
+    fn test_connection_registry_weak_reference() {
+        let manager = ConnectionRegistry::new();
 
         let id = manager.assign_connection_id();
         {

@@ -1601,6 +1601,7 @@ dependencies = [
  "paro-scheduler",
  "paro-storage",
  "serde_json",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1625,6 +1626,7 @@ dependencies = [
  "parking_lot",
  "paro-catalog",
  "paro-common",
+ "paro-context",
  "paro-function",
  "paro-parser",
  "paro-scheduler",
@@ -1727,6 +1729,7 @@ dependencies = [
  "paro-session",
  "paro-storage",
  "pgwire",
+ "rand 0.8.5",
  "serde",
  "serial_test",
  "tempfile",
@@ -1739,7 +1742,9 @@ dependencies = [
 name = "paro-session"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
+ "parking_lot",
  "paro-catalog",
  "paro-common",
  "paro-compiler",

@@ -95,10 +95,15 @@ async fn execute_prepare<S: ProtocolResultSink>(
     }
 
     let raw_stmt = (*stmt.statement).clone();
-    let snapshot = session.freeze_statement_context(StatementOptions {
-        source: StatementSource::PreparedSql,
-        ..StatementOptions::default()
-    });
+    let snapshot = session.freeze_statement_context(
+        StatementOptions {
+            source: StatementSource::PreparedSql,
+            ..StatementOptions::default()
+        },
+        session
+            .current_statement_cancellation()
+            .expect("PREPARE requires an active statement scope"),
+    );
     let parameter_types = if parameter_types.is_empty() {
         vec![None; placeholder_count]
     } else {
@@ -190,10 +195,15 @@ async fn execute_execute<S: ProtocolResultSink>(
         }
     };
 
-    let snapshot = session.freeze_statement_context(StatementOptions {
-        source: StatementSource::PreparedSql,
-        ..StatementOptions::default()
-    });
+    let snapshot = session.freeze_statement_context(
+        StatementOptions {
+            source: StatementSource::PreparedSql,
+            ..StatementOptions::default()
+        },
+        session
+            .current_statement_cancellation()
+            .expect("EXECUTE requires an active statement scope"),
+    );
 
     let compiled =
         match select_execute_plan(session, &name, &entry, snapshot.clone(), &bound_params) {
@@ -286,10 +296,15 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         session.begin_transaction_internal()?;
     }
 
-    let snapshot = session.freeze_statement_context(StatementOptions {
-        source: StatementSource::PreparedSql,
-        ..StatementOptions::default()
-    });
+    let snapshot = session.freeze_statement_context(
+        StatementOptions {
+            source: StatementSource::PreparedSql,
+            ..StatementOptions::default()
+        },
+        session
+            .current_statement_cancellation()
+            .expect("DECLARE CURSOR requires an active statement scope"),
+    );
     let compiled = match compile_statement(snapshot.clone(), (*stmt.query).clone()) {
         Ok(compiled) => compiled,
         Err(err) => {
@@ -340,7 +355,6 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         execution_state: PortalExecutionState::Active(PortalCursor {
             position: -1,
             execution: ExecutionCursorHandle::materialized(materialized),
-            cancellation: snapshot.cancellation.clone(),
         }),
         completion: None,
         dependency_epoch: session.transaction.visible_version().unwrap_or(0),
@@ -365,6 +379,7 @@ async fn execute_fetch<S: ProtocolResultSink>(
     move_only: bool,
     sink: &mut S,
 ) -> Result<()> {
+    session.check_active_statement_cancellation()?;
     let portal = session
         .state
         .get_portal_mut(stmt.cursor.name.as_str())
@@ -372,9 +387,6 @@ async fn execute_fetch<S: ProtocolResultSink>(
 
     let (outcome, result_schema) = match &mut portal.execution_state {
         PortalExecutionState::Active(cursor) => {
-            if cursor.cancellation.is_cancelled() {
-                return Err(paro_error::query_canceled());
-            }
             let outcome = cursor
                 .execution
                 .fetch(
@@ -732,10 +744,15 @@ async fn evaluate_scalar_expr(session: &Session, expr: &Expr) -> Result<Value> {
     let stmt = paro_parser::parse_one(&sql)
         .map_err(|err| paro_error::from_parser(err.to_string()))?
         .stmt;
-    let ctx = session.freeze_statement_context(StatementOptions {
-        source: StatementSource::PreparedSql,
-        ..StatementOptions::default()
-    });
+    let ctx = session.freeze_statement_context(
+        StatementOptions {
+            source: StatementSource::PreparedSql,
+            ..StatementOptions::default()
+        },
+        session
+            .current_statement_execution_attempt()
+            .unwrap_or_else(|| session.compile_scope_cancellation()),
+    );
     let compiled = compile_statement(ctx.clone(), stmt)?;
     let executor = Executor::new(ctx);
     let mut stream = executor.execute(compiled)?;

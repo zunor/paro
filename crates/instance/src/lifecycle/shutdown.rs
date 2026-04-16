@@ -42,7 +42,7 @@ impl Instance {
 
         let active_connections = self
             .runtime
-            .connection_manager()
+            .connection_registry()
             .get_active_connection_count();
         if active_connections != 0 {
             return Err(paro_error::cannot_connect_now().detail(format!(

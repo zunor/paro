@@ -247,6 +247,10 @@ impl EventCoordinator {
         self.scheduler.signal_task_rescheduled();
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
     /// Check if execution has completed (all events finished).
     pub fn is_complete(&self) -> bool {
         self.completed_events.load(Ordering::SeqCst) >= self.total_events.load(Ordering::SeqCst)

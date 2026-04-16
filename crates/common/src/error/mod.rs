@@ -138,6 +138,7 @@ pub use make_system::io;
 pub use make_system::io_error;
 pub use make_system::protocol_violation;
 pub use make_system::query_canceled;
+pub use make_system::statement_timeout;
 pub use make_system::system_error;
 
 // Internal errors

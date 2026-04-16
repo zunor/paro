@@ -55,6 +55,7 @@ tracing = { workspace = true }
 parking_lot = "0.12"
 num_cpus = "1.16"
 serde_json = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }

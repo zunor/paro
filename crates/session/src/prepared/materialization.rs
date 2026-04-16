@@ -15,10 +15,10 @@ use crate::Session;
 ///
 /// # Preconditions
 ///
-/// Callers must have already invoked `session.begin_query_internal()` so the
-/// session owns an active query context. This helper initializes the executor
+/// Callers must have already invoked `session.begin_statement_scope()` so the
+/// session owns an active statement context. This helper initializes the executor
 /// through `session.set_executor()` and runs it through `session.get_executor()`,
-/// both of which panic when no active query is present.
+/// both of which panic when no active statement is present.
 pub(crate) async fn materialize_compiled_statement(
     session: &mut Session,
     ctx: Arc<StatementContext>,

@@ -23,7 +23,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
 use paro_compiler::{compile_statement, compile_statement_with_parameters};
-use paro_context::{StatementOptions, StatementSource};
+use paro_context::{StatementCancellation, StatementOptions, StatementSource};
 use paro_execution::query_executor::executor::Executor;
 use paro_parser::ast::{CopyDirection, CopySource, CopyStmt, CopyTarget, ExecuteStmt, Statement};
 use std::time::Instant;
@@ -86,6 +86,7 @@ impl Session {
                     } else if self.is_in_explicit_block() {
                         self.set_transaction_failed();
                         final_result = Err(e);
+                        break;
                     } else {
                         final_result = Err(e);
                         break;
@@ -134,7 +135,7 @@ impl Session {
         );
 
         let query_str = stmt.to_string();
-        self.begin_query_internal(&query_str);
+        self.begin_statement_scope(&query_str);
 
         let route = dispatch_statement(stmt.clone());
         debug!(
@@ -151,8 +152,8 @@ impl Session {
             .await;
 
         match &result {
-            Ok(()) => self.end_query_internal(true),
-            Err(e) => self.end_query_internal_with_error(e),
+            Ok(()) => self.finish_statement_scope(true),
+            Err(e) => self.finish_statement_scope_with_error(e),
         }
 
         debug!(
@@ -291,11 +292,15 @@ impl Session {
         let statement_completion = initial_statement_completion(&stmt);
         let started_at = Instant::now();
 
-        let ctx = self.freeze_statement_context(StatementOptions {
-            statement_format,
-            source,
-            ..StatementOptions::default()
-        });
+        let ctx = self.freeze_statement_context(
+            StatementOptions {
+                statement_format,
+                source,
+                ..StatementOptions::default()
+            },
+            self.current_statement_cancellation()
+                .expect("query pipeline requires an active statement scope"),
+        );
 
         debug!(
             target: targets::QUERY,
@@ -513,11 +518,15 @@ impl Session {
         let statement_completion = StatementCompletion::Copy { rows: 0 };
         let started_at = Instant::now();
 
-        let ctx = self.freeze_statement_context(StatementOptions {
-            statement_format,
-            source,
-            ..StatementOptions::default()
-        });
+        let ctx = self.freeze_statement_context(
+            StatementOptions {
+                statement_format,
+                source,
+                ..StatementOptions::default()
+            },
+            self.current_statement_cancellation()
+                .expect("COPY execution requires an active statement scope"),
+        );
 
         debug!(
             target: targets::QUERY,
@@ -614,8 +623,11 @@ impl Session {
         };
         protocol_source.begin_copy_in(&spec).await?;
 
+        let cancellation = self
+            .current_statement_cancellation()
+            .expect("COPY FROM STDIN requires an active statement scope");
         let payload = FramedCopySourceBridge::new(self.copy_stdin_memory_limit())
-            .collect(protocol_source)
+            .collect(protocol_source, cancellation)
             .await?;
         let virtual_path = paro_function::table::read_csv::register_copy_stdin_payload(payload);
         let mut rewritten = copy_stmt.clone();
@@ -834,8 +846,13 @@ impl FramedCopySourceBridge {
         }
     }
 
-    async fn collect(mut self, source: &mut dyn CopyProtocolSource) -> Result<Vec<u8>> {
+    async fn collect(
+        mut self,
+        source: &mut dyn CopyProtocolSource,
+        cancellation: StatementCancellation,
+    ) -> Result<Vec<u8>> {
         while let Some(chunk) = source.next_chunk().await? {
+            cancellation.check()?;
             let new_len = self.buffer.len().checked_add(chunk.len()).ok_or_else(|| {
                 copy_stdin_metrics().record_rejection(CopyStdinRejectReason::TotalLimit);
                 paro_error::configuration_limit_exceeded("COPY FROM STDIN payload overflow")
@@ -852,6 +869,7 @@ impl FramedCopySourceBridge {
             self.buffer.extend_from_slice(&chunk);
             copy_stdin_metrics().observe_buffer_bytes(self.tracked_bytes, new_len);
             self.tracked_bytes = new_len;
+            cancellation.check()?;
         }
         Ok(std::mem::take(&mut self.buffer))
     }
@@ -897,7 +915,10 @@ mod tests {
         };
 
         let payload = FramedCopySourceBridge::new(16)
-            .collect(&mut source)
+            .collect(
+                &mut source,
+                StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+            )
             .await
             .unwrap();
         assert_eq!(payload, b"12345");
@@ -917,7 +938,10 @@ mod tests {
         };
 
         let err = FramedCopySourceBridge::new(4)
-            .collect(&mut source)
+            .collect(
+                &mut source,
+                StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+            )
             .await
             .expect_err("payload should exceed limit");
         assert!(err

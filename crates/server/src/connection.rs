@@ -3,17 +3,20 @@
 
 //! Per-client PostgreSQL wire-protocol loop.
 
+use crate::cancel::backend_key::BackendCancelKey;
 use paro_common::logging::targets;
-use paro_instance::{Instance, ManagedConnection};
+use paro_instance::{ConnectionHandle, Instance, SessionExecutionHandle, StatementCancelReason};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use paro_common::runtime_value::Value;
 use paro_session::{
-    copy_stdin_metrics, BindMessage, CloseTarget, CopyStdinRejectReason, DescribeTarget,
-    ExecutePortalMessage, ExtendedQueryMessage, ExtendedQueryResponder, ParseMessage, Session,
-    TransactionState,
+    copy_stdin_metrics, BindMessage, CloseTarget, ConnectionShutdownReason, CopyStdinRejectReason,
+    DescribeTarget, ExecutePortalMessage, ExtendedQueryMessage, ExtendedQueryResponder,
+    ParseMessage, Session, TransactionState,
 };
 use pgwire::error::PgWireError;
 use pgwire::messages::copy::{
@@ -21,7 +24,7 @@ use pgwire::messages::copy::{
 };
 use pgwire::messages::extendedquery::{MESSAGE_TYPE_BYTE_FLUSH, MESSAGE_TYPE_BYTE_SYNC};
 use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
-use pgwire::messages::startup::{Authentication, ParameterStatus};
+use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus, SecretKey};
 use pgwire::messages::terminate::MESSAGE_TYPE_BYTE_TERMINATE;
 use pgwire::messages::{
     DecodeContext, PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion,
@@ -37,7 +40,7 @@ use tracing::Instrument;
 
 use crate::connection_control::{ServerConnectionControl, ServerLimits};
 use crate::protocol::extended::PgWireExtendedQueryResponder;
-use crate::protocol::result::build_error_response_message;
+use crate::protocol::result::{build_error_response, build_error_response_message};
 use crate::protocol::simple::ProtocolSink;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,10 +101,17 @@ pub(crate) struct Connection {
     drain_token: CancellationToken,
     /// Server-side token that asks the connection to force-close.
     force_close_token: CancellationToken,
+    /// Frontend messages already decoded inside protocol subroutines and handed back to the
+    /// main connection loop.
+    pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
     /// The active session. Initialized after handshake.
     session: Option<Session>,
-    /// Whether this connection has been mirrored into Instance::ConnectionManager.
-    mirrored_in_connection_manager: bool,
+    /// Stable backend cancel key advertised after startup.
+    backend_key: Option<BackendCancelKey>,
+    /// Whether this connection has been mirrored into Instance::ConnectionRegistry.
+    mirrored_in_connection_registry: bool,
+    /// Whether this connection has been registered in the session execution registry.
+    registered_in_session_registry: bool,
     /// Protocol state for extended query error recovery.
     protocol_state: FrontendProtocolState,
     /// Whether we have an open extended-query pipeline waiting for `Sync`.
@@ -147,8 +157,11 @@ impl Connection {
             copy_stdin_memory_limit,
             drain_token,
             force_close_token,
+            pending_frontend_messages: Arc::new(Mutex::new(VecDeque::new())),
             session: None,
-            mirrored_in_connection_manager: false,
+            backend_key: None,
+            mirrored_in_connection_registry: false,
+            registered_in_session_registry: false,
             protocol_state: FrontendProtocolState::Ready,
             extended_query_pipeline_open: false,
         }
@@ -224,6 +237,12 @@ impl Connection {
                 Ok(DispatchResult::Continue {
                     send_ready_for_query,
                 }) => {
+                    if self.should_terminate_without_protocol_epilogue() {
+                        if self.force_close_token.is_cancelled() {
+                            self.force_close_session();
+                        }
+                        break;
+                    }
                     if send_ready_for_query {
                         self.send_ready_for_query().await?;
                     }
@@ -335,8 +354,10 @@ impl Connection {
                         )?;
                     }
 
+                    self.backend_key = Some(BackendCancelKey::generate());
                     self.session = Some(session);
-                    self.register_connection_manager_mirror();
+                    self.register_session_registry_entry();
+                    self.register_connection_registry_mirror();
 
                     // No auth implemented yet, just say OK
                     self.socket
@@ -357,6 +378,15 @@ impl Connection {
                             .await?;
                     }
 
+                    if let Some(backend_key) = self.backend_key {
+                        self.socket
+                            .send(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                                backend_key.pid().value(),
+                                SecretKey::I32(backend_key.secret().value()),
+                            )))
+                            .await?;
+                    }
+
                     // Send ReadyForQuery to complete the handshake
                     self.send_ready_for_query().await?;
 
@@ -370,13 +400,7 @@ impl Connection {
                     return Ok(());
                 }
                 PgWireFrontendMessage::CancelRequest(cancel) => {
-                    tracing::warn!(
-                        target: targets::CONNECTION,
-                        session_id = self.id,
-                        cancel_pid = cancel.pid,
-                        cancel_secret = ?cancel.secret_key,
-                        "CancelRequest received during startup but cancellation is not implemented yet"
-                    );
+                    self.handle_cancel_request(cancel)?;
                     return Ok(());
                 }
                 PgWireFrontendMessage::PasswordMessageFamily(_) => {
@@ -410,6 +434,22 @@ impl Connection {
     }
 
     async fn recv_frontend_message(&mut self) -> anyhow::Result<Option<PgWireFrontendMessage>> {
+        if self.force_close_token.is_cancelled() {
+            self.force_close_session();
+            return Ok(None);
+        }
+        if self.drain_token.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(message) = self
+            .pending_frontend_messages
+            .lock()
+            .expect("pending frontend queue")
+            .pop_front()
+        {
+            return Ok(Some(message));
+        }
+
         tokio::select! {
             biased;
             _ = self.force_close_token.cancelled() => {
@@ -605,16 +645,8 @@ impl Connection {
                 })
             }
             PgWireFrontendMessage::CancelRequest(cancel) => {
-                tracing::warn!(
-                    target: targets::CONNECTION,
-                    session_id = self.id,
-                    cancel_pid = cancel.pid,
-                    cancel_secret = ?cancel.secret_key,
-                    "CancelRequest reached normal dispatch path unexpectedly"
-                );
-                Ok(DispatchResult::Continue {
-                    send_ready_for_query: false,
-                })
+                self.handle_cancel_request(cancel)?;
+                Ok(DispatchResult::Terminate)
             }
             PgWireFrontendMessage::PasswordMessageFamily(_) => {
                 self.send_error_response("08P01", "unexpected authentication message")
@@ -673,8 +705,20 @@ impl Connection {
     ) -> anyhow::Result<()> {
         self.begin_extended_query_pipeline();
 
+        let execution_control = self
+            .session
+            .as_ref()
+            .expect("session must be initialized")
+            .execution_control()
+            .clone();
         let session = self.session.as_mut().expect("session must be initialized");
-        let mut responder = PgWireExtendedQueryResponder::new(&mut self.socket);
+        let mut responder = PgWireExtendedQueryResponder::new(
+            &mut self.socket,
+            execution_control,
+            self.drain_token.clone(),
+            self.force_close_token.clone(),
+            Arc::clone(&self.pending_frontend_messages),
+        );
         match session
             .execute_extended_query_message(message, &mut responder)
             .await
@@ -713,6 +757,10 @@ impl Connection {
         &mut self,
         err: paro_common::error::ParoError,
     ) -> anyhow::Result<()> {
+        if self.should_terminate_without_protocol_epilogue() {
+            return Ok(());
+        }
+
         let session = self.session.as_mut().expect("session must be initialized");
         if session.is_in_implicit_block() {
             let _ = session.rollback_implicit_transaction();
@@ -723,27 +771,51 @@ impl Connection {
         self.extended_query_pipeline_open = false;
         self.enter_skip_until_sync();
 
-        let mut responder = PgWireExtendedQueryResponder::new(&mut self.socket);
+        let execution_control = self
+            .session
+            .as_ref()
+            .expect("session must be initialized")
+            .execution_control()
+            .clone();
+        let mut responder = PgWireExtendedQueryResponder::new(
+            &mut self.socket,
+            execution_control,
+            self.drain_token.clone(),
+            self.force_close_token.clone(),
+            Arc::clone(&self.pending_frontend_messages),
+        );
         responder.send_error(&err).await?;
         Ok(())
     }
 
     async fn execute_protocol_query(&mut self, sql: &str) -> anyhow::Result<()> {
+        let execution_control = self
+            .session
+            .as_ref()
+            .expect("session must be initialized")
+            .execution_control()
+            .clone();
         let session = self.session.as_mut().expect("session must be initialized");
-        let mut sink = ProtocolSink::new(&mut self.socket);
+        let mut sink = ProtocolSink::new(
+            &mut self.socket,
+            execution_control,
+            self.drain_token.clone(),
+            self.force_close_token.clone(),
+            Arc::clone(&self.pending_frontend_messages),
+        );
 
         match session.execute_simple_query(sql, &mut sink).await {
             Ok(()) => Ok(()),
-            Err(err) if sink.error_was_sent() => {
-                tracing::debug!(
-                    target: targets::CONNECTION,
-                    session_id = self.id,
-                    error = %err,
-                    "Simple query returned after sending ErrorResponse"
-                );
+            Err(err) => {
+                if let Some(transport_failure) = sink.transport_failure() {
+                    return Err(transport_failure.into());
+                }
+                if self.should_terminate_without_protocol_epilogue() {
+                    return Ok(());
+                }
+                self.send_paro_error_response(&err).await?;
                 Ok(())
             }
-            Err(err) => Err(err.into()),
         }
     }
 
@@ -771,6 +843,18 @@ impl Connection {
             .send(PgWireBackendMessage::ErrorResponse(
                 build_error_response_message("ERROR", sqlstate, message),
             ))
+            .await?;
+        Ok(())
+    }
+
+    async fn send_paro_error_response(
+        &mut self,
+        err: &paro_common::error::ParoError,
+    ) -> anyhow::Result<()> {
+        self.socket
+            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
+                err,
+            )))
             .await?;
         Ok(())
     }
@@ -826,33 +910,96 @@ impl Connection {
         }
     }
 
-    fn register_connection_manager_mirror(&mut self) {
-        if self.mirrored_in_connection_manager {
+    fn register_connection_registry_mirror(&mut self) {
+        if self.mirrored_in_connection_registry {
             return;
         }
 
         self.control.mark_handshake_complete();
-        let connection: Arc<dyn ManagedConnection> = self.control.clone();
+        let connection: Arc<dyn ConnectionHandle> = self.control.clone();
         self.instance
-            .get_connection_manager()
+            .get_connection_registry()
             .add_connection(connection);
-        self.mirrored_in_connection_manager = true;
+        self.mirrored_in_connection_registry = true;
+    }
+
+    fn register_session_registry_entry(&mut self) {
+        if self.registered_in_session_registry {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let Some(backend_key) = self.backend_key else {
+            return;
+        };
+
+        let handle: Arc<dyn SessionExecutionHandle> = session.execution_control().clone();
+        self.instance
+            .get_session_registry()
+            .register(self.id, backend_key.registry_key(), handle);
+        self.registered_in_session_registry = true;
+    }
+
+    fn unregister_session_registry_entry(&mut self) {
+        if !self.registered_in_session_registry {
+            return;
+        }
+        self.instance.get_session_registry().unregister(self.id);
+        self.registered_in_session_registry = false;
+    }
+
+    fn handle_cancel_request(
+        &self,
+        cancel: pgwire::messages::cancel::CancelRequest,
+    ) -> anyhow::Result<()> {
+        let Some(secret) = cancel.secret_key.as_i32() else {
+            tracing::warn!(
+                target: targets::CONNECTION,
+                session_id = self.id,
+                cancel_pid = cancel.pid,
+                "CancelRequest secret key was not representable as i32"
+            );
+            return Ok(());
+        };
+
+        let cancelled = self.instance.get_session_registry().cancel_by_key(
+            paro_instance::RegistryKey::new(cancel.pid, secret),
+            StatementCancelReason::UserRequest,
+        );
+        tracing::debug!(
+            target: targets::CONNECTION,
+            session_id = self.id,
+            target_pid = cancel.pid,
+            cancelled,
+            "CancelRequest processed"
+        );
+        Ok(())
     }
 
     fn force_close_session(&mut self) {
         self.control.request_force_close();
         if let Some(session) = self.session.as_ref() {
-            session.interrupt();
+            session.request_connection_shutdown(ConnectionShutdownReason::ForceClosed);
         }
+    }
+
+    fn should_terminate_without_protocol_epilogue(&self) -> bool {
+        self.force_close_token.is_cancelled()
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.connection_shutdown_requested())
     }
 
     fn cleanup(&mut self) {
         self.control.deactivate();
-        if self.mirrored_in_connection_manager {
+        self.unregister_session_registry_entry();
+        if self.mirrored_in_connection_registry {
             self.instance
-                .get_connection_manager()
+                .get_connection_registry()
                 .remove_connection(self.id);
-            self.mirrored_in_connection_manager = false;
+            self.mirrored_in_connection_registry = false;
         }
     }
 }

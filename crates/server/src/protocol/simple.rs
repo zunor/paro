@@ -4,39 +4,54 @@
 //! Unified simple-query protocol sink with optional COPY adapters.
 
 use async_trait::async_trait;
-use futures::SinkExt;
 use paro_common::chunk::Chunk;
 use paro_common::error::{ParoError, Result};
 use paro_common::types::LogicalType;
 use paro_function::copy::CopyOptions;
 use paro_session::{
-    CopyProtocolSink, CopyProtocolSource, ProtocolResultSink, ResultSink, StatementCompletion,
+    CopyProtocolSink, CopyProtocolSource, ProtocolResultSink, ResultSink, SessionExecutionControl,
+    StatementCompletion,
 };
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
-use crate::client_connection::PgCodec;
+use crate::connection::PgCodec;
 
-use super::copy::{create_copy_in_source, create_copy_out_sink};
-use super::result::{build_error_response, PgWireResultSink};
+use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
+use super::result::PgWireResultSink;
 
 pub struct ProtocolSink<'a> {
     result_sink: PgWireResultSink<'a>,
-    error_was_sent: bool,
+    execution_control: Arc<SessionExecutionControl>,
+    drain_token: CancellationToken,
+    force_close_token: CancellationToken,
+    pending_frontend_messages: Arc<Mutex<VecDeque<pgwire::messages::PgWireFrontendMessage>>>,
     transport_failure: Option<ParoError>,
 }
 
 impl<'a> ProtocolSink<'a> {
-    pub fn new(socket: &'a mut Framed<TcpStream, PgCodec>) -> Self {
+    pub fn new(
+        socket: &'a mut Framed<TcpStream, PgCodec>,
+        execution_control: Arc<SessionExecutionControl>,
+        drain_token: CancellationToken,
+        force_close_token: CancellationToken,
+        pending_frontend_messages: Arc<Mutex<VecDeque<pgwire::messages::PgWireFrontendMessage>>>,
+    ) -> Self {
         Self {
             result_sink: PgWireResultSink::new(socket),
-            error_was_sent: false,
+            execution_control,
+            drain_token,
+            force_close_token,
+            pending_frontend_messages,
             transport_failure: None,
         }
     }
 
-    pub fn error_was_sent(&self) -> bool {
-        self.error_was_sent
+    pub fn transport_failure(&self) -> Option<ParoError> {
+        self.transport_failure.clone()
     }
 
     fn ensure_transport_available(&self) -> Result<()> {
@@ -75,19 +90,12 @@ impl ResultSink for ProtocolSink<'_> {
         self.remember_transport_failure(result)
     }
 
-    async fn error(&mut self, err: &ParoError) -> Result<()> {
-        self.ensure_transport_available()?;
-        let result = self
-            .result_sink
-            .socket_mut()
-            .send(pgwire::messages::PgWireBackendMessage::ErrorResponse(
-                build_error_response(err),
-            ))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()));
-        self.remember_transport_failure(result)?;
-        self.error_was_sent = true;
-        Ok(())
+    async fn error(&mut self, _err: &ParoError) -> Result<()> {
+        // Simple-query terminal ErrorResponse/ReadyForQuery ownership lives in `connection.rs`
+        // so it can make the final protocol-state decision in one place. This sink therefore
+        // only reports transport availability and leaves user-visible error emission to the
+        // outer connection loop.
+        self.ensure_transport_available()
     }
 }
 
@@ -102,6 +110,13 @@ impl ProtocolResultSink for ProtocolSink<'_> {
 
     fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
         self.ensure_transport_available()?;
-        create_copy_in_source(self.result_sink.socket_mut())
+        create_copy_in_source(
+            self.result_sink.socket_mut(),
+            Arc::clone(&self.execution_control),
+            self.drain_token.clone(),
+            self.force_close_token.clone(),
+            Arc::clone(&self.pending_frontend_messages),
+            CopyFrontendMode::SimpleQuery,
+        )
     }
 }

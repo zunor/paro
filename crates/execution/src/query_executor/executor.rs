@@ -272,10 +272,18 @@ impl Executor {
 
         // Start pipelines (non-blocking)
         let coordinator = self.start_pipelines(pipelines)?;
+        self.session
+            .bind_execution_coordinator(Arc::clone(&coordinator));
 
         // Return streaming result handler with buffer and coordinator
-        let handler =
-            ResultHandler::new(result_names, result_types, buffer, coordinator, allocator);
+        let handler = ResultHandler::new(
+            result_names,
+            result_types,
+            buffer,
+            coordinator,
+            self.session.cancellation.clone(),
+            allocator,
+        );
         debug!(
             target: targets::EXECUTOR,
             is_query,

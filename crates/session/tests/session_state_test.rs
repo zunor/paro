@@ -39,13 +39,15 @@ fn test_reset_session_state() {
             source: PreparedStatementSource::Sql,
         });
     session.state.enable_profiler();
-    session.interrupt();
+    session.begin_statement_scope("SELECT 1");
+    session.cancel_active_statement();
+    session.finish_statement_scope(false);
 
     session.reset_session_state();
 
     assert!(session.state.prepared.statements().next().is_none());
     assert!(!session.state.is_profiling_enabled());
-    assert!(!session.is_interrupted());
+    assert!(!session.connection_shutdown_requested());
 }
 
 #[test]
@@ -56,12 +58,12 @@ fn test_active_query_context_lifecycle() {
     assert!(session.get_current_query().is_none());
     assert!(session.active_query().is_none());
 
-    session.begin_query_internal("SELECT 1");
+    session.begin_statement_scope("SELECT 1");
     assert!(session.has_active_query());
     assert_eq!(session.get_current_query(), Some("SELECT 1"));
     assert!(session.active_query().is_some());
 
-    session.end_query_internal(true);
+    session.finish_statement_scope(true);
     assert!(!session.has_active_query());
     assert!(session.get_current_query().is_none());
 }
@@ -70,10 +72,10 @@ fn test_active_query_context_lifecycle() {
 fn test_active_query_context_failure() {
     let mut session = create_test_session();
 
-    session.begin_query_internal("SELECT * FROM nonexistent");
+    session.begin_statement_scope("SELECT * FROM nonexistent");
     assert!(session.has_active_query());
 
-    session.end_query_internal(false);
+    session.finish_statement_scope(false);
     assert!(!session.has_active_query());
 }
 
@@ -81,7 +83,7 @@ fn test_active_query_context_failure() {
 fn test_query_progress_tracking() {
     let mut session = create_test_session();
 
-    session.begin_query_internal("SELECT * FROM large_table");
+    session.begin_statement_scope("SELECT * FROM large_table");
 
     let progress = session.get_query_progress();
     assert_eq!(progress.percentage, 0.0);
@@ -93,28 +95,27 @@ fn test_query_progress_tracking() {
     assert_eq!(progress.rows_processed, 50);
     assert_eq!(progress.total_rows_to_process, 100);
 
-    session.end_query_internal(true);
+    session.finish_statement_scope(true);
 
     let progress = session.get_query_progress();
     assert_eq!(progress.percentage, 0.0);
 }
 
 #[test]
-fn test_query_cancellation() {
+fn test_statement_cancellation_is_scoped_to_active_statement() {
     let mut session = create_test_session();
 
-    session.begin_query_internal("SELECT * FROM large_table");
+    session.begin_statement_scope("SELECT * FROM large_table");
+    assert!(session.check_active_statement_cancellation().is_ok());
 
-    assert!(!session.is_interrupted());
-    assert!(session.check_cancelled().is_ok());
+    session.cancel_active_statement();
+    assert!(session.check_active_statement_cancellation().is_err());
 
-    session.cancel_query();
+    session.finish_statement_scope(false);
 
-    assert!(session.is_interrupted());
-    let result = session.check_cancelled();
-    assert!(result.is_err());
-
-    session.end_query_internal(false);
+    session.begin_statement_scope("SELECT 1");
+    assert!(session.check_active_statement_cancellation().is_ok());
+    session.finish_statement_scope(true);
 }
 
 #[test]
@@ -123,14 +124,14 @@ fn test_query_elapsed_time() {
 
     assert!(session.query_elapsed().is_none());
 
-    session.begin_query_internal("SELECT 1");
+    session.begin_statement_scope("SELECT 1");
 
     std::thread::sleep(std::time::Duration::from_millis(10));
     let elapsed = session.query_elapsed();
     assert!(elapsed.is_some());
     assert!(elapsed.unwrap().as_millis() >= 10);
 
-    session.end_query_internal(true);
+    session.finish_statement_scope(true);
     assert!(session.query_elapsed().is_none());
 }
 
@@ -138,7 +139,7 @@ fn test_query_elapsed_time() {
 fn test_active_query_mut_access() {
     let mut session = create_test_session();
 
-    session.begin_query_internal("SELECT 1");
+    session.begin_statement_scope("SELECT 1");
 
     let ctx = session.active_query_mut();
     assert!(ctx.is_some());
@@ -147,7 +148,7 @@ fn test_active_query_mut_access() {
     ctx.set_open_result(42);
     assert!(ctx.is_open_result(42));
 
-    session.end_query_internal(true);
+    session.finish_statement_scope(true);
 }
 
 #[derive(Debug, Default)]
@@ -277,8 +278,8 @@ fn test_registered_state_query_lifecycle_notifications() {
 
     session.register_state("lifecycle", LifecycleState::default());
 
-    session.begin_query_internal("SELECT 1");
-    session.end_query_internal(true);
+    session.begin_statement_scope("SELECT 1");
+    session.finish_statement_scope(true);
 
     let state = session.get_state("lifecycle").unwrap();
     let guard = state.lock().unwrap();

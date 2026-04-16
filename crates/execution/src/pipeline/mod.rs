@@ -11,7 +11,6 @@ pub mod builder;
 pub mod events;
 pub mod executor;
 pub mod meta_pipeline;
-pub mod parallel_executor;
 pub mod pipeline;
 pub mod scheduler;
 pub mod task;

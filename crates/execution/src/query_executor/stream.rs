@@ -10,6 +10,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
+use paro_context::StatementCancellation;
 use paro_scheduler::coordinator::EventCoordinator;
 use paro_scheduler::scheduler::TaskScheduler;
 
@@ -33,6 +34,8 @@ pub struct ResultHandler {
     buffer: Arc<Mutex<BufferedData>>,
     /// Event coordinator for pipeline execution.
     coordinator: Arc<EventCoordinator>,
+    /// Statement-scoped cancellation state shared with the session.
+    cancellation: StatementCancellation,
     /// Whether the handler is closed.
     closed: bool,
 }
@@ -54,6 +57,7 @@ impl ResultHandler {
         types: Vec<LogicalType>,
         buffer: Arc<Mutex<BufferedData>>,
         coordinator: Arc<EventCoordinator>,
+        cancellation: StatementCancellation,
         allocator: Arc<dyn Allocator>,
     ) -> Self {
         let output_chunk = if types.is_empty() {
@@ -69,6 +73,7 @@ impl ResultHandler {
             allocator,
             buffer,
             coordinator,
+            cancellation,
             closed: false,
         }
     }
@@ -88,6 +93,10 @@ impl ResultHandler {
             allocator,
             buffer,
             coordinator,
+            cancellation: StatementCancellation::new(
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
             closed: true,
         }
     }
@@ -126,9 +135,8 @@ impl ResultHandler {
             }
             StreamExecutionResult::Cancelled => {
                 self.closed = true;
-                Err(paro_common::error::internal(
-                    "Execution was cancelled".to_string(),
-                ))
+                self.cancellation.check()?;
+                Ok(None)
             }
             StreamExecutionResult::Error => {
                 self.closed = true;
@@ -191,6 +199,10 @@ impl ResultHandler {
     /// * `Err(ParoError)` - An error occurred
     fn replenish_buffer(&mut self) -> Result<StreamExecutionResult> {
         loop {
+            if self.coordinator.is_cancelled() || self.cancellation.is_cancelled() {
+                return Ok(StreamExecutionResult::Cancelled);
+            }
+
             // Check for errors first
             if self.coordinator.has_error() {
                 return Ok(StreamExecutionResult::Error);
@@ -235,6 +247,10 @@ impl ResultHandler {
     /// * `Ok(StreamExecutionResult)` - The execution status
     /// * `Err(ParoError)` - An error occurred
     fn execute_task_internal(&mut self) -> Result<StreamExecutionResult> {
+        if self.coordinator.is_cancelled() || self.cancellation.is_cancelled() {
+            return Ok(StreamExecutionResult::Cancelled);
+        }
+
         // Check for errors first
         {
             let buffer_guard = self.buffer.lock().map_err(|e| {
@@ -276,6 +292,9 @@ impl ResultHandler {
         }
 
         // Execute some tasks to drive execution
+        if self.coordinator.is_cancelled() || self.cancellation.is_cancelled() {
+            return Ok(StreamExecutionResult::Cancelled);
+        }
         let tasks_executed = self.coordinator.execute_some_tasks(10);
 
         // Check buffer again after executing tasks
@@ -398,7 +417,14 @@ impl ResultHandler {
         let dummy_scheduler = Arc::new(TaskScheduler::new());
         let coordinator = Arc::new(EventCoordinator::new(dummy_scheduler));
 
-        Self::new(names, types, buffer, coordinator, allocator)
+        Self::new(
+            names,
+            types,
+            buffer,
+            coordinator,
+            StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+            allocator,
+        )
     }
 }
 
@@ -429,6 +455,11 @@ pub enum StreamExecutionResult {
 mod tests {
     use super::*;
     use paro_common::allocator::default_allocator;
+    use paro_context::{NoopStatementTimeoutDriver, StatementCancelReason};
+    use paro_scheduler::event::Event;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_result_handler_empty() {
@@ -468,10 +499,61 @@ mod tests {
             vec![LogicalType::Integer],
             buffer,
             coordinator,
+            StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
             allocator,
         );
 
         // Call wait_for_task - should timeout gracefully
         handler.wait_for_task();
+    }
+
+    #[test]
+    fn blocked_fetch_returns_promptly_after_cancellation() {
+        let allocator = Arc::new(default_allocator().clone());
+        let buffer = Arc::new(Mutex::new(BufferedData::new(10, allocator.clone())));
+        let scheduler = Arc::new(TaskScheduler::new());
+        let coordinator = Arc::new(EventCoordinator::new(scheduler));
+        coordinator.add_event(Event::new());
+
+        let connection_token = CancellationToken::new();
+        let statement_token = connection_token.child_token();
+        let cancel_reason = Arc::new(OnceLock::new());
+        let cancellation = StatementCancellation::from_parts(
+            connection_token,
+            statement_token.clone(),
+            None,
+            cancel_reason.clone(),
+            Arc::new(NoopStatementTimeoutDriver),
+        );
+
+        let mut handler = ResultHandler::new(
+            vec!["col1".to_string()],
+            vec![LogicalType::Integer],
+            buffer,
+            coordinator.clone(),
+            cancellation,
+            allocator,
+        );
+
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = cancel_reason.set(StatementCancelReason::UserRequest);
+            statement_token.cancel();
+            coordinator.cancel();
+        });
+
+        let started = Instant::now();
+        let err = handler
+            .fetch()
+            .expect_err("fetch should surface query cancellation");
+        cancel_thread.join().expect("cancel thread should join");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "blocked fetch should wake promptly after cancellation"
+        );
+        assert!(err
+            .message()
+            .contains("canceling statement due to user request"));
     }
 }
