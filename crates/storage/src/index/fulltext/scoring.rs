@@ -255,8 +255,6 @@ fn score_cover_groups(groups: &[Vec<query_eval::RangeMatch>]) -> f32 {
         let mut end_counts = BTreeMap::<TokenPosition, usize>::new();
         let mut left = next_event_idx;
         let mut found_cover = false;
-        let scan_start = next_event_idx;
-
         let mut right = next_event_idx;
         while right < events.len() {
             add_cover_event(
