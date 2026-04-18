@@ -5,12 +5,13 @@
 
 use crate::compaction::plan::types::CumulativePointAction;
 use crate::index::IndexConstraintType;
-use crate::wal::txn_record::TxnRecord;
 use crate::wal::wal_type::WalType;
 use paro_common::chunk::Chunk;
 use paro_common::error as paro_error;
 use paro_common::error::Result;
+use paro_common::journal::JournalRecord;
 use paro_common::types::LogicalType;
+use paro_journal::{decode_frame, encode_record};
 use std::sync::Arc;
 
 /// Length of database identity bytes stored in WAL header metadata.
@@ -100,34 +101,10 @@ pub enum WalEntry {
     /// WAL version header
     Version { version: u64 },
 
-    /// Unified transaction begin.
-    TxnBegin { txn_id: u64, start_time: u64 },
+    /// Binary-framed durable journal record.
+    JournalRecord { lsn: u64, record: JournalRecord },
 
-    /// Unified transaction catalog op.
-    TxnCatalogOp {
-        seq: u32,
-        op: paro_common::effect::CatalogTxnOp,
-    },
-
-    /// Unified transaction data op.
-    TxnDataOp {
-        seq: u32,
-        op: paro_common::effect::PreparedDataOp,
-    },
-
-    /// Unified transaction post-commit hook.
-    TxnPostCommitHook {
-        seq: u32,
-        hook: paro_common::effect::PostCommitHookDescriptor,
-    },
-
-    /// Unified transaction commit.
-    TxnCommit { txn_id: u64, commit_id: u64 },
-
-    /// Unified transaction abort.
-    TxnAbort { txn_id: u64 },
-
-    /// USE TABLE (set context for row-oriented replay helpers; new databases use `Txn*` journal)
+    /// USE TABLE (set context for row-oriented replay helpers).
     UseTable {
         schema_name: String,
         table_name: String,
@@ -1314,12 +1291,7 @@ impl WalEntry {
     pub fn wal_type(&self) -> WalType {
         match self {
             WalEntry::Version { .. } => WalType::WalVersion,
-            WalEntry::TxnBegin { .. } => WalType::TxnBegin,
-            WalEntry::TxnCatalogOp { .. } => WalType::TxnCatalogOp,
-            WalEntry::TxnDataOp { .. } => WalType::TxnDataOp,
-            WalEntry::TxnPostCommitHook { .. } => WalType::TxnPostCommitHook,
-            WalEntry::TxnCommit { .. } => WalType::TxnCommit,
-            WalEntry::TxnAbort { .. } => WalType::TxnAbort,
+            WalEntry::JournalRecord { .. } => WalType::JournalRecord,
             WalEntry::UseTable { .. } => WalType::UseTable,
             WalEntry::PrimaryDelete { .. } => WalType::PrimaryDelete,
             WalEntry::RowIdDelete { .. } => WalType::RowIdDelete,
@@ -1335,44 +1307,9 @@ impl WalEntry {
         match self {
             WalEntry::Version { version } => version.to_le_bytes().to_vec(),
 
-            WalEntry::TxnBegin { txn_id, start_time } => TxnRecord::Begin {
-                txn_id: *txn_id,
-                start_time: *start_time,
+            WalEntry::JournalRecord { lsn, record } => {
+                encode_record(record, *lsn).expect("journal record serialization")
             }
-            .serialize_data()
-            .expect("txn begin serialization"),
-
-            WalEntry::TxnCatalogOp { seq, op } => TxnRecord::CatalogOp {
-                seq: *seq,
-                op: op.clone(),
-            }
-            .serialize_data()
-            .expect("txn catalog op serialization"),
-
-            WalEntry::TxnDataOp { seq, op } => TxnRecord::DataOp {
-                seq: *seq,
-                op: op.clone(),
-            }
-            .serialize_data()
-            .expect("txn data op serialization"),
-
-            WalEntry::TxnPostCommitHook { seq, hook } => TxnRecord::PostCommitHook {
-                seq: *seq,
-                hook: hook.clone(),
-            }
-            .serialize_data()
-            .expect("txn post-commit hook serialization"),
-
-            WalEntry::TxnCommit { txn_id, commit_id } => TxnRecord::Commit {
-                txn_id: *txn_id,
-                commit_id: *commit_id,
-            }
-            .serialize_data()
-            .expect("txn commit serialization"),
-
-            WalEntry::TxnAbort { txn_id } => TxnRecord::Abort { txn_id: *txn_id }
-                .serialize_data()
-                .expect("txn abort serialization"),
 
             WalEntry::UseTable {
                 schema_name,
@@ -1489,53 +1426,13 @@ impl WalEntry {
                 Ok(WalEntry::Version { version })
             }
 
-            WalType::TxnBegin => match TxnRecord::deserialize_data(data)? {
-                TxnRecord::Begin { txn_id, start_time } => {
-                    Ok(WalEntry::TxnBegin { txn_id, start_time })
-                }
-                other => Err(paro_error::serialization_error(format!(
-                    "expected TxnRecord::Begin, got {other:?}"
-                ))),
-            },
-
-            WalType::TxnCatalogOp => match TxnRecord::deserialize_data(data)? {
-                TxnRecord::CatalogOp { seq, op } => Ok(WalEntry::TxnCatalogOp { seq, op }),
-                other => Err(paro_error::serialization_error(format!(
-                    "expected TxnRecord::CatalogOp, got {other:?}"
-                ))),
-            },
-
-            WalType::TxnDataOp => match TxnRecord::deserialize_data(data)? {
-                TxnRecord::DataOp { seq, op } => Ok(WalEntry::TxnDataOp { seq, op }),
-                other => Err(paro_error::serialization_error(format!(
-                    "expected TxnRecord::DataOp, got {other:?}"
-                ))),
-            },
-
-            WalType::TxnPostCommitHook => match TxnRecord::deserialize_data(data)? {
-                TxnRecord::PostCommitHook { seq, hook } => {
-                    Ok(WalEntry::TxnPostCommitHook { seq, hook })
-                }
-                other => Err(paro_error::serialization_error(format!(
-                    "expected TxnRecord::PostCommitHook, got {other:?}"
-                ))),
-            },
-
-            WalType::TxnCommit => match TxnRecord::deserialize_data(data)? {
-                TxnRecord::Commit { txn_id, commit_id } => {
-                    Ok(WalEntry::TxnCommit { txn_id, commit_id })
-                }
-                other => Err(paro_error::serialization_error(format!(
-                    "expected TxnRecord::Commit, got {other:?}"
-                ))),
-            },
-
-            WalType::TxnAbort => match TxnRecord::deserialize_data(data)? {
-                TxnRecord::Abort { txn_id } => Ok(WalEntry::TxnAbort { txn_id }),
-                other => Err(paro_error::serialization_error(format!(
-                    "expected TxnRecord::Abort, got {other:?}"
-                ))),
-            },
+            WalType::JournalRecord => {
+                let frame = decode_frame(data)?;
+                Ok(WalEntry::JournalRecord {
+                    lsn: frame.header.lsn,
+                    record: frame.record,
+                })
+            }
 
             WalType::UseTable => {
                 let schema_name = read_string(data, &mut offset)?;
@@ -1824,19 +1721,23 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_begin_roundtrip() {
-        let entry = WalEntry::TxnBegin {
-            txn_id: 9,
-            start_time: 42,
+    fn test_journal_record_roundtrip() {
+        let entry = WalEntry::JournalRecord {
+            lsn: 11,
+            record: JournalRecord::CheckpointFence(paro_common::journal::CheckpointFence {
+                checkpoint_marker: 9,
+            }),
         };
         let mut bytes = vec![entry.wal_type() as u8];
         bytes.extend_from_slice(&entry.serialize_data());
         let recovered = WalEntry::deserialize(&bytes).unwrap();
         assert!(matches!(
             recovered,
-            WalEntry::TxnBegin {
-                txn_id: 9,
-                start_time: 42
+            WalEntry::JournalRecord {
+                lsn: 11,
+                record: JournalRecord::CheckpointFence(paro_common::journal::CheckpointFence {
+                    checkpoint_marker: 9
+                })
             }
         ));
     }

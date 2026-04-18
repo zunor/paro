@@ -21,6 +21,7 @@
 //! - `paro_graph_statistics(graph_name)` - Graph statistics ✅
 //! - `paro_optimizers()` - Optimizer profile snapshot ✅
 //! - `paro_storage_info(table)` - Segment/column storage observability ✅
+//! - `paro_wal_metrics()` - WAL/apply queue observability ✅
 //!
 //! ## Dependencies Check
 //! - Catalog: ✅ `paro_catalog`
@@ -43,6 +44,7 @@ pub mod paro_storage_info;
 pub mod paro_tables;
 pub mod paro_temporary_files;
 pub mod paro_views;
+pub mod paro_wal_metrics;
 pub mod pragma_database_size;
 
 pub use memory_runtime::{get_system_buffer_manager, register_system_buffer_manager};
@@ -62,4 +64,5 @@ pub use paro_storage_info::create_paro_storage_info_function_set;
 pub use paro_tables::create_paro_tables_function_set;
 pub use paro_temporary_files::create_paro_temporary_files_function_set;
 pub use paro_views::create_paro_views_function_set;
+pub use paro_wal_metrics::create_paro_wal_metrics_function_set;
 pub use pragma_database_size::create_pragma_database_size_function_set;

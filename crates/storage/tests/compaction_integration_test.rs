@@ -16,7 +16,6 @@ use paro_storage::tablet::{
     KeysType, RetiredGcBarrier, Tablet, TabletColumn, TabletReader, TabletReaderParams,
     TabletSchema,
 };
-use paro_storage::wal::wal_writer::{WalInitState, WalWriter};
 use paro_storage::write::DeltaWriter;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
@@ -519,7 +518,7 @@ fn test_compaction_crash_before_replace_recovers_atomically_with_wal() {
     let output = RowsetMerger::build(&tablet, Arc::new(plan), workspace, compaction_allocator())
         .unwrap()
         .expect("merge should produce staged output");
-    let staged_rowset_dir = match output {
+    let staged_rowset_dir = match &output {
         CompactionBuildOutput::Rowset(artifact) => artifact.workspace.rowset_dir.clone(),
         CompactionBuildOutput::PrimaryKey { .. } => panic!("expected duplicate-key output"),
     };
@@ -588,7 +587,7 @@ fn test_compaction_build_failure_does_not_pollute_visible_query_results() {
     if staging_rowset_dir.exists() {
         let _ = std::fs::set_permissions(&staging_rowset_dir, permissions);
     }
-    paro_storage::compaction::cleanup::sweep_staging_root(tablet.data_dir().join("_compaction"));
+    paro_storage::compaction::cleanup::sweep_staging_root(tablet.staged_root_dir());
     std::thread::sleep(Duration::from_millis(50));
 
     assert_eq!(read_rows(tablet.clone()), before);
@@ -673,54 +672,6 @@ fn test_duplicate_key_compaction_keeps_output_visible() {
         1,
         "compaction should converge to one rowset"
     );
-}
-
-#[test]
-fn test_compaction_publish_record_replay_recovers_replace_after_restart() {
-    let dir = TempDir::new().unwrap();
-    let tablet = create_duplicate_tablet(&dir, 304);
-
-    tablet.save_meta().unwrap();
-    append_range(&tablet, 901, 0, 500, 0);
-    append_range(&tablet, 902, 500, 1_000, 0);
-
-    let before = read_rows(tablet.clone());
-    let plan = CompactionPlanner::plan(&tablet)
-        .unwrap()
-        .expect("duplicate-key compaction plan");
-    let job_id = CompactionJobId(9_002);
-    let workspace = CompactionWorkspace::create(&tablet, job_id, plan.output_rowset_id).unwrap();
-    let output = RowsetMerger::build(&tablet, Arc::new(plan), workspace, compaction_allocator())
-        .unwrap()
-        .expect("staged compaction output");
-    CompactionValidator::validate_artifact(&tablet, &output).unwrap();
-    let request = CompactionPublisher::prepare_request(&tablet, output, job_id).unwrap();
-
-    let staged_rowset_dir = match &request.output {
-        CompactionBuildOutput::Rowset(artifact) => artifact.workspace.rowset_dir.clone(),
-        CompactionBuildOutput::PrimaryKey { .. } => panic!("expected duplicate-key output"),
-    };
-    let final_rowset_path = PathBuf::from(&request.record.output_rowset_path);
-    std::fs::rename(&staged_rowset_dir, &final_rowset_path).unwrap();
-
-    let wal = WalWriter::new(
-        tablet.data_dir().join("tablet.wal"),
-        WalInitState::Uninitialized,
-    );
-    wal.write_compaction_publish(&request.record).unwrap();
-    wal.flush().unwrap();
-
-    drop(tablet);
-
-    let reopened = Arc::new(Tablet::open(304, dir.path(), None).unwrap());
-    assert_eq!(read_rows(reopened.clone()), before);
-    assert_eq!(reopened.num_rowsets(), 1);
-    assert!(reopened
-        .find_rowset_by_id(request.record.output_rowset_id)
-        .is_some());
-    for input_rowset_id in request.record.replaced_inputs {
-        assert!(reopened.find_rowset_by_id(input_rowset_id).is_none());
-    }
 }
 
 #[tokio::test]

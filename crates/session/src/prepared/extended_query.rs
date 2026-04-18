@@ -197,7 +197,7 @@ async fn execute_parse<R: ExtendedQueryResponder>(
         plan_cache_mode: crate::prepared::plan_cache::PlanCacheMode::Auto,
         generic_plan,
         custom_plan_executions: 0,
-        dependency_epoch: session.transaction.visible_version().unwrap_or(0),
+        dependency_epoch: session.transaction_visible_version(),
         compile_environment: session.compile_environment_key(),
         source: PreparedStatementSource::Protocol,
     };

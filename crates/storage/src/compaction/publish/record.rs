@@ -6,6 +6,11 @@ use crate::compaction::plan::types::{CompactionJobId, CompactionPlanId, Cumulati
 use crate::primary_key::DeleteVector;
 use crate::rowset::RowsetId;
 use crate::tablet::{PhysicalRowRef, Version};
+use paro_common::durability::{PrepareToken, PreparedMaintenancePlan};
+use paro_common::effect::{
+    ArtifactRef, CompactionCumulativePointAction, RetiredRowsetInput, StorageCommitOp,
+    TabletApplyOp, TabletMutation, VersionSpan,
+};
 use paro_common::error::{self as paro_error, ParoError};
 
 #[derive(Debug, Clone)]
@@ -52,7 +57,8 @@ pub struct CompactionPublishRecord {
 pub struct CompactionPublishRequest {
     pub output: CompactionBuildOutput,
     pub record: CompactionPublishRecord,
-    pub retired_inputs: Vec<RetiredInput>,
+    pub maintenance_plan: PreparedMaintenancePlan,
+    pub token: PrepareToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,4 +85,42 @@ impl CompactionPublishConflict {
             self.tablet_id, self.plan_id, self.job_id, self.reason
         ))
     }
+}
+
+pub fn maintenance_storage_op(
+    record: &CompactionPublishRecord,
+    staged_ref: ArtifactRef,
+    output_ref: ArtifactRef,
+    retired_inputs: &[RetiredInput],
+) -> StorageCommitOp {
+    StorageCommitOp::Tablet(TabletApplyOp {
+        tablet_id: record.tablet_id,
+        mutations: vec![TabletMutation::PublishCompaction {
+            plan_id: record.plan_id.0,
+            job_id: record.job_id.0,
+            output_rowset_id: record.output_rowset_id,
+            output_version: VersionSpan {
+                start: record.output_version.start,
+                end: record.output_version.end,
+            },
+            staged_ref,
+            output_ref,
+            replaced_inputs: record.replaced_inputs.clone(),
+            retired_inputs: retired_inputs
+                .iter()
+                .map(|input| RetiredRowsetInput {
+                    rowset_id: input.rowset_id,
+                    start_version: input.version.start,
+                    end_version: input.version.end,
+                    rssids: input.rssids.clone(),
+                })
+                .collect(),
+            cumulative_point_action: match record.cumulative_point_action {
+                CumulativePointAction::Preserve => CompactionCumulativePointAction::Preserve,
+                CumulativePointAction::AdvanceToOutputEndExclusive => {
+                    CompactionCumulativePointAction::AdvanceToOutputEndExclusive
+                }
+            },
+        }],
+    })
 }

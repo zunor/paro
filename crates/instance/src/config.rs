@@ -115,6 +115,7 @@ pub struct BootConfig {
     pub initial_maximum_threads: Option<usize>,
     pub pin_threads: ThreadAffinityMode,
     pub checkpoint_wal_size: u64,
+    pub delete_patch_inline_row_ref_threshold: usize,
     pub initial_temporary_directory: String,
     pub initial_use_temporary_directory: bool,
     pub initial_max_temp_directory_size: Option<usize>,
@@ -153,6 +154,9 @@ impl BootConfig {
             initial_maximum_threads: config.options.maximum_threads,
             pin_threads: config.options.pin_threads,
             checkpoint_wal_size: config.options.checkpoint_wal_size,
+            delete_patch_inline_row_ref_threshold: config
+                .options
+                .delete_patch_inline_row_ref_threshold,
             initial_temporary_directory: config.options.temporary_directory.clone(),
             initial_use_temporary_directory: config.options.use_temporary_directory,
             initial_max_temp_directory_size: config.options.max_temp_directory_size,
@@ -181,6 +185,8 @@ pub struct InstanceConfigOptions {
     pub pin_threads: ThreadAffinityMode,
     /// Whether to use a temporary directory for intermediates.
     pub use_temporary_directory: bool,
+    /// Maximum delete-patch row refs to keep inline before spilling to an artifact.
+    pub delete_patch_inline_row_ref_threshold: usize,
     /// Directory to store temporary structures.
     pub temporary_directory: String,
     /// Maximum spill size for temporary directory (`None` means unlimited).
@@ -224,6 +230,7 @@ impl Default for InstanceConfigOptions {
             maximum_threads: None,
             pin_threads: ThreadAffinityMode::Auto,
             use_temporary_directory: true,
+            delete_patch_inline_row_ref_threshold: 256,
             temporary_directory: String::new(),
             max_temp_directory_size: None,
             enable_external_access: true,
@@ -426,6 +433,11 @@ impl InstanceConfig {
         self
     }
 
+    pub fn with_delete_patch_inline_row_ref_threshold(mut self, threshold: usize) -> Self {
+        self.options.delete_patch_inline_row_ref_threshold = threshold.max(1);
+        self
+    }
+
     /// Get a reference to the collation bindings.
 
     /// Get a reference to the collation bindings.
@@ -464,6 +476,7 @@ impl From<&paro_common::config::ClusterConfig> for InstanceConfig {
                 paro_common::config::ThreadPinMode::Auto => ThreadAffinityMode::Auto,
             },
             use_temporary_directory: true,
+            delete_patch_inline_row_ref_threshold: config.delete_patch_inline_row_ref_threshold,
             temporary_directory: String::new(),
             max_temp_directory_size: None,
             enable_external_access: config.enable_external_access,
@@ -579,5 +592,23 @@ mod tests {
         assert_eq!(config.options.pin_threads, ThreadAffinityMode::Auto);
         assert_eq!(config.options.default_database, "mydb");
         assert_eq!(config.options.instance_root, "/tmp/my-instance");
+    }
+
+    #[test]
+    fn test_delete_patch_inline_threshold_is_carried_into_boot_config() {
+        let config = InstanceConfig::new().with_delete_patch_inline_row_ref_threshold(17);
+        let boot = BootConfig::from_config(&config);
+
+        assert_eq!(config.options.delete_patch_inline_row_ref_threshold, 17);
+        assert_eq!(boot.delete_patch_inline_row_ref_threshold, 17);
+    }
+
+    #[test]
+    fn test_cluster_config_maps_delete_patch_inline_threshold() {
+        let mut cluster = paro_common::config::ClusterConfig::default();
+        cluster.delete_patch_inline_row_ref_threshold = 33;
+
+        let config = InstanceConfig::from(&cluster);
+        assert_eq!(config.options.delete_patch_inline_row_ref_threshold, 33);
     }
 }

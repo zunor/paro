@@ -5,8 +5,11 @@ use super::table_handle::TableHandle;
 use crate::compaction::compaction_manager::allocate_compaction_job_id;
 use crate::compaction::execution::job_orchestrator::run_job;
 use crate::compaction::plan::CompactionPlanner;
+use crate::compaction::publish::record::CompactionPublishRecord;
+use crate::table::index_runtime::IndexRuntime;
 use crate::table::storage_descriptor::TableStorageDescriptor;
 use paro_common::allocator::default_allocator;
+use paro_common::effect::TabletMutation;
 use paro_common::error::{self as paro_error, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +17,32 @@ use std::time::Duration;
 const TABLE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl TableHandle {
+    fn restore_declared_runtime_indexes_for_rowset(&self, rowset_id: u64) -> Result<()> {
+        let Some(rowset) = self.tablet().find_rowset_by_id(rowset_id) else {
+            return Ok(());
+        };
+
+        let fulltext_columns = self.declared_fulltext_columns_with_config();
+        if !fulltext_columns.is_empty() {
+            IndexRuntime::build_runtime_fulltext_indexes_for_rowset(&rowset, &fulltext_columns)?;
+        }
+
+        let art_columns = self.declared_art_columns();
+        if !art_columns.is_empty() {
+            if let Err(err) =
+                IndexRuntime::build_runtime_art_indexes_for_rowset(&rowset, &art_columns)
+            {
+                tracing::warn!(
+                    error = %err,
+                    rowset_id,
+                    "ART index backfill failed for replayed rowset; queries will fallback to scan"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Build a stable storage descriptor for catalog persistence.
     pub fn to_descriptor(&self) -> Result<TableStorageDescriptor> {
         let schema = self
@@ -60,13 +89,49 @@ impl TableHandle {
     ) -> Result<()> {
         self.tablet()
             .replay_rowset_commit(rowset_id, start_version, end_version, rowset_path)?;
+        self.restore_declared_runtime_indexes_for_rowset(rowset_id)?;
         self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
     /// Replay persisted row-id deletes against the underlying tablet.
     pub fn replay_row_id_delete(&self, locations: &[(u64, u32, u32)]) -> Result<()> {
-        self.tablet().apply_row_id_delete_locations(locations)?;
+        self.replay_row_id_delete_at_version(locations, self.tablet().max_version())
+    }
+
+    pub fn replay_row_id_delete_at_version(
+        &self,
+        locations: &[(u64, u32, u32)],
+        delete_version: i64,
+    ) -> Result<()> {
+        self.tablet()
+            .apply_row_id_delete_locations_idempotent_at_version(locations, delete_version)?;
+        self.tablet().repair_primary_index_after_replay()?;
+        Ok(())
+    }
+
+    pub fn replay_primary_delete(&self, keys: &[Vec<u8>]) -> Result<()> {
+        self.tablet()
+            .replay_primary_delete_idempotent(keys.to_vec())?;
+        self.tablet().repair_primary_index_after_replay()?;
+        Ok(())
+    }
+
+    pub fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
+        self.tablet().replay_compaction_publish(record)?;
+        self.restore_declared_runtime_indexes_for_rowset(record.output_rowset_id)?;
+        self.tablet().repair_primary_index_after_replay()?;
+        Ok(())
+    }
+
+    pub fn apply_compaction_publish(&self, op: &TabletMutation) -> Result<()> {
+        self.tablet().apply_compaction_publish(op)?;
+        if let TabletMutation::PublishCompaction {
+            output_rowset_id, ..
+        } = op
+        {
+            self.restore_declared_runtime_indexes_for_rowset(*output_rowset_id)?;
+        }
         self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }

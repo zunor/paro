@@ -785,12 +785,10 @@ impl DdlApplyContext for SessionDdlBridge {
                         if_not_exists: info.on_conflict == OnCreateConflict::IgnoreOnConflict,
                         storage: handle.entry().and_then(|entry| match entry.as_ref() {
                             CatalogEntryEnum::Table(table) => {
-                                let descriptor =
-                                    table.get_storage_descriptor().cloned().or_else(|| {
-                                        table
-                                            .get_storage()
-                                            .and_then(|storage| storage.to_descriptor().ok())
-                                    });
+                                let descriptor = table
+                                    .get_storage()
+                                    .and_then(|storage| storage.to_descriptor().ok())
+                                    .or_else(|| table.get_storage_descriptor().cloned());
                                 Self::ddl_storage_descriptor(descriptor.as_ref())
                             }
                             _ => None,

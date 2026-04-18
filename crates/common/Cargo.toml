@@ -20,6 +20,7 @@ toml = { workspace = true }
 dirs = { workspace = true }
 bytesize = { workspace = true }
 humantime-serde = { workspace = true }
+bincode = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

@@ -90,6 +90,7 @@ pub enum CompactionLifecycleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReadSnapshot {
     pub visible_version: i64,
+    pub rowset_epoch: u64,
     pub schema_epoch: Option<u64>,
 }
 

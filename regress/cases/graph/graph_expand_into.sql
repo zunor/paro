@@ -1,7 +1,7 @@
 -- Copyright 2024-2026 Zunor
 -- SPDX-License-Identifier: Apache-2.0
 
--- ExpandInto and bound-target shortest-path regression tests (Phase 6.3)
+-- ExpandInto and bound-target shortest-path regression tests
 
 CREATE TABLE ei_person (id BIGINT PRIMARY KEY, name VARCHAR);
 CREATE TABLE ei_knows (src_id BIGINT, dst_id BIGINT);

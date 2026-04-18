@@ -8,9 +8,6 @@ use crate::primary_key::{DeleteVector, RowID};
 use crate::table::table_handle::TableHandle;
 use crate::tablet::{KeysType, PhysicalRowRef};
 use crate::transaction::txn::Transaction;
-use crate::wal::wal_entry::WalEntry;
-use crate::wal::wal_type::WalType;
-use crate::wal::wal_writer::{WalInitState, WalWriter};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
@@ -68,10 +65,6 @@ pub(crate) fn delete(
         }
     }
 
-    let encoded_locations: Vec<_> = locations
-        .iter()
-        .map(|loc| (loc.rowset_id, loc.segment_id, loc.row_offset))
-        .collect();
     let deleted = locations.len();
 
     if let Some(txn) = txn {
@@ -80,16 +73,6 @@ pub(crate) fn delete(
     }
 
     tablet.apply_row_id_delete_refs(&locations)?;
-
-    let wal = WalWriter::new(
-        tablet.data_dir().join("tablet.wal"),
-        WalInitState::Uninitialized,
-    );
-    let entry = WalEntry::RowIdDelete {
-        locations: encoded_locations,
-    };
-    wal.write_entry(WalType::RowIdDelete, &entry.serialize_data())?;
-    wal.flush()?;
 
     Ok(deleted)
 }
@@ -158,16 +141,6 @@ pub(crate) fn delete_all(table: &TableHandle, txn: Option<Arc<Transaction>>) -> 
     }
 
     tablet.apply_row_id_delete_refs(&locations)?;
-    let wal_locations: Vec<_> = locations.into_iter().map(Into::into).collect();
-    let wal = WalWriter::new(
-        tablet.data_dir().join("tablet.wal"),
-        WalInitState::Uninitialized,
-    );
-    let entry = WalEntry::RowIdDelete {
-        locations: wal_locations,
-    };
-    wal.write_entry(WalType::RowIdDelete, &entry.serialize_data())?;
-    wal.flush()?;
 
     Ok(deleted)
 }

@@ -87,7 +87,8 @@ impl CompactionPlanner {
             input_rowsets,
             read_snapshot: ReadSnapshot {
                 visible_version: tablet.max_version(),
-                schema_epoch: None,
+                rowset_epoch: tablet.rowset_epoch(),
+                schema_epoch: tablet.schema_epoch(),
             },
             output_version,
             output_rowset_id: tablet.next_rowset_id(),
@@ -120,7 +121,8 @@ impl CompactionPlanner {
             input_rowsets,
             read_snapshot: ReadSnapshot {
                 visible_version: tablet.max_version(),
-                schema_epoch: None,
+                rowset_epoch: tablet.rowset_epoch(),
+                schema_epoch: tablet.schema_epoch(),
             },
             output_version,
             output_rowset_id: tablet.next_rowset_id(),
@@ -175,7 +177,8 @@ impl CompactionPlanner {
             input_rowsets,
             read_snapshot: ReadSnapshot {
                 visible_version: tablet.max_version(),
-                schema_epoch: None,
+                rowset_epoch: tablet.rowset_epoch(),
+                schema_epoch: tablet.schema_epoch(),
             },
             output_version,
             output_rowset_id: tablet.next_rowset_id(),

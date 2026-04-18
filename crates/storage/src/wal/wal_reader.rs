@@ -654,6 +654,7 @@ mod tests {
     use crate::wal::wal_entry::WalEntry;
     use crate::wal::wal_writer::{WalInitState, WalWriter};
     use paro_common::ddl::DdlChange;
+    use paro_common::journal::JournalRecord;
     use std::fs::OpenOptions;
     use std::io::Write;
     use tempfile::tempdir;
@@ -687,11 +688,17 @@ mod tests {
         let mut saw_flush = false;
         while let Some(entry) = reader.read_entry().unwrap() {
             match entry {
-                WalEntry::TxnCatalogOp { op, .. } => {
-                    if matches!(op.change.change, DdlChange::CreateSchema(_)) {
-                        assert_eq!(op.change.key.name, "test_schema");
-                        saw_schema = true;
-                    }
+                WalEntry::JournalRecord {
+                    lsn: _,
+                    record: JournalRecord::Commit(record),
+                } => {
+                    let op = record
+                        .catalog_ops
+                        .first()
+                        .expect("create schema commit should contain one catalog op");
+                    assert!(matches!(op.change.change, DdlChange::CreateSchema(_)));
+                    assert_eq!(op.change.key.name, "test_schema");
+                    saw_schema = true;
                 }
                 WalEntry::Flush => saw_flush = true,
                 _ => {}
@@ -726,8 +733,23 @@ mod tests {
         let mut reader = WalReader::open(&path).unwrap().unwrap();
         let entries: Vec<_> = reader.entries().collect();
 
-        assert!(entries.len() >= 4, "expected journal + flush entries");
+        assert!(
+            entries.len() >= 2,
+            "expected committed journal record + flush"
+        );
         assert!(entries.iter().all(|e| e.is_ok()));
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Ok(WalEntry::JournalRecord {
+                    record: JournalRecord::Commit(_),
+                    ..
+                })
+            )
+        }));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, Ok(WalEntry::Flush))));
     }
 
     #[test]
@@ -847,7 +869,7 @@ mod tests {
         assert!(!result.needs_truncation());
         assert!(result.torn_write_position.is_none());
         assert!(!result.has_unflushed_tail);
-        assert!(result.entries_scanned >= 4);
+        assert!(result.entries_scanned >= 2);
         assert!(result.last_flush_offset > 0);
         assert_eq!(
             result.last_successful_offset,

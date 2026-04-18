@@ -17,6 +17,7 @@ paro-common = { workspace = true }
 paro-catalog = { workspace = true }
 paro-context = { workspace = true }
 paro-compiler = { workspace = true }
+paro-journal = { workspace = true }
 paro-parser = { workspace = true }
 paro-planner = { workspace = true }
 paro-execution = { workspace = true }

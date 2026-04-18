@@ -135,16 +135,11 @@ pub struct TransactionManager {
     /// ```
     lowest_active_start: AtomicU64,
 
-    /// The last commit timestamp.
-    /// Updated after each successful commit.
-    ///
-    /// ```cpp
-    /// atomic<transaction_t> last_commit;
-    /// ```
-    last_commit: AtomicU64,
+    /// Highest durable commit timestamp observed by the runtime.
+    durable_commit_id: AtomicU64,
 
-    /// Serializes commit-version allocation with durable commit publication.
-    commit_barrier: Mutex<()>,
+    /// Highest published commit timestamp visible to new transactions.
+    published_commit_id: AtomicU64,
 
     /// List of active transactions.
     active_transactions: RwLock<Vec<Arc<Transaction>>>,
@@ -197,9 +192,8 @@ impl TransactionManager {
             lowest_active_id: AtomicU64::new(TRANSACTION_ID_START),
             // MAX means no active transactions
             lowest_active_start: AtomicU64::new(MAX_TRANSACTION_ID),
-            // No commits yet
-            last_commit: AtomicU64::new(0),
-            commit_barrier: Mutex::new(()),
+            durable_commit_id: AtomicU64::new(0),
+            published_commit_id: AtomicU64::new(0),
             active_transactions: RwLock::new(Vec::new()),
             recently_committed_transactions: RwLock::new(Vec::new()),
             cleanup_lock: Mutex::new(()),
@@ -221,7 +215,10 @@ impl TransactionManager {
     /// }
     /// ```
     pub fn begin_transaction(&self) -> Result<Arc<Transaction>> {
-        let start_time = self.last_commit.load(Ordering::SeqCst).saturating_add(1);
+        let start_time = self
+            .published_commit_id
+            .load(Ordering::SeqCst)
+            .saturating_add(1);
         let id = self.current_transaction_id.fetch_add(1, Ordering::SeqCst);
 
         let txn = Arc::new(Transaction::new(id, start_time));
@@ -254,14 +251,9 @@ impl TransactionManager {
     /// }
     /// ```
     pub fn commit_transaction(&self, transaction: Arc<Transaction>) -> Result<u64> {
-        let _barrier = self.enter_commit_barrier();
         let commit_id = self.allocate_commit_id();
         self.commit_transaction_with_commit_id(transaction, commit_id)?;
         Ok(commit_id)
-    }
-
-    pub fn enter_commit_barrier(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.commit_barrier.lock().unwrap()
     }
 
     pub fn allocate_commit_id(&self) -> u64 {
@@ -274,8 +266,30 @@ impl TransactionManager {
         commit_id: u64,
     ) -> Result<()> {
         transaction.commit(commit_id)?;
-        self.last_commit.store(commit_id, Ordering::SeqCst);
+        self.mark_durable_commit(commit_id);
+        self.publish_committed_transaction(transaction, commit_id)
+    }
 
+    pub fn complete_read_only_transaction(&self, transaction: Arc<Transaction>) -> Result<()> {
+        let cleanup_info = self.remove_transaction(&transaction, false);
+        if cleanup_info.should_schedule() {
+            self.schedule_cleanup(cleanup_info);
+        }
+        self.process_cleanup();
+        Ok(())
+    }
+
+    pub fn mark_durable_commit(&self, commit_id: u64) {
+        Self::bump_atomic_min(&self.durable_commit_id, commit_id);
+        Self::bump_atomic_min(&self.next_commit_id, commit_id.saturating_add(1));
+    }
+
+    pub fn publish_committed_transaction(
+        &self,
+        transaction: Arc<Transaction>,
+        commit_id: u64,
+    ) -> Result<()> {
+        Self::bump_atomic_min(&self.published_commit_id, commit_id);
         let store_transaction = transaction.changes_made();
         let cleanup_info = self.remove_transaction(&transaction, store_transaction);
         if cleanup_info.should_schedule() {
@@ -566,7 +580,17 @@ impl TransactionManager {
     /// ```
     #[inline]
     pub fn last_commit(&self) -> u64 {
-        self.last_commit.load(Ordering::SeqCst)
+        self.published_commit_id.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn durable_commit_id(&self) -> u64 {
+        self.durable_commit_id.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn published_commit_id(&self) -> u64 {
+        self.published_commit_id.load(Ordering::SeqCst)
     }
 
     /// Align the global commit clock with an externally observed committed version.
@@ -576,7 +600,8 @@ impl TransactionManager {
     pub fn sync_commit_id_with(&self, min_committed_version: u64) {
         let next = min_committed_version.saturating_add(1);
         Self::bump_atomic_min(&self.next_commit_id, next);
-        Self::bump_atomic_min(&self.last_commit, min_committed_version);
+        Self::bump_atomic_min(&self.durable_commit_id, min_committed_version);
+        Self::bump_atomic_min(&self.published_commit_id, min_committed_version);
     }
 
     /// Get the minimum start time among all active transactions.
@@ -586,7 +611,9 @@ impl TransactionManager {
     pub fn get_min_active_start_time(&self) -> u64 {
         let lowest = self.lowest_active_start.load(Ordering::SeqCst);
         if lowest == MAX_TRANSACTION_ID {
-            self.last_commit.load(Ordering::SeqCst).saturating_add(1)
+            self.published_commit_id
+                .load(Ordering::SeqCst)
+                .saturating_add(1)
         } else {
             lowest
         }
@@ -880,6 +907,19 @@ mod tests {
         let commit_id = tm.commit_transaction(txn).unwrap();
         assert!(commit_id >= 11);
         assert!(tm.last_commit() >= 10);
+    }
+
+    #[test]
+    fn test_durable_commit_does_not_advance_new_snapshot_frontier() {
+        let tm = TransactionManager::new();
+
+        tm.mark_durable_commit(7);
+
+        assert_eq!(tm.durable_commit_id(), 7);
+        assert_eq!(tm.published_commit_id(), 0);
+
+        let txn = tm.begin_transaction().unwrap();
+        assert_eq!(txn.start_time, 1);
     }
 
     #[test]

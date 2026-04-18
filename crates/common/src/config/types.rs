@@ -97,6 +97,8 @@ pub struct ClusterConfig {
     pub access_mode: AccessMode,
     /// Enable external file system and network access
     pub enable_external_access: bool,
+    /// Maximum delete-patch row refs to keep inline before spilling to an artifact.
+    pub delete_patch_inline_row_ref_threshold: usize,
 }
 
 impl Default for ClusterConfig {
@@ -108,6 +110,7 @@ impl Default for ClusterConfig {
             default_database: "postgres".to_string(),
             access_mode: AccessMode::ReadWrite,
             enable_external_access: true,
+            delete_patch_inline_row_ref_threshold: 256,
         }
     }
 }

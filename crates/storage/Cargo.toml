@@ -45,6 +45,7 @@ approx-constant = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-journal = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 crossbeam = "0.8"

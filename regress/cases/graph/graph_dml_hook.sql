@@ -3,7 +3,7 @@
 
 -- ============================================================
 -- Graph DML Hook
--- Phase 6.3.5: commit-time property-graph maintenance
+-- Commit-time property-graph maintenance regression coverage
 -- ============================================================
 
 CREATE TABLE gh_person (id BIGINT PRIMARY KEY, name VARCHAR);

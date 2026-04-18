@@ -10,6 +10,7 @@ use paro_common::logging::targets;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::{CompactionManager, CompactionObservability};
+use paro_storage::table::table_handle::TableHandle;
 use paro_storage::tablet::TabletRef;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -149,6 +150,52 @@ impl CompactionDriver {
             total = stats.total_registered,
             "Compaction tablet registry synchronized"
         );
+        Ok(())
+    }
+
+    pub fn register_tablet(
+        &self,
+        storage: &Arc<TableHandle>,
+        db_name: &str,
+        db_type: DatabaseType,
+    ) -> anyhow::Result<()> {
+        if !Self::should_enable(db_type) {
+            return Ok(());
+        }
+
+        self.ensure_started(db_name, db_type);
+        let manager = match self.manager.read().as_ref() {
+            Some(manager) => Arc::clone(manager),
+            None => return Ok(()),
+        };
+        storage.bind_compaction_manager(&manager);
+        manager.register_tablet(storage.tablet());
+        Ok(())
+    }
+
+    pub fn unregister_tablet(
+        &self,
+        tablet_id: u64,
+        db_name: &str,
+        db_type: DatabaseType,
+    ) -> anyhow::Result<()> {
+        if !Self::should_enable(db_type) {
+            return Ok(());
+        }
+
+        let manager = match self.manager.read().as_ref() {
+            Some(manager) => Arc::clone(manager),
+            None => {
+                tracing::debug!(
+                    target: targets::INSTANCE,
+                    db = %db_name,
+                    tablet_id,
+                    "Compaction manager not started; skipping tablet unregister"
+                );
+                return Ok(());
+            }
+        };
+        manager.unregister_tablet(tablet_id)?;
         Ok(())
     }
 

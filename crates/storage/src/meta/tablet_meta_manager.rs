@@ -1167,7 +1167,7 @@ mod tests {
             .save_tablet_meta(&build_tablet_meta(52, 901))
             .unwrap();
 
-        let wal_path = dir.path().join("tablet.wal");
+        let wal_path = dir.path().join("recovery_test.wal");
         let wal = WalWriter::new(&wal_path, WalInitState::Uninitialized);
 
         wal.write_rowset_commit(52, 1001, 1, 1, "/tmp/tablet-52/rowset-1001")

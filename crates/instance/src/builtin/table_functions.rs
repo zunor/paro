@@ -14,7 +14,7 @@ use paro_function::table::system::{
     create_paro_indexes_function_set, create_paro_logs_function_set,
     create_paro_optimizers_function_set, create_paro_schemas_function_set,
     create_paro_storage_info_function_set, create_paro_tables_function_set,
-    create_paro_views_function_set,
+    create_paro_views_function_set, create_paro_wal_metrics_function_set,
 };
 use paro_function::table::unnest::create_unnest_function_set;
 use paro_function::table::TableFunctionSet;
@@ -63,6 +63,7 @@ impl BuiltinTableFunctions {
             create_paro_logs_function_set(),
             create_paro_optimizers_function_set(),
             create_paro_storage_info_function_set(),
+            create_paro_wal_metrics_function_set(),
         ]
     }
 
@@ -153,6 +154,9 @@ impl BuiltinTableFunctions {
 
         let paro_storage_info_set = create_paro_storage_info_function_set();
         Self::register_set(schema, paro_storage_info_set);
+
+        let paro_wal_metrics_set = create_paro_wal_metrics_function_set();
+        Self::register_set(schema, paro_wal_metrics_set);
     }
 
     /// Register a table function set into the schema.

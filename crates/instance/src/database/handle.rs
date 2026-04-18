@@ -11,17 +11,25 @@ use crate::database::opener::DatabaseOpener;
 use crate::database::state::DatabaseState;
 use crate::database::wal_observability::WalLifecycleMetricsSnapshot;
 use crate::database::wal_observability::WalObservability;
+use crate::recovery::registry::RouteRegistry;
 use crate::storage_manager::StorageManager;
 use parking_lot::RwLock;
 use paro_catalog::database_catalog::ParoCatalog;
+use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
+use paro_catalog::mvcc::CatalogSnapshot;
+use paro_common::ddl::DdlObjectKey;
+use paro_common::effect::DeferredTask;
+use paro_common::journal::RecoverySummary;
 use paro_common::logging::targets;
+use paro_journal::{JournalAppender, JournalApplyRuntime, JournalCoordinator};
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::transaction::manager::TransactionManager;
+use paro_storage::wal::journal_sink::WalJournalSink;
 use paro_storage::wal::write_ahead_log::WriteAheadLog;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -225,6 +233,12 @@ pub struct DatabaseHandle {
     transaction_manager: Arc<TransactionManager>,
     buffer_pool: Arc<BufferPool>,
     storage_manager: RwLock<Option<Box<dyn StorageManager>>>,
+    journal_appender: RwLock<Option<Arc<JournalAppender>>>,
+    journal_coordinator: RwLock<Option<Arc<JournalCoordinator>>>,
+    journal_apply_runtime: RwLock<Option<Arc<JournalApplyRuntime>>>,
+    route_registry: RwLock<RouteRegistry>,
+    task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
+    replayed_deferred_tasks: RwLock<Vec<DeferredTask>>,
     compaction: CompactionDriver,
     checkpointer: Checkpointer,
     wal_observability: WalObservability,
@@ -264,6 +278,9 @@ impl DatabaseHandle {
         initial_state: DbState,
     ) -> Self {
         let catalog = Self::catalog_for_path(&identity.name, &identity.path);
+        let journal_apply_runtime = Arc::new(JournalApplyRuntime::new());
+        let journal_coordinator = Arc::new(JournalCoordinator::new(None));
+        journal_coordinator.bind_apply_runtime(Arc::clone(&journal_apply_runtime));
         Self {
             identity,
             state: DatabaseState::new(initial_state),
@@ -271,6 +288,12 @@ impl DatabaseHandle {
             transaction_manager: Arc::new(TransactionManager::new()),
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
+            journal_appender: RwLock::new(None),
+            journal_coordinator: RwLock::new(Some(journal_coordinator)),
+            journal_apply_runtime: RwLock::new(Some(journal_apply_runtime)),
+            route_registry: RwLock::new(RouteRegistry::default()),
+            task_scheduler: RwLock::new(None),
+            replayed_deferred_tasks: RwLock::new(Vec::new()),
             compaction: CompactionDriver::new(buffer_pool),
             checkpointer: Checkpointer::new(),
             wal_observability: WalObservability::new(),
@@ -456,11 +479,25 @@ impl DatabaseHandle {
 
     /// Bind the instance task scheduler for background maintenance tasks.
     pub fn bind_task_scheduler(&self, scheduler: Arc<TaskScheduler>) {
-        self.compaction.bind_scheduler(scheduler);
+        self.compaction.bind_scheduler(scheduler.clone());
+        *self.task_scheduler.write() = Some(scheduler);
+    }
+
+    pub fn task_scheduler(&self) -> Option<Arc<TaskScheduler>> {
+        self.task_scheduler.read().clone()
+    }
+
+    pub fn set_replayed_deferred_tasks(&self, tasks: Vec<DeferredTask>) {
+        *self.replayed_deferred_tasks.write() = tasks;
+    }
+
+    pub fn replayed_deferred_tasks(&self) -> Vec<DeferredTask> {
+        self.replayed_deferred_tasks.read().clone()
     }
 
     /// Sync compaction tablet registry with the currently visible catalog tables.
     pub fn sync_compaction_tablets(&self) -> anyhow::Result<()> {
+        self.bind_runtime_storage_wal();
         self.compaction
             .sync_tablets(&self.catalog, self.name(), self.db_type())
     }
@@ -473,6 +510,7 @@ impl DatabaseHandle {
         let mut storage = self.storage_manager.write();
         *storage = Some(manager);
         drop(storage);
+        self.refresh_journal_appender();
 
         self.compaction.ensure_started(self.name(), self.db_type());
         if let Err(err) = self.sync_compaction_tablets() {
@@ -495,6 +533,36 @@ impl DatabaseHandle {
     pub fn tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>> {
         let storage = self.storage_manager.read();
         storage.as_ref().and_then(|s| s.get_tablet_meta_manager())
+    }
+
+    fn bind_runtime_storage_wal(&self) {
+        let wal = self.wal();
+        let txn = CatalogSnapshot::read_only(u64::MAX);
+
+        for schema_entry in self
+            .catalog
+            .get_schema_collection()
+            .scan(txn.transaction_id, txn.start_time)
+        {
+            let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
+                continue;
+            };
+
+            for table_entry in schema
+                .collection(CatalogType::Table)
+                .expect("table collection")
+                .scan(txn.transaction_id, txn.start_time)
+            {
+                let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+                    continue;
+                };
+                if let Some(storage) = table.get_storage() {
+                    storage.bind_database_wal(wal.clone());
+                    storage.bind_journal_coordinator(self.journal_coordinator());
+                    storage.bind_journal_apply_runtime(self.journal_apply_runtime());
+                }
+            }
+        }
     }
 
     /// Get the catalog.
@@ -552,6 +620,8 @@ impl DatabaseHandle {
         if let Some(ref mut sm) = *storage {
             sm.initialize().map_err(|e| anyhow::anyhow!(e))?;
         }
+        drop(storage);
+        self.refresh_journal_appender();
 
         tracing::info!(
             target: targets::WAL,
@@ -567,6 +637,116 @@ impl DatabaseHandle {
     pub fn wal(&self) -> Option<Arc<WriteAheadLog>> {
         let storage = self.storage_manager.read();
         storage.as_ref().and_then(|s| s.get_wal_arc())
+    }
+
+    pub fn journal_appender(&self) -> Option<Arc<JournalAppender>> {
+        self.journal_appender.read().clone()
+    }
+
+    pub fn journal_coordinator(&self) -> Option<Arc<JournalCoordinator>> {
+        self.journal_coordinator.read().clone()
+    }
+
+    pub fn journal_apply_runtime(&self) -> Option<Arc<JournalApplyRuntime>> {
+        self.journal_apply_runtime.read().clone()
+    }
+
+    pub fn route_registry_snapshot(&self) -> RouteRegistry {
+        self.route_registry.read().clone()
+    }
+
+    pub fn replace_route_registry(&self, registry: RouteRegistry) -> RouteRegistry {
+        std::mem::replace(&mut *self.route_registry.write(), registry)
+    }
+
+    pub fn rebuild_route_registry_from_catalog(&self) -> paro_common::error::Result<()> {
+        let _ = self.replace_route_registry(RouteRegistry::from_catalog(&self.catalog)?);
+        Ok(())
+    }
+
+    pub fn sweep_staged_artifacts_after_recovery(&self) {
+        let mut seen = HashSet::new();
+        for route in self.route_registry_snapshot().tablet_routes() {
+            let tablet = route.storage.tablet();
+            if !seen.insert(tablet.tablet_id()) {
+                continue;
+            }
+            paro_storage::compaction::cleanup::sweep_staging_root(tablet.staged_root_dir());
+        }
+    }
+
+    pub fn refresh_journal_appender(&self) {
+        self.refresh_journal_appender_with_summary(RecoverySummary::default());
+    }
+
+    pub fn refresh_journal_appender_with_summary(&self, summary: RecoverySummary) {
+        let next_appender = self.wal().map(|wal| {
+            Arc::new(JournalAppender::new_with_next_lsn(
+                Arc::new(WalJournalSink::new(wal)),
+                summary.max_lsn.saturating_add(1).max(1),
+            ))
+        });
+        let next_apply_runtime = Some(Arc::new(JournalApplyRuntime::new()));
+        let next_coordinator = Some(Arc::new(JournalCoordinator::new(next_appender.clone())));
+        if let Some(runtime) = &next_apply_runtime {
+            runtime.bootstrap_frontiers(summary);
+        }
+        if let Some(coordinator) = &next_coordinator {
+            if let Some(runtime) = &next_apply_runtime {
+                coordinator.bind_apply_runtime(Arc::clone(runtime));
+            }
+            coordinator.sync_commit_id_with(summary.max_commit_id);
+            coordinator.sync_commit_id_with(self.transaction_manager.durable_commit_id());
+            coordinator.sync_maintenance_id_with(summary.max_maintenance_id);
+        }
+        *self.journal_appender.write() = next_appender;
+        *self.journal_coordinator.write() = next_coordinator;
+        *self.journal_apply_runtime.write() = next_apply_runtime;
+        self.bind_runtime_storage_wal();
+    }
+
+    fn bind_runtime_storage(&self, storage: &Arc<paro_storage::table::table_handle::TableHandle>) {
+        storage.bind_database_wal(self.wal());
+        storage.bind_journal_coordinator(self.journal_coordinator());
+        storage.bind_journal_apply_runtime(self.journal_apply_runtime());
+    }
+
+    pub fn sync_runtime_table_keys_incremental(
+        &self,
+        previous: &RouteRegistry,
+        current: &RouteRegistry,
+        table_keys: &[DdlObjectKey],
+    ) -> anyhow::Result<()> {
+        if table_keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut previous_tablet_ids = HashSet::new();
+        let mut current_routes = HashMap::new();
+        for key in table_keys {
+            if let Some(route) = previous.route_table_key(key) {
+                previous_tablet_ids.insert(route.storage.tablet_id());
+            }
+            if let Some(route) = current.route_table_key(key) {
+                current_routes
+                    .entry(route.storage.tablet_id())
+                    .or_insert_with(|| route.clone());
+            }
+        }
+
+        let current_tablet_ids: HashSet<_> = current_routes.keys().copied().collect();
+        for route in current_routes.values() {
+            self.bind_runtime_storage(&route.storage);
+            self.compaction
+                .register_tablet(&route.storage, self.name(), self.db_type())?;
+        }
+
+        for tablet_id in previous_tablet_ids.difference(&current_tablet_ids) {
+            self.compaction
+                .unregister_tablet(*tablet_id, self.name(), self.db_type())?;
+        }
+
+        Ok(())
     }
 
     /// Run a read-only WAL health check.
@@ -600,7 +780,13 @@ impl DatabaseHandle {
 
     /// Return WAL lifecycle observability snapshot for instance aggregation.
     pub fn wal_lifecycle_metrics(&self) -> WalLifecycleMetricsSnapshot {
-        self.wal_observability.snapshot(&self.checkpointer)
+        let appender = self.journal_appender.read();
+        let apply_runtime = self.journal_apply_runtime.read();
+        self.wal_observability.snapshot(
+            &self.checkpointer,
+            appender.as_deref(),
+            apply_runtime.as_deref(),
+        )
     }
 
     /// Check if this database has a WAL.

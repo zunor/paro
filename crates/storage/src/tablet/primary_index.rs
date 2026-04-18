@@ -8,9 +8,6 @@ use crate::rowset::column::ColumnBatch;
 use crate::rowset::Rowset;
 use crate::tablet::tablet_schema::KeysType;
 use crate::tablet::ColumnId;
-use crate::wal::wal_entry::WalEntry;
-use crate::wal::wal_type::WalType;
-use crate::wal::wal_writer::{WalInitState, WalWriter};
 use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -116,6 +113,18 @@ impl Tablet {
             return Ok(());
         }
         if !self.primary_index_full.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        self.reconcile_primary_index_row_count_strict()
+    }
+
+    fn reconcile_primary_index_row_count_strict(&self) -> Result<()> {
+        let schema = match self.schema() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        if schema.keys_type() != KeysType::PrimaryKeys {
             return Ok(());
         }
 
@@ -250,61 +259,6 @@ impl Tablet {
         Ok(())
     }
 
-    pub(crate) fn try_replace_primary_index_entries(
-        &self,
-        pairs: Vec<(Vec<u8>, PhysicalRowRef)>,
-        max_input_version: i64,
-    ) -> Result<Vec<(Vec<u8>, PhysicalRowRef)>> {
-        if pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let idx = self.primary_index_handle();
-        let persistent = self.persistent_index()?;
-        let mut bootstrap_pairs = Vec::new();
-        for (key, _) in &pairs {
-            if idx.get(key).is_none() {
-                if let Some(row_id) = persistent.get(key)? {
-                    bootstrap_pairs.push((key.clone(), row_id));
-                }
-            }
-        }
-        if !bootstrap_pairs.is_empty() {
-            idx.batch_upsert(bootstrap_pairs);
-        }
-
-        let encoded_pairs = pairs
-            .iter()
-            .map(|(key, location)| Ok((key.clone(), self.encode_row_location(*location)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let locations_by_key: HashMap<Vec<u8>, PhysicalRowRef> = pairs.into_iter().collect();
-
-        let successful = idx.batch_try_replace(
-            encoded_pairs,
-            |row_id| {
-                let location = self.decode_row_id(row_id)?;
-                let rowset = self.find_rowset_by_id(location.rowset_id).ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "Rowset {} not found while resolving compaction conflict",
-                        location.rowset_id
-                    ))
-                })?;
-                Ok(rowset.end_version())
-            },
-            max_input_version,
-        )?;
-
-        successful
-            .into_iter()
-            .map(|(key, _)| {
-                let location = locations_by_key.get(&key).copied().ok_or_else(|| {
-                    paro_error::internal("missing successful primary index replacement location")
-                })?;
-                Ok((key, location))
-            })
-            .collect()
-    }
-
     pub(crate) fn persist_primary_index_upserts(&self, pairs: &[(Vec<u8>, RowID)]) -> Result<()> {
         self.persistent_index()?.apply_upserts(pairs)
     }
@@ -381,7 +335,6 @@ impl Tablet {
     fn apply_primary_delete_internal(
         &self,
         keys: Vec<Vec<u8>>,
-        persist_wal: bool,
         ignore_missing: bool,
     ) -> Result<()> {
         if keys.is_empty() {
@@ -398,16 +351,20 @@ impl Tablet {
             }
         }
 
-        let resolved = self.lookup_primary_keys(&unique_keys)?;
         let idx = self.primary_index_handle();
         let persistent = self.persistent_index()?;
+        let version = self.max_version();
 
         let mut resolved_locations = Vec::with_capacity(unique_keys.len());
         let mut existing_keys = Vec::with_capacity(unique_keys.len());
-        for (key, current) in unique_keys.iter().zip(resolved.into_iter()) {
+        for key in &unique_keys {
+            let current = self
+                .primary_key_occurrences(key, version)?
+                .into_iter()
+                .find_map(|(location, is_deleted)| (!is_deleted).then_some(location));
             match current {
                 Some(current) => {
-                    resolved_locations.push(self.decode_row_id(current)?);
+                    resolved_locations.push(current);
                     existing_keys.push(key.clone());
                 }
                 None if ignore_missing => {}
@@ -432,18 +389,7 @@ impl Tablet {
                 .or_insert_with(DeleteVector::new);
             entry.mark_deleted(loc.row_offset);
         }
-        let version = self.max_version();
         self.persist_delete_vectors(version, pending)?;
-
-        if persist_wal {
-            let wal = WalWriter::new(
-                self.data_dir().join("tablet.wal"),
-                WalInitState::Uninitialized,
-            );
-            let entry = WalEntry::PrimaryDelete { keys: unique_keys };
-            wal.write_entry(WalType::PrimaryDelete, &entry.serialize_data())?;
-            wal.flush()?;
-        }
 
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
@@ -451,10 +397,10 @@ impl Tablet {
     }
 
     pub fn apply_primary_delete(&self, keys: Vec<Vec<u8>>) -> Result<()> {
-        self.apply_primary_delete_internal(keys, true, false)
+        self.apply_primary_delete_internal(keys, false)
     }
 
-    pub(super) fn replay_primary_delete_idempotent(&self, keys: Vec<Vec<u8>>) -> Result<()> {
+    pub(crate) fn replay_primary_delete_idempotent(&self, keys: Vec<Vec<u8>>) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -598,6 +544,17 @@ impl Tablet {
 
     pub(super) fn rebuild_primary_index_from_persistent(&self) -> Result<bool> {
         let persistent = self.persistent_index()?;
+        if persistent.applied_lsn() < self.applied_lsn() {
+            warn!(
+                tablet_id = self.tablet_id(),
+                persistent_applied_lsn = persistent.applied_lsn(),
+                tablet_applied_lsn = self.applied_lsn(),
+                "persistent primary index lsn lagged tablet snapshot; rebuilding"
+            );
+            self.rebuild_primary_index_from_visible_rowsets()?;
+            self.persist_primary_index_snapshot()?;
+            return Ok(true);
+        }
         match persistent.load() {
             Ok(index) => {
                 let index = Arc::new(index);
@@ -657,6 +614,7 @@ impl Tablet {
                 .store(true, Ordering::Release);
             return Err(err);
         }
+        persistent.set_applied_lsn(self.applied_lsn())?;
         idx.clear();
         self.primary_index_full.store(false, Ordering::Release);
         Ok(())
@@ -671,12 +629,14 @@ impl Tablet {
             return Ok(());
         }
 
-        if self.reconcile_primary_index_row_count().is_ok() {
+        if self.primary_index_full.load(Ordering::Acquire)
+            && self.reconcile_primary_index_row_count_strict().is_ok()
+        {
             return Ok(());
         }
 
         self.rebuild_primary_index_from_visible_rowsets()?;
-        self.reconcile_primary_index_row_count()?;
+        self.reconcile_primary_index_row_count_strict()?;
         self.persist_primary_index_snapshot()?;
         Ok(())
     }
@@ -691,10 +651,6 @@ impl Tablet {
         }
 
         let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
-        if visible_rowsets.is_empty() {
-            return Ok(());
-        }
-
         let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(&schema)?;
         let key_projection: Vec<crate::tablet::ColumnId> = schema
             .columns()
@@ -711,10 +667,6 @@ impl Tablet {
         let allocator = Arc::new(default_allocator());
 
         let repaired = PrimaryIndex::new();
-        let snapshot = self.primary_index_handle().snapshot();
-        if !snapshot.is_empty() {
-            repaired.batch_upsert(snapshot);
-        }
 
         for rowset in visible_rowsets {
             rowset.load()?;
@@ -784,6 +736,7 @@ impl Tablet {
             let idx = self.primary_index_handle();
             persistent.flush_l0(&idx, true)?;
         }
+        persistent.set_applied_lsn(self.applied_lsn())?;
         Ok(())
     }
 }

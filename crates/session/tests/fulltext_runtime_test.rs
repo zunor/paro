@@ -21,9 +21,21 @@ use std::sync::Arc;
 
 use exec_ok::exec_ok;
 use instance_persistent::create_persistent_instance;
+use paro_catalog::entry::{
+    CatalogEntryEnum, CreateIndexInfo, IndexBuildState, IndexCatalogEntry,
+    IndexType as CatalogIndexType, LogicalIndex,
+};
+use paro_catalog::mvcc::CatalogSnapshot;
+use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
+use paro_common::effect::DeferredTask;
+use paro_instance::{
+    build_recovery_consistency_report, DeferredTaskRecoveryHook, RecoveryHook, RecoveryHookContext,
+    RecoveryHookResult, StartupPolicy,
+};
 use query_bool_col::query_bool_col;
 use query_i64_col::query_i64_col;
 use query_string_col::query_string_col;
+use std::path::PathBuf;
 use unique_test_dir::create_unique_test_dir;
 
 fn explain_lines(sink: &CollectingSink) -> Vec<String> {
@@ -39,6 +51,33 @@ fn explain_lines(sink: &CollectingSink) -> Vec<String> {
         }
     }
     lines
+}
+
+fn deferred_task_context(session: &Session, task: DeferredTask) -> RecoveryHookContext {
+    RecoveryHookContext {
+        database_root: PathBuf::from(session.current_database.path()),
+        recovery_report: build_recovery_consistency_report(session.current_database.catalog()),
+        startup_policy: StartupPolicy::Strict,
+        graph_registry: session.instance.graph_manager().clone(),
+        scheduler: session.instance.get_scheduler().clone(),
+        replayed_deferred_tasks: vec![task],
+    }
+}
+
+fn lookup_index_entry(session: &Session, index_name: &str) -> Arc<IndexCatalogEntry> {
+    let txn = CatalogSnapshot::read_only(u64::MAX);
+    let schema = session
+        .current_database
+        .catalog()
+        .get_schema(&txn, session.current_schema())
+        .expect("schema should exist");
+    let entry = schema
+        .get_index(txn.transaction_id, txn.start_time, index_name)
+        .expect("index should exist");
+    match &*entry {
+        CatalogEntryEnum::Index(index) => index.clone(),
+        other => panic!("expected index entry, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -295,6 +334,211 @@ async fn create_index_marks_fulltext_coverage_complete_after_post_commit_build()
             .any(|line| line.to_ascii_uppercase().contains("FULLTEXT_SCAN")),
         "fulltext index should be eligible for pushdown after create index, actual:\n{}",
         lines.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn inserts_after_empty_fulltext_index_still_use_pushdown() {
+    let instance = Instance::new_in_memory();
+    let mut session = Session::new(1, instance);
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE docs_cov_late (id INT, content VARCHAR)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE INDEX idx_docs_cov_late_fts ON docs_cov_late USING GIN (to_tsvector('simple', content))",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO docs_cov_late VALUES
+            (1, 'vector after index'),
+            (2, 'noise')",
+    )
+    .await;
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "EXPLAIN
+         SELECT id
+         FROM docs_cov_late
+         WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
+         ORDER BY id",
+    )
+    .await;
+    let lines = explain_lines(&sink);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("FULLTEXT_SCAN")),
+        "fulltext index should stay pushdown-ready for inserts after empty index creation, actual:\n{}",
+        lines.join("\n")
+    );
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT id
+         FROM docs_cov_late
+         WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
+         ORDER BY id",
+    )
+    .await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1]);
+}
+
+#[tokio::test]
+async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_runtime() {
+    let instance = Instance::new_in_memory();
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE docs_redelivery (id INT, content VARCHAR)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO docs_redelivery VALUES (1, 'vector database'), (2, 'graph database')",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE INDEX idx_docs_redelivery_fts ON docs_redelivery USING GIN (to_tsvector('simple', content))",
+    )
+    .await;
+
+    let hook = DeferredTaskRecoveryHook;
+    let task = DeferredTask::BuildIndexRuntime {
+        index: DdlObjectKey::new(
+            session.current_database.catalog().name(),
+            Some(session.current_schema()),
+            "idx_docs_redelivery_fts",
+            DdlObjectKind::Index,
+        ),
+        table_name: "docs_redelivery".to_string(),
+        index_type: "FULLTEXT".to_string(),
+        column_ids: vec![1],
+        fulltext_config: Some("simple".to_string()),
+    };
+
+    let first = hook
+        .run(
+            &session.current_database,
+            &deferred_task_context(&session, task.clone()),
+        )
+        .expect("duplicate recovery hook should not error");
+    let second = hook
+        .run(
+            &session.current_database,
+            &deferred_task_context(&session, task),
+        )
+        .expect("second duplicate recovery hook should not error");
+
+    assert!(matches!(first, RecoveryHookResult::Skipped { .. }));
+    assert!(matches!(second, RecoveryHookResult::Skipped { .. }));
+}
+
+#[tokio::test]
+async fn deferred_task_failure_marks_catalog_failed_without_aborting_recovery_hook() {
+    let instance = Instance::new_in_memory();
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE docs_redelivery_fail (id INT, content VARCHAR)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO docs_redelivery_fail VALUES (1, 'vector database')",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT COUNT(*) FROM docs_redelivery_fail",
+    )
+    .await;
+
+    let writer = CatalogSnapshot::permanent_writer(9_901);
+    let schema = session
+        .current_database
+        .catalog()
+        .get_schema(&writer, session.current_schema())
+        .expect("schema should exist");
+    let table_entry = schema
+        .get_table(
+            writer.transaction_id,
+            writer.start_time,
+            "docs_redelivery_fail",
+        )
+        .expect("table should exist");
+    let table = table_entry.as_ref().as_table().expect("table entry");
+    schema
+        .create_index(
+            &writer,
+            CreateIndexInfo::new(
+                session.current_schema().to_string(),
+                "docs_redelivery_fail".to_string(),
+                "idx_docs_redelivery_fail_fts".to_string(),
+                vec![LogicalIndex::new(1)],
+                vec![paro_common::types::LogicalType::Varchar],
+            )
+            .with_catalog(session.current_database.catalog().name().to_string())
+            .with_index_type(CatalogIndexType::FullText)
+            .with_fulltext_options(LogicalIndex::new(1), "simple"),
+            table,
+        )
+        .expect("create building fulltext index")
+        .expect("index entry should be created");
+
+    let hook = DeferredTaskRecoveryHook;
+    let result = hook
+        .run(
+            &session.current_database,
+            &deferred_task_context(
+                &session,
+                DeferredTask::BuildIndexRuntime {
+                    index: DdlObjectKey::new(
+                        session.current_database.catalog().name(),
+                        Some(session.current_schema()),
+                        "idx_docs_redelivery_fail_fts",
+                        DdlObjectKind::Index,
+                    ),
+                    table_name: "docs_redelivery_fail".to_string(),
+                    index_type: "FULLTEXT".to_string(),
+                    column_ids: vec![1],
+                    fulltext_config: Some("unsupported_lang".to_string()),
+                },
+            ),
+        )
+        .expect("failed deferred task should be reported, not raised");
+
+    let index = lookup_index_entry(&session, "idx_docs_redelivery_fail_fts");
+    assert!(matches!(result, RecoveryHookResult::Failed { .. }));
+    assert_eq!(index.build_state(), IndexBuildState::Failed);
+    assert!(
+        index
+            .failure_reason()
+            .unwrap_or_default()
+            .contains("unsupported"),
+        "failed state should preserve the runtime build error"
     );
 }
 

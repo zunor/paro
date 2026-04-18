@@ -28,8 +28,9 @@ pub use database::handle::{
     RecoveryMode,
 };
 pub use database::hooks::{
-    FullTextRecoveryHook, GraphProjectionRecoveryHook, RecoveryHook, RecoveryHookContext,
-    RecoveryHookIssue, RecoveryHookIssueKind, RecoveryHookResult, VectorIndexRecoveryHook,
+    DeferredTaskRecoveryHook, FullTextRecoveryHook, GraphProjectionRecoveryHook, RecoveryHook,
+    RecoveryHookContext, RecoveryHookIssue, RecoveryHookIssueKind, RecoveryHookResult,
+    VectorIndexRecoveryHook,
 };
 pub use database::identity::{DatabaseIdentity, DatabaseType, RESERVED_NAMES};
 pub use database::opener::{
@@ -74,8 +75,10 @@ pub use metadata::InstanceMetadata;
 pub use recovery::consistency_report::{
     build_recovery_consistency_report, RecoveryConsistencyReport, RecoveryTableConsistencyReport,
 };
+pub use recovery::registry::RouteRegistry;
 pub use recovery::replay_handler::{
     needs_recovery, recover_database, recover_database_with_checkpoint, CatalogReplayHandler,
+    RuntimeCatalogApplyBatch,
 };
 pub use runtime::connection_registry::{ConnectionHandle, ConnectionId, ConnectionRegistry};
 pub use runtime::object_cache::{ObjectCache, ObjectCacheEntry};

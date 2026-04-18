@@ -8,7 +8,9 @@
 use crate::compaction::compaction_manager::CompactionManager;
 use crate::table::index_runtime::IndexRuntime;
 use crate::tablet::{Tablet, TabletRef};
+use crate::wal::write_ahead_log::WriteAheadLog;
 use paro_common::types::LogicalType;
+use paro_journal::{JournalApplyRuntime, JournalCoordinator};
 use std::sync::{Arc, Weak};
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,18 @@ impl TableHandle {
     /// Clone the runtime tablet handle backing this table.
     pub fn tablet(&self) -> TabletRef {
         Arc::clone(&self.runtime_tablet)
+    }
+
+    pub fn bind_database_wal(&self, wal: Option<Arc<WriteAheadLog>>) {
+        self.runtime_tablet.bind_database_wal(wal);
+    }
+
+    pub fn bind_journal_coordinator(&self, coordinator: Option<Arc<JournalCoordinator>>) {
+        self.runtime_tablet.bind_journal_coordinator(coordinator);
+    }
+
+    pub fn bind_journal_apply_runtime(&self, runtime: Option<Arc<JournalApplyRuntime>>) {
+        self.runtime_tablet.bind_journal_apply_runtime(runtime);
     }
 }
 

@@ -15,25 +15,27 @@ use crate::wal::wal_writer::{WalInitState, WAL_VERSION_NUMBER};
 use crate::wal::write_ahead_log::{
     checkpoint_wal_path_from_main, recovery_wal_path_from_main, WriteAheadLog,
 };
-use paro_common::effect::{CatalogTxnOp, PostCommitHookDescriptor, PreparedDataOp};
 use paro_common::error as paro_error;
 use paro_common::error::Result;
+use paro_common::journal::{CheckpointFence, CommitRecord, MaintenanceRecord};
 use paro_common::logging::targets;
 
 /// Callback trait for applying WAL entries during replay.
 ///
-/// Catalog mutations are delivered only through [`ReplayHandler::replay_transaction`]
-/// (`TxnBegin` … `TxnCommit` envelopes). Standalone per-DDL and row-tuple DML opcodes
-/// are no longer deserialized.
+/// Transactional catalog/data mutations are delivered through [`ReplayHandler::replay_commit_record`].
 pub trait ReplayHandler {
-    /// Replay one committed unified transaction (catalog + data + hooks).
-    fn replay_transaction(
-        &mut self,
-        _catalog_ops: &[CatalogTxnOp],
-        _data_ops: &[PreparedDataOp],
-        _post_commit_hooks: &[PostCommitHookDescriptor],
-        _commit_id: u64,
-    ) -> Result<()> {
+    /// Replay one committed journal record.
+    fn replay_commit_record(&mut self, _lsn: u64, _record: &CommitRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Replay one durable maintenance record.
+    fn replay_maintenance_record(&mut self, _lsn: u64, _record: &MaintenanceRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Replay one checkpoint fence carried by the journal stream.
+    fn replay_checkpoint_fence(&mut self, _lsn: u64, _fence: &CheckpointFence) -> Result<()> {
         Ok(())
     }
 
@@ -1192,7 +1194,7 @@ impl WalRecovery {
                             .map(|(entry_offset, _)| *entry_offset)
                             .unwrap_or(position);
 
-                        match self.apply_pending_transaction_entries(
+                        match self.apply_pending_entries(
                             &mut pending_entries,
                             handler,
                             &mut checkpoint_info,
@@ -1279,11 +1281,11 @@ impl WalRecovery {
         Ok(result)
     }
 
-    /// Apply pending WAL entries as a single committed transaction.
+    /// Apply pending WAL entries that have reached a durable flush boundary.
     ///
     /// Pending entries are replayed only when a `WalFlush` marker is reached.
     /// Returns the number of replayed entries including the flush marker.
-    fn apply_pending_transaction_entries<H: ReplayHandler>(
+    fn apply_pending_entries<H: ReplayHandler>(
         &self,
         pending_entries: &mut Vec<(u64, WalEntry)>,
         handler: &mut H,
@@ -1292,71 +1294,16 @@ impl WalRecovery {
         let mut replayed_entries = 0u64;
         let entries = std::mem::take(pending_entries);
         let mut tx_state = ReplayState::new();
-        let mut idx = 0usize;
+        for (position, entry) in entries {
+            tx_state.process_entry(&entry, position);
+            self.apply_entry(&entry, &tx_state, handler)?;
+            replayed_entries += 1;
 
-        while idx < entries.len() {
-            let (position, entry) = &entries[idx];
-            match entry {
-                WalEntry::TxnBegin { txn_id, .. } => {
-                    let mut catalog_ops = Vec::new();
-                    let mut data_ops = Vec::new();
-                    let mut hooks = Vec::new();
-                    let mut commit_id = None;
-                    let mut aborted = false;
-                    let mut cursor = idx + 1;
-                    while cursor < entries.len() {
-                        match &entries[cursor].1 {
-                            WalEntry::TxnCatalogOp { op, .. } => catalog_ops.push(op.clone()),
-                            WalEntry::TxnDataOp { op, .. } => data_ops.push(op.clone()),
-                            WalEntry::TxnPostCommitHook { hook, .. } => hooks.push(hook.clone()),
-                            WalEntry::TxnCommit {
-                                txn_id: commit_txn_id,
-                                commit_id: envelope_commit_id,
-                            } if commit_txn_id == txn_id => {
-                                commit_id = Some(*envelope_commit_id);
-                                cursor += 1;
-                                break;
-                            }
-                            WalEntry::TxnAbort {
-                                txn_id: abort_txn_id,
-                            } if abort_txn_id == txn_id => {
-                                aborted = true;
-                                cursor += 1;
-                                break;
-                            }
-                            _ => break,
-                        }
-                        cursor += 1;
-                    }
-                    if let Some(commit_id) = commit_id {
-                        handler.replay_transaction(&catalog_ops, &data_ops, &hooks, commit_id)?;
-                        replayed_entries += (cursor - idx) as u64;
-                        idx = cursor;
-                    } else {
-                        if !aborted {
-                            tracing::warn!(
-                                target: targets::WAL,
-                                txn_id = txn_id,
-                                "txn envelope missing commit inside flushed group; skipping"
-                            );
-                        }
-                        replayed_entries += (cursor - idx) as u64;
-                        idx = cursor;
-                    }
-                }
-                _ => {
-                    tx_state.process_entry(entry, *position);
-                    self.apply_entry(entry, &tx_state, handler)?;
-                    replayed_entries += 1;
-
-                    if let WalEntry::Checkpoint { checkpoint_marker } = entry {
-                        *checkpoint_info = Some(CheckpointInfo {
-                            checkpoint_marker: *checkpoint_marker,
-                            wal_position: *position,
-                        });
-                    }
-                    idx += 1;
-                }
+            if let WalEntry::Checkpoint { checkpoint_marker } = entry {
+                *checkpoint_info = Some(CheckpointInfo {
+                    checkpoint_marker,
+                    wal_position: position,
+                });
             }
         }
 
@@ -1377,12 +1324,17 @@ impl WalRecovery {
                 Ok(())
             }
 
-            WalEntry::TxnBegin { .. }
-            | WalEntry::TxnCatalogOp { .. }
-            | WalEntry::TxnDataOp { .. }
-            | WalEntry::TxnPostCommitHook { .. }
-            | WalEntry::TxnCommit { .. }
-            | WalEntry::TxnAbort { .. } => Ok(()),
+            WalEntry::JournalRecord { lsn, record } => match record {
+                paro_common::journal::JournalRecord::Commit(record) => {
+                    handler.replay_commit_record(*lsn, record)
+                }
+                paro_common::journal::JournalRecord::Maintenance(record) => {
+                    handler.replay_maintenance_record(*lsn, record)
+                }
+                paro_common::journal::JournalRecord::CheckpointFence(fence) => {
+                    handler.replay_checkpoint_fence(*lsn, fence)
+                }
+            },
 
             WalEntry::UseTable { .. } => Ok(()),
 
@@ -1463,7 +1415,7 @@ mod tests {
     use crate::wal::wal_writer::{WalInitState, WalWriter};
     use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::ddl::DdlChange;
-    use paro_common::effect::{CatalogTxnOp, PostCommitHookDescriptor, PreparedDataOp};
+    use paro_common::journal::{JournalRecord, MaintenanceKind, MaintenanceRecord};
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::fs::OpenOptions;
@@ -1497,19 +1449,13 @@ mod tests {
     }
 
     impl ReplayHandler for RecordingHandler {
-        fn replay_transaction(
-            &mut self,
-            catalog_ops: &[CatalogTxnOp],
-            _data_ops: &[PreparedDataOp],
-            _hooks: &[PostCommitHookDescriptor],
-            commit_id: u64,
-        ) -> Result<()> {
+        fn replay_commit_record(&mut self, _lsn: u64, record: &CommitRecord) -> Result<()> {
             self.operations.borrow_mut().push(format!(
                 "TXN commit_id={} catalog_ops={}",
-                commit_id,
-                catalog_ops.len()
+                record.commit_id,
+                record.catalog_ops.len()
             ));
-            for op in catalog_ops {
+            for op in &record.catalog_ops {
                 if matches!(&op.change.change, DdlChange::CreateSchema(_)) {
                     self.operations
                         .borrow_mut()
@@ -2212,6 +2158,90 @@ mod tests {
             .position(|op| op.starts_with("ROWSET_COMMIT tablet=10 rowset=99 v[3-3]"))
             .expect("expected rowset replay operation");
         assert!(validate_pos < replay_pos);
+    }
+
+    #[test]
+    fn journal_commit_replay_preserves_durable_order() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("journal_commit_order.wal");
+
+        let wal = WriteAheadLog::new(&wal_path).unwrap();
+        let writer = wal.writer();
+        write_flushed_create_schema_txn(writer.as_ref(), "default", "schema_one", 10, 10).unwrap();
+        write_flushed_create_schema_txn(writer.as_ref(), "default", "schema_two", 11, 11).unwrap();
+        drop(wal);
+
+        struct CommitOrderHandler {
+            seen: RefCell<Vec<(u64, u64)>>,
+        }
+
+        impl ReplayHandler for CommitOrderHandler {
+            fn replay_commit_record(&mut self, lsn: u64, record: &CommitRecord) -> Result<()> {
+                self.seen.borrow_mut().push((lsn, record.commit_id));
+                Ok(())
+            }
+        }
+
+        let mut handler = CommitOrderHandler {
+            seen: RefCell::new(Vec::new()),
+        };
+        let (_wal, result) = WalRecovery::new(&wal_path).recover(&mut handler).unwrap();
+        assert!(result.all_succeeded);
+        assert_eq!(*handler.seen.borrow(), vec![(10, 10), (11, 11)]);
+    }
+
+    #[test]
+    fn maintenance_record_kind_roundtrips_through_replay_observability() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("maintenance_kind_roundtrip.wal");
+
+        let wal = WriteAheadLog::new(&wal_path).unwrap();
+        let writer = wal.writer();
+        let record = MaintenanceRecord {
+            maintenance_id: 9,
+            kind: MaintenanceKind::MaterializedViewRefresh,
+            catalog_ops: Vec::new(),
+            storage_ops: Vec::new(),
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        };
+        let entry = WalEntry::JournalRecord {
+            lsn: 17,
+            record: JournalRecord::Maintenance(record),
+        };
+        writer
+            .write_entry(entry.wal_type(), &entry.serialize_data())
+            .unwrap();
+        writer.flush().unwrap();
+        drop(wal);
+
+        struct MaintenanceObservabilityHandler {
+            seen: RefCell<Vec<String>>,
+        }
+
+        impl ReplayHandler for MaintenanceObservabilityHandler {
+            fn replay_maintenance_record(
+                &mut self,
+                lsn: u64,
+                record: &MaintenanceRecord,
+            ) -> Result<()> {
+                self.seen.borrow_mut().push(format!(
+                    "MAINTENANCE lsn={} id={} kind={:?}",
+                    lsn, record.maintenance_id, record.kind
+                ));
+                Ok(())
+            }
+        }
+
+        let mut handler = MaintenanceObservabilityHandler {
+            seen: RefCell::new(Vec::new()),
+        };
+        let (_wal, result) = WalRecovery::new(&wal_path).recover(&mut handler).unwrap();
+        assert!(result.all_succeeded);
+        assert_eq!(
+            *handler.seen.borrow(),
+            vec!["MAINTENANCE lsn=17 id=9 kind=MaterializedViewRefresh".to_string()]
+        );
     }
 
     #[test]

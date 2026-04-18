@@ -23,6 +23,7 @@ async-trait = "0.1"
 bytes = "1.5"
 futures = "0.3"
 parking_lot = "0.12"
+bincode = "1.3"
 
 derive-visitor = { version = "0.4.0", features = ["std-types-drive"] }
 educe = { version = "1.0.0", features = ["default", "full"], package = "databend_educe" }
@@ -78,6 +79,7 @@ paro-scheduler = { path = "crates/scheduler" }
 paro-session = { path = "crates/session" }
 paro-server = { path = "crates/server" }
 paro-instance = { path = "crates/instance" }
+paro-journal = { path = "crates/journal" }
 
 [profile.dev.package.paro-parser]
 debug = 0

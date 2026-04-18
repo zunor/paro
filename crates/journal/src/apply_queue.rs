@@ -1,0 +1,1216 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::coordinator::JournalFrontierSnapshot;
+use crate::publish_frontier::{ApplyFrontier, PublishFrontier};
+use crate::waiter::WaitMode;
+use paro_common::error as paro_error;
+use paro_common::error::{ParoError, Result};
+use paro_common::journal::RecoverySummary;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread;
+use std::time::Instant;
+
+type ApplyWork = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
+type PublishedHook = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JournalApplyMetricsSnapshot {
+    pub queue_depth: u64,
+    pub queue_depth_peak: u64,
+    pub active_workers: u64,
+    pub active_workers_peak: u64,
+    pub mailbox_count: u64,
+    pub durable_lsn: u64,
+    pub applied_lsn: u64,
+    pub published_lsn: u64,
+    pub applied_lag: u64,
+    pub published_lag: u64,
+    pub durable_wait_count: u64,
+    pub durable_wait_micros: u64,
+    pub applied_wait_count: u64,
+    pub applied_wait_micros: u64,
+    pub published_wait_count: u64,
+    pub published_wait_micros: u64,
+}
+
+#[derive(Debug)]
+pub struct ApplySubmitResult<R> {
+    pub value: R,
+    pub wait_micros: u64,
+}
+
+pub struct TabletApplyPart {
+    pub tablet_id: u64,
+    pub apply: ApplyWork,
+}
+
+pub struct ApplyRequest<R> {
+    pub lsn: u64,
+    pub durable_batch_lsn: u64,
+    pub commit_id: Option<u64>,
+    pub wait_mode: WaitMode,
+    pub catalog_serial: bool,
+    pub catalog_pre: ApplyWork,
+    pub tablet_parts: Vec<TabletApplyPart>,
+    pub descriptor_phase: ApplyWork,
+    pub catalog_post: Box<dyn FnOnce() -> Result<R> + Send + 'static>,
+    pub on_published: PublishedHook,
+}
+
+pub struct JournalApplyRuntime {
+    inner: Arc<JournalApplyRuntimeInner>,
+}
+
+impl std::fmt::Debug for JournalApplyRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JournalApplyRuntime")
+            .field("frontiers", &self.frontiers())
+            .finish()
+    }
+}
+
+impl Default for JournalApplyRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JournalApplyRuntime {
+    pub fn new() -> Self {
+        let inner = Arc::new(JournalApplyRuntimeInner {
+            state: Mutex::new(ApplyRuntimeState::default()),
+            catalog_lane: Mutex::new(()),
+            dispatch_wake: Condvar::new(),
+            tablet_dispatch: Mutex::new(TabletDispatchState::default()),
+            tablet_wake: Condvar::new(),
+            metrics: ApplyRuntimeMetrics::default(),
+        });
+        let runtime = Self {
+            inner: Arc::clone(&inner),
+        };
+        for worker_id in 0..default_apply_worker_count() {
+            let worker_inner = Arc::downgrade(&inner);
+            thread::Builder::new()
+                .name(format!("paro-tablet-apply-{worker_id}"))
+                .spawn(move || run_tablet_worker(worker_inner))
+                .expect("spawn tablet apply worker");
+        }
+        runtime
+    }
+
+    pub fn frontiers(&self) -> JournalFrontierSnapshot {
+        self.inner.state.lock().unwrap().frontiers
+    }
+
+    pub fn metrics(&self) -> JournalApplyMetricsSnapshot {
+        self.inner.metrics_snapshot()
+    }
+
+    pub fn bootstrap_frontiers(&self, summary: RecoverySummary) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.next_dispatch_lsn = summary.max_lsn.saturating_add(1).max(1);
+        state.next_ephemeral_lsn = summary.max_lsn.saturating_add(1).max(1);
+        state.frontiers.durable_lsn = summary.max_lsn;
+        state.frontiers.applied_lsn = summary.max_lsn;
+        state.frontiers.published_lsn = summary.max_lsn;
+        state.frontiers.durable_commit_id = summary.max_commit_id;
+        state.frontiers.published_commit_id = summary.max_commit_id;
+        state.apply_frontier.bootstrap(summary.max_lsn);
+        state.publish_frontier.bootstrap(summary.max_lsn);
+    }
+
+    pub fn sync_commit_frontier_with(&self, min_committed_version: u64) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.frontiers.durable_commit_id =
+            state.frontiers.durable_commit_id.max(min_committed_version);
+        state.frontiers.published_commit_id = state
+            .frontiers
+            .published_commit_id
+            .max(min_committed_version);
+    }
+
+    pub fn note_durable_append(&self, durable_lsn: u64, commit_id: Option<u64>) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.frontiers.durable_lsn = state.frontiers.durable_lsn.max(durable_lsn);
+        if let Some(commit_id) = commit_id {
+            state.frontiers.durable_commit_id = state.frontiers.durable_commit_id.max(commit_id);
+        }
+    }
+
+    pub fn submit<R>(&self, request: ApplyRequest<R>) -> Result<R> {
+        self.submit_observed(request).map(|observed| observed.value)
+    }
+
+    pub fn submit_observed<R>(&self, request: ApplyRequest<R>) -> Result<ApplySubmitResult<R>> {
+        let started_at = Instant::now();
+        let ApplyRequest {
+            lsn,
+            durable_batch_lsn,
+            commit_id,
+            wait_mode,
+            catalog_serial,
+            catalog_pre,
+            tablet_parts,
+            descriptor_phase,
+            catalog_post,
+            on_published,
+        } = request;
+
+        let ticket = self.inner.register_record(
+            lsn,
+            durable_batch_lsn,
+            commit_id,
+            tablet_parts.len(),
+            on_published,
+        )?;
+
+        let record_wait_metrics = |result: Result<R>| {
+            let wait_micros = started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.inner.record_wait(wait_mode, wait_micros);
+            result.map(|value| ApplySubmitResult { value, wait_micros })
+        };
+
+        if let Err(err) = self.inner.wait_for_dispatch_turn(ticket.lsn) {
+            self.inner.fail_record(&ticket, err.clone());
+            return record_wait_metrics(Err(err));
+        }
+
+        let _catalog_lane = if catalog_serial {
+            Some(self.inner.catalog_lane.lock().unwrap())
+        } else {
+            None
+        };
+
+        if let Err(err) = catalog_pre() {
+            self.inner.fail_record(&ticket, err.clone());
+            return record_wait_metrics(Err(err));
+        }
+
+        if let Err(err) = self.inner.enqueue_tablet_parts(&ticket, tablet_parts) {
+            self.inner.fail_record(&ticket, err.clone());
+            return record_wait_metrics(Err(err));
+        }
+        self.inner.finish_dispatch_turn(ticket.lsn);
+
+        if let Err(err) = ticket.wait_for_tablet_phase(&self.inner) {
+            self.inner.fail_record(&ticket, err.clone());
+            return record_wait_metrics(Err(err));
+        }
+
+        if let Err(err) = descriptor_phase() {
+            self.inner.fail_record(&ticket, err.clone());
+            return record_wait_metrics(Err(err));
+        }
+
+        let result = match catalog_post() {
+            Ok(result) => result,
+            Err(err) => {
+                self.inner.fail_record(&ticket, err.clone());
+                return record_wait_metrics(Err(err));
+            }
+        };
+
+        self.inner.mark_applied(&ticket)?;
+        if wait_mode == WaitMode::Published {
+            ticket.wait_for_published(&self.inner)?;
+        }
+
+        record_wait_metrics(Ok(result))
+    }
+}
+
+impl Clone for JournalApplyRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for JournalApplyRuntime {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            let mut state = self.inner.tablet_dispatch.lock().unwrap();
+            state.shutdown = true;
+            self.inner.tablet_wake.notify_all();
+        }
+    }
+}
+
+struct ApplyRuntimeState {
+    next_dispatch_lsn: u64,
+    next_ephemeral_lsn: u64,
+    frontiers: JournalFrontierSnapshot,
+    apply_frontier: ApplyFrontier,
+    publish_frontier: PublishFrontier,
+    records: HashMap<u64, Arc<RecordTicket>>,
+    poisoned: Option<ParoError>,
+}
+
+impl Default for ApplyRuntimeState {
+    fn default() -> Self {
+        Self {
+            next_dispatch_lsn: 1,
+            next_ephemeral_lsn: 1,
+            frontiers: JournalFrontierSnapshot::default(),
+            apply_frontier: ApplyFrontier::default(),
+            publish_frontier: PublishFrontier::default(),
+            records: HashMap::new(),
+            poisoned: None,
+        }
+    }
+}
+
+struct JournalApplyRuntimeInner {
+    state: Mutex<ApplyRuntimeState>,
+    catalog_lane: Mutex<()>,
+    dispatch_wake: Condvar,
+    tablet_dispatch: Mutex<TabletDispatchState>,
+    tablet_wake: Condvar,
+    metrics: ApplyRuntimeMetrics,
+}
+
+impl JournalApplyRuntimeInner {
+    fn metrics_snapshot(&self) -> JournalApplyMetricsSnapshot {
+        let frontiers = self.state.lock().unwrap().frontiers;
+        JournalApplyMetricsSnapshot {
+            queue_depth: self.metrics.queue_depth.load(Ordering::Relaxed),
+            queue_depth_peak: self.metrics.queue_depth_peak.load(Ordering::Relaxed),
+            active_workers: self.metrics.active_workers.load(Ordering::Relaxed),
+            active_workers_peak: self.metrics.active_workers_peak.load(Ordering::Relaxed),
+            mailbox_count: self.metrics.mailbox_count.load(Ordering::Relaxed),
+            durable_lsn: frontiers.durable_lsn,
+            applied_lsn: frontiers.applied_lsn,
+            published_lsn: frontiers.published_lsn,
+            applied_lag: frontiers.durable_lsn.saturating_sub(frontiers.applied_lsn),
+            published_lag: frontiers
+                .durable_lsn
+                .saturating_sub(frontiers.published_lsn),
+            durable_wait_count: self.metrics.durable_wait_count.load(Ordering::Relaxed),
+            durable_wait_micros: self.metrics.durable_wait_micros.load(Ordering::Relaxed),
+            applied_wait_count: self.metrics.applied_wait_count.load(Ordering::Relaxed),
+            applied_wait_micros: self.metrics.applied_wait_micros.load(Ordering::Relaxed),
+            published_wait_count: self.metrics.published_wait_count.load(Ordering::Relaxed),
+            published_wait_micros: self.metrics.published_wait_micros.load(Ordering::Relaxed),
+        }
+    }
+
+    fn register_record(
+        &self,
+        raw_lsn: u64,
+        durable_batch_lsn: u64,
+        commit_id: Option<u64>,
+        tablet_parts: usize,
+        on_published: PublishedHook,
+    ) -> Result<Arc<RecordTicket>> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(err) = state.poisoned.clone() {
+            return Err(err);
+        }
+        let lsn = if raw_lsn == 0 {
+            let lsn = state.next_ephemeral_lsn;
+            state.next_ephemeral_lsn = state.next_ephemeral_lsn.saturating_add(1);
+            lsn
+        } else {
+            state.next_ephemeral_lsn = state.next_ephemeral_lsn.max(raw_lsn.saturating_add(1));
+            raw_lsn
+        };
+        let ticket = Arc::new(RecordTicket::new(
+            lsn,
+            commit_id,
+            tablet_parts as u32,
+            on_published,
+        ));
+        state.frontiers.durable_lsn = state.frontiers.durable_lsn.max(durable_batch_lsn);
+        if let Some(commit_id) = commit_id {
+            state.frontiers.durable_commit_id = state.frontiers.durable_commit_id.max(commit_id);
+        }
+        state.records.insert(lsn, Arc::clone(&ticket));
+        Ok(ticket)
+    }
+
+    fn wait_for_dispatch_turn(&self, lsn: u64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(err) = state.poisoned.clone() {
+                return Err(err);
+            }
+            if state.next_dispatch_lsn == lsn {
+                return Ok(());
+            }
+            state = self.dispatch_wake.wait(state).unwrap();
+        }
+    }
+
+    fn finish_dispatch_turn(&self, lsn: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.next_dispatch_lsn == lsn {
+            state.next_dispatch_lsn = state.next_dispatch_lsn.saturating_add(1);
+        }
+        self.dispatch_wake.notify_all();
+    }
+
+    fn enqueue_tablet_parts(
+        self: &Arc<Self>,
+        ticket: &Arc<RecordTicket>,
+        tablet_parts: Vec<TabletApplyPart>,
+    ) -> Result<()> {
+        if tablet_parts.is_empty() {
+            ticket.notify_zero_tablet_parts();
+            return Ok(());
+        }
+
+        self.metrics
+            .increment_queue_depth(tablet_parts.len() as u64);
+        for part in tablet_parts {
+            self.enqueue_tablet_part(
+                part.tablet_id,
+                TabletApplyWork {
+                    apply: Some(part.apply),
+                    runtime: Arc::downgrade(self),
+                    ticket: Arc::clone(ticket),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_tablet_part(&self, tablet_id: u64, work: TabletApplyWork) -> Result<()> {
+        let mut state = self.tablet_dispatch.lock().unwrap();
+        let mut created = false;
+        let mailbox = state.mailboxes.entry(tablet_id).or_insert_with(|| {
+            created = true;
+            TabletMailbox::default()
+        });
+        if created {
+            self.metrics.increment_mailbox_count();
+        }
+        mailbox.queue.push_back(work);
+        if !mailbox.scheduled_or_running {
+            mailbox.scheduled_or_running = true;
+            state.ready_tablets.push_back(tablet_id);
+            self.tablet_wake.notify_one();
+        }
+        Ok(())
+    }
+
+    fn complete_tablet_part(&self, ticket: &Arc<RecordTicket>, result: Result<()>) {
+        self.metrics.decrement_queue_depth(1);
+        if let Err(err) = result {
+            self.fail_record(ticket, err);
+            return;
+        }
+        ticket.complete_tablet_part();
+    }
+
+    fn fail_record(&self, ticket: &Arc<RecordTicket>, err: ParoError) {
+        let normalized = normalize_durable_apply_failure(&err);
+        let waiters = {
+            let mut state = self.state.lock().unwrap();
+            if state.poisoned.is_none() {
+                state.poisoned = Some(normalized.clone());
+            }
+            state.records.values().cloned().collect::<Vec<_>>()
+        };
+        ticket.fail(normalized);
+        self.dispatch_wake.notify_all();
+        for waiter in waiters {
+            waiter.notify_poison();
+        }
+    }
+
+    fn record_wait(&self, mode: WaitMode, latency_micros: u64) {
+        match mode {
+            WaitMode::Durable => {
+                self.metrics
+                    .durable_wait_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .durable_wait_micros
+                    .fetch_add(latency_micros, Ordering::Relaxed);
+            }
+            WaitMode::Applied => {
+                self.metrics
+                    .applied_wait_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .applied_wait_micros
+                    .fetch_add(latency_micros, Ordering::Relaxed);
+            }
+            WaitMode::Published => {
+                self.metrics
+                    .published_wait_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .published_wait_micros
+                    .fetch_add(latency_micros, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn mark_applied(&self, ticket: &Arc<RecordTicket>) -> Result<()> {
+        let (published_waiters, published_lsns) = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(err) = state.poisoned.clone() {
+                return Err(err);
+            }
+
+            ticket.mark_applied();
+            let mut published_waiters = Vec::new();
+            let mut published_lsns = Vec::new();
+            for applied_lsn in state.apply_frontier.mark_ready(ticket.lsn) {
+                state.frontiers.applied_lsn = applied_lsn;
+                let commit_id = state
+                    .records
+                    .get(&applied_lsn)
+                    .and_then(|record| record.commit_id);
+                for (published_lsn, published_commit_id) in
+                    state.publish_frontier.mark_ready(applied_lsn, commit_id)
+                {
+                    state.frontiers.published_lsn = published_lsn;
+                    if let Some(published_commit_id) = published_commit_id {
+                        state.frontiers.published_commit_id = published_commit_id;
+                    }
+                    if let Some(record) = state.records.remove(&published_lsn) {
+                        published_waiters.push(record);
+                        published_lsns.push(published_lsn);
+                    }
+                }
+            }
+            (published_waiters, published_lsns)
+        };
+
+        for (record, published_lsn) in published_waiters.into_iter().zip(published_lsns) {
+            if let Err(err) = record.run_published_hook() {
+                self.fail_record(
+                    &record,
+                    paro_error::internal(format!(
+                        "published hook failed at lsn {}: {}",
+                        published_lsn, err
+                    )),
+                );
+                return Err(paro_error::internal(format!(
+                    "published hook failed at lsn {}: {}",
+                    published_lsn, err
+                )));
+            }
+            record.mark_published();
+        }
+
+        Ok(())
+    }
+
+    fn dequeue_tablet_work(&self) -> Option<(u64, TabletApplyWork)> {
+        let mut state = self.tablet_dispatch.lock().unwrap();
+        loop {
+            if state.shutdown && state.ready_tablets.is_empty() {
+                return None;
+            }
+            if let Some(tablet_id) = state.ready_tablets.pop_front() {
+                if let Some(mailbox) = state.mailboxes.get_mut(&tablet_id) {
+                    if let Some(work) = mailbox.queue.pop_front() {
+                        return Some((tablet_id, work));
+                    }
+                    mailbox.scheduled_or_running = false;
+                    state.mailboxes.remove(&tablet_id);
+                    self.metrics.decrement_mailbox_count();
+                }
+                continue;
+            }
+            state = self.tablet_wake.wait(state).unwrap();
+        }
+    }
+
+    fn finish_tablet_dispatch(&self, tablet_id: u64) {
+        let mut state = self.tablet_dispatch.lock().unwrap();
+        let Some(mailbox) = state.mailboxes.get_mut(&tablet_id) else {
+            return;
+        };
+        if mailbox.queue.is_empty() {
+            mailbox.scheduled_or_running = false;
+            state.mailboxes.remove(&tablet_id);
+            self.metrics.decrement_mailbox_count();
+        } else {
+            state.ready_tablets.push_back(tablet_id);
+            self.tablet_wake.notify_one();
+        }
+    }
+}
+
+#[derive(Default)]
+struct ApplyRuntimeMetrics {
+    queue_depth: AtomicU64,
+    queue_depth_peak: AtomicU64,
+    active_workers: AtomicU64,
+    active_workers_peak: AtomicU64,
+    mailbox_count: AtomicU64,
+    durable_wait_count: AtomicU64,
+    durable_wait_micros: AtomicU64,
+    applied_wait_count: AtomicU64,
+    applied_wait_micros: AtomicU64,
+    published_wait_count: AtomicU64,
+    published_wait_micros: AtomicU64,
+}
+
+impl ApplyRuntimeMetrics {
+    fn increment_queue_depth(&self, amount: u64) {
+        let new_depth = self.queue_depth.fetch_add(amount, Ordering::Relaxed) + amount;
+        let mut current_peak = self.queue_depth_peak.load(Ordering::Relaxed);
+        while new_depth > current_peak {
+            match self.queue_depth_peak.compare_exchange_weak(
+                current_peak,
+                new_depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_peak = observed,
+            }
+        }
+    }
+
+    fn decrement_queue_depth(&self, amount: u64) {
+        self.queue_depth.fetch_sub(amount, Ordering::Relaxed);
+    }
+
+    fn increment_active_workers(&self) {
+        let new_count = self.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut current_peak = self.active_workers_peak.load(Ordering::Relaxed);
+        while new_count > current_peak {
+            match self.active_workers_peak.compare_exchange_weak(
+                current_peak,
+                new_count,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_peak = observed,
+            }
+        }
+    }
+
+    fn decrement_active_workers(&self) {
+        self.active_workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn increment_mailbox_count(&self) {
+        self.mailbox_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_mailbox_count(&self) {
+        self.mailbox_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn normalize_durable_apply_failure(err: &ParoError) -> ParoError {
+    paro_error::internal("journal apply failed after durable append")
+        .detail(err.to_string())
+        .context(format!(
+            "original durable apply failure class: {}",
+            err.error_class()
+        ))
+}
+
+struct RecordTicket {
+    lsn: u64,
+    commit_id: Option<u64>,
+    on_published: Mutex<Option<PublishedHook>>,
+    progress: Mutex<RecordProgress>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct RecordProgress {
+    remaining_tablet_parts: u32,
+    part_error: Option<ParoError>,
+    applied: bool,
+    published: bool,
+}
+
+impl RecordTicket {
+    fn new(
+        lsn: u64,
+        commit_id: Option<u64>,
+        remaining_tablet_parts: u32,
+        on_published: PublishedHook,
+    ) -> Self {
+        Self {
+            lsn,
+            commit_id,
+            on_published: Mutex::new(Some(on_published)),
+            progress: Mutex::new(RecordProgress {
+                remaining_tablet_parts,
+                part_error: None,
+                applied: false,
+                published: false,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn notify_zero_tablet_parts(&self) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.remaining_tablet_parts = 0;
+        self.wake.notify_all();
+    }
+
+    fn complete_tablet_part(&self) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.remaining_tablet_parts = progress.remaining_tablet_parts.saturating_sub(1);
+        self.wake.notify_all();
+    }
+
+    fn mark_applied(&self) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.applied = true;
+        self.wake.notify_all();
+    }
+
+    fn mark_published(&self) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.published = true;
+        self.wake.notify_all();
+    }
+
+    fn fail(&self, err: ParoError) {
+        let mut progress = self.progress.lock().unwrap();
+        if progress.part_error.is_none() {
+            progress.part_error = Some(err);
+        }
+        self.wake.notify_all();
+    }
+
+    fn notify_poison(&self) {
+        self.wake.notify_all();
+    }
+
+    fn wait_for_tablet_phase(&self, runtime: &JournalApplyRuntimeInner) -> Result<()> {
+        let mut progress = self.progress.lock().unwrap();
+        loop {
+            if let Some(err) = progress.part_error.clone() {
+                return Err(err);
+            }
+            if progress.remaining_tablet_parts == 0 {
+                return Ok(());
+            }
+            if let Some(err) = runtime.state.lock().unwrap().poisoned.clone() {
+                return Err(err);
+            }
+            progress = self.wake.wait(progress).unwrap();
+        }
+    }
+
+    fn wait_for_published(&self, runtime: &JournalApplyRuntimeInner) -> Result<()> {
+        let mut progress = self.progress.lock().unwrap();
+        loop {
+            if let Some(err) = progress.part_error.clone() {
+                return Err(err);
+            }
+            if progress.published {
+                return Ok(());
+            }
+            if let Some(err) = runtime.state.lock().unwrap().poisoned.clone() {
+                return Err(err);
+            }
+            progress = self.wake.wait(progress).unwrap();
+        }
+    }
+
+    fn run_published_hook(&self) -> Result<()> {
+        let Some(hook) = self.on_published.lock().unwrap().take() else {
+            return Ok(());
+        };
+        hook()
+    }
+}
+
+#[derive(Default)]
+struct TabletDispatchState {
+    mailboxes: HashMap<u64, TabletMailbox>,
+    ready_tablets: VecDeque<u64>,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+struct TabletMailbox {
+    queue: VecDeque<TabletApplyWork>,
+    scheduled_or_running: bool,
+}
+
+struct TabletApplyWork {
+    apply: Option<ApplyWork>,
+    runtime: Weak<JournalApplyRuntimeInner>,
+    ticket: Arc<RecordTicket>,
+}
+
+fn default_apply_worker_count() -> usize {
+    // JournalApplyRuntime is instantiated per database today, so a "one worker per core"
+    // policy quickly overcommits thread resources when tests or deployments keep several
+    // databases open at once. Keep the default pool conservative until we move to a shared
+    // executor or expose an explicit tuning knob.
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .clamp(1, 4)
+}
+
+fn run_tablet_worker(runtime: Weak<JournalApplyRuntimeInner>) {
+    loop {
+        let Some(inner) = runtime.upgrade() else {
+            return;
+        };
+        let Some((tablet_id, work)) = inner.dequeue_tablet_work() else {
+            return;
+        };
+
+        inner.metrics.increment_active_workers();
+        let result = match work.apply {
+            Some(apply) => apply(),
+            None => Ok(()),
+        };
+        inner.metrics.decrement_active_workers();
+        inner.finish_tablet_dispatch(tablet_id);
+
+        let Some(runtime) = work.runtime.upgrade().or_else(|| Some(Arc::clone(&inner))) else {
+            return;
+        };
+        runtime.complete_tablet_part(&work.ticket, result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::thread;
+    use std::time::Duration;
+
+    fn empty_request(
+        lsn: u64,
+        commit_id: Option<u64>,
+        wait_mode: WaitMode,
+        tablet_parts: Vec<TabletApplyPart>,
+    ) -> ApplyRequest<()> {
+        ApplyRequest {
+            lsn,
+            durable_batch_lsn: lsn,
+            commit_id,
+            wait_mode,
+            catalog_serial: false,
+            catalog_pre: Box::new(|| Ok(())),
+            tablet_parts,
+            descriptor_phase: Box::new(|| Ok(())),
+            catalog_post: Box::new(|| Ok(())),
+            on_published: Box::new(|| Ok(())),
+        }
+    }
+
+    #[test]
+    fn tablet_queue_dispatch_respects_lsn_order_even_if_submit_arrives_out_of_order() {
+        let runtime = JournalApplyRuntime::new();
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let second_finished = Arc::new(AtomicBool::new(false));
+
+        let runtime_second = runtime.clone();
+        let order_second = Arc::clone(&order);
+        let second_flag = Arc::clone(&second_finished);
+        let second = thread::spawn(move || {
+            runtime_second
+                .submit(empty_request(
+                    2,
+                    Some(2),
+                    WaitMode::Published,
+                    vec![TabletApplyPart {
+                        tablet_id: 7,
+                        apply: Box::new(move || {
+                            order_second.lock().unwrap().push(2);
+                            second_flag.store(true, Ordering::Release);
+                            Ok(())
+                        }),
+                    }],
+                ))
+                .unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!second_finished.load(Ordering::Acquire));
+
+        runtime
+            .submit(empty_request(
+                1,
+                Some(1),
+                WaitMode::Published,
+                vec![TabletApplyPart {
+                    tablet_id: 7,
+                    apply: Box::new({
+                        let order = Arc::clone(&order);
+                        move || {
+                            order.lock().unwrap().push(1);
+                            Ok(())
+                        }
+                    }),
+                }],
+            ))
+            .unwrap();
+        second.join().unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.published_lsn, 2);
+        assert_eq!(frontiers.published_commit_id, 2);
+    }
+
+    #[test]
+    fn maintenance_publish_advances_lsn_without_advancing_commit_frontier() {
+        let runtime = JournalApplyRuntime::new();
+        runtime
+            .submit(empty_request(1, Some(7), WaitMode::Published, Vec::new()))
+            .unwrap();
+        runtime
+            .submit(empty_request(2, None, WaitMode::Published, Vec::new()))
+            .unwrap();
+
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.applied_lsn, 2);
+        assert_eq!(frontiers.published_lsn, 2);
+        assert_eq!(frontiers.published_commit_id, 7);
+    }
+
+    #[test]
+    fn synthetic_lsn_zero_submits_publish_without_deadlock() {
+        let runtime = JournalApplyRuntime::new();
+        runtime
+            .submit(empty_request(0, Some(9), WaitMode::Published, Vec::new()))
+            .unwrap();
+        runtime
+            .submit(empty_request(0, Some(10), WaitMode::Published, Vec::new()))
+            .unwrap();
+
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.applied_lsn, 2);
+        assert_eq!(frontiers.published_lsn, 2);
+        assert_eq!(frontiers.published_commit_id, 10);
+    }
+
+    #[test]
+    fn bootstrap_frontiers_resumes_from_recovered_lsn() {
+        let runtime = JournalApplyRuntime::new();
+        runtime.bootstrap_frontiers(RecoverySummary {
+            max_lsn: 7,
+            max_commit_id: 4,
+            ..RecoverySummary::default()
+        });
+
+        runtime
+            .submit(empty_request(8, Some(5), WaitMode::Published, Vec::new()))
+            .unwrap();
+
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.durable_lsn, 8);
+        assert_eq!(frontiers.published_lsn, 8);
+        assert_eq!(frontiers.published_commit_id, 5);
+    }
+
+    #[test]
+    fn descriptor_phase_waits_for_all_tablet_parts() {
+        let runtime = JournalApplyRuntime::new();
+        let fast_part_done = Arc::new(AtomicBool::new(false));
+        let descriptor_ran = Arc::new(AtomicBool::new(false));
+        let release_slow_part = Arc::new((StdMutex::new(false), Condvar::new()));
+
+        let runtime_worker = runtime.clone();
+        let fast_part_done_worker = Arc::clone(&fast_part_done);
+        let descriptor_ran_worker = Arc::clone(&descriptor_ran);
+        let release_slow_part_worker = Arc::clone(&release_slow_part);
+        let handle = thread::spawn(move || {
+            runtime_worker
+                .submit(ApplyRequest {
+                    lsn: 1,
+                    durable_batch_lsn: 1,
+                    commit_id: Some(1),
+                    wait_mode: WaitMode::Published,
+                    catalog_serial: false,
+                    catalog_pre: Box::new(|| Ok(())),
+                    tablet_parts: vec![
+                        TabletApplyPart {
+                            tablet_id: 11,
+                            apply: Box::new(move || {
+                                fast_part_done_worker.store(true, Ordering::Release);
+                                Ok(())
+                            }),
+                        },
+                        TabletApplyPart {
+                            tablet_id: 22,
+                            apply: Box::new(move || {
+                                let (lock, wake) = &*release_slow_part_worker;
+                                let mut released = lock.lock().unwrap();
+                                while !*released {
+                                    released = wake.wait(released).unwrap();
+                                }
+                                Ok(())
+                            }),
+                        },
+                    ],
+                    descriptor_phase: Box::new(move || {
+                        descriptor_ran_worker.store(true, Ordering::Release);
+                        Ok(())
+                    }),
+                    catalog_post: Box::new(|| Ok(())),
+                    on_published: Box::new(|| Ok(())),
+                })
+                .unwrap();
+        });
+
+        for _ in 0..20 {
+            if fast_part_done.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fast_part_done.load(Ordering::Acquire));
+        assert!(!descriptor_ran.load(Ordering::Acquire));
+
+        let (lock, wake) = &*release_slow_part;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+
+        handle.join().unwrap();
+        assert!(descriptor_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_pool_keeps_active_workers_bounded() {
+        let runtime = JournalApplyRuntime::new();
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let tablet_parts = (0..32u64)
+            .map(|tablet_id| {
+                let release = Arc::clone(&release);
+                TabletApplyPart {
+                    tablet_id,
+                    apply: Box::new(move || {
+                        let (lock, wake) = &*release;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = wake.wait(ready).unwrap();
+                        }
+                        Ok(())
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let runtime_submit = runtime.clone();
+        let handle = thread::spawn(move || {
+            runtime_submit
+                .submit(empty_request(1, Some(1), WaitMode::Published, tablet_parts))
+                .unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let metrics = runtime.metrics();
+        assert!(metrics.active_workers_peak <= default_apply_worker_count() as u64);
+        assert!(metrics.mailbox_count <= 32);
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn published_frontier_waits_for_earlier_multi_tablet_record_before_releasing_later_commit() {
+        let runtime = JournalApplyRuntime::new();
+        let fast_part_done = Arc::new(AtomicBool::new(false));
+        let second_finished = Arc::new(AtomicBool::new(false));
+        let release_slow_part = Arc::new((StdMutex::new(false), Condvar::new()));
+
+        let runtime_first = runtime.clone();
+        let fast_part_done_first = Arc::clone(&fast_part_done);
+        let release_slow_part_first = Arc::clone(&release_slow_part);
+        let first = thread::spawn(move || {
+            runtime_first
+                .submit(ApplyRequest {
+                    lsn: 1,
+                    durable_batch_lsn: 1,
+                    commit_id: Some(1),
+                    wait_mode: WaitMode::Applied,
+                    catalog_serial: false,
+                    catalog_pre: Box::new(|| Ok(())),
+                    tablet_parts: vec![
+                        TabletApplyPart {
+                            tablet_id: 11,
+                            apply: Box::new(move || {
+                                fast_part_done_first.store(true, Ordering::Release);
+                                Ok(())
+                            }),
+                        },
+                        TabletApplyPart {
+                            tablet_id: 22,
+                            apply: Box::new(move || {
+                                let (lock, wake) = &*release_slow_part_first;
+                                let mut released = lock.lock().unwrap();
+                                while !*released {
+                                    released = wake.wait(released).unwrap();
+                                }
+                                Ok(())
+                            }),
+                        },
+                    ],
+                    descriptor_phase: Box::new(|| Ok(())),
+                    catalog_post: Box::new(|| Ok(())),
+                    on_published: Box::new(|| Ok(())),
+                })
+                .unwrap();
+        });
+
+        for _ in 0..20 {
+            if fast_part_done.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fast_part_done.load(Ordering::Acquire));
+
+        let runtime_second = runtime.clone();
+        let second_finished_flag = Arc::clone(&second_finished);
+        let second = thread::spawn(move || {
+            runtime_second
+                .submit(empty_request(2, Some(2), WaitMode::Published, Vec::new()))
+                .unwrap();
+            second_finished_flag.store(true, Ordering::Release);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!second_finished.load(Ordering::Acquire));
+
+        let stalled = runtime.frontiers();
+        assert_eq!(stalled.durable_lsn, 2);
+        assert_eq!(stalled.durable_commit_id, 2);
+        assert_eq!(stalled.applied_lsn, 0);
+        assert_eq!(stalled.published_lsn, 0);
+        assert_eq!(stalled.published_commit_id, 0);
+
+        let (lock, wake) = &*release_slow_part;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert!(second_finished.load(Ordering::Acquire));
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.applied_lsn, 2);
+        assert_eq!(frontiers.published_lsn, 2);
+        assert_eq!(frontiers.published_commit_id, 2);
+    }
+
+    #[test]
+    fn durable_apply_failure_is_normalized_to_internal_poison() {
+        let runtime = JournalApplyRuntime::new();
+        let err = runtime
+            .submit(ApplyRequest {
+                lsn: 1,
+                durable_batch_lsn: 1,
+                commit_id: Some(1),
+                wait_mode: WaitMode::Published,
+                catalog_serial: false,
+                catalog_pre: Box::new(|| Ok(())),
+                tablet_parts: vec![TabletApplyPart {
+                    tablet_id: 7,
+                    apply: Box::new(|| {
+                        Err(paro_error::serialization_failure(
+                            "stale delete patch should poison runtime",
+                        ))
+                    }),
+                }],
+                descriptor_phase: Box::new(|| Ok(())),
+                catalog_post: Box::new(|| Ok(())),
+                on_published: Box::new(|| Ok(())),
+            })
+            .unwrap_err();
+
+        assert!(err.is_internal_error());
+        assert!(
+            err.to_string()
+                .contains("journal apply failed after durable append"),
+            "normalized error message should avoid surfacing retryable business conflicts"
+        );
+
+        let next = runtime
+            .submit(empty_request(2, Some(2), WaitMode::Published, Vec::new()))
+            .unwrap_err();
+        assert!(next.is_internal_error());
+    }
+
+    #[test]
+    fn metrics_track_queue_depth_frontiers_and_wait_modes() {
+        let runtime = JournalApplyRuntime::new();
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let started = Arc::new((StdMutex::new(false), Condvar::new()));
+        let release_worker = Arc::clone(&release);
+        let started_worker = Arc::clone(&started);
+        let runtime_worker = runtime.clone();
+
+        let worker = thread::spawn(move || {
+            runtime_worker
+                .submit(ApplyRequest {
+                    lsn: 1,
+                    durable_batch_lsn: 5,
+                    commit_id: Some(8),
+                    wait_mode: WaitMode::Published,
+                    catalog_serial: false,
+                    catalog_pre: Box::new(|| Ok(())),
+                    tablet_parts: vec![TabletApplyPart {
+                        tablet_id: 99,
+                        apply: Box::new(move || {
+                            let (started_lock, started_wake) = &*started_worker;
+                            *started_lock.lock().unwrap() = true;
+                            started_wake.notify_all();
+                            let (lock, wake) = &*release_worker;
+                            let mut released = lock.lock().unwrap();
+                            while !*released {
+                                released = wake.wait(released).unwrap();
+                            }
+                            Ok(())
+                        }),
+                    }],
+                    descriptor_phase: Box::new(|| Ok(())),
+                    catalog_post: Box::new(|| Ok(())),
+                    on_published: Box::new(|| Ok(())),
+                })
+                .unwrap();
+        });
+
+        let (started_lock, started_wake) = &*started;
+        let mut observed_started = started_lock.lock().unwrap();
+        while !*observed_started {
+            observed_started = started_wake.wait(observed_started).unwrap();
+        }
+        drop(observed_started);
+
+        let inflight = runtime.metrics();
+        assert_eq!(inflight.queue_depth, 1);
+        assert!(inflight.queue_depth_peak >= 1);
+        assert_eq!(inflight.durable_lsn, 5);
+        assert_eq!(inflight.applied_lag, 5);
+        assert_eq!(inflight.published_lag, 5);
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        worker.join().unwrap();
+
+        let metrics = runtime.metrics();
+        assert_eq!(metrics.queue_depth, 0);
+        assert_eq!(metrics.applied_lsn, 1);
+        assert_eq!(metrics.published_lsn, 1);
+        assert_eq!(metrics.applied_lag, 4);
+        assert_eq!(metrics.published_lag, 4);
+        assert_eq!(metrics.published_wait_count, 1);
+        assert!(metrics.published_wait_micros > 0);
+    }
+}
