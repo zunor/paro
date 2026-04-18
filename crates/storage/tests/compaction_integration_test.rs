@@ -518,7 +518,7 @@ fn test_compaction_crash_before_replace_recovers_atomically_with_wal() {
     let output = RowsetMerger::build(&tablet, Arc::new(plan), workspace, compaction_allocator())
         .unwrap()
         .expect("merge should produce staged output");
-    let staged_rowset_dir = match output {
+    let staged_rowset_dir = match &output {
         CompactionBuildOutput::Rowset(artifact) => artifact.workspace.rowset_dir.clone(),
         CompactionBuildOutput::PrimaryKey { .. } => panic!("expected duplicate-key output"),
     };
