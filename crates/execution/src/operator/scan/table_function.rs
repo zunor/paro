@@ -571,6 +571,7 @@ fn populate_system_table_function_data(
         "paro_pg_cursors" => populate_paro_pg_cursors(global_state, ctx),
         "paro_optimizers" => populate_paro_optimizers(global_state),
         "paro_storage_info" => populate_paro_storage_info(global_state, ctx),
+        "paro_wal_metrics" => populate_paro_wal_metrics(global_state, ctx),
         "paro_property_graphs" => populate_paro_property_graphs(global_state, ctx),
         "paro_graph_statistics" => populate_paro_graph_statistics(global_state, ctx),
         _ => {} // Not a system table function, no data to inject
@@ -1378,6 +1379,97 @@ fn populate_paro_storage_info(
     }
 
     populate_storage_info_data(state, entries, None);
+}
+
+fn populate_paro_wal_metrics(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &ExecutionContext,
+) {
+    use paro_function::table::system::paro_wal_metrics::{
+        populate_wal_metric_data, ParoWalMetricsGlobalState, WalMetricData,
+    };
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoWalMetricsGlobalState>()
+    else {
+        return;
+    };
+
+    let mut entries = Vec::new();
+    for db in ctx.session.databases.iter() {
+        let metrics = db.wal_metrics();
+        entries.push(WalMetricData {
+            database_oid: db.identity.id,
+            database_name: db.identity.name.clone(),
+            recovery_mode: metrics.recovery_mode.clone(),
+            checkpoint_success_total: metrics.checkpoint_success_total.min(i64::MAX as u64) as i64,
+            checkpoint_failure_total: metrics.checkpoint_failure_total.min(i64::MAX as u64) as i64,
+            wal_health_check_total: metrics.wal_health_check_total.min(i64::MAX as u64) as i64,
+            wal_keep_from: metrics.wal_keep_from.min(i64::MAX as u64) as i64,
+            main_wal_needs_truncation: metrics.main_wal_needs_truncation,
+            checkpoint_wal_needs_truncation: metrics.checkpoint_wal_needs_truncation,
+            recovery_wal_needs_truncation: metrics.recovery_wal_needs_truncation,
+            journal_apply_queue_depth: metrics.journal_apply_queue_depth.min(i64::MAX as u64)
+                as i64,
+            journal_apply_queue_depth_peak: metrics
+                .journal_apply_queue_depth_peak
+                .min(i64::MAX as u64) as i64,
+            journal_apply_active_workers: metrics.journal_apply_active_workers.min(i64::MAX as u64)
+                as i64,
+            journal_apply_active_workers_peak: metrics
+                .journal_apply_active_workers_peak
+                .min(i64::MAX as u64) as i64,
+            journal_apply_mailbox_count: metrics.journal_apply_mailbox_count.min(i64::MAX as u64)
+                as i64,
+            journal_apply_applied_lag: metrics.journal_apply_applied_lag.min(i64::MAX as u64)
+                as i64,
+            journal_apply_published_lag: metrics.journal_apply_published_lag.min(i64::MAX as u64)
+                as i64,
+            journal_apply_durable_wait_count: metrics
+                .journal_apply_durable_wait_count
+                .min(i64::MAX as u64) as i64,
+            journal_apply_durable_wait_micros: metrics
+                .journal_apply_durable_wait_micros
+                .min(i64::MAX as u64) as i64,
+            journal_apply_applied_wait_count: metrics
+                .journal_apply_applied_wait_count
+                .min(i64::MAX as u64) as i64,
+            journal_apply_applied_wait_micros: metrics
+                .journal_apply_applied_wait_micros
+                .min(i64::MAX as u64) as i64,
+            journal_apply_published_wait_count: metrics
+                .journal_apply_published_wait_count
+                .min(i64::MAX as u64) as i64,
+            journal_apply_published_wait_micros: metrics
+                .journal_apply_published_wait_micros
+                .min(i64::MAX as u64) as i64,
+            journal_commit_bytes_total: metrics.journal_commit_bytes_total.min(i64::MAX as u64)
+                as i64,
+            journal_group_count: metrics.journal_group_count.min(i64::MAX as u64) as i64,
+            journal_group_size_last: metrics.journal_group_size_last.min(i64::MAX as u64) as i64,
+            journal_group_size_peak: metrics.journal_group_size_peak.min(i64::MAX as u64) as i64,
+            journal_sync_latency_micros_total: metrics
+                .journal_sync_latency_micros_total
+                .min(i64::MAX as u64) as i64,
+            journal_sync_latency_micros_peak: metrics
+                .journal_sync_latency_micros_peak
+                .min(i64::MAX as u64) as i64,
+            journal_replay_rowsets_total: metrics.journal_replay_rowsets_total.min(i64::MAX as u64)
+                as i64,
+            journal_replay_delete_patches_total: metrics
+                .journal_replay_delete_patches_total
+                .min(i64::MAX as u64) as i64,
+            journal_inline_patch_ratio: if metrics.journal_delete_patch_count == 0 {
+                0.0
+            } else {
+                metrics.journal_inline_delete_patch_count as f64
+                    / metrics.journal_delete_patch_count as f64
+            },
+        });
+    }
+
+    populate_wal_metric_data(state, entries);
 }
 
 /// Populate paro_property_graphs() with data from Catalog and GraphProjectionIndexManager.

@@ -232,6 +232,10 @@ impl CompactionManager {
         }
 
         if !stale_ids.is_empty() {
+            info!(
+                stale_skip_count = stale_ids.len(),
+                "CompactionManager: dropping stale tablet registrations during sync"
+            );
             for tablet_id in &stale_ids {
                 self.drain_tablet(
                     *tablet_id,

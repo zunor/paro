@@ -47,6 +47,8 @@ struct Manifest {
     #[serde(default)]
     edit_version: u64,
     #[serde(default)]
+    applied_lsn: u64,
+    #[serde(default)]
     l1_files: Vec<ImmutableFileMeta>,
     #[serde(default)]
     l2_file: Option<ImmutableFileMeta>,
@@ -59,6 +61,7 @@ impl Default for Manifest {
             active_wal_id: 0,
             next_file_id: default_next_file_id(),
             edit_version: 0,
+            applied_lsn: 0,
             l1_files: Vec::new(),
             l2_file: None,
         }
@@ -88,6 +91,7 @@ pub struct PersistentIndex {
     active_wal_id: u64,
     next_file_id: u64,
     edit_version: u64,
+    applied_lsn: u64,
     l1_files: Vec<ImmutableFileMeta>,
     l2_file: Option<ImmutableFileMeta>,
 }
@@ -134,9 +138,14 @@ impl PersistentIndex {
                         .map(|meta| meta.edit_version)
                         .unwrap_or(0),
                 ),
+            applied_lsn: manifest.applied_lsn,
             l1_files: manifest.l1_files,
             l2_file: manifest.l2_file,
         })
+    }
+
+    pub fn applied_lsn(&self) -> u64 {
+        self.applied_lsn
     }
 
     pub fn load(&self) -> Result<PrimaryIndex> {
@@ -325,6 +334,11 @@ impl PersistentIndex {
             ))
         })?;
         Ok(())
+    }
+
+    pub fn set_applied_lsn(&mut self, applied_lsn: u64) -> Result<()> {
+        self.applied_lsn = applied_lsn;
+        self.write_manifest()
     }
 
     fn validate_current_format(&self) -> Result<()> {
@@ -528,6 +542,7 @@ impl PersistentIndex {
             active_wal_id: self.active_wal_id,
             next_file_id: self.next_file_id,
             edit_version: self.edit_version,
+            applied_lsn: self.applied_lsn,
             l1_files: self.l1_files.clone(),
             l2_file: self.l2_file.clone(),
         };
@@ -809,6 +824,16 @@ mod tests {
 
         assert!(dir.path().exists());
         assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn applied_lsn_roundtrips_in_manifest() {
+        let dir = tempdir().unwrap();
+        let mut pi = PersistentIndex::new(dir.path()).unwrap();
+        pi.set_applied_lsn(42).unwrap();
+
+        let reopened = PersistentIndex::new(dir.path()).unwrap();
+        assert_eq!(reopened.applied_lsn(), 42);
     }
 
     #[test]

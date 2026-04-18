@@ -20,10 +20,8 @@ use crate::statistics::IndexType;
 use crate::table::storage_descriptor::TableStorageDescriptor;
 use crate::table::table_factory::{stable_data_dir, TableFactory};
 use crate::tablet::tablet_reader::TabletReaderParams;
-use crate::tablet::{KeysType, TabletColumn, TabletSchema};
+use crate::tablet::{KeysType, PhysicalRowRef, TabletColumn, TabletSchema};
 use crate::transaction::txn::Transaction;
-use crate::wal::wal_entry::WalEntry;
-use crate::wal::wal_reader::WalReader;
 use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
@@ -128,6 +126,18 @@ fn collect_row_ids_by_id(table: &TableHandle) -> HashMap<i32, u64> {
         }
     }
     row_ids
+}
+
+fn collect_row_locations_by_id(table: &TableHandle) -> HashMap<i32, PhysicalRowRef> {
+    let row_ids = collect_row_ids_by_id(table);
+    row_ids
+        .into_iter()
+        .map(|(id, raw_row_id)| {
+            let row_id = RowID::from_raw(raw_row_id);
+            let location = table.tablet().decode_row_id(row_id).expect("decode row id");
+            (id, location)
+        })
+        .collect()
 }
 
 fn collect_rows_i32_pair(table: &TableHandle) -> Vec<(i32, i32)> {
@@ -426,7 +436,7 @@ fn primary_key_append_and_delete() {
 }
 
 #[test]
-fn row_id_delete_writes_delvec_and_wal() {
+fn row_id_delete_updates_delete_vector_and_visible_rows() {
     let table = create_table(&[LogicalType::Integer]);
     let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
     table.append(&chunk).unwrap();
@@ -469,20 +479,136 @@ fn row_id_delete_writes_delvec_and_wal() {
     values_after_delete.sort_unstable();
     assert_eq!(values_after_delete, vec![1, 3]);
 
-    let wal_path = table.tablet().data_dir().join("tablet.wal");
-    let mut wal_reader = WalReader::open(&wal_path)
+    let delete_vector = crate::primary_key::DeleteVector::load_from_dir(
+        table
+            .tablet()
+            .find_rowset_by_id(target_location.0)
+            .expect("rowset should still exist")
+            .rowset_path(),
+        target_location.1,
+    )
+    .unwrap()
+    .expect("delete vector should exist after row_id delete");
+    assert!(delete_vector.is_deleted(target_location.2));
+}
+
+#[test]
+fn row_id_delete_on_primary_keys_rebuilds_stale_index_entries() {
+    let table = create_table_with_keys(
+        &[LogicalType::Integer, LogicalType::Integer],
+        KeysType::PrimaryKeys,
+    );
+    let chunk = Chunk::from_vectors(vec![
+        Vector::from_i32(&[1, 2, 3]),
+        Vector::from_i32(&[10, 20, 30]),
+    ]);
+    table.append(&chunk).unwrap();
+
+    let row_ids = collect_row_ids_by_id(&table);
+    let deleted = table.delete(&[row_ids[&2]], None).unwrap();
+    assert_eq!(deleted, 1);
+    assert_eq!(collect_rows_i32_pair(&table), vec![(1, 10), (3, 30)]);
+    assert_eq!(
+        table
+            .tablet()
+            .snapshot_primary_index_entries()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let reinsert = Chunk::from_vectors(vec![Vector::from_i32(&[2]), Vector::from_i32(&[222])]);
+    table.append(&reinsert).unwrap();
+    assert_eq!(
+        collect_rows_i32_pair(&table),
+        vec![(1, 10), (2, 222), (3, 30)]
+    );
+}
+
+#[test]
+fn replay_row_id_delete_patch_is_idempotent() {
+    let table = create_table_with_keys(
+        &[LogicalType::Integer, LogicalType::Integer],
+        KeysType::PrimaryKeys,
+    );
+    let chunk = Chunk::from_vectors(vec![
+        Vector::from_i32(&[1, 2, 3]),
+        Vector::from_i32(&[10, 20, 30]),
+    ]);
+    table.append(&chunk).unwrap();
+
+    let locations = collect_row_locations_by_id(&table);
+    let target_location = locations[&2];
+    let patch = [(
+        target_location.rowset_id,
+        target_location.segment_id,
+        target_location.row_offset,
+    )];
+
+    table.replay_row_id_delete(&patch).unwrap();
+    assert_eq!(collect_rows_i32_pair(&table), vec![(1, 10), (3, 30)]);
+
+    table.replay_row_id_delete(&patch).unwrap();
+    assert_eq!(collect_rows_i32_pair(&table), vec![(1, 10), (3, 30)]);
+
+    let delete_vector = crate::primary_key::DeleteVector::load_from_dir(
+        table
+            .tablet()
+            .find_rowset_by_id(target_location.rowset_id)
+            .expect("rowset should still exist")
+            .rowset_path(),
+        target_location.segment_id,
+    )
+    .unwrap()
+    .expect("delete vector should exist after replayed patch");
+    assert!(delete_vector.is_deleted(target_location.row_offset));
+}
+
+#[test]
+fn compaction_rewrites_physical_refs_and_rejects_stale_delete_patch_token() {
+    let table = create_table_with_keys(
+        &[LogicalType::Integer, LogicalType::Integer],
+        KeysType::PrimaryKeys,
+    );
+    table
+        .append(&Chunk::from_vectors(vec![
+            Vector::from_i32(&[1, 2]),
+            Vector::from_i32(&[10, 20]),
+        ]))
+        .unwrap();
+    table
+        .append(&Chunk::from_vectors(vec![
+            Vector::from_i32(&[3, 4]),
+            Vector::from_i32(&[30, 40]),
+        ]))
+        .unwrap();
+
+    let before_locations = collect_row_locations_by_id(&table);
+    let before_location = before_locations[&2];
+    let snapshot = crate::tablet::capture_prepare_snapshot(table.tablet().as_ref(), &[]).unwrap();
+    let patch =
+        crate::tablet::build_delete_patch_from_row_refs(&snapshot, &[before_location]).unwrap();
+    assert_eq!(patch.expect("delete patch before compaction").row_count, 1);
+
+    let context = CompactionPlanner::plan(&table.tablet())
         .unwrap()
-        .expect("wal should exist after row_id delete");
-    let mut saw_row_id_delete = false;
-    while let Some(entry) = wal_reader.read_entry().unwrap() {
-        if let WalEntry::RowIdDelete { locations } = entry {
-            if locations.contains(&target_location) {
-                saw_row_id_delete = true;
-                break;
-            }
-        }
-    }
-    assert!(saw_row_id_delete, "expected RowIdDelete WAL entry");
+        .expect("plan compaction for stale patch test");
+    let mut task =
+        HorizontalCompactionTask::new(table.tablet(), context, Arc::new(default_allocator()));
+    task.run().unwrap();
+
+    let after_locations = collect_row_locations_by_id(&table);
+    let after_location = after_locations[&2];
+    assert_ne!(after_location, before_location);
+
+    let err = table
+        .tablet()
+        .validate_prepare_token(&snapshot.prepare_token())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("rowset_epoch"),
+        "stale token should be rejected after compaction rewrites physical refs: {err}"
+    );
 }
 
 #[test]
@@ -1443,6 +1569,32 @@ fn full_table_delete_non_pk_marks_all_rows() {
 }
 
 #[test]
+fn full_table_delete_non_pk_respects_delete_versions_beyond_rowset_max() {
+    let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
+    let chunk = Chunk::from_vectors(vec![
+        Vector::from_i32(&[1, 2, 3]),
+        Vector::from_i32(&[10, 20, 30]),
+    ]);
+    table.append(&chunk).unwrap();
+
+    let delete_version = table.max_version() + 7;
+    let locations = collect_row_locations_by_id(&table);
+    table
+        .tablet()
+        .apply_row_id_delete_refs_at_version(&[locations[&2]], delete_version)
+        .unwrap();
+
+    assert_eq!(table.max_version(), delete_version);
+    assert_eq!(collect_rows_i32_pair(&table), vec![(1, 10), (3, 30)]);
+
+    let deleted = table.delete_all(None).unwrap();
+    assert_eq!(deleted, 2);
+
+    let visible_rows: usize = table.scan_chunks().unwrap().iter().map(|c| c.size()).sum();
+    assert_eq!(visible_rows, 0);
+}
+
+#[test]
 fn full_table_delete_primary_key_clears_index() {
     let table = create_table_with_keys(
         &[LogicalType::Integer, LogicalType::Integer],
@@ -1478,6 +1630,39 @@ fn full_table_delete_primary_key_clears_index() {
 
     let deleted_again = table.delete_all(None).unwrap();
     assert_eq!(deleted_again, 0);
+}
+
+#[test]
+fn reopen_recovers_delete_visibility_beyond_rowset_max() {
+    let types = [LogicalType::Integer, LogicalType::Integer];
+    let table = create_table_with_keys(&types, KeysType::PrimaryKeys);
+    let chunk = Chunk::from_vectors(vec![
+        Vector::from_i32(&[1, 2, 3]),
+        Vector::from_i32(&[10, 20, 30]),
+    ]);
+    table.append(&chunk).unwrap();
+
+    let descriptor = table.to_descriptor().unwrap();
+    let delete_version = table.max_version() + 9;
+    let locations = collect_row_locations_by_id(&table);
+    table
+        .tablet()
+        .apply_row_id_delete_refs_at_version(&[locations[&2]], delete_version)
+        .unwrap();
+    table.tablet().save_meta().unwrap();
+    drop(table);
+
+    let reopened = open_table_from_descriptor(&types, &descriptor);
+    assert_eq!(reopened.max_version(), delete_version);
+    assert_eq!(collect_rows_i32_pair(&reopened), vec![(1, 10), (3, 30)]);
+    assert_eq!(
+        reopened
+            .tablet()
+            .snapshot_primary_index_entries()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]

@@ -4,8 +4,8 @@
 //! # WAL Entry Types
 //!
 //! On-disk type bytes for the supported WAL protocol. Historical per-DDL catalog opcodes
-//! (bytes 1-24) and row-oriented tuple payloads (26-29) are rejected at parse time;
-//! catalog changes use the unified `Txn*` journal records only.
+//! (bytes 1-24), row-oriented tuple payloads (26-29), and the legacy multi-entry
+//! transaction envelope (43-48) are rejected at parse time.
 
 /// WAL entry type enumeration (type byte on disk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,18 +29,8 @@ pub enum WalType {
     /// Compaction publish intent (replace inputs with one output)
     CompactionPublish = 33,
 
-    /// Unified transaction begin marker
-    TxnBegin = 43,
-    /// Unified transaction catalog op
-    TxnCatalogOp = 44,
-    /// Unified transaction data op
-    TxnDataOp = 45,
-    /// Unified transaction post-commit hook
-    TxnPostCommitHook = 46,
-    /// Unified transaction commit marker
-    TxnCommit = 47,
-    /// Unified transaction abort marker
-    TxnAbort = 48,
+    /// Binary-framed journal record
+    JournalRecord = 49,
 
     /// WAL version header
     WalVersion = 98,
@@ -65,10 +55,10 @@ fn unsupported_historical_wal_opcode(value: u8) -> paro_common::error::ParoError
 }
 
 impl WalType {
-    /// Typed catalog mutations appear only as `TxnCatalogOp` inside a txn envelope.
+    /// Catalog mutations appear only inside `JournalRecord`.
     #[inline]
     pub fn is_catalog_operation(&self) -> bool {
-        matches!(self, WalType::TxnCatalogOp)
+        matches!(self, WalType::JournalRecord)
     }
 
     #[inline]
@@ -80,7 +70,7 @@ impl WalType {
                 | WalType::PrimaryDelete
                 | WalType::RowIdDelete
                 | WalType::CompactionPublish
-                | WalType::TxnDataOp
+                | WalType::JournalRecord
         )
     }
 
@@ -88,15 +78,7 @@ impl WalType {
     pub fn is_control_operation(&self) -> bool {
         matches!(
             self,
-            WalType::WalVersion
-                | WalType::Checkpoint
-                | WalType::WalFlush
-                | WalType::TxnBegin
-                | WalType::TxnCatalogOp
-                | WalType::TxnDataOp
-                | WalType::TxnPostCommitHook
-                | WalType::TxnCommit
-                | WalType::TxnAbort
+            WalType::WalVersion | WalType::Checkpoint | WalType::WalFlush | WalType::JournalRecord
         )
     }
 }
@@ -117,12 +99,8 @@ impl TryFrom<u8> for WalType {
             31 => Ok(WalType::PrimaryDelete),
             32 => Ok(WalType::RowIdDelete),
             33 => Ok(WalType::CompactionPublish),
-            43 => Ok(WalType::TxnBegin),
-            44 => Ok(WalType::TxnCatalogOp),
-            45 => Ok(WalType::TxnDataOp),
-            46 => Ok(WalType::TxnPostCommitHook),
-            47 => Ok(WalType::TxnCommit),
-            48 => Ok(WalType::TxnAbort),
+            43..=48 => Err(unsupported_historical_wal_opcode(value)),
+            49 => Ok(WalType::JournalRecord),
             98 => Ok(WalType::WalVersion),
             99 => Ok(WalType::Checkpoint),
             100 => Ok(WalType::WalFlush),
@@ -152,8 +130,7 @@ mod tests {
             WalType::RowsetCommit,
             WalType::CompactionPublish,
             WalType::RowIdDelete,
-            WalType::TxnBegin,
-            WalType::TxnCommit,
+            WalType::JournalRecord,
             WalType::Checkpoint,
             WalType::WalFlush,
         ];
@@ -167,15 +144,13 @@ mod tests {
 
     #[test]
     fn test_wal_type_categories() {
-        assert!(WalType::TxnCatalogOp.is_catalog_operation());
+        assert!(WalType::JournalRecord.is_catalog_operation());
         assert!(!WalType::RowIdDelete.is_catalog_operation());
-        assert!(WalType::TxnBegin.is_control_operation());
-        assert!(WalType::TxnCommit.is_control_operation());
+        assert!(WalType::JournalRecord.is_control_operation());
 
         assert!(WalType::RowIdDelete.is_data_operation());
         assert!(WalType::CompactionPublish.is_data_operation());
-        assert!(WalType::TxnDataOp.is_data_operation());
-        assert!(!WalType::TxnCatalogOp.is_data_operation());
+        assert!(WalType::JournalRecord.is_data_operation());
 
         assert!(WalType::Checkpoint.is_control_operation());
         assert!(WalType::WalFlush.is_control_operation());
@@ -211,6 +186,17 @@ mod tests {
     fn test_legacy_tuple_dml_rejected() {
         for b in [26u8, 27, 28] {
             let err = WalType::try_from(b).expect_err("tuple DML");
+            assert!(err.is_feature_not_supported());
+            assert!(err
+                .to_string()
+                .contains(&format!("unsupported historical WAL opcode {}", b)));
+        }
+    }
+
+    #[test]
+    fn test_legacy_txn_envelope_rejected() {
+        for b in [43u8, 44, 45, 46, 47, 48] {
+            let err = WalType::try_from(b).expect_err("legacy txn envelope");
             assert!(err.is_feature_not_supported());
             assert!(err
                 .to_string()

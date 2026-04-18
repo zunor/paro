@@ -145,7 +145,7 @@ impl DeltaWriter {
         let rowset_id = tablet.next_rowset_id();
 
         // Flush writes directly into the canonical final rowset namespace.
-        let rowset_path = tablet.canonical_rowset_path(rowset_id);
+        let rowset_path = tablet.staged_rowset_path(txn_id, rowset_id);
         std::fs::create_dir_all(&rowset_path).map_err(|e| {
             paro_error::io_error(format!(
                 "Failed to create rowset path {:?}: {}",
@@ -948,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_writer_delete_keys_writes_wal_and_delvec() {
+    fn delta_writer_delete_keys_persists_delete_vector() {
         let (tablet, tmp) = create_test_tablet();
         // Seed data
         let mut writer = DeltaWriter::open(tablet.clone(), 10).unwrap();
@@ -970,12 +970,6 @@ mod tests {
             .unwrap();
         assert_eq!(dv.cardinality(), 4);
         assert!(dv.is_deleted(0));
-
-        // WAL recorded
-        let wal_path = tablet.data_dir().join("tablet.wal");
-        assert!(wal_path.exists());
-        let meta = std::fs::metadata(&wal_path).unwrap();
-        assert!(meta.len() > 0);
 
         drop(tmp);
     }

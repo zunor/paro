@@ -15,6 +15,7 @@ use crate::metadata::InstanceMetadata;
 use crate::{BootConfig, Instance, InstanceConfig, ManagedDatabaseService};
 use paro_common::logging::targets;
 use paro_storage::meta::{FileMetadataStore, MetadataStore};
+use paro_storage::tablet::set_delete_patch_inline_row_ref_threshold;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -120,6 +121,9 @@ impl InstanceBuilder {
         metadata: InstanceMetadata,
         runtime: crate::runtime::InstanceRuntime,
     ) -> Arc<Instance> {
+        set_delete_patch_inline_row_ref_threshold(
+            boot_config.delete_patch_inline_row_ref_threshold,
+        );
         let recovery_hooks = config
             .take_recovery_hooks()
             .unwrap_or_else(default_recovery_hooks);

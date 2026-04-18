@@ -26,11 +26,11 @@ use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::version::{pg_compat_server_version, PG_COMPAT_SERVER_VERSION_NUM};
 use paro_context::{
-    AttachedDatabaseDirectory, AttachedDatabaseSnapshot, CompileEnvironmentKey, CursorSummary,
-    DatabaseSnapshotIdentity, EffectiveSettings, ExecutionResources, PreparedStatementSummary,
-    QueryResources, RuntimeLimits, SessionMetadataRows, StatementCancelReason,
-    StatementCancellation, StatementContext, StatementEnvironment, StatementOptions,
-    StatementSource, StatementView,
+    AttachedDatabaseDirectory, AttachedDatabaseSnapshot, AttachedDatabaseWalMetricsSnapshot,
+    CompileEnvironmentKey, CursorSummary, DatabaseSnapshotIdentity, EffectiveSettings,
+    ExecutionResources, PreparedStatementSummary, QueryResources, RuntimeLimits,
+    SessionMetadataRows, StatementCancelReason, StatementCancellation, StatementContext,
+    StatementEnvironment, StatementOptions, StatementSource, StatementView,
 };
 use paro_execution::operator::ddl::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
@@ -101,9 +101,11 @@ impl Session {
     }
 
     pub fn transaction_visible_version(&self) -> u64 {
-        self.transaction
-            .visible_version()
-            .unwrap_or_else(|| self.current_database.transaction_manager().last_commit())
+        self.transaction.visible_version().unwrap_or_else(|| {
+            self.current_database
+                .transaction_manager()
+                .published_commit_id()
+        })
     }
 
     pub fn active_transaction(&self) -> Option<Arc<paro_storage::transaction::txn::Transaction>> {
@@ -141,15 +143,63 @@ impl Session {
         databases.sort_by(|left, right| left.name().cmp(right.name()));
         let databases = databases
             .into_iter()
-            .map(|database| AttachedDatabaseSnapshot {
-                identity: DatabaseSnapshotIdentity {
-                    id: database.id(),
-                    name: database.name().to_string(),
-                    path: database.path().to_string(),
-                    db_type: database.db_type(),
-                },
-                catalog: database.catalog().clone(),
-                tablet_meta: database.tablet_meta_manager(),
+            .map(|database| {
+                let wal_metrics = database.wal_lifecycle_metrics();
+                AttachedDatabaseSnapshot {
+                    identity: DatabaseSnapshotIdentity {
+                        id: database.id(),
+                        name: database.name().to_string(),
+                        path: database.path().to_string(),
+                        db_type: database.db_type(),
+                    },
+                    catalog: database.catalog().clone(),
+                    tablet_meta: database.tablet_meta_manager(),
+                    wal_metrics: AttachedDatabaseWalMetricsSnapshot {
+                        checkpoint_success_total: wal_metrics.checkpoint_success_total,
+                        checkpoint_failure_total: wal_metrics.checkpoint_failure_total,
+                        wal_health_check_total: wal_metrics.wal_health_check_total,
+                        wal_keep_from: wal_metrics.wal_keep_from,
+                        recovery_mode: wal_metrics.recovery_mode.as_str().to_string(),
+                        main_wal_needs_truncation: wal_metrics.main_wal_needs_truncation,
+                        checkpoint_wal_needs_truncation: wal_metrics
+                            .checkpoint_wal_needs_truncation,
+                        recovery_wal_needs_truncation: wal_metrics.recovery_wal_needs_truncation,
+                        journal_apply_queue_depth: wal_metrics.journal_apply_queue_depth,
+                        journal_apply_queue_depth_peak: wal_metrics.journal_apply_queue_depth_peak,
+                        journal_apply_active_workers: wal_metrics.journal_apply_active_workers,
+                        journal_apply_active_workers_peak: wal_metrics
+                            .journal_apply_active_workers_peak,
+                        journal_apply_mailbox_count: wal_metrics.journal_apply_mailbox_count,
+                        journal_apply_applied_lag: wal_metrics.journal_apply_applied_lag,
+                        journal_apply_published_lag: wal_metrics.journal_apply_published_lag,
+                        journal_apply_durable_wait_count: wal_metrics
+                            .journal_apply_durable_wait_count,
+                        journal_apply_durable_wait_micros: wal_metrics
+                            .journal_apply_durable_wait_micros,
+                        journal_apply_applied_wait_count: wal_metrics
+                            .journal_apply_applied_wait_count,
+                        journal_apply_applied_wait_micros: wal_metrics
+                            .journal_apply_applied_wait_micros,
+                        journal_apply_published_wait_count: wal_metrics
+                            .journal_apply_published_wait_count,
+                        journal_apply_published_wait_micros: wal_metrics
+                            .journal_apply_published_wait_micros,
+                        journal_commit_bytes_total: wal_metrics.journal_commit_bytes_total,
+                        journal_group_count: wal_metrics.journal_group_count,
+                        journal_group_size_last: wal_metrics.journal_group_size_last,
+                        journal_group_size_peak: wal_metrics.journal_group_size_peak,
+                        journal_sync_latency_micros_total: wal_metrics
+                            .journal_sync_latency_micros_total,
+                        journal_sync_latency_micros_peak: wal_metrics
+                            .journal_sync_latency_micros_peak,
+                        journal_replay_rowsets_total: wal_metrics.journal_replay_rowsets_total,
+                        journal_replay_delete_patches_total: wal_metrics
+                            .journal_replay_delete_patches_total,
+                        journal_inline_delete_patch_count: wal_metrics
+                            .journal_inline_delete_patch_count,
+                        journal_delete_patch_count: wal_metrics.journal_delete_patch_count,
+                    },
+                }
             })
             .collect();
 
@@ -1075,7 +1125,11 @@ impl Session {
                 self.transaction_start_time(),
             )
         } else {
-            paro_catalog::mvcc::CatalogSnapshot::read_only(u64::MAX)
+            paro_catalog::mvcc::CatalogSnapshot::read_only(
+                self.current_database
+                    .transaction_manager()
+                    .published_commit_id(),
+            )
         }
     }
 

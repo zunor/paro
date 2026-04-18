@@ -3,24 +3,39 @@
 
 //! Bridges storage-level WAL replay with catalog and runtime recovery.
 
+use super::apply_engine::ApplyEngine;
 use super::consistency_report::{
     build_recovery_consistency_report, log_recovery_consistency_report,
 };
+use super::ddl::{catalog_apply_phase, route_registry_table_keys, CatalogApplyPhase};
 use super::index_restore::{reconcile_fulltext_index_coverage, restore_runtime_art_indexes};
-use paro_catalog::collection::{CatalogReplaySummary, InstallMode, StagedCatalogMutation};
+use super::registry::RouteRegistry;
+use crate::database::wal_observability::WalReplayCounters;
+use paro_catalog::collection::{CatalogReplaySummary, InstallMode};
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogEntryEnum, CreateSchemaInfo, OnCreateConflict};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_catalog::mvcc::REPLAY_WRITER_ID;
-use paro_common::effect::{CatalogTxnOp, PostCommitHookDescriptor, PreparedDataOp};
+use paro_common::ddl::{DdlChange, DdlChangeRecord};
+#[cfg(test)]
+use paro_common::effect::{
+    encode_delete_patch_artifact_bytes, DeletePatchEncoding, DeletePatchGroup, DeletePatchInline,
+    DeletePatchRef, DeletePatchSegment,
+};
+use paro_common::effect::{
+    ApplyDescriptor, ArtifactNamespace, ArtifactRef, DeferredTask, StorageCommitOp, TabletApplyOp,
+    TabletMutation, VersionSpan,
+};
 use paro_common::error as paro_error;
+use paro_common::journal::{CheckpointFence, CommitRecord, MaintenanceRecord, RecoverySummary};
 use paro_common::logging::targets;
+use paro_storage::index::graph::GraphProjectionIndexManager;
 use paro_storage::meta::TabletMetaManager;
-use paro_storage::transaction::descriptor_cleanup::DescriptorCleanupQueue;
 use paro_storage::wal::recovery::{ReplayHandler, WalRecovery};
 use paro_storage::wal::replay_state::ReplayResult;
 use paro_storage::wal::wal_entry::WalHeaderMetadata;
 use paro_storage::wal::write_ahead_log::WriteAheadLog;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,6 +43,12 @@ use std::sync::Arc;
 ///
 /// This handler is used during database startup to replay WAL entries
 /// and restore the catalog to a consistent state.
+pub trait RuntimeCatalogApplyBatch {
+    fn len(&self) -> usize;
+    fn record(&self, index: usize) -> &DdlChangeRecord;
+    fn apply(&mut self, index: usize, commit_id: u64) -> paro_common::error::Result<()>;
+}
+
 pub struct CatalogReplayHandler<'a> {
     /// The catalog to apply entries to
     pub(super) catalog: &'a Arc<ParoCatalog>,
@@ -41,6 +62,16 @@ pub struct CatalogReplayHandler<'a> {
     pub(super) max_seen_object_id: u64,
     /// Highest committed catalog timestamp installed during replay.
     pub(super) max_catalog_commit_id: u64,
+    /// Fast routing registry used by runtime apply and recovery replay.
+    pub(super) registry: RouteRegistry,
+    /// Optional graph runtime registry used by live apply paths.
+    pub(super) graph_registry: Option<Arc<GraphProjectionIndexManager>>,
+    /// Deferred tasks recovered from durable journal records for startup redelivery.
+    pub(super) replayed_deferred_tasks: Vec<DeferredTask>,
+    /// Durable replay summary used to bootstrap allocators and frontiers.
+    pub(super) recovery_summary: RecoverySummary,
+    /// Optional startup replay counters for observability export.
+    pub(super) replay_counters: Option<Arc<WalReplayCounters>>,
 }
 
 impl<'a> CatalogReplayHandler<'a> {
@@ -51,6 +82,14 @@ impl<'a> CatalogReplayHandler<'a> {
         } else {
             CatalogSnapshot::replay_writer(commit_ts)
         };
+        let registry = RouteRegistry::from_catalog(catalog).unwrap_or_else(|error| {
+            tracing::warn!(
+                target: targets::INSTANCE,
+                error = %error,
+                "failed to bootstrap replay route registry from catalog; starting empty"
+            );
+            RouteRegistry::default()
+        });
         Self {
             catalog,
             transaction,
@@ -58,6 +97,11 @@ impl<'a> CatalogReplayHandler<'a> {
             tablet_meta_manager: None,
             max_seen_object_id: 0,
             max_catalog_commit_id: 0,
+            registry,
+            graph_registry: None,
+            replayed_deferred_tasks: Vec::new(),
+            recovery_summary: RecoverySummary::default(),
+            replay_counters: None,
         }
     }
 
@@ -71,6 +115,21 @@ impl<'a> CatalogReplayHandler<'a> {
         tablet_meta_manager: Option<Arc<TabletMetaManager>>,
     ) -> Self {
         self.tablet_meta_manager = tablet_meta_manager;
+        self
+    }
+
+    pub fn with_registry(mut self, registry: RouteRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn with_graph_registry(mut self, graph_registry: Arc<GraphProjectionIndexManager>) -> Self {
+        self.graph_registry = Some(graph_registry);
+        self
+    }
+
+    pub(crate) fn with_replay_counters(mut self, replay_counters: Arc<WalReplayCounters>) -> Self {
+        self.replay_counters = Some(replay_counters);
         self
     }
 
@@ -92,6 +151,155 @@ impl<'a> CatalogReplayHandler<'a> {
         Ok(())
     }
 
+    pub(super) fn replay_storage_op(
+        &mut self,
+        op: &StorageCommitOp,
+        lsn: u64,
+    ) -> paro_common::error::Result<()> {
+        self.apply_effects(std::slice::from_ref(op), &[], lsn, 0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn replay_primary_delete(
+        &mut self,
+        tablet_id: u64,
+        keys: &[Vec<u8>],
+        lsn: u64,
+    ) -> paro_common::error::Result<()> {
+        let route = self
+            .registry
+            .route_tablet(tablet_id)
+            .cloned()
+            .ok_or_else(|| {
+                paro_error::serialization_error(format!(
+                    "tablet {} missing from recovery registry",
+                    tablet_id
+                ))
+            })?;
+        let resolved = route.storage.tablet().lookup_primary_keys(keys)?;
+        let mut locations = Vec::new();
+        for row_id in resolved.into_iter().flatten() {
+            locations.push(route.storage.tablet().decode_row_id(row_id)?);
+        }
+        let patch = Self::inline_delete_patch(&locations);
+        let mutation = TabletMutation::ApplyDeletePatch {
+            deleted_row_count: patch.row_count(),
+            patch,
+        };
+        // Test-only helper: model a committed delete patch by reusing the durable lsn
+        // as visibility when no full CommitRecord wrapper is needed.
+        self.apply_effects(
+            &[StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id,
+                mutations: vec![mutation],
+            })],
+            &[],
+            lsn,
+            lsn.max(1),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn replay_rowset_commit(
+        &mut self,
+        tablet_id: u64,
+        rowset_id: u64,
+        start_version: i64,
+        end_version: i64,
+        rowset_path: &str,
+        replaced_locations: &[(u64, u32, u32)],
+        lsn: u64,
+    ) -> paro_common::error::Result<()> {
+        let mut mutations = Vec::new();
+        if !replaced_locations.is_empty() {
+            let patch = Self::inline_delete_patch(
+                &replaced_locations
+                    .iter()
+                    .copied()
+                    .map(Into::into)
+                    .collect::<Vec<_>>(),
+            );
+            mutations.push(TabletMutation::ApplyDeletePatch {
+                deleted_row_count: patch.row_count(),
+                patch,
+            });
+        }
+        mutations.push(TabletMutation::PublishRowset {
+            rowset_id,
+            version_span: VersionSpan {
+                start: start_version,
+                end: end_version,
+            },
+            rowset_ref: self.artifact_ref_for_tablet_path(tablet_id, Path::new(rowset_path))?,
+        });
+        self.replay_storage_op(
+            &StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id,
+                mutations,
+            }),
+            lsn,
+        )
+    }
+
+    pub(super) fn replay_tablet_mutation(
+        &mut self,
+        tablet_id: u64,
+        mutation: &TabletMutation,
+        lsn: u64,
+    ) -> paro_common::error::Result<()> {
+        self.replay_storage_op(
+            &StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id,
+                mutations: vec![mutation.clone()],
+            }),
+            lsn,
+        )
+    }
+
+    #[cfg(test)]
+    fn inline_delete_patch(locations: &[paro_storage::tablet::PhysicalRowRef]) -> DeletePatchRef {
+        let mut grouped =
+            std::collections::BTreeMap::<u64, std::collections::BTreeMap<u32, Vec<u32>>>::new();
+        for location in locations {
+            grouped
+                .entry(location.rowset_id)
+                .or_default()
+                .entry(location.segment_id)
+                .or_default()
+                .push(location.row_offset);
+        }
+        let groups = grouped
+            .into_iter()
+            .map(|(rowset_id, segments)| DeletePatchGroup {
+                rowset_id,
+                segments: segments
+                    .into_iter()
+                    .map(|(segment_id, offsets)| {
+                        let mut previous = 0u32;
+                        let mut encoded = Vec::with_capacity(offsets.len());
+                        for (index, row_offset) in offsets.into_iter().enumerate() {
+                            if index == 0 {
+                                encoded.push(row_offset);
+                            } else {
+                                encoded.push(row_offset - previous);
+                            }
+                            previous = row_offset;
+                        }
+                        DeletePatchSegment {
+                            segment_id,
+                            row_offsets_delta: encoded,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        DeletePatchRef::Inline(DeletePatchInline {
+            encoding: DeletePatchEncoding::GroupedRowOffsetDeltaV1,
+            row_count: locations.len() as u32,
+            groups,
+        })
+    }
+
     pub(super) fn install_replayed_entry(
         &mut self,
         collection: &paro_catalog::collection::CatalogCollection,
@@ -105,7 +313,7 @@ impl<'a> CatalogReplayHandler<'a> {
 
     pub(super) fn publish_catalog_handle(
         &mut self,
-        handle: StagedCatalogMutation,
+        handle: paro_catalog::collection::StagedCatalogMutation,
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
         handle.publish(commit_id)?;
@@ -117,6 +325,24 @@ impl<'a> CatalogReplayHandler<'a> {
             max_catalog_commit_id: self.max_catalog_commit_id,
             max_seen_object_id: self.max_seen_object_id,
         }
+    }
+
+    pub fn replayed_deferred_tasks(&self) -> &[DeferredTask] {
+        &self.replayed_deferred_tasks
+    }
+
+    pub fn recovery_summary(&self) -> RecoverySummary {
+        RecoverySummary {
+            max_lsn: self.recovery_summary.max_lsn,
+            max_commit_id: self.recovery_summary.max_commit_id,
+            max_maintenance_id: self.recovery_summary.max_maintenance_id,
+            max_catalog_commit_id: self.max_catalog_commit_id,
+            max_seen_object_id: self.max_seen_object_id,
+        }
+    }
+
+    fn observe_replayed_lsn(&mut self, lsn: u64) {
+        self.recovery_summary.max_lsn = self.recovery_summary.max_lsn.max(lsn);
     }
 
     fn finalize_object_id_allocator(&self) -> paro_common::error::Result<()> {
@@ -164,53 +390,189 @@ impl<'a> CatalogReplayHandler<'a> {
             }
         }
     }
+
+    fn apply_runtime_catalog_phase<T: RuntimeCatalogApplyBatch>(
+        &mut self,
+        batch: &mut T,
+        commit_id: u64,
+        phase: CatalogApplyPhase,
+    ) -> paro_common::error::Result<()> {
+        for index in 0..batch.len() {
+            if catalog_apply_phase(batch.record(index)) != phase {
+                continue;
+            }
+            batch.apply(index, commit_id)?;
+            self.observe_catalog_commit_id(commit_id)?;
+        }
+        Ok(())
+    }
+
+    fn apply_runtime_catalog_non_drop<T: RuntimeCatalogApplyBatch>(
+        &mut self,
+        batch: &mut T,
+        commit_id: u64,
+    ) -> paro_common::error::Result<()> {
+        self.apply_runtime_catalog_phase(batch, commit_id, CatalogApplyPhase::Create)?;
+        self.apply_runtime_catalog_phase(batch, commit_id, CatalogApplyPhase::Alter)
+    }
+
+    fn apply_runtime_catalog_drop<T: RuntimeCatalogApplyBatch>(
+        &mut self,
+        batch: &mut T,
+        commit_id: u64,
+    ) -> paro_common::error::Result<()> {
+        self.apply_runtime_catalog_phase(batch, commit_id, CatalogApplyPhase::Drop)
+    }
+
+    fn sync_route_registry_for_catalog_ops(
+        &mut self,
+        ops: &[paro_common::effect::CatalogTxnOp],
+        phase: CatalogApplyPhase,
+    ) -> paro_common::error::Result<()> {
+        let mut targets = HashSet::new();
+        for op in ops {
+            if catalog_apply_phase(&op.change) != phase {
+                continue;
+            }
+            let route_keys = match &op.change.change {
+                DdlChange::DropSchema(_) if phase == CatalogApplyPhase::Drop => self
+                    .registry
+                    .table_keys_in_schema(&op.change.key.database, &op.change.key.name),
+                _ => route_registry_table_keys(&op.change, self.catalog.name())?,
+            };
+            for key in route_keys {
+                targets.insert(key);
+            }
+        }
+        for target in targets {
+            self.registry
+                .sync_table_from_catalog(self.catalog, &target)?;
+        }
+        Ok(())
+    }
+
+    fn apply_effects(
+        &mut self,
+        storage_ops: &[StorageCommitOp],
+        descriptors: &[ApplyDescriptor],
+        lsn: u64,
+        commit_id: u64,
+    ) -> paro_common::error::Result<()> {
+        if storage_ops.is_empty() && descriptors.is_empty() {
+            return Ok(());
+        }
+        ApplyEngine::new(self).apply_effects(storage_ops, descriptors, lsn, commit_id)
+    }
+
+    pub fn apply_runtime_commit_record<T: RuntimeCatalogApplyBatch>(
+        &mut self,
+        record: &CommitRecord,
+        lsn: u64,
+        catalog_batch: &mut T,
+    ) -> paro_common::error::Result<()> {
+        self.apply_runtime_catalog_non_drop(catalog_batch, record.commit_id)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Create)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Alter)?;
+        self.apply_effects(
+            &record.storage_ops,
+            &record.apply_descriptors,
+            lsn,
+            record.commit_id,
+        )?;
+        self.apply_runtime_catalog_drop(catalog_batch, record.commit_id)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Drop)?;
+        Ok(())
+    }
+
+    fn apply_recovered_commit_record(
+        &mut self,
+        record: &CommitRecord,
+        lsn: u64,
+    ) -> paro_common::error::Result<()> {
+        self.replay_catalog_non_drop_ops(&record.catalog_ops, record.commit_id)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Create)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Alter)?;
+        self.apply_effects(
+            &record.storage_ops,
+            &record.apply_descriptors,
+            lsn,
+            record.commit_id,
+        )?;
+        self.replay_catalog_drop_ops(&record.catalog_ops, record.commit_id)?;
+        self.replayed_deferred_tasks
+            .extend(record.deferred_tasks.iter().cloned());
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Drop)?;
+        Ok(())
+    }
+
+    fn apply_recovered_maintenance_record(
+        &mut self,
+        record: &MaintenanceRecord,
+        lsn: u64,
+    ) -> paro_common::error::Result<()> {
+        self.replay_catalog_non_drop_ops(&record.catalog_ops, 0)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Create)?;
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Alter)?;
+        self.apply_effects(&record.storage_ops, &record.apply_descriptors, lsn, 0)?;
+        self.replay_catalog_drop_ops(&record.catalog_ops, 0)?;
+        self.replayed_deferred_tasks
+            .extend(record.deferred_tasks.iter().cloned());
+        self.sync_route_registry_for_catalog_ops(&record.catalog_ops, CatalogApplyPhase::Drop)?;
+        Ok(())
+    }
+
+    fn artifact_ref_for_tablet_path(
+        &self,
+        tablet_id: u64,
+        path: &Path,
+    ) -> paro_common::error::Result<ArtifactRef> {
+        let route = self.registry.route_tablet(tablet_id).ok_or_else(|| {
+            paro_error::internal(format!(
+                "tablet {} not mapped in route registry during replay",
+                tablet_id
+            ))
+        })?;
+        ArtifactRef::from_tablet_path(route.storage.tablet().data_dir(), path)
+    }
 }
 
 impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
-    fn replay_transaction(
+    fn replay_commit_record(
         &mut self,
-        catalog_ops: &[CatalogTxnOp],
-        data_ops: &[PreparedDataOp],
-        post_commit_hooks: &[PostCommitHookDescriptor],
-        commit_id: u64,
+        lsn: u64,
+        record: &CommitRecord,
     ) -> paro_common::error::Result<()> {
-        self.replay_catalog_ops_in_commit_order(catalog_ops, commit_id)?;
-        for op in data_ops {
-            match op {
-                PreparedDataOp::RowsetCommit {
-                    locator,
-                    start_version,
-                    end_version,
-                } => {
-                    let rowset_path = locator.path_components.join("/");
-                    self.replay_rowset_commit(
-                        locator.tablet_id,
-                        locator.rowset_id,
-                        *start_version,
-                        *end_version,
-                        &rowset_path,
-                    )?;
-                }
-                PreparedDataOp::PrimaryDelete { keys, .. } => {
-                    self.replay_primary_delete(keys)?;
-                }
-                PreparedDataOp::RowIdDelete { locations, .. } => {
-                    self.replay_row_id_delete(locations)?;
-                }
-            }
-        }
-        self.replay_catalog_drop_ops(catalog_ops, commit_id)?;
-        self.replay_runtime_transitions(catalog_ops, commit_id)?;
-        self.replay_post_commit_hooks(post_commit_hooks, commit_id)?;
-        let mut cleanup_queue = DescriptorCleanupQueue::default();
-        for op in catalog_ops {
-            cleanup_queue.enqueue(commit_id, op.cleanups.clone());
-        }
-        for batch in cleanup_queue.drain() {
-            for cleanup in &batch.descriptors {
-                self.apply_cleanup_descriptor(cleanup)?;
-            }
-        }
+        self.observe_replayed_lsn(lsn);
+        self.recovery_summary.max_commit_id =
+            self.recovery_summary.max_commit_id.max(record.commit_id);
+        self.apply_recovered_commit_record(record, lsn)
+    }
+
+    fn replay_maintenance_record(
+        &mut self,
+        lsn: u64,
+        record: &MaintenanceRecord,
+    ) -> paro_common::error::Result<()> {
+        self.observe_replayed_lsn(lsn);
+        self.recovery_summary.max_maintenance_id = self
+            .recovery_summary
+            .max_maintenance_id
+            .max(record.maintenance_id);
+        self.apply_recovered_maintenance_record(record, lsn)
+    }
+
+    fn replay_checkpoint_fence(
+        &mut self,
+        lsn: u64,
+        fence: &CheckpointFence,
+    ) -> paro_common::error::Result<()> {
+        self.observe_replayed_lsn(lsn);
+        tracing::info!(
+            target: targets::INSTANCE,
+            lsn,
+            checkpoint_marker = fence.checkpoint_marker,
+            "Checkpoint fence found during replay"
+        );
         Ok(())
     }
 
@@ -221,6 +583,51 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
             "Checkpoint marker found during replay"
         );
         Ok(())
+    }
+
+    fn replay_compaction_publish(
+        &mut self,
+        tablet_id: u64,
+        plan_id: u64,
+        job_id: u64,
+        output_rowset_id: u64,
+        output_start_version: i64,
+        output_end_version: i64,
+        cumulative_point_action: paro_storage::compaction::plan::types::CumulativePointAction,
+        output_rowset_path: &str,
+        replaced_inputs: &[u64],
+    ) -> paro_common::error::Result<()> {
+        self.replay_tablet_mutation(
+            tablet_id,
+            &TabletMutation::PublishCompaction {
+                plan_id,
+                job_id,
+                output_rowset_id,
+                output_version: VersionSpan {
+                    start: output_start_version,
+                    end: output_end_version,
+                },
+                staged_ref: ArtifactRef {
+                    namespace: ArtifactNamespace::Staged,
+                    locator: Vec::new(),
+                },
+                output_ref: self.artifact_ref_for_tablet_path(
+                    tablet_id,
+                    Path::new(output_rowset_path),
+                )?,
+                replaced_inputs: replaced_inputs.to_vec(),
+                retired_inputs: Vec::new(),
+                cumulative_point_action: match cumulative_point_action {
+                    paro_storage::compaction::plan::types::CumulativePointAction::Preserve => {
+                        paro_common::effect::CompactionCumulativePointAction::Preserve
+                    }
+                    paro_storage::compaction::plan::types::CumulativePointAction::AdvanceToOutputEndExclusive => {
+                        paro_common::effect::CompactionCumulativePointAction::AdvanceToOutputEndExclusive
+                    }
+                },
+            },
+            0,
+        )
     }
 }
 
@@ -242,7 +649,28 @@ pub fn recover_database(
     wal_path: &Path,
     catalog: &Arc<ParoCatalog>,
     tablet_meta_manager: Option<Arc<TabletMetaManager>>,
-) -> paro_common::error::Result<(WriteAheadLog, ReplayResult, CatalogReplaySummary)> {
+) -> paro_common::error::Result<(
+    WriteAheadLog,
+    ReplayResult,
+    CatalogReplaySummary,
+    RecoverySummary,
+    Vec<DeferredTask>,
+)> {
+    recover_database_observed(wal_path, catalog, tablet_meta_manager, None)
+}
+
+pub(crate) fn recover_database_observed(
+    wal_path: &Path,
+    catalog: &Arc<ParoCatalog>,
+    tablet_meta_manager: Option<Arc<TabletMetaManager>>,
+    replay_counters: Option<Arc<WalReplayCounters>>,
+) -> paro_common::error::Result<(
+    WriteAheadLog,
+    ReplayResult,
+    CatalogReplaySummary,
+    RecoverySummary,
+    Vec<DeferredTask>,
+)> {
     let recovery = WalRecovery::new(wal_path);
 
     // Use a dedicated replay writer identity and a maximally-open snapshot so
@@ -255,16 +683,28 @@ pub fn recover_database(
                 .unwrap_or_else(|| Path::new(""))
                 .to_path_buf(),
         )
-        .with_tablet_meta_manager(tablet_meta_manager);
+        .with_tablet_meta_manager(tablet_meta_manager)
+        .with_registry(RouteRegistry::from_catalog(catalog)?);
+    if let Some(replay_counters) = replay_counters {
+        handler = handler.with_replay_counters(replay_counters);
+    }
     let recovered = recovery.recover(&mut handler)?;
     let summary = handler.summary();
+    let recovery_summary = handler.recovery_summary();
+    let deferred_tasks = handler.replayed_deferred_tasks().to_vec();
     handler.finalize_object_id_allocator()?;
     catalog.rebuild_dependency_graph()?;
     restore_runtime_art_indexes(catalog);
     reconcile_fulltext_index_coverage(catalog);
     let report = build_recovery_consistency_report(catalog);
     log_recovery_consistency_report(&report);
-    Ok((recovered.0, recovered.1, summary))
+    Ok((
+        recovered.0,
+        recovered.1,
+        summary,
+        recovery_summary,
+        deferred_tasks,
+    ))
 }
 
 /// Recover a database from its WAL with checkpoint coordination.
@@ -289,7 +729,39 @@ pub fn recover_database_with_checkpoint(
     checkpoint_marker: Option<u64>,
     wal_header_metadata: Option<WalHeaderMetadata>,
     wal_keep_from: Option<u64>,
-) -> paro_common::error::Result<(WriteAheadLog, ReplayResult, CatalogReplaySummary)> {
+) -> paro_common::error::Result<(
+    WriteAheadLog,
+    ReplayResult,
+    CatalogReplaySummary,
+    RecoverySummary,
+    Vec<DeferredTask>,
+)> {
+    recover_database_with_checkpoint_observed(
+        wal_path,
+        catalog,
+        tablet_meta_manager,
+        checkpoint_marker,
+        wal_header_metadata,
+        wal_keep_from,
+        None,
+    )
+}
+
+pub(crate) fn recover_database_with_checkpoint_observed(
+    wal_path: &Path,
+    catalog: &Arc<ParoCatalog>,
+    tablet_meta_manager: Option<Arc<TabletMetaManager>>,
+    checkpoint_marker: Option<u64>,
+    wal_header_metadata: Option<WalHeaderMetadata>,
+    wal_keep_from: Option<u64>,
+    replay_counters: Option<Arc<WalReplayCounters>>,
+) -> paro_common::error::Result<(
+    WriteAheadLog,
+    ReplayResult,
+    CatalogReplaySummary,
+    RecoverySummary,
+    Vec<DeferredTask>,
+)> {
     let mut recovery = WalRecovery::new(wal_path);
 
     // If we have a checkpoint marker, use it for verification.
@@ -314,16 +786,28 @@ pub fn recover_database_with_checkpoint(
                 .unwrap_or_else(|| Path::new(""))
                 .to_path_buf(),
         )
-        .with_tablet_meta_manager(tablet_meta_manager);
+        .with_tablet_meta_manager(tablet_meta_manager)
+        .with_registry(RouteRegistry::from_catalog(catalog)?);
+    if let Some(replay_counters) = replay_counters {
+        handler = handler.with_replay_counters(replay_counters);
+    }
     let recovered = recovery.recover(&mut handler)?;
     let summary = handler.summary();
+    let recovery_summary = handler.recovery_summary();
+    let deferred_tasks = handler.replayed_deferred_tasks().to_vec();
     handler.finalize_object_id_allocator()?;
     catalog.rebuild_dependency_graph()?;
     restore_runtime_art_indexes(catalog);
     reconcile_fulltext_index_coverage(catalog);
     let report = build_recovery_consistency_report(catalog);
     log_recovery_consistency_report(&report);
-    Ok((recovered.0, recovered.1, summary))
+    Ok((
+        recovered.0,
+        recovered.1,
+        summary,
+        recovery_summary,
+        deferred_tasks,
+    ))
 }
 
 /// Check if a WAL file exists and needs recovery.
@@ -364,8 +848,10 @@ mod tests {
     use paro_common::effect::CatalogTxnOp;
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
+    use paro_storage::primary_key::PrimaryKeySerializer;
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
+    use paro_storage::tablet::tablet_schema::KeysType;
     use paro_storage::wal::wal_entry::{ColumnInfo, WalEntry};
     use paro_storage::wal::wal_type::WalType;
     use paro_storage::wal::wal_writer::{WalInitState, WalWriter};
@@ -376,6 +862,12 @@ mod tests {
 
     fn create_table(types: &[LogicalType]) -> TableHandle {
         TableFactory::default().create_table(types).unwrap()
+    }
+
+    fn create_primary_key_table(types: &[LogicalType]) -> TableHandle {
+        TableFactory::default()
+            .create_table_with_keys(types, KeysType::PrimaryKeys)
+            .unwrap()
     }
 
     fn find_first_segment_dir(root: &Path) -> Option<PathBuf> {
@@ -402,6 +894,20 @@ mod tests {
             }
         }
         None
+    }
+
+    fn copy_dir_all(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let target = to.join(entry.file_name());
+            if path.is_dir() {
+                copy_dir_all(&path, &target);
+            } else {
+                fs::copy(&path, &target).unwrap();
+            }
+        }
     }
 
     fn ensure_main_schema(catalog: &Arc<ParoCatalog>) {
@@ -452,33 +958,58 @@ mod tests {
         commit_id: u64,
         changes: Vec<DdlChangeRecord>,
     ) {
-        let begin = WalEntry::TxnBegin {
+        let record = paro_common::journal::CommitRecord {
             txn_id,
             start_time: 0,
+            commit_id,
+            catalog_ops: changes
+                .into_iter()
+                .map(|change| CatalogTxnOp { change })
+                .collect(),
+            storage_ops: vec![],
+            apply_descriptors: vec![],
+            deferred_tasks: vec![],
+        };
+        let commit = WalEntry::JournalRecord {
+            lsn: commit_id,
+            record: paro_common::journal::JournalRecord::Commit(record),
         };
         writer
-            .write_entry(WalType::TxnBegin, &begin.serialize_data())
-            .unwrap();
-        for (seq, change) in changes.into_iter().enumerate() {
-            let op = CatalogTxnOp {
-                change,
-                staged_artifacts: vec![],
-                runtime_transitions: vec![],
-                cleanups: vec![],
-            };
-            let entry = WalEntry::TxnCatalogOp {
-                seq: seq as u32,
-                op,
-            };
-            writer
-                .write_entry(WalType::TxnCatalogOp, &entry.serialize_data())
-                .unwrap();
-        }
-        let commit = WalEntry::TxnCommit { txn_id, commit_id };
-        writer
-            .write_entry(WalType::TxnCommit, &commit.serialize_data())
+            .write_entry(WalType::JournalRecord, &commit.serialize_data())
             .unwrap();
         writer.flush().unwrap();
+    }
+
+    fn write_flushed_commit_record(writer: &WalWriter, lsn: u64, record: CommitRecord) {
+        let commit = WalEntry::JournalRecord {
+            lsn,
+            record: paro_common::journal::JournalRecord::Commit(record),
+        };
+        writer
+            .write_entry(WalType::JournalRecord, &commit.serialize_data())
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct RecordingCatalogBatch {
+        records: Vec<DdlChangeRecord>,
+        applied: Vec<String>,
+    }
+
+    impl RuntimeCatalogApplyBatch for RecordingCatalogBatch {
+        fn len(&self) -> usize {
+            self.records.len()
+        }
+
+        fn record(&self, index: usize) -> &DdlChangeRecord {
+            &self.records[index]
+        }
+
+        fn apply(&mut self, index: usize, _commit_id: u64) -> paro_common::error::Result<()> {
+            self.applied.push(self.records[index].key.name.clone());
+            Ok(())
+        }
     }
 
     #[test]
@@ -1276,7 +1807,8 @@ mod tests {
         let catalog = Arc::new(ParoCatalog::new("test".to_string()));
         catalog.initialize(false);
 
-        let (wal, result, _summary) = recover_database(&wal_path, &catalog, None).unwrap();
+        let (wal, result, _summary, _recovery, _tasks) =
+            recover_database(&wal_path, &catalog, None).unwrap();
 
         assert!(result.all_succeeded, "replay error: {:?}", result.error);
         assert_eq!(result.entries_replayed, 0);
@@ -1304,7 +1836,8 @@ mod tests {
             .unwrap();
         }
 
-        let (_wal, result, _summary) = recover_database(&wal_path, &catalog, None).unwrap();
+        let (_wal, result, _summary, _recovery, _tasks) =
+            recover_database(&wal_path, &catalog, None).unwrap();
 
         assert!(result.all_succeeded, "replay error: {:?}", result.error);
         assert!(result.entries_replayed > 0);
@@ -1455,9 +1988,10 @@ mod tests {
             ],
         );
 
-        let (_wal, result, _summary) = recover_database(&wal_path, &catalog, None).unwrap();
+        let (_wal, result, _summary, _recovery, _tasks) =
+            recover_database(&wal_path, &catalog, None).unwrap();
         assert!(result.all_succeeded, "replay error: {:?}", result.error);
-        assert!(result.entries_replayed >= 5);
+        assert!(result.entries_replayed > 0);
 
         let txn = CatalogSnapshot::read_only(u64::MAX);
         let schema = catalog.get_schema(&txn, "replay_combo").unwrap();
@@ -1512,6 +2046,128 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_catalog_apply_orders_non_drop_before_drop() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+
+        let mut batch = RecordingCatalogBatch {
+            records: vec![
+                DdlChangeRecord {
+                    key: DdlObjectKey::new(
+                        "test",
+                        None::<String>,
+                        "drop_first",
+                        DdlObjectKind::Schema,
+                    ),
+                    change: DdlChange::DropSchema(paro_common::ddl::DropSchemaPayload {
+                        cascade: false,
+                        if_exists: false,
+                    }),
+                },
+                DdlChangeRecord {
+                    key: DdlObjectKey::new(
+                        "test",
+                        None::<String>,
+                        "create_schema",
+                        DdlObjectKind::Schema,
+                    ),
+                    change: DdlChange::CreateSchema(CreateSchemaPayload {
+                        object_id: 91_001,
+                        if_not_exists: false,
+                    }),
+                },
+                DdlChangeRecord {
+                    key: DdlObjectKey::new(
+                        "test",
+                        None::<String>,
+                        "alter_last",
+                        DdlObjectKind::Schema,
+                    ),
+                    change: DdlChange::AlterEntry(paro_common::ddl::AlterEntryPayload {
+                        sql: "ALTER SCHEMA create_schema RENAME TO alter_last".to_string(),
+                    }),
+                },
+            ],
+            applied: Vec::new(),
+        };
+
+        let record = CommitRecord {
+            txn_id: 7,
+            start_time: 3,
+            commit_id: 42,
+            catalog_ops: Vec::new(),
+            storage_ops: Vec::new(),
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        };
+
+        let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX);
+        handler
+            .apply_runtime_commit_record(&record, 11, &mut batch)
+            .unwrap();
+
+        assert_eq!(
+            batch.applied,
+            vec![
+                "create_schema".to_string(),
+                "alter_last".to_string(),
+                "drop_first".to_string(),
+            ]
+        );
+        assert_eq!(handler.summary().max_catalog_commit_id, 42);
+    }
+
+    #[test]
+    fn test_recovery_accumulates_deferred_tasks_from_commit_and_maintenance_records() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+
+        let build_index = DeferredTask::BuildIndexRuntime {
+            index: DdlObjectKey::new("test", Some("main"), "idx_runtime", DdlObjectKind::Index),
+            table_name: "items".to_string(),
+            index_type: "ART".to_string(),
+            column_ids: vec![0],
+            fulltext_config: None,
+        };
+        let graph_maintenance = DeferredTask::GraphDmlMaintenance {
+            deltas: vec![paro_common::effect::GraphDmlTableDelta::from_parts(
+                7,
+                1,
+                0,
+                0,
+                &std::collections::BTreeSet::new(),
+            )],
+        };
+
+        let commit = CommitRecord {
+            txn_id: 7,
+            start_time: 3,
+            commit_id: 42,
+            catalog_ops: Vec::new(),
+            storage_ops: Vec::new(),
+            apply_descriptors: Vec::new(),
+            deferred_tasks: vec![build_index.clone()],
+        };
+        let maintenance = MaintenanceRecord {
+            maintenance_id: 9,
+            kind: paro_common::journal::MaintenanceKind::Compaction,
+            catalog_ops: Vec::new(),
+            storage_ops: Vec::new(),
+            apply_descriptors: Vec::new(),
+            deferred_tasks: vec![graph_maintenance.clone()],
+        };
+
+        let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX);
+        handler.replay_commit_record(42, &commit).unwrap();
+        handler.replay_maintenance_record(43, &maintenance).unwrap();
+
+        assert_eq!(
+            handler.replayed_deferred_tasks(),
+            &[build_index, graph_maintenance]
+        );
+    }
+
+    #[test]
     fn test_catalog_replay_drop_table_idempotent() {
         let catalog = Arc::new(ParoCatalog::new("test".to_string()));
         catalog.initialize(false);
@@ -1561,6 +2217,11 @@ mod tests {
             .expect("expected source rowset directory with segment files");
 
         let target_descriptor = target_storage.to_descriptor().unwrap();
+        let staged_rowset_dir = Path::new(&target_descriptor.data_dir)
+            .join("_staged")
+            .join("replay_rowset_commit")
+            .join("rowset_9999");
+        copy_dir_all(&rowset_dir, &staged_rowset_dir);
         let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX);
         handler
             .replay_rowset_commit(
@@ -1568,7 +2229,9 @@ mod tests {
                 9_999,
                 1,
                 1,
-                rowset_dir.to_string_lossy().as_ref(),
+                staged_rowset_dir.to_string_lossy().as_ref(),
+                &[],
+                1,
             )
             .unwrap();
 
@@ -1582,11 +2245,483 @@ mod tests {
                 9_999,
                 1,
                 1,
-                rowset_dir.to_string_lossy().as_ref(),
+                staged_rowset_dir.to_string_lossy().as_ref(),
+                &[],
+                2,
             )
             .unwrap();
         assert_eq!(target_storage.rowset_count(), 1);
         assert_eq!(target_storage.total_rows(), 3);
+    }
+
+    #[test]
+    fn test_replay_commit_record_restores_tablet_applied_lsn_from_durable_lsn() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+
+        let target_storage = Arc::new(create_table(&[LogicalType::Integer]));
+        let target_columns = vec![ColumnDefinition::new(
+            "id".to_string(),
+            LogicalType::Integer,
+        )];
+        install_committed_table(
+            &catalog,
+            "main",
+            "target_table",
+            target_columns,
+            Arc::clone(&target_storage),
+        );
+
+        let source_storage = create_table(&[LogicalType::Integer]);
+        let source_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[7, 8, 9])]);
+        source_storage.append(&source_chunk).unwrap();
+        let source_descriptor = source_storage.to_descriptor().unwrap();
+        let rowset_dir = find_first_segment_dir(Path::new(&source_descriptor.data_dir))
+            .expect("expected source rowset directory with segment files");
+        let staged_rowset_dir = target_storage.tablet().staged_rowset_path(77, 4_242);
+        copy_dir_all(&rowset_dir, &staged_rowset_dir);
+
+        let tablet_id = target_storage.tablet_id();
+        let record = CommitRecord {
+            txn_id: 11,
+            start_time: 5,
+            commit_id: 19,
+            catalog_ops: Vec::new(),
+            storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id,
+                mutations: vec![TabletMutation::PublishRowset {
+                    rowset_id: 4_242,
+                    version_span: VersionSpan { start: 1, end: 1 },
+                    rowset_ref: ArtifactRef::from_tablet_path(
+                        target_storage.tablet().data_dir(),
+                        &staged_rowset_dir,
+                    )
+                    .unwrap(),
+                }],
+            })],
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        };
+
+        let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX)
+            .with_registry(RouteRegistry::from_catalog(&catalog).unwrap());
+        handler.replay_commit_record(41, &record).unwrap();
+
+        assert_eq!(target_storage.total_rows(), 3);
+        assert_eq!(target_storage.tablet().applied_lsn(), 41);
+        assert_eq!(handler.registry.tablet_applied_lsn(tablet_id), Some(41));
+        assert!(!staged_rowset_dir.exists());
+        assert!(target_storage
+            .tablet()
+            .canonical_rowset_path(4_242)
+            .exists());
+    }
+
+    #[test]
+    fn test_recover_database_replays_durable_rowset_publish_without_live_apply() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("durable_rowset_publish.wal");
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+
+        let target_storage = Arc::new(create_table(&[LogicalType::Integer]));
+        install_committed_table(
+            &catalog,
+            "main",
+            "target_table",
+            vec![ColumnDefinition::new(
+                "id".to_string(),
+                LogicalType::Integer,
+            )],
+            Arc::clone(&target_storage),
+        );
+        assert_eq!(target_storage.rowset_count(), 0);
+
+        let source_storage = create_table(&[LogicalType::Integer]);
+        let source_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[7, 8, 9])]);
+        source_storage.append(&source_chunk).unwrap();
+        let source_descriptor = source_storage.to_descriptor().unwrap();
+        let rowset_dir = find_first_segment_dir(Path::new(&source_descriptor.data_dir))
+            .expect("expected source rowset directory with segment files");
+        let staged_rowset_dir = target_storage.tablet().staged_rowset_path(88, 4_242);
+        copy_dir_all(&rowset_dir, &staged_rowset_dir);
+
+        let commit_id = 41;
+        let record = CommitRecord {
+            txn_id: 11,
+            start_time: 5,
+            commit_id,
+            catalog_ops: Vec::new(),
+            storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id: target_storage.tablet_id(),
+                mutations: vec![TabletMutation::PublishRowset {
+                    rowset_id: 4_242,
+                    version_span: VersionSpan {
+                        start: commit_id as i64,
+                        end: commit_id as i64,
+                    },
+                    rowset_ref: ArtifactRef::from_tablet_path(
+                        target_storage.tablet().data_dir(),
+                        &staged_rowset_dir,
+                    )
+                    .unwrap(),
+                }],
+            })],
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        };
+
+        let writer = WalWriter::new(&wal_path, WalInitState::Uninitialized);
+        write_flushed_commit_record(&writer, commit_id, record);
+
+        let (_wal, result, _summary, recovery_summary, _tasks) =
+            recover_database(&wal_path, &catalog, None).unwrap();
+
+        assert!(result.all_succeeded, "replay error: {:?}", result.error);
+        assert!(result.entries_replayed > 0);
+        assert_eq!(recovery_summary.max_lsn, commit_id);
+        assert_eq!(recovery_summary.max_commit_id, commit_id);
+        assert_eq!(target_storage.total_rows(), 3);
+        assert_eq!(target_storage.tablet().applied_lsn(), commit_id);
+        assert!(!staged_rowset_dir.exists());
+        assert!(target_storage
+            .tablet()
+            .canonical_rowset_path(4_242)
+            .exists());
+        let replayed_rowset = target_storage
+            .tablet()
+            .get_rowset_by_version(commit_id as i64)
+            .expect("rowset should be visible at commit version");
+        assert_eq!(replayed_rowset.start_version(), commit_id as i64);
+        assert_eq!(replayed_rowset.end_version(), commit_id as i64);
+    }
+
+    #[test]
+    fn test_recover_database_replays_durable_delete_patch_without_live_apply() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("durable_delete_patch.wal");
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+
+        let target_storage = Arc::new(create_primary_key_table(&[
+            LogicalType::Integer,
+            LogicalType::Integer,
+        ]));
+        install_committed_table(
+            &catalog,
+            "main",
+            "target_table",
+            vec![
+                ColumnDefinition::new("id".to_string(), LogicalType::Integer),
+                ColumnDefinition::new("value".to_string(), LogicalType::Integer),
+            ],
+            Arc::clone(&target_storage),
+        );
+
+        let chunk = Chunk::from_vectors(vec![
+            Vector::from_i32(&[1, 2, 3]),
+            Vector::from_i32(&[10, 20, 30]),
+        ]);
+        target_storage.append(&chunk).unwrap();
+
+        let serializer =
+            PrimaryKeySerializer::from_schema_ref(&target_storage.tablet().schema().unwrap())
+                .unwrap();
+        let delete_key = serializer.encode_row(&chunk, 1).unwrap();
+        let delete_row_id = target_storage
+            .tablet()
+            .lookup_primary_key(&delete_key)
+            .unwrap()
+            .expect("row should exist before replay");
+        let delete_location = target_storage
+            .tablet()
+            .decode_row_id(delete_row_id)
+            .expect("decode row id");
+        let patch = CatalogReplayHandler::inline_delete_patch(&[delete_location]);
+
+        let commit_id = 52;
+        let record = CommitRecord {
+            txn_id: 12,
+            start_time: 6,
+            commit_id,
+            catalog_ops: Vec::new(),
+            storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id: target_storage.tablet_id(),
+                mutations: vec![TabletMutation::ApplyDeletePatch {
+                    deleted_row_count: 1,
+                    patch,
+                }],
+            })],
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        };
+
+        let writer = WalWriter::new(&wal_path, WalInitState::Uninitialized);
+        write_flushed_commit_record(&writer, commit_id, record);
+
+        let (_wal, result, _summary, recovery_summary, _tasks) =
+            recover_database(&wal_path, &catalog, None).unwrap();
+
+        assert!(result.all_succeeded, "replay error: {:?}", result.error);
+        assert_eq!(recovery_summary.max_commit_id, commit_id);
+        assert_eq!(target_storage.tablet().applied_lsn(), commit_id);
+        assert!(target_storage
+            .tablet()
+            .lookup_primary_key(&delete_key)
+            .unwrap()
+            .is_none());
+
+        let rowset = target_storage
+            .tablet()
+            .find_rowset_by_id(delete_location.rowset_id)
+            .expect("rowset should remain visible");
+        let segment = rowset
+            .get_segment(delete_location.segment_id)
+            .expect("segment should exist");
+        let delete_vector = segment
+            .load_delete_vector_at_version(commit_id as i64)
+            .unwrap()
+            .expect("delete vector should exist at commit version");
+        assert_eq!(delete_vector.version(), commit_id as i64);
+        assert!(delete_vector.is_deleted(delete_location.row_offset));
+    }
+
+    #[test]
+    fn test_recovery_skips_delete_patch_replay_when_tablet_applied_lsn_already_covers_record() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+
+        let target_storage = Arc::new(create_primary_key_table(&[
+            LogicalType::Integer,
+            LogicalType::Integer,
+        ]));
+        install_committed_table(
+            &catalog,
+            "main",
+            "target_table",
+            vec![
+                ColumnDefinition::new("id".to_string(), LogicalType::Integer),
+                ColumnDefinition::new("value".to_string(), LogicalType::Integer),
+            ],
+            Arc::clone(&target_storage),
+        );
+
+        let chunk = Chunk::from_vectors(vec![
+            Vector::from_i32(&[1, 2, 3]),
+            Vector::from_i32(&[10, 20, 30]),
+        ]);
+        target_storage.append(&chunk).unwrap();
+
+        let serializer =
+            PrimaryKeySerializer::from_schema_ref(&target_storage.tablet().schema().unwrap())
+                .unwrap();
+        let delete_key = serializer.encode_row(&chunk, 1).unwrap();
+        let delete_row_id = target_storage
+            .tablet()
+            .lookup_primary_key(&delete_key)
+            .unwrap()
+            .expect("row should exist before replay");
+        let delete_location = target_storage
+            .tablet()
+            .decode_row_id(delete_row_id)
+            .expect("decode row id");
+        let DeletePatchRef::Inline(patch) =
+            CatalogReplayHandler::inline_delete_patch(&[delete_location])
+        else {
+            panic!("inline helper should return inline patch");
+        };
+        let artifact_path = target_storage
+            .tablet()
+            .data_dir()
+            .join("_delete_patch")
+            .join("txn_7")
+            .join("patch_0.bin");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &artifact_path,
+            encode_delete_patch_artifact_bytes(&patch).unwrap(),
+        )
+        .unwrap();
+
+        let commit_id = 63;
+        let patch_ref = DeletePatchRef::Artifact(
+            ArtifactRef::from_tablet_path(target_storage.tablet().data_dir(), &artifact_path)
+                .unwrap(),
+        );
+        let record = CommitRecord {
+            txn_id: 12,
+            start_time: 6,
+            commit_id,
+            catalog_ops: Vec::new(),
+            storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id: target_storage.tablet_id(),
+                mutations: vec![TabletMutation::ApplyDeletePatch {
+                    deleted_row_count: 1,
+                    patch: patch_ref.clone(),
+                }],
+            })],
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        };
+
+        let mut first = CatalogReplayHandler::new(&catalog, 0, u64::MAX)
+            .with_registry(RouteRegistry::from_catalog(&catalog).unwrap());
+        first.replay_commit_record(commit_id, &record).unwrap();
+        assert_eq!(target_storage.tablet().applied_lsn(), commit_id);
+        assert!(target_storage
+            .tablet()
+            .lookup_primary_key(&delete_key)
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_file(&artifact_path).unwrap();
+
+        let mut second = CatalogReplayHandler::new(&catalog, 0, u64::MAX)
+            .with_registry(RouteRegistry::from_catalog(&catalog).unwrap());
+        second.replay_commit_record(commit_id, &record).unwrap();
+        assert_eq!(
+            second
+                .registry
+                .tablet_applied_lsn(target_storage.tablet_id()),
+            Some(commit_id)
+        );
+        assert!(target_storage
+            .tablet()
+            .lookup_primary_key(&delete_key)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_drop_schema_replay_removes_schema_owned_routes_from_registry() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+        let schema_info = CreateSchemaInfo {
+            catalog: catalog.name().to_string(),
+            name: "drop_registry".to_string(),
+            internal: false,
+            on_conflict: OnCreateConflict::IgnoreOnConflict,
+        };
+        let schema_entry = Arc::new(CatalogEntryEnum::Schema(Arc::new(
+            paro_catalog::entry::SchemaEntry::from_info(&schema_info, catalog.gc_epoch_handle(), 0),
+        )));
+        catalog
+            .get_schema_collection()
+            .install_committed(schema_entry, InstallMode::RejectExisting)
+            .expect("install schema for replay test");
+
+        let storage = Arc::new(create_table(&[LogicalType::Integer]));
+        install_committed_table(
+            &catalog,
+            "drop_registry",
+            "items",
+            vec![ColumnDefinition::new(
+                "id".to_string(),
+                LogicalType::Integer,
+            )],
+            Arc::clone(&storage),
+        );
+        let table_key = paro_common::ddl::DdlObjectKey::new(
+            "test",
+            Some("drop_registry"),
+            "items",
+            paro_common::ddl::DdlObjectKind::Table,
+        );
+
+        let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX)
+            .with_registry(RouteRegistry::from_catalog(&catalog).unwrap());
+        assert!(handler.registry.route_table_key(&table_key).is_some());
+
+        handler
+            .replay_commit_record(
+                91,
+                &CommitRecord {
+                    txn_id: 5,
+                    start_time: 1,
+                    commit_id: 12,
+                    catalog_ops: vec![paro_common::effect::CatalogTxnOp {
+                        change: DdlChangeRecord {
+                            key: paro_common::ddl::DdlObjectKey::new(
+                                "test",
+                                None::<String>,
+                                "drop_registry",
+                                paro_common::ddl::DdlObjectKind::Schema,
+                            ),
+                            change: paro_common::ddl::DdlChange::DropSchema(
+                                paro_common::ddl::DropSchemaPayload {
+                                    cascade: true,
+                                    if_exists: false,
+                                },
+                            ),
+                        },
+                    }],
+                    storage_ops: Vec::new(),
+                    apply_descriptors: Vec::new(),
+                    deferred_tasks: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(handler.registry.route_table_key(&table_key).is_none());
+    }
+
+    #[test]
+    fn test_catalog_replay_primary_delete_applies_when_table_mapped() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+
+        let target_storage = Arc::new(create_primary_key_table(&[
+            LogicalType::Integer,
+            LogicalType::Integer,
+        ]));
+        let target_columns = vec![
+            ColumnDefinition::new("id".to_string(), LogicalType::Integer),
+            ColumnDefinition::new("value".to_string(), LogicalType::Integer),
+        ];
+        install_committed_table(
+            &catalog,
+            "main",
+            "target_table",
+            target_columns,
+            Arc::clone(&target_storage),
+        );
+
+        let chunk = Chunk::from_vectors(vec![
+            Vector::from_i32(&[1, 2, 3]),
+            Vector::from_i32(&[10, 20, 30]),
+        ]);
+        target_storage.append(&chunk).unwrap();
+
+        let serializer =
+            PrimaryKeySerializer::from_schema_ref(&target_storage.tablet().schema().unwrap())
+                .unwrap();
+        let delete_key = serializer.encode_row(&chunk, 1).unwrap();
+        let tablet_id = target_storage.tablet_id();
+
+        let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX);
+        handler
+            .replay_primary_delete(tablet_id, &[delete_key.clone()], 1)
+            .unwrap();
+
+        assert!(target_storage
+            .tablet()
+            .lookup_primary_key(&delete_key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            target_storage
+                .tablet()
+                .snapshot_primary_index_entries()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

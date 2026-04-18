@@ -7,9 +7,9 @@
 //! replay/truncation during recovery.
 
 mod checksum;
+pub mod journal_sink;
 pub mod recovery;
 pub mod replay_state;
-pub mod txn_record;
 pub mod wal_entry;
 pub mod wal_reader;
 pub mod wal_type;

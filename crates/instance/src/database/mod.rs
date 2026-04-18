@@ -27,7 +27,8 @@ pub mod wal_observability;
 
 use crate::database::handle::{AttachOptions, DatabaseHandle};
 use crate::database::hooks::{
-    GraphProjectionRecoveryHook, RecoveryHook, RecoveryHookContext, RecoveryHookResult,
+    DeferredTaskRecoveryHook, GraphProjectionRecoveryHook, RecoveryHook, RecoveryHookContext,
+    RecoveryHookResult,
 };
 use crate::database::opener::{
     DatabaseOpenContext, DatabaseOpenError, DatabaseOpenIntent, DatabaseOpenRequest,
@@ -57,6 +58,16 @@ pub struct InstanceWalLifecycleMetrics {
     pub storage_wal_truncate_bytes: u64,
     pub storage_wal_checkpoint_merges: u64,
     pub storage_wal_recovery_mode_metric: u64,
+    pub journal_apply_queue_depth: u64,
+    pub journal_apply_queue_depth_peak_max: u64,
+    pub journal_apply_applied_lag_max: u64,
+    pub journal_apply_published_lag_max: u64,
+    pub journal_apply_durable_wait_count: u64,
+    pub journal_apply_durable_wait_micros: u64,
+    pub journal_apply_applied_wait_count: u64,
+    pub journal_apply_applied_wait_micros: u64,
+    pub journal_apply_published_wait_count: u64,
+    pub journal_apply_published_wait_micros: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +77,10 @@ pub(crate) struct RecoveryHookExecutionError {
 }
 
 pub fn default_recovery_hooks() -> Vec<Arc<dyn RecoveryHook>> {
-    vec![Arc::new(GraphProjectionRecoveryHook)]
+    vec![
+        Arc::new(DeferredTaskRecoveryHook),
+        Arc::new(GraphProjectionRecoveryHook),
+    ]
 }
 
 /// Narrow context for managed database DDL orchestration.
@@ -518,6 +532,26 @@ impl ManagedDatabaseService {
             if db_metrics.recovery_wal_needs_truncation {
                 metrics.recovery_wal_needs_truncation_dbs += 1;
             }
+            metrics.journal_apply_queue_depth += db_metrics.journal_apply_queue_depth;
+            metrics.journal_apply_queue_depth_peak_max = metrics
+                .journal_apply_queue_depth_peak_max
+                .max(db_metrics.journal_apply_queue_depth_peak);
+            metrics.journal_apply_applied_lag_max = metrics
+                .journal_apply_applied_lag_max
+                .max(db_metrics.journal_apply_applied_lag);
+            metrics.journal_apply_published_lag_max = metrics
+                .journal_apply_published_lag_max
+                .max(db_metrics.journal_apply_published_lag);
+            metrics.journal_apply_durable_wait_count += db_metrics.journal_apply_durable_wait_count;
+            metrics.journal_apply_durable_wait_micros +=
+                db_metrics.journal_apply_durable_wait_micros;
+            metrics.journal_apply_applied_wait_count += db_metrics.journal_apply_applied_wait_count;
+            metrics.journal_apply_applied_wait_micros +=
+                db_metrics.journal_apply_applied_wait_micros;
+            metrics.journal_apply_published_wait_count +=
+                db_metrics.journal_apply_published_wait_count;
+            metrics.journal_apply_published_wait_micros +=
+                db_metrics.journal_apply_published_wait_micros;
         }
 
         let storage_metrics = ::paro_storage::metrics::storage_metrics().snapshot();
@@ -542,6 +576,10 @@ impl ManagedDatabaseService {
             recovery_report: consistency.clone(),
             startup_policy,
             graph_registry: self.graph_manager.clone(),
+            scheduler: db
+                .task_scheduler()
+                .unwrap_or_else(|| Arc::new(paro_scheduler::scheduler::TaskScheduler::new())),
+            replayed_deferred_tasks: db.replayed_deferred_tasks(),
         };
 
         for hook in &self.recovery_hooks {

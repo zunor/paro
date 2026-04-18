@@ -394,6 +394,8 @@ fn create_single_int_table(
             Arc::clone(&storage),
         )
         .expect("create table should succeed");
+    db.rebuild_route_registry_from_catalog()
+        .expect("route registry should reflect test catalog create");
 
     let chunk = Chunk::from_vectors(vec![Vector::from_i32(values)]);
     storage.append(&chunk).expect("append table data");

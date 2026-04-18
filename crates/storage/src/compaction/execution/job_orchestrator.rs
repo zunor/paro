@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub fn run_job(
-    tablet: &Tablet,
+    tablet: &Arc<Tablet>,
     plan: Arc<CompactionPlan>,
     job_id: CompactionJobId,
     allocator: Arc<dyn Allocator>,
@@ -31,7 +31,7 @@ pub fn run_job(
 }
 
 pub fn run_job_with_lifecycle<F>(
-    tablet: &Tablet,
+    tablet: &Arc<Tablet>,
     plan: Arc<CompactionPlan>,
     job_id: CompactionJobId,
     allocator: Arc<dyn Allocator>,

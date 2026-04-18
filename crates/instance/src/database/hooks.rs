@@ -8,19 +8,33 @@
 
 use crate::database::handle::DatabaseHandle;
 use crate::lifecycle::startup_report::StartupPolicy;
-use paro_catalog::entry::{graph_schema_fingerprint, CatalogEntryEnum, CreatePropertyGraphInfo};
+use paro_catalog::entry::{
+    graph_schema_fingerprint, CatalogEntryEnum, CreatePropertyGraphInfo, IndexBuildState,
+    IndexCatalogEntry, IndexType as CatalogIndexType, PropertyGraphCatalogEntry,
+};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::chunk::Chunk;
+use paro_common::effect::DeferredTask;
 use paro_common::error as paro_error;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
+use paro_execution::operator::ddl::refresh_property_graph::{
+    mark_property_graph_stale, refresh_property_graph_committed,
+    schedule_property_graph_background_rebuild,
+};
+use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::index::graph::{
     EdgeBuildInput, GraphBuildInput, GraphManifest, GraphProjectionIndex,
     GraphProjectionIndexManager, GraphState, GraphStatistics, GraphStorageGeneration,
     VertexBuildInput, VertexKey,
 };
+use paro_storage::index::hnsw::{
+    build_missing_hnsw_indexes_with_scheduler, DistanceMetric, HnswColumnBuildConfig, HnswConfig,
+};
 use paro_storage::tablet::TabletReaderParams;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,6 +72,8 @@ pub struct RecoveryHookContext {
     pub recovery_report: crate::recovery::consistency_report::RecoveryConsistencyReport,
     pub startup_policy: StartupPolicy,
     pub graph_registry: Arc<GraphProjectionIndexManager>,
+    pub scheduler: Arc<TaskScheduler>,
+    pub replayed_deferred_tasks: Vec<DeferredTask>,
 }
 
 /// Post-WAL-replay recovery hook executed before a database is published to the runtime registry.
@@ -87,6 +103,106 @@ pub struct GraphProjectionRecoveryHook;
 #[derive(Debug, Default)]
 pub struct FullTextRecoveryHook;
 
+#[derive(Debug, Default)]
+pub struct DeferredTaskRecoveryHook;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferredTaskDelivery {
+    Executed(String),
+    Skipped(String),
+}
+
+impl RecoveryHook for DeferredTaskRecoveryHook {
+    fn name(&self) -> &'static str {
+        "deferred_task"
+    }
+
+    fn run(
+        &self,
+        db: &Arc<DatabaseHandle>,
+        ctx: &RecoveryHookContext,
+    ) -> anyhow::Result<RecoveryHookResult> {
+        if ctx.replayed_deferred_tasks.is_empty() {
+            return Ok(RecoveryHookResult::Skipped {
+                reason: "no deferred tasks recovered from journal".to_string(),
+            });
+        }
+
+        let mut executed = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        let mut details = Vec::new();
+
+        for task in &ctx.replayed_deferred_tasks {
+            let delivery = match task {
+                DeferredTask::BuildIndexRuntime {
+                    index,
+                    table_name,
+                    index_type,
+                    column_ids,
+                    fulltext_config,
+                } => replay_build_index_runtime_task(
+                    db,
+                    ctx,
+                    index,
+                    table_name,
+                    index_type,
+                    column_ids,
+                    fulltext_config.as_deref(),
+                ),
+                DeferredTask::GraphDmlMaintenance { deltas } => {
+                    replay_graph_dml_maintenance_task(db, ctx, deltas)
+                }
+            };
+
+            match delivery {
+                Ok(DeferredTaskDelivery::Executed(detail)) => {
+                    executed += 1;
+                    details.push(detail);
+                }
+                Ok(DeferredTaskDelivery::Skipped(reason)) => {
+                    skipped += 1;
+                    details.push(reason);
+                }
+                Err(err) => {
+                    failed += 1;
+                    details.push(err.to_string());
+                }
+            }
+        }
+
+        if failed > 0 {
+            return Ok(RecoveryHookResult::Failed {
+                error: format!(
+                    "{} recovered deferred task(s) failed after durable replay: {}",
+                    failed,
+                    details.join("; ")
+                ),
+                issues: Vec::new(),
+            });
+        }
+
+        if executed == 0 {
+            return Ok(RecoveryHookResult::Skipped {
+                reason: format!(
+                    "{} recovered deferred task(s) were already converged or no longer applicable",
+                    skipped
+                ),
+            });
+        }
+
+        Ok(RecoveryHookResult::Rebuilt {
+            detail: Some(format!(
+                "redelivered {} deferred task(s), skipped {}: {}",
+                executed,
+                skipped,
+                details.join("; ")
+            )),
+            issues: Vec::new(),
+        })
+    }
+}
+
 impl RecoveryHook for FullTextRecoveryHook {
     fn name(&self) -> &'static str {
         "fulltext"
@@ -101,6 +217,379 @@ impl RecoveryHook for FullTextRecoveryHook {
             reason: "fulltext runtime recovery is already reconciled during WAL replay".to_string(),
         })
     }
+}
+
+fn replay_build_index_runtime_task(
+    db: &Arc<DatabaseHandle>,
+    ctx: &RecoveryHookContext,
+    index: &paro_common::ddl::DdlObjectKey,
+    table_name: &str,
+    index_type: &str,
+    column_ids: &[u32],
+    fulltext_config: Option<&str>,
+) -> anyhow::Result<DeferredTaskDelivery> {
+    let txn = CatalogSnapshot::default();
+    let Some(schema_name) = index.schema.as_deref() else {
+        return Err(anyhow::anyhow!(
+            "deferred task for index {} is missing schema name",
+            index.name
+        ));
+    };
+    let schema = match db.catalog().get_schema(&txn, schema_name) {
+        Ok(schema) => schema,
+        Err(_) => {
+            return Ok(DeferredTaskDelivery::Skipped(format!(
+                "index {} skipped: schema {} disappeared after replay",
+                index.name, schema_name
+            )))
+        }
+    };
+    let Some(table_entry) = schema.get_table(txn.transaction_id, txn.start_time, table_name) else {
+        return Ok(DeferredTaskDelivery::Skipped(format!(
+            "index {} skipped: table {}.{} disappeared after replay",
+            index.name, schema_name, table_name
+        )));
+    };
+    let Some(table) = table_entry.as_ref().as_table() else {
+        return Ok(DeferredTaskDelivery::Skipped(format!(
+            "index {} skipped: {}.{} is no longer a table",
+            index.name, schema_name, table_name
+        )));
+    };
+    let Some(storage) = table.get_storage() else {
+        return Ok(DeferredTaskDelivery::Skipped(format!(
+            "index {} skipped: table {}.{} has no storage",
+            index.name, schema_name, table_name
+        )));
+    };
+    let index_entry = schema
+        .get_index(txn.transaction_id, txn.start_time, &index.name)
+        .and_then(|entry| match &*entry {
+            CatalogEntryEnum::Index(index) => Some(index.clone()),
+            _ => None,
+        });
+
+    if let Some(reason) = index_runtime_skip_reason(
+        storage.as_ref(),
+        index_entry.as_ref(),
+        index_type,
+        column_ids,
+        fulltext_config,
+    ) {
+        return Ok(DeferredTaskDelivery::Skipped(format!(
+            "index {} skipped: {}",
+            index.name, reason
+        )));
+    }
+
+    mark_declared_runtime_indexes(storage.as_ref(), index_type, column_ids, fulltext_config);
+
+    match CatalogIndexType::from_str(index_type) {
+        CatalogIndexType::ART => {
+            let [column_id] = column_ids else {
+                return Err(anyhow::anyhow!(
+                    "ART deferred task for index {} requires exactly one column",
+                    index.name
+                ));
+            };
+            if let Err(err) = storage.build_runtime_art_index(*column_id) {
+                storage.unmark_declared_art_index(*column_id);
+                let _ = storage.remove_runtime_art_index(*column_id);
+                mark_index_runtime_failed(
+                    index_entry.as_ref(),
+                    format!("ART runtime restore failed: {}", err),
+                );
+                return Err(anyhow::anyhow!(err.to_string()));
+            }
+        }
+        CatalogIndexType::FullText => {
+            let config = fulltext_config.unwrap_or("simple");
+            for column_id in column_ids {
+                if let Err(err) =
+                    storage.build_runtime_fulltext_index_with_config(*column_id, config)
+                {
+                    mark_index_runtime_failed(
+                        index_entry.as_ref(),
+                        format!("FULLTEXT runtime restore failed: {}", err),
+                    );
+                    return Err(anyhow::anyhow!(err.to_string()));
+                }
+            }
+        }
+        CatalogIndexType::HNSW => {
+            let tablet = storage.tablet();
+            let schema = tablet
+                .schema()
+                .ok_or_else(|| anyhow::anyhow!("table {} has no schema", table_name))?;
+            let mut columns = Vec::new();
+            for &column_id in column_ids {
+                let schema_col = schema.column_by_id(column_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HNSW column {} missing from table {}",
+                        column_id,
+                        table_name
+                    )
+                })?;
+                match &schema_col.logical_type {
+                    LogicalType::Array(inner, _dim) if matches!(**inner, LogicalType::Float) => {}
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "HNSW index {} requires Array(Float, N), got {:?} for column {}",
+                            index.name,
+                            other,
+                            column_id
+                        ))
+                    }
+                }
+                columns.push(HnswColumnBuildConfig::new(
+                    column_id,
+                    HnswConfig::new(schema_col.hnsw_m, schema_col.hnsw_ef_construct),
+                    DistanceMetric::from_u8(schema_col.hnsw_distance),
+                ));
+            }
+            let rowsets = tablet
+                .capture_consistent_rowsets(tablet.max_version())
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            if rowsets.is_empty() {
+                return Ok(DeferredTaskDelivery::Skipped(format!(
+                    "index {} skipped: table {}.{} has no visible rowsets",
+                    index.name, schema_name, table_name
+                )));
+            }
+            if let Err(err) =
+                build_missing_hnsw_indexes_with_scheduler(&rowsets, &columns, ctx.scheduler.clone())
+            {
+                mark_index_runtime_failed(
+                    index_entry.as_ref(),
+                    format!("HNSW runtime restore failed: {}", err),
+                );
+                return Err(anyhow::anyhow!(err.to_string()));
+            }
+        }
+        CatalogIndexType::Sparse => {
+            return Ok(DeferredTaskDelivery::Skipped(format!(
+                "index {} skipped: sparse runtime state is already persistent",
+                index.name
+            )))
+        }
+        _ => {
+            return Ok(DeferredTaskDelivery::Skipped(format!(
+                "index {} skipped: {} requires no deferred runtime rebuild",
+                index.name, index_type
+            )))
+        }
+    }
+
+    Ok(DeferredTaskDelivery::Executed(format!(
+        "index {} on {}.{} redelivered as {} runtime build",
+        index.name, schema_name, table_name, index_type
+    )))
+}
+
+fn index_runtime_skip_reason(
+    storage: &paro_storage::table::table_handle::TableHandle,
+    index_entry: Option<&Arc<IndexCatalogEntry>>,
+    index_type: &str,
+    column_ids: &[u32],
+    fulltext_config: Option<&str>,
+) -> Option<String> {
+    let index_entry = index_entry?;
+    if index_entry.build_state() != IndexBuildState::Ready {
+        return None;
+    }
+
+    match CatalogIndexType::from_str(index_type) {
+        CatalogIndexType::FullText => {
+            let config = fulltext_config.unwrap_or("simple");
+            let complete = column_ids.iter().all(|column_id| {
+                storage
+                    .fulltext_index_coverage(*column_id)
+                    .map(|coverage| {
+                        coverage.visible_segment_count == coverage.indexed_segment_count
+                            && storage.has_fulltext_index_with_config(*column_id, config)
+                    })
+                    .unwrap_or(false)
+            });
+            if complete {
+                return Some("full-text runtime already converged".to_string());
+            }
+            None
+        }
+        CatalogIndexType::Sparse => Some("sparse runtime state is already persistent".to_string()),
+        _ => None,
+    }
+}
+
+fn mark_index_runtime_failed(index_entry: Option<&Arc<IndexCatalogEntry>>, reason: String) {
+    if let Some(index_entry) = index_entry {
+        index_entry.mark_failed(Some(reason));
+    }
+}
+
+fn replay_graph_dml_maintenance_task(
+    db: &Arc<DatabaseHandle>,
+    ctx: &RecoveryHookContext,
+    dml_deltas: &[paro_common::effect::GraphDmlTableDelta],
+) -> anyhow::Result<DeferredTaskDelivery> {
+    if dml_deltas.is_empty() {
+        return Ok(DeferredTaskDelivery::Skipped(
+            "graph maintenance skipped: empty delta batch".to_string(),
+        ));
+    }
+
+    let catalog = db.catalog().clone();
+    let visible_start_time = db.transaction_manager().published_commit_id();
+    let visible_txn = CatalogSnapshot::read_only(visible_start_time.saturating_add(1));
+    let visible_graphs = catalog.scan_property_graphs(&visible_txn);
+    if visible_graphs.is_empty() {
+        return Ok(DeferredTaskDelivery::Skipped(
+            "graph maintenance skipped: no property graphs in visible catalog".to_string(),
+        ));
+    }
+
+    let mut graphs_to_stale: HashMap<String, Arc<PropertyGraphCatalogEntry>> = HashMap::new();
+    let mut graphs_to_refresh: HashMap<String, Arc<PropertyGraphCatalogEntry>> = HashMap::new();
+
+    for delta in dml_deltas {
+        let table_oid = delta.table_oid;
+        let updated_columns = delta.updated_columns.iter().copied().collect();
+        for graph_entry in &visible_graphs {
+            let graph_name = graph_entry.info.graph_name.clone();
+            let vertex_structural = graph_entry
+                .info
+                .vertex_tables
+                .iter()
+                .find(|vertex| vertex.table_oid == table_oid)
+                .map(|vertex| {
+                    delta.inserted > 0
+                        || delta.deleted > 0
+                        || graph_update_hits_columns(&updated_columns, &vertex.key_column_ids)
+                })
+                .unwrap_or(false);
+            if vertex_structural {
+                graphs_to_refresh.remove(&graph_name);
+                graphs_to_stale.insert(graph_name, Arc::clone(graph_entry));
+                continue;
+            }
+
+            let edge_structural = graph_entry
+                .info
+                .edge_tables
+                .iter()
+                .find(|edge| edge.table_oid == table_oid)
+                .map(|edge| {
+                    delta.inserted > 0
+                        || delta.deleted > 0
+                        || graph_update_hits_columns(&updated_columns, &edge.source_key_column_ids)
+                        || graph_update_hits_columns(
+                            &updated_columns,
+                            &edge.destination_key_column_ids,
+                        )
+                })
+                .unwrap_or(false);
+            if edge_structural && !graphs_to_stale.contains_key(&graph_name) {
+                graphs_to_refresh.insert(graph_name, Arc::clone(graph_entry));
+            }
+        }
+    }
+
+    let graph_index = ctx.graph_registry.clone();
+    let graph_registry = ctx.graph_registry.clone();
+    let mut touched = 0usize;
+    for graph_entry in graphs_to_stale.values() {
+        mark_property_graph_stale(
+            catalog.as_ref(),
+            graph_index.as_ref(),
+            graph_registry.as_ref(),
+            graph_entry,
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        schedule_property_graph_background_rebuild(
+            catalog.clone(),
+            graph_index.clone(),
+            graph_registry.clone(),
+            Arc::clone(graph_entry),
+            visible_start_time,
+        );
+        touched += 1;
+    }
+
+    for graph_entry in graphs_to_refresh.values() {
+        if let Err(err) = refresh_property_graph_committed(
+            catalog.clone(),
+            graph_index.clone(),
+            graph_registry.clone(),
+            Arc::clone(graph_entry),
+            visible_start_time,
+        ) {
+            tracing::warn!(
+                target: targets::INSTANCE,
+                hook = "deferred_task",
+                graph = %graph_entry.info.graph_name,
+                error = %err,
+                "Deferred graph maintenance refresh failed; falling back to stale+background rebuild"
+            );
+            mark_property_graph_stale(
+                catalog.as_ref(),
+                graph_index.as_ref(),
+                graph_registry.as_ref(),
+                graph_entry,
+            )
+            .map_err(|stale_err| anyhow::anyhow!(stale_err.to_string()))?;
+            schedule_property_graph_background_rebuild(
+                catalog.clone(),
+                graph_index.clone(),
+                graph_registry.clone(),
+                Arc::clone(graph_entry),
+                visible_start_time,
+            );
+        }
+        touched += 1;
+    }
+
+    if touched == 0 {
+        return Ok(DeferredTaskDelivery::Skipped(
+            "graph maintenance skipped: recovered deltas no longer touch visible graphs"
+                .to_string(),
+        ));
+    }
+
+    Ok(DeferredTaskDelivery::Executed(format!(
+        "graph maintenance redelivered for {} graph(s)",
+        touched
+    )))
+}
+
+fn mark_declared_runtime_indexes(
+    storage: &paro_storage::table::table_handle::TableHandle,
+    index_type: &str,
+    column_ids: &[u32],
+    fulltext_config: Option<&str>,
+) {
+    let index_type = CatalogIndexType::from_str(index_type);
+    for column_id in column_ids {
+        match index_type {
+            CatalogIndexType::ART => storage.mark_declared_art_index(*column_id),
+            CatalogIndexType::HNSW => storage.mark_declared_vector_index(*column_id),
+            CatalogIndexType::Sparse => storage.mark_declared_sparse_index(*column_id),
+            CatalogIndexType::FullText => {
+                storage.mark_declared_fulltext_index_with_config(
+                    *column_id,
+                    fulltext_config.unwrap_or("simple"),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn graph_update_hits_columns(
+    updated_columns: &std::collections::BTreeSet<u32>,
+    graph_columns: &[u32],
+) -> bool {
+    graph_columns
+        .iter()
+        .any(|column_id| updated_columns.contains(column_id))
 }
 
 #[derive(Debug, Default)]

@@ -120,6 +120,12 @@ pub struct TabletMeta {
 
     /// Primary-index RowID encoding format version persisted for upgrade handling.
     row_id_format_version: u32,
+
+    /// Monotonic epoch covering visible rowset/delete state.
+    rowset_epoch: u64,
+
+    /// Highest journal LSN whose synchronous storage effects are reflected by this snapshot.
+    applied_lsn: u64,
 }
 
 impl TabletMeta {
@@ -156,6 +162,8 @@ impl TabletMeta {
             data_dir: data_dir.into(),
             rssid_mappings: Vec::new(),
             row_id_format_version: 0,
+            rowset_epoch: 0,
+            applied_lsn: 0,
         })
     }
 
@@ -242,6 +250,14 @@ impl TabletMeta {
         self.row_id_format_version
     }
 
+    pub fn rowset_epoch(&self) -> u64 {
+        self.rowset_epoch
+    }
+
+    pub fn applied_lsn(&self) -> u64 {
+        self.applied_lsn
+    }
+
     // ==================== Setters ====================
 
     /// Set shard ID
@@ -265,6 +281,14 @@ impl TabletMeta {
 
     pub fn set_row_id_format_version(&mut self, version: u32) {
         self.row_id_format_version = version;
+    }
+
+    pub fn set_rowset_epoch(&mut self, epoch: u64) {
+        self.rowset_epoch = epoch;
+    }
+
+    pub fn set_applied_lsn(&mut self, lsn: u64) {
+        self.applied_lsn = lsn;
     }
 
     // ==================== Rowset Management ====================
@@ -383,6 +407,8 @@ impl TabletMeta {
         }
 
         data.extend_from_slice(&self.row_id_format_version.to_le_bytes());
+        data.extend_from_slice(&self.rowset_epoch.to_le_bytes());
+        data.extend_from_slice(&self.applied_lsn.to_le_bytes());
 
         Ok(data)
     }
@@ -515,6 +541,18 @@ impl TabletMeta {
             0
         };
 
+        let rowset_epoch = if offset < data.len() {
+            read_u64(data, &mut offset)?
+        } else {
+            0
+        };
+
+        let applied_lsn = if offset < data.len() {
+            read_u64(data, &mut offset)?
+        } else {
+            0
+        };
+
         Ok(Self {
             tablet_id,
             table_id,
@@ -531,6 +569,8 @@ impl TabletMeta {
             data_dir,
             rssid_mappings,
             row_id_format_version,
+            rowset_epoch,
+            applied_lsn,
         })
     }
 }
@@ -602,6 +642,8 @@ mod tests {
             segment_id: 0,
         }]);
         meta.set_row_id_format_version(1);
+        meta.set_rowset_epoch(9);
+        meta.set_applied_lsn(77);
 
         let bytes = meta.serialize().unwrap();
         let restored = TabletMeta::deserialize(&bytes).unwrap();
@@ -619,6 +661,8 @@ mod tests {
             }]
         );
         assert_eq!(restored.row_id_format_version(), 1);
+        assert_eq!(restored.rowset_epoch(), 9);
+        assert_eq!(restored.applied_lsn(), 77);
         assert!(restored.schema().is_some());
     }
 

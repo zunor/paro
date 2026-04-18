@@ -8,21 +8,22 @@
 use crate::index::fulltext::tokenizer::TokenizerKind;
 use crate::rowset::RowsetSharedPtr;
 use crate::table::index_runtime::IndexRuntime;
-use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState};
+use crate::tablet::{
+    build_delete_patch_from_primary_keys, build_delete_patch_from_row_refs,
+    capture_prepare_snapshot, materialize_delete_patch, PhysicalRowRef, PrepareSnapshot,
+    PrimaryIndexUpdate, TabletRef, TabletState,
+};
 use crate::transaction::undo_buffer::{ActiveTransactionState, UndoBuffer};
-use crate::wal::wal_entry::WalEntry;
-use crate::wal::wal_type::WalType;
-use crate::wal::wal_writer::{WalInitState, WalWriter};
 use crate::write::{DeltaWriter, DeltaWriterSavepoint};
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
+use paro_common::durability::PrepareToken;
 use paro_common::effect::{
-    GraphDmlTableDelta as GraphDmlHookDelta, PostCommitHookDescriptor, PreparedDataOp,
-    RowsetLocator,
+    ArtifactRef, GraphDmlTableDelta as GraphDmlHookDelta, PostCommitHookDescriptor,
+    StorageCommitOp, TabletApplyOp, TabletMutation, VersionSpan,
 };
 use paro_common::error::{self as paro_error, Result};
-use std::collections::{BTreeSet, HashMap};
-use std::path::Component;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -76,10 +77,23 @@ pub struct StorageSavepointMark {
     pub writer_marks: HashMap<u64, DeltaWriterSavepoint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PreparedStorageCommit {
-    pub data_ops: Vec<PreparedDataOp>,
+    pub storage_ops: Vec<StorageCommitOp>,
     pub post_commit_hooks: Vec<PostCommitHookDescriptor>,
+    pub tablets: Vec<PreparedTabletCommit>,
+}
+
+impl PreparedStorageCommit {
+    pub fn is_empty(&self) -> bool {
+        self.storage_ops.is_empty() && self.post_commit_hooks.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedTabletCommit {
+    pub tablet: TabletRef,
+    pub token: PrepareToken,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +101,7 @@ struct PreparedStorageState {
     rowsets: Vec<PendingRowset>,
     primary_deletes: Vec<PendingPrimaryDelete>,
     row_id_deletes: Vec<PendingRowIdDelete>,
+    delete_patch_artifacts: Vec<PathBuf>,
 }
 
 /// A transaction context representing an active database transaction.
@@ -737,6 +752,7 @@ impl Transaction {
                 .tablet
                 .release_row_id_delete_intents(self.id, &delete.locations);
         }
+        Self::cleanup_delete_patch_artifacts(&prepared.delete_patch_artifacts);
     }
 
     pub fn record_graph_insert(&self, table_oid: u64, rows: usize) {
@@ -777,16 +793,6 @@ impl Transaction {
             paro_error::internal(format!("failed to lock pending graph dml: {}", e))
         })?;
         Ok(std::mem::take(&mut *pending))
-    }
-
-    fn path_components(path: &std::path::Path) -> Vec<String> {
-        path.components()
-            .filter_map(|component| match component {
-                Component::Normal(value) => Some(value.to_string_lossy().to_string()),
-                Component::RootDir => Some("/".to_string()),
-                _ => None,
-            })
-            .collect()
     }
 
     fn split_pending_operations(
@@ -834,18 +840,7 @@ impl Transaction {
                 }
                 pending
                     .tablet
-                    .apply_row_id_delete_refs(&pending.locations)?;
-                let wal_locations: Vec<_> =
-                    pending.locations.iter().copied().map(Into::into).collect();
-                let wal = WalWriter::new(
-                    pending.tablet.data_dir().join("tablet.wal"),
-                    WalInitState::Uninitialized,
-                );
-                let entry = WalEntry::RowIdDelete {
-                    locations: wal_locations,
-                };
-                wal.write_entry(WalType::RowIdDelete, &entry.serialize_data())?;
-                wal.flush()?;
+                    .apply_row_id_delete_refs_at_version(&pending.locations, commit_version)?;
             }
 
             for pending in rowsets {
@@ -866,6 +861,231 @@ impl Transaction {
         })()
     }
 
+    fn rowset_replaced_locations(
+        primary_update: &Option<PrimaryIndexUpdate>,
+    ) -> Vec<PhysicalRowRef> {
+        let Some(primary_update) = primary_update.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut locations = primary_update
+            .pending_delete_vectors
+            .iter()
+            .flat_map(|(&(rowset_id, segment_id), delete_vector)| {
+                delete_vector
+                    .iter()
+                    .map(move |row_offset| PhysicalRowRef::new(rowset_id, segment_id, row_offset))
+            })
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|location| {
+            (location.rowset_id, location.segment_id, location.row_offset)
+        });
+        locations
+    }
+
+    fn capture_prepare_snapshots(
+        primary_deletes: &[PendingPrimaryDelete],
+        row_id_deletes: &[PendingRowIdDelete],
+        rowsets: &[PendingRowset],
+    ) -> Result<BTreeMap<u64, (TabletRef, PrepareSnapshot)>> {
+        let mut lookup_keys_by_tablet: BTreeMap<u64, (TabletRef, Vec<Vec<u8>>)> = BTreeMap::new();
+        for pending in primary_deletes {
+            let entry = lookup_keys_by_tablet
+                .entry(pending.tablet.tablet_id())
+                .or_insert_with(|| (pending.tablet.clone(), Vec::new()));
+            entry.1.extend(pending.keys.iter().cloned());
+        }
+        for pending in row_id_deletes {
+            lookup_keys_by_tablet
+                .entry(pending.tablet.tablet_id())
+                .or_insert_with(|| (pending.tablet.clone(), Vec::new()));
+        }
+        for pending in rowsets {
+            lookup_keys_by_tablet
+                .entry(pending.tablet.tablet_id())
+                .or_insert_with(|| (pending.tablet.clone(), Vec::new()));
+        }
+
+        lookup_keys_by_tablet
+            .into_iter()
+            .map(|(tablet_id, (tablet, lookup_keys))| {
+                let snapshot = capture_prepare_snapshot(tablet.as_ref(), &lookup_keys)?;
+                Ok((tablet_id, (tablet, snapshot)))
+            })
+            .collect()
+    }
+
+    fn rebuild_prepared_commit(
+        &self,
+        prepared_state: &mut PreparedStorageState,
+        post_commit_hooks: Vec<PostCommitHookDescriptor>,
+    ) -> Result<PreparedStorageCommit> {
+        Self::cleanup_delete_patch_artifacts(&prepared_state.delete_patch_artifacts);
+        prepared_state.delete_patch_artifacts.clear();
+
+        let prepare_snapshots = Self::capture_prepare_snapshots(
+            &prepared_state.primary_deletes,
+            &prepared_state.row_id_deletes,
+            &prepared_state.rowsets,
+        )?;
+        let mut mutations_by_tablet: BTreeMap<u64, Vec<TabletMutation>> = BTreeMap::new();
+        let mut prepared_tablets = BTreeMap::new();
+        let mut delete_patch_ordinal = 0usize;
+
+        let storage_ops = (|| -> Result<Vec<StorageCommitOp>> {
+            for pending in &prepared_state.primary_deletes {
+                let tablet_id = pending.tablet.tablet_id();
+                let (_, snapshot) = prepare_snapshots.get(&tablet_id).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "prepare snapshot missing for tablet {} primary delete",
+                        tablet_id
+                    ))
+                })?;
+                if let Some(patch) = build_delete_patch_from_primary_keys(snapshot, &pending.keys)?
+                {
+                    let materialized = materialize_delete_patch(
+                        pending.tablet.as_ref(),
+                        self.id,
+                        delete_patch_ordinal,
+                        patch,
+                    )?;
+                    delete_patch_ordinal = delete_patch_ordinal.saturating_add(1);
+                    if let Some(path) = materialized.artifact_path.clone() {
+                        prepared_state.delete_patch_artifacts.push(path);
+                    }
+                    prepared_tablets
+                        .entry(tablet_id)
+                        .or_insert_with(|| PreparedTabletCommit {
+                            tablet: pending.tablet.clone(),
+                            token: snapshot.prepare_token(),
+                        });
+                    mutations_by_tablet.entry(tablet_id).or_default().push(
+                        TabletMutation::ApplyDeletePatch {
+                            patch: materialized.patch_ref,
+                            deleted_row_count: materialized.deleted_row_count,
+                        },
+                    );
+                }
+            }
+
+            for pending in &prepared_state.row_id_deletes {
+                let tablet_id = pending.tablet.tablet_id();
+                let (_, snapshot) = prepare_snapshots.get(&tablet_id).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "prepare snapshot missing for tablet {} row-id delete",
+                        tablet_id
+                    ))
+                })?;
+                if let Some(patch) = build_delete_patch_from_row_refs(snapshot, &pending.locations)?
+                {
+                    let materialized = materialize_delete_patch(
+                        pending.tablet.as_ref(),
+                        self.id,
+                        delete_patch_ordinal,
+                        patch,
+                    )?;
+                    delete_patch_ordinal = delete_patch_ordinal.saturating_add(1);
+                    if let Some(path) = materialized.artifact_path.clone() {
+                        prepared_state.delete_patch_artifacts.push(path);
+                    }
+                    prepared_tablets
+                        .entry(tablet_id)
+                        .or_insert_with(|| PreparedTabletCommit {
+                            tablet: pending.tablet.clone(),
+                            token: snapshot.prepare_token(),
+                        });
+                    mutations_by_tablet.entry(tablet_id).or_default().push(
+                        TabletMutation::ApplyDeletePatch {
+                            patch: materialized.patch_ref,
+                            deleted_row_count: materialized.deleted_row_count,
+                        },
+                    );
+                }
+            }
+
+            for pending in &prepared_state.rowsets {
+                let tablet_id = pending.tablet.tablet_id();
+                let (_, snapshot) = prepare_snapshots.get(&tablet_id).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "prepare snapshot missing for tablet {} rowset publish",
+                        tablet_id
+                    ))
+                })?;
+                prepared_tablets
+                    .entry(tablet_id)
+                    .or_insert_with(|| PreparedTabletCommit {
+                        tablet: pending.tablet.clone(),
+                        token: snapshot.prepare_token(),
+                    });
+
+                if let Some(patch) = build_delete_patch_from_row_refs(
+                    snapshot,
+                    &Self::rowset_replaced_locations(&pending.primary_update),
+                )? {
+                    let materialized = materialize_delete_patch(
+                        pending.tablet.as_ref(),
+                        self.id,
+                        delete_patch_ordinal,
+                        patch,
+                    )?;
+                    delete_patch_ordinal = delete_patch_ordinal.saturating_add(1);
+                    if let Some(path) = materialized.artifact_path.clone() {
+                        prepared_state.delete_patch_artifacts.push(path);
+                    }
+                    mutations_by_tablet.entry(tablet_id).or_default().push(
+                        TabletMutation::ApplyDeletePatch {
+                            patch: materialized.patch_ref,
+                            deleted_row_count: materialized.deleted_row_count,
+                        },
+                    );
+                }
+
+                mutations_by_tablet.entry(tablet_id).or_default().push(
+                    TabletMutation::PublishRowset {
+                        rowset_id: pending.rowset.rowset_id(),
+                        version_span: VersionSpan {
+                            start: pending.rowset.start_version(),
+                            end: pending.rowset.end_version(),
+                        },
+                        rowset_ref: ArtifactRef::from_tablet_path(
+                            pending.tablet.data_dir(),
+                            &pending.rowset_path,
+                        )?,
+                    },
+                );
+            }
+
+            Ok(mutations_by_tablet
+                .into_iter()
+                .filter_map(|(tablet_id, mutations)| {
+                    if mutations.is_empty() {
+                        None
+                    } else {
+                        Some(StorageCommitOp::Tablet(TabletApplyOp {
+                            tablet_id,
+                            mutations,
+                        }))
+                    }
+                })
+                .collect::<Vec<_>>())
+        })();
+
+        let storage_ops = match storage_ops {
+            Ok(storage_ops) => storage_ops,
+            Err(err) => {
+                Self::cleanup_delete_patch_artifacts(&prepared_state.delete_patch_artifacts);
+                prepared_state.delete_patch_artifacts.clear();
+                return Err(err);
+            }
+        };
+
+        Ok(PreparedStorageCommit {
+            storage_ops,
+            post_commit_hooks,
+            tablets: prepared_tablets.into_values().collect(),
+        })
+    }
+
     pub fn prepare_commit(&self) -> Result<PreparedStorageCommit> {
         self.materialize_pending_writers()?;
 
@@ -877,35 +1097,6 @@ impl Transaction {
             std::mem::take(&mut *ops)
         };
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending);
-
-        let mut data_ops = Vec::new();
-        for pending in &rowsets {
-            let tablet_id = pending.tablet.tablet_id();
-            let rowset_id = pending.rowset.rowset_id();
-            let locator = RowsetLocator {
-                tablet_id,
-                rowset_id,
-                path_components: Self::path_components(&pending.rowset_path),
-            };
-            data_ops.push(PreparedDataOp::RowsetCommit {
-                locator,
-                start_version: pending.rowset.start_version(),
-                end_version: pending.rowset.end_version(),
-            });
-        }
-        for pending in &primary_deletes {
-            data_ops.push(PreparedDataOp::PrimaryDelete {
-                tablet_id: pending.tablet.tablet_id(),
-                keys: pending.keys.clone(),
-            });
-        }
-        for pending in &row_id_deletes {
-            data_ops.push(PreparedDataOp::RowIdDelete {
-                tablet_id: pending.tablet.tablet_id(),
-                locations: pending.locations.iter().copied().map(Into::into).collect(),
-            });
-        }
-
         let graph_deltas = self.take_graph_dml_deltas()?;
         let post_commit_hooks = if graph_deltas.is_empty() {
             Vec::new()
@@ -925,19 +1116,33 @@ impl Transaction {
                     .collect(),
             }]
         };
-
-        *self.prepared_storage_state.lock().map_err(|e| {
-            paro_error::internal(format!("failed to lock prepared storage state: {}", e))
-        })? = Some(PreparedStorageState {
+        let mut prepared_state = PreparedStorageState {
             rowsets,
             primary_deletes,
             row_id_deletes,
-        });
+            delete_patch_artifacts: Vec::new(),
+        };
+        let prepared_commit =
+            self.rebuild_prepared_commit(&mut prepared_state, post_commit_hooks)?;
 
-        Ok(PreparedStorageCommit {
-            data_ops,
-            post_commit_hooks,
-        })
+        *self.prepared_storage_state.lock().map_err(|e| {
+            paro_error::internal(format!("failed to lock prepared storage state: {}", e))
+        })? = Some(prepared_state);
+
+        Ok(prepared_commit)
+    }
+
+    pub fn reprepare_commit(
+        &self,
+        post_commit_hooks: &[PostCommitHookDescriptor],
+    ) -> Result<PreparedStorageCommit> {
+        let mut prepared_state = self.prepared_storage_state.lock().map_err(|e| {
+            paro_error::internal(format!("failed to lock prepared storage state: {}", e))
+        })?;
+        let prepared_state = prepared_state.as_mut().ok_or_else(|| {
+            paro_error::internal("prepared storage state missing during reprepare")
+        })?;
+        self.rebuild_prepared_commit(prepared_state, post_commit_hooks.to_vec())
     }
 
     fn apply_pending_writes(&self, commit_id: u64) -> Result<()> {
@@ -996,8 +1201,48 @@ impl Transaction {
                 .tablet
                 .release_row_id_delete_intents(self.id, &pending.locations);
         }
+        Self::cleanup_delete_patch_artifacts(&prepared.delete_patch_artifacts);
 
         result
+    }
+
+    fn release_prepared_storage_state(&self) -> Result<()> {
+        let prepared = self
+            .prepared_storage_state
+            .lock()
+            .map_err(|e| {
+                paro_error::internal(format!("failed to lock prepared storage state: {}", e))
+            })?
+            .take();
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+
+        for pending in &prepared.primary_deletes {
+            pending
+                .tablet
+                .release_primary_delete_intents(self.id, &pending.keys);
+        }
+        for pending in &prepared.row_id_deletes {
+            pending
+                .tablet
+                .release_row_id_delete_intents(self.id, &pending.locations);
+        }
+        Self::cleanup_delete_patch_artifacts(&prepared.delete_patch_artifacts);
+
+        Ok(())
+    }
+
+    fn cleanup_delete_patch_artifacts(paths: &[PathBuf]) {
+        for path in paths.iter().rev() {
+            let _ = std::fs::remove_file(path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+                if let Some(grandparent) = parent.parent() {
+                    let _ = std::fs::remove_dir(grandparent);
+                }
+            }
+        }
     }
 
     fn rollback_pending_writes(&self) {
@@ -1049,7 +1294,15 @@ impl Transaction {
     /// persisted via Tablet/Rowset; the undo buffer only tracks catalog-level edits.
     pub fn commit(&self, commit_id: u64) -> Result<()> {
         self.commit_prepared_storage(commit_id)?;
+        self.finish_commit_state(commit_id)
+    }
 
+    pub fn finalize_commit_after_apply(&self, commit_id: u64) -> Result<()> {
+        self.release_prepared_storage_state()?;
+        self.finish_commit_state(commit_id)
+    }
+
+    fn finish_commit_state(&self, commit_id: u64) -> Result<()> {
         if let Ok(mut pending) = self.pending_art_columns.lock() {
             pending.clear();
         }
@@ -1485,6 +1738,101 @@ mod tests {
             .expect("stage primary delete after rollback");
         txn2.commit(9202).expect("commit txn2");
         assert_eq!(collect_rows_i32_pair(&table), vec![(2, 20)]);
+    }
+
+    #[test]
+    fn test_primary_delete_reprepare_refreshes_stale_prepare_token_after_rowset_epoch_changes() {
+        let table = create_table_with_keys(
+            &[LogicalType::Integer, LogicalType::Integer],
+            KeysType::PrimaryKeys,
+        );
+        table
+            .append(&Chunk::from_vectors(vec![
+                Vector::from_i32(&[1, 2, 3]),
+                Vector::from_i32(&[10, 20, 30]),
+            ]))
+            .expect("append rows");
+
+        let tablet = table.tablet();
+        let txn = Transaction::new(9_401, 9_401);
+        txn.add_pending_primary_delete(tablet.clone(), vec![primary_key_bytes(&table, 2)])
+            .expect("stage primary delete");
+
+        let prepared = txn.prepare_commit().expect("prepare commit");
+        assert_eq!(prepared.tablets.len(), 1);
+        let original_token = prepared.tablets[0].token;
+
+        let StorageCommitOp::Tablet(original_apply) = prepared
+            .storage_ops
+            .first()
+            .expect("prepared storage op")
+            .clone();
+        let TabletMutation::ApplyDeletePatch {
+            patch: original_patch,
+            deleted_row_count,
+        } = original_apply
+            .mutations
+            .into_iter()
+            .next()
+            .expect("delete mutation")
+        else {
+            panic!("expected delete patch mutation");
+        };
+        assert_eq!(deleted_row_count, 1);
+        assert_eq!(
+            original_patch
+                .decode_row_refs_for_tablet(tablet.data_dir())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        tablet.bump_rowset_epoch();
+        let stale = tablet
+            .validate_prepare_token(&original_token)
+            .expect_err("rowset epoch bump should stale original token");
+        assert!(
+            stale.to_string().contains("rowset_epoch"),
+            "expected stale token error, got: {stale}"
+        );
+
+        let reprepared = txn
+            .reprepare_commit(&prepared.post_commit_hooks)
+            .expect("reprepare commit after stale token");
+        assert_eq!(reprepared.tablets.len(), 1);
+        let refreshed_token = reprepared.tablets[0].token;
+        assert!(refreshed_token.rowset_epoch > original_token.rowset_epoch);
+        tablet
+            .validate_prepare_token(&refreshed_token)
+            .expect("refreshed token should validate");
+
+        let StorageCommitOp::Tablet(reprepared_apply) = reprepared
+            .storage_ops
+            .first()
+            .expect("reprepared storage op")
+            .clone();
+        let TabletMutation::ApplyDeletePatch {
+            patch: refreshed_patch,
+            deleted_row_count,
+        } = reprepared_apply
+            .mutations
+            .into_iter()
+            .next()
+            .expect("refreshed delete mutation")
+        else {
+            panic!("expected refreshed delete patch mutation");
+        };
+        assert_eq!(deleted_row_count, 1);
+        assert_eq!(
+            refreshed_patch
+                .decode_row_refs_for_tablet(tablet.data_dir())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        txn.commit(9_402).expect("commit refreshed delete patch");
+        assert_eq!(collect_rows_i32_pair(&table), vec![(1, 10), (3, 30)]);
     }
 
     #[test]

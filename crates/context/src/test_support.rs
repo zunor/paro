@@ -184,6 +184,7 @@ impl TestStatementContextBuilder {
                     },
                     catalog,
                     tablet_meta: None,
+                    wal_metrics: crate::AttachedDatabaseWalMetricsSnapshot::default(),
                 }],
             )),
             limits,

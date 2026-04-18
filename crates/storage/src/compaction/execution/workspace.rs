@@ -40,7 +40,7 @@ impl CompactionWorkspace {
         rowset_id: RowsetId,
         cancel_token: CancellationToken,
     ) -> Result<Self> {
-        let staging_root = tablet.data_dir().join("_compaction");
+        let staging_root = tablet.compaction_staging_dir();
         let final_root = tablet.data_dir().join("rowsets");
         fs::create_dir_all(&staging_root).map_err(|err| {
             paro_error::io_error(format!(

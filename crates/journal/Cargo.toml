@@ -1,0 +1,19 @@
+[package]
+name = "paro-journal"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+paro-common = { workspace = true }
+bincode = { workspace = true }
+crc32c = "0.6"
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+parking_lot = { workspace = true }
+
+[[bench]]
+name = "journal_pipeline"
+harness = false

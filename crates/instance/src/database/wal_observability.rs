@@ -6,6 +6,7 @@ use crate::storage_manager::StorageManager;
 use parking_lot::RwLock;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_common::logging::targets;
+use paro_journal::{JournalAppender, JournalApplyRuntime};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,59 @@ pub struct WalLifecycleMetricsSnapshot {
     pub main_wal_needs_truncation: bool,
     pub checkpoint_wal_needs_truncation: bool,
     pub recovery_wal_needs_truncation: bool,
+    pub journal_apply_queue_depth: u64,
+    pub journal_apply_queue_depth_peak: u64,
+    pub journal_apply_active_workers: u64,
+    pub journal_apply_active_workers_peak: u64,
+    pub journal_apply_mailbox_count: u64,
+    pub journal_apply_applied_lag: u64,
+    pub journal_apply_published_lag: u64,
+    pub journal_apply_durable_wait_count: u64,
+    pub journal_apply_durable_wait_micros: u64,
+    pub journal_apply_applied_wait_count: u64,
+    pub journal_apply_applied_wait_micros: u64,
+    pub journal_apply_published_wait_count: u64,
+    pub journal_apply_published_wait_micros: u64,
+    pub journal_commit_bytes_total: u64,
+    pub journal_group_count: u64,
+    pub journal_group_size_last: u64,
+    pub journal_group_size_peak: u64,
+    pub journal_sync_latency_micros_total: u64,
+    pub journal_sync_latency_micros_peak: u64,
+    pub journal_replay_rowsets_total: u64,
+    pub journal_replay_delete_patches_total: u64,
+    pub journal_inline_delete_patch_count: u64,
+    pub journal_delete_patch_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WalReplayCountersSnapshot {
+    pub replay_rowsets_total: u64,
+    pub replay_delete_patches_total: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WalReplayCounters {
+    replay_rowsets_total: AtomicU64,
+    replay_delete_patches_total: AtomicU64,
+}
+
+impl WalReplayCounters {
+    pub(crate) fn record_rowset(&self) {
+        self.replay_rowsets_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_delete_patch(&self) {
+        self.replay_delete_patches_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> WalReplayCountersSnapshot {
+        WalReplayCountersSnapshot {
+            replay_rowsets_total: self.replay_rowsets_total.load(Ordering::Relaxed),
+            replay_delete_patches_total: self.replay_delete_patches_total.load(Ordering::Relaxed),
+        }
+    }
 }
 
 fn wal_recovery_mode_from_metric(value: u64) -> paro_storage::wal::recovery::WalRecoveryMode {
@@ -43,6 +97,7 @@ pub struct WalObservability {
     recovery_wal_needs_truncation: AtomicBool,
     last_recovery_report:
         RwLock<Option<crate::recovery::consistency_report::RecoveryConsistencyReport>>,
+    replay_counters: Arc<WalReplayCounters>,
 }
 
 impl WalObservability {
@@ -57,10 +112,23 @@ impl WalObservability {
             checkpoint_wal_needs_truncation: AtomicBool::new(false),
             recovery_wal_needs_truncation: AtomicBool::new(false),
             last_recovery_report: RwLock::new(None),
+            replay_counters: Arc::new(WalReplayCounters::default()),
         }
     }
 
-    pub fn snapshot(&self, checkpointer: &Checkpointer) -> WalLifecycleMetricsSnapshot {
+    pub fn snapshot(
+        &self,
+        checkpointer: &Checkpointer,
+        journal_appender: Option<&JournalAppender>,
+        journal_apply_runtime: Option<&JournalApplyRuntime>,
+    ) -> WalLifecycleMetricsSnapshot {
+        let journal_appender_metrics = journal_appender
+            .map(|appender| appender.metrics())
+            .unwrap_or_default();
+        let journal_metrics = journal_apply_runtime
+            .map(|runtime| runtime.metrics())
+            .unwrap_or_default();
+        let replay_metrics = self.replay_counters.snapshot();
         WalLifecycleMetricsSnapshot {
             checkpoint_success_total: checkpointer.checkpoint_success_total(),
             checkpoint_failure_total: checkpointer.checkpoint_failure_total(),
@@ -76,7 +144,34 @@ impl WalObservability {
             recovery_wal_needs_truncation: self
                 .recovery_wal_needs_truncation
                 .load(Ordering::Relaxed),
+            journal_apply_queue_depth: journal_metrics.queue_depth,
+            journal_apply_queue_depth_peak: journal_metrics.queue_depth_peak,
+            journal_apply_active_workers: journal_metrics.active_workers,
+            journal_apply_active_workers_peak: journal_metrics.active_workers_peak,
+            journal_apply_mailbox_count: journal_metrics.mailbox_count,
+            journal_apply_applied_lag: journal_metrics.applied_lag,
+            journal_apply_published_lag: journal_metrics.published_lag,
+            journal_apply_durable_wait_count: journal_metrics.durable_wait_count,
+            journal_apply_durable_wait_micros: journal_metrics.durable_wait_micros,
+            journal_apply_applied_wait_count: journal_metrics.applied_wait_count,
+            journal_apply_applied_wait_micros: journal_metrics.applied_wait_micros,
+            journal_apply_published_wait_count: journal_metrics.published_wait_count,
+            journal_apply_published_wait_micros: journal_metrics.published_wait_micros,
+            journal_commit_bytes_total: journal_appender_metrics.commit_bytes_total,
+            journal_group_count: journal_appender_metrics.group_count,
+            journal_group_size_last: journal_appender_metrics.group_size_last,
+            journal_group_size_peak: journal_appender_metrics.group_size_peak,
+            journal_sync_latency_micros_total: journal_appender_metrics.sync_latency_micros_total,
+            journal_sync_latency_micros_peak: journal_appender_metrics.sync_latency_micros_peak,
+            journal_replay_rowsets_total: replay_metrics.replay_rowsets_total,
+            journal_replay_delete_patches_total: replay_metrics.replay_delete_patches_total,
+            journal_inline_delete_patch_count: journal_appender_metrics.inline_delete_patch_count,
+            journal_delete_patch_count: journal_appender_metrics.delete_patch_count,
         }
+    }
+
+    pub(crate) fn replay_counters(&self) -> Arc<WalReplayCounters> {
+        Arc::clone(&self.replay_counters)
     }
 
     pub fn wal_keep_from(&self) -> u64 {

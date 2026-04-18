@@ -41,6 +41,7 @@
 //! - `tablet_schema`: Schema definition for Tablet columns
 //! - `tablet_reader`: Cross-Rowset merge reader
 
+mod apply_planner;
 mod delete_intent_store;
 mod prepared_txn_registry;
 mod primary_index;
@@ -53,9 +54,12 @@ mod tablet_reader_params;
 mod tablet_rowid_lookup;
 mod tablet_runtime;
 pub mod tablet_schema;
-mod wal_replay;
 
 // Re-export main types
+pub(crate) use apply_planner::{
+    build_delete_patch_from_primary_keys, build_delete_patch_from_row_refs,
+    capture_prepare_snapshot, materialize_delete_patch, PrepareSnapshot,
+};
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::TabletMeta;
 pub use tablet_reader::TabletReader;
@@ -65,3 +69,11 @@ pub use tablet_runtime::{
     TabletIdentity, TabletReadGuard, TabletRef, TabletState, Version, VersionGap,
 };
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
+
+pub fn set_delete_patch_inline_row_ref_threshold(threshold: usize) {
+    apply_planner::set_delete_patch_inline_row_ref_threshold(threshold);
+}
+
+pub fn current_delete_patch_inline_row_ref_threshold() -> usize {
+    apply_planner::current_delete_patch_inline_row_ref_threshold()
+}

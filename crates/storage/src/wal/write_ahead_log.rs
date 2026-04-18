@@ -69,8 +69,8 @@ pub(crate) fn recovery_wal_path_from_main(main_wal_path: &Path) -> PathBuf {
 /// # Usage
 /// ```ignore
 /// let wal = WriteAheadLog::new("data/db.wal")?;
-/// // Journal records are written through the storage transaction path
-/// // (`TxnBegin` / `TxnCatalogOp` / `TxnDataOp` / `TxnCommit`) and closed with `WalWriter::flush`.
+/// // Journal records are appended as binary `JournalRecord` WAL entries
+/// // and closed with `WalWriter::flush`.
 /// ```
 pub struct WriteAheadLog {
     /// The underlying WAL writer

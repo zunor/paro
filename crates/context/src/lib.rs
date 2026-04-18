@@ -24,7 +24,8 @@ mod write_guard;
 pub mod test_support;
 
 pub use attached_databases::{
-    AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DatabaseSnapshotIdentity,
+    AttachedDatabaseDirectory, AttachedDatabaseSnapshot, AttachedDatabaseWalMetricsSnapshot,
+    DatabaseSnapshotIdentity,
 };
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use effective_settings::EffectiveSettings;

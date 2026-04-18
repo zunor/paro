@@ -149,7 +149,7 @@ async fn execute_prepare<S: ProtocolResultSink>(
         plan_cache_mode: crate::prepared::plan_cache::PlanCacheMode::Auto,
         generic_plan,
         custom_plan_executions: 0,
-        dependency_epoch: session.transaction.visible_version().unwrap_or(0),
+        dependency_epoch: session.transaction_visible_version(),
         compile_environment: snapshot.compile_environment_key(),
         source: PreparedStatementSource::Sql,
     };
@@ -357,7 +357,7 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
             execution: ExecutionCursorHandle::materialized(materialized),
         }),
         completion: None,
-        dependency_epoch: session.transaction.visible_version().unwrap_or(0),
+        dependency_epoch: session.transaction_visible_version(),
         created_generation: 0,
         transaction_owned: session.has_active_transaction(),
     };

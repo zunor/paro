@@ -15,11 +15,47 @@ pub struct DatabaseSnapshotIdentity {
     pub db_type: DatabaseType,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachedDatabaseWalMetricsSnapshot {
+    pub checkpoint_success_total: u64,
+    pub checkpoint_failure_total: u64,
+    pub wal_health_check_total: u64,
+    pub wal_keep_from: u64,
+    pub recovery_mode: String,
+    pub main_wal_needs_truncation: bool,
+    pub checkpoint_wal_needs_truncation: bool,
+    pub recovery_wal_needs_truncation: bool,
+    pub journal_apply_queue_depth: u64,
+    pub journal_apply_queue_depth_peak: u64,
+    pub journal_apply_active_workers: u64,
+    pub journal_apply_active_workers_peak: u64,
+    pub journal_apply_mailbox_count: u64,
+    pub journal_apply_applied_lag: u64,
+    pub journal_apply_published_lag: u64,
+    pub journal_apply_durable_wait_count: u64,
+    pub journal_apply_durable_wait_micros: u64,
+    pub journal_apply_applied_wait_count: u64,
+    pub journal_apply_applied_wait_micros: u64,
+    pub journal_apply_published_wait_count: u64,
+    pub journal_apply_published_wait_micros: u64,
+    pub journal_commit_bytes_total: u64,
+    pub journal_group_count: u64,
+    pub journal_group_size_last: u64,
+    pub journal_group_size_peak: u64,
+    pub journal_sync_latency_micros_total: u64,
+    pub journal_sync_latency_micros_peak: u64,
+    pub journal_replay_rowsets_total: u64,
+    pub journal_replay_delete_patches_total: u64,
+    pub journal_inline_delete_patch_count: u64,
+    pub journal_delete_patch_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttachedDatabaseSnapshot {
     pub identity: DatabaseSnapshotIdentity,
     pub catalog: Arc<ParoCatalog>,
     pub tablet_meta: Option<Arc<TabletMetaManager>>,
+    pub wal_metrics: AttachedDatabaseWalMetricsSnapshot,
 }
 
 impl AttachedDatabaseSnapshot {
@@ -45,6 +81,10 @@ impl AttachedDatabaseSnapshot {
 
     pub fn tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>> {
         self.tablet_meta.clone()
+    }
+
+    pub fn wal_metrics(&self) -> &AttachedDatabaseWalMetricsSnapshot {
+        &self.wal_metrics
     }
 }
 

@@ -4,10 +4,11 @@
 use super::replay_handler::CatalogReplayHandler;
 use paro_catalog::entry::IndexType;
 use paro_common::effect::{
-    CatalogTxnOp, CleanupDescriptor, PostCommitHookDescriptor, RuntimeTransitionDescriptor,
-    StagedArtifactDescriptor,
+    ApplyDescriptor, CleanupDescriptor, RuntimeTransitionDescriptor, StagedArtifactDescriptor,
 };
 use paro_common::error as paro_error;
+use paro_common::identity::GraphId;
+use paro_storage::index::graph::{GraphProjectionIndex, GraphStorageGeneration};
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor;
 use std::path::PathBuf;
@@ -85,27 +86,46 @@ impl<'a> CatalogReplayHandler<'a> {
         }
     }
 
-    pub(super) fn replay_post_commit_hooks(
-        &mut self,
-        hooks: &[PostCommitHookDescriptor],
-        commit_id: u64,
-    ) -> paro_common::error::Result<()> {
-        let _ = (hooks, commit_id);
-        Ok(())
-    }
-
-    fn replay_runtime_transition(
+    fn apply_runtime_transition(
         &mut self,
         transition: &RuntimeTransitionDescriptor,
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
         match transition {
             RuntimeTransitionDescriptor::RegisterGraphRuntime { graph } => {
-                let _ = (graph, commit_id);
+                let _ = commit_id;
+                let Some(graph_registry) = self.graph_registry.as_ref() else {
+                    return Ok(());
+                };
+                let schema_name = graph.schema.as_deref().ok_or_else(|| {
+                    paro_error::serialization_error(
+                        "CREATE PROPERTY GRAPH runtime transition missing schema name",
+                    )
+                })?;
+                let graph_dir = self.database_root.join("graph").join(&graph.name);
+                let index = GraphProjectionIndex::load(&graph_dir)?;
+                let manifest = GraphProjectionIndex::load_manifest(&graph_dir)?;
+                let runtime_key =
+                    GraphId::new(&graph.database, schema_name, &graph.name).runtime_key();
+                graph_registry.register_generation(
+                    &runtime_key,
+                    GraphStorageGeneration::from_index(index, manifest, 0),
+                );
                 Ok(())
             }
             RuntimeTransitionDescriptor::UnregisterGraphRuntime { graph } => {
-                let _ = (graph, commit_id);
+                let _ = commit_id;
+                let Some(graph_registry) = self.graph_registry.as_ref() else {
+                    return Ok(());
+                };
+                let schema_name = graph.schema.as_deref().ok_or_else(|| {
+                    paro_error::serialization_error(
+                        "DROP PROPERTY GRAPH runtime transition missing schema name",
+                    )
+                })?;
+                let runtime_key =
+                    GraphId::new(&graph.database, schema_name, &graph.name).runtime_key();
+                graph_registry.unregister(&runtime_key);
                 Ok(())
             }
             RuntimeTransitionDescriptor::AttachIndexRuntime {
@@ -128,7 +148,7 @@ impl<'a> CatalogReplayHandler<'a> {
                 ) {
                     if let Some(table) = table_entry.as_ref().as_table() {
                         if let Some(storage) = table.get_storage() {
-                            Self::mark_declared_search_indexes(
+                            Self::mark_declared_runtime_indexes(
                                 storage.as_ref(),
                                 index_type,
                                 column_ids,
@@ -160,7 +180,7 @@ impl<'a> CatalogReplayHandler<'a> {
                     if let Some(table) = table_entry.as_ref().as_table() {
                         if let Some(storage) = table.get_storage() {
                             let _ = storage.remove_index(&index.name);
-                            Self::unmark_declared_search_indexes(
+                            let _ = Self::unmark_declared_runtime_indexes(
                                 storage.as_ref(),
                                 index_type,
                                 column_ids,
@@ -174,25 +194,28 @@ impl<'a> CatalogReplayHandler<'a> {
         }
     }
 
-    pub(super) fn replay_runtime_transitions(
+    pub fn apply_descriptors(
         &mut self,
-        ops: &[CatalogTxnOp],
+        descriptors: &[ApplyDescriptor],
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
-        for op in ops {
-            for artifact in &op.staged_artifacts {
-                self.apply_staged_artifact_descriptor(artifact)?;
-            }
-        }
-        for op in ops {
-            for transition in &op.runtime_transitions {
-                self.replay_runtime_transition(transition, commit_id)?;
+        for descriptor in descriptors {
+            match descriptor {
+                ApplyDescriptor::PublishStagedArtifact(artifact) => {
+                    self.apply_staged_artifact_descriptor(artifact)?;
+                }
+                ApplyDescriptor::RuntimeTransition(transition) => {
+                    self.apply_runtime_transition(transition, commit_id)?;
+                }
+                ApplyDescriptor::Cleanup(cleanup) => {
+                    self.apply_cleanup_descriptor(cleanup)?;
+                }
             }
         }
         Ok(())
     }
 
-    fn mark_declared_search_indexes(
+    fn mark_declared_runtime_indexes(
         storage: &TableHandle,
         index_type: &str,
         column_ids: &[u32],
@@ -201,6 +224,7 @@ impl<'a> CatalogReplayHandler<'a> {
         let index_type = IndexType::from_str(index_type);
         for column_id in column_ids {
             match index_type {
+                IndexType::ART => storage.mark_declared_art_index(*column_id),
                 IndexType::HNSW => storage.mark_declared_vector_index(*column_id),
                 IndexType::Sparse => storage.mark_declared_sparse_index(*column_id),
                 IndexType::FullText => storage.mark_declared_fulltext_index_with_config(
@@ -212,20 +236,25 @@ impl<'a> CatalogReplayHandler<'a> {
         }
     }
 
-    fn unmark_declared_search_indexes(
+    fn unmark_declared_runtime_indexes(
         storage: &TableHandle,
         index_type: &str,
         column_ids: &[u32],
         _fulltext_config: Option<&str>,
-    ) {
+    ) -> paro_common::error::Result<()> {
         let index_type = IndexType::from_str(index_type);
         for column_id in column_ids {
             match index_type {
+                IndexType::ART => {
+                    storage.unmark_declared_art_index(*column_id);
+                    storage.remove_runtime_art_index(*column_id)?;
+                }
                 IndexType::HNSW => storage.unmark_declared_vector_index(*column_id),
                 IndexType::Sparse => storage.unmark_declared_sparse_index(*column_id),
                 IndexType::FullText => storage.unmark_declared_fulltext_index(*column_id),
                 _ => {}
             }
         }
+        Ok(())
     }
 }

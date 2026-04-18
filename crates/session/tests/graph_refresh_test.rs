@@ -338,3 +338,114 @@ async fn refresh_property_graph_compacts_large_delta() {
         .unregister(&graph_runtime_key(graph_name));
     let _ = std::fs::remove_dir_all(&base_dir);
 }
+
+#[tokio::test]
+async fn refresh_property_graph_handles_edge_delete_regression() {
+    let base_dir = create_unique_test_dir("graph_refresh", "delete_regression");
+    let graph_name = "refresh_delete_graph";
+    let instance = create_persistent_instance(&base_dir);
+    let mut session = Session::new(4, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE rd_person (id BIGINT PRIMARY KEY, name VARCHAR)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE rd_knows (src_id BIGINT, dst_id BIGINT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO rd_person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO rd_knows VALUES (1, 2)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE PROPERTY GRAPH refresh_delete_graph \
+         VERTEX TABLES (rd_person LABEL Person) \
+         EDGE TABLES (rd_knows SOURCE KEY (src_id) REFERENCES rd_person (id) DESTINATION KEY (dst_id) REFERENCES rd_person (id) LABEL Knows)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO rd_knows VALUES (2, 3)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "REFRESH PROPERTY GRAPH refresh_delete_graph",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "DELETE FROM rd_knows WHERE src_id = 1 AND dst_id = 2",
+    )
+    .await;
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT CAST(id AS VARCHAR), name FROM rd_person ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        query_string_pairs(&sink),
+        vec![
+            ("1".to_string(), "Alice".to_string()),
+            ("2".to_string(), "Bob".to_string()),
+            ("3".to_string(), "Carol".to_string()),
+        ]
+    );
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT CAST(src_id AS VARCHAR), CAST(dst_id AS VARCHAR) FROM rd_knows ORDER BY src_id, dst_id",
+    )
+    .await;
+    assert_eq!(
+        query_string_pairs(&sink),
+        vec![("2".to_string(), "3".to_string())]
+    );
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "REFRESH PROPERTY GRAPH refresh_delete_graph",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT src, dst FROM GRAPH_TABLE(refresh_delete_graph \
+         MATCH (a:Person)-[e:Knows]->(b:Person) \
+         COLUMNS (a.name AS src, b.name AS dst)) gt \
+         ORDER BY src, dst",
+    )
+    .await;
+    assert_eq!(
+        query_string_pairs(&sink),
+        vec![("Bob".to_string(), "Carol".to_string())]
+    );
+
+    instance
+        .graph_manager()
+        .unregister(&graph_runtime_key(graph_name));
+    let _ = std::fs::remove_dir_all(&base_dir);
+}

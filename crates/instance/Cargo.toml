@@ -14,9 +14,11 @@ paro-common = { workspace = true }
 paro-context = { workspace = true }
 paro-scheduler = { workspace = true }
 paro-catalog = { workspace = true }
+paro-journal = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }
 paro-parser = { workspace = true }
+paro-execution = { workspace = true }
 
 anyhow = { workspace = true }
 crc32fast = "1"
@@ -29,3 +31,8 @@ tempfile = "3.8"
 tracing = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+name = "route_registry"
+harness = false
