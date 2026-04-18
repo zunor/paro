@@ -257,7 +257,8 @@ fn score_cover_groups(groups: &[Vec<query_eval::RangeMatch>]) -> f32 {
         let mut found_cover = false;
         let scan_start = next_event_idx;
 
-        for right in scan_start..events.len() {
+        let mut right = next_event_idx;
+        while right < events.len() {
             add_cover_event(
                 events[right],
                 &mut counts,
@@ -276,6 +277,7 @@ fn score_cover_groups(groups: &[Vec<query_eval::RangeMatch>]) -> f32 {
             }
 
             if covered_groups != groups.len() {
+                right += 1;
                 continue;
             }
 

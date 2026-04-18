@@ -2186,27 +2186,22 @@ mod tests {
 
         let adaptivity = TemporaryFileCompressionAdaptivity::new();
 
-        // Simulate a fast uncompressed write (10 microseconds)
-        let time_before = TemporaryFileCompressionAdaptivity::get_current_time_nanos();
-        std::thread::sleep(std::time::Duration::from_micros(10));
+        // Drive update() with an explicit elapsed time instead of relying on sleep granularity.
+        let time_before = TemporaryFileCompressionAdaptivity::get_current_time_nanos() - 1_000_000;
         adaptivity.update(TemporaryCompressionLevel::Uncompressed, time_before);
 
-        // The updated value should be different from INITIAL_NS
         let updated_value = adaptivity
             .last_uncompressed_write_ns
             .load(Ordering::Relaxed);
-        // Due to moving average, it should be between the old and new value
-        assert!(updated_value != TemporaryFileCompressionAdaptivity::INITIAL_NS);
+        assert!(updated_value > TemporaryFileCompressionAdaptivity::INITIAL_NS);
 
-        // Simulate a compressed write
-        let time_before = TemporaryFileCompressionAdaptivity::get_current_time_nanos();
-        std::thread::sleep(std::time::Duration::from_micros(20));
+        let time_before = TemporaryFileCompressionAdaptivity::get_current_time_nanos() - 2_000_000;
         adaptivity.update(TemporaryCompressionLevel::ZstdOne, time_before);
 
         let index =
             TemporaryFileCompressionAdaptivity::level_to_index(TemporaryCompressionLevel::ZstdOne);
         let updated_value = adaptivity.last_compressed_writes_ns[index].load(Ordering::Relaxed);
-        assert!(updated_value != TemporaryFileCompressionAdaptivity::INITIAL_NS);
+        assert!(updated_value > TemporaryFileCompressionAdaptivity::INITIAL_NS);
     }
 
     #[test]

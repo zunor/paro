@@ -351,16 +351,20 @@ impl Tablet {
             }
         }
 
-        let resolved = self.lookup_primary_keys(&unique_keys)?;
         let idx = self.primary_index_handle();
         let persistent = self.persistent_index()?;
+        let version = self.max_version();
 
         let mut resolved_locations = Vec::with_capacity(unique_keys.len());
         let mut existing_keys = Vec::with_capacity(unique_keys.len());
-        for (key, current) in unique_keys.iter().zip(resolved.into_iter()) {
+        for key in &unique_keys {
+            let current = self
+                .primary_key_occurrences(key, version)?
+                .into_iter()
+                .find_map(|(location, is_deleted)| (!is_deleted).then_some(location));
             match current {
                 Some(current) => {
-                    resolved_locations.push(self.decode_row_id(current)?);
+                    resolved_locations.push(current);
                     existing_keys.push(key.clone());
                 }
                 None if ignore_missing => {}
@@ -385,7 +389,6 @@ impl Tablet {
                 .or_insert_with(DeleteVector::new);
             entry.mark_deleted(loc.row_offset);
         }
-        let version = self.max_version();
         self.persist_delete_vectors(version, pending)?;
 
         self.reconcile_primary_index_row_count()?;

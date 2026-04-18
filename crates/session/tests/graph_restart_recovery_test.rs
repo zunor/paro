@@ -38,6 +38,21 @@ fn graph_manifest_path(base_dir: &Path, graph_name: &str) -> std::path::PathBuf 
         .join("meta.json")
 }
 
+fn recovery_results_without_empty_deferred_task_skip(
+    hook_results: &[RecoveryHookResult],
+) -> Vec<&RecoveryHookResult> {
+    hook_results
+        .iter()
+        .filter(|result| {
+            !matches!(
+                result,
+                RecoveryHookResult::Skipped { reason }
+                    if reason == "no deferred tasks recovered from journal"
+            )
+        })
+        .collect()
+}
+
 fn table_rowids(session: &Session, schema_name: &str, table_name: &str) -> Vec<u64> {
     let txn = CatalogSnapshot::default();
     let table_entry = session
@@ -198,13 +213,14 @@ async fn property_graph_is_recovered_on_restart() {
         .iter()
         .find(|entry| entry.name == "postgres")
         .expect("startup report should include postgres");
+    let hook_results = &postgres
+        .recovery_report
+        .as_ref()
+        .expect("postgres should include recovery report")
+        .hook_results;
     assert_eq!(
-        postgres
-            .recovery_report
-            .as_ref()
-            .expect("postgres should include recovery report")
-            .hook_results,
-        vec![RecoveryHookResult::Reused],
+        recovery_results_without_empty_deferred_task_skip(hook_results),
+        vec![&RecoveryHookResult::Reused],
         "valid persisted graph projection should be reused during startup"
     );
 
@@ -285,8 +301,13 @@ async fn property_graph_is_rebuilt_when_projection_dir_is_missing_on_restart() {
         .as_ref()
         .expect("postgres should include recovery report")
         .hook_results;
-    assert_eq!(hook_results.len(), 1, "expected exactly one recovery hook");
-    match &hook_results[0] {
+    let hook_results = recovery_results_without_empty_deferred_task_skip(hook_results);
+    assert_eq!(
+        hook_results.len(),
+        1,
+        "expected exactly one graph recovery hook"
+    );
+    match hook_results[0] {
         RecoveryHookResult::Rebuilt { detail, .. } => {
             assert!(
                 detail
@@ -393,8 +414,13 @@ async fn property_graph_manifest_mismatch_is_reported_and_rebuilt_on_restart() {
         .as_ref()
         .expect("postgres should include recovery report")
         .hook_results;
-    assert_eq!(hook_results.len(), 1, "expected exactly one recovery hook");
-    match &hook_results[0] {
+    let hook_results = recovery_results_without_empty_deferred_task_skip(hook_results);
+    assert_eq!(
+        hook_results.len(),
+        1,
+        "expected exactly one graph recovery hook"
+    );
+    match hook_results[0] {
         RecoveryHookResult::Rebuilt { issues, .. } => {
             assert!(
                 !issues.is_empty(),

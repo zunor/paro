@@ -1123,8 +1123,12 @@ impl Tablet {
     fn rowset_commit_locked(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
-        if version <= current_max {
-            // Already committed (idempotent)
+        if version < current_max
+            || (version == current_max && self.get_rowset_by_version(version).is_some())
+        {
+            // A delete patch can advance max_version without publishing a new rowset at that
+            // version. Only treat the write as already committed when a rowset actually covers
+            // this version.
             return Ok(());
         }
 
@@ -1178,7 +1182,9 @@ impl Tablet {
     ) -> Result<()> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
-        if version <= current_max {
+        if version < current_max
+            || (version == current_max && self.get_rowset_by_version(version).is_some())
+        {
             return Ok(());
         }
 
@@ -2306,6 +2312,7 @@ impl Tablet {
             )
         })?;
         self.save_meta()?;
+        self.validate_primary_index_consistency_after_compaction(output.as_ref())?;
         Ok(())
     }
 
@@ -2348,6 +2355,7 @@ impl Tablet {
             )
         })?;
         self.save_meta()?;
+        self.validate_primary_index_consistency_after_compaction(output.as_ref())?;
         Ok(())
     }
 

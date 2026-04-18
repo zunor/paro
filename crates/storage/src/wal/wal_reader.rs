@@ -733,8 +733,23 @@ mod tests {
         let mut reader = WalReader::open(&path).unwrap().unwrap();
         let entries: Vec<_> = reader.entries().collect();
 
-        assert!(entries.len() >= 4, "expected journal + flush entries");
+        assert!(
+            entries.len() >= 2,
+            "expected committed journal record + flush"
+        );
         assert!(entries.iter().all(|e| e.is_ok()));
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Ok(WalEntry::JournalRecord {
+                    record: JournalRecord::Commit(_),
+                    ..
+                })
+            )
+        }));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, Ok(WalEntry::Flush))));
     }
 
     #[test]
@@ -854,7 +869,7 @@ mod tests {
         assert!(!result.needs_truncation());
         assert!(result.torn_write_position.is_none());
         assert!(!result.has_unflushed_tail);
-        assert!(result.entries_scanned >= 4);
+        assert!(result.entries_scanned >= 2);
         assert!(result.last_flush_offset > 0);
         assert_eq!(
             result.last_successful_offset,

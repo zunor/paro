@@ -504,7 +504,7 @@ fn process_mixed_batch(inner: &Arc<JournalCoordinatorInner>, batch: Vec<PendingR
                         AcceptedRequest::Commit { commit_id, .. } => Some(*commit_id),
                         AcceptedRequest::Maintenance { .. } => None,
                     })
-                    .last()
+                    .next_back()
                     .unwrap_or(0);
                 update_durable_frontier(inner, last.durable_batch_lsn, last_commit_id);
                 tracing::info!(

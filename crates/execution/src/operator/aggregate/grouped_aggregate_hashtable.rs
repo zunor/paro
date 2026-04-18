@@ -1217,9 +1217,10 @@ fn combine_hash_scalar(mut left: u64, right: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::mem::size_of;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread_local;
 
     use paro_common::runtime_value::Value;
     use paro_function::aggregate::AggregateFunction;
@@ -1227,7 +1228,21 @@ mod tests {
         AggregateExpression, AggregateType, Expression, ReferenceExpression,
     };
 
-    static DESTRUCTOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static DESTRUCTOR_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn reset_destructor_calls() {
+        DESTRUCTOR_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn record_destructor_calls(count: usize) {
+        DESTRUCTOR_CALLS.with(|calls| calls.set(calls.get() + count));
+    }
+
+    fn destructor_calls() -> usize {
+        DESTRUCTOR_CALLS.with(Cell::get)
+    }
 
     unsafe fn sum_initialize(state: *mut u8) {
         *(state as *mut i64) = 0;
@@ -1290,7 +1305,7 @@ mod tests {
     }
 
     unsafe fn sum_destructor(_states: &Vector, _input_data: &AggregateInputData, count: usize) {
-        DESTRUCTOR_CALLS.fetch_add(count, Ordering::Relaxed);
+        record_destructor_calls(count);
     }
 
     fn make_sum_object() -> AggregateObject {
@@ -1554,7 +1569,7 @@ mod tests {
 
     #[test]
     fn grouped_hash_table_destroy_calls_destructor() {
-        DESTRUCTOR_CALLS.store(0, Ordering::Relaxed);
+        reset_destructor_calls();
 
         let mut table = GroupedAggregateHashTable::new(
             vec![LogicalType::Integer],
@@ -1578,7 +1593,7 @@ mod tests {
         let before_destroy = table.memory_usage();
         table.destroy().expect("destroy hash table");
         assert_eq!(table.count(), 0);
-        assert_eq!(DESTRUCTOR_CALLS.load(Ordering::Relaxed), 3);
+        assert_eq!(destructor_calls(), 3);
         assert!(table.memory_usage() <= before_destroy);
     }
 }

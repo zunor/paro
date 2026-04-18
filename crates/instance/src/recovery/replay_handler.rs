@@ -45,8 +45,21 @@ use std::sync::Arc;
 /// and restore the catalog to a consistent state.
 pub trait RuntimeCatalogApplyBatch {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn record(&self, index: usize) -> &DdlChangeRecord;
     fn apply(&mut self, index: usize, commit_id: u64) -> paro_common::error::Result<()>;
+}
+
+#[cfg(test)]
+struct RowsetCommitReplay<'a> {
+    tablet_id: u64,
+    rowset_id: u64,
+    version_span: VersionSpan,
+    rowset_path: &'a str,
+    replaced_locations: &'a [(u64, u32, u32)],
+    lsn: u64,
 }
 
 pub struct CatalogReplayHandler<'a> {
@@ -200,20 +213,15 @@ impl<'a> CatalogReplayHandler<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn replay_rowset_commit(
+    fn replay_rowset_commit(
         &mut self,
-        tablet_id: u64,
-        rowset_id: u64,
-        start_version: i64,
-        end_version: i64,
-        rowset_path: &str,
-        replaced_locations: &[(u64, u32, u32)],
-        lsn: u64,
+        replay: RowsetCommitReplay<'_>,
     ) -> paro_common::error::Result<()> {
         let mut mutations = Vec::new();
-        if !replaced_locations.is_empty() {
+        if !replay.replaced_locations.is_empty() {
             let patch = Self::inline_delete_patch(
-                &replaced_locations
+                &replay
+                    .replaced_locations
                     .iter()
                     .copied()
                     .map(Into::into)
@@ -225,19 +233,17 @@ impl<'a> CatalogReplayHandler<'a> {
             });
         }
         mutations.push(TabletMutation::PublishRowset {
-            rowset_id,
-            version_span: VersionSpan {
-                start: start_version,
-                end: end_version,
-            },
-            rowset_ref: self.artifact_ref_for_tablet_path(tablet_id, Path::new(rowset_path))?,
+            rowset_id: replay.rowset_id,
+            version_span: replay.version_span,
+            rowset_ref: self
+                .artifact_ref_for_tablet_path(replay.tablet_id, Path::new(replay.rowset_path))?,
         });
         self.replay_storage_op(
             &StorageCommitOp::Tablet(TabletApplyOp {
-                tablet_id,
+                tablet_id: replay.tablet_id,
                 mutations,
             }),
-            lsn,
+            replay.lsn,
         )
     }
 
@@ -2224,15 +2230,14 @@ mod tests {
         copy_dir_all(&rowset_dir, &staged_rowset_dir);
         let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX);
         handler
-            .replay_rowset_commit(
-                target_descriptor.tablet_id,
-                9_999,
-                1,
-                1,
-                staged_rowset_dir.to_string_lossy().as_ref(),
-                &[],
-                1,
-            )
+            .replay_rowset_commit(RowsetCommitReplay {
+                tablet_id: target_descriptor.tablet_id,
+                rowset_id: 9_999,
+                version_span: VersionSpan { start: 1, end: 1 },
+                rowset_path: staged_rowset_dir.to_string_lossy().as_ref(),
+                replaced_locations: &[],
+                lsn: 1,
+            })
             .unwrap();
 
         assert_eq!(target_storage.rowset_count(), 1);
@@ -2240,15 +2245,14 @@ mod tests {
 
         // Rowset commit replay is idempotent for the same rowset_id.
         handler
-            .replay_rowset_commit(
-                target_descriptor.tablet_id,
-                9_999,
-                1,
-                1,
-                staged_rowset_dir.to_string_lossy().as_ref(),
-                &[],
-                2,
-            )
+            .replay_rowset_commit(RowsetCommitReplay {
+                tablet_id: target_descriptor.tablet_id,
+                rowset_id: 9_999,
+                version_span: VersionSpan { start: 1, end: 1 },
+                rowset_path: staged_rowset_dir.to_string_lossy().as_ref(),
+                replaced_locations: &[],
+                lsn: 2,
+            })
             .unwrap();
         assert_eq!(target_storage.rowset_count(), 1);
         assert_eq!(target_storage.total_rows(), 3);
@@ -2706,7 +2710,7 @@ mod tests {
 
         let mut handler = CatalogReplayHandler::new(&catalog, 0, u64::MAX);
         handler
-            .replay_primary_delete(tablet_id, &[delete_key.clone()], 1)
+            .replay_primary_delete(tablet_id, std::slice::from_ref(&delete_key), 1)
             .unwrap();
 
         assert!(target_storage

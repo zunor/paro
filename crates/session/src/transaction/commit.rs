@@ -43,6 +43,16 @@ pub struct CommitFailure {
     pub rollback_succeeded: bool,
 }
 
+struct RuntimeApplyBuildContext {
+    database: Arc<DatabaseHandle>,
+    catalog: Arc<ParoCatalog>,
+    database_root: PathBuf,
+    tablet_meta_manager: Option<Arc<paro_storage::meta::TabletMetaManager>>,
+    graph_registry: Arc<paro_storage::index::graph::GraphProjectionIndexManager>,
+    manager: Arc<paro_storage::transaction::manager::TransactionManager>,
+    apply_state: Arc<Mutex<Option<CommitApplyState>>>,
+}
+
 pub struct CommitPipeline<'a> {
     session: &'a Session,
     frozen: FrozenTransaction,
@@ -233,13 +243,15 @@ impl<'a> CommitPipeline<'a> {
                 manager.mark_durable_commit(ctx.commit_id);
                 let request = match Self::build_runtime_apply_request(
                     ctx,
-                    Arc::clone(&session.current_database),
-                    Arc::clone(&catalog),
-                    database_root,
-                    tablet_meta_manager,
-                    graph_registry,
-                    Arc::clone(&manager),
-                    Arc::clone(&apply_state),
+                    RuntimeApplyBuildContext {
+                        database: Arc::clone(&session.current_database),
+                        catalog: Arc::clone(&catalog),
+                        database_root,
+                        tablet_meta_manager,
+                        graph_registry,
+                        manager: Arc::clone(&manager),
+                        apply_state: Arc::clone(&apply_state),
+                    },
                 ) {
                     Ok(request) => request,
                     Err(error) => {
@@ -329,14 +341,18 @@ impl<'a> CommitPipeline<'a> {
 
     fn build_runtime_apply_request(
         ctx: paro_journal::CommitExecutionContext,
-        database: Arc<DatabaseHandle>,
-        catalog: Arc<ParoCatalog>,
-        database_root: PathBuf,
-        tablet_meta_manager: Option<Arc<paro_storage::meta::TabletMetaManager>>,
-        graph_registry: Arc<paro_storage::index::graph::GraphProjectionIndexManager>,
-        manager: Arc<paro_storage::transaction::manager::TransactionManager>,
-        apply_state: Arc<Mutex<Option<CommitApplyState>>>,
+        runtime: RuntimeApplyBuildContext,
     ) -> Result<ApplyRequest<CommitOutcome>> {
+        let RuntimeApplyBuildContext {
+            database,
+            catalog,
+            database_root,
+            tablet_meta_manager,
+            graph_registry,
+            manager,
+            apply_state,
+        } = runtime;
+
         let publish_active = apply_state
             .lock()
             .unwrap()
@@ -391,8 +407,8 @@ impl<'a> CommitPipeline<'a> {
             .record
             .storage_ops
             .iter()
-            .cloned()
             .map(|storage_op| {
+                let storage_op = storage_op.clone();
                 let registry_slot = Arc::clone(&registry_slot);
                 TabletApplyPart {
                     tablet_id: storage_op.tablet_id(),
@@ -719,7 +735,7 @@ impl<'a> CommitPipeline<'a> {
     fn journal_storage_ops(
         prepared_storage: &PreparedStorageCommit,
     ) -> Result<Vec<StorageCommitOp>> {
-        Ok(prepared_storage.storage_ops.iter().cloned().collect())
+        Ok(prepared_storage.storage_ops.to_vec())
     }
 
     fn hook_to_deferred_task(hook: PostCommitHookDescriptor) -> DeferredTask {

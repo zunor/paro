@@ -13,6 +13,7 @@ use paro_common::allocator::Allocator;
 use paro_common::error::Result;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 pub fn run_job(
     tablet: &Arc<Tablet>,
@@ -76,7 +77,19 @@ where
 
     on_state(CompactionLifecycleState::Publishing);
     let request = CompactionPublisher::prepare_request(tablet, output, job_id)?;
-    CompactionPublisher::publish(tablet, request)?;
+    if let Err(err) = CompactionPublisher::publish(tablet, request) {
+        if err.is_retryable() {
+            info!(
+                tablet_id = tablet.tablet_id(),
+                ?job_id,
+                plan_id = plan.plan_id.0,
+                error = %err,
+                "Compaction publish skipped after concurrent mutation invalidated the prepared snapshot"
+            );
+            return Ok(false);
+        }
+        return Err(err);
+    }
     on_state(CompactionLifecycleState::RetiredPendingGc);
     Ok(true)
 }

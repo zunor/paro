@@ -388,7 +388,15 @@ impl DeltaWriter {
             } else {
                 self.tablet.rowset_commit_auto(rowset.clone())?;
             }
-            Ok(rowset)
+            self.tablet
+                .find_rowset_by_id(rowset.rowset_id())
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "published rowset {} missing from tablet {}",
+                        rowset.rowset_id(),
+                        self.tablet.tablet_id()
+                    ))
+                })
         })();
 
         if !publish_attempted {
@@ -402,7 +410,13 @@ impl DeltaWriter {
     /// Commit: finalize rowset and register it with the transaction (deferred publish).
     pub fn commit_in_transaction(self, txn: Arc<Transaction>) -> Result<RowsetSharedPtr> {
         let (tablet, rowset, primary_update) = self.finalize_for_transaction()?;
-        if let Err(err) = txn.add_pending_rowset(tablet, rowset.clone(), primary_update) {
+        if let Err(err) = txn.add_pending_rowset(
+            tablet,
+            rowset.clone(),
+            primary_update,
+            Vec::new(),
+            Vec::new(),
+        ) {
             let _ = std::fs::remove_dir_all(rowset.rowset_path());
             return Err(err);
         }

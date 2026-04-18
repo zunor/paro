@@ -229,7 +229,7 @@ fn run_worker(inner: Weak<JournalAppenderInner>) {
                 let durable_batch_lsn = encoded
                     .iter()
                     .filter_map(|pending| pending.lsns.last().copied())
-                    .last()
+                    .next_back()
                     .unwrap_or(0);
                 {
                     let mut state = inner.state.lock().unwrap();

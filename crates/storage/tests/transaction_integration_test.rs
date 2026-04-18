@@ -218,7 +218,8 @@ fn test_delete_vector() {
     let _rowset2 = writer2.commit_in_transaction(t2.clone()).unwrap();
     tm.commit_transaction(t2).unwrap();
 
-    let dv = DeleteVector::load_from_dir(rowset1.rowset_path(), 0)
+    let committed_rowset1 = tablet.find_rowset_by_id(rowset1.rowset_id()).unwrap();
+    let dv = DeleteVector::load_from_dir(committed_rowset1.rowset_path(), 0)
         .unwrap()
         .unwrap();
     assert_eq!(dv.cardinality(), 1);

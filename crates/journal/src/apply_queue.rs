@@ -747,10 +747,14 @@ struct TabletApplyWork {
 }
 
 fn default_apply_worker_count() -> usize {
+    // JournalApplyRuntime is instantiated per database today, so a "one worker per core"
+    // policy quickly overcommits thread resources when tests or deployments keep several
+    // databases open at once. Keep the default pool conservative until we move to a shared
+    // executor or expose an explicit tuning knob.
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(4)
-        .clamp(1, 16)
+        .clamp(1, 4)
 }
 
 fn run_tablet_worker(runtime: Weak<JournalApplyRuntimeInner>) {

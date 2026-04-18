@@ -43,6 +43,8 @@ pub struct PendingRowset {
     rowset: RowsetSharedPtr,
     primary_update: Option<PrimaryIndexUpdate>,
     rowset_path: PathBuf,
+    art_columns: Vec<u32>,
+    fulltext_columns: Vec<(u32, String)>,
 }
 
 /// Pending primary key delete (no rowset).
@@ -439,6 +441,8 @@ impl Transaction {
         tablet: TabletRef,
         rowset: RowsetSharedPtr,
         primary_update: Option<PrimaryIndexUpdate>,
+        art_columns: Vec<u32>,
+        fulltext_columns: Vec<(u32, String)>,
     ) -> Result<()> {
         let tablet_id = tablet.tablet_id();
         let mut ops = self
@@ -472,6 +476,8 @@ impl Transaction {
             rowset: rowset.clone(),
             primary_update,
             rowset_path: rowset.rowset_path().to_path_buf(),
+            art_columns,
+            fulltext_columns,
         }));
         self.bump_mutation_generation();
         self.set_read_write();
@@ -689,7 +695,13 @@ impl Transaction {
                 }
             }
 
-            if let Err(err) = self.add_pending_rowset(tablet, rowset.clone(), primary_update) {
+            if let Err(err) = self.add_pending_rowset(
+                tablet,
+                rowset.clone(),
+                primary_update,
+                art_columns,
+                fulltext_columns,
+            ) {
                 let _ = std::fs::remove_dir_all(rowset.rowset_path());
                 return Err(err);
             }
@@ -844,21 +856,100 @@ impl Transaction {
             }
 
             for pending in rowsets {
-                if let Some(update) = pending.primary_update {
-                    pending.tablet.publish_rowset_with_index(
-                        commit_version,
-                        pending.rowset.clone(),
-                        update,
-                    )?;
+                let PendingRowset {
+                    tablet,
+                    rowset,
+                    primary_update,
+                    art_columns,
+                    fulltext_columns,
+                    ..
+                } = pending;
+
+                if let Some(update) = primary_update {
+                    tablet.publish_rowset_with_index(commit_version, rowset.clone(), update)?;
                 } else {
-                    pending
-                        .tablet
-                        .rowset_commit(commit_version, pending.rowset.clone())?;
+                    tablet.rowset_commit(commit_version, rowset.clone())?;
                 }
+
+                let published = tablet
+                    .find_rowset_by_id(rowset.rowset_id())
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "published rowset {} missing from tablet {}",
+                            rowset.rowset_id(),
+                            tablet.tablet_id()
+                        ))
+                    })?;
+                Self::restore_runtime_indexes_on_published_rowset(
+                    tablet.tablet_id(),
+                    &rowset,
+                    &published,
+                    &art_columns,
+                    &fulltext_columns,
+                )?;
             }
 
             Ok(())
         })()
+    }
+
+    fn restore_runtime_indexes_on_published_rowset(
+        tablet_id: u64,
+        staged: &RowsetSharedPtr,
+        published: &RowsetSharedPtr,
+        art_columns: &[u32],
+        fulltext_columns: &[(u32, String)],
+    ) -> Result<()> {
+        if art_columns.is_empty() && fulltext_columns.is_empty() {
+            return Ok(());
+        }
+
+        let staged_segments = staged.segments();
+        let published_segments = published.segments();
+        let segments_match = staged_segments.len() == published_segments.len()
+            && staged_segments
+                .iter()
+                .zip(published_segments.iter())
+                .all(|(source, target)| source.segment_id() == target.segment_id());
+
+        let mut rebuild_fulltext = !fulltext_columns.is_empty() && !segments_match;
+        let mut rebuild_art = !art_columns.is_empty() && !segments_match;
+
+        if segments_match {
+            for (source, target) in staged_segments.iter().zip(published_segments.iter()) {
+                for (column_id, _) in fulltext_columns {
+                    if let Some(index) = source.fulltext_index(*column_id) {
+                        target.register_runtime_fulltext_index(*column_id, index);
+                    } else {
+                        rebuild_fulltext = true;
+                    }
+                }
+                for &column_id in art_columns {
+                    if let Some(index) = source.art_index(column_id) {
+                        target.register_runtime_art_index(column_id, index);
+                    } else {
+                        rebuild_art = true;
+                    }
+                }
+            }
+        }
+
+        if rebuild_fulltext {
+            IndexRuntime::build_runtime_fulltext_indexes_for_rowset(published, fulltext_columns)?;
+        }
+        if rebuild_art {
+            if let Err(err) =
+                IndexRuntime::build_runtime_art_indexes_for_rowset(published, art_columns)
+            {
+                tracing::warn!(
+                    error = %err,
+                    tablet_id,
+                    rowset_id = published.rowset_id(),
+                    "ART index backfill failed for published transaction rowset; queries will fallback to scan"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn rowset_replaced_locations(

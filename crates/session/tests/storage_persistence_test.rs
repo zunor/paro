@@ -761,7 +761,7 @@ async fn drop_schema_cascade_updates_route_registry_and_compaction_incrementally
         .expect("compaction manager should exist")
         .registered_tablets;
     assert!(
-        registered_after_create >= initial_registered + 1,
+        registered_after_create > initial_registered,
         "compaction manager should register the new table without an explicit full resync"
     );
 
