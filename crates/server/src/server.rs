@@ -88,7 +88,7 @@ impl Server {
         }
 
         // `ParoConfig.cluster` is the TOML section name; map it into runtime `InstanceConfig`.
-        let mut instance_config = InstanceConfig::from(&config.cluster);
+        let mut instance_config = InstanceConfig::from(config);
         instance_config.options.instance_root = server_config.data_dir.clone();
 
         // Always create a persistent instance (in-memory mode is only for testing).

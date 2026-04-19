@@ -116,13 +116,14 @@ impl SchemaContents {
         &self,
         buffer: &mut Vec<u8>,
         collection: &Arc<CatalogCollection>,
+        snapshot_ts: u64,
         serialize_entry: F,
     ) -> Result<()>
     where
         F: Fn(&CatalogEntryEnum) -> Result<Option<Vec<u8>>>,
     {
         let mut payloads = Vec::new();
-        for entry in collection.scan(0, u64::MAX) {
+        for entry in collection.scan(0, snapshot_ts) {
             if let Some(bytes) = serialize_entry(entry.as_ref())? {
                 payloads.push(bytes);
             }
@@ -163,29 +164,49 @@ impl SchemaContents {
         Ok(())
     }
 
-    pub fn serialize_payload(&self) -> Result<Vec<u8>> {
+    pub fn serialize_payload_at(&self, snapshot_ts: u64) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
 
-        self.write_entry_block(&mut buffer, &self.tables, |entry| match entry {
-            CatalogEntryEnum::Table(table) => table.serialize().map(Some),
-            _ => Ok(None),
-        })?;
-        self.write_entry_block(&mut buffer, &self.indexes, |entry| match entry {
-            CatalogEntryEnum::Index(index) => index.serialize_to_bytes().map(Some),
-            _ => Ok(None),
-        })?;
-        self.write_entry_block(&mut buffer, &self.property_graphs, |entry| match entry {
-            CatalogEntryEnum::PropertyGraph(graph) => graph.serialize_to_bytes().map(Some),
-            _ => Ok(None),
-        })?;
-        self.write_entry_block(&mut buffer, &self.views, |entry| match entry {
+        self.write_entry_block(
+            &mut buffer,
+            &self.tables,
+            snapshot_ts,
+            |entry| match entry {
+                CatalogEntryEnum::Table(table) => table.serialize().map(Some),
+                _ => Ok(None),
+            },
+        )?;
+        self.write_entry_block(
+            &mut buffer,
+            &self.indexes,
+            snapshot_ts,
+            |entry| match entry {
+                CatalogEntryEnum::Index(index) => index.serialize_to_bytes().map(Some),
+                _ => Ok(None),
+            },
+        )?;
+        self.write_entry_block(
+            &mut buffer,
+            &self.property_graphs,
+            snapshot_ts,
+            |entry| match entry {
+                CatalogEntryEnum::PropertyGraph(graph) => graph.serialize_to_bytes().map(Some),
+                _ => Ok(None),
+            },
+        )?;
+        self.write_entry_block(&mut buffer, &self.views, snapshot_ts, |entry| match entry {
             CatalogEntryEnum::View(view) => view.serialize_to_bytes().map(Some),
             _ => Ok(None),
         })?;
-        self.write_entry_block(&mut buffer, &self.sequences, |entry| match entry {
-            CatalogEntryEnum::Sequence(sequence) => sequence.serialize_to_bytes().map(Some),
-            _ => Ok(None),
-        })?;
+        self.write_entry_block(
+            &mut buffer,
+            &self.sequences,
+            snapshot_ts,
+            |entry| match entry {
+                CatalogEntryEnum::Sequence(sequence) => sequence.serialize_to_bytes().map(Some),
+                _ => Ok(None),
+            },
+        )?;
 
         Ok(buffer)
     }

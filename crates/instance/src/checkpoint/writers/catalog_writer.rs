@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::storage_manager::StorageManager;
+use crate::checkpoint::view::CheckpointView;
 use crc32fast::hash as crc32;
 use paro_catalog::collection::InstallMode;
 use paro_catalog::database_catalog::ParoCatalog;
@@ -9,69 +9,27 @@ use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::CatalogType;
 use paro_catalog::entry::{CatalogEntryEnum, SchemaEntry};
 use paro_catalog::mvcc::CatalogSnapshot;
-use paro_storage::meta::{MetadataOp, MetadataStore, TabletMetaManager};
+use paro_storage::meta::TabletMetaManager;
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
-pub const CATALOG_CHECKPOINT_KEY: &str = "catalog/checkpoint";
-pub const CATALOG_CHECKPOINT_ID_KEY: &str = "catalog/checkpoint_id";
+const CATALOG_SNAPSHOT_MAGIC: &[u8; 4] = b"PCAT";
+const CATALOG_SNAPSHOT_VERSION: u16 = 4;
 
-const CATALOG_CHECKPOINT_MAGIC: &[u8; 4] = b"PCAT";
-const CATALOG_CHECKPOINT_VERSION: u16 = 4;
+/// Catalog snapshot writer / loader used by checkpoint base-image flows.
+pub struct CatalogWriter;
 
-pub struct CatalogCheckpoint;
-
-impl CatalogCheckpoint {
-    pub fn decode_marker(raw: &[u8]) -> anyhow::Result<u64> {
-        if raw.len() != 8 {
-            return Err(anyhow::anyhow!(
-                "Invalid catalog checkpoint marker length: expected 8, got {}",
-                raw.len()
-            ));
-        }
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(raw);
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    pub fn read_marker(store: &dyn MetadataStore) -> anyhow::Result<Option<u64>> {
-        store
-            .get(CATALOG_CHECKPOINT_ID_KEY)
-            .map_err(|e| anyhow::anyhow!(e))
-            .and_then(|raw| raw.map(|v| Self::decode_marker(&v)).transpose())
-    }
-
-    pub fn next_marker(store: &dyn MetadataStore) -> anyhow::Result<u64> {
-        let current = Self::read_marker(store)?.unwrap_or(0);
-        current.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("Catalog checkpoint marker overflow at value {}", current)
-        })
-    }
-
-    pub fn write_metadata_batch(
-        store: &dyn MetadataStore,
-        catalog_bytes: Vec<u8>,
-    ) -> anyhow::Result<u64> {
-        let checkpoint_marker = Self::next_marker(store)?;
-        let marker_bytes = checkpoint_marker.to_le_bytes().to_vec();
-        let metadata_ops = vec![
-            MetadataOp::Put {
-                key: CATALOG_CHECKPOINT_KEY.to_string(),
-                value: catalog_bytes,
-            },
-            MetadataOp::Put {
-                key: CATALOG_CHECKPOINT_ID_KEY.to_string(),
-                value: marker_bytes,
-            },
-        ];
-        store
-            .write_batch(&metadata_ops)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(checkpoint_marker)
-    }
-
+impl CatalogWriter {
     pub fn serialize(catalog: &ParoCatalog) -> anyhow::Result<Vec<u8>> {
-        let txn = CatalogSnapshot::read_only(u64::MAX);
+        Self::serialize_at(catalog, u64::MAX)
+    }
+
+    pub fn serialize_view(catalog: &ParoCatalog, view: &CheckpointView) -> anyhow::Result<Vec<u8>> {
+        Self::serialize_at(catalog, view.catalog_snapshot_ts)
+    }
+
+    fn serialize_at(catalog: &ParoCatalog, snapshot_ts: u64) -> anyhow::Result<Vec<u8>> {
+        let txn = CatalogSnapshot::read_only(snapshot_ts);
         let schema_entries = catalog
             .get_schema_collection()
             .scan(txn.transaction_id, txn.start_time);
@@ -85,7 +43,7 @@ impl CatalogCheckpoint {
                 .serialize_metadata()
                 .map_err(|e| anyhow::anyhow!(e))?;
             let contents = schema
-                .serialize_contents()
+                .serialize_contents_at(snapshot_ts)
                 .map_err(|e| anyhow::anyhow!(e))?;
             schema_payloads.push((schema.base.name.clone(), metadata, contents));
         }
@@ -105,7 +63,7 @@ impl CatalogCheckpoint {
 
         let schema_count = u64::try_from(schema_payloads.len()).map_err(|_| {
             anyhow::anyhow!(
-                "Catalog checkpoint schema count overflow: {}",
+                "Catalog snapshot schema count overflow: {}",
                 schema_payloads.len()
             )
         })?;
@@ -119,8 +77,8 @@ impl CatalogCheckpoint {
         }
 
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(CATALOG_CHECKPOINT_MAGIC);
-        bytes.write_all(&CATALOG_CHECKPOINT_VERSION.to_le_bytes())?;
+        bytes.extend_from_slice(CATALOG_SNAPSHOT_MAGIC);
+        bytes.write_all(&CATALOG_SNAPSHOT_VERSION.to_le_bytes())?;
         bytes.write_all(&(body.len() as u32).to_le_bytes())?;
         bytes.extend_from_slice(&body);
         bytes.write_all(&crc32(&body).to_le_bytes())?;
@@ -136,10 +94,10 @@ impl CatalogCheckpoint {
 
         let mut magic = [0u8; 4];
         cursor.read_exact(&mut magic)?;
-        if &magic != CATALOG_CHECKPOINT_MAGIC {
+        if &magic != CATALOG_SNAPSHOT_MAGIC {
             return Err(anyhow::anyhow!(
-                "Invalid catalog checkpoint magic: expected {:?}, got {:?}",
-                CATALOG_CHECKPOINT_MAGIC,
+                "Invalid catalog snapshot magic: expected {:?}, got {:?}",
+                CATALOG_SNAPSHOT_MAGIC,
                 magic
             ));
         }
@@ -147,9 +105,9 @@ impl CatalogCheckpoint {
         let mut version_buf = [0u8; 2];
         cursor.read_exact(&mut version_buf)?;
         let version = u16::from_le_bytes(version_buf);
-        if version != CATALOG_CHECKPOINT_VERSION {
+        if version != CATALOG_SNAPSHOT_VERSION {
             return Err(anyhow::anyhow!(
-                "Unsupported catalog checkpoint version {}",
+                "Unsupported catalog snapshot version {}",
                 version
             ));
         }
@@ -167,7 +125,7 @@ impl CatalogCheckpoint {
         let actual_checksum = crc32(&body);
         if actual_checksum != expected_checksum {
             return Err(anyhow::anyhow!(
-                "Catalog checkpoint checksum mismatch: expected {}, got {}",
+                "Catalog snapshot checksum mismatch: expected {}, got {}",
                 expected_checksum,
                 actual_checksum
             ));
@@ -175,7 +133,7 @@ impl CatalogCheckpoint {
 
         if cursor.position() != bytes.len() as u64 {
             return Err(anyhow::anyhow!(
-                "Catalog checkpoint has trailing bytes: {}",
+                "Catalog snapshot has trailing bytes: {}",
                 bytes.len() as u64 - cursor.position()
             ));
         }
@@ -183,46 +141,10 @@ impl CatalogCheckpoint {
         Self::deserialize_body(&body, catalog, tablet_meta)
     }
 
-    pub fn load_from_store(
-        catalog: &ParoCatalog,
-        store: &dyn MetadataStore,
-        tablet_meta: Option<Arc<TabletMetaManager>>,
-    ) -> anyhow::Result<()> {
-        let checkpoint_data = store
-            .get(CATALOG_CHECKPOINT_KEY)
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        if let Some(bytes) = checkpoint_data {
-            tracing::info!(
-                target: paro_common::logging::targets::CHECKPOINT,
-                db = %catalog.name(),
-                bytes = bytes.len(),
-                "Loading catalog from checkpoint"
-            );
-            Self::deserialize(&bytes, catalog, tablet_meta)?;
-        } else {
-            tracing::debug!(
-                target: paro_common::logging::targets::CHECKPOINT,
-                db = %catalog.name(),
-                "No catalog checkpoint found in MetadataStore"
-            );
-        }
-
-        Ok(())
-    }
-
-    pub fn marker_from_storage(storage: &dyn StorageManager) -> anyhow::Result<Option<u64>> {
-        storage
-            .get_metadata_store()
-            .map(Self::read_marker)
-            .transpose()
-            .map(|value| value.flatten())
-    }
-
     fn write_field(buf: &mut Vec<u8>, field: &str, payload: &[u8]) -> anyhow::Result<()> {
         let len = u32::try_from(payload.len()).map_err(|_| {
             anyhow::anyhow!(
-                "Catalog checkpoint field '{}' is too large: {} bytes",
+                "Catalog snapshot field '{}' is too large: {} bytes",
                 field,
                 payload.len()
             )
@@ -254,7 +176,7 @@ impl CatalogCheckpoint {
             let payload = Self::read_field(&mut cursor)?;
             if payload.len() != 8 {
                 return Err(anyhow::anyhow!(
-                    "Catalog checkpoint field 'object_id_allocator_watermark' is too large: {} bytes",
+                    "Catalog snapshot field 'object_id_allocator_watermark' is too large: {} bytes",
                     payload.len()
                 ));
             }
@@ -291,7 +213,7 @@ impl CatalogCheckpoint {
 
         if cursor.position() != body.len() as u64 {
             return Err(anyhow::anyhow!(
-                "Catalog checkpoint body has trailing bytes: {}",
+                "Catalog snapshot body has trailing bytes: {}",
                 body.len() as u64 - cursor.position()
             ));
         }
@@ -303,13 +225,17 @@ impl CatalogCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::view::{CheckpointCut, CheckpointView};
     use paro_catalog::catalog::Catalog;
     use paro_catalog::entry::{
         CatalogEntryEnum, CreateIndexInfo, CreateSequenceInfo, CreateViewInfo, IndexBuildState,
         IndexCatalogEntry, LogicalIndex, SequenceCatalogEntry, ViewCatalogEntry,
     };
+    use paro_common::checkpoint::{CheckpointFrontier, RecoverySummary};
     use paro_common::types::LogicalType;
     use paro_parser::parse_one;
+    use paro_storage::meta::{FileMetadataStore, MetadataStore};
+    use tempfile::tempdir;
 
     fn parse_query(sql: &str) -> Box<paro_parser::ast::Query> {
         match parse_one(sql).expect("query should parse").stmt {
@@ -318,8 +244,18 @@ mod tests {
         }
     }
 
+    fn create_test_meta_manager() -> Arc<TabletMetaManager> {
+        let temp_dir = tempdir().unwrap();
+        let store: Arc<dyn MetadataStore> =
+            Arc::new(FileMetadataStore::new(temp_dir.path().join("meta")).unwrap());
+        Arc::new(TabletMetaManager::with_store_and_data_root(
+            store,
+            temp_dir.keep(),
+        ))
+    }
+
     #[test]
-    fn checkpoint_roundtrip_preserves_view_and_sequence_oid() {
+    fn catalog_snapshot_roundtrip_preserves_view_and_sequence_oid() {
         let catalog = ParoCatalog::new("test_db".to_string());
         catalog.initialize(false);
         catalog.set_object_id_allocator(1_000_000_000_000);
@@ -404,11 +340,16 @@ mod tests {
             .object_id();
         let original_allocator_watermark = catalog.current_object_id();
 
-        let checkpoint_bytes = CatalogCheckpoint::serialize(&catalog).unwrap();
+        let checkpoint_bytes = CatalogWriter::serialize(&catalog).unwrap();
 
         let restored = ParoCatalog::new("test_db".to_string());
         restored.initialize(false);
-        CatalogCheckpoint::deserialize(&checkpoint_bytes, &restored, None).unwrap();
+        CatalogWriter::deserialize(
+            &checkpoint_bytes,
+            &restored,
+            Some(create_test_meta_manager()),
+        )
+        .unwrap();
 
         let restored_schema = restored.get_schema(&read_txn, "public").unwrap();
         let restored_view_oid = restored_schema
@@ -444,5 +385,86 @@ mod tests {
         let allocated_after_restore = restored.next_object_id();
         assert!(allocated_after_restore >= restored_allocator_watermark);
         assert!(restored.current_object_id() > allocated_after_restore);
+    }
+
+    #[test]
+    fn serialize_view_respects_catalog_snapshot_ts() {
+        let catalog = ParoCatalog::new("test_db".to_string());
+        catalog.initialize(false);
+
+        let read_txn = CatalogSnapshot::read_only(u64::MAX);
+        let schema = catalog.get_schema(&read_txn, "public").unwrap();
+        let views = schema
+            .collection(CatalogType::View)
+            .expect("view collection");
+
+        let before_cut = Arc::new(CatalogEntryEnum::View(Arc::new(ViewCatalogEntry::new(
+            CreateViewInfo::new(
+                "public".to_string(),
+                "before_cut".to_string(),
+                parse_query("SELECT 1 AS id"),
+            )
+            .with_column_names(vec!["id".to_string()])
+            .with_column_types(vec![LogicalType::Integer]),
+            100,
+            catalog.name().to_string(),
+        ))));
+        views
+            .install_replayed(10, before_cut, InstallMode::RejectExisting)
+            .expect("pre-cut view install should succeed");
+
+        let after_cut = Arc::new(CatalogEntryEnum::View(Arc::new(ViewCatalogEntry::new(
+            CreateViewInfo::new(
+                "public".to_string(),
+                "after_cut".to_string(),
+                parse_query("SELECT 2 AS id"),
+            )
+            .with_column_names(vec!["id".to_string()])
+            .with_column_types(vec![LogicalType::Integer]),
+            101,
+            catalog.name().to_string(),
+        ))));
+        views
+            .install_replayed(11, after_cut, InstallMode::RejectExisting)
+            .expect("post-cut view install should succeed");
+
+        let view = CheckpointView::new(
+            CheckpointCut {
+                target_lsn: 4,
+                issued_at_micros: 1,
+            },
+            CheckpointFrontier {
+                checkpoint_lsn: 4,
+                checkpoint_commit_id: 10,
+                checkpoint_maintenance_id: 0,
+            },
+            RecoverySummary {
+                max_lsn: 4,
+                max_commit_id: 10,
+                max_maintenance_id: 0,
+                max_catalog_commit_id: 10,
+                max_seen_object_id: 101,
+            },
+            11,
+        )
+        .expect("checkpoint view should be aligned");
+
+        let checkpoint_bytes = CatalogWriter::serialize_view(&catalog, &view).unwrap();
+        let restored = ParoCatalog::new("test_db".to_string());
+        restored.initialize(false);
+        CatalogWriter::deserialize(
+            &checkpoint_bytes,
+            &restored,
+            Some(create_test_meta_manager()),
+        )
+        .unwrap();
+
+        let restored_schema = restored.get_schema(&read_txn, "public").unwrap();
+        assert!(restored_schema
+            .get_view(read_txn.transaction_id, read_txn.start_time, "before_cut")
+            .is_some());
+        assert!(restored_schema
+            .get_view(read_txn.transaction_id, read_txn.start_time, "after_cut")
+            .is_none());
     }
 }

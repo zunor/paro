@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Buffered WAL file writing with checksums and checkpoint-aware file handling.
+//! Buffered WAL file writing with checksums and explicit flush handling.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -304,21 +304,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Write a checkpoint marker.
-    ///
-    /// This writes a checkpoint entry to the WAL containing a checkpoint marker.
-    /// During recovery, this marker is used to verify if the checkpoint completed:
-    /// - If the metadata-store marker matches this WAL marker, checkpoint succeeded
-    /// - If they don't match, the checkpoint was incomplete and WAL replay is needed
-    ///
-    /// # Arguments
-    /// * `checkpoint_marker` - Logical marker persisted alongside checkpoint metadata.
-    pub fn write_checkpoint(&self, checkpoint_marker: u64) -> Result<()> {
-        let mut data = Vec::with_capacity(8);
-        data.extend_from_slice(&checkpoint_marker.to_le_bytes());
-        self.write_entry(WalType::Checkpoint, &data)
-    }
-
     /// Write a RowsetCommit entry.
     ///
     /// Format:
@@ -356,20 +341,6 @@ impl WalWriter {
             replaced_inputs: record.replaced_inputs.clone(),
         };
         self.write_entry(WalType::CompactionPublish, &entry.serialize_data())
-    }
-
-    /// Write a checkpoint start marker.
-    ///
-    /// This is written at the beginning of a checkpoint operation to indicate
-    /// that a checkpoint is in progress. If recovery finds this marker without
-    /// a corresponding checkpoint completion, it knows the checkpoint failed.
-    ///
-    /// # Arguments
-    /// * `checkpoint_marker` - Expected checkpoint marker for this checkpoint cycle.
-    pub fn write_checkpoint_start(&self, checkpoint_marker: u64) -> Result<()> {
-        // Write checkpoint marker - same format as write_checkpoint
-        // The distinction is in how it's used during recovery
-        self.write_checkpoint(checkpoint_marker)
     }
 
     /// Write a flush marker and sync to disk.
@@ -466,7 +437,14 @@ mod tests {
         let path = dir.path().join("test.wal");
 
         let wal = WalWriter::new(&path, WalInitState::Uninitialized);
-        wal.write_entry(WalType::Checkpoint, &42u64.to_le_bytes())
+        let entry = WalEntry::RowsetCommit {
+            tablet_id: 1,
+            rowset_id: 2,
+            start_version: 0,
+            end_version: 1,
+            rowset_path: "rs".to_string(),
+        };
+        wal.write_entry(entry.wal_type(), &entry.serialize_data())
             .unwrap();
 
         assert!(wal.file_size() > 0);

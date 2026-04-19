@@ -192,7 +192,7 @@ impl ColumnStatistics {
     /// Serialize the ColumnStatistics to a writer.
     pub fn serialize<W: Write>(&self, w: &mut W) -> Result<()> {
         // Serialize base statistics
-        let stats_bytes = self.stats.serialize()?;
+        let stats_bytes = self.stats.to_bytes()?;
         w.write_all(&(stats_bytes.len() as u32).to_le_bytes())?;
         w.write_all(&stats_bytes)?;
 
@@ -217,7 +217,7 @@ impl ColumnStatistics {
 
         let mut stats_bytes = vec![0u8; stats_len];
         r.read_exact(&mut stats_bytes)?;
-        let stats = BaseStatistics::deserialize(&stats_bytes, data_type)?;
+        let stats = BaseStatistics::from_bytes(&stats_bytes, data_type)?;
 
         // Deserialize distinct statistics presence flag
         let mut has_distinct_buf = [0u8; 1];
@@ -332,8 +332,8 @@ mod tests {
         let mut stats2 = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
 
         // Update base statistics
-        stats1.statistics_mut().update(&Value::Integer(10));
-        stats2.statistics_mut().update(&Value::Integer(20));
+        stats1.statistics_mut().observe_value(&Value::Integer(10));
+        stats2.statistics_mut().observe_value(&Value::Integer(20));
 
         // Update distinct statistics
         let hashes1: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
@@ -347,8 +347,8 @@ mod tests {
         stats1.merge(&stats2);
 
         // Check base statistics merged
-        assert_eq!(stats1.statistics().min(), Some(Value::Integer(10)));
-        assert_eq!(stats1.statistics().max(), Some(Value::Integer(20)));
+        assert_eq!(stats1.statistics().min_value(), Some(Value::Integer(10)));
+        assert_eq!(stats1.statistics().max_value(), Some(Value::Integer(20)));
 
         // Check distinct statistics merged
         let merged_count = stats1.get_distinct_count();
@@ -375,22 +375,28 @@ mod tests {
     #[test]
     fn test_copy() {
         let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
-        stats.statistics_mut().update(&Value::Integer(42));
+        stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
         stats.update_distinct_statistics_full(&hashes, hashes.len());
 
         let copy = stats.copy();
 
-        assert_eq!(stats.statistics().min(), copy.statistics().min());
-        assert_eq!(stats.statistics().max(), copy.statistics().max());
+        assert_eq!(
+            stats.statistics().min_value(),
+            copy.statistics().min_value()
+        );
+        assert_eq!(
+            stats.statistics().max_value(),
+            copy.statistics().max_value()
+        );
         assert_eq!(stats.get_distinct_count(), copy.get_distinct_count());
     }
 
     #[test]
     fn test_serialize_deserialize() {
         let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
-        stats.statistics_mut().update(&Value::Integer(42));
+        stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
         stats.update_distinct_statistics_full(&hashes, hashes.len());
@@ -399,8 +405,14 @@ mod tests {
         let restored = ColumnStatistics::from_bytes(&bytes, LogicalType::Integer)
             .expect("Deserialization failed");
 
-        assert_eq!(stats.statistics().min(), restored.statistics().min());
-        assert_eq!(stats.statistics().max(), restored.statistics().max());
+        assert_eq!(
+            stats.statistics().min_value(),
+            restored.statistics().min_value()
+        );
+        assert_eq!(
+            stats.statistics().max_value(),
+            restored.statistics().max_value()
+        );
         assert_eq!(stats.has_distinct_stats(), restored.has_distinct_stats());
         assert_eq!(stats.get_distinct_count(), restored.get_distinct_count());
     }
@@ -454,7 +466,7 @@ mod tests {
     #[test]
     fn test_to_string() {
         let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
-        stats.statistics_mut().update(&Value::Integer(42));
+        stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let s = stats.to_string();
         assert!(!s.is_empty());

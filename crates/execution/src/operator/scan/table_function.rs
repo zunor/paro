@@ -1365,10 +1365,10 @@ fn populate_paro_storage_info(
                     distinct_count: stats
                         .map(|stats| stats.get_distinct_count().min(i64::MAX as usize) as i64),
                     min_value: base_stats
-                        .and_then(|stats| stats.min())
+                        .and_then(|stats| stats.min_value())
                         .map(|value| value.to_string()),
                     max_value: base_stats
-                        .and_then(|stats| stats.max())
+                        .and_then(|stats| stats.max_value())
                         .map(|value| value.to_string()),
                     has_hnsw_index: segment.hnsw_index(meta.column_id).is_some(),
                     has_sparse_index: segment.sparse_index(meta.column_id).is_some(),

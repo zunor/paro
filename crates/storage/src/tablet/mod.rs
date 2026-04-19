@@ -41,7 +41,6 @@
 //! - `tablet_schema`: Schema definition for Tablet columns
 //! - `tablet_reader`: Cross-Rowset merge reader
 
-mod apply_planner;
 mod delete_intent_store;
 mod prepared_txn_registry;
 mod primary_index;
@@ -54,26 +53,33 @@ mod tablet_reader_params;
 mod tablet_rowid_lookup;
 mod tablet_runtime;
 pub mod tablet_schema;
+mod wal_replay;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const DEFAULT_DELETE_PATCH_INLINE_ROW_REF_THRESHOLD: usize = 256;
+static DELETE_PATCH_INLINE_ROW_REF_THRESHOLD: AtomicUsize =
+    AtomicUsize::new(DEFAULT_DELETE_PATCH_INLINE_ROW_REF_THRESHOLD);
 
 // Re-export main types
-pub(crate) use apply_planner::{
-    build_delete_patch_from_primary_keys, build_delete_patch_from_row_refs,
-    capture_prepare_snapshot, materialize_delete_patch, PrepareSnapshot,
-};
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::TabletMeta;
 pub use tablet_reader::TabletReader;
 pub use tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
 pub use tablet_runtime::{
-    PhysicalRowRef, PrimaryIndexUpdate, RetiredGcBarrier, RetiredPendingGcStatus, Tablet, TabletId,
-    TabletIdentity, TabletReadGuard, TabletRef, TabletState, Version, VersionGap,
+    CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,
+    CheckpointTabletSnapshot, PhysicalRowRef, PrimaryIndexUpdate, RetiredGcBarrier,
+    RetiredPendingGcStatus, Tablet, TabletId, TabletIdentity, TabletReadGuard, TabletRef,
+    TabletState, Version, VersionGap,
 };
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
 
 pub fn set_delete_patch_inline_row_ref_threshold(threshold: usize) {
-    apply_planner::set_delete_patch_inline_row_ref_threshold(threshold);
+    DELETE_PATCH_INLINE_ROW_REF_THRESHOLD.store(threshold.max(1), Ordering::Relaxed);
 }
 
 pub fn current_delete_patch_inline_row_ref_threshold() -> usize {
-    apply_planner::current_delete_patch_inline_row_ref_threshold()
+    DELETE_PATCH_INLINE_ROW_REF_THRESHOLD
+        .load(Ordering::Relaxed)
+        .max(1)
 }

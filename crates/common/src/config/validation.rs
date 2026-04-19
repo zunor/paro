@@ -123,13 +123,55 @@ impl ParoConfig {
             )));
         }
 
-        // Checkpoint threshold must be reasonable
+        // Checkpoint trigger must be reasonable
         const MIN_CHECKPOINT: usize = 1024 * 1024; // 1MB
-        if self.storage.wal.checkpoint_threshold < MIN_CHECKPOINT {
+        if self.storage.checkpoint.trigger_bytes < MIN_CHECKPOINT {
             return Err(ConfigError::Validation(format!(
-                "storage.wal.checkpoint_threshold must be at least 1MB, got {} bytes",
-                self.storage.wal.checkpoint_threshold
+                "storage.checkpoint.trigger_bytes must be at least 1MB, got {} bytes",
+                self.storage.checkpoint.trigger_bytes
             )));
+        }
+
+        if self.storage.checkpoint.trigger_interval.is_zero() {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.trigger_interval must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.storage.checkpoint.drain_timeout.is_zero() {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.drain_timeout must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.storage.checkpoint.max_concurrent_writers == 0 {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.max_concurrent_writers must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.storage.checkpoint.artifact_gc_batch_size == 0 {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.artifact_gc_batch_size must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.storage.checkpoint.artifact_gc_delete_budget == 0 {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.artifact_gc_delete_budget must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.storage.checkpoint.checkpoint_gc_delete_budget == 0 {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.checkpoint_gc_delete_budget must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.storage.checkpoint.segment_prune_delete_budget == 0 {
+            return Err(ConfigError::Validation(
+                "storage.checkpoint.segment_prune_delete_budget must be greater than 0".to_string(),
+            ));
         }
 
         Ok(())
@@ -171,6 +213,21 @@ mod tests {
     fn test_invalid_buffer_pool() {
         let mut config = ParoConfig::default();
         config.storage.buffer_pool.size = 1024; // Too small
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_checkpoint_config() {
+        let mut config = ParoConfig::default();
+        config.storage.checkpoint.trigger_bytes = 128;
+        assert!(config.validate().is_err());
+
+        let mut config = ParoConfig::default();
+        config.storage.checkpoint.max_concurrent_writers = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = ParoConfig::default();
+        config.storage.checkpoint.artifact_gc_delete_budget = 0;
         assert!(config.validate().is_err());
     }
 

@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{create_table, create_table_from_specs};
+use common::{create_table, create_table_from_specs_with_meta_manager, create_test_meta_manager};
 use paro_catalog::catalog::Catalog;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{
@@ -20,6 +20,7 @@ use std::sync::Arc;
 fn catalog_descriptor_roundtrip_test() {
     let catalog = ParoCatalog::new("test_db".to_string());
     catalog.initialize(false);
+    let meta_manager = create_test_meta_manager();
 
     let transaction_id = TRANSACTION_ID_START + 100;
     let start_time = TRANSACTION_ID_START + 1_000;
@@ -40,20 +41,23 @@ fn catalog_descriptor_roundtrip_test() {
             comment: None,
         },
     ];
-    let storage = Arc::new(create_table_from_specs(&[
-        TableColumnSpec {
-            name: "id".to_string(),
-            logical_type: LogicalType::BigInt,
-            is_key: true,
-            not_null: true,
-        },
-        TableColumnSpec {
-            name: "payload".to_string(),
-            logical_type: LogicalType::Varchar,
-            is_key: false,
-            not_null: false,
-        },
-    ]));
+    let storage = Arc::new(create_table_from_specs_with_meta_manager(
+        &[
+            TableColumnSpec {
+                name: "id".to_string(),
+                logical_type: LogicalType::BigInt,
+                is_key: true,
+                not_null: true,
+            },
+            TableColumnSpec {
+                name: "payload".to_string(),
+                logical_type: LogicalType::Varchar,
+                is_key: false,
+                not_null: false,
+            },
+        ],
+        meta_manager.clone(),
+    ));
     let expected_descriptor = storage.to_descriptor().unwrap();
 
     catalog
@@ -76,7 +80,8 @@ fn catalog_descriptor_roundtrip_test() {
     };
 
     let bytes = table.serialize().unwrap();
-    let restored = TableCatalogEntry::deserialize(&bytes, "test_db".to_string(), None).unwrap();
+    let restored =
+        TableCatalogEntry::deserialize(&bytes, "test_db".to_string(), Some(meta_manager)).unwrap();
 
     assert_eq!(
         restored.get_storage_descriptor().unwrap(),
@@ -93,6 +98,7 @@ fn catalog_descriptor_roundtrip_test() {
 fn catalog_descriptor_roundtrip_with_constraints_test() {
     let catalog = ParoCatalog::new("test_db".to_string());
     catalog.initialize(false);
+    let meta_manager = create_test_meta_manager();
 
     let txn_id = TRANSACTION_ID_START + 200;
     let start_time = TRANSACTION_ID_START + 2_000;
@@ -113,20 +119,23 @@ fn catalog_descriptor_roundtrip_with_constraints_test() {
             comment: None,
         },
     ];
-    let storage = Arc::new(create_table_from_specs(&[
-        TableColumnSpec {
-            name: "pk_col".to_string(),
-            logical_type: LogicalType::Integer,
-            is_key: true,
-            not_null: true,
-        },
-        TableColumnSpec {
-            name: "val".to_string(),
-            logical_type: LogicalType::Double,
-            is_key: false,
-            not_null: false,
-        },
-    ]));
+    let storage = Arc::new(create_table_from_specs_with_meta_manager(
+        &[
+            TableColumnSpec {
+                name: "pk_col".to_string(),
+                logical_type: LogicalType::Integer,
+                is_key: true,
+                not_null: true,
+            },
+            TableColumnSpec {
+                name: "val".to_string(),
+                logical_type: LogicalType::Double,
+                is_key: false,
+                not_null: false,
+            },
+        ],
+        meta_manager.clone(),
+    ));
     let expected_descriptor = storage.to_descriptor().unwrap();
 
     catalog
@@ -149,7 +158,8 @@ fn catalog_descriptor_roundtrip_with_constraints_test() {
     };
 
     let bytes = table.serialize().unwrap();
-    let restored = TableCatalogEntry::deserialize(&bytes, "test_db".to_string(), None).unwrap();
+    let restored =
+        TableCatalogEntry::deserialize(&bytes, "test_db".to_string(), Some(meta_manager)).unwrap();
 
     assert_eq!(restored.columns.len(), 2);
     assert_eq!(restored.columns[0].name, "pk_col");

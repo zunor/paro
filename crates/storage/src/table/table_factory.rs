@@ -112,20 +112,12 @@ impl TableFactory {
     ) -> Result<TableHandle> {
         descriptor.validate()?;
         let data_dir = PathBuf::from(&descriptor.data_dir);
-        let meta_path = data_dir.join("tablet_meta");
-        let identity = descriptor.identity();
-
-        let tablet = if self.meta_manager.is_some() || meta_path.exists() {
-            Tablet::open(descriptor.tablet_id, &data_dir, self.meta_manager.clone())?
-        } else {
-            let schema = build_schema_from_types(
-                types,
-                descriptor.keys_type_enum()?,
-                identity.schema_id,
-                identity.schema_version,
-            )?;
-            self.bootstrap_tablet(identity, schema)?
-        };
+        let meta_manager = self.meta_manager.clone().ok_or_else(|| {
+            paro_error::invalid_input(
+                "TableFactory::open_from_descriptor requires an explicit TabletMetaManager",
+            )
+        })?;
+        let tablet = Tablet::open(descriptor.tablet_id, &data_dir, meta_manager)?;
 
         validate_descriptor_match(&tablet, descriptor)?;
 

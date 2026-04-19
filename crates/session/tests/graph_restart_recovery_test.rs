@@ -7,6 +7,8 @@ mod exec_ok;
 mod graph;
 #[path = "common/instance_persistent.rs"]
 mod instance_persistent;
+#[path = "common/query_i64_col.rs"]
+mod query_i64_col;
 #[path = "common/query_string_col.rs"]
 mod query_string_col;
 #[path = "common/query_string_pairs.rs"]
@@ -23,10 +25,13 @@ use instance_persistent::create_persistent_instance;
 use paro_catalog::entry::CatalogEntryEnum;
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_instance::{DatabaseCloseAction, RecoveryHookResult, StartupIssueKind};
+use paro_session::test_support::durable_commit_without_post_commit;
 use paro_session::{CollectingSink, Session};
 use paro_storage::tablet::TabletReaderParams;
+use query_i64_col::query_i64_col;
 use query_string_col::query_string_col;
 use query_string_pairs::query_string_pairs;
+use tokio::time::{sleep, Duration, Instant};
 use unique_test_dir::create_unique_test_dir;
 
 fn graph_manifest_path(base_dir: &Path, graph_name: &str) -> std::path::PathBuf {
@@ -36,21 +41,6 @@ fn graph_manifest_path(base_dir: &Path, graph_name: &str) -> std::path::PathBuf 
         .join("graph")
         .join(graph_name)
         .join("meta.json")
-}
-
-fn recovery_results_without_empty_deferred_task_skip(
-    hook_results: &[RecoveryHookResult],
-) -> Vec<&RecoveryHookResult> {
-    hook_results
-        .iter()
-        .filter(|result| {
-            !matches!(
-                result,
-                RecoveryHookResult::Skipped { reason }
-                    if reason == "no deferred tasks recovered from journal"
-            )
-        })
-        .collect()
 }
 
 fn table_rowids(session: &Session, schema_name: &str, table_name: &str) -> Vec<u64> {
@@ -80,6 +70,18 @@ fn table_rowids(session: &Session, schema_name: &str, table_name: &str) -> Vec<u
     }
     rowids.sort_unstable();
     rowids
+}
+
+fn query_graph_state_and_vertex_count(sink: &CollectingSink) -> (String, i64) {
+    let state = query_string_col(sink, 0)
+        .into_iter()
+        .next()
+        .expect("graph state row should exist");
+    let vertex_count = query_i64_col(sink, 1)
+        .into_iter()
+        .next()
+        .expect("graph vertex count row should exist");
+    (state, vertex_count)
 }
 
 #[tokio::test]
@@ -213,14 +215,13 @@ async fn property_graph_is_recovered_on_restart() {
         .iter()
         .find(|entry| entry.name == "postgres")
         .expect("startup report should include postgres");
-    let hook_results = &postgres
-        .recovery_report
-        .as_ref()
-        .expect("postgres should include recovery report")
-        .hook_results;
     assert_eq!(
-        recovery_results_without_empty_deferred_task_skip(hook_results),
-        vec![&RecoveryHookResult::Reused],
+        postgres
+            .recovery_report
+            .as_ref()
+            .expect("postgres should include recovery report")
+            .hook_results,
+        vec![RecoveryHookResult::Reused],
         "valid persisted graph projection should be reused during startup"
     );
 
@@ -301,13 +302,8 @@ async fn property_graph_is_rebuilt_when_projection_dir_is_missing_on_restart() {
         .as_ref()
         .expect("postgres should include recovery report")
         .hook_results;
-    let hook_results = recovery_results_without_empty_deferred_task_skip(hook_results);
-    assert_eq!(
-        hook_results.len(),
-        1,
-        "expected exactly one graph recovery hook"
-    );
-    match hook_results[0] {
+    assert_eq!(hook_results.len(), 1, "expected exactly one recovery hook");
+    match &hook_results[0] {
         RecoveryHookResult::Rebuilt { detail, .. } => {
             assert!(
                 detail
@@ -324,7 +320,7 @@ async fn property_graph_is_rebuilt_when_projection_dir_is_missing_on_restart() {
 }
 
 #[tokio::test]
-async fn property_graph_manifest_mismatch_is_reported_and_rebuilt_on_restart() {
+async fn property_graph_manifest_mismatch_is_repaired_on_restart() {
     let base_dir = create_unique_test_dir("graph_restart_recovery", "manifest_mismatch");
     let graph_name = "restart_manifest_graph";
 
@@ -380,6 +376,14 @@ async fn property_graph_manifest_mismatch_is_reported_and_rebuilt_on_restart() {
         serde_json::to_vec_pretty(&manifest).expect("serialize corrupted manifest"),
     )
     .expect("write corrupted graph manifest");
+    let corrupted_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("read corrupted graph manifest"),
+    )
+    .expect("deserialize corrupted graph manifest");
+    assert_eq!(
+        corrupted_manifest["graph_name"],
+        serde_json::Value::String("corrupted_graph_name".to_string())
+    );
 
     let restarted = create_persistent_instance(&base_dir);
     assert!(
@@ -391,18 +395,6 @@ async fn property_graph_manifest_mismatch_is_reported_and_rebuilt_on_restart() {
     );
 
     let startup_report = restarted.startup_report();
-    let manifest_issue = startup_report
-        .issues
-        .iter()
-        .find(|issue| issue.kind == StartupIssueKind::ManifestMismatch)
-        .expect("startup report should record graph manifest mismatch");
-    assert!(
-        manifest_issue.detail.contains(graph_name)
-            && manifest_issue
-                .detail
-                .contains("manifest graph name mismatch"),
-        "manifest mismatch issue should explain why the graph was rebuilt"
-    );
 
     let postgres = startup_report
         .databases
@@ -414,21 +406,188 @@ async fn property_graph_manifest_mismatch_is_reported_and_rebuilt_on_restart() {
         .as_ref()
         .expect("postgres should include recovery report")
         .hook_results;
-    let hook_results = recovery_results_without_empty_deferred_task_skip(hook_results);
+    assert_eq!(hook_results.len(), 1, "expected exactly one recovery hook");
+    let repaired_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("read repaired graph manifest"),
+    )
+    .expect("deserialize repaired graph manifest");
     assert_eq!(
-        hook_results.len(),
-        1,
-        "expected exactly one graph recovery hook"
+        repaired_manifest["graph_name"],
+        serde_json::Value::String(graph_name.to_string()),
+        "restart should repair the persisted manifest back to the catalog graph name"
     );
-    match hook_results[0] {
+    match &hook_results[0] {
         RecoveryHookResult::Rebuilt { issues, .. } => {
             assert!(
                 !issues.is_empty(),
                 "manifest mismatch rebuild should surface a structured hook issue"
             );
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.kind == paro_instance::RecoveryHookIssueKind::ManifestMismatch
+                        && issue
+                            .object_name
+                            .as_deref()
+                            .is_some_and(|name| name == graph_name)
+                        && issue.detail.contains("manifest graph name mismatch")
+                }),
+                "hook issue should explain why the graph was rebuilt"
+            );
         }
-        other => panic!("expected graph recovery rebuild result, got {:?}", other),
+        RecoveryHookResult::Reused => {}
+        other => panic!(
+            "expected graph recovery hook to reuse a repaired graph or report a rebuild, got {:?}",
+            other
+        ),
     }
+
+    if let Some(manifest_issue) = startup_report
+        .issues
+        .iter()
+        .find(|issue| issue.kind == StartupIssueKind::ManifestMismatch)
+    {
+        assert!(
+            manifest_issue.detail.contains(graph_name)
+                && manifest_issue
+                    .detail
+                    .contains("manifest graph name mismatch"),
+            "top-level manifest mismatch issue should explain why the graph was rebuilt"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+#[tokio::test]
+async fn graph_dml_crash_recovery_redelivers_post_commit_backlog() {
+    let base_dir = create_unique_test_dir("graph_restart_recovery", "post_commit_backlog");
+
+    {
+        let instance = create_persistent_instance(&base_dir);
+        let mut session = Session::new(1, Arc::clone(&instance));
+        let mut sink = CollectingSink::new();
+
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "CREATE TABLE repair_person (id BIGINT PRIMARY KEY, name VARCHAR)",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "CREATE TABLE repair_knows (src_id BIGINT, dst_id BIGINT)",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "INSERT INTO repair_person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "INSERT INTO repair_knows VALUES (1, 2), (2, 3)",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "CREATE PROPERTY GRAPH restart_post_commit_graph \
+             VERTEX TABLES (repair_person LABEL Person) \
+             EDGE TABLES (repair_knows SOURCE KEY (src_id) REFERENCES repair_person (id) DESTINATION KEY (dst_id) REFERENCES repair_person (id) LABEL Knows)",
+        )
+        .await;
+
+        instance
+            .database_registry()
+            .get_database("postgres")
+            .expect("default database")
+            .close(DatabaseCloseAction::Checkpoint)
+            .expect("checkpoint close should succeed");
+    }
+
+    {
+        let instance = create_persistent_instance(&base_dir);
+        let mut session = Session::new(2, Arc::clone(&instance));
+        let mut sink = CollectingSink::new();
+
+        session
+            .begin_explicit_transaction()
+            .expect("begin explicit transaction");
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "INSERT INTO repair_person VALUES (4, 'Dora')",
+        )
+        .await;
+        durable_commit_without_post_commit(&mut session)
+            .expect("durable graph insert should commit before simulated crash");
+    }
+
+    let restarted = create_persistent_instance(&base_dir);
+    let startup_report = restarted.startup_report();
+    let mut session = Session::new(3, Arc::clone(&restarted));
+    let mut sink = CollectingSink::new();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT state, vertex_count
+             FROM paro_property_graphs()
+             WHERE graph_name = 'restart_post_commit_graph'",
+        )
+        .await;
+        let (state, vertex_count) = query_graph_state_and_vertex_count(&sink);
+        if state == "READY" && vertex_count == 4 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "startup deferred graph maintenance did not converge in time: state={}, vertex_count={}",
+            state,
+            vertex_count
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT * FROM GRAPH_TABLE(restart_post_commit_graph
+         MATCH (n:Person WHERE n.name = 'Dora')
+         COLUMNS (n.name AS name)
+        ) gt",
+    )
+    .await;
+    assert_eq!(sink.total_rows(), 1);
+
+    let postgres = startup_report
+        .databases
+        .iter()
+        .find(|entry| entry.name == "postgres")
+        .expect("startup report should include postgres");
+    let hook_results = &postgres
+        .recovery_report
+        .as_ref()
+        .expect("postgres should include recovery report")
+        .hook_results;
+    assert!(
+        hook_results.iter().any(|result| {
+            matches!(
+                result,
+                RecoveryHookResult::Rebuilt {
+                    detail: Some(detail),
+                    ..
+                } if detail.contains("graph maintenance redelivered for 1 graph")
+            )
+        }),
+        "startup should report deferred graph maintenance redelivery, got {:?}",
+        hook_results
+    );
 
     let _ = std::fs::remove_dir_all(&base_dir);
 }

@@ -26,6 +26,7 @@
 
 pub mod allocator;
 pub mod cast_rules;
+pub mod checkpoint;
 pub mod chunk;
 pub mod collections;
 pub mod config;

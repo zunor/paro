@@ -17,38 +17,6 @@ use std::sync::Arc;
 const GRAPH_LINKS_MAGIC: u32 = u32::from_le_bytes(*b"HGLK");
 const GRAPH_LINKS_VERSION_COMPRESSED_V1: u32 = 1;
 const GRAPH_LINKS_COMPRESSED_HEADER_LEN: usize = 24;
-const GRAPH_LINKS_WRITE_FORMAT_ENV: &str = "PARO_HNSW_GRAPH_LINKS_WRITE_FORMAT";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraphLinksEncoding {
-    LegacyU32,
-    CompressedVarintDeltaV1,
-}
-
-impl Default for GraphLinksEncoding {
-    fn default() -> Self {
-        Self::LegacyU32
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphLinksWriteFormat {
-    Legacy,
-    CompressedV1,
-}
-
-impl GraphLinksWriteFormat {
-    fn from_env() -> Self {
-        match std::env::var(GRAPH_LINKS_WRITE_FORMAT_ENV)
-            .ok()
-            .map(|value| value.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("legacy" | "v0" | "plain") => Self::Legacy,
-            _ => Self::CompressedV1,
-        }
-    }
-}
 
 /// Backing storage for flattened graph-link data.
 #[derive(Debug)]
@@ -74,46 +42,27 @@ impl GraphLinksData {
 
 /// Memory-efficient storage for HNSW graph links.
 ///
-/// Legacy payload layout (`LegacyU32`):
-/// [num_levels, level_0_count, level_0_links..., level_1_count, ...] with u32 values.
-///
-/// Compressed payload layout (`CompressedVarintDeltaV1`):
+/// Payload layout (`CompressedV1`):
 /// [num_levels(varint), level_0_count(varint), level_0_links(sorted-delta varint), ...]
 ///
 /// Link payload can be backed by RAM bytes or mmap bytes.
 #[derive(Debug, Default)]
 pub struct GraphLinks {
     data: GraphLinksData,
-    encoding: GraphLinksEncoding,
     data_offset_bytes: usize,
     data_len_bytes: usize,
-    /// Start offset for each point in the payload.
-    /// Legacy format uses u32 element offsets.
-    /// Compressed format uses byte offsets.
+    /// Start byte offset for each point in the compressed payload.
     offsets: Vec<usize>,
 }
 
 #[derive(Debug)]
 struct ParsedLayout {
-    encoding: GraphLinksEncoding,
     payload_offset: usize,
     payload_len: usize,
     offsets: Vec<usize>,
 }
 
 impl GraphLinks {
-    fn validate_legacy_offsets(offsets: &[usize], data_len_u32: usize) -> Result<()> {
-        for (idx, &offset) in offsets.iter().enumerate() {
-            if offset >= data_len_u32 {
-                return Err(paro_error::data_corrupted(format!(
-                    "GraphLinks offset out of range: point={} offset={} data_len={}",
-                    idx, offset, data_len_u32
-                )));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_compressed_offsets(offsets: &[usize], data_len_bytes: usize) -> Result<()> {
         if offsets.is_empty() {
             if data_len_bytes != 0 {
@@ -153,55 +102,51 @@ impl GraphLinks {
     /// `edges` is expected to be `Vec<Vec<Vec<PointOffset>>>` where:
     /// edges[point_idx][level] = neighbors
     pub fn new_from_edges(edges: Vec<Vec<Vec<PointOffset>>>) -> Self {
-        let mut links = Vec::new();
-        let mut offsets = Vec::with_capacity(edges.len());
-        let mut link_u32_len = 0usize;
-
-        for point_edges in edges {
-            offsets.push(link_u32_len);
-
-            let num_levels = point_edges.len();
-            links.extend_from_slice(&(num_levels as u32).to_le_bytes());
-            link_u32_len += 1;
-
-            for level_links in point_edges {
-                links.extend_from_slice(&(level_links.len() as u32).to_le_bytes());
-                link_u32_len += 1;
-                for link in level_links {
-                    links.extend_from_slice(&link.to_le_bytes());
-                    link_u32_len += 1;
-                }
-            }
-        }
+        let (offsets, links) = Self::encode_edges(edges);
+        let data_len_bytes = links.len();
 
         Self {
             data: GraphLinksData::Ram(links),
-            encoding: GraphLinksEncoding::LegacyU32,
             data_offset_bytes: 0,
-            data_len_bytes: link_u32_len * std::mem::size_of::<u32>(),
+            data_len_bytes,
             offsets,
         }
     }
 
+    fn encode_edges(edges: Vec<Vec<Vec<PointOffset>>>) -> (Vec<usize>, Vec<u8>) {
+        let mut payload = Vec::new();
+        let mut offsets = Vec::with_capacity(edges.len());
+
+        for point_edges in edges {
+            offsets.push(payload.len());
+            Self::encode_varint(point_edges.len() as u64, &mut payload);
+
+            for mut level_links in point_edges {
+                level_links.sort_unstable();
+                Self::encode_varint(level_links.len() as u64, &mut payload);
+
+                let mut previous = 0u32;
+                for (idx, link) in level_links.into_iter().enumerate() {
+                    let delta = if idx == 0 {
+                        u64::from(link)
+                    } else {
+                        u64::from(link - previous)
+                    };
+                    Self::encode_varint(delta, &mut payload);
+                    previous = link;
+                }
+            }
+        }
+
+        (offsets, payload)
+    }
+
     /// Iterate over links of a point at a specific level.
-    pub fn for_each_link<F>(&self, point_id: PointOffset, level: usize, mut f: F)
+    pub fn for_each_link<F>(&self, point_id: PointOffset, level: usize, f: F)
     where
         F: FnMut(PointOffset),
     {
-        match self.encoding {
-            GraphLinksEncoding::LegacyU32 => {
-                let Some((links_start, count)) = self.level_slice_start_legacy(point_id, level)
-                else {
-                    return;
-                };
-                for i in 0..count {
-                    f(self.read_legacy_u32_at(links_start + i));
-                }
-            }
-            GraphLinksEncoding::CompressedVarintDeltaV1 => {
-                self.for_each_compressed_link(point_id, level, f);
-            }
-        }
+        self.for_each_compressed_link(point_id, level, f);
     }
 
     /// Number of levels for a given point.
@@ -209,17 +154,12 @@ impl GraphLinks {
         let Some(&start_offset) = self.offsets.get(point_id as usize) else {
             return 0;
         };
-        match self.encoding {
-            GraphLinksEncoding::LegacyU32 => self.read_legacy_u32_at(start_offset) as usize,
-            GraphLinksEncoding::CompressedVarintDeltaV1 => {
-                let payload = self.links_bytes();
-                let mut cursor = start_offset;
-                let Some(levels) = Self::decode_varint_checked(payload, &mut cursor) else {
-                    return 0;
-                };
-                usize::try_from(levels).unwrap_or(0)
-            }
-        }
+        let payload = self.links_bytes();
+        let mut cursor = start_offset;
+        let Some(levels) = Self::decode_varint_checked(payload, &mut cursor) else {
+            return 0;
+        };
+        usize::try_from(levels).unwrap_or(0)
     }
 
     /// Highest level index for a point.
@@ -235,44 +175,6 @@ impl GraphLinks {
         let mut links = Vec::new();
         self.for_each_link(point_id, level, |neighbor| links.push(neighbor));
         Some(links)
-    }
-
-    fn level_slice_start_legacy(
-        &self,
-        point_id: PointOffset,
-        level: usize,
-    ) -> Option<(usize, usize)> {
-        let start_offset = *self.offsets.get(point_id as usize)?;
-        let num_levels = self.read_legacy_u32_at(start_offset) as usize;
-        if level >= num_levels {
-            return None;
-        }
-
-        let mut current_pos = start_offset + 1;
-        for _ in 0..level {
-            let count = self.read_legacy_u32_at(current_pos) as usize;
-            current_pos += 1 + count;
-        }
-
-        let count = self.read_legacy_u32_at(current_pos) as usize;
-        let links_start = current_pos + 1;
-        Some((links_start, count))
-    }
-
-    fn legacy_data_len_u32(&self) -> usize {
-        debug_assert_eq!(self.data_len_bytes % std::mem::size_of::<u32>(), 0);
-        self.data_len_bytes / std::mem::size_of::<u32>()
-    }
-
-    fn read_legacy_u32_at(&self, idx: usize) -> u32 {
-        debug_assert_eq!(self.encoding, GraphLinksEncoding::LegacyU32);
-        debug_assert!(idx < self.legacy_data_len_u32());
-        let byte_offset = self
-            .data_offset_bytes
-            .saturating_add(idx.saturating_mul(std::mem::size_of::<u32>()));
-        let bytes = self.data.as_bytes();
-        let chunk = &bytes[byte_offset..byte_offset + 4];
-        u32::from_le_bytes(chunk.try_into().expect("u32 chunk"))
     }
 
     fn links_bytes(&self) -> &[u8] {
@@ -483,46 +385,6 @@ impl GraphLinks {
         }
     }
 
-    fn build_legacy_payload(&self) -> Result<(Vec<usize>, Vec<u8>, usize)> {
-        let mut payload = Vec::new();
-        let mut offsets = Vec::with_capacity(self.num_points());
-        let mut payload_len_u32 = 0usize;
-
-        for point in 0..self.num_points() as PointOffset {
-            offsets.push(payload_len_u32);
-
-            let num_levels = self.num_levels(point);
-            let num_levels_u32 = u32::try_from(num_levels).map_err(|_| {
-                paro_error::out_of_range(format!(
-                    "GraphLinks point {} levels exceed u32: {}",
-                    point, num_levels
-                ))
-            })?;
-            payload.extend_from_slice(&num_levels_u32.to_le_bytes());
-            payload_len_u32 += 1;
-
-            for level in 0..num_levels {
-                let links = self.links_on_level(point, level).unwrap_or_default();
-                let level_count_u32 = u32::try_from(links.len()).map_err(|_| {
-                    paro_error::out_of_range(format!(
-                        "GraphLinks point {} level {} links exceed u32: {}",
-                        point,
-                        level,
-                        links.len()
-                    ))
-                })?;
-                payload.extend_from_slice(&level_count_u32.to_le_bytes());
-                payload_len_u32 += 1;
-                for link in links {
-                    payload.extend_from_slice(&link.to_le_bytes());
-                    payload_len_u32 += 1;
-                }
-            }
-        }
-
-        Ok((offsets, payload, payload_len_u32))
-    }
-
     fn build_compressed_payload(&self) -> Result<(Vec<usize>, Vec<u8>)> {
         let mut payload = Vec::new();
         let mut offsets = Vec::with_capacity(self.num_points());
@@ -553,25 +415,7 @@ impl GraphLinks {
         Ok((offsets, payload))
     }
 
-    fn serialize_legacy_bytes(&self) -> Result<Vec<u8>> {
-        let (offsets, payload, payload_len_u32) = self.build_legacy_payload()?;
-
-        let point_count_u32 = u32::try_from(offsets.len())
-            .map_err(|_| paro_error::out_of_range("GraphLinks point_count overflow"))?;
-        let payload_len_u32 = u32::try_from(payload_len_u32)
-            .map_err(|_| paro_error::out_of_range("GraphLinks payload_len overflow"))?;
-
-        let mut out = Vec::with_capacity(8 + offsets.len() * 8 + payload.len());
-        out.extend_from_slice(&point_count_u32.to_le_bytes());
-        out.extend_from_slice(&payload_len_u32.to_le_bytes());
-        for offset in offsets {
-            out.extend_from_slice(&(offset as u64).to_le_bytes());
-        }
-        out.extend_from_slice(&payload);
-        Ok(out)
-    }
-
-    fn serialize_compressed_v1_bytes(&self) -> Result<Vec<u8>> {
+    fn serialize_bytes(&self) -> Result<Vec<u8>> {
         let (offsets, payload) = self.build_compressed_payload()?;
 
         let point_count_u32 = u32::try_from(offsets.len())
@@ -598,13 +442,6 @@ impl GraphLinks {
         Ok(out)
     }
 
-    fn serialize_bytes_for_format(&self, format: GraphLinksWriteFormat) -> Result<Vec<u8>> {
-        match format {
-            GraphLinksWriteFormat::Legacy => self.serialize_legacy_bytes(),
-            GraphLinksWriteFormat::CompressedV1 => self.serialize_compressed_v1_bytes(),
-        }
-    }
-
     fn read_u32(bytes: &[u8], start: usize, field: &str) -> Result<u32> {
         let end = start
             .checked_add(4)
@@ -623,52 +460,6 @@ impl GraphLinks {
             paro_error::data_corrupted(format!("GraphLinks missing field: {}", field))
         })?;
         Ok(u64::from_le_bytes(raw.try_into().unwrap()))
-    }
-
-    fn parse_legacy_layout(bytes: &[u8], point_count: usize) -> Result<ParsedLayout> {
-        if bytes.len() < 8 {
-            return Err(paro_error::data_corrupted(
-                "GraphLinks file too small for legacy header",
-            ));
-        }
-
-        let payload_len_u32 = Self::read_u32(bytes, 4, "legacy payload_len")? as usize;
-        let offsets_bytes_len = point_count
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or_else(|| paro_error::data_corrupted("GraphLinks offsets length overflow"))?;
-        let payload_offset = 8usize
-            .checked_add(offsets_bytes_len)
-            .ok_or_else(|| paro_error::data_corrupted("GraphLinks payload offset overflow"))?;
-        let payload_len = payload_len_u32
-            .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| paro_error::data_corrupted("GraphLinks payload length overflow"))?;
-        let payload_end = payload_offset
-            .checked_add(payload_len)
-            .ok_or_else(|| paro_error::data_corrupted("GraphLinks payload range overflow"))?;
-        if payload_end > bytes.len() {
-            return Err(paro_error::data_corrupted(format!(
-                "GraphLinks legacy data truncated: need {} bytes, got {} bytes",
-                payload_end,
-                bytes.len()
-            )));
-        }
-
-        let mut offsets = Vec::with_capacity(point_count);
-        for i in 0..point_count {
-            let start = 8 + i * 8;
-            let offset = Self::read_u64(bytes, start, "legacy offset")?;
-            let offset = usize::try_from(offset)
-                .map_err(|_| paro_error::data_corrupted("GraphLinks legacy offset overflow"))?;
-            offsets.push(offset);
-        }
-        Self::validate_legacy_offsets(&offsets, payload_len_u32)?;
-
-        Ok(ParsedLayout {
-            encoding: GraphLinksEncoding::LegacyU32,
-            payload_offset,
-            payload_len,
-            offsets,
-        })
     }
 
     fn parse_compressed_v1_layout(bytes: &[u8]) -> Result<ParsedLayout> {
@@ -733,7 +524,6 @@ impl GraphLinks {
         Self::validate_compressed_payload(&offsets, &bytes[payload_offset..payload_end])?;
 
         Ok(ParsedLayout {
-            encoding: GraphLinksEncoding::CompressedVarintDeltaV1,
             payload_offset,
             payload_len,
             offsets,
@@ -741,48 +531,25 @@ impl GraphLinks {
     }
 
     fn parse_layout(bytes: &[u8]) -> Result<ParsedLayout> {
-        if bytes.len() < 8 {
+        if bytes.len() < GRAPH_LINKS_COMPRESSED_HEADER_LEN {
             return Err(paro_error::data_corrupted(
                 "GraphLinks file too small for header",
             ));
         }
         let marker = Self::read_u32(bytes, 0, "marker")?;
         if marker == GRAPH_LINKS_MAGIC {
-            Self::parse_compressed_v1_layout(bytes)
-        } else {
-            Self::parse_legacy_layout(bytes, marker as usize)
+            return Self::parse_compressed_v1_layout(bytes);
         }
-    }
-
-    /// Save graph links to a writer using explicit wire format.
-    pub fn serialize_with_format<W: Write>(
-        &self,
-        mut writer: W,
-        format: GraphLinksWriteFormat,
-    ) -> Result<()> {
-        let bytes = self.serialize_bytes_for_format(format)?;
-        writer.write_all(&bytes)?;
-        Ok(())
+        Err(paro_error::data_corrupted(
+            "legacy GraphLinks payloads are no longer supported",
+        ))
     }
 
     /// Save graph links to a writer.
-    ///
-    /// Default is compressed v1. If compressed serialization fails, it falls back
-    /// to legacy format for rollback safety.
     pub fn serialize<W: Write>(&self, mut writer: W) -> Result<()> {
-        let preferred = GraphLinksWriteFormat::from_env();
-        match self.serialize_bytes_for_format(preferred) {
-            Ok(bytes) => {
-                writer.write_all(&bytes)?;
-                Ok(())
-            }
-            Err(_) if preferred == GraphLinksWriteFormat::CompressedV1 => {
-                let bytes = self.serialize_bytes_for_format(GraphLinksWriteFormat::Legacy)?;
-                writer.write_all(&bytes)?;
-                Ok(())
-            }
-            Err(err) => Err(err),
-        }
+        let bytes = self.serialize_bytes()?;
+        writer.write_all(&bytes)?;
+        Ok(())
     }
 
     /// Save graph links to a file.
@@ -802,7 +569,6 @@ impl GraphLinks {
 
         Ok(Self {
             data: GraphLinksData::Ram(payload),
-            encoding: layout.encoding,
             data_offset_bytes: 0,
             data_len_bytes: layout.payload_len,
             offsets: layout.offsets,
@@ -824,7 +590,6 @@ impl GraphLinks {
 
         Ok(Self {
             data: GraphLinksData::Mmap(mmap),
-            encoding: layout.encoding,
             data_offset_bytes: layout.payload_offset,
             data_len_bytes: layout.payload_len,
             offsets: layout.offsets,
@@ -841,11 +606,7 @@ impl GraphLinks {
 
     /// Serialized size in bytes (as produced by `serialize`).
     pub fn serialized_size_bytes(&self) -> u64 {
-        let preferred = GraphLinksWriteFormat::from_env();
-        if let Ok(bytes) = self.serialize_bytes_for_format(preferred) {
-            return bytes.len() as u64;
-        }
-        self.serialize_bytes_for_format(GraphLinksWriteFormat::Legacy)
+        self.serialize_bytes()
             .map(|bytes| bytes.len() as u64)
             .unwrap_or(0)
     }
@@ -874,27 +635,26 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_compat_with_existing_binary_layout() {
-        let links = GraphLinks::new_from_edges(sample_edges());
+    fn legacy_payload_is_rejected() {
         let mut bytes = Vec::new();
-        links
-            .serialize_with_format(&mut bytes, GraphLinksWriteFormat::Legacy)
-            .unwrap();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
 
-        let restored = GraphLinks::deserialize(bytes.as_slice()).unwrap();
-        assert_eq!(restored.num_points(), 4);
-        assert_eq!(collect_links(&restored, 0, 0), vec![2, 1]);
-        assert_eq!(collect_links(&restored, 0, 1), vec![3]);
-        assert_eq!(collect_links(&restored, 2, 1), vec![0]);
+        let err = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
+        assert!(
+            err.to_string().contains("legacy GraphLinks payloads"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn compressed_roundtrip_uses_versioned_header_and_sorted_delta() {
         let links = GraphLinks::new_from_edges(sample_edges());
         let mut bytes = Vec::new();
-        links
-            .serialize_with_format(&mut bytes, GraphLinksWriteFormat::CompressedV1)
-            .unwrap();
+        links.serialize(&mut bytes).unwrap();
 
         assert_eq!(
             u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
@@ -916,9 +676,7 @@ mod tests {
     fn compressed_deserialize_ignores_stats_trailer() {
         let links = GraphLinks::new_from_edges(sample_edges());
         let mut bytes = Vec::new();
-        links
-            .serialize_with_format(&mut bytes, GraphLinksWriteFormat::CompressedV1)
-            .unwrap();
+        links.serialize(&mut bytes).unwrap();
 
         append_stats_trailer(&mut bytes, &[7, 7, 7]).unwrap();
         let restored = GraphLinks::deserialize(bytes.as_slice()).unwrap();
@@ -946,25 +704,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_legacy_serialize_supports_rollback_path() {
-        let links = GraphLinks::new_from_edges(sample_edges());
-        let mut bytes = Vec::new();
-        links
-            .serialize_with_format(&mut bytes, GraphLinksWriteFormat::Legacy)
-            .unwrap();
-        let marker = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_ne!(marker, GRAPH_LINKS_MAGIC);
-    }
-
-    #[test]
     fn mmap_load_matches_ram_load() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("graph_links.bin");
         let links = GraphLinks::new_from_edges(sample_edges());
         let mut file = File::create(&file_path).unwrap();
-        links
-            .serialize_with_format(&mut file, GraphLinksWriteFormat::CompressedV1)
-            .unwrap();
+        links.serialize(&mut file).unwrap();
         drop(file);
 
         let ram = GraphLinks::load(&file_path).unwrap();

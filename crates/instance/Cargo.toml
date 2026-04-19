@@ -11,16 +11,17 @@ needless-borrows-for-generic-args = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-journal = { workspace = true }
 paro-context = { workspace = true }
 paro-scheduler = { workspace = true }
 paro-catalog = { workspace = true }
-paro-journal = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }
 paro-parser = { workspace = true }
 paro-execution = { workspace = true }
 
 anyhow = { workspace = true }
+bincode = { workspace = true }
 crc32fast = "1"
 fs2 = "0.4"
 parking_lot = "0.12"

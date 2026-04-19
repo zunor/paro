@@ -143,16 +143,28 @@ data_dir = "./data"              # Data directory
 size = 1024                      # Buffer pool size (pages)
 
 [storage.checkpoint]
-interval = "5m"                  # Checkpoint interval
-wal_size = "64MiB"              # WAL size threshold
+trigger_interval = "5m"          # Checkpoint interval
+trigger_bytes = "64MiB"          # WAL growth threshold
+drain_timeout = "30s"            # Exact-prefix drain timeout
+max_concurrent_writers = 4
+artifact_gc_batch_size = 64
+artifact_gc_delete_budget = 256
+checkpoint_gc_delete_budget = 8
+segment_prune_delete_budget = 32
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `data_dir` | PathBuf | "./data" | Data directory |
 | `buffer_pool.size` | usize | 1024 | Buffer pool size |
-| `checkpoint.interval` | Duration | 5m | Checkpoint interval |
-| `checkpoint.wal_size` | String | "64MiB" | WAL size threshold |
+| `checkpoint.trigger_interval` | Duration | 5m | Checkpoint interval |
+| `checkpoint.trigger_bytes` | String | "16MiB" | WAL growth threshold since last checkpoint |
+| `checkpoint.drain_timeout` | Duration | 30s | Exact-prefix drain timeout |
+| `checkpoint.max_concurrent_writers` | usize | 4 | Parallel bundle serialization fan-out |
+| `checkpoint.artifact_gc_batch_size` | usize | 64 | Artifact GC per-namespace batch size |
+| `checkpoint.artifact_gc_delete_budget` | usize | 256 | Artifact GC total delete budget per sweep |
+| `checkpoint.checkpoint_gc_delete_budget` | usize | 8 | Old checkpoint bundle delete budget per sweep |
+| `checkpoint.segment_prune_delete_budget` | usize | 32 | Sealed journal segment prune budget per sweep |
 
 ---
 
@@ -309,8 +321,14 @@ data_dir = "/var/lib/paro/data"
 size = 4096
 
 [storage.checkpoint]
-interval = "5m"
-wal_size = "128MiB"
+trigger_interval = "5m"
+trigger_bytes = "128MiB"
+drain_timeout = "30s"
+max_concurrent_writers = 4
+artifact_gc_batch_size = 64
+artifact_gc_delete_budget = 256
+checkpoint_gc_delete_budget = 8
+segment_prune_delete_budget = 32
 ```
 
 ---

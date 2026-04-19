@@ -11,13 +11,9 @@ mod table;
 mod view;
 
 use crate::recovery::replay_handler::CatalogReplayHandler;
-use paro_catalog::catalog::DEFAULT_SCHEMA;
 use paro_common::ddl::{DdlChange, DdlChangeRecord};
-use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
 use paro_common::effect::CatalogTxnOp;
 use paro_common::error as paro_error;
-use paro_parser::ast::{AlterTableAction, Statement, TableReference};
-use paro_parser::parse_one;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CatalogApplyPhase {
@@ -41,99 +37,6 @@ pub(super) fn catalog_apply_phase(change: &DdlChangeRecord) -> CatalogApplyPhase
         | DdlChange::DropIndex(_)
         | DdlChange::DropPropertyGraph(_)
         | DdlChange::DropSequence(_) => CatalogApplyPhase::Drop,
-    }
-}
-
-pub(super) fn route_registry_table_keys(
-    change: &DdlChangeRecord,
-    default_database: &str,
-) -> paro_common::error::Result<Vec<DdlObjectKey>> {
-    match &change.change {
-        DdlChange::CreateTable(_) | DdlChange::DropTable(_)
-            if change.key.kind == DdlObjectKind::Table =>
-        {
-            Ok(vec![change.key.clone()])
-        }
-        DdlChange::AlterEntry(payload) => {
-            route_registry_table_keys_for_alter(&payload.sql, default_database)
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn route_registry_table_keys_for_alter(
-    sql: &str,
-    default_database: &str,
-) -> paro_common::error::Result<Vec<DdlObjectKey>> {
-    let statement = parse_one(sql).map_err(|err| {
-        paro_error::serialization_error(format!("failed to parse ALTER ENTRY SQL: {err}"))
-    })?;
-    match statement.stmt {
-        Statement::RenameTable(stmt) => {
-            let database_name = stmt
-                .database
-                .map(|ident| ident.name)
-                .unwrap_or_else(|| default_database.to_string());
-            let schema_name = stmt
-                .schema
-                .map(|ident| ident.name)
-                .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
-            let target_database_name = stmt
-                .new_database
-                .map(|ident| ident.name)
-                .unwrap_or_else(|| database_name.clone());
-            let target_schema_name = stmt
-                .new_schema
-                .map(|ident| ident.name)
-                .unwrap_or_else(|| schema_name.clone());
-            Ok(vec![
-                DdlObjectKey::new(
-                    database_name,
-                    Some(schema_name),
-                    stmt.table.name,
-                    DdlObjectKind::Table,
-                ),
-                DdlObjectKey::new(
-                    target_database_name,
-                    Some(target_schema_name),
-                    stmt.new_table.name,
-                    DdlObjectKind::Table,
-                ),
-            ])
-        }
-        Statement::AlterTable(stmt) => {
-            let TableReference::Table {
-                database,
-                schema,
-                table,
-                ..
-            } = stmt.table_reference
-            else {
-                return Ok(Vec::new());
-            };
-            let database_name = database
-                .map(|ident| ident.name)
-                .unwrap_or_else(|| default_database.to_string());
-            let schema_name = schema
-                .map(|ident| ident.name)
-                .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
-            let mut keys = vec![DdlObjectKey::new(
-                database_name.clone(),
-                Some(schema_name.clone()),
-                table.name,
-                DdlObjectKind::Table,
-            )];
-            if let AlterTableAction::RenameTable { new_table } = stmt.action {
-                keys.push(DdlObjectKey::new(
-                    database_name,
-                    Some(schema_name),
-                    new_table.name,
-                    DdlObjectKind::Table,
-                ));
-            }
-            Ok(keys)
-        }
-        _ => Ok(Vec::new()),
     }
 }
 

@@ -157,6 +157,10 @@ def actual_header_kind(lines: list[str]) -> str:
 
 def validate_file(path: PurePosixPath, expectation: HeaderExpectation) -> list[str]:
     absolute_path = ROOT / path
+    if not absolute_path.exists():
+        # Local dirty worktrees can contain tracked deletes during large refactors.
+        # Skip them here so header validation only inspects files that still exist.
+        return []
     try:
         text = absolute_path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:

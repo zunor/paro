@@ -91,6 +91,31 @@ fn test_default_database_is_ready_after_bootstrap() {
 }
 
 #[test]
+fn test_in_memory_checkpoint_coordinator_is_explicit_no_op() {
+    let instance = Instance::new_in_memory();
+    let default_db = instance
+        .database_registry()
+        .get_database("postgres")
+        .expect("default database should exist");
+
+    assert_eq!(default_db.path(), ":memory:");
+    assert!(default_db.force_checkpoint().is_ok());
+    assert_eq!(
+        default_db
+            .checkpoint_coordinator()
+            .checkpoint_success_total(),
+        1,
+        "in-memory checkpoint should succeed as an explicit no-op"
+    );
+    assert_eq!(
+        default_db
+            .checkpoint_coordinator()
+            .checkpoint_failure_total(),
+        0
+    );
+}
+
+#[test]
 fn test_in_memory_bootstrap_uses_memory_catalog_store_and_startup_report() {
     let instance = Instance::new_in_memory_with_config(
         InstanceConfig::in_memory().with_default_database("memdb"),

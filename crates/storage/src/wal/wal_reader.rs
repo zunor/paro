@@ -352,6 +352,13 @@ impl WalReader {
             )));
         }
 
+        if self.wal_version < 2 {
+            return Err(paro_error::not_supported(format!(
+                "unsupported WAL version {}; requires a clean data directory or a fresh checkpoint written by unified Txn* journal",
+                self.wal_version
+            )));
+        }
+
         if self.wal_version >= 3 {
             let mut db_identifier = [0u8; WAL_DB_IDENTIFIER_LEN];
             self.reader.read_exact(&mut db_identifier)?;
@@ -417,13 +424,7 @@ impl WalReader {
 
         let entry_start = self.reader.current_offset();
 
-        // For WAL version 2+, entries have size and checksum
-        if self.wal_version >= 2 {
-            self.read_checksummed_entry_with_detection(entry_start)
-        } else {
-            // Version 1: no checksums (legacy format)
-            self.read_legacy_entry(entry_start)
-        }
+        self.read_checksummed_entry_with_detection(entry_start)
     }
 
     /// Read a checksummed entry with torn write detection (WAL version 2+).
@@ -510,26 +511,6 @@ impl WalReader {
         }
 
         Ok(ReadEntryResult::Entry(entry))
-    }
-
-    /// Read a legacy entry (WAL version 1, no checksums).
-    fn read_legacy_entry(&mut self, _entry_start: u64) -> Result<ReadEntryResult> {
-        // Version 1 format: just [wal_type: u8][data...]
-        // This is a simplified implementation - full version would need
-        // to know entry sizes from the type
-        let wal_type_byte = match self.reader.read_u8() {
-            Ok(b) => b,
-            Err(_) => return Ok(ReadEntryResult::EndOfFile),
-        };
-
-        let wal_type = WalType::try_from(wal_type_byte)?;
-
-        // For legacy format, we'd need type-specific parsing
-        // For now, return an error as we don't support version 1
-        Err(paro_error::serialization_error(format!(
-            "WAL version 1 not fully supported, found entry type {:?}",
-            wal_type
-        )))
     }
 
     /// Iterate over all entries in the WAL.

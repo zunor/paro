@@ -7,7 +7,6 @@
 //! It encapsulates:
 //! - Write-ahead log (WAL) for durability
 //! - Metadata/tablet management
-//! - Checkpointing
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
@@ -18,11 +17,6 @@ use std::sync::Arc;
 
 /// Suffix for the main WAL file.
 pub const MAIN_WAL_SUFFIX: &str = ".wal";
-/// Suffix for the checkpoint WAL file.
-pub const CHECKPOINT_WAL_SUFFIX: &str = ".checkpoint.wal";
-/// Suffix for the recovery WAL file.
-pub const RECOVERY_WAL_SUFFIX: &str = ".recovery.wal";
-
 /// Build a WAL-related file path from a database path and a suffix.
 ///
 pub fn wal_path_with_suffix(db_path: &str, suffix: &str) -> String {
@@ -132,44 +126,6 @@ impl Drop for SingleFileStorageCommitState {
     }
 }
 
-/// Options for checkpointing.
-///
-#[derive(Debug, Clone)]
-pub struct CheckpointOptions {
-    /// Force checkpoint even if not needed
-    pub force: bool,
-    /// Whether this is an automatic checkpoint
-    pub is_automatic: bool,
-}
-
-impl Default for CheckpointOptions {
-    fn default() -> Self {
-        Self {
-            force: false,
-            is_automatic: false,
-        }
-    }
-}
-
-impl CheckpointOptions {
-    /// Create new checkpoint options.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Force checkpoint even if not needed.
-    pub fn force(mut self) -> Self {
-        self.force = true;
-        self
-    }
-
-    /// Mark as automatic checkpoint.
-    pub fn automatic(mut self) -> Self {
-        self.is_automatic = true;
-        self
-    }
-}
-
 /// Database size information.
 ///
 #[derive(Debug, Clone, Default)]
@@ -205,7 +161,6 @@ pub struct MetadataBlockInfo {
 /// This trait encapsulates:
 /// - Write-ahead log (WAL)
 /// - Metadata / tablet management
-/// - Checkpointing
 pub trait StorageManager: Send + Sync + std::fmt::Debug {
     /// Get the database path.
     ///
@@ -284,18 +239,6 @@ pub trait StorageManager: Send + Sync + std::fmt::Debug {
         wal_path_with_suffix(self.get_path(), MAIN_WAL_SUFFIX)
     }
 
-    /// Get the checkpoint WAL path.
-    ///
-    fn get_checkpoint_wal_path(&self) -> String {
-        wal_path_with_suffix(self.get_path(), CHECKPOINT_WAL_SUFFIX)
-    }
-
-    /// Get the recovery WAL path.
-    ///
-    fn get_recovery_wal_path(&self) -> String {
-        wal_path_with_suffix(self.get_path(), RECOVERY_WAL_SUFFIX)
-    }
-
     /// Get metadata store provider used by catalog/tablet metadata paths.
     fn get_metadata_store(&self) -> Option<&dyn MetadataStore>;
 
@@ -304,18 +247,6 @@ pub trait StorageManager: Send + Sync + std::fmt::Debug {
 
     /// Get tablet metadata manager.
     fn get_tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>>;
-
-    /// Create a checkpoint.
-    ///
-    ///
-    /// Note: this is a low-level storage primitive only. Instance lifecycle
-    /// checkpoints should be coordinated by `DatabaseHandle` to ensure WAL
-    /// protocol and catalog serialization go through a single path.
-    fn create_checkpoint(&self, options: CheckpointOptions) -> Result<()>;
-
-    /// Check if automatic checkpoint should be triggered.
-    ///
-    fn automatic_checkpoint(&self, estimated_wal_bytes: u64) -> bool;
 
     /// Generate a storage commit state for a transaction.
     ///
@@ -341,20 +272,6 @@ pub trait StorageManager: Send + Sync + std::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_checkpoint_options_default() {
-        let opts = CheckpointOptions::default();
-        assert!(!opts.force);
-        assert!(!opts.is_automatic);
-    }
-
-    #[test]
-    fn test_checkpoint_options_builder() {
-        let opts = CheckpointOptions::new().force().automatic();
-        assert!(opts.force);
-        assert!(opts.is_automatic);
-    }
 
     #[test]
     fn test_database_size_default() {

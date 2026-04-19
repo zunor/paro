@@ -15,8 +15,8 @@ pub use cleanup::CleanupDescriptor;
 pub use data_op::{
     decode_delete_patch_artifact_bytes, encode_delete_patch_artifact_bytes, ArtifactNamespace,
     ArtifactRef, CompactionCumulativePointAction, DeletePatchEncoding, DeletePatchGroup,
-    DeletePatchInline, DeletePatchRef, DeletePatchSegment, RetiredRowsetInput, StorageCommitOp,
-    TabletApplyOp, TabletMutation, VersionSpan,
+    DeletePatchInline, DeletePatchRef, DeletePatchSegment, PreparedDataOp, RetiredRowsetInput,
+    RowsetLocator, StorageCommitOp, TabletApplyOp, TabletMutation, VersionSpan,
 };
 pub use deferred_task::DeferredTask;
 pub use post_commit_hook::{GraphDmlTableDelta, PostCommitHookDescriptor};

@@ -23,7 +23,7 @@ use paro_common::vector::Vector;
 
 use super::internal_node::{Node16, Node256, Node4, Node48};
 use super::leaf::Leaf;
-use super::node::{GateStatus, NType, Node, ALLOCATOR_COUNT, DEPRECATED_ALLOCATOR_COUNT};
+use super::node::{GateStatus, NType, Node, ALLOCATOR_COUNT};
 use super::prefix::Prefix;
 use super::ARTKey;
 use crate::buffer::BufferManager;
@@ -1752,18 +1752,7 @@ impl ART {
     /// Prepare the ART for serialization.
     ///
     /// This removes empty buffers and prepares the allocators for serialization.
-    ///
-    /// # Arguments
-    /// * `options` - Serialization options
-    /// * `v1_0_0_storage` - Whether to use deprecated storage format
-    ///
-    /// # Returns
-    /// IndexStorageInfo containing the serialization metadata
-    fn prepare_serialize(
-        &mut self,
-        options: &HashMap<String, Value>,
-        _v1_0_0_storage: bool,
-    ) -> IndexStorageInfo {
+    fn prepare_serialize(&mut self, options: &HashMap<String, Value>) -> IndexStorageInfo {
         let mut info = IndexStorageInfo::new(&self.name);
         info.root = self.tree.into();
         info.options = options.clone();
@@ -1786,31 +1775,18 @@ impl ART {
     ///
     /// # Returns
     /// IndexStorageInfo containing all information needed to restore the index
-    pub fn serialize_to_disk_impl(&mut self, options: &HashMap<String, Value>) -> IndexStorageInfo {
-        // Check for v1.0.0 storage format option
-        let v1_0_0_storage = options
-            .get("v1_0_0_storage")
-            .map(|v| match v {
-                Value::Boolean(b) => *b,
-                _ => true,
-            })
-            .unwrap_or(true);
-
-        let mut info = self.prepare_serialize(options, v1_0_0_storage);
-
-        // Determine allocator count based on storage format
-        let allocator_count = if v1_0_0_storage {
-            DEPRECATED_ALLOCATOR_COUNT
-        } else {
-            ALLOCATOR_COUNT
-        };
+    pub fn serialize_to_disk_impl(
+        &mut self,
+        options: &HashMap<String, Value>,
+    ) -> Result<IndexStorageInfo> {
+        let mut info = self.prepare_serialize(options);
 
         // Collect allocator info for each allocator
-        for i in 0..allocator_count {
+        for i in 0..ALLOCATOR_COUNT {
             info.allocator_infos.push(self.allocators[i].get_info());
         }
 
-        info
+        Ok(info)
     }
 
     /// Serialize the ART to WAL.
@@ -1822,33 +1798,20 @@ impl ART {
     ///
     /// # Returns
     /// IndexStorageInfo containing all information needed to restore the index
-    pub fn serialize_to_wal_impl(&mut self, options: &HashMap<String, Value>) -> IndexStorageInfo {
-        // Check for v1.0.0 storage format option
-        let v1_0_0_storage = options
-            .get("v1_0_0_storage")
-            .map(|v| match v {
-                Value::Boolean(b) => *b,
-                _ => true,
-            })
-            .unwrap_or(true);
-
-        let mut info = self.prepare_serialize(options, v1_0_0_storage);
-
-        // Determine allocator count based on storage format
-        let allocator_count = if v1_0_0_storage {
-            DEPRECATED_ALLOCATOR_COUNT
-        } else {
-            ALLOCATOR_COUNT
-        };
+    pub fn serialize_to_wal_impl(
+        &mut self,
+        options: &HashMap<String, Value>,
+    ) -> Result<IndexStorageInfo> {
+        let mut info = self.prepare_serialize(options);
 
         // Collect allocator info and buffer data for each allocator
-        for i in 0..allocator_count {
+        for i in 0..ALLOCATOR_COUNT {
             let buffer_infos = self.allocators[i].init_serialization_to_wal();
             info.buffers.push(buffer_infos);
             info.allocator_infos.push(self.allocators[i].get_info());
         }
 
-        info
+        Ok(info)
     }
 
     /// Initialize allocators from storage info.
@@ -1871,24 +1834,53 @@ impl ART {
     ///
     /// # Arguments
     /// * `info` - The storage info
-    fn set_prefix_count(&mut self, info: &IndexStorageInfo) {
-        // Check for backwards compatibility with root_block_ptr
+    fn validate_storage_info_format(info: &IndexStorageInfo) -> Result<()> {
         if info.root_block_ptr.is_valid() {
-            self.prefix_count = super::prefix::DEPRECATED_COUNT;
-            return;
+            return Err(paro_error::data_corrupted(
+                "legacy ART storage format with root_block_ptr is no longer supported",
+            ));
         }
+        if !info.allocator_infos.is_empty() && info.allocator_infos.len() != ALLOCATOR_COUNT {
+            return Err(paro_error::data_corrupted(format!(
+                "unsupported ART allocator count {} (expected {})",
+                info.allocator_infos.len(),
+                ALLOCATOR_COUNT
+            )));
+        }
+        if !info.buffers.is_empty() && info.buffers.len() != ALLOCATOR_COUNT {
+            return Err(paro_error::data_corrupted(format!(
+                "unsupported ART buffer set count {} (expected {})",
+                info.buffers.len(),
+                ALLOCATOR_COUNT
+            )));
+        }
+        Ok(())
+    }
 
+    fn set_prefix_count(&mut self, info: &IndexStorageInfo) -> Result<()> {
         // Get prefix count from allocator info
         if !info.allocator_infos.is_empty() {
-            let serialized_count =
-                info.allocator_infos[0].segment_size - super::prefix::METADATA_SIZE;
-            self.prefix_count = serialized_count as u8;
-            return;
+            let serialized_count = info.allocator_infos[0]
+                .segment_size
+                .checked_sub(super::prefix::METADATA_SIZE)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(
+                        "ART prefix allocator segment size is smaller than metadata size",
+                    )
+                })?;
+            self.prefix_count = u8::try_from(serialized_count).map_err(|_| {
+                paro_error::data_corrupted(format!(
+                    "ART prefix count out of range: {}",
+                    serialized_count
+                ))
+            })?;
+            return Ok(());
         }
 
         // Calculate from column types
         self.prefix_count =
             Self::align_prefix_count(Self::type_size(&self.logical_type).saturating_sub(1));
+        Ok(())
     }
 
     /// Create an ART from storage info.
@@ -1912,7 +1904,7 @@ impl ART {
         logical_type: LogicalType,
         buffer_manager: Arc<dyn BufferManager>,
         info: &IndexStorageInfo,
-    ) -> Self {
+    ) -> Result<Self> {
         let name = name.into();
 
         // Determine if we need key length verification
@@ -1943,7 +1935,8 @@ impl ART {
 
         // Initialize from storage info if valid
         if info.is_valid() {
-            art.set_prefix_count(info);
+            Self::validate_storage_info_format(info)?;
+            art.set_prefix_count(info)?;
 
             // Set root node
             if info.root.is_valid() {
@@ -1954,7 +1947,7 @@ impl ART {
             art.init_allocators(info);
         }
 
-        art
+        Ok(art)
     }
 }
 
@@ -2796,13 +2789,12 @@ mod tests {
         }
 
         let options = HashMap::new();
-        let info = art.serialize_to_disk_impl(&options);
+        let info = art.serialize_to_disk_impl(&options).unwrap();
 
         assert_eq!(info.name, "test_idx");
         assert!(info.is_valid());
         assert!(info.root.is_valid());
-        // Should have allocator infos for deprecated format (6 allocators)
-        assert_eq!(info.allocator_infos.len(), DEPRECATED_ALLOCATOR_COUNT);
+        assert_eq!(info.allocator_infos.len(), ALLOCATOR_COUNT);
     }
 
     #[test]
@@ -2817,15 +2809,14 @@ mod tests {
         }
 
         let options = HashMap::new();
-        let info = art.serialize_to_wal_impl(&options);
+        let info = art.serialize_to_wal_impl(&options).unwrap();
 
         assert_eq!(info.name, "test_idx");
         assert!(info.is_valid());
         assert!(info.root.is_valid());
-        // Should have allocator infos
-        assert_eq!(info.allocator_infos.len(), DEPRECATED_ALLOCATOR_COUNT);
+        assert_eq!(info.allocator_infos.len(), ALLOCATOR_COUNT);
         // Should have buffer data for WAL
-        assert_eq!(info.buffers.len(), DEPRECATED_ALLOCATOR_COUNT);
+        assert_eq!(info.buffers.len(), ALLOCATOR_COUNT);
     }
 
     #[test]
@@ -2840,7 +2831,8 @@ mod tests {
             LogicalType::BigInt,
             buffer_manager,
             &info,
-        );
+        )
+        .unwrap();
 
         assert_eq!(art.index_name(), "restored_idx");
         assert!(art.is_empty());
@@ -2869,7 +2861,8 @@ mod tests {
             LogicalType::BigInt,
             buffer_manager,
             &info,
-        );
+        )
+        .unwrap();
 
         // Verify the new ART has the same structure
         assert_eq!(art2.index_name(), "test_idx");
@@ -2879,43 +2872,26 @@ mod tests {
     }
 
     #[test]
-    fn test_art_serialize_with_v1_0_0_option() {
-        let mut art = create_test_art();
-        let mut arena = create_arena();
+    fn test_art_from_storage_info_rejects_legacy_root_block_ptr() {
+        let buffer_manager = Arc::new(StandardBufferManager::default_manager());
+        let info = IndexStorageInfo::new("legacy_idx")
+            .with_root_block_ptr(crate::index::BlockPointer::new(42, 0));
 
-        // Insert some keys
-        for i in 0..3 {
-            let key = ARTKey::from_i64(&mut arena, i * 10).unwrap();
-            art.insert_key(&mut arena, &key, i, IndexAppendMode::Default);
-        }
+        let err = ART::from_storage_info(
+            "legacy_idx",
+            IndexConstraintType::None,
+            0,
+            LogicalType::BigInt,
+            buffer_manager,
+            &info,
+        )
+        .err()
+        .expect("legacy root_block_ptr should fail");
 
-        // Serialize with v1.0.0 storage format
-        let mut options = HashMap::new();
-        options.insert("v1_0_0_storage".to_string(), Value::Boolean(true));
-        let info = art.serialize_to_disk_impl(&options);
-
-        assert!(info.is_valid());
-        assert_eq!(info.allocator_infos.len(), DEPRECATED_ALLOCATOR_COUNT);
-    }
-
-    #[test]
-    fn test_art_serialize_with_new_format() {
-        let mut art = create_test_art();
-        let mut arena = create_arena();
-
-        // Insert some keys
-        for i in 0..3 {
-            let key = ARTKey::from_i64(&mut arena, i * 10).unwrap();
-            art.insert_key(&mut arena, &key, i, IndexAppendMode::Default);
-        }
-
-        // Serialize with new storage format
-        let mut options = HashMap::new();
-        options.insert("v1_0_0_storage".to_string(), Value::Boolean(false));
-        let info = art.serialize_to_disk_impl(&options);
-
-        assert!(info.is_valid());
-        assert_eq!(info.allocator_infos.len(), ALLOCATOR_COUNT);
+        assert!(
+            err.to_string().contains("legacy ART storage format"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -3,11 +3,15 @@
 
 use super::tablet_runtime::{PhysicalRowRef, PrimaryIndexUpdate, Tablet};
 use crate::codec::vector_decoder;
+use crate::compaction::publish::record::PkPublishDelta;
 use crate::primary_key::{DeleteVector, PersistentIndex, PrimaryIndex, RowID};
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::Rowset;
 use crate::tablet::tablet_schema::KeysType;
 use crate::tablet::ColumnId;
+use crate::wal::wal_entry::WalEntry;
+use crate::wal::wal_type::WalType;
+use crate::wal::write_ahead_log::WriteAheadLog;
 use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -116,18 +120,6 @@ impl Tablet {
             return Ok(());
         }
 
-        self.reconcile_primary_index_row_count_strict()
-    }
-
-    fn reconcile_primary_index_row_count_strict(&self) -> Result<()> {
-        let schema = match self.schema() {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        if schema.keys_type() != KeysType::PrimaryKeys {
-            return Ok(());
-        }
-
         let live_rows: u64 = self
             .rs_version_map
             .read()
@@ -164,6 +156,69 @@ impl Tablet {
                     first_error, second_error
                 ))
             })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_compaction_publish_delta(
+        &self,
+        output_rowset_id: u64,
+        output_version: i64,
+        pk_delta: &PkPublishDelta,
+    ) -> Result<()> {
+        let schema = match self.schema() {
+            Some(schema) => schema,
+            None => return Ok(()),
+        };
+        if schema.keys_type() != KeysType::PrimaryKeys {
+            return Ok(());
+        }
+
+        let mut pending_delete_vectors =
+            HashMap::with_capacity(pk_delta.internal_delete_vectors.len());
+        for delta in &pk_delta.internal_delete_vectors {
+            let entry = pending_delete_vectors
+                .entry((output_rowset_id, delta.segment_id))
+                .or_insert_with(DeleteVector::new);
+            for row_id in delta.delete_vector.iter() {
+                entry.mark_deleted(row_id);
+            }
+        }
+
+        let mut pairs = Vec::with_capacity(pk_delta.upsert_candidates.len());
+        for candidate in &pk_delta.upsert_candidates {
+            let output_entry = pending_delete_vectors
+                .entry((
+                    candidate.output_location.rowset_id,
+                    candidate.output_location.segment_id,
+                ))
+                .or_insert_with(DeleteVector::new);
+            let source_row_id = self.encode_row_location(candidate.source_location)?;
+            let Some(current_row_id) = self.lookup_primary_key(&candidate.key)? else {
+                output_entry.mark_deleted(candidate.output_location.row_offset);
+                continue;
+            };
+            if current_row_id != source_row_id {
+                output_entry.mark_deleted(candidate.output_location.row_offset);
+                continue;
+            }
+            pairs.push((
+                candidate.key.clone(),
+                self.encode_row_location(candidate.output_location)?,
+            ));
+        }
+
+        if !pairs.is_empty() {
+            self.persist_primary_index_upserts(&pairs)?;
+            self.primary_index_handle().batch_upsert(pairs);
+        }
+
+        if !pending_delete_vectors.is_empty() {
+            // Compaction can publish after concurrent writes/deletes have already advanced the
+            // tablet's visible version. Stamp output delete vectors at the current visible
+            // version so they remain live after delete-vector version GC.
+            let delete_vector_version = self.max_version().max(output_version);
+            self.persist_delete_vectors(delete_vector_version, pending_delete_vectors)?;
         }
         Ok(())
     }
@@ -335,6 +390,7 @@ impl Tablet {
     fn apply_primary_delete_internal(
         &self,
         keys: Vec<Vec<u8>>,
+        persist_wal: bool,
         ignore_missing: bool,
     ) -> Result<()> {
         if keys.is_empty() {
@@ -351,20 +407,16 @@ impl Tablet {
             }
         }
 
+        let resolved = self.lookup_primary_keys(&unique_keys)?;
         let idx = self.primary_index_handle();
         let persistent = self.persistent_index()?;
-        let version = self.max_version();
 
         let mut resolved_locations = Vec::with_capacity(unique_keys.len());
         let mut existing_keys = Vec::with_capacity(unique_keys.len());
-        for key in &unique_keys {
-            let current = self
-                .primary_key_occurrences(key, version)?
-                .into_iter()
-                .find_map(|(location, is_deleted)| (!is_deleted).then_some(location));
+        for (key, current) in unique_keys.iter().zip(resolved.into_iter()) {
             match current {
                 Some(current) => {
-                    resolved_locations.push(current);
+                    resolved_locations.push(self.decode_row_id(current)?);
                     existing_keys.push(key.clone());
                 }
                 None if ignore_missing => {}
@@ -389,7 +441,16 @@ impl Tablet {
                 .or_insert_with(DeleteVector::new);
             entry.mark_deleted(loc.row_offset);
         }
+        let version = self.max_version();
         self.persist_delete_vectors(version, pending)?;
+
+        if persist_wal {
+            let wal = WriteAheadLog::new(self.data_dir().join("tablet.wal"))?;
+            let entry = WalEntry::PrimaryDelete { keys: unique_keys };
+            wal.writer()
+                .write_entry(WalType::PrimaryDelete, &entry.serialize_data())?;
+            wal.flush()?;
+        }
 
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
@@ -397,7 +458,7 @@ impl Tablet {
     }
 
     pub fn apply_primary_delete(&self, keys: Vec<Vec<u8>>) -> Result<()> {
-        self.apply_primary_delete_internal(keys, false)
+        self.apply_primary_delete_internal(keys, true, false)
     }
 
     pub(crate) fn replay_primary_delete_idempotent(&self, keys: Vec<Vec<u8>>) -> Result<()> {
@@ -544,17 +605,6 @@ impl Tablet {
 
     pub(super) fn rebuild_primary_index_from_persistent(&self) -> Result<bool> {
         let persistent = self.persistent_index()?;
-        if persistent.applied_lsn() < self.applied_lsn() {
-            warn!(
-                tablet_id = self.tablet_id(),
-                persistent_applied_lsn = persistent.applied_lsn(),
-                tablet_applied_lsn = self.applied_lsn(),
-                "persistent primary index lsn lagged tablet snapshot; rebuilding"
-            );
-            self.rebuild_primary_index_from_visible_rowsets()?;
-            self.persist_primary_index_snapshot()?;
-            return Ok(true);
-        }
         match persistent.load() {
             Ok(index) => {
                 let index = Arc::new(index);
@@ -614,7 +664,6 @@ impl Tablet {
                 .store(true, Ordering::Release);
             return Err(err);
         }
-        persistent.set_applied_lsn(self.applied_lsn())?;
         idx.clear();
         self.primary_index_full.store(false, Ordering::Release);
         Ok(())
@@ -629,14 +678,12 @@ impl Tablet {
             return Ok(());
         }
 
-        if self.primary_index_full.load(Ordering::Acquire)
-            && self.reconcile_primary_index_row_count_strict().is_ok()
-        {
+        if self.reconcile_primary_index_row_count().is_ok() {
             return Ok(());
         }
 
         self.rebuild_primary_index_from_visible_rowsets()?;
-        self.reconcile_primary_index_row_count_strict()?;
+        self.reconcile_primary_index_row_count()?;
         self.persist_primary_index_snapshot()?;
         Ok(())
     }
@@ -651,6 +698,10 @@ impl Tablet {
         }
 
         let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
+        if visible_rowsets.is_empty() {
+            return Ok(());
+        }
+
         let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(&schema)?;
         let key_projection: Vec<crate::tablet::ColumnId> = schema
             .columns()
@@ -667,6 +718,10 @@ impl Tablet {
         let allocator = Arc::new(default_allocator());
 
         let repaired = PrimaryIndex::new();
+        let snapshot = self.primary_index_handle().snapshot();
+        if !snapshot.is_empty() {
+            repaired.batch_upsert(snapshot);
+        }
 
         for rowset in visible_rowsets {
             rowset.load()?;
@@ -736,7 +791,6 @@ impl Tablet {
             let idx = self.primary_index_handle();
             persistent.flush_l0(&idx, true)?;
         }
-        persistent.set_applied_lsn(self.applied_lsn())?;
         Ok(())
     }
 }

@@ -7,25 +7,84 @@ use crate::session::Session;
 use paro_catalog::entry::{
     CatalogEntryEnum, IndexCatalogEntry, IndexCoverage, IndexType as CatalogIndexType, LogicalIndex,
 };
-use paro_common::effect::{DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor};
+use paro_common::effect::{
+    CleanupDescriptor, DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor,
+    StagedArtifactDescriptor,
+};
 use paro_common::error::{self as paro_error, Result};
+use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
+use paro_storage::index::graph::{GraphProjectionIndex, GraphStorageGeneration};
 use paro_storage::index::hnsw::{
     build_missing_hnsw_indexes_with_scheduler, DistanceMetric, HnswColumnBuildConfig, HnswConfig,
 };
+use paro_storage::table::table_handle::TableHandle;
+use paro_storage::transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor;
+use std::path::{Path, PathBuf};
 
 pub struct PostCommitActions;
 
 impl PostCommitActions {
     pub fn execute(session: &mut Session, outcome: CommitOutcome) -> Result<()> {
         session.on_transaction_commit_prepared();
+        Self::execute_catalog_effects(session, &outcome);
+        if !outcome.catalog_ops.is_empty() {
+            if let Err(err) = session.current_database.sync_compaction_tablets() {
+                tracing::warn!(
+                    target: targets::TRANSACTION,
+                    commit_id = outcome.commit_id,
+                    error = %err,
+                    "compaction tablet registry sync failed after durable catalog commit"
+                );
+            }
+        }
         Self::execute_deferred_tasks(session, &outcome)?;
         session.notify_transaction_commit();
         session.current_database.maybe_gc_catalog();
         crate::utility::settings::reconcile_effective_settings(session)?;
         session.refresh_session_metadata();
         Ok(())
+    }
+
+    fn execute_catalog_effects(session: &Session, outcome: &CommitOutcome) {
+        for op in &outcome.catalog_ops {
+            for artifact in &op.staged_artifacts {
+                if let Err(err) = Self::publish_staged_artifact(session, artifact) {
+                    tracing::warn!(
+                        target: targets::TRANSACTION,
+                        commit_id = outcome.commit_id,
+                        artifact = ?artifact,
+                        error = %err,
+                        "catalog staged artifact post-commit publish failed after durable commit"
+                    );
+                }
+            }
+
+            for transition in &op.runtime_transitions {
+                if let Err(err) = Self::apply_runtime_transition(session, transition) {
+                    tracing::warn!(
+                        target: targets::TRANSACTION,
+                        commit_id = outcome.commit_id,
+                        transition = ?transition,
+                        error = %err,
+                        "catalog runtime transition failed after durable commit"
+                    );
+                }
+            }
+
+            for cleanup in &op.cleanups {
+                if let Err(err) = Self::apply_cleanup_descriptor(session, cleanup) {
+                    tracing::warn!(
+                        target: targets::TRANSACTION,
+                        commit_id = outcome.commit_id,
+                        cleanup = ?cleanup,
+                        error = %err,
+                        "catalog cleanup failed after durable commit"
+                    );
+                }
+            }
+        }
     }
 
     fn execute_deferred_tasks(session: &Session, outcome: &CommitOutcome) -> Result<()> {
@@ -70,10 +129,10 @@ impl PostCommitActions {
                     Self::build_index_runtime_task(
                         session,
                         outcome,
-                        index,
-                        table_name,
-                        index_type,
-                        column_ids,
+                        &index,
+                        &table_name,
+                        &index_type,
+                        &column_ids,
                         fulltext_config.as_deref(),
                     )
                     .unwrap_or_else(|err| {
@@ -290,6 +349,159 @@ impl PostCommitActions {
         Ok(())
     }
 
+    fn publish_staged_artifact(
+        session: &Session,
+        artifact: &StagedArtifactDescriptor,
+    ) -> Result<()> {
+        match artifact {
+            StagedArtifactDescriptor::PropertyGraphBuild {
+                object, staging, ..
+            } => {
+                let staging_path = Self::path_from_components(&staging.path_components);
+                let final_path =
+                    Self::graph_dir(Path::new(session.current_database.path()), &object.name);
+
+                if !staging_path.exists() {
+                    if final_path.exists() {
+                        return Ok(());
+                    }
+                    return Err(paro_error::internal(format!(
+                        "missing staged property graph artifact during post-commit publish: {}",
+                        staging_path.display()
+                    )));
+                }
+
+                if let Some(parent) = final_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|err| {
+                        paro_error::internal(format!(
+                            "post-commit create property graph parent dir {}: {}",
+                            parent.display(),
+                            err
+                        ))
+                    })?;
+                }
+
+                if final_path.exists() {
+                    std::fs::remove_dir_all(&final_path).map_err(|err| {
+                        paro_error::internal(format!(
+                            "post-commit remove stale property graph dir {}: {}",
+                            final_path.display(),
+                            err
+                        ))
+                    })?;
+                }
+
+                std::fs::rename(&staging_path, &final_path).map_err(|err| {
+                    paro_error::internal(format!(
+                        "post-commit publish property graph staging {} -> {}: {}",
+                        staging_path.display(),
+                        final_path.display(),
+                        err
+                    ))
+                })
+            }
+        }
+    }
+
+    fn apply_runtime_transition(
+        session: &Session,
+        transition: &RuntimeTransitionDescriptor,
+    ) -> Result<()> {
+        match transition {
+            RuntimeTransitionDescriptor::AttachIndexRuntime { .. } => Ok(()),
+            RuntimeTransitionDescriptor::DetachIndexRuntime {
+                index,
+                table_name,
+                index_type,
+                column_ids,
+                ..
+            } => {
+                let Some(storage) =
+                    Self::table_storage(session, index.schema.as_deref(), table_name)?
+                else {
+                    return Ok(());
+                };
+                let _ = storage.remove_index(&index.name);
+                Self::unmark_declared_runtime_indexes(storage.as_ref(), index_type, column_ids)
+            }
+            RuntimeTransitionDescriptor::RegisterGraphRuntime { graph } => {
+                let schema_name = graph.schema.as_deref().ok_or_else(|| {
+                    paro_error::serialization_error(
+                        "CREATE PROPERTY GRAPH runtime transition missing schema name",
+                    )
+                })?;
+                let graph_dir =
+                    Self::graph_dir(Path::new(session.current_database.path()), &graph.name);
+                let index = GraphProjectionIndex::load(&graph_dir)?;
+                let manifest = GraphProjectionIndex::load_manifest(&graph_dir)?;
+                let runtime_key =
+                    GraphId::new(&graph.database, schema_name, &graph.name).runtime_key();
+                session.instance.graph_manager().register_generation(
+                    &runtime_key,
+                    GraphStorageGeneration::from_index(index, manifest, 0),
+                );
+                Ok(())
+            }
+            RuntimeTransitionDescriptor::UnregisterGraphRuntime { graph } => {
+                let schema_name = graph.schema.as_deref().ok_or_else(|| {
+                    paro_error::serialization_error(
+                        "DROP PROPERTY GRAPH runtime transition missing schema name",
+                    )
+                })?;
+                let runtime_key =
+                    GraphId::new(&graph.database, schema_name, &graph.name).runtime_key();
+                session.instance.graph_manager().unregister(&runtime_key);
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_cleanup_descriptor(session: &Session, cleanup: &CleanupDescriptor) -> Result<()> {
+        let tablet_meta_manager = session.current_database.tablet_meta_manager();
+        run_cleanup_descriptor(cleanup, tablet_meta_manager.as_deref())
+    }
+
+    fn table_storage(
+        session: &Session,
+        schema_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<std::sync::Arc<TableHandle>>> {
+        let Some(schema_name) = schema_name else {
+            return Err(paro_error::serialization_error(
+                "runtime transition missing schema name",
+            ));
+        };
+        let txn = session.catalog_txn_view();
+        let schema = session
+            .current_database
+            .catalog()
+            .get_schema(&txn, schema_name)?;
+        let Some(table_entry) = schema.get_table(txn.transaction_id, txn.start_time, table_name)
+        else {
+            return Ok(None);
+        };
+        let Some(table) = table_entry.as_ref().as_table() else {
+            return Ok(None);
+        };
+        Ok(table.get_storage().cloned())
+    }
+
+    fn graph_dir(database_root: &Path, graph_name: &str) -> PathBuf {
+        database_root.join("graph").join(graph_name)
+    }
+
+    fn path_from_components(components: &[String]) -> PathBuf {
+        let mut iter = components.iter();
+        let Some(first) = iter.next() else {
+            return PathBuf::new();
+        };
+        let mut path = PathBuf::from(first);
+        for component in iter {
+            path.push(component);
+        }
+        path
+    }
+
     fn resolve_index_entry(
         session: &Session,
         index: &paro_common::ddl::DdlObjectKey,
@@ -356,6 +568,38 @@ impl PostCommitActions {
             }
             _ => {}
         }
+    }
+
+    fn unmark_declared_runtime_indexes(
+        storage: &TableHandle,
+        index_type: &str,
+        column_ids: &[u32],
+    ) -> Result<()> {
+        match CatalogIndexType::from_str(index_type) {
+            CatalogIndexType::ART => {
+                for column_id in column_ids {
+                    storage.unmark_declared_art_index(*column_id);
+                    storage.remove_runtime_art_index(*column_id)?;
+                }
+            }
+            CatalogIndexType::HNSW => {
+                for column_id in column_ids {
+                    storage.unmark_declared_vector_index(*column_id);
+                }
+            }
+            CatalogIndexType::Sparse => {
+                for column_id in column_ids {
+                    storage.unmark_declared_sparse_index(*column_id);
+                }
+            }
+            CatalogIndexType::FullText => {
+                for column_id in column_ids {
+                    storage.unmark_declared_fulltext_index(*column_id);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn build_hnsw_indexes_parallel(

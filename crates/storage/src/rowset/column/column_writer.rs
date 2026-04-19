@@ -952,7 +952,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         }
 
         if let Some(value) = Self::decode_value(&self.stats_logical_type, value_bytes)? {
-            self.column_stats.statistics_mut().update(&value);
+            self.column_stats.statistics_mut().observe_value(&value);
         } else {
             self.column_stats.statistics_mut().set_has_no_null_fast();
         }

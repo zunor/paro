@@ -3,13 +3,15 @@
 
 //! Write-ahead logging, replay state tracking, and crash recovery.
 //!
-//! The WAL layer owns record encoding, buffered I/O, checkpoint handoff, and
-//! replay/truncation during recovery.
+//! The WAL layer owns record encoding, buffered I/O, segment rotation, and
+//! physical replay/truncation helpers used by segment-catalog recovery and
+//! read-only health probes.
 
 mod checksum;
 pub mod journal_sink;
 pub mod recovery;
 pub mod replay_state;
+pub mod txn_record;
 pub mod wal_entry;
 pub mod wal_reader;
 pub mod wal_type;

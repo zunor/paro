@@ -36,7 +36,6 @@ pub enum GraphRecoveryResult {
     Loaded { graph_name: String },
     Missing { graph_name: String },
     Stale { graph_name: String, reason: String },
-    NeedsUpgrade { graph_name: String },
 }
 
 impl GraphProjectionIndexManager {
@@ -187,24 +186,6 @@ impl GraphProjectionIndexManager {
                 continue;
             }
 
-            let version = match GraphProjectionIndex::manifest_version(&path) {
-                Ok(version) => version,
-                Err(error) => {
-                    results.push(GraphRecoveryResult::Stale {
-                        graph_name: entry.graph_name.clone(),
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            if version == 1 {
-                results.push(GraphRecoveryResult::NeedsUpgrade {
-                    graph_name: entry.graph_name.clone(),
-                });
-                continue;
-            }
-
             let manifest = match GraphProjectionIndex::load_manifest(&path) {
                 Ok(manifest) => manifest,
                 Err(error) => {
@@ -296,6 +277,8 @@ impl std::fmt::Debug for GraphProjectionIndexManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_empty_manager() {
@@ -323,5 +306,41 @@ mod tests {
 
         let snapshot = manager.snapshot("g").expect("snapshot should exist");
         assert_eq!(snapshot.generation_id(), 7);
+    }
+
+    #[test]
+    fn recover_from_catalog_entries_marks_unsupported_manifest_as_stale() {
+        let manager = GraphProjectionIndexManager::new();
+        let temp_dir = TempDir::new().unwrap();
+        let graph_dir = temp_dir.path().join("social_network");
+        fs::create_dir_all(&graph_dir).unwrap();
+        fs::write(
+            graph_dir.join("meta.json"),
+            r#"{
+  "version": 1,
+  "graph_name": "social_network",
+  "vertices": [],
+  "edges": []
+}"#,
+        )
+        .unwrap();
+
+        let results = manager.recover_from_catalog_entries(
+            temp_dir.path(),
+            &[GraphRecoveryCatalogEntry {
+                graph_name: "social_network".to_string(),
+                schema_fingerprint: "fp:test".to_string(),
+            }],
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0],
+            GraphRecoveryResult::Stale {
+                graph_name: "social_network".to_string(),
+                reason: "GraphProjectionIndex: unsupported current meta.json format version 1 (expected 2)"
+                    .to_string(),
+            }
+        );
     }
 }

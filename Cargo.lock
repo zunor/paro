@@ -1631,6 +1631,7 @@ name = "paro-instance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "crc32fast",
  "divan",
  "fs2",
@@ -1661,6 +1662,7 @@ dependencies = [
  "parking_lot",
  "paro-common",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

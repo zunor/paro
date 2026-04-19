@@ -58,7 +58,6 @@ clap = { version = "4.0", features = ["derive"] }
 dirs = "5.0"
 bytesize = { version = "1.3", features = ["serde"] }
 humantime-serde = "1.1"
-
 # Dev dependencies for parser
 divan = "0.1"
 goldenfile = "1"

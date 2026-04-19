@@ -719,6 +719,7 @@ impl RecoveryHook for GraphProjectionRecoveryHook {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 enum ExistingGraphRecovery {
     Reuse {
         index: GraphProjectionIndex,
@@ -740,22 +741,6 @@ fn recover_existing_graph(
         return Ok(ExistingGraphRecovery::Rebuild {
             reason: "graph directory missing; rebuilding from catalog".to_string(),
             issue: None,
-        });
-    }
-
-    let version = match GraphProjectionIndex::manifest_version(graph_dir) {
-        Ok(version) => version,
-        Err(error) => {
-            return Ok(ExistingGraphRecovery::Rebuild {
-                reason: format!("manifest unreadable ({}); rebuilding from catalog", error),
-                issue: Some(RecoveryHookIssueKind::ManifestMismatch),
-            });
-        }
-    };
-    if version == 1 {
-        return Ok(ExistingGraphRecovery::Rebuild {
-            reason: "legacy manifest version; rebuilding from catalog".to_string(),
-            issue: Some(RecoveryHookIssueKind::ManifestMismatch),
         });
     }
 
@@ -1053,4 +1038,92 @@ fn graph_rowid_from_value(value: &Value, context: &str) -> paro_common::error::R
         .as_i64()
         .and_then(|v| u64::try_from(v).ok())
         .ok_or_else(|| paro_error::internal(format!("Missing or invalid rowid for {}", context)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recover_existing_graph, ExistingGraphRecovery, RecoveryHookIssueKind};
+    use paro_storage::index::graph::{
+        GraphBuildInput, GraphManifest, GraphProjectionIndex, GraphState, VertexBuildInput,
+        VertexKey,
+    };
+    use tempfile::tempdir;
+
+    fn save_graph(dir: &std::path::Path, fingerprint: &str) {
+        let index = GraphProjectionIndex::build(&GraphBuildInput {
+            graph_name: "g".to_string(),
+            vertex_tables: vec![VertexBuildInput {
+                label: "Person".to_string(),
+                keys_and_rowids: vec![(VertexKey::Int64(1), 42)],
+            }],
+            edge_tables: Vec::new(),
+            build_backward_adjacency: false,
+        })
+        .expect("build graph index");
+        index
+            .save_with_manifest(
+                dir,
+                GraphManifest::new("g".to_string(), GraphState::Ready, fingerprint.to_string()),
+            )
+            .expect("save graph index");
+    }
+
+    #[test]
+    fn recover_existing_graph_reuses_matching_ready_manifest() {
+        let dir = tempdir().expect("tempdir");
+        save_graph(dir.path(), "fp:test");
+
+        let recovery =
+            recover_existing_graph(dir.path(), "g", "fp:test").expect("recover existing graph");
+        match recovery {
+            ExistingGraphRecovery::Reuse { reason, .. } => {
+                assert!(reason.contains("reusing persisted graph projection"));
+            }
+            other => panic!("expected graph reuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_existing_graph_rebuilds_on_schema_fingerprint_change() {
+        let dir = tempdir().expect("tempdir");
+        save_graph(dir.path(), "fp:old");
+
+        let recovery =
+            recover_existing_graph(dir.path(), "g", "fp:new").expect("recover existing graph");
+        match recovery {
+            ExistingGraphRecovery::Rebuild { reason, issue } => {
+                assert!(reason.contains("schema fingerprint changed"));
+                assert_eq!(issue, Some(RecoveryHookIssueKind::ManifestMismatch));
+            }
+            other => panic!("expected graph rebuild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_existing_graph_rebuilds_on_unsupported_legacy_manifest_format() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("meta.json"),
+            r#"{
+  "version": 1,
+  "graph_name": "g",
+  "vertices": [],
+  "edges": []
+}"#,
+        )
+        .expect("write legacy meta");
+
+        let recovery =
+            recover_existing_graph(dir.path(), "g", "fp:test").expect("recover existing graph");
+        match recovery {
+            ExistingGraphRecovery::Rebuild { reason, issue } => {
+                assert!(
+                    reason.contains("unsupported current meta.json format version 1"),
+                    "unexpected reason: {reason}"
+                );
+                assert_eq!(issue, Some(RecoveryHookIssueKind::ManifestMismatch));
+            }
+            other => panic!("expected graph rebuild, got {other:?}"),
+        }
+    }
 }

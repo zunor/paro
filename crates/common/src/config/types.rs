@@ -304,6 +304,8 @@ pub struct StorageConfig {
     pub temp_dir: Option<PathBuf>,
     /// WAL configuration
     pub wal: WalConfig,
+    /// Checkpoint coordination configuration
+    pub checkpoint: CheckpointConfig,
     /// Buffer pool configuration
     pub buffer_pool: BufferPoolConfig,
 }
@@ -314,6 +316,7 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./data"),
             temp_dir: None,
             wal: WalConfig::default(),
+            checkpoint: CheckpointConfig::default(),
             buffer_pool: BufferPoolConfig::default(),
         }
     }
@@ -325,20 +328,51 @@ impl Default for StorageConfig {
 pub struct WalConfig {
     /// Enable WAL
     pub enabled: bool,
-    /// Checkpoint threshold in bytes
-    #[serde(with = "human_bytes")]
-    pub checkpoint_threshold: usize,
-    /// Checkpoint interval
-    #[serde(with = "humantime_serde")]
-    pub checkpoint_interval: Duration,
 }
 
 impl Default for WalConfig {
     fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Durable checkpoint scheduling and retention coordination configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckpointConfig {
+    /// Trigger an automatic checkpoint once WAL reaches this size.
+    #[serde(with = "human_bytes")]
+    pub trigger_bytes: usize,
+    /// Trigger an automatic checkpoint after this much wall-clock time has
+    /// elapsed since the previous checkpoint finish or abort.
+    #[serde(with = "humantime_serde")]
+    pub trigger_interval: Duration,
+    /// Maximum time to wait for exact-prefix drain before aborting this round.
+    #[serde(with = "humantime_serde")]
+    pub drain_timeout: Duration,
+    /// Maximum number of concurrent bundle serialization workers.
+    pub max_concurrent_writers: usize,
+    /// Maximum number of artifact entries removed from one namespace sweep pass.
+    pub artifact_gc_batch_size: usize,
+    /// Maximum number of artifact entries removed during one retention sweep.
+    pub artifact_gc_delete_budget: usize,
+    /// Maximum number of committed checkpoint bundles deleted in one sweep.
+    pub checkpoint_gc_delete_budget: usize,
+    /// Maximum number of sealed journal segments pruned in one sweep.
+    pub segment_prune_delete_budget: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
         Self {
-            enabled: true,
-            checkpoint_threshold: 10 * 1024 * 1024, // 10MB
-            checkpoint_interval: Duration::from_secs(300), // 5 minutes
+            trigger_bytes: 16 * 1024 * 1024,            // 16 MiB
+            trigger_interval: Duration::from_secs(300), // 5 minutes
+            drain_timeout: Duration::from_secs(30),
+            max_concurrent_writers: 4,
+            artifact_gc_batch_size: 64,
+            artifact_gc_delete_budget: 256,
+            checkpoint_gc_delete_budget: 8,
+            segment_prune_delete_budget: 32,
         }
     }
 }
