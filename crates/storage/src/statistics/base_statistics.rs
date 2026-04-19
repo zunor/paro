@@ -365,10 +365,8 @@ impl BaseStatistics {
         result
     }
 
-    // ========== Backward compatibility methods ==========
-
-    /// Update statistics with a new value (backward compatibility).
-    pub fn update(&mut self, value: &Value) {
+    /// Fold one value into the statistics summary.
+    pub fn observe_value(&mut self, value: &Value) {
         if value.is_null() {
             self.has_null = true;
             return;
@@ -389,8 +387,8 @@ impl BaseStatistics {
         }
     }
 
-    /// Get the minimum value (backward compatibility).
-    pub fn min(&self) -> Option<Value> {
+    /// Return the minimum observed value when this statistics kind tracks one.
+    pub fn min_value(&self) -> Option<Value> {
         match &self.stats_data {
             StatsData::Numeric(data) => data.min_value(&self.data_type),
             StatsData::String(data) => Some(Value::Varchar(data.min_string())),
@@ -398,8 +396,8 @@ impl BaseStatistics {
         }
     }
 
-    /// Get the maximum value (backward compatibility).
-    pub fn max(&self) -> Option<Value> {
+    /// Return the maximum observed value when this statistics kind tracks one.
+    pub fn max_value(&self) -> Option<Value> {
         match &self.stats_data {
             StatsData::Numeric(data) => data.max_value(&self.data_type),
             StatsData::String(data) => Some(Value::Varchar(data.max_string())),
@@ -407,13 +405,8 @@ impl BaseStatistics {
         }
     }
 
-    /// Check if the data has NULL values (backward compatibility).
-    pub fn has_null(&self) -> bool {
-        self.has_null
-    }
-
-    /// Serialize statistics to a byte vector (backward compatibility).
-    pub fn serialize(&self) -> paro_common::error::Result<Vec<u8>> {
+    /// Serialize statistics into the current durable byte format.
+    pub fn to_bytes(&self) -> paro_common::error::Result<Vec<u8>> {
         use std::io::Write;
 
         let mut buffer = Vec::new();
@@ -490,8 +483,8 @@ impl BaseStatistics {
         Ok(())
     }
 
-    /// Deserialize statistics from a byte slice (backward compatibility).
-    pub fn deserialize(bytes: &[u8], data_type: LogicalType) -> paro_common::error::Result<Self> {
+    /// Deserialize statistics from the current durable byte format.
+    pub fn from_bytes(bytes: &[u8], data_type: LogicalType) -> paro_common::error::Result<Self> {
         use std::io::{Cursor, Read};
 
         let mut cursor = Cursor::new(bytes);

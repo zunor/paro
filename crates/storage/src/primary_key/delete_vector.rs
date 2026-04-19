@@ -222,10 +222,10 @@ impl VersionedDeleteVector {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 8 || bytes.get(0..4) != Some(&DELETE_VECTOR_MAGIC) {
-            let mut legacy = DeleteVector::from_bytes(bytes)?;
-            legacy.set_version(0);
-            return Ok(Self::from_versions(vec![legacy]));
+        if bytes.len() < 12 || bytes.get(0..4) != Some(&DELETE_VECTOR_MAGIC) {
+            return Err(paro_error::data_corrupted(
+                "legacy delete vector payloads without versioned header are no longer supported",
+            ));
         }
 
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
@@ -461,6 +461,21 @@ mod tests {
         let mut chain = VersionedDeleteVector::new();
         chain.add_dels_as_new_version(&[9], 4);
         assert!(chain.latest_at(3).is_none());
+    }
+
+    #[test]
+    fn version_chain_rejects_legacy_payload_without_header() {
+        storage_metrics().reset_for_tests();
+        let mut dv = DeleteVector::new();
+        dv.mark_deleted(7);
+
+        let legacy_bytes = dv.to_bytes().unwrap();
+        let err = VersionedDeleteVector::from_bytes(&legacy_bytes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("legacy delete vector payloads without versioned header"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

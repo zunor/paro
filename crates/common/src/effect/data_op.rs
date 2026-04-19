@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 const DELETE_PATCH_ARTIFACT_MAGIC: [u8; 4] = *b"DPCH";
 const DELETE_PATCH_ARTIFACT_VERSION: u32 = 1;
+const LEGACY_COMPACTION_STAGING_ROOT: &str = "_compaction";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactNamespace {
@@ -43,6 +44,17 @@ impl ArtifactRef {
                 });
             }
         }
+        if let Ok(relative) =
+            path.strip_prefix(tablet_data_dir.join(LEGACY_COMPACTION_STAGING_ROOT))
+        {
+            let mut locator = Vec::with_capacity(1 + relative.components().count());
+            locator.push(LEGACY_COMPACTION_STAGING_ROOT.to_string());
+            locator.extend(path_components(relative));
+            return Ok(Self {
+                namespace: ArtifactNamespace::Staged,
+                locator,
+            });
+        }
         Err(paro_error::invalid_input(format!(
             "artifact path {} is not under tablet data dir {}",
             path.display(),
@@ -51,16 +63,62 @@ impl ArtifactRef {
     }
 
     pub fn resolve_for_tablet(&self, tablet_data_dir: &Path) -> PathBuf {
-        let mut path = match self.namespace {
-            ArtifactNamespace::CanonicalRowset => tablet_data_dir.join("rowsets"),
-            ArtifactNamespace::Staged => tablet_data_dir.join("_staged"),
-            ArtifactNamespace::DeletePatch => tablet_data_dir.join("_delete_patch"),
-        };
-        for component in &self.locator {
-            path.push(component);
+        match self.namespace {
+            ArtifactNamespace::CanonicalRowset => {
+                let mut path = tablet_data_dir.join("rowsets");
+                for component in &self.locator {
+                    path.push(component);
+                }
+                path
+            }
+            ArtifactNamespace::Staged => {
+                let is_legacy_compaction = self
+                    .locator
+                    .first()
+                    .is_some_and(|component| component == LEGACY_COMPACTION_STAGING_ROOT);
+                let mut path = if is_legacy_compaction {
+                    tablet_data_dir.join(LEGACY_COMPACTION_STAGING_ROOT)
+                } else {
+                    tablet_data_dir.join("_staged")
+                };
+                for component in self.locator.iter().skip(usize::from(is_legacy_compaction)) {
+                    path.push(component);
+                }
+                path
+            }
+            ArtifactNamespace::DeletePatch => {
+                let mut path = tablet_data_dir.join("_delete_patch");
+                for component in &self.locator {
+                    path.push(component);
+                }
+                path
+            }
         }
-        path
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowsetLocator {
+    pub tablet_id: u64,
+    pub rowset_id: u64,
+    pub path_components: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreparedDataOp {
+    RowsetCommit {
+        locator: RowsetLocator,
+        start_version: i64,
+        end_version: i64,
+    },
+    PrimaryDelete {
+        tablet_id: u64,
+        keys: Vec<Vec<u8>>,
+    },
+    RowIdDelete {
+        tablet_id: u64,
+        locations: Vec<(u64, u32, u32)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

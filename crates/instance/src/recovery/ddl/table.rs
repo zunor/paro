@@ -120,8 +120,10 @@ impl<'a> CatalogReplayHandler<'a> {
             }
         }
 
-        let storage =
-            Arc::new(TableFactory::default().open_from_descriptor(&column_types, descriptor)?);
+        let storage = Arc::new(
+            TableFactory::new(self.tablet_meta_manager.clone())
+                .open_from_descriptor(&column_types, descriptor)?,
+        );
         let info = CreateTableInfo::new(
             self.catalog.name().to_string(),
             schema_name.to_string(),

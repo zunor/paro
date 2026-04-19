@@ -15,10 +15,8 @@ use instance_persistent::create_persistent_instance;
 use paro_catalog::entry::{CatalogEntryEnum, ColumnDefinition};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::chunk::Chunk;
-use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_instance::storage_manager::{wal_path_with_suffix, MAIN_WAL_SUFFIX};
 use paro_instance::{DatabaseCloseAction, DatabaseHandle, Instance};
 use paro_session::{CollectingSink, Session};
 use paro_storage::table::table_factory::TableFactory;
@@ -106,6 +104,16 @@ fn sequence_metadata(
     }
 }
 
+fn table_exists(db: &Arc<DatabaseHandle>, schema_name: &str, table_name: &str) -> bool {
+    let txn = CatalogSnapshot::read_only(u64::MAX);
+    let Ok(schema) = db.catalog().get_schema(&txn, schema_name) else {
+        return false;
+    };
+    schema
+        .get_table(txn.transaction_id, txn.start_time, table_name)
+        .is_some()
+}
+
 fn table_storage(
     db: &Arc<DatabaseHandle>,
     schema_name: &str,
@@ -175,8 +183,8 @@ async fn restart_recovers_persisted_table_and_checkpoint_truncates_wal() {
             .expect("catalog table creation should succeed");
         session
             .current_database
-            .rebuild_route_registry_from_catalog()
-            .expect("route registry should reflect out-of-band catalog create");
+            .sync_compaction_tablets()
+            .expect("compaction registry should reflect out-of-band catalog create");
 
         // Checkpoint once to flush baseline state.
         exec_ok(&mut session, &mut sink, "CHECKPOINT").await;
@@ -226,10 +234,17 @@ async fn restart_recovers_persisted_table_and_checkpoint_truncates_wal() {
         );
 
         // Checkpoint truncation expectation: no WAL growth after checkpoint.
-        let wal_path = wal_path_with_suffix(session.current_database.path(), MAIN_WAL_SUFFIX);
-        let before = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let before = session
+            .current_database
+            .wal()
+            .map(|wal| wal.file_size())
+            .unwrap_or(0);
         exec_ok(&mut session, &mut sink, "CHECKPOINT").await;
-        let after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let after = session
+            .current_database
+            .wal()
+            .map(|wal| wal.file_size())
+            .unwrap_or(0);
         assert!(
             after <= before,
             "checkpoint should not increase WAL size: before={before}, after={after}"
@@ -734,12 +749,6 @@ async fn drop_schema_cascade_updates_route_registry_and_compaction_incrementally
         .compaction_observability()
         .expect("compaction manager should exist")
         .registered_tablets;
-    let table_key = DdlObjectKey::new(
-        "postgres",
-        Some("route_cascade"),
-        "items",
-        DdlObjectKind::Table,
-    );
     let mut session = Session::new(1, Arc::clone(&instance));
 
     exec_ok(&mut session, &mut sink, "CREATE SCHEMA route_cascade").await;
@@ -751,10 +760,8 @@ async fn drop_schema_cascade_updates_route_registry_and_compaction_incrementally
     .await;
 
     assert!(
-        db.route_registry_snapshot()
-            .route_table_key(&table_key)
-            .is_some(),
-        "route registry should expose the created table immediately after commit"
+        table_exists(&db, "route_cascade", "items"),
+        "catalog should expose the created table immediately after commit"
     );
     let registered_after_create = db
         .compaction_observability()
@@ -768,10 +775,8 @@ async fn drop_schema_cascade_updates_route_registry_and_compaction_incrementally
     exec_ok(&mut session, &mut sink, "DROP SCHEMA route_cascade CASCADE").await;
 
     assert!(
-        db.route_registry_snapshot()
-            .route_table_key(&table_key)
-            .is_none(),
-        "route registry should drop schema-owned tables immediately after commit"
+        !table_exists(&db, "route_cascade", "items"),
+        "catalog should drop schema-owned tables immediately after commit"
     );
     let registered_after_drop = db
         .compaction_observability()

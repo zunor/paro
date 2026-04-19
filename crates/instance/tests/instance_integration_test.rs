@@ -2,21 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_catalog::catalog::Catalog;
-use paro_catalog::entry::{CatalogType, ColumnDefinition};
+use paro_catalog::entry::{CatalogEntryEnum, ColumnDefinition};
 use paro_catalog::mvcc::CatalogSnapshot;
+use paro_common::checkpoint::BundleKind;
 use paro_common::chunk::Chunk;
+use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
+use paro_common::effect::{ApplyDescriptor, StagedArtifactDescriptor, StagingArtifactId};
+use paro_common::journal::{CommitRecord, JournalRecord};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
-use paro_instance::storage_manager::{
-    wal_path_with_suffix, CHECKPOINT_WAL_SUFFIX, MAIN_WAL_SUFFIX, RECOVERY_WAL_SUFFIX,
-};
+use paro_instance::checkpoint::manifest_store::testing::arm_manifest_rename_failure_for_path_on_nth_call;
+use paro_instance::checkpoint::{manifest_store::ManifestStore, CheckpointRecovery};
+use paro_instance::storage_manager::{wal_path_with_suffix, StorageManager};
 use paro_instance::{
-    DatabaseCloseAction, DatabaseHandle, DatabaseRecordState, DatabaseStartupStatus,
-    DatabaseStorageIdentity, Instance, InstanceCatalogStore, InstanceConfig, InstanceLayout,
-    InstanceLifecycleState, InstanceRunState, InstanceRunStateStore, InstanceShutdownDisposition,
-    InstanceShutdownMode, InstanceStartupDisposition, RecoveryHook, RecoveryHookContext,
-    RecoveryHookResult, StartupIssueKind, StartupPolicy, INSTANCE_RUN_STATE_FORMAT_VERSION,
+    recover_database_with_checkpoint, DatabaseCloseAction, DatabaseHandle, DatabaseRecordState,
+    DatabaseStartupStatus, DatabaseStorage, DatabaseStorageIdentity, Instance,
+    InstanceCatalogStore, InstanceConfig, InstanceLayout, InstanceLifecycleState, InstanceRunState,
+    InstanceRunStateStore, InstanceShutdownDisposition, InstanceShutdownMode,
+    InstanceStartupDisposition, RecoveryHook, RecoveryHookContext, RecoveryHookResult,
+    StartupIssueKind, StartupPolicy, INSTANCE_RUN_STATE_FORMAT_VERSION,
 };
+use paro_journal::segments::SegmentCatalogStore;
+use paro_journal::segments::DEFAULT_SEGMENT_ROTATION_BYTES;
+use paro_storage::buffer::StandardBufferManager;
 use paro_storage::meta::metadata_store::testing::{
     arm_metadata_parent_sync_failure_for_path_on_nth_call,
     arm_metadata_rename_failure_for_path_on_nth_call,
@@ -25,14 +33,16 @@ use paro_storage::meta::{FileMetadataStore, MetadataStore};
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::wal::test_support::{
-    write_flushed_create_schema_txn, write_flushed_create_schema_txn_at_path,
+    write_flushed_create_schema_txn, write_flushed_create_schema_txn_with_lsn,
 };
-use paro_storage::wal::wal_entry::WalHeaderMetadata;
-use paro_storage::wal::wal_writer::{WalInitState, WalWriter};
+use paro_storage::wal::wal_entry::{WalEntry, WalHeaderMetadata};
+use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn create_table(types: &[LogicalType]) -> TableHandle {
@@ -92,11 +102,11 @@ fn storage_identity_path(storage_dir: &Path) -> PathBuf {
         .join("storage_identity.json")
 }
 
-fn catalog_checkpoint_path(storage_dir: &Path) -> PathBuf {
+fn checkpoint_current_path(storage_dir: &Path) -> PathBuf {
     storage_dir
-        .join("meta")
-        .join("catalog")
-        .join("checkpoint.bin")
+        .join("checkpoints")
+        .join("manifests")
+        .join("CURRENT")
 }
 
 fn load_storage_identity(storage_dir: &Path) -> DatabaseStorageIdentity {
@@ -210,7 +220,7 @@ fn capture_wal_identity(db: &Arc<DatabaseHandle>) -> (String, WalHeaderMetadata)
     (db_path, metadata)
 }
 
-fn wal_paths(db_path: &str) -> (PathBuf, PathBuf, PathBuf) {
+fn wal_probe_paths(db_path: &str) -> (PathBuf, PathBuf, PathBuf) {
     let root = PathBuf::from(db_path.split('?').next().unwrap_or(db_path));
     let wal_dir = root.join("wal");
     let wal_basename = root
@@ -220,16 +230,95 @@ fn wal_paths(db_path: &str) -> (PathBuf, PathBuf, PathBuf) {
         .unwrap_or_else(|| "db".to_string());
 
     (
-        wal_dir.join(format!("{}{}", wal_basename, MAIN_WAL_SUFFIX)),
-        wal_dir.join(format!("{}{}", wal_basename, CHECKPOINT_WAL_SUFFIX)),
-        wal_dir.join(format!("{}{}", wal_basename, RECOVERY_WAL_SUFFIX)),
+        wal_dir.join(format!("{wal_basename}.wal")),
+        wal_dir.join(format!("{wal_basename}.checkpoint.wal")),
+        wal_dir.join(format!("{wal_basename}.recovery.wal")),
     )
 }
 
-fn remove_if_exists(path: &Path) {
-    if path.exists() {
-        std::fs::remove_file(path).expect("failed to remove stale WAL file");
+fn active_segment_path(db_path: &str) -> PathBuf {
+    let (main_wal, _, _) = wal_probe_paths(db_path);
+    let store = SegmentCatalogStore::from_seed_path(&main_wal);
+    let catalog = store
+        .load()
+        .expect("load segment catalog")
+        .expect("segment catalog should exist");
+    store.layout().segment_path(catalog.active_segment_id)
+}
+
+fn open_loaded_storage(path: &str) -> DatabaseStorage {
+    let mut storage = DatabaseStorage::new(
+        path.to_string(),
+        Arc::new(StandardBufferManager::with_defaults(8 * 1024 * 1024)),
+    );
+    storage.load_existing().expect("load existing storage");
+    storage.load_wal().expect("load WAL state");
+    storage
+}
+
+fn write_flushed_missing_graph_publish_record(
+    writer: &paro_storage::wal::wal_writer::WalWriter,
+    lsn: u64,
+    commit_id: u64,
+    graph_name: &str,
+) {
+    let staging_root = std::env::temp_dir()
+        .join("paro-missing-staged-artifact")
+        .join(graph_name);
+    let record = CommitRecord {
+        txn_id: lsn,
+        start_time: 0,
+        commit_id,
+        catalog_ops: Vec::new(),
+        storage_ops: Vec::new(),
+        apply_descriptors: vec![ApplyDescriptor::PublishStagedArtifact(
+            StagedArtifactDescriptor::PropertyGraphBuild {
+                object: DdlObjectKey::new(
+                    "postgres",
+                    Some("public"),
+                    graph_name,
+                    DdlObjectKind::PropertyGraph,
+                ),
+                staging: StagingArtifactId::new(
+                    lsn,
+                    vec![
+                        staging_root
+                            .parent()
+                            .expect("staging root parent")
+                            .to_string_lossy()
+                            .to_string(),
+                        staging_root
+                            .file_name()
+                            .expect("staging root leaf")
+                            .to_string_lossy()
+                            .to_string(),
+                    ],
+                ),
+                schema_fingerprint: "fp:missing".to_string(),
+            },
+        )],
+        deferred_tasks: Vec::new(),
+    };
+    let entry = WalEntry::JournalRecord {
+        lsn,
+        record: JournalRecord::Commit(record),
+    };
+    writer
+        .write_entry(entry.wal_type(), &entry.serialize_data())
+        .expect("write failing journal record");
+    writer.flush().expect("flush failing journal record");
+}
+
+fn collect_single_int_rows(table: &TableHandle) -> Vec<i32> {
+    let mut values = Vec::new();
+    for chunk in table.scan_chunks().expect("scan chunks") {
+        let ids = chunk.column(0).expect("column 0");
+        for idx in 0..chunk.size() {
+            values.push(ids.get_i32(idx).expect("value as i32"));
+        }
     }
+    values.sort_unstable();
+    values
 }
 
 fn legacy_wal_checksum(buffer: &[u8]) -> u64 {
@@ -343,8 +432,14 @@ fn assert_legacy_wal_opcode_rejected(
 ) {
     let dir = tempdir().expect("tempdir");
     let wal_path = dir.path().join(wal_name);
-    let writer = WalWriter::new(&wal_path, WalInitState::Uninitialized);
-    writer.write_header().expect("write wal header");
+    let wal = WriteAheadLog::new(&wal_path).expect("initialize segment-backed wal");
+    wal.flush().expect("materialize active segment header");
+    let store = SegmentCatalogStore::from_seed_path(&wal_path);
+    let catalog = store
+        .load()
+        .expect("load segment catalog")
+        .expect("segment catalog should exist");
+    let active_segment_path = store.layout().segment_path(catalog.active_segment_id);
 
     let mut entry_data = Vec::with_capacity(1 + payload.len());
     entry_data.push(opcode);
@@ -352,7 +447,7 @@ fn assert_legacy_wal_opcode_rejected(
 
     let mut file = OpenOptions::new()
         .append(true)
-        .open(&wal_path)
+        .open(&active_segment_path)
         .expect("open wal for raw append");
     file.write_all(&(entry_data.len() as u64).to_le_bytes())
         .expect("write entry size");
@@ -394,192 +489,611 @@ fn create_single_int_table(
             Arc::clone(&storage),
         )
         .expect("create table should succeed");
-    db.rebuild_route_registry_from_catalog()
-        .expect("route registry should reflect test catalog create");
+    db.sync_compaction_tablets()
+        .expect("compaction registry should reflect test catalog create");
 
     let chunk = Chunk::from_vectors(vec![Vector::from_i32(values)]);
     storage.append(&chunk).expect("append table data");
     storage
 }
 
-#[test]
-fn interrupted_checkpoint_merges_main_and_checkpoint_wal_on_instance_startup() {
-    let dir = tempdir().expect("tempdir");
-    let instance = open_instance(dir.path());
-    let db = default_db(&instance);
-
-    db.close(DatabaseCloseAction::Checkpoint)
-        .expect("close with checkpoint should succeed");
-    let (db_path, metadata) = capture_wal_identity(&db);
-    drop(instance);
-
-    let (main_wal, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
-    remove_if_exists(&main_wal);
-    remove_if_exists(&checkpoint_wal);
-    remove_if_exists(&recovery_wal);
-
-    write_flushed_create_schema_txn_at_path(
-        &main_wal,
-        metadata,
-        "postgres",
-        "cp_before_restart",
-        1,
-        100,
-    )
-    .expect("write flushed create schema txn");
-    let checkpoint_metadata = WalHeaderMetadata::new(
-        metadata.db_identifier,
-        metadata.checkpoint_iteration.saturating_add(1),
-    );
-    write_flushed_create_schema_txn_at_path(
-        &checkpoint_wal,
-        checkpoint_metadata,
-        "postgres",
-        "cp_during_restart",
-        1,
-        100,
-    )
-    .expect("write flushed create schema txn");
-
-    let restarted = open_instance(dir.path());
-    let restarted_db = default_db(&restarted);
-    assert!(schema_exists(&restarted_db, "cp_before_restart"));
-    assert!(schema_exists(&restarted_db, "cp_during_restart"));
-    assert!(
-        !checkpoint_wal.exists(),
-        "checkpoint WAL should be consumed during recovery"
-    );
-}
-
-#[test]
-fn checkpoint_only_wal_is_recovered_on_instance_startup() {
-    let dir = tempdir().expect("tempdir");
-    let instance = open_instance(dir.path());
-    let db = default_db(&instance);
-
-    db.close(DatabaseCloseAction::Checkpoint)
-        .expect("close with checkpoint should succeed");
-    let (db_path, metadata) = capture_wal_identity(&db);
-    drop(instance);
-
-    let (main_wal, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
-    remove_if_exists(&main_wal);
-    remove_if_exists(&checkpoint_wal);
-    remove_if_exists(&recovery_wal);
-
-    let checkpoint_metadata = WalHeaderMetadata::new(
-        metadata.db_identifier,
-        metadata.checkpoint_iteration.saturating_add(1),
-    );
-    write_flushed_create_schema_txn_at_path(
-        &checkpoint_wal,
-        checkpoint_metadata,
-        "postgres",
-        "checkpoint_only_replay",
-        1,
-        100,
-    )
-    .expect("write flushed create schema txn");
-
-    let restarted = open_instance(dir.path());
-    let restarted_db = default_db(&restarted);
-    assert!(schema_exists(&restarted_db, "checkpoint_only_replay"));
-    assert!(
-        restarted_db.transaction_manager().last_commit() >= 100,
-        "DDL-only replay should advance the transaction commit floor"
-    );
-    assert!(
-        restarted_db
-            .transaction_manager()
-            .get_min_active_start_time()
-            > 100,
-        "recovery watermark should be based on the replayed catalog commit id"
-    );
-    assert!(
-        main_wal.exists(),
-        "checkpoint-only recovery should promote checkpoint WAL to main WAL"
-    );
-    assert!(
-        !checkpoint_wal.exists(),
-        "checkpoint WAL should be consumed during checkpoint-only recovery"
-    );
-}
-
-#[test]
-fn recovery_then_concurrent_lazy_default_lookup_remains_idempotent() {
-    let dir = tempdir().expect("tempdir");
-    let instance = open_instance(dir.path());
-    let db = default_db(&instance);
-
-    db.close(DatabaseCloseAction::Checkpoint)
-        .expect("close with checkpoint should succeed");
-    let (db_path, metadata) = capture_wal_identity(&db);
-    drop(instance);
-
-    let (main_wal, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
-    remove_if_exists(&main_wal);
-    remove_if_exists(&checkpoint_wal);
-    remove_if_exists(&recovery_wal);
-
-    let checkpoint_metadata = WalHeaderMetadata::new(
-        metadata.db_identifier,
-        metadata.checkpoint_iteration.saturating_add(1),
-    );
-    write_flushed_create_schema_txn_at_path(
-        &checkpoint_wal,
-        checkpoint_metadata,
-        "postgres",
-        "recovery_lookup_anchor",
-        1,
-        100,
-    )
-    .expect("write flushed create schema txn");
-
-    let restarted = open_instance(dir.path());
-    let restarted_db = default_db(&restarted);
-    assert!(schema_exists(&restarted_db, "recovery_lookup_anchor"));
-
-    let thread_count = 8;
-    let barrier = Arc::new(Barrier::new(thread_count));
-    let seen_ids = Arc::new(Mutex::new(Vec::new()));
-
-    std::thread::scope(|scope| {
-        for _ in 0..thread_count {
-            let barrier = Arc::clone(&barrier);
-            let db = Arc::clone(&restarted_db);
-            let seen_ids = Arc::clone(&seen_ids);
-            scope.spawn(move || {
-                let txn = CatalogSnapshot::read_only(u64::MAX);
-                let schema = db
-                    .catalog()
-                    .get_schema(&txn, "pg_catalog")
-                    .expect("pg_catalog should exist");
-                barrier.wait();
-                let view = schema
-                    .get_view(txn.transaction_id, txn.start_time, "pg_prepared_statements")
-                    .expect("lazy default view should materialize");
-                seen_ids.lock().unwrap().push(view.object_id().raw());
-            });
+fn wait_for(description: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
         }
-    });
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {description}");
+}
 
-    let seen_ids = seen_ids.lock().unwrap().clone();
-    assert_eq!(seen_ids.len(), thread_count);
-    assert!(seen_ids.windows(2).all(|pair| pair[0] == pair[1]));
+#[test]
+fn checkpoint_manifest_records_segment_tail_without_sidecars() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    create_single_int_table(&db, "manifest_tail_items", &[1, 2, 3]);
+    db.force_checkpoint().expect("checkpoint should succeed");
+
+    let (db_path, _) = capture_wal_identity(&db);
+    let (main_wal, checkpoint_wal, recovery_wal) = wal_probe_paths(&db_path);
+    let manifest_store = ManifestStore::open_database_root(&db_path).expect("open manifest store");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .expect("read current manifest")
+        .expect("checkpoint manifest should exist");
+
+    assert_eq!(
+        main_wal.extension().and_then(|ext| ext.to_str()),
+        Some("wal"),
+        "storage should still expose a main WAL seed path"
+    );
+    assert!(
+        manifest.journal.replay_from_segment_id > 0,
+        "committed checkpoint should point at a concrete journal segment"
+    );
+    assert!(
+        SegmentCatalogStore::from_seed_path(&main_wal)
+            .load()
+            .expect("load segment catalog")
+            .is_some(),
+        "segment catalog should exist for checkpoint manifest replay"
+    );
+    assert!(
+        !checkpoint_wal.exists(),
+        "legacy checkpoint sidecar WAL must not exist"
+    );
+    assert!(
+        !recovery_wal.exists(),
+        "legacy recovery sidecar WAL must not exist"
+    );
+}
+
+#[test]
+fn automatic_checkpoint_bytes_trigger_coalesces_into_committed_manifest_publish() {
+    let dir = tempdir().expect("tempdir");
+    let mut config =
+        InstanceConfig::new().with_instance_root(dir.path().to_string_lossy().to_string());
+    config.options.checkpoint.trigger_bytes = 1;
+    config.options.checkpoint.trigger_interval = Duration::from_secs(3600);
+    let instance = open_instance_with_config(config);
+    let db = default_db(&instance);
+
+    let (_summary, lsn) = db.publish_checkpoint_transaction(1, 0, 0);
+    if let Some(wal) = db.wal() {
+        wal.note_flushed_lsn(lsn)
+            .expect("checkpoint transaction lsn should flush");
+    }
+    {
+        let storage = db
+            .storage_manager()
+            .expect("storage manager should be available");
+        storage
+            .as_ref()
+            .expect("storage should be attached")
+            .set_wal_size(1);
+    }
+
+    db.schedule_auto_checkpoint_if_needed();
+    db.schedule_auto_checkpoint_if_needed();
+
+    let current_path = checkpoint_current_path(Path::new(db.path()));
+    wait_for(
+        "automatic bytes-trigger checkpoint publish",
+        Duration::from_secs(5),
+        || current_path.exists(),
+    );
+
+    let manifest_store = ManifestStore::open_database_root(db.path()).expect("open manifest store");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .expect("read current manifest")
+        .expect("checkpoint manifest should exist");
+    assert_eq!(manifest.frontier.checkpoint_lsn, 1);
+    assert_eq!(manifest.checkpoint_id, 1);
+}
+
+#[test]
+fn automatic_checkpoint_interval_trigger_runs_after_elapsed_interval() {
+    let dir = tempdir().expect("tempdir");
+    let mut config =
+        InstanceConfig::new().with_instance_root(dir.path().to_string_lossy().to_string());
+    config.options.checkpoint.trigger_bytes = u64::MAX;
+    config.options.checkpoint.trigger_interval = Duration::from_millis(50);
+    let instance = open_instance_with_config(config);
+    let db = default_db(&instance);
+
+    let (_summary, lsn) = db.publish_checkpoint_transaction(1, 0, 0);
+    if let Some(wal) = db.wal() {
+        wal.note_flushed_lsn(lsn)
+            .expect("checkpoint transaction lsn should flush");
+    }
+    {
+        let storage = db
+            .storage_manager()
+            .expect("storage manager should be available");
+        storage
+            .as_ref()
+            .expect("storage should be attached")
+            .set_wal_size(1);
+    }
+
+    thread::sleep(Duration::from_millis(80));
+    db.schedule_auto_checkpoint_if_needed();
+
+    let current_path = checkpoint_current_path(Path::new(db.path()));
+    wait_for(
+        "automatic interval-trigger checkpoint publish",
+        Duration::from_secs(5),
+        || current_path.exists(),
+    );
+
+    let manifest_store = ManifestStore::open_database_root(db.path()).expect("open manifest store");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .expect("read current manifest")
+        .expect("checkpoint manifest should exist");
+    assert_eq!(manifest.frontier.checkpoint_lsn, 1);
+}
+
+#[test]
+fn checkpoint_manifest_bootstrap_restores_allocator_and_frontier_watermarks() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    let (_summary, lsn) = db.publish_checkpoint_transaction(7, 7, 99);
+    if let Some(wal) = db.wal() {
+        wal.note_flushed_lsn(lsn)
+            .expect("checkpoint transaction lsn should flush");
+    }
+    db.force_checkpoint().expect("checkpoint should succeed");
+    drop(instance);
+
+    let reopened = open_instance(dir.path());
+    let db = default_db(&reopened);
+    let (summary, lsn) = db.publish_checkpoint_transaction(8, 0, 0);
+    if let Some(wal) = db.wal() {
+        wal.note_flushed_lsn(lsn)
+            .expect("checkpoint transaction lsn should flush after restart");
+    }
+
+    assert_eq!(summary.max_lsn, 2);
+    assert_eq!(summary.max_commit_id, 8);
+    assert_eq!(
+        summary.max_catalog_commit_id, 7,
+        "manifest bootstrap should restore catalog watermark without replaying trimmed prefix"
+    );
+    assert_eq!(
+        summary.max_seen_object_id, 99,
+        "manifest bootstrap should restore object-id allocator floor"
+    );
+}
+
+#[test]
+fn checkpoint_base_restore_reloads_tablet_state_from_snapshot_bundles() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    create_single_int_table(&db, "checkpoint_base_items", &[10, 20, 30]);
+    db.force_checkpoint().expect("checkpoint should succeed");
+
+    let storage = open_loaded_storage(db.path());
+    let restored_catalog = Arc::new(paro_catalog::database_catalog::ParoCatalog::new(
+        "postgres".to_string(),
+    ));
+    let checkpoint_base = CheckpointRecovery::load_base_from_storage(
+        restored_catalog.as_ref(),
+        &storage,
+        storage.get_tablet_meta_manager(),
+    )
+    .expect("load checkpoint base");
+
+    assert!(checkpoint_base.checkpoint_id.is_some());
+    assert!(checkpoint_base.frontier.is_some());
+    assert!(checkpoint_base.journal_tail.is_some());
 
     let txn = CatalogSnapshot::read_only(u64::MAX);
-    let schema = restarted_db
-        .catalog()
-        .get_schema(&txn, "pg_catalog")
-        .expect("pg_catalog should remain available");
-    let installed = schema
-        .collection(CatalogType::View)
-        .expect("view collection")
-        .scan_committed()
+    let table = restored_catalog
+        .get_table(&txn, "public", "checkpoint_base_items")
+        .expect("checkpointed table should restore");
+    let CatalogEntryEnum::Table(table) = table.as_ref() else {
+        panic!("expected table entry");
+    };
+    let storage = table.get_storage().expect("table storage should restore");
+    assert_eq!(collect_single_int_rows(storage.as_ref()), vec![10, 20, 30]);
+    assert!(
+        storage.rowset_count() > 0,
+        "tablet rowsets should restore from bundles"
+    );
+}
+
+#[test]
+fn checkpoint_base_restore_rejects_foreign_checkpoint_identity() {
+    fn copy_dir_all(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).expect("create destination directory");
+        for entry in std::fs::read_dir(src).expect("read source directory") {
+            let entry = entry.expect("directory entry");
+            let file_type = entry.file_type().expect("entry file type");
+            let target = dst.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir_all(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy file");
+            }
+        }
+    }
+
+    let source_dir = tempdir().expect("tempdir");
+    let source_instance = open_instance(source_dir.path());
+    let source_db = default_db(&source_instance);
+    source_db
+        .force_checkpoint()
+        .expect("checkpoint should succeed");
+
+    let target_dir = tempdir().expect("tempdir");
+    let target_storage_dir = target_dir.path().join("target_db");
+    let mut target_storage = DatabaseStorage::new(
+        target_storage_dir.to_string_lossy().to_string(),
+        Arc::new(StandardBufferManager::with_defaults(8 * 1024 * 1024)),
+    );
+    target_storage.create_new().expect("create target storage");
+    target_storage
+        .bootstrap_storage_identity(99)
+        .expect("bootstrap target storage identity");
+
+    copy_dir_all(
+        &PathBuf::from(source_db.path()).join("checkpoints"),
+        &target_storage_dir.join("checkpoints"),
+    );
+
+    let target_storage = open_loaded_storage(target_storage_dir.to_string_lossy().as_ref());
+    let restored_catalog = Arc::new(paro_catalog::database_catalog::ParoCatalog::new(
+        "postgres".to_string(),
+    ));
+    let err = CheckpointRecovery::load_base_from_storage(
+        restored_catalog.as_ref(),
+        &target_storage,
+        target_storage.get_tablet_meta_manager(),
+    )
+    .expect_err("foreign checkpoint identity should be rejected");
+
+    assert!(err.to_string().contains("identity mismatch"));
+}
+
+#[test]
+fn checkpoint_base_restore_preflight_does_not_mutate_live_tablets_on_invalid_catalog() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    let durable_storage = Arc::new(
+        TableFactory::new(db.tablet_meta_manager())
+            .create_table(&[LogicalType::Integer])
+            .expect("create durable test table"),
+    );
+    let write_txn = CatalogSnapshot::permanent_writer(u64::MAX);
+    db.catalog()
+        .create_table_in_snapshot(
+            &write_txn,
+            "public",
+            "checkpoint_preflight_items",
+            vec![ColumnDefinition::new(
+                "id".to_string(),
+                LogicalType::Integer,
+            )],
+            Arc::clone(&durable_storage),
+        )
+        .expect("install durable test table");
+    db.sync_compaction_tablets()
+        .expect("sync compaction registry for durable table");
+    durable_storage
+        .append(&Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]))
+        .expect("append durable test data");
+    db.force_checkpoint().expect("checkpoint should succeed");
+
+    let storage = open_loaded_storage(db.path());
+    let tablet_meta_manager = storage
+        .get_tablet_meta_manager()
+        .expect("tablet meta manager should exist");
+    let before_tablets: Vec<u64> = tablet_meta_manager
+        .scan_all_tablets()
+        .expect("scan tablets before corrupt checkpoint")
         .into_iter()
-        .filter(|entry| entry.name() == "pg_prepared_statements")
-        .count();
-    assert_eq!(installed, 1);
+        .map(|meta| meta.tablet_id())
+        .collect();
+    assert!(
+        !before_tablets.is_empty(),
+        "checkpointed database should have durable tablet metadata"
+    );
+
+    let manifest_store = ManifestStore::open_database_root(db.path()).expect("open manifest store");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .expect("read current manifest")
+        .expect("current manifest should exist");
+    let identity =
+        ManifestStore::load_database_identity(&storage).expect("load checkpoint identity");
+    let mut staged = manifest_store
+        .begin_publish(identity)
+        .expect("begin corrupt publish");
+
+    for bundle in &manifest.bundle_refs {
+        let file_name = Path::new(&bundle.locator)
+            .file_name()
+            .expect("bundle file name")
+            .to_string_lossy()
+            .to_string();
+        match &bundle.kind {
+            BundleKind::TabletShard { .. } => {}
+            BundleKind::Catalog => manifest_store
+                .stage_raw_bundle(
+                    &mut staged,
+                    &file_name,
+                    bundle.kind.clone(),
+                    bundle.format_version,
+                    b"corrupt-catalog",
+                    bundle.base_checkpoint_id,
+                )
+                .expect("stage corrupt catalog bundle"),
+            _ => {
+                let payload = manifest_store
+                    .read_bundle_payload(bundle)
+                    .expect("read original bundle payload");
+                manifest_store
+                    .stage_raw_bundle(
+                        &mut staged,
+                        &file_name,
+                        bundle.kind.clone(),
+                        bundle.format_version,
+                        &payload,
+                        bundle.base_checkpoint_id,
+                    )
+                    .expect("stage copied bundle");
+            }
+        }
+    }
+
+    manifest_store
+        .publish_manifest(
+            staged,
+            manifest.frontier.clone(),
+            manifest.bootstrap.clone(),
+            manifest.journal.clone(),
+            manifest.retention_floor.clone(),
+        )
+        .expect("publish corrupt manifest");
+
+    let restored_catalog = Arc::new(paro_catalog::database_catalog::ParoCatalog::new(
+        "postgres".to_string(),
+    ));
+    let err = CheckpointRecovery::load_base_from_storage(
+        restored_catalog.as_ref(),
+        &storage,
+        Some(tablet_meta_manager.clone()),
+    )
+    .expect_err("corrupt catalog bundle should fail preflight");
+    assert!(err.to_string().contains("Invalid catalog snapshot magic"));
+
+    let after_tablets: Vec<u64> = tablet_meta_manager
+        .scan_all_tablets()
+        .expect("scan tablets after corrupt checkpoint")
+        .into_iter()
+        .map(|meta| meta.tablet_id())
+        .collect();
+    assert_eq!(
+        after_tablets, before_tablets,
+        "failed checkpoint preflight must not rewrite live tablet metadata"
+    );
+}
+
+#[test]
+fn recover_database_with_checkpoint_replays_only_tail_journal() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    create_single_int_table(&db, "tail_replay_base_items", &[7, 8, 9]);
+    db.force_checkpoint().expect("checkpoint should succeed");
+
+    let (db_path, metadata) = capture_wal_identity(&db);
+    let wal = db.wal().expect("persistent db should have WAL");
+    let tail_lsn = 211;
+    write_flushed_create_schema_txn_with_lsn(
+        wal.writer().as_ref(),
+        "postgres",
+        "tail_only_schema",
+        11,
+        tail_lsn,
+        tail_lsn,
+    )
+    .expect("append tail schema txn");
+
+    let storage = open_loaded_storage(&db_path);
+    let restored_catalog = Arc::new(paro_catalog::database_catalog::ParoCatalog::new(
+        "postgres".to_string(),
+    ));
+    let checkpoint_base = CheckpointRecovery::load_base_from_storage(
+        restored_catalog.as_ref(),
+        &storage,
+        storage.get_tablet_meta_manager(),
+    )
+    .expect("load checkpoint base");
+
+    let (main_wal, checkpoint_wal, recovery_wal) = wal_probe_paths(&db_path);
+    let (_wal, replay, summary) = recover_database_with_checkpoint(
+        &main_wal,
+        &restored_catalog,
+        storage.get_tablet_meta_manager(),
+        checkpoint_base.journal_tail.clone(),
+        Some(metadata),
+        Some(storage.wal_keep_from()),
+    )
+    .expect("recover from checkpoint base + tail");
+
+    assert_eq!(
+        replay.entries_replayed, 2,
+        "tail replay should apply one committed txn plus its flush boundary"
+    );
+    assert_eq!(
+        summary.max_lsn, tail_lsn,
+        "tail replay should surface the highest durable logical LSN from the replayed journal tail"
+    );
+    assert!(schema_exists(&db, "public"));
+    let txn = CatalogSnapshot::read_only(u64::MAX);
+    assert!(restored_catalog
+        .get_table(&txn, "public", "tail_replay_base_items")
+        .is_ok());
+    assert!(restored_catalog
+        .get_schema(&txn, "tail_only_schema")
+        .is_ok());
+    assert!(
+        !checkpoint_wal.exists(),
+        "legacy checkpoint sidecar WAL must not exist"
+    );
+    assert!(
+        !recovery_wal.exists(),
+        "legacy recovery sidecar WAL must not exist"
+    );
+}
+
+#[test]
+fn checkpoint_tail_replay_spans_multiple_rotated_segments() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    let wal = db.wal().expect("persistent db should have WAL");
+    write_flushed_create_schema_txn(
+        wal.writer().as_ref(),
+        "postgres",
+        "before_checkpoint_segment_one",
+        1,
+        100,
+    )
+    .expect("write first schema txn");
+    wal.writer()
+        .truncate(DEFAULT_SEGMENT_ROTATION_BYTES)
+        .expect("inflate active segment to rotation threshold");
+    wal.note_flushed_lsn(1)
+        .expect("rotate after sealing first segment");
+
+    write_flushed_create_schema_txn(
+        wal.writer().as_ref(),
+        "postgres",
+        "before_checkpoint_segment_two",
+        2,
+        101,
+    )
+    .expect("write second schema txn");
+    wal.note_flushed_lsn(2).expect("record second schema flush");
+    db.force_checkpoint().expect("checkpoint should succeed");
+
+    write_flushed_create_schema_txn(
+        wal.writer().as_ref(),
+        "postgres",
+        "tail_segment_two",
+        3,
+        102,
+    )
+    .expect("write tail schema in second segment");
+    wal.writer()
+        .truncate(DEFAULT_SEGMENT_ROTATION_BYTES)
+        .expect("inflate second segment to rotation threshold");
+    wal.note_flushed_lsn(3).expect("rotate into third segment");
+
+    write_flushed_create_schema_txn(
+        wal.writer().as_ref(),
+        "postgres",
+        "tail_segment_three",
+        4,
+        103,
+    )
+    .expect("write tail schema in third segment");
+    wal.note_flushed_lsn(4).expect("record third segment flush");
+
+    let segment_catalog = wal.segment_catalog_snapshot();
+    assert!(
+        segment_catalog.segments.len() >= 3,
+        "setup should produce at least three physical WAL segments"
+    );
+
+    drop(instance);
+
+    let restarted = open_instance(dir.path());
+    let restarted_db = default_db(&restarted);
+    assert!(schema_exists(
+        &restarted_db,
+        "before_checkpoint_segment_one"
+    ));
+    assert!(schema_exists(
+        &restarted_db,
+        "before_checkpoint_segment_two"
+    ));
+    assert!(schema_exists(&restarted_db, "tail_segment_two"));
+    assert!(schema_exists(&restarted_db, "tail_segment_three"));
+}
+
+#[test]
+fn checkpoint_tail_replay_stops_after_first_partial_segment() {
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("partial_tail_stop.wal");
+    let wal = WriteAheadLog::new(&wal_path).expect("initialize segment-backed wal");
+
+    write_flushed_create_schema_txn(wal.writer().as_ref(), "postgres", "segment_one_ok", 1, 100)
+        .expect("write first segment schema");
+    wal.writer()
+        .truncate(DEFAULT_SEGMENT_ROTATION_BYTES)
+        .expect("inflate first segment to rotation threshold");
+    wal.note_flushed_lsn(1).expect("rotate into second segment");
+
+    write_flushed_missing_graph_publish_record(
+        wal.writer().as_ref(),
+        2,
+        101,
+        "missing_graph_segment_two",
+    );
+    wal.writer()
+        .truncate(DEFAULT_SEGMENT_ROTATION_BYTES)
+        .expect("inflate second segment to rotation threshold");
+    wal.note_flushed_lsn(2).expect("rotate into third segment");
+
+    write_flushed_create_schema_txn(
+        wal.writer().as_ref(),
+        "postgres",
+        "segment_three_must_not_apply",
+        3,
+        102,
+    )
+    .expect("write third segment schema");
+
+    let restored_catalog = Arc::new(paro_catalog::database_catalog::ParoCatalog::new(
+        "postgres".to_string(),
+    ));
+    restored_catalog.initialize(false);
+
+    let (_wal, replay, summary) =
+        recover_database_with_checkpoint(&wal_path, &restored_catalog, None, None, None, None)
+            .expect("recover from multi-segment tail");
+
+    assert!(!replay.all_succeeded);
+    assert!(replay
+        .error
+        .as_deref()
+        .is_some_and(|msg| msg.contains("missing staged property graph artifact")));
+    assert_eq!(
+        summary.max_lsn, 1,
+        "recovery summary must stop at the last exact-prefix segment"
+    );
+
+    let txn = CatalogSnapshot::read_only(u64::MAX);
+    assert!(restored_catalog.get_schema(&txn, "segment_one_ok").is_ok());
+    assert!(restored_catalog
+        .get_schema(&txn, "segment_three_must_not_apply")
+        .is_err());
 }
 
 #[test]
@@ -588,7 +1102,7 @@ fn close_path_checkpoint_has_no_data_loss_window() {
     let instance = open_instance(dir.path());
     let db = default_db(&instance);
     let (db_path, _) = capture_wal_identity(&db);
-    let (main_wal, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
+    let (_, checkpoint_wal, recovery_wal) = wal_probe_paths(&db_path);
 
     let wal = db.wal().expect("persistent db should have WAL");
     write_flushed_create_schema_txn(
@@ -604,24 +1118,18 @@ fn close_path_checkpoint_has_no_data_loss_window() {
         .expect("close checkpoint should succeed");
     assert!(
         !checkpoint_wal.exists(),
-        "close-path checkpoint should not leave checkpoint WAL behind"
+        "close-path checkpoint should not leave legacy checkpoint sidecar WAL behind"
     );
     assert!(
         !recovery_wal.exists(),
-        "close-path checkpoint should not leave recovery WAL behind"
+        "close-path checkpoint should not leave legacy recovery sidecar WAL behind"
     );
-    if main_wal.exists() {
-        let report = db.check_wal_health().expect("wal health check");
-        assert!(report.healthy, "main WAL should remain healthy after close");
-    }
-    drop(instance);
 
-    let restarted = open_instance(dir.path());
-    let restarted_db = default_db(&restarted);
-    let report = restarted_db
-        .check_wal_health()
-        .expect("wal health check after restart");
-    assert!(report.healthy, "restart should not observe WAL corruption");
+    let report = db.check_wal_health().expect("wal health check");
+    assert!(
+        report.healthy,
+        "segment journal should remain healthy after close"
+    );
 }
 
 #[test]
@@ -630,44 +1138,41 @@ fn torn_write_tail_is_repaired_on_instance_startup() {
     let instance = open_instance(dir.path());
     let db = default_db(&instance);
 
-    db.close(DatabaseCloseAction::Checkpoint)
-        .expect("close with checkpoint should succeed");
-    let (db_path, metadata) = capture_wal_identity(&db);
-    drop(instance);
-
-    let (main_wal, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
-    remove_if_exists(&main_wal);
-    remove_if_exists(&checkpoint_wal);
-    remove_if_exists(&recovery_wal);
-
-    write_flushed_create_schema_txn_at_path(
-        &main_wal,
-        metadata,
+    let wal = db.wal().expect("persistent db should have WAL");
+    write_flushed_create_schema_txn(
+        wal.writer().as_ref(),
         "postgres",
         "torn_before_restart",
         1,
         100,
     )
-    .expect("write flushed create schema txn");
-    let size_before_torn = std::fs::metadata(&main_wal)
-        .expect("main WAL metadata before torn write")
+    .expect("write schema txn");
+
+    db.close(DatabaseCloseAction::Checkpoint)
+        .expect("close with checkpoint should succeed");
+    let (db_path, _) = capture_wal_identity(&db);
+    let active_segment = active_segment_path(&db_path);
+    let size_before_torn = std::fs::metadata(&active_segment)
+        .expect("active segment metadata before torn write")
         .len();
+
+    drop(instance);
 
     {
         let mut file = OpenOptions::new()
             .append(true)
-            .open(&main_wal)
-            .expect("open WAL for torn write injection");
+            .open(&active_segment)
+            .expect("open active segment for torn write injection");
         file.write_all(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE])
             .expect("append torn tail");
         file.sync_all().expect("sync torn tail");
     }
-    let size_with_torn = std::fs::metadata(&main_wal)
-        .expect("main WAL metadata after torn write")
+    let size_with_torn = std::fs::metadata(&active_segment)
+        .expect("active segment metadata after torn write")
         .len();
     assert!(
         size_with_torn > size_before_torn,
-        "torn write injection should increase WAL size"
+        "torn write injection should increase active segment size"
     );
 
     let restarted = open_instance(dir.path());
@@ -679,12 +1184,12 @@ fn torn_write_tail_is_repaired_on_instance_startup() {
         .expect("wal health check after torn-write recovery");
     assert!(report.healthy, "recovery should repair torn WAL tail");
 
-    let size_after_recovery = std::fs::metadata(&main_wal)
-        .expect("main WAL metadata after recovery")
+    let size_after_recovery = std::fs::metadata(&active_segment)
+        .expect("active segment metadata after recovery")
         .len();
     assert!(
         size_after_recovery < size_with_torn,
-        "recovery should truncate torn tail bytes"
+        "recovery should truncate torn tail bytes from the active segment"
     );
 }
 
@@ -692,12 +1197,8 @@ fn torn_write_tail_is_repaired_on_instance_startup() {
 fn wal_path_construction_supports_query_parameters() {
     let db_path = "/tmp/paro_instance_test.db?token=abc&readonly=true";
     assert_eq!(
-        wal_path_with_suffix(db_path, MAIN_WAL_SUFFIX),
+        wal_path_with_suffix(db_path, ".wal"),
         "/tmp/paro_instance_test.db.wal?token=abc&readonly=true"
-    );
-    assert_eq!(
-        wal_path_with_suffix(db_path, CHECKPOINT_WAL_SUFFIX),
-        "/tmp/paro_instance_test.db.checkpoint.wal?token=abc&readonly=true"
     );
 }
 
@@ -724,68 +1225,39 @@ fn legacy_row_tuple_delete_wal_rejects_recovery() {
 }
 
 #[test]
-fn compaction_checkpoint_recovery_regression() {
+fn legacy_segment_wal_version_rejects_recovery() {
     let dir = tempdir().expect("tempdir");
-    let instance = open_instance(dir.path());
-    let db = default_db(&instance);
+    let wal_path = dir.path().join("legacy_segment_version.wal");
+    let active_segment_path = {
+        let wal = WriteAheadLog::new(&wal_path).expect("initialize segment-backed wal");
+        wal.flush().expect("materialize active segment header");
 
-    create_single_int_table(&db, "compaction_items", &[10, 20]);
-    db.sync_compaction_tablets()
-        .expect("compaction tablet sync should succeed");
-    let obs = db
-        .compaction_observability()
-        .expect("compaction manager should exist");
-    assert!(obs.registered_tablets >= 1);
+        let store = SegmentCatalogStore::from_seed_path(&wal_path);
+        let catalog = store
+            .load()
+            .expect("load segment catalog")
+            .expect("segment catalog should exist");
+        store.layout().segment_path(catalog.active_segment_id)
+    };
 
-    db.force_checkpoint().expect("checkpoint should succeed");
-    db.close(DatabaseCloseAction::Checkpoint)
-        .expect("close checkpoint should succeed");
-    let (db_path, metadata) = capture_wal_identity(&db);
-    drop(instance);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&active_segment_path)
+        .expect("open active segment for header rewrite");
+    file.seek(SeekFrom::Start(1))
+        .expect("seek to WAL version field");
+    file.write_all(&2u64.to_le_bytes())
+        .expect("overwrite WAL version");
+    file.sync_all().expect("sync rewritten WAL header");
 
-    let (main_wal, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
-    remove_if_exists(&main_wal);
-    remove_if_exists(&checkpoint_wal);
-    remove_if_exists(&recovery_wal);
-
-    write_flushed_create_schema_txn_at_path(
-        &main_wal,
-        metadata,
-        "postgres",
-        "compaction_recovery_before",
-        1,
-        100,
-    )
-    .expect("write flushed create schema txn");
-    let checkpoint_metadata = WalHeaderMetadata::new(
-        metadata.db_identifier,
-        metadata.checkpoint_iteration.saturating_add(1),
-    );
-    write_flushed_create_schema_txn_at_path(
-        &checkpoint_wal,
-        checkpoint_metadata,
-        "postgres",
-        "compaction_recovery_during",
-        1,
-        100,
-    )
-    .expect("write flushed create schema txn");
-
-    let restarted = open_instance(dir.path());
-    let restarted_db = default_db(&restarted);
-    assert!(schema_exists(&restarted_db, "compaction_recovery_before"));
-    assert!(schema_exists(&restarted_db, "compaction_recovery_during"));
-
-    restarted_db
-        .sync_compaction_tablets()
-        .expect("compaction sync should succeed after recovery");
-    let recovered_obs = restarted_db
-        .compaction_observability()
-        .expect("compaction manager should exist after recovery");
-    assert!(!recovered_obs.suspended);
-    restarted_db
-        .force_checkpoint()
-        .expect("checkpoint should succeed after recovery");
+    let catalog = Arc::new(paro_catalog::database_catalog::ParoCatalog::new(
+        "test".to_string(),
+    ));
+    catalog.initialize(false);
+    let err = paro_instance::recover_database(&wal_path, &catalog, None)
+        .expect_err("legacy segment WAL version should fail recovery");
+    assert!(err.is_feature_not_supported());
+    assert!(err.to_string().contains("unsupported WAL version 2"));
 }
 
 // --- Instance acceptance tests (startup, checkpoint, compaction) ---
@@ -856,16 +1328,16 @@ fn all_checkpoint_entries_use_wal_coordination() {
         .expect("force_checkpoint should succeed via WAL coordination");
 
     let (db_path, _) = capture_wal_identity(&db);
-    let (_, checkpoint_wal, recovery_wal) = wal_paths(&db_path);
+    let (_, checkpoint_wal, recovery_wal) = wal_probe_paths(&db_path);
 
     // After a successful checkpoint, no stale checkpoint/recovery WAL should remain
     assert!(
         !checkpoint_wal.exists(),
-        "checkpoint WAL should be consumed after force_checkpoint"
+        "legacy checkpoint sidecar WAL should not exist after force_checkpoint"
     );
     assert!(
         !recovery_wal.exists(),
-        "recovery WAL should not exist after force_checkpoint"
+        "legacy recovery sidecar WAL should not exist after force_checkpoint"
     );
 
     let wal = db.wal().expect("WAL should exist");
@@ -908,7 +1380,7 @@ fn all_checkpoint_entries_use_wal_coordination() {
 /// - Compaction manager is created on startup
 /// - Tablets are synced after recovery
 /// - Compaction is not suspended after normal startup
-/// - Checkpoint suspends and resumes compaction
+/// - Checkpoint does not leave compaction suspended
 #[test]
 fn compaction_scheduling_integrates_with_instance_lifecycle() {
     let dir = tempdir().expect("tempdir");
@@ -935,7 +1407,7 @@ fn compaction_scheduling_integrates_with_instance_lifecycle() {
         "compaction should not be suspended during normal operation"
     );
 
-    // Checkpoint should temporarily suspend compaction, then resume
+    // Checkpoint should complete without leaving compaction suspended
     db.force_checkpoint().expect("checkpoint should succeed");
 
     let obs_after = db
@@ -2114,8 +2586,8 @@ fn shutdown_clean_returns_error_and_keeps_run_state_dirty_when_checkpoint_close_
         .expect("tracked work should already be drained");
 
     let postgres_storage_dir = PathBuf::from(default_db(&instance).path());
-    arm_metadata_rename_failure_for_path_on_nth_call(
-        catalog_checkpoint_path(&postgres_storage_dir),
+    arm_manifest_rename_failure_for_path_on_nth_call(
+        checkpoint_current_path(&postgres_storage_dir),
         1,
     );
     let err = instance

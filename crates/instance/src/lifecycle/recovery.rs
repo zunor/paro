@@ -69,7 +69,7 @@ impl InstanceRecovery {
                 DatabaseOpenIntent::OpenExisting,
                 &instance
                     .runtime
-                    .database_open_context(instance.boot_config.checkpoint_wal_size),
+                    .database_open_context(instance.boot_config.checkpoint),
                 instance.lifecycle.startup_policy,
                 true,
             ) {

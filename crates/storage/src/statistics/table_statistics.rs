@@ -488,7 +488,7 @@ mod tests {
         // Update stats in stats2
         {
             let mut base = BaseStatistics::create_empty(LogicalType::Integer);
-            base.update(&Value::Integer(42));
+            base.observe_value(&Value::Integer(42));
             stats2.merge_stats_column(0, &base);
         }
 
@@ -496,7 +496,7 @@ mod tests {
 
         // Check that stats1 now has the merged data
         let copied = stats1.copy_stats(0).unwrap();
-        assert!(copied.has_null() || copied.max().is_some());
+        assert!(copied.can_have_null() || copied.max_value().is_some());
     }
 
     #[test]
@@ -505,12 +505,12 @@ mod tests {
         let mut stats = TableStatistics::initialize_empty(&types);
 
         let mut base = BaseStatistics::create_empty(LogicalType::Integer);
-        base.update(&Value::Integer(100));
+        base.observe_value(&Value::Integer(100));
 
         stats.merge_stats_column(0, &base);
 
         let copied = stats.copy_stats(0).unwrap();
-        assert_eq!(copied.max(), Some(Value::Integer(100)));
+        assert_eq!(copied.max_value(), Some(Value::Integer(100)));
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
         // Update the stats
         {
             let mut base = BaseStatistics::create_empty(LogicalType::Integer);
-            base.update(&Value::Integer(50));
+            base.observe_value(&Value::Integer(50));
             stats.merge_stats_column(0, &base);
         }
 
@@ -548,7 +548,7 @@ mod tests {
         assert!(copied.is_some());
 
         let copied = copied.unwrap();
-        assert_eq!(copied.max(), Some(Value::Integer(50)));
+        assert_eq!(copied.max_value(), Some(Value::Integer(50)));
     }
 
     #[test]
@@ -601,7 +601,7 @@ mod tests {
         // Update some stats
         {
             let mut base = BaseStatistics::create_empty(LogicalType::Integer);
-            base.update(&Value::Integer(42));
+            base.observe_value(&Value::Integer(42));
             stats.merge_stats_column(0, &base);
         }
 
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(restored.column_count(), 2);
 
         let copied = restored.copy_stats(0).unwrap();
-        assert_eq!(copied.max(), Some(Value::Integer(42)));
+        assert_eq!(copied.max_value(), Some(Value::Integer(42)));
     }
 
     #[test]

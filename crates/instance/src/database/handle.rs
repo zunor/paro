@@ -3,7 +3,10 @@
 
 //! Represents a single database attached to the Paro instance.
 
-use crate::database::checkpointer::{CheckpointContext, Checkpointer};
+use crate::checkpoint::coordinator::{
+    CheckpointCoordinator, CheckpointExecutionContext, CheckpointTriggerReason,
+};
+use crate::config::CheckpointConfigOptions;
 use crate::database::closer::DatabaseCloser;
 use crate::database::compaction_driver::CompactionDriver;
 use crate::database::identity::{DatabaseIdentity, DatabaseType};
@@ -11,27 +14,23 @@ use crate::database::opener::DatabaseOpener;
 use crate::database::state::DatabaseState;
 use crate::database::wal_observability::WalLifecycleMetricsSnapshot;
 use crate::database::wal_observability::WalObservability;
-use crate::recovery::registry::RouteRegistry;
 use crate::storage_manager::StorageManager;
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;
-use paro_common::ddl::DdlObjectKey;
-use paro_common::effect::DeferredTask;
-use paro_common::journal::RecoverySummary;
+use paro_common::checkpoint::RecoverySummary;
 use paro_common::logging::targets;
-use paro_journal::{JournalAppender, JournalApplyRuntime, JournalCoordinator};
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::transaction::manager::TransactionManager;
-use paro_storage::wal::journal_sink::WalJournalSink;
 use paro_storage::wal::write_ahead_log::WriteAheadLog;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::thread;
 
 /// State of an attached database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,17 +232,19 @@ pub struct DatabaseHandle {
     transaction_manager: Arc<TransactionManager>,
     buffer_pool: Arc<BufferPool>,
     storage_manager: RwLock<Option<Box<dyn StorageManager>>>,
-    journal_appender: RwLock<Option<Arc<JournalAppender>>>,
-    journal_coordinator: RwLock<Option<Arc<JournalCoordinator>>>,
-    journal_apply_runtime: RwLock<Option<Arc<JournalApplyRuntime>>>,
-    route_registry: RwLock<RouteRegistry>,
-    task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
-    replayed_deferred_tasks: RwLock<Vec<DeferredTask>>,
     compaction: CompactionDriver,
-    checkpointer: Checkpointer,
+    checkpoint_coordinator: CheckpointCoordinator,
+    checkpoint_trigger: CheckpointTriggerState,
     wal_observability: WalObservability,
     last_gc_epoch: AtomicU64,
     last_gc_watermark: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct CheckpointTriggerState {
+    background_started: std::sync::atomic::AtomicBool,
+    pending: Mutex<bool>,
+    changed: Condvar,
 }
 
 impl std::fmt::Debug for DatabaseHandle {
@@ -278,9 +279,6 @@ impl DatabaseHandle {
         initial_state: DbState,
     ) -> Self {
         let catalog = Self::catalog_for_path(&identity.name, &identity.path);
-        let journal_apply_runtime = Arc::new(JournalApplyRuntime::new());
-        let journal_coordinator = Arc::new(JournalCoordinator::new(None));
-        journal_coordinator.bind_apply_runtime(Arc::clone(&journal_apply_runtime));
         Self {
             identity,
             state: DatabaseState::new(initial_state),
@@ -288,14 +286,9 @@ impl DatabaseHandle {
             transaction_manager: Arc::new(TransactionManager::new()),
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
-            journal_appender: RwLock::new(None),
-            journal_coordinator: RwLock::new(Some(journal_coordinator)),
-            journal_apply_runtime: RwLock::new(Some(journal_apply_runtime)),
-            route_registry: RwLock::new(RouteRegistry::default()),
-            task_scheduler: RwLock::new(None),
-            replayed_deferred_tasks: RwLock::new(Vec::new()),
             compaction: CompactionDriver::new(buffer_pool),
-            checkpointer: Checkpointer::new(),
+            checkpoint_coordinator: CheckpointCoordinator::new(),
+            checkpoint_trigger: CheckpointTriggerState::default(),
             wal_observability: WalObservability::new(),
             last_gc_epoch: AtomicU64::new(0),
             last_gc_watermark: AtomicU64::new(0),
@@ -478,28 +471,17 @@ impl DatabaseHandle {
     }
 
     /// Bind the instance task scheduler for background maintenance tasks.
-    pub fn bind_task_scheduler(&self, scheduler: Arc<TaskScheduler>) {
-        self.compaction.bind_scheduler(scheduler.clone());
-        *self.task_scheduler.write() = Some(scheduler);
-    }
-
-    pub fn task_scheduler(&self) -> Option<Arc<TaskScheduler>> {
-        self.task_scheduler.read().clone()
-    }
-
-    pub fn set_replayed_deferred_tasks(&self, tasks: Vec<DeferredTask>) {
-        *self.replayed_deferred_tasks.write() = tasks;
-    }
-
-    pub fn replayed_deferred_tasks(&self) -> Vec<DeferredTask> {
-        self.replayed_deferred_tasks.read().clone()
+    pub fn bind_task_scheduler(self: &Arc<Self>, scheduler: Arc<TaskScheduler>) {
+        self.compaction.bind_scheduler(scheduler);
+        self.ensure_checkpoint_background_runner();
     }
 
     /// Sync compaction tablet registry with the currently visible catalog tables.
     pub fn sync_compaction_tablets(&self) -> anyhow::Result<()> {
-        self.bind_runtime_storage_wal();
         self.compaction
-            .sync_tablets(&self.catalog, self.name(), self.db_type())
+            .sync_tablets(&self.catalog, self.name(), self.db_type())?;
+        self.bind_checkpoint_publish_observers();
+        Ok(())
     }
 
     /// Set the storage manager for persistence.
@@ -510,7 +492,6 @@ impl DatabaseHandle {
         let mut storage = self.storage_manager.write();
         *storage = Some(manager);
         drop(storage);
-        self.refresh_journal_appender();
 
         self.compaction.ensure_started(self.name(), self.db_type());
         if let Err(err) = self.sync_compaction_tablets() {
@@ -533,36 +514,6 @@ impl DatabaseHandle {
     pub fn tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>> {
         let storage = self.storage_manager.read();
         storage.as_ref().and_then(|s| s.get_tablet_meta_manager())
-    }
-
-    fn bind_runtime_storage_wal(&self) {
-        let wal = self.wal();
-        let txn = CatalogSnapshot::read_only(u64::MAX);
-
-        for schema_entry in self
-            .catalog
-            .get_schema_collection()
-            .scan(txn.transaction_id, txn.start_time)
-        {
-            let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
-                continue;
-            };
-
-            for table_entry in schema
-                .collection(CatalogType::Table)
-                .expect("table collection")
-                .scan(txn.transaction_id, txn.start_time)
-            {
-                let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
-                    continue;
-                };
-                if let Some(storage) = table.get_storage() {
-                    storage.bind_database_wal(wal.clone());
-                    storage.bind_journal_coordinator(self.journal_coordinator());
-                    storage.bind_journal_apply_runtime(self.journal_apply_runtime());
-                }
-            }
-        }
     }
 
     /// Get the catalog.
@@ -620,8 +571,6 @@ impl DatabaseHandle {
         if let Some(ref mut sm) = *storage {
             sm.initialize().map_err(|e| anyhow::anyhow!(e))?;
         }
-        drop(storage);
-        self.refresh_journal_appender();
 
         tracing::info!(
             target: targets::WAL,
@@ -639,119 +588,9 @@ impl DatabaseHandle {
         storage.as_ref().and_then(|s| s.get_wal_arc())
     }
 
-    pub fn journal_appender(&self) -> Option<Arc<JournalAppender>> {
-        self.journal_appender.read().clone()
-    }
-
-    pub fn journal_coordinator(&self) -> Option<Arc<JournalCoordinator>> {
-        self.journal_coordinator.read().clone()
-    }
-
-    pub fn journal_apply_runtime(&self) -> Option<Arc<JournalApplyRuntime>> {
-        self.journal_apply_runtime.read().clone()
-    }
-
-    pub fn route_registry_snapshot(&self) -> RouteRegistry {
-        self.route_registry.read().clone()
-    }
-
-    pub fn replace_route_registry(&self, registry: RouteRegistry) -> RouteRegistry {
-        std::mem::replace(&mut *self.route_registry.write(), registry)
-    }
-
-    pub fn rebuild_route_registry_from_catalog(&self) -> paro_common::error::Result<()> {
-        let _ = self.replace_route_registry(RouteRegistry::from_catalog(&self.catalog)?);
-        Ok(())
-    }
-
-    pub fn sweep_staged_artifacts_after_recovery(&self) {
-        let mut seen = HashSet::new();
-        for route in self.route_registry_snapshot().tablet_routes() {
-            let tablet = route.storage.tablet();
-            if !seen.insert(tablet.tablet_id()) {
-                continue;
-            }
-            paro_storage::compaction::cleanup::sweep_staging_root(tablet.staged_root_dir());
-        }
-    }
-
-    pub fn refresh_journal_appender(&self) {
-        self.refresh_journal_appender_with_summary(RecoverySummary::default());
-    }
-
-    pub fn refresh_journal_appender_with_summary(&self, summary: RecoverySummary) {
-        let next_appender = self.wal().map(|wal| {
-            Arc::new(JournalAppender::new_with_next_lsn(
-                Arc::new(WalJournalSink::new(wal)),
-                summary.max_lsn.saturating_add(1).max(1),
-            ))
-        });
-        let next_apply_runtime = Some(Arc::new(JournalApplyRuntime::new()));
-        let next_coordinator = Some(Arc::new(JournalCoordinator::new(next_appender.clone())));
-        if let Some(runtime) = &next_apply_runtime {
-            runtime.bootstrap_frontiers(summary);
-        }
-        if let Some(coordinator) = &next_coordinator {
-            if let Some(runtime) = &next_apply_runtime {
-                coordinator.bind_apply_runtime(Arc::clone(runtime));
-            }
-            coordinator.sync_commit_id_with(summary.max_commit_id);
-            coordinator.sync_commit_id_with(self.transaction_manager.durable_commit_id());
-            coordinator.sync_maintenance_id_with(summary.max_maintenance_id);
-        }
-        *self.journal_appender.write() = next_appender;
-        *self.journal_coordinator.write() = next_coordinator;
-        *self.journal_apply_runtime.write() = next_apply_runtime;
-        self.bind_runtime_storage_wal();
-    }
-
-    fn bind_runtime_storage(&self, storage: &Arc<paro_storage::table::table_handle::TableHandle>) {
-        storage.bind_database_wal(self.wal());
-        storage.bind_journal_coordinator(self.journal_coordinator());
-        storage.bind_journal_apply_runtime(self.journal_apply_runtime());
-    }
-
-    pub fn sync_runtime_table_keys_incremental(
-        &self,
-        previous: &RouteRegistry,
-        current: &RouteRegistry,
-        table_keys: &[DdlObjectKey],
-    ) -> anyhow::Result<()> {
-        if table_keys.is_empty() {
-            return Ok(());
-        }
-
-        let mut previous_tablet_ids = HashSet::new();
-        let mut current_routes = HashMap::new();
-        for key in table_keys {
-            if let Some(route) = previous.route_table_key(key) {
-                previous_tablet_ids.insert(route.storage.tablet_id());
-            }
-            if let Some(route) = current.route_table_key(key) {
-                current_routes
-                    .entry(route.storage.tablet_id())
-                    .or_insert_with(|| route.clone());
-            }
-        }
-
-        let current_tablet_ids: HashSet<_> = current_routes.keys().copied().collect();
-        for route in current_routes.values() {
-            self.bind_runtime_storage(&route.storage);
-            self.compaction
-                .register_tablet(&route.storage, self.name(), self.db_type())?;
-        }
-
-        for tablet_id in previous_tablet_ids.difference(&current_tablet_ids) {
-            self.compaction
-                .unregister_tablet(*tablet_id, self.name(), self.db_type())?;
-        }
-
-        Ok(())
-    }
-
     /// Run a read-only WAL health check.
     ///
-    /// This inspects main/checkpoint/recovery WAL files without mutating state.
+    /// This inspects the active segment-backed WAL without mutating state.
     pub fn check_wal_health(
         &self,
     ) -> anyhow::Result<paro_storage::wal::recovery::WalHealthCheckReport> {
@@ -780,13 +619,8 @@ impl DatabaseHandle {
 
     /// Return WAL lifecycle observability snapshot for instance aggregation.
     pub fn wal_lifecycle_metrics(&self) -> WalLifecycleMetricsSnapshot {
-        let appender = self.journal_appender.read();
-        let apply_runtime = self.journal_apply_runtime.read();
-        self.wal_observability.snapshot(
-            &self.checkpointer,
-            appender.as_deref(),
-            apply_runtime.as_deref(),
-        )
+        self.wal_observability
+            .snapshot(&self.checkpoint_coordinator)
     }
 
     /// Check if this database has a WAL.
@@ -816,17 +650,14 @@ impl DatabaseHandle {
         self.wal_observability.wal_keep_from()
     }
 
-    /// Set the checkpoint WAL size threshold.
-    ///
-    /// When the WAL size exceeds this threshold, an automatic checkpoint
-    /// will be triggered after transaction commit.
-    pub fn set_checkpoint_wal_size(&self, size: u64) {
-        self.checkpointer.set_checkpoint_wal_size(size);
+    /// Configure runtime checkpoint trigger and retention policy.
+    pub fn configure_checkpoint_runtime(&self, checkpoint: CheckpointConfigOptions) {
+        self.checkpoint_coordinator.configure(checkpoint);
     }
 
-    /// Get the checkpoint WAL size threshold.
-    pub fn checkpoint_wal_size(&self) -> u64 {
-        self.checkpointer.checkpoint_wal_size()
+    /// Get the active checkpoint runtime policy.
+    pub fn checkpoint_config(&self) -> CheckpointConfigOptions {
+        self.checkpoint_coordinator.config()
     }
 
     /// Get a reference to the storage manager.
@@ -846,8 +677,9 @@ impl DatabaseHandle {
 
     /// Check if automatic checkpoint should be triggered.
     ///
-    /// This method checks if the WAL size has exceeded the configured threshold.
-    /// It also considers any estimated additional bytes that will be written.
+    /// Automatic triggers coalesce into a single background request while a run
+    /// is pending or already in flight. After an abort, interval scheduling is
+    /// anchored from the abort time so background retry does not spin.
     ///
     /// # Arguments
     /// * `estimated_wal_bytes` - Estimated additional bytes to be written to WAL
@@ -855,13 +687,16 @@ impl DatabaseHandle {
     /// # Returns
     /// `true` if checkpoint should be triggered, `false` otherwise
     pub fn should_checkpoint(&self, estimated_wal_bytes: u64) -> bool {
-        self.checkpointer
-            .should_checkpoint(self.has_wal(), self.wal_size(), estimated_wal_bytes)
+        self.checkpoint_coordinator.should_checkpoint(
+            self.has_wal(),
+            self.wal_size(),
+            estimated_wal_bytes,
+        )
     }
 
     /// Check if a checkpoint is currently in progress.
     pub fn is_checkpoint_in_progress(&self) -> bool {
-        self.checkpointer.is_in_progress()
+        self.checkpoint_coordinator.is_in_progress()
     }
 
     /// Perform automatic checkpoint if needed.
@@ -877,33 +712,30 @@ impl DatabaseHandle {
     /// * `Ok(false)` - Checkpoint was not needed or already in progress
     /// * `Err(...)` - Checkpoint failed
     pub fn checkpoint_if_needed(&self, force: bool) -> anyhow::Result<bool> {
-        self.checkpointer.checkpoint_if_needed(
+        self.checkpoint_coordinator.checkpoint_if_needed(
             &self.storage_manager,
-            &self.compaction,
             &self.catalog,
             self.name(),
             force,
         )
     }
 
-    /// Checkpoint the database to disk.
-    /// This saves the catalog and updates the database header.
+    /// Checkpoint the database through the committed-manifest snapshot path.
     ///
-    /// This method always goes through WAL coordination to guarantee a single
-    /// checkpoint path (`start_checkpoint -> metadata update -> finish_checkpoint`).
+    /// The durable flow is:
+    /// `capture_durable_prefix -> exact-prefix drain -> snapshot bundles -> manifest publish`.
     pub fn checkpoint(&self) -> anyhow::Result<()> {
-        let Some(ctx) = CheckpointContext::acquire(
-            &self.checkpointer,
-            &self.compaction,
+        let Some(ctx) = CheckpointExecutionContext::acquire(
+            &self.checkpoint_coordinator,
             &self.storage_manager,
-            self.name(),
         ) else {
             return Err(anyhow::anyhow!("Checkpoint already in progress"));
         };
         let result = self
-            .checkpointer
+            .checkpoint_coordinator
             .execute(ctx, self.catalog.as_ref(), self.name());
-        self.checkpointer.record_checkpoint_outcome(&result);
+        self.checkpoint_coordinator
+            .record_checkpoint_outcome(&result, self.wal_size());
         result
     }
 
@@ -912,6 +744,143 @@ impl DatabaseHandle {
     /// This is equivalent to the `FORCE CHECKPOINT` SQL command.
     pub fn force_checkpoint(&self) -> anyhow::Result<()> {
         self.checkpoint()
+    }
+
+    /// Coalesced automatic checkpoint scheduling hook for commit-path trigger checks.
+    pub fn schedule_auto_checkpoint_if_needed(self: &Arc<Self>) {
+        if !self.should_checkpoint(0) {
+            return;
+        }
+
+        self.ensure_checkpoint_background_runner();
+        {
+            let mut pending = self.checkpoint_trigger.pending.lock();
+            *pending = true;
+        }
+        self.checkpoint_trigger.changed.notify_one();
+    }
+
+    pub fn bootstrap_checkpoint_runtime(&self, summary: RecoverySummary) {
+        self.checkpoint_coordinator.bootstrap_runtime(summary);
+    }
+
+    pub fn publish_checkpoint_transaction(
+        &self,
+        commit_id: u64,
+        catalog_commit_id: u64,
+        max_seen_object_id: u64,
+    ) -> (RecoverySummary, u64) {
+        self.checkpoint_coordinator.publish_transaction(
+            commit_id,
+            catalog_commit_id,
+            max_seen_object_id,
+        )
+    }
+
+    fn ensure_checkpoint_background_runner(self: &Arc<Self>) {
+        if self.path() == ":memory:" {
+            return;
+        }
+
+        if self
+            .checkpoint_trigger
+            .background_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let weak = Arc::downgrade(self);
+        let db_name = self.name().to_string();
+        let _ = thread::Builder::new()
+            .name(format!("paro-checkpoint-{db_name}"))
+            .spawn(move || Self::checkpoint_background_loop(weak));
+    }
+
+    fn checkpoint_background_loop(weak: Weak<Self>) {
+        loop {
+            let Some(db) = weak.upgrade() else {
+                return;
+            };
+
+            if let Some(reason) =
+                db.checkpoint_coordinator
+                    .auto_trigger_reason(db.has_wal(), db.wal_size(), 0)
+            {
+                if let Err(error) = db.run_auto_checkpoint(reason) {
+                    tracing::warn!(
+                        target: targets::CHECKPOINT,
+                        db = %db.name(),
+                        reason = ?reason,
+                        error = %error,
+                        "Automatic checkpoint trigger failed"
+                    );
+                }
+                continue;
+            }
+
+            let wait_timeout = db.checkpoint_coordinator.interval_wait_timeout();
+            let triggered = {
+                let mut pending = db.checkpoint_trigger.pending.lock();
+                if !*pending {
+                    db.checkpoint_trigger
+                        .changed
+                        .wait_for(&mut pending, wait_timeout);
+                }
+                let triggered = *pending;
+                *pending = false;
+                triggered
+            };
+
+            let Some(db) = weak.upgrade() else {
+                return;
+            };
+
+            let trigger_reason =
+                db.checkpoint_coordinator
+                    .auto_trigger_reason(db.has_wal(), db.wal_size(), 0);
+            if triggered && trigger_reason.is_none() {
+                continue;
+            }
+
+            let Some(reason) = trigger_reason else {
+                continue;
+            };
+
+            if let Err(error) = db.run_auto_checkpoint(reason) {
+                tracing::warn!(
+                    target: targets::CHECKPOINT,
+                    db = %db.name(),
+                    reason = ?reason,
+                    error = %error,
+                    "Automatic checkpoint trigger failed"
+                );
+            }
+        }
+    }
+
+    fn run_auto_checkpoint(&self, reason: CheckpointTriggerReason) -> anyhow::Result<()> {
+        let Some(ctx) = CheckpointExecutionContext::acquire(
+            &self.checkpoint_coordinator,
+            &self.storage_manager,
+        ) else {
+            return Ok(());
+        };
+
+        tracing::debug!(
+            target: targets::CHECKPOINT,
+            db = %self.name(),
+            reason = ?reason,
+            "Running coalesced automatic checkpoint trigger"
+        );
+
+        let result = self
+            .checkpoint_coordinator
+            .execute(ctx, self.catalog.as_ref(), self.name());
+        self.checkpoint_coordinator
+            .record_checkpoint_outcome(&result, self.wal_size());
+        result
     }
 
     // --- Lifecycle Management ---
@@ -1015,8 +984,36 @@ impl DatabaseHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn checkpointer(&self) -> &Checkpointer {
-        &self.checkpointer
+    pub(crate) fn checkpoint_coordinator(&self) -> &CheckpointCoordinator {
+        &self.checkpoint_coordinator
+    }
+
+    fn bind_checkpoint_publish_observers(&self) {
+        let observer = self.checkpoint_coordinator.compaction_publish_observer();
+        let txn = CatalogSnapshot::read_only(u64::MAX);
+        for schema_entry in self
+            .catalog
+            .get_schema_collection()
+            .scan(txn.transaction_id, txn.start_time)
+        {
+            let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
+                continue;
+            };
+            for table_entry in schema
+                .collection(CatalogType::Table)
+                .expect("table collection")
+                .scan(txn.transaction_id, txn.start_time)
+            {
+                let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+                    continue;
+                };
+                if let Some(storage) = table.get_storage() {
+                    storage
+                        .tablet()
+                        .bind_checkpoint_publish_observer(observer.clone());
+                }
+            }
+        }
     }
 }
 

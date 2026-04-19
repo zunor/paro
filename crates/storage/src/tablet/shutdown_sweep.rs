@@ -1,7 +1,6 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::tablet_meta::{TabletMeta, TabletState};
 use paro_common::error::{self as paro_error, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -13,20 +12,6 @@ use tracing::warn;
 
 static SHUTDOWN_SWEEP_QUEUE: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-
-pub(crate) fn mark_shutdown_meta_file(data_dir: &Path) -> Result<()> {
-    let meta_path = data_dir.join("tablet_meta");
-    if !meta_path.exists() {
-        return Ok(());
-    }
-
-    let mut meta = load_legacy_meta_file(data_dir)?;
-    if meta.tablet_state() != TabletState::Shutdown {
-        meta.set_tablet_state(TabletState::Shutdown);
-        save_legacy_meta_file(&meta_path, &meta)?;
-    }
-    Ok(())
-}
 
 pub(crate) fn schedule_shutdown_sweep(data_dir: &Path, move_to_trash: bool) -> Result<()> {
     let queue_key = data_dir.to_string_lossy().to_string();
@@ -137,22 +122,4 @@ fn move_shutdown_data_dir_to_trash(data_dir: &Path) -> Result<()> {
         "failed to move {:?} into trash after many retries",
         data_dir
     )))
-}
-
-fn save_legacy_meta_file(path: &Path, meta: &TabletMeta) -> Result<()> {
-    let bytes = meta.serialize()?;
-    fs::write(path, bytes).map_err(|err| {
-        paro_error::internal(format!("Failed to save TabletMeta to {:?}: {}", path, err))
-    })
-}
-
-fn load_legacy_meta_file(data_dir: &Path) -> Result<TabletMeta> {
-    let meta_path = data_dir.join("tablet_meta");
-    let bytes = fs::read(&meta_path).map_err(|err| {
-        paro_error::internal(format!(
-            "Failed to load TabletMeta from {:?}: {}",
-            meta_path, err
-        ))
-    })?;
-    TabletMeta::deserialize(&bytes)
 }

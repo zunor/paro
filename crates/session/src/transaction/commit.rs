@@ -4,37 +4,24 @@
 use super::ddl_changes::PreparedCatalogOp;
 use super::session_transaction::FrozenTransaction;
 use crate::session::Session;
-use paro_catalog::database_catalog::ParoCatalog;
-use paro_common::ddl::{DdlChange, DdlChangeRecord, DdlObjectKey, DdlObjectKind};
-use paro_common::durability::{PreparedCommitPlan, PreparedTabletPlan};
-use paro_common::effect::{
-    ApplyDescriptor, DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor,
-    StorageCommitOp, TabletMutation,
-};
+use paro_common::ddl::DdlChange;
+use paro_common::effect::{DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor};
 use paro_common::error::{ParoError, Result};
 use paro_common::logging::targets;
-use paro_instance::{CatalogReplayHandler, DatabaseHandle, RouteRegistry};
-use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
-use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::txn::{PreparedStorageCommit, Transaction};
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use paro_storage::wal::txn_record::TxnRecord;
+use paro_storage::wal::wal_writer::WalWriter;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug)]
 pub struct CommitOutcome {
     pub commit_id: u64,
-    pub lsn: u64,
-    pub durable_batch_lsn: u64,
-    pub durable_batch_size: u64,
-    pub durable_batch_bytes: u64,
-    pub sync_latency_micros: u64,
-    pub publish_wait_micros: u64,
-    pub published_at: Instant,
     pub active_txn: Arc<Transaction>,
     pub catalog_ops: Vec<PreparedCatalogOp>,
     pub deferred_tasks: Vec<DeferredTask>,
+    pub published_at: Instant,
+    pub post_commit_hooks: Vec<PostCommitHookDescriptor>,
 }
 
 #[derive(Debug)]
@@ -43,51 +30,9 @@ pub struct CommitFailure {
     pub rollback_succeeded: bool,
 }
 
-struct RuntimeApplyBuildContext {
-    database: Arc<DatabaseHandle>,
-    catalog: Arc<ParoCatalog>,
-    database_root: PathBuf,
-    tablet_meta_manager: Option<Arc<paro_storage::meta::TabletMetaManager>>,
-    graph_registry: Arc<paro_storage::index::graph::GraphProjectionIndexManager>,
-    manager: Arc<paro_storage::transaction::manager::TransactionManager>,
-    apply_state: Arc<Mutex<Option<CommitApplyState>>>,
-}
-
 pub struct CommitPipeline<'a> {
     session: &'a Session,
     frozen: FrozenTransaction,
-}
-
-impl CommitOutcome {
-    fn observe_published(&mut self, wait_micros: u64) {
-        self.publish_wait_micros = wait_micros;
-        self.published_at = Instant::now();
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CatalogApplyPhase {
-    Create,
-    Alter,
-    Drop,
-}
-
-fn catalog_apply_phase(record: &DdlChangeRecord) -> CatalogApplyPhase {
-    match &record.change {
-        DdlChange::CreateSchema(_)
-        | DdlChange::CreateTable(_)
-        | DdlChange::CreateView(_)
-        | DdlChange::CreateIndex(_)
-        | DdlChange::CreatePropertyGraph(_)
-        | DdlChange::CreateSequence(_) => CatalogApplyPhase::Create,
-        DdlChange::AlterEntry(_) => CatalogApplyPhase::Alter,
-        DdlChange::DropSchema(_)
-        | DdlChange::DropTable(_)
-        | DdlChange::DropView(_)
-        | DdlChange::DropIndex(_)
-        | DdlChange::DropPropertyGraph(_)
-        | DdlChange::DropSequence(_) => CatalogApplyPhase::Drop,
-    }
 }
 
 impl<'a> CommitPipeline<'a> {
@@ -118,185 +63,88 @@ impl<'a> CommitPipeline<'a> {
             }
         };
 
-        if ddl_changes.is_empty() && prepared_storage.is_empty() {
-            if let Err(error) = session
-                .current_database
-                .transaction_manager()
-                .complete_read_only_transaction(Arc::clone(&active))
-            {
-                return Err(CommitFailure {
-                    error,
-                    rollback_succeeded: false,
-                });
-            }
+        let manager = session.current_database.transaction_manager();
+        let commit_id = manager.allocate_commit_id();
 
-            return Ok(CommitOutcome {
-                commit_id: 0,
-                lsn: 0,
-                durable_batch_lsn: 0,
-                durable_batch_size: 0,
-                durable_batch_bytes: 0,
-                sync_latency_micros: 0,
-                publish_wait_micros: 0,
-                published_at: Instant::now(),
-                active_txn: active,
-                catalog_ops: ddl_changes,
-                deferred_tasks: Vec::new(),
+        if let Err(error) =
+            Self::write_txn_journal(session, &active, &ddl_changes, commit_id, &prepared_storage)
+        {
+            let rollback_succeeded = Self::rollback_catalog_changes(&mut ddl_changes).is_ok()
+                && session
+                    .current_database
+                    .transaction_manager()
+                    .rollback_transaction(Arc::clone(&active))
+                    .is_ok();
+            return Err(CommitFailure {
+                error,
+                rollback_succeeded,
             });
         }
 
-        let Some(coordinator) = session.current_database.journal_coordinator() else {
+        if let Err(error) =
+            manager.commit_transaction_with_commit_id(Arc::clone(&active), commit_id)
+        {
             return Err(CommitFailure {
-                error: paro_common::error::internal("database journal coordinator missing"),
+                error,
                 rollback_succeeded: false,
             });
-        };
-        let Some(apply_runtime) = session.current_database.journal_apply_runtime() else {
+        }
+
+        if let Err(error) = Self::publish_catalog_changes(session, &mut ddl_changes, commit_id) {
             return Err(CommitFailure {
-                error: paro_common::error::internal("database apply runtime missing"),
+                error,
                 rollback_succeeded: false,
             });
-        };
-        coordinator.sync_commit_id_with(
-            session
-                .current_database
-                .transaction_manager()
-                .durable_commit_id(),
+        }
+        let (catalog_commit_id, max_seen_object_id) =
+            Self::published_catalog_watermarks(&ddl_changes, commit_id);
+        let (_summary, journal_lsn) = session.current_database.publish_checkpoint_transaction(
+            commit_id,
+            catalog_commit_id,
+            max_seen_object_id,
         );
-
-        let manager = Arc::clone(session.current_database.transaction_manager());
-        let catalog = session.current_database.catalog().clone();
-        let database_root = PathBuf::from(session.current_database.path());
-        let tablet_meta_manager = session.current_database.tablet_meta_manager();
-        let graph_registry = Arc::clone(session.instance.graph_manager());
-
-        let mut prepared_storage = prepared_storage;
-        let mut remaining_reprepare_attempts = 2usize;
-        let submit_result = loop {
-            let prepared_plan =
-                match Self::build_prepared_commit_plan(&active, &ddl_changes, &prepared_storage) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        let rollback_succeeded = Self::rollback_catalog_changes(&mut ddl_changes)
-                            .is_ok()
-                            && session
-                                .current_database
-                                .transaction_manager()
-                                .rollback_transaction(Arc::clone(&active))
-                                .is_ok();
-                        return Err(CommitFailure {
-                            error,
-                            rollback_succeeded,
-                        });
-                    }
-                };
-            let prepared_tablets = prepared_storage.tablets.clone();
-            match coordinator.submit_commit_context(prepared_plan, move |_| {
-                for tablet in &prepared_tablets {
-                    tablet.tablet.validate_prepare_token(&tablet.token)?;
-                }
-                Ok(())
-            }) {
-                Ok(ctx) => break Ok(ctx),
-                Err(error) if error.is_retryable() && remaining_reprepare_attempts > 0 => {
-                    remaining_reprepare_attempts = remaining_reprepare_attempts.saturating_sub(1);
-                    tracing::info!(
-                        target: targets::TRANSACTION,
-                        txn_id = active.id,
-                        error = %error,
-                        attempts_remaining = remaining_reprepare_attempts,
-                        "commit prepare token went stale before durable append; repreparing commit plan"
-                    );
-                    match active.reprepare_commit(&prepared_storage.post_commit_hooks) {
-                        Ok(next_prepared_storage) => {
-                            prepared_storage = next_prepared_storage;
-                        }
-                        Err(reprepare_error) => {
-                            let rollback_succeeded =
-                                Self::rollback_catalog_changes(&mut ddl_changes).is_ok()
-                                    && session
-                                        .current_database
-                                        .transaction_manager()
-                                        .rollback_transaction(Arc::clone(&active))
-                                        .is_ok();
-                            return Err(CommitFailure {
-                                error: reprepare_error,
-                                rollback_succeeded,
-                            });
-                        }
-                    }
-                }
-                Err(error) => break Err(error),
-            }
-        };
-
-        match submit_result {
-            Ok(ctx) => {
-                let apply_state = Arc::new(Mutex::new(Some(CommitApplyState {
-                    active: Arc::clone(&active),
-                    deferred_tasks: Self::collect_deferred_tasks(
-                        &prepared_storage.post_commit_hooks,
-                        &ddl_changes,
-                    ),
-                    catalog_ops: ddl_changes,
-                })));
-                manager.mark_durable_commit(ctx.commit_id);
-                let request = match Self::build_runtime_apply_request(
-                    ctx,
-                    RuntimeApplyBuildContext {
-                        database: Arc::clone(&session.current_database),
-                        catalog: Arc::clone(&catalog),
-                        database_root,
-                        tablet_meta_manager,
-                        graph_registry,
-                        manager: Arc::clone(&manager),
-                        apply_state: Arc::clone(&apply_state),
-                    },
-                ) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return Err(CommitFailure {
-                            error,
-                            rollback_succeeded: false,
-                        });
-                    }
-                };
-
-                apply_runtime
-                    .submit_observed(request)
-                    .map(|mut observed| {
-                        observed.value.observe_published(observed.wait_micros);
-                        tracing::info!(
-                            target: targets::WAL,
-                            commit_id = observed.value.commit_id,
-                            lsn = observed.value.lsn,
-                            durable_batch_lsn = observed.value.durable_batch_lsn,
-                            group_size = observed.value.durable_batch_size,
-                            batch_bytes = observed.value.durable_batch_bytes,
-                            sync_latency_micros = observed.value.sync_latency_micros,
-                            publish_wait_micros = observed.value.publish_wait_micros,
-                            "Commit published through WAL"
-                        );
-                        observed.value
-                    })
-                    .map_err(|error| CommitFailure {
-                        error,
-                        rollback_succeeded: false,
-                    })
-            }
-            Err(error) => {
-                let rollback_succeeded = Self::rollback_catalog_changes(&mut ddl_changes).is_ok()
-                    && session
-                        .current_database
-                        .transaction_manager()
-                        .rollback_transaction(Arc::clone(&active))
-                        .is_ok();
-                Err(CommitFailure {
-                    error,
-                    rollback_succeeded,
-                })
+        if let Some(wal) = session.current_database.wal() {
+            if let Err(error) = wal.note_flushed_lsn(journal_lsn) {
+                tracing::warn!(
+                    target: targets::WAL,
+                    db = %session.current_database.name(),
+                    lsn = journal_lsn,
+                    error = %error,
+                    "failed to advance journal segment catalog after transaction flush"
+                );
             }
         }
+
+        let deferred_tasks = Self::collect_deferred_tasks(&prepared_storage, &ddl_changes);
+        let mut post_commit_hooks = prepared_storage.post_commit_hooks;
+        for op in &ddl_changes {
+            post_commit_hooks.extend(op.post_commit_hooks.clone());
+        }
+
+        Ok(CommitOutcome {
+            commit_id,
+            active_txn: active,
+            catalog_ops: ddl_changes,
+            deferred_tasks,
+            published_at: Instant::now(),
+            post_commit_hooks,
+        })
+    }
+
+    fn publish_catalog_changes(
+        session: &Session,
+        ddl_changes: &mut [PreparedCatalogOp],
+        commit_id: u64,
+    ) -> Result<()> {
+        for op in ddl_changes.iter_mut() {
+            if let Some(handle) = op.catalog.take() {
+                handle.publish(commit_id)?;
+            }
+            if let Some(delta) = op.dependencies.take() {
+                delta.publish(session.current_database.catalog().dependency_graph())?;
+            }
+        }
+        Ok(())
     }
 
     fn rollback_catalog_changes(ddl_changes: &mut [PreparedCatalogOp]) -> Result<()> {
@@ -311,465 +159,136 @@ impl<'a> CommitPipeline<'a> {
         Ok(())
     }
 
-    fn build_prepared_commit_plan(
+    fn write_txn_journal(
+        session: &Session,
         active_txn: &Arc<Transaction>,
         ddl_changes: &[PreparedCatalogOp],
-        prepared_storage: &PreparedStorageCommit,
-    ) -> Result<PreparedCommitPlan> {
-        Ok(PreparedCommitPlan {
-            txn_id: active_txn.id,
-            start_time: active_txn.start_time,
-            catalog_ops: ddl_changes
-                .iter()
-                .map(|op| paro_common::effect::CatalogTxnOp {
-                    change: op.record.clone(),
-                })
-                .collect(),
-            storage_ops: Self::journal_storage_ops(prepared_storage)?,
-            apply_descriptors: Self::collect_apply_descriptors(ddl_changes),
-            deferred_tasks: Self::collect_deferred_tasks(
-                &prepared_storage.post_commit_hooks,
-                ddl_changes,
-            ),
-            tablets: prepared_storage
-                .tablets
-                .iter()
-                .map(|tablet| PreparedTabletPlan::new(tablet.tablet.tablet_id(), tablet.token))
-                .collect(),
-        })
-    }
-
-    fn build_runtime_apply_request(
-        ctx: paro_journal::CommitExecutionContext,
-        runtime: RuntimeApplyBuildContext,
-    ) -> Result<ApplyRequest<CommitOutcome>> {
-        let RuntimeApplyBuildContext {
-            database,
-            catalog,
-            database_root,
-            tablet_meta_manager,
-            graph_registry,
-            manager,
-            apply_state,
-        } = runtime;
-
-        let publish_active = apply_state
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|state| Arc::clone(&state.active))
-            .ok_or_else(|| paro_common::error::internal("commit apply state missing"))?;
-        let registry_slot = Arc::new(Mutex::new(database.route_registry_snapshot()));
-        let commit_id = ctx.commit_id;
-        let has_catalog_lane = !ctx.record.catalog_ops.is_empty();
-
-        let catalog_pre = {
-            let catalog = Arc::clone(&catalog);
-            let registry_slot = Arc::clone(&registry_slot);
-            let apply_state = Arc::clone(&apply_state);
-            Box::new(move || {
-                let mut guard = apply_state.lock().unwrap();
-                let state = guard
-                    .as_mut()
-                    .ok_or_else(|| paro_common::error::internal("commit apply state missing"))?;
-                Self::apply_catalog_phase(
-                    &catalog,
-                    &mut state.catalog_ops,
-                    commit_id,
-                    CatalogApplyPhase::Create,
-                )?;
-                Self::apply_catalog_phase(
-                    &catalog,
-                    &mut state.catalog_ops,
-                    commit_id,
-                    CatalogApplyPhase::Alter,
-                )?;
-                if has_catalog_lane {
-                    let mut registry = registry_slot.lock().unwrap();
-                    Self::sync_route_registry_for_runtime_ops(
-                        &catalog,
-                        &mut registry,
-                        &state.catalog_ops,
-                        CatalogApplyPhase::Create,
-                    )?;
-                    Self::sync_route_registry_for_runtime_ops(
-                        &catalog,
-                        &mut registry,
-                        &state.catalog_ops,
-                        CatalogApplyPhase::Alter,
-                    )?;
-                }
-                Ok(())
-            }) as Box<dyn FnOnce() -> Result<()> + Send>
-        };
-
-        let tablet_parts = ctx
-            .record
-            .storage_ops
-            .iter()
-            .map(|storage_op| {
-                let storage_op = storage_op.clone();
-                let registry_slot = Arc::clone(&registry_slot);
-                TabletApplyPart {
-                    tablet_id: storage_op.tablet_id(),
-                    apply: Box::new(move || {
-                        let storage = {
-                            let registry = registry_slot.lock().unwrap().clone();
-                            registry
-                                .route_tablet(storage_op.tablet_id())
-                                .cloned()
-                                .map(|route| route.storage)
-                                .ok_or_else(|| {
-                                    paro_common::error::internal(format!(
-                                        "runtime apply route missing for tablet {}",
-                                        storage_op.tablet_id()
-                                    ))
-                                })?
-                        };
-                        Self::apply_storage_op(
-                            storage.as_ref(),
-                            &storage_op,
-                            ctx.lsn,
-                            i64::try_from(commit_id).map_err(|_| {
-                                paro_common::error::invalid_input(
-                                    "commit_id exceeds supported version range",
-                                )
-                            })?,
-                            &registry_slot.lock().unwrap().clone(),
-                        )
-                    }),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let descriptor_phase = {
-            let catalog = Arc::clone(&catalog);
-            let registry_slot = Arc::clone(&registry_slot);
-            let descriptors = ctx.record.apply_descriptors.clone();
-            Box::new(move || {
-                if descriptors.is_empty() {
-                    return Ok(());
-                }
-                let registry = registry_slot.lock().unwrap().clone();
-                let mut applier = CatalogReplayHandler::new(&catalog, 0, u64::MAX)
-                    .with_database_root(database_root)
-                    .with_tablet_meta_manager(tablet_meta_manager)
-                    .with_registry(registry)
-                    .with_graph_registry(graph_registry);
-                applier.apply_descriptors(&descriptors, commit_id)
-            }) as Box<dyn FnOnce() -> Result<()> + Send>
-        };
-
-        let catalog_post = {
-            let catalog = Arc::clone(&catalog);
-            let database = Arc::clone(&database);
-            let apply_state = Arc::clone(&apply_state);
-            Box::new(move || {
-                let mut state =
-                    apply_state.lock().unwrap().take().ok_or_else(|| {
-                        paro_common::error::internal("commit apply state missing")
-                    })?;
-                Self::apply_catalog_phase(
-                    &catalog,
-                    &mut state.catalog_ops,
-                    commit_id,
-                    CatalogApplyPhase::Drop,
-                )?;
-                if has_catalog_lane {
-                    let mut registry = registry_slot.lock().unwrap();
-                    Self::sync_route_registry_for_runtime_ops(
-                        &catalog,
-                        &mut registry,
-                        &state.catalog_ops,
-                        CatalogApplyPhase::Drop,
-                    )?;
-                    let previous_registry = database.replace_route_registry(registry.clone());
-                    let runtime_table_keys = Self::runtime_table_keys_for_catalog_ops(
-                        &previous_registry,
-                        &state.catalog_ops,
-                    );
-                    database
-                        .sync_runtime_table_keys_incremental(
-                            &previous_registry,
-                            &registry,
-                            &runtime_table_keys,
-                        )
-                        .map_err(|err| {
-                            paro_common::error::internal(format!(
-                                "incremental runtime table sync failed after catalog apply: {}",
-                                err
-                            ))
-                        })?;
-                }
-                state.active.finalize_commit_after_apply(commit_id)?;
-                Ok(CommitOutcome {
-                    commit_id,
-                    lsn: ctx.lsn,
-                    durable_batch_lsn: ctx.durable_batch_lsn,
-                    durable_batch_size: ctx.durable_batch_size,
-                    durable_batch_bytes: ctx.durable_batch_bytes,
-                    sync_latency_micros: ctx.sync_latency_micros,
-                    publish_wait_micros: 0,
-                    published_at: Instant::now(),
-                    active_txn: state.active,
-                    catalog_ops: state.catalog_ops,
-                    deferred_tasks: state.deferred_tasks,
-                })
-            }) as Box<dyn FnOnce() -> Result<CommitOutcome> + Send>
-        };
-
-        let on_published = Box::new(move || {
-            manager.publish_committed_transaction(Arc::clone(&publish_active), commit_id)?;
-            Ok(())
-        });
-
-        Ok(ApplyRequest {
-            lsn: ctx.lsn,
-            durable_batch_lsn: ctx.durable_batch_lsn,
-            commit_id: Some(commit_id),
-            wait_mode: WaitMode::Published,
-            catalog_serial: has_catalog_lane,
-            catalog_pre,
-            tablet_parts,
-            descriptor_phase,
-            catalog_post,
-            on_published,
-        })
-    }
-
-    fn apply_catalog_phase(
-        catalog: &Arc<ParoCatalog>,
-        ops: &mut [PreparedCatalogOp],
         commit_id: u64,
-        phase: CatalogApplyPhase,
+        prepared_storage: &PreparedStorageCommit,
     ) -> Result<()> {
-        for op in ops.iter_mut() {
-            if catalog_apply_phase(&op.record) != phase {
-                continue;
+        let Some(wal) = session.current_database.wal() else {
+            return Ok(());
+        };
+        let write_state = wal.begin_write();
+        let writer: &Arc<WalWriter> = write_state.wal();
+
+        writer.write_entry(
+            TxnRecord::Begin {
+                txn_id: active_txn.id,
+                start_time: active_txn.start_time,
             }
-            if let Some(handle) = op.catalog.take() {
-                handle.publish(commit_id)?;
+            .wal_type(),
+            &TxnRecord::Begin {
+                txn_id: active_txn.id,
+                start_time: active_txn.start_time,
             }
-            if let Some(delta) = op.dependencies.take() {
-                delta.publish(catalog.dependency_graph())?;
-            }
+            .serialize_data()?,
+        )?;
+
+        for (seq, op) in ddl_changes.iter().enumerate() {
+            let record = TxnRecord::CatalogOp {
+                seq: seq as u32,
+                op: paro_common::effect::CatalogTxnOp {
+                    change: op.record.clone(),
+                },
+            };
+            writer.write_entry(record.wal_type(), &record.serialize_data()?)?;
         }
+
+        let base_seq = ddl_changes.len() as u32;
+        for (idx, op) in prepared_storage.data_ops.iter().enumerate() {
+            let record = TxnRecord::DataOp {
+                seq: base_seq + idx as u32,
+                op: op.clone(),
+            };
+            writer.write_entry(record.wal_type(), &record.serialize_data()?)?;
+        }
+
+        let hook_base_seq = base_seq + prepared_storage.data_ops.len() as u32;
+        for (idx, hook) in prepared_storage.post_commit_hooks.iter().enumerate() {
+            let record = TxnRecord::PostCommitHook {
+                seq: hook_base_seq + idx as u32,
+                hook: hook.clone(),
+            };
+            writer.write_entry(record.wal_type(), &record.serialize_data()?)?;
+        }
+
+        let commit = TxnRecord::Commit {
+            txn_id: active_txn.id,
+            commit_id,
+        };
+        writer.write_entry(commit.wal_type(), &commit.serialize_data()?)?;
+        write_state.flush()?;
         Ok(())
     }
 
-    fn apply_storage_op(
-        storage: &TableHandle,
-        op: &StorageCommitOp,
-        lsn: u64,
-        commit_visibility: i64,
-        registry: &RouteRegistry,
-    ) -> Result<()> {
-        match op {
-            StorageCommitOp::Tablet(tablet) => {
-                for mutation in &tablet.mutations {
-                    match mutation {
-                        TabletMutation::PublishRowset {
-                            rowset_id,
-                            version_span,
-                            rowset_ref,
-                        } => {
-                            storage.replay_rowset_commit(
-                                *rowset_id,
-                                version_span.start,
-                                version_span.end,
-                                &rowset_ref
-                                    .resolve_for_tablet(storage.tablet().data_dir())
-                                    .to_string_lossy(),
-                            )?;
-                            registry.note_rowset_owner(*rowset_id, tablet.tablet_id);
-                        }
-                        TabletMutation::ApplyDeletePatch { patch, .. } => {
-                            let locations =
-                                patch.decode_row_refs_for_tablet(storage.tablet().data_dir())?;
-                            storage
-                                .replay_row_id_delete_at_version(&locations, commit_visibility)?;
-                        }
-                        TabletMutation::PublishCompaction { .. } => {
-                            storage.apply_compaction_publish(mutation)?;
-                            if let TabletMutation::PublishCompaction {
-                                output_rowset_id,
-                                replaced_inputs,
-                                retired_inputs,
-                                ..
-                            } = mutation
-                            {
-                                registry.note_rowset_owner(*output_rowset_id, tablet.tablet_id);
-                                for rowset_id in replaced_inputs {
-                                    registry.forget_rowset_owner(*rowset_id);
-                                }
-                                for input in retired_inputs {
-                                    registry.forget_rowset_owner(input.rowset_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                registry.note_tablet_applied_lsn(
-                    tablet.tablet_id,
-                    storage.tablet().applied_lsn().max(lsn),
-                );
-            }
+    fn published_catalog_watermarks(
+        ddl_changes: &[PreparedCatalogOp],
+        commit_id: u64,
+    ) -> (u64, u64) {
+        if ddl_changes.is_empty() {
+            return (0, 0);
         }
-        storage.tablet().note_applied_lsn(lsn)?;
-        Ok(())
-    }
 
-    fn sync_route_registry_for_runtime_ops(
-        catalog: &Arc<ParoCatalog>,
-        registry: &mut RouteRegistry,
-        ops: &[PreparedCatalogOp],
-        phase: CatalogApplyPhase,
-    ) -> Result<()> {
-        for target in Self::route_registry_targets_for_phase(registry, ops, phase) {
-            registry.sync_table_from_catalog(catalog, &target)?;
-        }
-        Ok(())
-    }
+        let max_seen_object_id = ddl_changes
+            .iter()
+            .filter_map(|op| match &op.record.change {
+                DdlChange::CreateSchema(payload) => Some(payload.object_id),
+                DdlChange::CreateTable(payload) => Some(payload.object_id),
+                DdlChange::CreateView(payload) => Some(payload.object_id),
+                DdlChange::CreateIndex(payload) => Some(payload.object_id),
+                DdlChange::CreatePropertyGraph(payload) => Some(payload.object_id),
+                DdlChange::CreateSequence(payload) => Some(payload.object_id),
+                DdlChange::DropSchema(_)
+                | DdlChange::DropTable(_)
+                | DdlChange::DropView(_)
+                | DdlChange::DropIndex(_)
+                | DdlChange::DropPropertyGraph(_)
+                | DdlChange::DropSequence(_)
+                | DdlChange::AlterEntry(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
 
-    fn route_registry_targets_for_phase(
-        registry: &RouteRegistry,
-        ops: &[PreparedCatalogOp],
-        phase: CatalogApplyPhase,
-    ) -> Vec<DdlObjectKey> {
-        let mut targets = HashSet::new();
-        for op in ops {
-            if catalog_apply_phase(&op.record) != phase {
-                continue;
-            }
-            match &op.record.change {
-                DdlChange::DropSchema(_) if phase == CatalogApplyPhase::Drop => {
-                    for target in
-                        registry.table_keys_in_schema(&op.record.key.database, &op.record.key.name)
-                    {
-                        targets.insert(target);
-                    }
-                }
-                _ => {
-                    for target in &op.dml_targets {
-                        if target.kind == DdlObjectKind::Table {
-                            targets.insert(target.clone());
-                        }
-                    }
-                }
-            }
-        }
-        targets.into_iter().collect()
-    }
-
-    fn runtime_table_keys_for_catalog_ops(
-        previous_registry: &RouteRegistry,
-        ops: &[PreparedCatalogOp],
-    ) -> Vec<DdlObjectKey> {
-        let mut targets = HashSet::new();
-        for op in ops {
-            match &op.record.change {
-                DdlChange::DropSchema(_) => {
-                    for target in previous_registry
-                        .table_keys_in_schema(&op.record.key.database, &op.record.key.name)
-                    {
-                        targets.insert(target);
-                    }
-                }
-                _ => {
-                    for target in &op.dml_targets {
-                        if target.kind == DdlObjectKind::Table {
-                            targets.insert(target.clone());
-                        }
-                    }
-                }
-            }
-        }
-        targets.into_iter().collect()
-    }
-
-    fn collect_apply_descriptors(ddl_changes: &[PreparedCatalogOp]) -> Vec<ApplyDescriptor> {
-        let mut descriptors = Vec::new();
-        for op in ddl_changes {
-            descriptors.extend(
-                op.staged_artifacts
-                    .iter()
-                    .cloned()
-                    .map(ApplyDescriptor::PublishStagedArtifact),
-            );
-            descriptors.extend(
-                op.runtime_transitions
-                    .iter()
-                    .cloned()
-                    .map(ApplyDescriptor::RuntimeTransition),
-            );
-            descriptors.extend(op.cleanups.iter().cloned().map(ApplyDescriptor::Cleanup));
-        }
-        descriptors
+        (commit_id, max_seen_object_id)
     }
 
     fn collect_deferred_tasks(
-        prepared_hooks: &[PostCommitHookDescriptor],
+        prepared_storage: &PreparedStorageCommit,
         ddl_changes: &[PreparedCatalogOp],
     ) -> Vec<DeferredTask> {
-        let mut tasks = prepared_hooks
-            .iter()
-            .cloned()
-            .map(Self::hook_to_deferred_task)
-            .collect::<Vec<_>>();
-        for op in ddl_changes {
-            tasks.extend(
-                op.post_commit_hooks
-                    .iter()
-                    .cloned()
-                    .map(Self::hook_to_deferred_task),
-            );
-            tasks.extend(
-                op.runtime_transitions
-                    .iter()
-                    .filter_map(Self::runtime_to_deferred_task),
-            );
+        let mut tasks = Vec::new();
+
+        for hook in &prepared_storage.post_commit_hooks {
+            let PostCommitHookDescriptor::GraphDmlMaintenance { deltas } = hook;
+            tasks.push(DeferredTask::GraphDmlMaintenance {
+                deltas: deltas.clone(),
+            });
         }
-        tasks
-    }
 
-    fn journal_storage_ops(
-        prepared_storage: &PreparedStorageCommit,
-    ) -> Result<Vec<StorageCommitOp>> {
-        Ok(prepared_storage.storage_ops.to_vec())
-    }
-
-    fn hook_to_deferred_task(hook: PostCommitHookDescriptor) -> DeferredTask {
-        match hook {
-            PostCommitHookDescriptor::GraphDmlMaintenance { deltas } => {
-                DeferredTask::GraphDmlMaintenance { deltas }
+        for op in ddl_changes {
+            for transition in &op.runtime_transitions {
+                if let RuntimeTransitionDescriptor::AttachIndexRuntime {
+                    index,
+                    table_name,
+                    index_type,
+                    column_ids,
+                    fulltext_config,
+                } = transition
+                {
+                    tasks.push(DeferredTask::BuildIndexRuntime {
+                        index: index.clone(),
+                        table_name: table_name.clone(),
+                        index_type: index_type.clone(),
+                        column_ids: column_ids.clone(),
+                        fulltext_config: fulltext_config.clone(),
+                    });
+                }
             }
         }
-    }
 
-    fn runtime_to_deferred_task(transition: &RuntimeTransitionDescriptor) -> Option<DeferredTask> {
-        match transition {
-            RuntimeTransitionDescriptor::AttachIndexRuntime {
-                index,
-                table_name,
-                index_type,
-                column_ids,
-                fulltext_config,
-            } => Some(DeferredTask::BuildIndexRuntime {
-                index: index.clone(),
-                table_name: table_name.clone(),
-                index_type: index_type.clone(),
-                column_ids: column_ids.clone(),
-                fulltext_config: fulltext_config.clone(),
-            }),
-            _ => None,
-        }
+        tasks
     }
-}
-
-struct CommitApplyState {
-    active: Arc<Transaction>,
-    catalog_ops: Vec<PreparedCatalogOp>,
-    deferred_tasks: Vec<DeferredTask>,
 }
 
 impl Session {
@@ -778,6 +297,7 @@ impl Session {
         let pipeline = CommitPipeline::new(self, frozen);
         match pipeline.execute() {
             Ok(outcome) => {
+                self.current_database.schedule_auto_checkpoint_if_needed();
                 super::post_commit::PostCommitActions::execute(self, outcome)?;
                 Ok(())
             }
@@ -815,10 +335,6 @@ mod tests {
         CreateSchemaPayload, DdlChange, DdlChangeRecord, DdlObjectKey, DdlObjectKind,
     };
     use paro_context::DdlExecutionProfile;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex as StdMutex};
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     fn staged_dependency_change(catalog_name: &str) -> PreparedCatalogOp {
         let schema_id = CatalogObjectId::from_raw(90_001);
@@ -868,13 +384,6 @@ mod tests {
     fn commit_pipeline_commits_frozen_transaction() {
         let mut session = TestSessionBuilder::minimal().build();
         session.begin_explicit_transaction().unwrap();
-        let catalog_name = session.current_database.catalog().name().to_string();
-        session
-            .transaction
-            .ddl_changes()
-            .lock()
-            .unwrap()
-            .record(staged_dependency_change(&catalog_name));
 
         let frozen = session.transaction.freeze().unwrap();
         let outcome = CommitPipeline::new(&session, frozen).execute().unwrap();
@@ -909,181 +418,5 @@ mod tests {
             .plan_drop(CatalogObjectId::from_raw(90_001), false)
             .unwrap_err();
         assert!(error.to_string().contains("dep_view"));
-    }
-
-    #[test]
-    fn read_only_commit_short_circuits_without_advancing_visibility_frontier() {
-        let mut session = TestSessionBuilder::minimal().build();
-        let before_metrics = session.current_database.wal_lifecycle_metrics();
-        session.begin_explicit_transaction().unwrap();
-
-        assert_eq!(
-            session.current_database.transaction_manager().last_commit(),
-            0
-        );
-        session.commit_transaction().unwrap();
-        assert_eq!(
-            session.current_database.transaction_manager().last_commit(),
-            0
-        );
-        assert_eq!(
-            session
-                .current_database
-                .transaction_manager()
-                .durable_commit_id(),
-            0
-        );
-        let after_metrics = session.current_database.wal_lifecycle_metrics();
-        assert_eq!(
-            before_metrics.journal_group_count,
-            after_metrics.journal_group_count
-        );
-        assert_eq!(
-            before_metrics.journal_commit_bytes_total,
-            after_metrics.journal_commit_bytes_total
-        );
-    }
-
-    #[test]
-    fn commit_pipeline_returns_after_publish_frontier_advances() {
-        let mut session = TestSessionBuilder::minimal().build();
-        session.begin_explicit_transaction().unwrap();
-        let catalog_name = session.current_database.catalog().name().to_string();
-        session
-            .transaction
-            .ddl_changes()
-            .lock()
-            .unwrap()
-            .record(staged_dependency_change(&catalog_name));
-
-        let frozen = session.transaction.freeze().unwrap();
-        let outcome = CommitPipeline::new(&session, frozen).execute().unwrap();
-
-        assert_eq!(
-            session
-                .current_database
-                .transaction_manager()
-                .published_commit_id(),
-            outcome.commit_id
-        );
-    }
-
-    #[test]
-    fn sql_commit_waits_for_published_frontier_when_earlier_durable_record_is_still_applying() {
-        let mut session = TestSessionBuilder::minimal().build();
-        let coordinator = session
-            .current_database
-            .journal_coordinator()
-            .expect("journal coordinator");
-        let apply_runtime = session
-            .current_database
-            .journal_apply_runtime()
-            .expect("apply runtime");
-
-        coordinator.sync_commit_id_with(
-            session
-                .current_database
-                .transaction_manager()
-                .durable_commit_id(),
-        );
-
-        let slow_part_started = Arc::new(AtomicBool::new(false));
-        let release_slow_part = Arc::new((StdMutex::new(false), Condvar::new()));
-        let release_slow_part_worker = Arc::clone(&release_slow_part);
-        let slow_part_started_worker = Arc::clone(&slow_part_started);
-        let apply_runtime_worker = Arc::clone(&apply_runtime);
-        let coordinator_worker = Arc::clone(&coordinator);
-
-        let earlier = thread::spawn(move || {
-            coordinator_worker
-                .submit_commit(
-                    PreparedCommitPlan {
-                        txn_id: 77,
-                        start_time: 77,
-                        catalog_ops: Vec::new(),
-                        storage_ops: Vec::new(),
-                        apply_descriptors: Vec::new(),
-                        deferred_tasks: Vec::new(),
-                        tablets: Vec::new(),
-                    },
-                    |_| Ok(()),
-                    move |ctx| {
-                        apply_runtime_worker.submit(ApplyRequest {
-                            lsn: ctx.lsn,
-                            durable_batch_lsn: ctx.lsn,
-                            commit_id: Some(ctx.commit_id),
-                            wait_mode: WaitMode::Published,
-                            catalog_serial: false,
-                            catalog_pre: Box::new(|| Ok(())),
-                            tablet_parts: vec![TabletApplyPart {
-                                tablet_id: 9_001,
-                                apply: Box::new(move || {
-                                    slow_part_started_worker.store(true, Ordering::Release);
-                                    let (lock, wake) = &*release_slow_part_worker;
-                                    let mut released = lock.lock().unwrap();
-                                    while !*released {
-                                        released = wake.wait(released).unwrap();
-                                    }
-                                    Ok(())
-                                }),
-                            }],
-                            descriptor_phase: Box::new(|| Ok(())),
-                            catalog_post: Box::new(|| Ok(())),
-                            on_published: Box::new(|| Ok(())),
-                        })?;
-                        Ok(())
-                    },
-                )
-                .unwrap();
-        });
-
-        for _ in 0..20 {
-            if slow_part_started.load(Ordering::Acquire) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(slow_part_started.load(Ordering::Acquire));
-
-        let catalog_name = session.current_database.catalog().name().to_string();
-        session.begin_explicit_transaction().unwrap();
-        session
-            .transaction
-            .ddl_changes()
-            .lock()
-            .unwrap()
-            .record(staged_dependency_change(&catalog_name));
-
-        let release_after_delay = Arc::clone(&release_slow_part);
-        let releaser = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(120));
-            let (lock, wake) = &*release_after_delay;
-            *lock.lock().unwrap() = true;
-            wake.notify_all();
-        });
-
-        let started_at = Instant::now();
-        session
-            .commit_transaction()
-            .expect("commit should wait for published frontier");
-        let elapsed = started_at.elapsed();
-
-        releaser.join().unwrap();
-        earlier.join().unwrap();
-
-        assert!(
-            elapsed >= Duration::from_millis(80),
-            "commit returned before published frontier cleared the earlier durable record: {elapsed:?}"
-        );
-        assert_eq!(
-            session
-                .current_database
-                .transaction_manager()
-                .published_commit_id(),
-            session
-                .current_database
-                .transaction_manager()
-                .durable_commit_id()
-        );
     }
 }

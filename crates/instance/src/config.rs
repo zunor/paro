@@ -12,6 +12,7 @@ use paro_scheduler::scheduler::ThreadAffinityMode;
 use paro_storage::buffer::{BufferManager, BufferPool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Collation binding for string comparisons.
 #[derive(Debug)]
@@ -99,12 +100,49 @@ impl Default for IndexTypeSet {
     }
 }
 
+/// Runtime checkpoint scheduling and retention policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointConfigOptions {
+    /// Trigger bytes threshold for automatic checkpoint scheduling.
+    pub trigger_bytes: u64,
+    /// Wall-clock interval between automatic checkpoint attempts.
+    pub trigger_interval: Duration,
+    /// Exact-prefix drain timeout for one checkpoint attempt.
+    pub drain_timeout: Duration,
+    /// Maximum number of concurrent bundle serialization workers.
+    pub max_concurrent_writers: usize,
+    /// Artifact GC per-pass batch size.
+    pub artifact_gc_batch_size: usize,
+    /// Artifact GC total delete budget per sweep.
+    pub artifact_gc_delete_budget: usize,
+    /// Committed checkpoint bundle delete budget per sweep.
+    pub checkpoint_gc_delete_budget: usize,
+    /// Segment prune delete budget per sweep.
+    pub segment_prune_delete_budget: usize,
+}
+
+impl Default for CheckpointConfigOptions {
+    fn default() -> Self {
+        Self {
+            trigger_bytes: 1 << 24, // 16 MiB
+            trigger_interval: Duration::from_secs(300),
+            drain_timeout: Duration::from_secs(30),
+            max_concurrent_writers: 4,
+            artifact_gc_batch_size: 64,
+            artifact_gc_delete_budget: 256,
+            checkpoint_gc_delete_budget: 8,
+            segment_prune_delete_budget: 32,
+        }
+    }
+}
+
 /// Immutable boot-time configuration shared by the whole instance.
 #[derive(Debug)]
 pub struct BootConfig {
     pub instance_root: String,
     pub default_database: String,
     pub startup_policy: StartupPolicy,
+    pub delete_patch_inline_row_ref_threshold: usize,
     pub cast_functions: Arc<CastFunctionSet>,
     pub collation_bindings: Arc<CollationBinding>,
     pub index_types: Arc<IndexTypeSet>,
@@ -114,8 +152,7 @@ pub struct BootConfig {
     pub initial_maximum_memory: usize,
     pub initial_maximum_threads: Option<usize>,
     pub pin_threads: ThreadAffinityMode,
-    pub checkpoint_wal_size: u64,
-    pub delete_patch_inline_row_ref_threshold: usize,
+    pub checkpoint: CheckpointConfigOptions,
     pub initial_temporary_directory: String,
     pub initial_use_temporary_directory: bool,
     pub initial_max_temp_directory_size: Option<usize>,
@@ -144,6 +181,9 @@ impl BootConfig {
             instance_root: config.options.instance_root.clone(),
             default_database: config.options.default_database.clone(),
             startup_policy: config.options.startup_policy,
+            delete_patch_inline_row_ref_threshold: config
+                .options
+                .delete_patch_inline_row_ref_threshold,
             cast_functions: Arc::clone(&config.cast_functions),
             collation_bindings: Arc::clone(&config.collation_bindings),
             index_types: Arc::clone(&config.index_types),
@@ -153,10 +193,7 @@ impl BootConfig {
             initial_maximum_memory: config.options.maximum_memory,
             initial_maximum_threads: config.options.maximum_threads,
             pin_threads: config.options.pin_threads,
-            checkpoint_wal_size: config.options.checkpoint_wal_size,
-            delete_patch_inline_row_ref_threshold: config
-                .options
-                .delete_patch_inline_row_ref_threshold,
+            checkpoint: config.options.checkpoint,
             initial_temporary_directory: config.options.temporary_directory.clone(),
             initial_use_temporary_directory: config.options.use_temporary_directory,
             initial_max_temp_directory_size: config.options.max_temp_directory_size,
@@ -174,8 +211,8 @@ pub struct InstanceConfigOptions {
     pub instance_root: String,
     /// Access mode of the database (ReadOnly or ReadWrite).
     pub access_mode: AccessMode,
-    /// Checkpoint when WAL reaches this size (default: 16MB).
-    pub checkpoint_wal_size: u64,
+    /// Checkpoint runtime coordination policy.
+    pub checkpoint: CheckpointConfigOptions,
     /// Maximum memory used by the database system (in bytes).
     pub maximum_memory: usize,
     /// Maximum threads used by the database system.
@@ -185,12 +222,12 @@ pub struct InstanceConfigOptions {
     pub pin_threads: ThreadAffinityMode,
     /// Whether to use a temporary directory for intermediates.
     pub use_temporary_directory: bool,
-    /// Maximum delete-patch row refs to keep inline before spilling to an artifact.
-    pub delete_patch_inline_row_ref_threshold: usize,
     /// Directory to store temporary structures.
     pub temporary_directory: String,
     /// Maximum spill size for temporary directory (`None` means unlimited).
     pub max_temp_directory_size: Option<usize>,
+    /// Inline row-ref cutoff for delete patch encoding.
+    pub delete_patch_inline_row_ref_threshold: usize,
     /// Whether to enable external access (file system, network).
     pub enable_external_access: bool,
     /// Default database name.
@@ -224,15 +261,15 @@ impl Default for InstanceConfigOptions {
         Self {
             instance_root: String::new(),
             access_mode: AccessMode::ReadWrite,
-            checkpoint_wal_size: 1 << 24,       // 16MB
+            checkpoint: CheckpointConfigOptions::default(),
             maximum_memory: 1024 * 1024 * 1024, // 1GB
             // None means "use system default" which is resolved in effective_max_threads()
             maximum_threads: None,
             pin_threads: ThreadAffinityMode::Auto,
             use_temporary_directory: true,
-            delete_patch_inline_row_ref_threshold: 256,
             temporary_directory: String::new(),
             max_temp_directory_size: None,
+            delete_patch_inline_row_ref_threshold: 256,
             enable_external_access: true,
             default_database: "postgres".to_string(),
             startup_policy: StartupPolicy::Strict,
@@ -434,7 +471,7 @@ impl InstanceConfig {
     }
 
     pub fn with_delete_patch_inline_row_ref_threshold(mut self, threshold: usize) -> Self {
-        self.options.delete_patch_inline_row_ref_threshold = threshold.max(1);
+        self.options.delete_patch_inline_row_ref_threshold = threshold;
         self
     }
 
@@ -467,7 +504,7 @@ impl From<&paro_common::config::ClusterConfig> for InstanceConfig {
         let options = InstanceConfigOptions {
             instance_root: String::new(),
             access_mode: config.access_mode.into(),
-            checkpoint_wal_size: 1 << 24,
+            checkpoint: CheckpointConfigOptions::default(),
             maximum_memory: config.max_memory,
             maximum_threads: config.num_threads,
             pin_threads: match config.pin_threads {
@@ -476,9 +513,9 @@ impl From<&paro_common::config::ClusterConfig> for InstanceConfig {
                 paro_common::config::ThreadPinMode::Auto => ThreadAffinityMode::Auto,
             },
             use_temporary_directory: true,
-            delete_patch_inline_row_ref_threshold: config.delete_patch_inline_row_ref_threshold,
             temporary_directory: String::new(),
             max_temp_directory_size: None,
+            delete_patch_inline_row_ref_threshold: config.delete_patch_inline_row_ref_threshold,
             enable_external_access: config.enable_external_access,
             default_database: config.default_database.clone(),
             startup_policy: StartupPolicy::Strict,
@@ -499,6 +536,29 @@ impl From<&paro_common::config::ClusterConfig> for InstanceConfig {
             path_manager: None,
             recovery_hooks: None,
         }
+    }
+}
+
+impl From<&paro_common::config::CheckpointConfig> for CheckpointConfigOptions {
+    fn from(config: &paro_common::config::CheckpointConfig) -> Self {
+        Self {
+            trigger_bytes: config.trigger_bytes as u64,
+            trigger_interval: config.trigger_interval,
+            drain_timeout: config.drain_timeout,
+            max_concurrent_writers: config.max_concurrent_writers,
+            artifact_gc_batch_size: config.artifact_gc_batch_size,
+            artifact_gc_delete_budget: config.artifact_gc_delete_budget,
+            checkpoint_gc_delete_budget: config.checkpoint_gc_delete_budget,
+            segment_prune_delete_budget: config.segment_prune_delete_budget,
+        }
+    }
+}
+
+impl From<&paro_common::config::ParoConfig> for InstanceConfig {
+    fn from(config: &paro_common::config::ParoConfig) -> Self {
+        let mut instance = Self::from(&config.cluster);
+        instance.options.checkpoint = CheckpointConfigOptions::from(&config.storage.checkpoint);
+        instance
     }
 }
 
@@ -564,10 +624,40 @@ mod tests {
         assert_eq!(config.options.maximum_memory, 1024 * 1024 * 1024);
         assert_eq!(config.options.default_database, "postgres");
         assert_eq!(config.options.pin_threads, ThreadAffinityMode::Auto);
+        assert_eq!(config.options.checkpoint.trigger_bytes, 1 << 24);
 
         // Check new fields
         assert!(config.get_collation_bindings().get_collations().is_empty());
         assert!(config.get_index_types().find_by_name("ART").is_some());
+    }
+
+    #[test]
+    fn test_paro_config_maps_storage_checkpoint_policy() {
+        let mut config = paro_common::config::ParoConfig::default();
+        config.storage.checkpoint.trigger_bytes = 32 * 1024 * 1024;
+        config.storage.checkpoint.trigger_interval = Duration::from_secs(17);
+        config.storage.checkpoint.drain_timeout = Duration::from_secs(9);
+        config.storage.checkpoint.max_concurrent_writers = 6;
+        config.storage.checkpoint.artifact_gc_batch_size = 11;
+        config.storage.checkpoint.artifact_gc_delete_budget = 22;
+        config.storage.checkpoint.checkpoint_gc_delete_budget = 3;
+        config.storage.checkpoint.segment_prune_delete_budget = 7;
+
+        let instance = InstanceConfig::from(&config);
+        assert_eq!(instance.options.checkpoint.trigger_bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            instance.options.checkpoint.trigger_interval,
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            instance.options.checkpoint.drain_timeout,
+            Duration::from_secs(9)
+        );
+        assert_eq!(instance.options.checkpoint.max_concurrent_writers, 6);
+        assert_eq!(instance.options.checkpoint.artifact_gc_batch_size, 11);
+        assert_eq!(instance.options.checkpoint.artifact_gc_delete_budget, 22);
+        assert_eq!(instance.options.checkpoint.checkpoint_gc_delete_budget, 3);
+        assert_eq!(instance.options.checkpoint.segment_prune_delete_budget, 7);
     }
 
     #[test]
@@ -592,23 +682,5 @@ mod tests {
         assert_eq!(config.options.pin_threads, ThreadAffinityMode::Auto);
         assert_eq!(config.options.default_database, "mydb");
         assert_eq!(config.options.instance_root, "/tmp/my-instance");
-    }
-
-    #[test]
-    fn test_delete_patch_inline_threshold_is_carried_into_boot_config() {
-        let config = InstanceConfig::new().with_delete_patch_inline_row_ref_threshold(17);
-        let boot = BootConfig::from_config(&config);
-
-        assert_eq!(config.options.delete_patch_inline_row_ref_threshold, 17);
-        assert_eq!(boot.delete_patch_inline_row_ref_threshold, 17);
-    }
-
-    #[test]
-    fn test_cluster_config_maps_delete_patch_inline_threshold() {
-        let mut cluster = paro_common::config::ClusterConfig::default();
-        cluster.delete_patch_inline_row_ref_threshold = 33;
-
-        let config = InstanceConfig::from(&cluster);
-        assert_eq!(config.options.delete_patch_inline_row_ref_threshold, 33);
     }
 }

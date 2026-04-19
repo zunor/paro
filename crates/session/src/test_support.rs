@@ -1,7 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::Session;
+use crate::transaction::commit::CommitPipeline;
+use crate::{CommitFailure, CommitOutcome, Session};
 use paro_context::StatementTimeoutDriver;
 use paro_instance::Instance;
 use std::sync::Arc;
@@ -84,4 +85,20 @@ impl TestSessionBuilder {
         );
         (instance, session)
     }
+}
+
+/// Commit the current transaction through the durable pipeline but intentionally
+/// skip post-commit side effects. Tests use this to simulate a crash after the
+/// durable commit record is published.
+pub fn durable_commit_without_post_commit(
+    session: &mut Session,
+) -> std::result::Result<CommitOutcome, CommitFailure> {
+    let frozen = session
+        .transaction
+        .freeze()
+        .map_err(|error| CommitFailure {
+            error,
+            rollback_succeeded: true,
+        })?;
+    CommitPipeline::new(session, frozen).execute()
 }

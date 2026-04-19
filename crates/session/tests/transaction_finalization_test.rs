@@ -19,6 +19,7 @@ use exec_ok::exec_ok;
 use instance_persistent::create_persistent_instance;
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::error::ParoError;
+use paro_common::identity::GraphId;
 use paro_common::runtime_value::Value;
 use paro_instance::{DatabaseCloseAction, Instance};
 use paro_session::{CollectingSink, Session, SessionContextState};
@@ -179,6 +180,18 @@ async fn run_graph_commit_path(path: CommitPath) {
         ),
     )
     .await;
+    let graph_dir = PathBuf::from(session.current_database.path())
+        .join("graph")
+        .join(&graph_name);
+    assert!(
+        graph_dir.exists(),
+        "{path:?} should publish the graph artifact before returning"
+    );
+    let runtime_key = GraphId::new("postgres", "public", &graph_name).runtime_key();
+    assert!(
+        instance.graph_manager().get(&runtime_key).is_some(),
+        "{path:?} should register the graph runtime before returning"
+    );
 
     session.register_state("txn", TxnLifecycleState::default());
 

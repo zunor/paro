@@ -161,43 +161,31 @@ impl Session {
                         wal_keep_from: wal_metrics.wal_keep_from,
                         recovery_mode: wal_metrics.recovery_mode.as_str().to_string(),
                         main_wal_needs_truncation: wal_metrics.main_wal_needs_truncation,
-                        checkpoint_wal_needs_truncation: wal_metrics
-                            .checkpoint_wal_needs_truncation,
-                        recovery_wal_needs_truncation: wal_metrics.recovery_wal_needs_truncation,
-                        journal_apply_queue_depth: wal_metrics.journal_apply_queue_depth,
-                        journal_apply_queue_depth_peak: wal_metrics.journal_apply_queue_depth_peak,
-                        journal_apply_active_workers: wal_metrics.journal_apply_active_workers,
-                        journal_apply_active_workers_peak: wal_metrics
-                            .journal_apply_active_workers_peak,
-                        journal_apply_mailbox_count: wal_metrics.journal_apply_mailbox_count,
-                        journal_apply_applied_lag: wal_metrics.journal_apply_applied_lag,
-                        journal_apply_published_lag: wal_metrics.journal_apply_published_lag,
-                        journal_apply_durable_wait_count: wal_metrics
-                            .journal_apply_durable_wait_count,
-                        journal_apply_durable_wait_micros: wal_metrics
-                            .journal_apply_durable_wait_micros,
-                        journal_apply_applied_wait_count: wal_metrics
-                            .journal_apply_applied_wait_count,
-                        journal_apply_applied_wait_micros: wal_metrics
-                            .journal_apply_applied_wait_micros,
-                        journal_apply_published_wait_count: wal_metrics
-                            .journal_apply_published_wait_count,
-                        journal_apply_published_wait_micros: wal_metrics
-                            .journal_apply_published_wait_micros,
-                        journal_commit_bytes_total: wal_metrics.journal_commit_bytes_total,
-                        journal_group_count: wal_metrics.journal_group_count,
-                        journal_group_size_last: wal_metrics.journal_group_size_last,
-                        journal_group_size_peak: wal_metrics.journal_group_size_peak,
-                        journal_sync_latency_micros_total: wal_metrics
-                            .journal_sync_latency_micros_total,
-                        journal_sync_latency_micros_peak: wal_metrics
-                            .journal_sync_latency_micros_peak,
-                        journal_replay_rowsets_total: wal_metrics.journal_replay_rowsets_total,
-                        journal_replay_delete_patches_total: wal_metrics
-                            .journal_replay_delete_patches_total,
-                        journal_inline_delete_patch_count: wal_metrics
-                            .journal_inline_delete_patch_count,
-                        journal_delete_patch_count: wal_metrics.journal_delete_patch_count,
+                        checkpoint_wal_needs_truncation: false,
+                        recovery_wal_needs_truncation: false,
+                        journal_apply_queue_depth: 0,
+                        journal_apply_queue_depth_peak: 0,
+                        journal_apply_active_workers: 0,
+                        journal_apply_active_workers_peak: 0,
+                        journal_apply_mailbox_count: 0,
+                        journal_apply_applied_lag: 0,
+                        journal_apply_published_lag: 0,
+                        journal_apply_durable_wait_count: 0,
+                        journal_apply_durable_wait_micros: 0,
+                        journal_apply_applied_wait_count: 0,
+                        journal_apply_applied_wait_micros: 0,
+                        journal_apply_published_wait_count: 0,
+                        journal_apply_published_wait_micros: 0,
+                        journal_commit_bytes_total: 0,
+                        journal_group_count: 0,
+                        journal_group_size_last: 0,
+                        journal_group_size_peak: 0,
+                        journal_sync_latency_micros_total: 0,
+                        journal_sync_latency_micros_peak: 0,
+                        journal_replay_rowsets_total: 0,
+                        journal_replay_delete_patches_total: 0,
+                        journal_inline_delete_patch_count: 0,
+                        journal_delete_patch_count: 0,
                     },
                 }
             })

@@ -4,31 +4,25 @@
 use crate::compaction::execution::workspace::{CompactionBuildOutput, StagedArtifact};
 use crate::compaction::plan::types::CompactionJobId;
 use crate::compaction::publish::record::{
-    maintenance_storage_op, CompactionPublishRecord, CompactionPublishRequest, RetiredInput,
+    maintenance_storage_op, CompactionPublishRecord, CompactionPublishRequest, PkPublishDelta,
+    RetiredInput,
 };
 use crate::rowset::{Rowset, RowsetSharedPtr};
 use crate::tablet::Tablet;
 use paro_common::durability::{PrepareToken, PreparedMaintenancePlan, PreparedTabletPlan};
 use paro_common::effect::ArtifactRef;
-use paro_common::effect::StorageCommitOp;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::journal::MaintenanceKind;
-use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::warn;
 
 pub struct CompactionPublisher;
 
-struct PreparedPublishRuntime {
-    _artifact_guard: StagedArtifact,
-    input_rowsets: Vec<RowsetSharedPtr>,
-    validation_rowset: RowsetSharedPtr,
-    staged_path: PathBuf,
-}
-
 impl CompactionPublisher {
     pub fn prepare_request(
-        tablet: &Arc<Tablet>,
+        tablet: &Tablet,
         output: CompactionBuildOutput,
         job_id: CompactionJobId,
     ) -> Result<CompactionPublishRequest> {
@@ -86,6 +80,7 @@ impl CompactionPublisher {
                 rssids: tablet.rowset_rssids(input.rowset.as_ref()),
             })
             .collect::<Vec<_>>();
+
         let maintenance_plan = PreparedMaintenancePlan {
             kind: MaintenanceKind::Compaction,
             catalog_ops: Vec::new(),
@@ -111,149 +106,173 @@ impl CompactionPublisher {
         })
     }
 
-    pub fn publish(tablet: &Arc<Tablet>, request: CompactionPublishRequest) -> Result<()> {
-        let prepared = Self::prepare_publish(tablet, request)?;
-        let cleanup_path = prepared.runtime.staged_path.clone();
-        let mut durable_submitted = false;
+    pub fn publish(tablet: &Tablet, request: CompactionPublishRequest) -> Result<()> {
+        let CompactionPublishRequest { output, record, .. } = request;
+        let retired_inputs: Vec<_> = match &output {
+            CompactionBuildOutput::Rowset(artifact) => artifact
+                .plan
+                .input_rowsets
+                .iter()
+                .map(|input| RetiredInput {
+                    rowset_id: input.rowset.rowset_id(),
+                    version: input.rowset.version(),
+                    rssids: tablet.rowset_rssids(input.rowset.as_ref()),
+                })
+                .collect(),
+            CompactionBuildOutput::PrimaryKey { artifact, .. } => artifact
+                .plan
+                .input_rowsets
+                .iter()
+                .map(|input| RetiredInput {
+                    rowset_id: input.rowset.rowset_id(),
+                    version: input.rowset.version(),
+                    rssids: tablet.rowset_rssids(input.rowset.as_ref()),
+                })
+                .collect(),
+        };
+        let final_path = PathBuf::from(&record.output_rowset_path);
+        let mut installed_final_namespace = false;
+        let mut wal_durable = false;
 
-        let result = if let Some(coordinator) = tablet.journal_coordinator() {
-            let apply_runtime = tablet.journal_apply_runtime().ok_or_else(|| {
-                paro_error::internal("tablet journal apply runtime missing during compaction")
-            })?;
-            let validate_tablet = Arc::clone(tablet);
-            let apply_tablet = Arc::clone(tablet);
-            let token = prepared.token;
-            let record = prepared.record.clone();
-            let input_rowsets = prepared.runtime.input_rowsets.clone();
-            let validation_rowset = prepared.runtime.validation_rowset.clone();
-            let maintenance_plan = prepared.maintenance_plan.clone();
-            let ctx = coordinator.submit_maintenance_context(maintenance_plan, move |_| {
-                validate_tablet.with_meta_lock("validate compaction publish", || {
-                    validate_tablet.validate_prepare_token(&token)?;
-                    validate_tablet.validate_compaction_publish_locked(
+        let result = match output {
+            CompactionBuildOutput::Rowset(artifact) => {
+                tablet.with_meta_lock("publish compaction", || {
+                    Self::publish_artifact(
+                        tablet,
+                        artifact,
+                        None,
                         &record,
-                        &input_rowsets,
-                        validation_rowset.as_ref(),
+                        &retired_inputs,
+                        &final_path,
+                        &mut installed_final_namespace,
+                        &mut wal_durable,
                     )
                 })
-            })?;
-            durable_submitted = true;
-            let compaction_op = ctx
-                .record
-                .storage_ops
-                .first()
-                .and_then(|op| match op {
-                    StorageCommitOp::Tablet(tablet_op) => tablet_op.mutations.first().cloned(),
+            }
+            CompactionBuildOutput::PrimaryKey { artifact, pk_delta } => {
+                tablet.with_meta_lock("publish compaction", || {
+                    Self::publish_artifact(
+                        tablet,
+                        artifact,
+                        Some(pk_delta),
+                        &record,
+                        &retired_inputs,
+                        &final_path,
+                        &mut installed_final_namespace,
+                        &mut wal_durable,
+                    )
                 })
-                .ok_or_else(|| {
-                    paro_error::internal("compaction maintenance plan missing mutation")
-                })?;
-            apply_runtime.submit(ApplyRequest {
-                lsn: ctx.lsn,
-                durable_batch_lsn: ctx.durable_batch_lsn,
-                commit_id: None,
-                wait_mode: WaitMode::Published,
-                catalog_serial: !ctx.record.catalog_ops.is_empty(),
-                catalog_pre: Box::new(|| Ok(())),
-                tablet_parts: vec![TabletApplyPart {
-                    tablet_id: tablet.tablet_id(),
-                    apply: Box::new(move || apply_tablet.apply_compaction_publish(&compaction_op)),
-                }],
-                descriptor_phase: Box::new(|| Ok(())),
-                catalog_post: Box::new(|| Ok(())),
-                on_published: Box::new(|| Ok(())),
-            })
-        } else {
-            Self::validate_prepared_publish(tablet, &prepared)?;
-            let compaction_op = prepared
-                .maintenance_plan
-                .storage_ops
-                .first()
-                .and_then(|op| match op {
-                    StorageCommitOp::Tablet(tablet_op) => tablet_op.mutations.first(),
-                })
-                .ok_or_else(|| {
-                    paro_error::internal("compaction maintenance plan missing mutation")
-                })?;
-            tablet.apply_compaction_publish(compaction_op)
+            }
         };
 
-        if result.is_err() && !durable_submitted && cleanup_path.exists() {
-            crate::compaction::cleanup::cleanup_now(&cleanup_path);
+        if result.is_err() && installed_final_namespace && !wal_durable {
+            crate::compaction::cleanup::cleanup_now(&final_path);
         }
 
-        result.map(|_| ())
+        result
     }
 
-    fn prepare_publish(
-        tablet: &Arc<Tablet>,
-        request: CompactionPublishRequest,
-    ) -> Result<PreparedPublish> {
-        let CompactionPublishRequest {
-            output,
+    fn publish_artifact(
+        tablet: &Tablet,
+        artifact: StagedArtifact,
+        pk_delta: Option<PkPublishDelta>,
+        record: &CompactionPublishRecord,
+        retired_inputs: &[RetiredInput],
+        final_path: &Path,
+        installed_final_namespace: &mut bool,
+        wal_durable: &mut bool,
+    ) -> Result<()> {
+        let staged_stats = artifact.rowset.statistics().ok();
+        tablet.validate_compaction_publish_locked(
             record,
-            maintenance_plan,
-            token,
-        } = request;
-
-        let artifact = match output {
-            CompactionBuildOutput::Rowset(artifact) => artifact,
-            CompactionBuildOutput::PrimaryKey { artifact, .. } => artifact,
-        };
-
-        let input_rowsets = artifact.plan.input_rowset_ptrs();
-        let staged_path = artifact.workspace.rowset_dir.clone();
-        let validation_rowset = build_rowset(
-            tablet,
-            &artifact,
-            &staged_path,
-            artifact.rowset.statistics().ok(),
+            &artifact.plan.input_rowset_ptrs(),
+            artifact.rowset.as_ref(),
         )?;
 
-        Ok(PreparedPublish {
-            record,
-            maintenance_plan,
-            token,
-            runtime: PreparedPublishRuntime {
-                _artifact_guard: artifact,
-                input_rowsets,
-                validation_rowset,
-                staged_path,
-            },
-        })
-    }
+        install_staged_rowset(&artifact.workspace.rowset_dir, final_path)?;
+        *installed_final_namespace = true;
+        Tablet::sync_parent_dir(final_path)?;
 
-    fn validate_prepared_publish(tablet: &Arc<Tablet>, prepared: &PreparedPublish) -> Result<()> {
-        tablet.with_meta_lock("validate compaction publish", || {
-            tablet.validate_prepare_token(&prepared.token)?;
-            tablet.validate_compaction_publish_locked(
-                &prepared.record,
-                &prepared.runtime.input_rowsets,
-                prepared.runtime.validation_rowset.as_ref(),
-            )
-        })
+        let final_rowset = build_final_rowset(tablet, &artifact, final_path, staged_stats)?;
+        tablet.ensure_rowset_rssids(&final_rowset);
+        tablet.write_compaction_publish_wal(record)?;
+        *wal_durable = true;
+        let checkpoint_ticket = tablet.begin_checkpoint_compaction_publish();
+
+        final_rowset.make_visible()?;
+        tablet.install_compaction_publish_locked(
+            &artifact.plan.input_rowset_ptrs(),
+            retired_inputs,
+            final_rowset.clone(),
+            checkpoint_ticket
+                .map(|ticket| ticket.maintenance_id)
+                .unwrap_or(0),
+            record.cumulative_point_action,
+            false,
+        )?;
+        if let Some(ticket) = checkpoint_ticket {
+            tablet.finish_checkpoint_compaction_publish(ticket);
+        }
+
+        if let Some(pk_delta) = pk_delta.as_ref() {
+            tablet.apply_compaction_publish_delta(
+                final_rowset.rowset_id(),
+                final_rowset.end_version(),
+                pk_delta,
+            )?;
+        }
+
+        if matches!(
+            artifact.plan.merge_semantics,
+            crate::compaction::plan::types::MergeSemantics::Deduplicate
+        ) {
+            tablet.validate_primary_index_consistency_after_compaction(&final_rowset)?;
+            tablet.maybe_flush_primary_index()?;
+        }
+
+        if let Err(err) = tablet.persist_meta_snapshot() {
+            warn!(
+                tablet_id = tablet.tablet_id(),
+                plan_id = %record.plan_id,
+                job_id = %record.job_id,
+                error = %err,
+                "compaction publish completed but failed to persist tablet meta snapshot"
+            );
+        }
+        Ok(())
     }
 }
 
-struct PreparedPublish {
-    record: CompactionPublishRecord,
-    maintenance_plan: PreparedMaintenancePlan,
-    token: PrepareToken,
-    runtime: PreparedPublishRuntime,
+fn install_staged_rowset(staged_path: &Path, final_path: &Path) -> Result<()> {
+    if final_path.exists() {
+        return Err(paro_error::object_exists(
+            "compaction output rowset",
+            final_path.display().to_string(),
+        ));
+    }
+
+    fs::rename(staged_path, final_path).map_err(|err| {
+        paro_error::io_error(format!(
+            "install compaction artifact {} -> {}: {}",
+            staged_path.display(),
+            final_path.display(),
+            err
+        ))
+    })
 }
 
-fn build_rowset(
+fn build_final_rowset(
     tablet: &Tablet,
     artifact: &StagedArtifact,
-    rowset_path: &Path,
+    final_path: &Path,
     staged_stats: Option<crate::rowset::rowset_statistics::RowsetStatistics>,
 ) -> Result<RowsetSharedPtr> {
     let schema = tablet
         .schema()
         .ok_or_else(|| paro_error::internal("Tablet schema missing during compaction publish"))?;
     let mut rowset_meta = artifact.rowset.rowset_meta();
-    rowset_meta.set_rowset_path(rowset_path.to_string_lossy().to_string());
-    let rowset = Arc::new(Rowset::create(schema, rowset_meta, rowset_path)?);
+    rowset_meta.set_rowset_path(final_path.to_string_lossy().to_string());
+    let rowset = Arc::new(Rowset::create(schema, rowset_meta, final_path)?);
     if let Some(stats) = staged_stats {
         rowset.set_statistics_cache(stats);
     }

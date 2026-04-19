@@ -7,8 +7,8 @@
 
 use crate::database::storage_identity::{DatabaseStorageIdentity, DATABASE_STORAGE_IDENTITY_KEY};
 use crate::storage_manager::{
-    wal_path_with_suffix, CheckpointOptions, DatabaseSize, MetadataBlockInfo, StorageCommitState,
-    StorageManager, CHECKPOINT_WAL_SUFFIX, MAIN_WAL_SUFFIX, RECOVERY_WAL_SUFFIX,
+    wal_path_with_suffix, DatabaseSize, MetadataBlockInfo, StorageCommitState, StorageManager,
+    MAIN_WAL_SUFFIX,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_storage::buffer::BufferManager;
@@ -20,9 +20,7 @@ use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-
-pub const DEFAULT_CHECKPOINT_WAL_SIZE: u64 = 1 << 24;
+use std::sync::Arc;
 
 const DEFAULT_PARALLEL_TABLET_LOAD: usize = 4;
 const DEFAULT_WAL_BASENAME: &str = "db";
@@ -39,8 +37,6 @@ pub struct DatabaseStorage {
     loaded: bool,
     /// Optional WAL handle.
     wal: Option<Arc<WriteAheadLog>>,
-    /// WAL mutex for synchronization.
-    wal_lock: Mutex<()>,
     /// Metadata store.
     metadata_store: Option<Arc<dyn MetadataStore>>,
     /// Tablet metadata manager.
@@ -51,8 +47,6 @@ pub struct DatabaseStorage {
     wal_size: AtomicU64,
     /// WAL keep-from retention threshold.
     wal_keep_from: AtomicU64,
-    /// Checkpoint WAL threshold.
-    checkpoint_wal_size: u64,
     /// Storage identity persisted in metadata and mirrored into WAL headers.
     storage_identity: Option<DatabaseStorageIdentity>,
     /// WAL header metadata used for new WAL creation.
@@ -75,7 +69,6 @@ impl std::fmt::Debug for DatabaseStorage {
             .field("has_buffer_manager", &self.buffer_manager.is_some())
             .field("wal_size", &self.wal_size.load(Ordering::Relaxed))
             .field("wal_keep_from", &self.wal_keep_from.load(Ordering::Acquire))
-            .field("checkpoint_wal_size", &self.checkpoint_wal_size)
             .field("storage_identity", &self.storage_identity)
             .field("wal_header_metadata", &self.wal_header_metadata)
             .finish()
@@ -91,13 +84,11 @@ impl DatabaseStorage {
             read_only: false,
             loaded: false,
             wal: None,
-            wal_lock: Mutex::new(()),
             metadata_store: None,
             tablet_meta_manager: None,
             buffer_manager: Some(buffer_manager),
             wal_size: AtomicU64::new(0),
             wal_keep_from: AtomicU64::new(u64::MAX),
-            checkpoint_wal_size: DEFAULT_CHECKPOINT_WAL_SIZE,
             storage_identity: None,
             wal_header_metadata: WalHeaderMetadata::default(),
         }
@@ -110,13 +101,11 @@ impl DatabaseStorage {
             read_only: false,
             loaded: false,
             wal: None,
-            wal_lock: Mutex::new(()),
             metadata_store: None,
             tablet_meta_manager: None,
             buffer_manager: None,
             wal_size: AtomicU64::new(0),
             wal_keep_from: AtomicU64::new(u64::MAX),
-            checkpoint_wal_size: DEFAULT_CHECKPOINT_WAL_SIZE,
             storage_identity: None,
             wal_header_metadata: WalHeaderMetadata::default(),
         }
@@ -125,11 +114,6 @@ impl DatabaseStorage {
     /// Set read-only mode.
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
-    }
-
-    /// Set the checkpoint WAL size threshold.
-    pub fn set_checkpoint_wal_size(&mut self, size: u64) {
-        self.checkpoint_wal_size = size;
     }
 
     fn storage_root_path(&self) -> Option<PathBuf> {
@@ -280,8 +264,7 @@ impl DatabaseStorage {
     }
 
     fn refresh_wal_size_from_disk(&self) {
-        let wal_path = PathBuf::from(self.get_wal_path());
-        let size = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = self.wal.as_ref().map(|wal| wal.file_size()).unwrap_or(0);
         self.set_wal_size(size);
     }
 
@@ -459,17 +442,21 @@ impl DatabaseStorage {
     /// Load an existing WAL.
     pub fn load_wal(&mut self) -> Result<()> {
         let wal_path = self.get_wal_path();
-        let wal_path_buf = PathBuf::from(&wal_path);
-        if wal_path_buf.exists() {
-            let wal = WriteAheadLog::new(&wal_path)?;
-            if let Some(mut reader) = paro_storage::wal::wal_reader::WalReader::open(&wal_path)? {
-                reader.ensure_header_read()?;
-                self.wal_header_metadata = reader.header_metadata();
-            } else {
-                self.wal_header_metadata = WalHeaderMetadata::default();
-            }
+        if WriteAheadLog::exists_for_seed(&wal_path) {
+            let wal = WriteAheadLog::new_with_header_metadata(&wal_path, self.wal_header_metadata)?;
+            self.wal_header_metadata = wal.header_metadata();
             self.wal = Some(Arc::new(wal));
             self.refresh_wal_size_from_disk();
+        } else if Path::new(&wal_path).exists() {
+            return Err(paro_error::not_supported(format!(
+                "legacy single-file WAL layout is unsupported at {}; expected segment catalog {}. {}",
+                wal_path,
+                paro_journal::segments::SegmentCatalogStore::from_seed_path(&wal_path)
+                    .layout()
+                    .catalog_path()
+                    .display(),
+                self.identity_repair_guidance()
+            )));
         } else {
             self.wal = None;
             self.set_wal_size(0);
@@ -589,14 +576,6 @@ impl StorageManager for DatabaseStorage {
         self.wal_path_with_suffix(MAIN_WAL_SUFFIX)
     }
 
-    fn get_checkpoint_wal_path(&self) -> String {
-        self.wal_path_with_suffix(CHECKPOINT_WAL_SUFFIX)
-    }
-
-    fn get_recovery_wal_path(&self) -> String {
-        self.wal_path_with_suffix(RECOVERY_WAL_SUFFIX)
-    }
-
     fn get_metadata_store(&self) -> Option<&dyn MetadataStore> {
         self.metadata_store.as_deref()
     }
@@ -607,38 +586,6 @@ impl StorageManager for DatabaseStorage {
 
     fn get_tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>> {
         self.tablet_meta_manager.clone()
-    }
-
-    fn create_checkpoint(&self, options: CheckpointOptions) -> Result<()> {
-        let _lock = self
-            .wal_lock
-            .lock()
-            .map_err(|_| paro_error::internal("WAL lock poisoned"))?;
-
-        if !options.force && self.wal_size() == 0 {
-            return Ok(());
-        }
-
-        if let Some(tablet_meta_manager) = &self.tablet_meta_manager {
-            tablet_meta_manager.rebuild_storage_manifest()?;
-        }
-
-        if let Some(wal) = self.wal.as_ref() {
-            let had_content = wal.start_checkpoint(0)?;
-            if had_content {
-                wal.finish_checkpoint()?;
-            }
-        }
-
-        self.set_wal_size(0);
-        Ok(())
-    }
-
-    fn automatic_checkpoint(&self, estimated_wal_bytes: u64) -> bool {
-        if self.read_only {
-            return false;
-        }
-        self.wal_size() + estimated_wal_bytes >= self.checkpoint_wal_size
     }
 
     fn gen_storage_commit_state(&self, transaction_id: u64) -> Box<dyn StorageCommitState> {
@@ -807,14 +754,6 @@ impl StorageManager for InMemoryDatabaseStorage {
         self.inner.get_wal_path()
     }
 
-    fn get_checkpoint_wal_path(&self) -> String {
-        self.inner.get_checkpoint_wal_path()
-    }
-
-    fn get_recovery_wal_path(&self) -> String {
-        self.inner.get_recovery_wal_path()
-    }
-
     fn get_metadata_store(&self) -> Option<&dyn MetadataStore> {
         self.inner.get_metadata_store()
     }
@@ -825,14 +764,6 @@ impl StorageManager for InMemoryDatabaseStorage {
 
     fn get_tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>> {
         self.inner.get_tablet_meta_manager()
-    }
-
-    fn create_checkpoint(&self, options: CheckpointOptions) -> Result<()> {
-        self.inner.create_checkpoint(options)
-    }
-
-    fn automatic_checkpoint(&self, estimated_wal_bytes: u64) -> bool {
-        self.inner.automatic_checkpoint(estimated_wal_bytes)
     }
 
     fn gen_storage_commit_state(&self, transaction_id: u64) -> Box<dyn StorageCommitState> {
@@ -1032,22 +963,6 @@ mod tests {
     }
 
     #[test]
-    fn automatic_checkpoint_respects_threshold_and_read_only_mode() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("db");
-        let mut storage =
-            DatabaseStorage::new(db_path.to_string_lossy().to_string(), test_buffer_manager());
-        storage.set_checkpoint_wal_size(1000);
-
-        storage.set_wal_size(500);
-        assert!(!storage.automatic_checkpoint(499));
-        assert!(storage.automatic_checkpoint(500));
-
-        storage.set_read_only(true);
-        assert!(!storage.automatic_checkpoint(u64::MAX));
-    }
-
-    #[test]
     fn wal_paths_match_storage_manager_suffixes() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("db");
@@ -1059,13 +974,24 @@ mod tests {
             storage.get_wal_path(),
             wal_dir.join("db.wal").to_string_lossy()
         );
-        assert_eq!(
-            storage.get_checkpoint_wal_path(),
-            wal_dir.join("db.checkpoint.wal").to_string_lossy()
-        );
-        assert_eq!(
-            storage.get_recovery_wal_path(),
-            wal_dir.join("db.recovery.wal").to_string_lossy()
-        );
+    }
+
+    #[test]
+    fn load_wal_rejects_legacy_single_file_seed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let mut storage =
+            DatabaseStorage::new(db_path.to_string_lossy().to_string(), test_buffer_manager());
+        storage.create_new().unwrap();
+        storage.bootstrap_storage_identity(7).unwrap();
+
+        let wal_path = PathBuf::from(storage.get_wal_path());
+        std::fs::write(&wal_path, b"legacy").unwrap();
+
+        let err = storage
+            .load_wal()
+            .expect_err("legacy single-file seed should be rejected");
+        assert!(err.is_feature_not_supported());
+        assert!(err.to_string().contains("legacy single-file WAL layout"));
     }
 }

@@ -14,7 +14,6 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GRAPH_PROJECTION_META_FILE: &str = "meta.json";
-const GRAPH_PROJECTION_META_VERSION_V1: u32 = 1;
 const GRAPH_PROJECTION_META_VERSION_V2: u32 = 2;
 
 /// Input for building a graph projection index.
@@ -69,14 +68,6 @@ pub struct GraphProjectionIndex {
     /// per edge label -> backward adjacency
     backward_adjacency: HashMap<String, AdjacencyCSR>,
     edge_endpoints: HashMap<String, EdgeEndpoints>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GraphProjectionMeta {
-    version: u32,
-    graph_name: String,
-    vertices: Vec<VertexFileMeta>,
-    edges: Vec<EdgeFileMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -248,25 +239,29 @@ impl GraphProjectionIndex {
 
     /// Load index from directory. CSR files are mmap-backed when possible.
     pub fn load(dir: &Path) -> Result<Self> {
-        match Self::read_meta_file(dir)? {
-            GraphMetaFile::V1(meta) => Self::load_from_v1_meta(dir, meta),
-            GraphMetaFile::V2(manifest) => Self::load_from_manifest(dir, manifest),
-        }
-    }
-
-    pub fn manifest_version(dir: &Path) -> Result<u32> {
-        Self::read_meta_version(dir)?.ok_or_else(|| {
-            paro_error::invalid_input("GraphProjectionIndex: meta.json is missing version field")
-        })
+        let manifest = Self::load_manifest(dir)?;
+        Self::load_from_manifest(dir, manifest)
     }
 
     pub fn load_manifest(dir: &Path) -> Result<GraphManifest> {
-        match Self::read_meta_file(dir)? {
-            GraphMetaFile::V2(manifest) => Ok(manifest),
-            GraphMetaFile::V1(_) => Err(paro_error::invalid_input(
-                "GraphProjectionIndex: legacy v1 meta requires upgrade before recovery",
-            )),
+        let meta_bytes = Self::read_meta_bytes(dir)?;
+        let version = Self::read_meta_version_from_bytes(&meta_bytes).ok_or_else(|| {
+            paro_error::invalid_input(
+                "GraphProjectionIndex: invalid meta.json content: missing version",
+            )
+        })?;
+        if version != GRAPH_PROJECTION_META_VERSION_V2 {
+            return Err(paro_error::invalid_input(format!(
+                "GraphProjectionIndex: unsupported current meta.json format version {} (expected {})",
+                version, GRAPH_PROJECTION_META_VERSION_V2
+            )));
         }
+        serde_json::from_slice(&meta_bytes).map_err(|e| {
+            paro_error::invalid_input(format!(
+                "GraphProjectionIndex: invalid manifest content: {}",
+                e
+            ))
+        })
     }
 
     pub fn write_manifest(dir: &Path, manifest: &GraphManifest) -> Result<()> {
@@ -342,21 +337,6 @@ impl GraphProjectionIndex {
         Ok((vertices_meta, edges_meta))
     }
 
-    fn load_from_v1_meta(dir: &Path, meta: GraphProjectionMeta) -> Result<Self> {
-        if meta.version != GRAPH_PROJECTION_META_VERSION_V1 {
-            return Err(paro_error::invalid_input(format!(
-                "GraphProjectionIndex: unsupported meta version {} (expected {})",
-                meta.version, GRAPH_PROJECTION_META_VERSION_V1
-            )));
-        }
-        if meta.graph_name.trim().is_empty() {
-            return Err(paro_error::invalid_input(
-                "GraphProjectionIndex: graph_name in meta is empty",
-            ));
-        }
-        Self::load_from_parts(dir, meta.graph_name, &meta.vertices, &meta.edges)
-    }
-
     fn load_from_manifest(dir: &Path, manifest: GraphManifest) -> Result<Self> {
         if manifest.version != GRAPH_PROJECTION_META_VERSION_V2 {
             return Err(paro_error::invalid_input(format!(
@@ -389,19 +369,12 @@ impl GraphProjectionIndex {
         vertices: &[VertexFileMeta],
         edges: &[EdgeFileMeta],
     ) -> Result<Self> {
-        let meta = GraphProjectionMeta {
-            version: GRAPH_PROJECTION_META_VERSION_V1,
-            graph_name,
-            vertices: vertices.to_vec(),
-            edges: edges.to_vec(),
-        };
-
-        let mut vertex_maps = HashMap::with_capacity(meta.vertices.len());
-        for vertex_meta in &meta.vertices {
+        let mut vertex_maps = HashMap::with_capacity(vertices.len());
+        for vertex_meta in vertices {
             validate_label(&vertex_meta.label, "vertex label")?;
             if vertex_maps.contains_key(&vertex_meta.label) {
                 return Err(paro_error::invalid_input(format!(
-                    "GraphProjectionIndex: duplicate vertex label '{}' in meta",
+                    "GraphProjectionIndex: duplicate vertex label '{}' in manifest",
                     vertex_meta.label
                 )));
             }
@@ -416,27 +389,27 @@ impl GraphProjectionIndex {
             vertex_maps.insert(vertex_meta.label.clone(), map);
         }
 
-        let mut forward_adjacency = HashMap::with_capacity(meta.edges.len());
-        let mut backward_adjacency = HashMap::with_capacity(meta.edges.len());
-        let mut edge_endpoints = HashMap::with_capacity(meta.edges.len());
+        let mut forward_adjacency = HashMap::with_capacity(edges.len());
+        let mut backward_adjacency = HashMap::with_capacity(edges.len());
+        let mut edge_endpoints = HashMap::with_capacity(edges.len());
 
-        for edge_meta in &meta.edges {
+        for edge_meta in edges {
             validate_label(&edge_meta.label, "edge label")?;
             if forward_adjacency.contains_key(&edge_meta.label) {
                 return Err(paro_error::invalid_input(format!(
-                    "GraphProjectionIndex: duplicate edge label '{}' in meta",
+                    "GraphProjectionIndex: duplicate edge label '{}' in manifest",
                     edge_meta.label
                 )));
             }
             if !vertex_maps.contains_key(&edge_meta.source_vertex_label) {
                 return Err(paro_error::invalid_input(format!(
-                    "GraphProjectionIndex: edge '{}' source vertex label '{}' not found in meta vertex maps",
+                    "GraphProjectionIndex: edge '{}' source vertex label '{}' not found in manifest vertex maps",
                     edge_meta.label, edge_meta.source_vertex_label
                 )));
             }
             if !vertex_maps.contains_key(&edge_meta.destination_vertex_label) {
                 return Err(paro_error::invalid_input(format!(
-                    "GraphProjectionIndex: edge '{}' destination vertex label '{}' not found in meta vertex maps",
+                    "GraphProjectionIndex: edge '{}' destination vertex label '{}' not found in manifest vertex maps",
                     edge_meta.label, edge_meta.destination_vertex_label
                 )));
             }
@@ -461,7 +434,7 @@ impl GraphProjectionIndex {
         }
 
         Ok(Self {
-            graph_name: meta.graph_name,
+            graph_name,
             vertex_maps,
             forward_adjacency,
             backward_adjacency,
@@ -469,7 +442,7 @@ impl GraphProjectionIndex {
         })
     }
 
-    fn read_meta_file(dir: &Path) -> Result<GraphMetaFile> {
+    fn read_meta_bytes(dir: &Path) -> Result<Vec<u8>> {
         let meta_path = dir.join(GRAPH_PROJECTION_META_FILE);
         let mut meta_file = File::open(&meta_path).map_err(|e| {
             paro_error::io_error(format!(
@@ -479,56 +452,14 @@ impl GraphProjectionIndex {
         })?;
         let mut meta_bytes = Vec::new();
         meta_file.read_to_end(&mut meta_bytes)?;
-        let version = serde_json::from_slice::<serde_json::Value>(&meta_bytes)
-            .ok()
-            .and_then(|value| value.get("version").and_then(|v| v.as_u64()))
-            .ok_or_else(|| {
-                paro_error::invalid_input(
-                    "GraphProjectionIndex: invalid meta.json content: missing version",
-                )
-            })? as u32;
-
-        match version {
-            GRAPH_PROJECTION_META_VERSION_V1 => {
-                let meta: GraphProjectionMeta =
-                    serde_json::from_slice(&meta_bytes).map_err(|e| {
-                        paro_error::invalid_input(format!(
-                            "GraphProjectionIndex: invalid meta.json content: {}",
-                            e
-                        ))
-                    })?;
-                Ok(GraphMetaFile::V1(meta))
-            }
-            GRAPH_PROJECTION_META_VERSION_V2 => {
-                let manifest: GraphManifest = serde_json::from_slice(&meta_bytes).map_err(|e| {
-                    paro_error::invalid_input(format!(
-                        "GraphProjectionIndex: invalid manifest content: {}",
-                        e
-                    ))
-                })?;
-                Ok(GraphMetaFile::V2(manifest))
-            }
-            other => Err(paro_error::invalid_input(format!(
-                "GraphProjectionIndex: unsupported meta version {}",
-                other
-            ))),
-        }
+        Ok(meta_bytes)
     }
 
-    fn read_meta_version(dir: &Path) -> Result<Option<u32>> {
-        let meta_path = dir.join(GRAPH_PROJECTION_META_FILE);
-        let mut meta_file = File::open(&meta_path).map_err(|e| {
-            paro_error::io_error(format!(
-                "GraphProjectionIndex: failed to open meta file {:?}: {}",
-                meta_path, e
-            ))
-        })?;
-        let mut meta_bytes = Vec::new();
-        meta_file.read_to_end(&mut meta_bytes)?;
-        Ok(serde_json::from_slice::<serde_json::Value>(&meta_bytes)
+    fn read_meta_version_from_bytes(meta_bytes: &[u8]) -> Option<u32> {
+        serde_json::from_slice::<serde_json::Value>(meta_bytes)
             .ok()
             .and_then(|value| value.get("version").and_then(|v| v.as_u64()))
-            .map(|value| value as u32))
+            .map(|value| value as u32)
     }
 
     /// Get all vertex labels.
@@ -597,11 +528,6 @@ fn validate_label(label: &str, context: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-enum GraphMetaFile {
-    V1(GraphProjectionMeta),
-    V2(GraphManifest),
 }
 
 impl GraphManifest {
@@ -858,6 +784,52 @@ mod tests {
         let err = GraphProjectionIndex::load(temp_dir.path()).unwrap_err();
         assert!(
             err.to_string().contains("not queryable"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_manifest_rejects_legacy_v1_meta() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join(GRAPH_PROJECTION_META_FILE),
+            r#"{
+  "version": 1,
+  "graph_name": "social_network",
+  "vertices": [],
+  "edges": []
+}"#,
+        )
+        .unwrap();
+
+        let err = GraphProjectionIndex::load_manifest(temp_dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported current meta.json format version 1"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_rejects_legacy_v1_meta() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join(GRAPH_PROJECTION_META_FILE),
+            r#"{
+  "version": 1,
+  "graph_name": "social_network",
+  "vertices": [],
+  "edges": []
+}"#,
+        )
+        .unwrap();
+
+        let err = GraphProjectionIndex::load(temp_dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported current meta.json format version 1"),
             "unexpected error: {}",
             err
         );

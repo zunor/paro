@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::database::catalog_checkpoint::{
-    CatalogCheckpoint, CATALOG_CHECKPOINT_ID_KEY, CATALOG_CHECKPOINT_KEY,
-};
+use crate::checkpoint::manifest_store::ManifestStore;
+use crate::checkpoint::writers::CatalogWriter;
 use crate::database::identity::DatabaseType;
+use crate::database::storage::DatabaseStorage;
 use crate::InMemoryDatabaseStorage;
 use paro_catalog::entry::{
     CatalogObjectRef, CatalogType, ColumnDefinition, CreateSequenceInfo, CreateViewInfo,
@@ -15,13 +15,34 @@ use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::types::LogicalType;
 use paro_parser::ast::Statement;
 use paro_parser::parse_one;
+use paro_storage::buffer::{BufferManager, StandardBufferManager, DEFAULT_BLOCK_ALLOC_SIZE};
+use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::TableHandle;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 fn create_table(types: &[LogicalType]) -> TableHandle {
     TableFactory::default().create_table(types).unwrap()
+}
+
+fn create_test_meta_manager(path: &str) -> Arc<TabletMetaManager> {
+    let store: Arc<dyn MetadataStore> =
+        Arc::new(FileMetadataStore::new(Path::new(path).join("tablet_meta")).unwrap());
+    Arc::new(TabletMetaManager::with_store_and_data_root(
+        store,
+        Path::new(path),
+    ))
+}
+
+fn create_table_with_meta_manager(
+    types: &[LogicalType],
+    meta_manager: Arc<TabletMetaManager>,
+) -> TableHandle {
+    TableFactory::new(Some(meta_manager))
+        .create_table(types)
+        .unwrap()
 }
 
 fn parse_query(sql: &str) -> Box<paro_parser::ast::Query> {
@@ -31,19 +52,31 @@ fn parse_query(sql: &str) -> Box<paro_parser::ast::Query> {
     }
 }
 
-fn create_checkpointable_db(path: &str) -> DatabaseHandle {
+fn create_checkpointable_db(path: &str) -> (DatabaseHandle, Arc<TabletMetaManager>) {
+    let _ = std::fs::remove_dir_all(path);
     let buffer_pool = Arc::new(BufferPool::new(1024));
     let db = DatabaseHandle::new(1, "test_db".into(), path.into(), buffer_pool);
     db.initialize().unwrap();
 
-    let mut storage = InMemoryDatabaseStorage::new();
-    storage.initialize().unwrap();
+    let buffer_manager: Arc<dyn BufferManager> = Arc::new(StandardBufferManager::new(
+        8 * 1024 * 1024,
+        DEFAULT_BLOCK_ALLOC_SIZE,
+        8,
+    ));
+    let mut storage = DatabaseStorage::new(path.to_string(), buffer_manager);
+    storage.create_new().unwrap();
+    storage.bootstrap_storage_identity(db.id()).unwrap();
+    storage.initialize_wal().unwrap();
     db.attach_storage(Box::new(storage));
     db.finalize_load().unwrap();
+    let tablet_meta_manager = create_test_meta_manager(path);
 
     let txn = CatalogSnapshot::permanent_writer(u64::MAX);
     let schema = db.catalog().get_schema(&txn, "public").unwrap();
-    let storage = Arc::new(create_table(&[LogicalType::Integer]));
+    let storage = Arc::new(create_table_with_meta_manager(
+        &[LogicalType::Integer],
+        tablet_meta_manager.clone(),
+    ));
     let table_entry = Arc::new(TableCatalogEntry::new(
         "test_db".to_string(),
         "public".to_string(),
@@ -59,7 +92,7 @@ fn create_checkpointable_db(path: &str) -> DatabaseHandle {
         .create_table(&txn, table_entry, OnCreateConflict::ErrorOnConflict)
         .unwrap();
 
-    db
+    (db, tablet_meta_manager)
 }
 
 #[test]
@@ -183,16 +216,22 @@ fn test_checkpoint_in_progress_flag() {
     assert!(!db.is_checkpoint_in_progress());
 
     let guard = db
-        .checkpointer()
+        .checkpoint_coordinator()
         .try_acquire_in_progress()
         .expect("first acquire should succeed");
     assert!(db.is_checkpoint_in_progress());
 
-    assert!(db.checkpointer().try_acquire_in_progress().is_none());
+    assert!(db
+        .checkpoint_coordinator()
+        .try_acquire_in_progress()
+        .is_none());
 
     drop(guard);
     assert!(!db.is_checkpoint_in_progress());
-    assert!(db.checkpointer().try_acquire_in_progress().is_some());
+    assert!(db
+        .checkpoint_coordinator()
+        .try_acquire_in_progress()
+        .is_some());
 }
 
 #[test]
@@ -250,13 +289,11 @@ fn test_wal_lifecycle_metrics_tracks_wal_health_check() {
         paro_storage::wal::recovery::WalRecoveryMode::NoWal
     );
     assert!(!metrics.main_wal_needs_truncation);
-    assert!(!metrics.checkpoint_wal_needs_truncation);
-    assert!(!metrics.recovery_wal_needs_truncation);
 }
 
 #[test]
 fn test_recovery_consistency_report_cached_for_management_query() {
-    let db = create_checkpointable_db("/tmp/recovery_consistency_cached");
+    let (db, _tablet_meta_manager) = create_checkpointable_db("/tmp/recovery_consistency_cached");
 
     let report = db.recovery_consistency_report();
     let cached = db.last_recovery_consistency_report();
@@ -450,15 +487,27 @@ fn test_close_idempotent() {
 
 #[test]
 fn test_checkpoint_serializes_catalog_metadata() {
-    let db = create_checkpointable_db("/tmp/checkpoint_serialization");
+    let (db, _tablet_meta_manager) = create_checkpointable_db("/tmp/checkpoint_serialization");
 
     db.checkpoint().unwrap();
 
-    let metadata_store = db
-        .metadata_store()
-        .expect("metadata store should be available");
-    let metadata = metadata_store.get(CATALOG_CHECKPOINT_KEY).unwrap();
-    let metadata = metadata.expect("catalog checkpoint payload should exist");
+    let storage = db.storage_lock().read();
+    let sm = storage
+        .as_ref()
+        .expect("storage manager should be attached");
+    let manifest_store = ManifestStore::open_for_storage(sm.as_ref())
+        .unwrap()
+        .expect("manifest store should exist");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .unwrap()
+        .expect("current manifest should exist");
+    let catalog_bundle = manifest
+        .bundle_refs
+        .iter()
+        .find(|bundle| matches!(bundle.kind, paro_common::checkpoint::BundleKind::Catalog))
+        .expect("catalog bundle should exist");
+    let metadata = manifest_store.read_bundle_payload(catalog_bundle).unwrap();
     assert!(!metadata.is_empty());
     assert!(
         metadata
@@ -470,7 +519,7 @@ fn test_checkpoint_serializes_catalog_metadata() {
 
 #[test]
 fn test_checkpoint_roundtrip_preserves_object_ids() {
-    let db = create_checkpointable_db("/tmp/checkpoint_oid_roundtrip");
+    let (db, tablet_meta_manager) = create_checkpointable_db("/tmp/checkpoint_oid_roundtrip");
     let txn = CatalogSnapshot::permanent_writer(u64::MAX);
     let schema = db.catalog().get_schema(&txn, "public").unwrap();
 
@@ -521,10 +570,10 @@ fn test_checkpoint_roundtrip_preserves_object_ids() {
         .object_id();
     let original_allocator_watermark = db.catalog().current_object_id();
 
-    let checkpoint_bytes = CatalogCheckpoint::serialize(db.catalog().as_ref()).unwrap();
+    let checkpoint_bytes = CatalogWriter::serialize(db.catalog().as_ref()).unwrap();
 
     let restored = ParoCatalog::new("test_db".to_string());
-    CatalogCheckpoint::deserialize(&checkpoint_bytes, &restored, None).unwrap();
+    CatalogWriter::deserialize(&checkpoint_bytes, &restored, Some(tablet_meta_manager)).unwrap();
 
     let restored_txn = CatalogSnapshot::read_only(u64::MAX);
     let restored_schema = restored.get_schema(&restored_txn, "public").unwrap();
@@ -604,7 +653,7 @@ fn test_checkpoint_roundtrip_preserves_object_ids() {
 
 #[test]
 fn test_create_assigns_stable_unique_object_ids() {
-    let db = create_checkpointable_db("/tmp/create_object_id_identity");
+    let (db, _tablet_meta_manager) = create_checkpointable_db("/tmp/create_object_id_identity");
     let txn = CatalogSnapshot::permanent_writer(u64::MAX);
     let schema = db.catalog().get_schema(&txn, "public").unwrap();
 
@@ -657,24 +706,32 @@ fn test_create_assigns_stable_unique_object_ids() {
 
 #[test]
 fn test_close_uses_wal_coordinated_checkpoint_path() {
-    let db = create_checkpointable_db("/tmp/close_checkpoint");
+    let (db, _tablet_meta_manager) = create_checkpointable_db("/tmp/close_checkpoint");
 
     db.close(DatabaseCloseAction::Checkpoint).unwrap();
 
     assert!(db.is_closed());
-    let metadata_store = db
-        .metadata_store()
-        .expect("metadata store should be available");
-    let checkpoint_marker = metadata_store
-        .get(CATALOG_CHECKPOINT_ID_KEY)
+    let storage = db.storage_lock().read();
+    let sm = storage
+        .as_ref()
+        .expect("storage manager should be attached");
+    let manifest_store = ManifestStore::open_for_storage(sm.as_ref())
         .unwrap()
-        .expect("checkpoint marker should exist");
-    assert_eq!(checkpoint_marker.len(), 8);
+        .expect("manifest store should exist");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .unwrap()
+        .expect("current manifest should exist");
+    assert!(manifest.checkpoint_id > 0);
+    assert!(manifest
+        .bundle_refs
+        .iter()
+        .any(|bundle| matches!(bundle.kind, paro_common::checkpoint::BundleKind::Catalog)));
 }
 
 #[test]
 fn test_checkpoint_updates_wal_lifecycle_metrics() {
-    let db = create_checkpointable_db("/tmp/checkpoint_metrics");
+    let (db, _tablet_meta_manager) = create_checkpointable_db("/tmp/checkpoint_metrics");
 
     db.checkpoint().unwrap();
 

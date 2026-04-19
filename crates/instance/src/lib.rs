@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 pub mod builder;
 pub mod builtin;
+pub mod checkpoint;
 pub mod config;
 pub mod database;
 pub mod file_system;
@@ -22,7 +23,7 @@ pub mod valid_checker;
 mod tests;
 
 pub use builder::InstanceBuilder;
-pub use config::{BootConfig, InstanceConfig, InstanceConfigOptions};
+pub use config::{BootConfig, CheckpointConfigOptions, InstanceConfig, InstanceConfigOptions};
 pub use database::handle::{
     AccessMode, AttachOptions, AttachVisibility, DatabaseCloseAction, DatabaseHandle, DbState,
     RecoveryMode,
@@ -42,9 +43,7 @@ pub use database::registry::{
     InsertDatabasePathResult, OnCreateConflict, OnEntryNotFound, SYSTEM_CATALOG, TEMP_CATALOG,
 };
 pub use database::state::DatabaseState;
-pub use database::storage::{
-    DatabaseStorage, InMemoryDatabaseStorage, DEFAULT_CHECKPOINT_WAL_SIZE,
-};
+pub use database::storage::{DatabaseStorage, InMemoryDatabaseStorage};
 pub use database::storage_identity::{
     DatabaseStorageIdentity, DATABASE_STORAGE_IDENTITY_FORMAT_VERSION,
     DATABASE_STORAGE_IDENTITY_KEY,
@@ -78,7 +77,6 @@ pub use recovery::consistency_report::{
 pub use recovery::registry::RouteRegistry;
 pub use recovery::replay_handler::{
     needs_recovery, recover_database, recover_database_with_checkpoint, CatalogReplayHandler,
-    RuntimeCatalogApplyBatch,
 };
 pub use runtime::connection_registry::{ConnectionHandle, ConnectionId, ConnectionRegistry};
 pub use runtime::object_cache::{ObjectCache, ObjectCacheEntry};
@@ -88,7 +86,7 @@ pub use runtime::session_registry::{
 };
 pub use runtime::shutdown_reason::ConnectionShutdownReason;
 pub use runtime::InstanceRuntime;
-pub use storage_manager::{CheckpointOptions, DatabaseSize, MetadataBlockInfo, StorageManager};
+pub use storage_manager::{DatabaseSize, MetadataBlockInfo, StorageManager};
 pub use valid_checker::ValidChecker;
 
 /// Shared runtime for instance-wide resources and managed databases.

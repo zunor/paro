@@ -788,13 +788,16 @@ impl SchemaEntry {
     }
 
     pub fn serialize_contents(&self) -> Result<Vec<u8>> {
-        self.contents.serialize_payload()
+        self.serialize_contents_at(u64::MAX)
     }
 
-    /// Persist the schema entry to disk
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    pub fn serialize_contents_at(&self, snapshot_ts: u64) -> Result<Vec<u8>> {
+        self.contents.serialize_payload_at(snapshot_ts)
+    }
+
+    pub fn serialize_at(&self, snapshot_ts: u64) -> Result<Vec<u8>> {
         let metadata = self.serialize_metadata()?;
-        let contents = self.serialize_contents()?;
+        let contents = self.serialize_contents_at(snapshot_ts)?;
 
         let mut buffer = Vec::new();
         buffer.write_all(&(metadata.len() as u32).to_le_bytes())?;
@@ -802,6 +805,11 @@ impl SchemaEntry {
         buffer.write_all(&(contents.len() as u32).to_le_bytes())?;
         buffer.write_all(&contents)?;
         Ok(buffer)
+    }
+
+    /// Persist the schema entry to disk
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        self.serialize_at(u64::MAX)
     }
 
     pub fn deserialize_metadata(bytes: &[u8], gc_epoch: Arc<AtomicU64>) -> Result<Self> {
@@ -1458,14 +1466,33 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_function::table::{TableFunction, TableFunctionSet};
     use paro_parser::parse_one;
+    use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
     use paro_storage::transaction::manager::TRANSACTION_ID_START;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, LazyLock};
 
-    fn create_table(types: &[LogicalType]) -> TableHandle {
-        TableFactory::default().create_table(types).unwrap()
+    fn create_test_meta_manager() -> Arc<TabletMetaManager> {
+        static NEXT_TEST_META_ROOT: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+        let root = std::env::temp_dir().join(format!(
+            "paro_catalog_schema_entry_meta_{}_{}",
+            std::process::id(),
+            NEXT_TEST_META_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store: Arc<dyn MetadataStore> =
+            Arc::new(FileMetadataStore::new(root.join("meta")).unwrap());
+        Arc::new(TabletMetaManager::with_store_and_data_root(store, &root))
+    }
+
+    fn create_table_with_meta_manager(
+        types: &[LogicalType],
+        meta_manager: Arc<TabletMetaManager>,
+    ) -> TableHandle {
+        TableFactory::new(Some(meta_manager))
+            .create_table(types)
+            .unwrap()
     }
 
     fn parse_query(sql: &str) -> Box<paro_parser::ast::Query> {
@@ -1484,11 +1511,14 @@ mod tests {
         )
     }
 
-    fn deserialize_test_schema(bytes: &[u8]) -> SchemaEntry {
+    fn deserialize_test_schema(
+        bytes: &[u8],
+        meta_manager: Option<Arc<TabletMetaManager>>,
+    ) -> SchemaEntry {
         SchemaEntry::deserialize(
             bytes,
             "test_catalog".to_string(),
-            None,
+            meta_manager,
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap()
@@ -1594,9 +1624,13 @@ mod tests {
     fn test_schema_table_descriptor_roundtrip() {
         let schema = test_schema("public", 0);
         let txn = CatalogSnapshot::permanent_writer(u64::MAX);
+        let meta_manager = create_test_meta_manager();
 
         let columns = vec![ColumnDefinition::new("id".to_string(), LogicalType::BigInt)];
-        let storage = Arc::new(create_table(&[LogicalType::BigInt]));
+        let storage = Arc::new(create_table_with_meta_manager(
+            &[LogicalType::BigInt],
+            meta_manager.clone(),
+        ));
         let expected_descriptor = storage.to_descriptor().unwrap();
 
         let table = Arc::new(TableCatalogEntry::new(
@@ -1612,7 +1646,7 @@ mod tests {
             .unwrap();
 
         let bytes = schema.serialize().unwrap();
-        let restored = deserialize_test_schema(&bytes);
+        let restored = deserialize_test_schema(&bytes, Some(meta_manager));
 
         let lookup = EntryLookupInfo::table("descriptor_tbl".to_string());
         let restored_entry = restored.lookup_entry(&txn, &lookup).unwrap();
@@ -1657,7 +1691,7 @@ mod tests {
             .unwrap();
 
         let bytes = schema.serialize().unwrap();
-        let restored = deserialize_test_schema(&bytes);
+        let restored = deserialize_test_schema(&bytes, None);
 
         let view_lookup = EntryLookupInfo::view("active_users".to_string());
         let view_entry = restored
@@ -1708,7 +1742,7 @@ mod tests {
             .object_id();
 
         let bytes = schema.serialize().unwrap();
-        let restored = deserialize_test_schema(&bytes);
+        let restored = deserialize_test_schema(&bytes, None);
 
         assert_eq!(restored.base.object_id, schema.base.object_id);
         assert_eq!(
@@ -1758,7 +1792,7 @@ mod tests {
             .object_id();
 
         let bytes = schema.serialize().unwrap();
-        let restored = deserialize_test_schema(&bytes);
+        let restored = deserialize_test_schema(&bytes, None);
         let restored_index = restored
             .lookup_entry(&txn, &EntryLookupInfo::index("roundtrip_idx".to_string()))
             .expect("index should survive schema roundtrip");
@@ -1794,7 +1828,7 @@ mod tests {
         let txn = CatalogSnapshot::permanent_writer(u64::MAX);
 
         let bytes = schema.serialize().unwrap();
-        let restored = deserialize_test_schema(&bytes);
+        let restored = deserialize_test_schema(&bytes, None);
 
         assert!(restored.is_internal());
 

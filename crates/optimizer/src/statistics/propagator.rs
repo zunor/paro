@@ -67,12 +67,12 @@ impl StatisticsPropagator {
         }
 
         // Check if we have min/max statistics
-        let (left_min, left_max) = match (left.min(), left.max()) {
+        let (left_min, left_max) = match (left.min_value(), left.max_value()) {
             (Some(lo), Some(hi)) => (lo, hi),
             _ => return FilterPropagateResult::NoPruningPossible,
         };
 
-        let (right_min, right_max) = match (right.min(), right.max()) {
+        let (right_min, right_max) = match (right.min_value(), right.max_value()) {
             (Some(lo), Some(hi)) => (lo, hi),
             _ => return FilterPropagateResult::NoPruningPossible,
         };
@@ -375,7 +375,7 @@ impl StatisticsPropagator {
                                     }
 
                                     if let (Some(min), Some(max)) =
-                                        (storage_stats.min(), storage_stats.max())
+                                        (storage_stats.min_value(), storage_stats.max_value())
                                     {
                                         match (&min, &max) {
                                             (Value::Varchar(min_s), Value::Varchar(max_s)) => {
@@ -626,7 +626,7 @@ impl StatisticsPropagator {
                 new_base.set_distinct_count(s.get_distinct_count());
             }
 
-            if let (Some(min), Some(max)) = (s.min(), s.max()) {
+            if let (Some(min), Some(max)) = (s.min_value(), s.max_value()) {
                 NumericStats::set_min(&mut new_base, &min);
                 NumericStats::set_max(&mut new_base, &max);
             }
@@ -679,10 +679,10 @@ impl StatisticsPropagator {
                 return;
             }
 
-            let left_min = left.min();
-            let left_max = left.max();
-            let right_min = right.min();
-            let right_max = right.max();
+            let left_min = left.min_value();
+            let left_max = left.max_value();
+            let right_min = right.min_value();
+            let right_max = right.max_value();
 
             if let (Some(ln), Some(lx), Some(rn), Some(rx)) =
                 (left_min, left_max, right_min, right_max)
@@ -790,12 +790,12 @@ impl StatisticsPropagator {
 
         let before = stats_before.statistics();
         let after = stats_after.statistics();
-        let (min_before, max_before) = match (before.min(), before.max()) {
+        let (min_before, max_before) = match (before.min_value(), before.max_value()) {
             (Some(lo), Some(hi)) => (lo, hi),
             _ => return plan,
         };
 
-        let (min_after, max_after) = match (after.min(), after.max()) {
+        let (min_after, max_after) = match (after.min_value(), after.max_value()) {
             (Some(lo), Some(hi)) => (lo, hi),
             _ => return plan,
         };

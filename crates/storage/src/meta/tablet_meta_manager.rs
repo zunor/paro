@@ -938,7 +938,7 @@ mod tests {
     use crate::rowset::RowsetMetaBuilder;
     use crate::tablet::{KeysType, TabletColumn, TabletSchema, TabletState, Version};
     use crate::wal::recovery::{ReplayHandler, WalRecovery};
-    use crate::wal::wal_writer::{WalInitState, WalWriter};
+    use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::types::LogicalType;
     use std::cell::RefCell;
     use std::thread;
@@ -1037,10 +1037,6 @@ mod tests {
                 .apply_wal_rowset_commits(&self.pending_rowset_commits)?;
             self.pending_rowset_commits.clear();
             *self.flush_count.borrow_mut() += 1;
-            Ok(())
-        }
-
-        fn on_checkpoint(&mut self, _checkpoint_marker: u64) -> Result<()> {
             Ok(())
         }
     }
@@ -1167,8 +1163,8 @@ mod tests {
             .save_tablet_meta(&build_tablet_meta(52, 901))
             .unwrap();
 
-        let wal_path = dir.path().join("recovery_test.wal");
-        let wal = WalWriter::new(&wal_path, WalInitState::Uninitialized);
+        let wal_path = dir.path().join("tablet.wal");
+        let wal = WriteAheadLog::new(&wal_path).unwrap();
 
         wal.write_rowset_commit(52, 1001, 1, 1, "/tmp/tablet-52/rowset-1001")
             .unwrap();

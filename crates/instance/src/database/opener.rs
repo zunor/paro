@@ -1,18 +1,20 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::catalog_checkpoint::CatalogCheckpoint;
 use super::handle::{AttachOptions, DatabaseHandle, RecoveryMode};
 use super::hooks::RecoveryHookResult;
 use super::storage::{DatabaseStorage, InMemoryDatabaseStorage};
+use crate::checkpoint::recovery::{CheckpointBaseState, CheckpointRecovery};
+use crate::checkpoint::RetentionCoordinator;
+use crate::config::CheckpointConfigOptions;
 use crate::metadata::instance_catalog::DatabaseRecord;
 use crate::storage_manager::StorageManager;
 use paro_catalog::catalog::Catalog;
-use paro_catalog::collection::CatalogReplaySummary;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;
-use paro_common::journal::RecoverySummary;
+use paro_common::checkpoint::RecoverySummary;
+use paro_common::effect::DeferredTask;
 use paro_common::logging::targets;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};
@@ -32,7 +34,7 @@ pub struct DatabaseOpenContext {
     pub buffer_pool: Arc<BufferPool>,
     pub buffer_manager: Arc<dyn BufferManager>,
     pub scheduler: Arc<TaskScheduler>,
-    pub checkpoint_wal_size: u64,
+    pub checkpoint: CheckpointConfigOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -84,14 +86,27 @@ impl std::error::Error for DatabaseOpenError {}
 pub struct DatabaseOpenResult {
     pub handle: Arc<DatabaseHandle>,
     pub recovery_report: RecoveryReport,
+    pub(crate) replayed_deferred_tasks: Vec<DeferredTask>,
 }
 
 #[derive(Debug)]
 struct FinalizeLoadInputs {
     wal_path: PathBuf,
-    checkpoint_marker: Option<u64>,
+    checkpoint_base: CheckpointBaseState,
     wal_header_metadata: Option<WalHeaderMetadata>,
     wal_keep_from: u64,
+}
+
+#[derive(Debug)]
+struct FinalizeLoadOutcome {
+    consistency: crate::recovery::consistency_report::RecoveryConsistencyReport,
+    replayed_deferred_tasks: Vec<DeferredTask>,
+}
+
+#[derive(Debug)]
+struct WalReplayOutcome {
+    summary: RecoverySummary,
+    replayed_deferred_tasks: Vec<DeferredTask>,
 }
 
 pub struct DatabaseOpener;
@@ -117,13 +132,20 @@ impl DatabaseOpener {
     }
 
     pub fn finalize_load(db: &DatabaseHandle) -> anyhow::Result<()> {
-        Self::finalize_load_with_report(db, 0).map(|_| ())
+        Self::finalize_load_outcome(db, CheckpointConfigOptions::default()).map(|_| ())
     }
 
     pub fn finalize_load_with_report(
         db: &DatabaseHandle,
-        checkpoint_wal_size: u64,
+        checkpoint: CheckpointConfigOptions,
     ) -> anyhow::Result<crate::recovery::consistency_report::RecoveryConsistencyReport> {
+        Self::finalize_load_outcome(db, checkpoint).map(|outcome| outcome.consistency)
+    }
+
+    fn finalize_load_outcome(
+        db: &DatabaseHandle,
+        checkpoint: CheckpointConfigOptions,
+    ) -> anyhow::Result<FinalizeLoadOutcome> {
         tracing::debug!(
             target: targets::INSTANCE,
             db = %db.name(),
@@ -134,34 +156,36 @@ impl DatabaseOpener {
         let _compaction_guard = db.compaction().suspend(db.name(), "recovery");
         let inputs = Self::collect_finalize_inputs(db)?;
 
-        Self::load_catalog_checkpoint(db);
+        let (recovery_summary, replayed_deferred_tasks, replayed_wal) =
+            if crate::recovery::replay_handler::needs_recovery(&inputs.wal_path) {
+                let replay = Self::replay_wal(db, &inputs)?;
+                (replay.summary, replay.replayed_deferred_tasks, true)
+            } else {
+                tracing::debug!(
+                    target: targets::WAL,
+                    db = %db.name(),
+                    wal_path = %inputs.wal_path.display(),
+                    stage = "wal_probe",
+                    "No WAL recovery needed"
+                );
+                (inputs.checkpoint_base.bootstrap.clone(), Vec::new(), false)
+            };
 
-        let replay_summary = if crate::recovery::replay_handler::needs_recovery(&inputs.wal_path) {
-            Self::replay_wal(db, &inputs)?
-        } else {
-            tracing::debug!(
-                target: targets::WAL,
-                db = %db.name(),
-                wal_path = %inputs.wal_path.display(),
-                stage = "wal_probe",
-                "No WAL recovery needed"
+        db.bootstrap_checkpoint_runtime(recovery_summary.clone());
+        if !replayed_wal {
+            CheckpointRecovery::redeliver_deferred_tasks(
+                db.catalog(),
+                &inputs.checkpoint_base.deferred_tasks,
             );
-            (CatalogReplaySummary::default(), RecoverySummary::default())
-        };
-
-        db.rebuild_route_registry_from_catalog()
-            .map_err(|error| anyhow::anyhow!(error))?;
-        db.sweep_staged_artifacts_after_recovery();
-
+        }
         let report = Self::refresh_recovery_report(db, &inputs.wal_path);
-        Self::reconcile_runtime_state(
-            db,
-            replay_summary.0.max_catalog_commit_id,
-            replay_summary.1,
-            checkpoint_wal_size,
-        )?;
+        Self::sweep_checkpoint_artifacts(db, checkpoint)?;
+        Self::reconcile_runtime_state(db, &recovery_summary, checkpoint)?;
         db.maybe_gc_catalog();
-        Ok(report)
+        Ok(FinalizeLoadOutcome {
+            consistency: report,
+            replayed_deferred_tasks,
+        })
     }
 
     fn open_database(
@@ -226,13 +250,14 @@ impl DatabaseOpener {
             }
         }
 
-        let consistency = Self::finalize_load_with_report(&db, context.checkpoint_wal_size)?;
+        let finalize = Self::finalize_load_outcome(&db, context.checkpoint)?;
         Ok(DatabaseOpenResult {
             handle: db,
             recovery_report: RecoveryReport {
-                consistency,
+                consistency: finalize.consistency,
                 hook_results: Vec::new(),
             },
+            replayed_deferred_tasks: finalize.replayed_deferred_tasks,
         })
     }
 
@@ -314,41 +339,20 @@ impl DatabaseOpener {
 
         Ok(FinalizeLoadInputs {
             wal_path: PathBuf::from(sm.get_wal_path()),
-            checkpoint_marker: CatalogCheckpoint::marker_from_storage(sm.as_ref())?,
+            checkpoint_base: CheckpointRecovery::load_base_from_storage(
+                db.catalog().as_ref(),
+                sm.as_ref(),
+                db.tablet_meta_manager(),
+            )?,
             wal_header_metadata: sm.wal_header_metadata(),
             wal_keep_from: sm.wal_keep_from(),
         })
     }
 
-    fn load_catalog_checkpoint(db: &DatabaseHandle) {
-        let metadata_store = {
-            let storage = db.storage_lock().read();
-            storage.as_ref().and_then(|sm| sm.get_metadata_store_arc())
-        };
-
-        let Some(store) = metadata_store else {
-            return;
-        };
-
-        if let Err(err) = CatalogCheckpoint::load_from_store(
-            db.catalog().as_ref(),
-            store.as_ref(),
-            db.tablet_meta_manager(),
-        ) {
-            tracing::error!(
-                target: targets::CHECKPOINT,
-                db = %db.name(),
-                err = %err,
-                stage = "checkpoint_overlay",
-                "Failed to load catalog checkpoint during finalize_load; proceeding to WAL-only recovery"
-            );
-        }
-    }
-
     fn replay_wal(
         db: &DatabaseHandle,
         inputs: &FinalizeLoadInputs,
-    ) -> anyhow::Result<(CatalogReplaySummary, RecoverySummary)> {
+    ) -> anyhow::Result<WalReplayOutcome> {
         tracing::info!(
             target: targets::WAL,
             db = %db.name(),
@@ -357,22 +361,22 @@ impl DatabaseOpener {
             "WAL recovery needed, replaying entries"
         );
 
-        let (recovered_wal, result, summary, recovery_summary, deferred_tasks) =
-            crate::recovery::replay_handler::recover_database_with_checkpoint_observed(
-                &inputs.wal_path,
-                db.catalog(),
-                db.tablet_meta_manager(),
-                inputs.checkpoint_marker,
-                inputs.wal_header_metadata,
-                (inputs.wal_keep_from != u64::MAX).then_some(inputs.wal_keep_from),
-                Some(db.wal_observability().replay_counters()),
-            )?;
+        let replay = crate::recovery::replay_handler::recover_database_with_checkpoint_bootstrap(
+            &inputs.wal_path,
+            db.catalog(),
+            db.tablet_meta_manager(),
+            inputs.checkpoint_base.journal_tail.clone(),
+            inputs.wal_header_metadata,
+            (inputs.wal_keep_from != u64::MAX).then_some(inputs.wal_keep_from),
+            inputs.checkpoint_base.bootstrap.clone(),
+        )?;
 
         tracing::info!(
             target: targets::WAL,
             db = %db.name(),
-            entries_replayed = result.entries_replayed,
-            all_succeeded = result.all_succeeded,
+            entries_replayed = replay.replay_result.entries_replayed,
+            all_succeeded = replay.replay_result.all_succeeded,
+            replayed_deferred_tasks = replay.replayed_deferred_tasks.len(),
             stage = "wal_replay",
             "WAL recovery complete"
         );
@@ -381,12 +385,12 @@ impl DatabaseOpener {
         let sm = storage
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("StorageManager disappeared during finalize_load"))?;
-        sm.replace_wal(Arc::new(recovered_wal))
+        sm.replace_wal(Arc::new(replay.wal))
             .map_err(|e| anyhow::anyhow!(e))?;
-        drop(storage);
-        db.set_replayed_deferred_tasks(deferred_tasks);
-        db.refresh_journal_appender_with_summary(recovery_summary);
-        Ok((summary, recovery_summary))
+        Ok(WalReplayOutcome {
+            summary: replay.summary,
+            replayed_deferred_tasks: replay.replayed_deferred_tasks,
+        })
     }
 
     fn refresh_recovery_report(
@@ -412,15 +416,13 @@ impl DatabaseOpener {
 
     fn reconcile_runtime_state(
         db: &DatabaseHandle,
-        recovery_catalog_commit_floor: u64,
-        recovery_summary: RecoverySummary,
-        checkpoint_wal_size: u64,
+        recovery_summary: &RecoverySummary,
+        checkpoint: CheckpointConfigOptions,
     ) -> anyhow::Result<()> {
-        Self::sync_transaction_clock(db, recovery_catalog_commit_floor, recovery_summary);
-        if checkpoint_wal_size != 0 {
-            db.set_checkpoint_wal_size(checkpoint_wal_size);
-        }
-        db.sync_compaction_tablets()?;
+        Self::sync_transaction_clock(db, recovery_summary.max_commit_id);
+        db.configure_checkpoint_runtime(checkpoint);
+        db.compaction()
+            .sync_tablets(db.catalog().as_ref(), db.name(), db.db_type())?;
         Self::mark_ready(db);
         Ok(())
     }
@@ -434,11 +436,34 @@ impl DatabaseOpener {
         );
     }
 
-    fn sync_transaction_clock(
+    fn sweep_checkpoint_artifacts(
         db: &DatabaseHandle,
-        recovery_catalog_commit_floor: u64,
-        recovery_summary: RecoverySummary,
-    ) {
+        checkpoint: CheckpointConfigOptions,
+    ) -> anyhow::Result<()> {
+        let storage = db.storage_lock().read();
+        let Some(sm) = storage.as_ref() else {
+            return Ok(());
+        };
+        let report = RetentionCoordinator::sweep_startup_orphans(
+            db.catalog().as_ref(),
+            sm.as_ref(),
+            db.tablet_meta_manager(),
+            checkpoint,
+        )?;
+        if report != crate::checkpoint::artifact_gc::ArtifactGcReport::default() {
+            tracing::info!(
+                target: targets::CHECKPOINT,
+                db = %db.name(),
+                removed_graph_dirs = report.removed_graph_dirs,
+                removed_staging_entries = report.removed_staging_entries,
+                removed_compaction_dirs = report.removed_compaction_dirs,
+                "Removed orphan checkpoint-related artifacts during startup"
+            );
+        }
+        Ok(())
+    }
+
+    fn sync_transaction_clock(db: &DatabaseHandle, recovery_commit_floor: u64) {
         let txn = CatalogSnapshot::default();
         let mut max_committed_version = 0u64;
 
@@ -469,23 +494,14 @@ impl DatabaseOpener {
             }
         }
 
-        let runtime_commit_floor = max_committed_version
-            .max(recovery_catalog_commit_floor)
-            .max(recovery_summary.max_commit_id);
+        let runtime_commit_floor = max_committed_version.max(recovery_commit_floor);
         db.transaction_manager()
             .sync_commit_id_with(runtime_commit_floor);
-        if let Some(coordinator) = db.journal_coordinator() {
-            coordinator.sync_commit_id_with(runtime_commit_floor);
-            coordinator.sync_maintenance_id_with(recovery_summary.max_maintenance_id);
-        }
         tracing::debug!(
             target: targets::INSTANCE,
             db = %db.name(),
             max_committed_version,
-            recovery_catalog_commit_floor,
-            recovery_max_commit_id = recovery_summary.max_commit_id,
-            recovery_max_maintenance_id = recovery_summary.max_maintenance_id,
-            recovery_max_lsn = recovery_summary.max_lsn,
+            recovery_commit_floor,
             runtime_commit_floor,
             stage = "reconcile",
             "Synchronized transaction clock with recovered storage version"

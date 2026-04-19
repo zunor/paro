@@ -128,6 +128,7 @@ impl InstanceBuilder {
             .take_recovery_hooks()
             .unwrap_or_else(default_recovery_hooks);
         let boot_id = generate_boot_id();
+        let scheduler = Arc::clone(runtime.scheduler());
 
         Arc::new(Instance {
             boot_config: Arc::clone(&boot_config),
@@ -140,6 +141,7 @@ impl InstanceBuilder {
             ),
             database_service: ManagedDatabaseService::new_with_boot_config(
                 boot_config.as_ref(),
+                scheduler,
                 recovery_hooks,
             ),
         })

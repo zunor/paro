@@ -265,7 +265,16 @@ data_dir = "/var/lib/paro/data"
 
 [storage.wal]
 enabled = true
-checkpoint_threshold = "10MB"
+
+[storage.checkpoint]
+trigger_bytes = "16MiB"
+trigger_interval = "5m"
+drain_timeout = "30s"
+max_concurrent_writers = 4
+artifact_gc_batch_size = 64
+artifact_gc_delete_budget = 256
+checkpoint_gc_delete_budget = 8
+segment_prune_delete_budget = 32
 
 [storage.buffer_pool]
 size = "512MB"
@@ -535,9 +544,10 @@ cache_size = "64KB"     # 65536
 ### 时间
 
 ```toml
-timeout = "30s"         # 30 seconds
-checkpoint_interval = "5m"  # 5 minutes
-max_age = "24h"         # 24 hours
+timeout = "30s"              # 30 seconds
+checkpoint_trigger_interval = "5m"  # 5 minutes
+checkpoint_drain_timeout = "30s"    # 30 seconds
+max_age = "24h"              # 24 hours
 ```
 
 ### 实现

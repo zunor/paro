@@ -8,6 +8,7 @@ mod apply_queue;
 mod codec;
 mod coordinator;
 mod publish_frontier;
+pub mod segments;
 mod waiter;
 
 pub use appender::{AppendResult, JournalAppender, JournalAppenderMetricsSnapshot, JournalSink};

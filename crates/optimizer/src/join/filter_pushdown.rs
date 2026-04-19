@@ -199,10 +199,10 @@ impl JoinFilterPushdown {
             };
             let base_stats = col_stats.stats.statistics();
 
-            if let Some(candidate_min) = base_stats.min() {
+            if let Some(candidate_min) = base_stats.min_value() {
                 Self::update_min(&mut min_value, candidate_min);
             }
-            if let Some(candidate_max) = base_stats.max() {
+            if let Some(candidate_max) = base_stats.max_value() {
                 Self::update_max(&mut max_value, candidate_max);
             }
         }

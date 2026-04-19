@@ -54,8 +54,10 @@ pub struct StorageMetricsSnapshot {
     pub wal_replay_entries: u64,
     pub wal_replay_bytes: u64,
     pub wal_truncate_bytes: u64,
-    pub wal_checkpoint_merges: u64,
     pub wal_recovery_mode: u64,
+    pub checkpoint_capture_optimistic_total: u64,
+    pub checkpoint_capture_meta_lock_total: u64,
+    pub checkpoint_capture_retry_total: u64,
     pub graph_expand_rows: u64,
     pub graph_frontier_size: usize,
     pub graph_frontier_size_peak: usize,
@@ -123,8 +125,10 @@ pub struct StorageMetrics {
     wal_replay_entries: AtomicU64,
     wal_replay_bytes: AtomicU64,
     wal_truncate_bytes: AtomicU64,
-    wal_checkpoint_merges: AtomicU64,
     wal_recovery_mode: AtomicU64,
+    checkpoint_capture_optimistic_total: AtomicU64,
+    checkpoint_capture_meta_lock_total: AtomicU64,
+    checkpoint_capture_retry_total: AtomicU64,
     graph_expand_rows: AtomicU64,
     graph_frontier_size: AtomicUsize,
     graph_frontier_size_peak: AtomicUsize,
@@ -327,16 +331,27 @@ impl StorageMetrics {
         }
     }
 
-    /// Record one main+checkpoint WAL merge.
-    pub fn inc_wal_checkpoint_merge(&self) {
-        self.wal_checkpoint_merges.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Set the last observed WAL recovery mode as an integer gauge.
     ///
     /// Mode values are defined by `wal::recovery::WalRecoveryMode::as_metric_value()`.
     pub fn set_wal_recovery_mode(&self, mode: u64) {
         self.wal_recovery_mode.store(mode, Ordering::Relaxed);
+    }
+
+    /// Record one checkpoint tablet freeze capture and any optimistic retries
+    /// that were invalidated before the final snapshot mode succeeded.
+    pub fn record_checkpoint_capture(&self, used_meta_lock: bool, retries: usize) {
+        if used_meta_lock {
+            self.checkpoint_capture_meta_lock_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.checkpoint_capture_optimistic_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if retries > 0 {
+            self.checkpoint_capture_retry_total
+                .fetch_add(retries as u64, Ordering::Relaxed);
+        }
     }
 
     /// Record graph rows emitted by expand / shortest-path operators.
@@ -414,8 +429,16 @@ impl StorageMetrics {
             wal_replay_entries: self.wal_replay_entries.load(Ordering::Relaxed),
             wal_replay_bytes: self.wal_replay_bytes.load(Ordering::Relaxed),
             wal_truncate_bytes: self.wal_truncate_bytes.load(Ordering::Relaxed),
-            wal_checkpoint_merges: self.wal_checkpoint_merges.load(Ordering::Relaxed),
             wal_recovery_mode: self.wal_recovery_mode.load(Ordering::Relaxed),
+            checkpoint_capture_optimistic_total: self
+                .checkpoint_capture_optimistic_total
+                .load(Ordering::Relaxed),
+            checkpoint_capture_meta_lock_total: self
+                .checkpoint_capture_meta_lock_total
+                .load(Ordering::Relaxed),
+            checkpoint_capture_retry_total: self
+                .checkpoint_capture_retry_total
+                .load(Ordering::Relaxed),
             graph_expand_rows: self.graph_expand_rows.load(Ordering::Relaxed),
             graph_frontier_size: self.graph_frontier_size.load(Ordering::Relaxed),
             graph_frontier_size_peak: self.graph_frontier_size_peak.load(Ordering::Relaxed),
@@ -468,8 +491,13 @@ impl StorageMetrics {
         self.wal_replay_entries.store(0, Ordering::Relaxed);
         self.wal_replay_bytes.store(0, Ordering::Relaxed);
         self.wal_truncate_bytes.store(0, Ordering::Relaxed);
-        self.wal_checkpoint_merges.store(0, Ordering::Relaxed);
         self.wal_recovery_mode.store(0, Ordering::Relaxed);
+        self.checkpoint_capture_optimistic_total
+            .store(0, Ordering::Relaxed);
+        self.checkpoint_capture_meta_lock_total
+            .store(0, Ordering::Relaxed);
+        self.checkpoint_capture_retry_total
+            .store(0, Ordering::Relaxed);
         self.graph_expand_rows.store(0, Ordering::Relaxed);
         self.graph_frontier_size.store(0, Ordering::Relaxed);
         self.graph_frontier_size_peak.store(0, Ordering::Relaxed);
@@ -522,8 +550,9 @@ mod tests {
         m.record_parallel_decompress(4, 16);
         m.add_wal_replay(3, 512);
         m.add_wal_truncate_bytes(128);
-        m.inc_wal_checkpoint_merge();
         m.set_wal_recovery_mode(2);
+        m.record_checkpoint_capture(false, 2);
+        m.record_checkpoint_capture(true, 1);
         m.add_graph_expand_rows(7);
         m.set_graph_frontier_size(5);
         m.set_graph_frontier_size(3);
@@ -558,8 +587,10 @@ mod tests {
         assert_eq!(snap.wal_replay_entries, 3);
         assert_eq!(snap.wal_replay_bytes, 512);
         assert_eq!(snap.wal_truncate_bytes, 128);
-        assert_eq!(snap.wal_checkpoint_merges, 1);
         assert_eq!(snap.wal_recovery_mode, 2);
+        assert_eq!(snap.checkpoint_capture_optimistic_total, 1);
+        assert_eq!(snap.checkpoint_capture_meta_lock_total, 1);
+        assert_eq!(snap.checkpoint_capture_retry_total, 3);
         assert_eq!(snap.graph_expand_rows, 7);
         assert_eq!(snap.graph_frontier_size, 3);
         assert_eq!(snap.graph_frontier_size_peak, 5);

@@ -7,12 +7,11 @@ use crate::metadata::instance_catalog::{DatabaseRecord, DatabaseRecordState, Ins
 use crate::metadata::InstanceMetadata;
 use crate::{Instance, InstanceDdlOwner};
 use paro_common::logging::targets;
+use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::index::graph::GraphProjectionIndexManager;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub mod catalog_checkpoint;
-pub mod checkpointer;
 pub mod closer;
 pub mod compaction_driver;
 pub mod handle;
@@ -36,6 +35,7 @@ use crate::database::opener::{
 };
 use crate::database::registry::{AttachInfo, DatabaseRegistry, OnEntryNotFound};
 use crate::recovery::consistency_report::RecoveryConsistencyReport;
+use paro_common::effect::DeferredTask;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstanceWalLifecycleMetrics {
@@ -48,26 +48,11 @@ pub struct InstanceWalLifecycleMetrics {
     pub recovery_mode_unknown: usize,
     pub recovery_mode_no_wal: usize,
     pub recovery_mode_main_wal_only: usize,
-    pub recovery_mode_checkpoint_wal_only: usize,
-    pub recovery_mode_main_and_checkpoint_wal: usize,
     pub main_wal_needs_truncation_dbs: usize,
-    pub checkpoint_wal_needs_truncation_dbs: usize,
-    pub recovery_wal_needs_truncation_dbs: usize,
     pub storage_wal_replay_entries: u64,
     pub storage_wal_replay_bytes: u64,
     pub storage_wal_truncate_bytes: u64,
-    pub storage_wal_checkpoint_merges: u64,
     pub storage_wal_recovery_mode_metric: u64,
-    pub journal_apply_queue_depth: u64,
-    pub journal_apply_queue_depth_peak_max: u64,
-    pub journal_apply_applied_lag_max: u64,
-    pub journal_apply_published_lag_max: u64,
-    pub journal_apply_durable_wait_count: u64,
-    pub journal_apply_durable_wait_micros: u64,
-    pub journal_apply_applied_wait_count: u64,
-    pub journal_apply_applied_wait_micros: u64,
-    pub journal_apply_published_wait_count: u64,
-    pub journal_apply_published_wait_micros: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -77,10 +62,7 @@ pub(crate) struct RecoveryHookExecutionError {
 }
 
 pub fn default_recovery_hooks() -> Vec<Arc<dyn RecoveryHook>> {
-    vec![
-        Arc::new(DeferredTaskRecoveryHook),
-        Arc::new(GraphProjectionRecoveryHook),
-    ]
+    vec![Arc::new(GraphProjectionRecoveryHook)]
 }
 
 /// Narrow context for managed database DDL orchestration.
@@ -114,6 +96,7 @@ impl DatabaseDdlContext<'_> {
 pub struct ManagedDatabaseService {
     registry: Arc<DatabaseRegistry>,
     graph_manager: Arc<GraphProjectionIndexManager>,
+    scheduler: Arc<TaskScheduler>,
     recovery_hooks: Vec<Arc<dyn RecoveryHook>>,
 }
 
@@ -121,17 +104,20 @@ impl ManagedDatabaseService {
     pub(crate) fn new(
         registry: Arc<DatabaseRegistry>,
         graph_manager: Arc<GraphProjectionIndexManager>,
+        scheduler: Arc<TaskScheduler>,
         recovery_hooks: Vec<Arc<dyn RecoveryHook>>,
     ) -> Self {
         Self {
             registry,
             graph_manager,
+            scheduler,
             recovery_hooks,
         }
     }
 
     pub(crate) fn new_with_boot_config(
         boot_config: &BootConfig,
+        scheduler: Arc<TaskScheduler>,
         recovery_hooks: Vec<Arc<dyn RecoveryHook>>,
     ) -> Self {
         let registry = match &boot_config.path_manager {
@@ -143,6 +129,7 @@ impl ManagedDatabaseService {
         Self::new(
             registry,
             Arc::new(GraphProjectionIndexManager::new()),
+            scheduler,
             recovery_hooks,
         )
     }
@@ -346,6 +333,7 @@ impl ManagedDatabaseService {
                 &result.handle,
                 &result.recovery_report.consistency,
                 startup_policy,
+                &result.replayed_deferred_tasks,
             ) {
                 Ok(hook_results) => hook_results,
                 Err(hook_error) => {
@@ -515,50 +503,17 @@ impl ManagedDatabaseService {
                 ::paro_storage::wal::recovery::WalRecoveryMode::MainWalOnly => {
                     metrics.recovery_mode_main_wal_only += 1
                 }
-                ::paro_storage::wal::recovery::WalRecoveryMode::CheckpointWalOnly => {
-                    metrics.recovery_mode_checkpoint_wal_only += 1
-                }
-                ::paro_storage::wal::recovery::WalRecoveryMode::MainAndCheckpointWal => {
-                    metrics.recovery_mode_main_and_checkpoint_wal += 1
-                }
             }
 
             if db_metrics.main_wal_needs_truncation {
                 metrics.main_wal_needs_truncation_dbs += 1;
             }
-            if db_metrics.checkpoint_wal_needs_truncation {
-                metrics.checkpoint_wal_needs_truncation_dbs += 1;
-            }
-            if db_metrics.recovery_wal_needs_truncation {
-                metrics.recovery_wal_needs_truncation_dbs += 1;
-            }
-            metrics.journal_apply_queue_depth += db_metrics.journal_apply_queue_depth;
-            metrics.journal_apply_queue_depth_peak_max = metrics
-                .journal_apply_queue_depth_peak_max
-                .max(db_metrics.journal_apply_queue_depth_peak);
-            metrics.journal_apply_applied_lag_max = metrics
-                .journal_apply_applied_lag_max
-                .max(db_metrics.journal_apply_applied_lag);
-            metrics.journal_apply_published_lag_max = metrics
-                .journal_apply_published_lag_max
-                .max(db_metrics.journal_apply_published_lag);
-            metrics.journal_apply_durable_wait_count += db_metrics.journal_apply_durable_wait_count;
-            metrics.journal_apply_durable_wait_micros +=
-                db_metrics.journal_apply_durable_wait_micros;
-            metrics.journal_apply_applied_wait_count += db_metrics.journal_apply_applied_wait_count;
-            metrics.journal_apply_applied_wait_micros +=
-                db_metrics.journal_apply_applied_wait_micros;
-            metrics.journal_apply_published_wait_count +=
-                db_metrics.journal_apply_published_wait_count;
-            metrics.journal_apply_published_wait_micros +=
-                db_metrics.journal_apply_published_wait_micros;
         }
 
         let storage_metrics = ::paro_storage::metrics::storage_metrics().snapshot();
         metrics.storage_wal_replay_entries = storage_metrics.wal_replay_entries;
         metrics.storage_wal_replay_bytes = storage_metrics.wal_replay_bytes;
         metrics.storage_wal_truncate_bytes = storage_metrics.wal_truncate_bytes;
-        metrics.storage_wal_checkpoint_merges = storage_metrics.wal_checkpoint_merges;
         metrics.storage_wal_recovery_mode_metric = storage_metrics.wal_recovery_mode;
 
         metrics
@@ -569,6 +524,7 @@ impl ManagedDatabaseService {
         db: &Arc<DatabaseHandle>,
         consistency: &RecoveryConsistencyReport,
         startup_policy: StartupPolicy,
+        replayed_deferred_tasks: &[DeferredTask],
     ) -> Result<Vec<RecoveryHookResult>, RecoveryHookExecutionError> {
         let mut hook_results = Vec::with_capacity(self.recovery_hooks.len());
         let context = RecoveryHookContext {
@@ -576,10 +532,8 @@ impl ManagedDatabaseService {
             recovery_report: consistency.clone(),
             startup_policy,
             graph_registry: self.graph_manager.clone(),
-            scheduler: db
-                .task_scheduler()
-                .unwrap_or_else(|| Arc::new(paro_scheduler::scheduler::TaskScheduler::new())),
-            replayed_deferred_tasks: db.replayed_deferred_tasks(),
+            scheduler: Arc::clone(&self.scheduler),
+            replayed_deferred_tasks: replayed_deferred_tasks.to_vec(),
         };
 
         for hook in &self.recovery_hooks {
@@ -589,6 +543,33 @@ impl ManagedDatabaseService {
                     let hook_error = format!(
                         "recovery hook {} failed for database {}: {}",
                         hook.name(),
+                        db.name(),
+                        err
+                    );
+                    hook_results.push(RecoveryHookResult::Failed {
+                        error: hook_error.clone(),
+                        issues: Vec::new(),
+                    });
+                    return Err(RecoveryHookExecutionError {
+                        detail: hook_error,
+                        hook_results,
+                    });
+                }
+            }
+        }
+
+        let deferred_task_hook = DeferredTaskRecoveryHook;
+        let deferred_task_hook_configured = self
+            .recovery_hooks
+            .iter()
+            .any(|hook| hook.name() == deferred_task_hook.name());
+        if !context.replayed_deferred_tasks.is_empty() && !deferred_task_hook_configured {
+            match deferred_task_hook.run(db, &context) {
+                Ok(result) => hook_results.push(result),
+                Err(err) => {
+                    let hook_error = format!(
+                        "recovery hook {} failed for database {}: {}",
+                        deferred_task_hook.name(),
                         db.name(),
                         err
                     );
@@ -659,7 +640,7 @@ impl Instance {
             metadata: &self.metadata,
             open_ctx: self
                 .runtime
-                .database_open_context(self.boot_config.checkpoint_wal_size),
+                .database_open_context(self.boot_config.checkpoint),
         }
     }
 

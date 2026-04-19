@@ -236,8 +236,8 @@ fn can_use_perfect_hash_aggregate(
 }
 
 fn integer_min_max_from_stats(stats: &BaseStatistics) -> Option<(i128, i128)> {
-    let min = stats.min().and_then(|value| value_to_i128(&value))?;
-    let max = stats.max().and_then(|value| value_to_i128(&value))?;
+    let min = stats.min_value().and_then(|value| value_to_i128(&value))?;
+    let max = stats.max_value().and_then(|value| value_to_i128(&value))?;
     Some((min, max))
 }
 

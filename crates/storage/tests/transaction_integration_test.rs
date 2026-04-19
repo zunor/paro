@@ -4,6 +4,7 @@
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::metrics::storage_metrics;
 use paro_storage::primary_key::DeleteVector;
 use paro_storage::table::table_factory::TableFactory;
@@ -20,6 +21,15 @@ use tempfile::TempDir;
 
 fn create_table(types: &[LogicalType]) -> TableHandle {
     TableFactory::default().create_table(types).unwrap()
+}
+
+fn create_test_meta_manager(temp_dir: &TempDir) -> Arc<TabletMetaManager> {
+    let store: Arc<dyn MetadataStore> =
+        Arc::new(FileMetadataStore::new(temp_dir.path().join("meta")).unwrap());
+    Arc::new(TabletMetaManager::with_store_and_data_root(
+        store,
+        temp_dir.path(),
+    ))
 }
 
 fn read_rows(table: &TableHandle, visible_version: u64) -> usize {
@@ -47,6 +57,21 @@ fn create_pk_tablet() -> (TabletRef, TempDir) {
     let tablet = Tablet::new(1, 10, 100, schema, temp_dir.path(), None).unwrap();
     tablet.init().unwrap();
     (Arc::new(tablet), temp_dir)
+}
+
+fn create_managed_pk_tablet() -> (TabletRef, TempDir, Arc<TabletMetaManager>) {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = create_test_meta_manager(&temp_dir);
+    let schema = {
+        let cols = vec![
+            TabletColumn::key(0, "id", LogicalType::Integer),
+            TabletColumn::new(1, "v", LogicalType::Integer),
+        ];
+        Arc::new(TabletSchema::new(1, cols, KeysType::PrimaryKeys).unwrap())
+    };
+    let tablet = Tablet::new(1, 10, 100, schema, temp_dir.path(), Some(manager.clone())).unwrap();
+    tablet.init().unwrap();
+    (Arc::new(tablet), temp_dir, manager)
 }
 
 fn chunk_with_pairs(ids: &[i32], vals: &[i32]) -> Chunk {
@@ -227,7 +252,7 @@ fn test_delete_vector() {
 
 #[test]
 fn test_wal_recovery_rowset() {
-    let (tablet, tmp) = create_pk_tablet();
+    let (tablet, tmp, manager) = create_managed_pk_tablet();
 
     let mut writer = DeltaWriter::open(tablet.clone(), 1).unwrap();
     writer
@@ -252,7 +277,7 @@ fn test_wal_recovery_rowset() {
     tablet.save_meta().unwrap();
     drop(tablet);
 
-    let reloaded = Arc::new(Tablet::open(1, tmp.path(), None).unwrap());
+    let reloaded = Arc::new(Tablet::open(1, tmp.path(), manager).unwrap());
     assert_eq!(reloaded.num_rowsets(), 1);
 
     let mut reader = TabletReader::new(
@@ -270,7 +295,7 @@ fn test_wal_recovery_rowset() {
 
 #[test]
 fn test_wal_recovery_replays_delete_then_reinsert_for_primary_key() {
-    let (tablet, tmp) = create_pk_tablet();
+    let (tablet, tmp, manager) = create_managed_pk_tablet();
 
     let mut writer = DeltaWriter::open(tablet.clone(), 31).unwrap();
     writer
@@ -293,7 +318,7 @@ fn test_wal_recovery_replays_delete_then_reinsert_for_primary_key() {
     tablet.save_meta().unwrap();
     drop(tablet);
 
-    let reloaded = Arc::new(Tablet::open(1, tmp.path(), None).unwrap());
+    let reloaded = Arc::new(Tablet::open(1, tmp.path(), manager).unwrap());
     let rows = read_row_map_from_tablet(&reloaded, reloaded.max_version());
     let expected: BTreeMap<i32, i32> = vec![(1, 111), (2, 20)].into_iter().collect();
     assert_eq!(rows, expected);

@@ -1256,11 +1256,36 @@ impl InCatalogEntry for TableCatalogEntry {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use paro_storage::table::table_factory::TableFactory;
     use std::io::{Cursor, Read};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, LazyLock};
 
     fn create_table(types: &[LogicalType]) -> TableHandle {
         TableFactory::default().create_table(types).unwrap()
+    }
+
+    fn create_test_meta_manager() -> Arc<TabletMetaManager> {
+        static NEXT_TEST_META_ROOT: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+        let root = std::env::temp_dir().join(format!(
+            "paro_catalog_table_entry_meta_{}_{}",
+            std::process::id(),
+            NEXT_TEST_META_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store: Arc<dyn MetadataStore> =
+            Arc::new(FileMetadataStore::new(root.join("meta")).unwrap());
+        Arc::new(TabletMetaManager::with_store_and_data_root(store, &root))
+    }
+
+    fn create_table_with_meta_manager(
+        types: &[LogicalType],
+        meta_manager: Arc<TabletMetaManager>,
+    ) -> TableHandle {
+        TableFactory::new(Some(meta_manager))
+            .create_table(types)
+            .unwrap()
     }
 
     fn descriptor_offset(entry_bytes: &[u8]) -> usize {
@@ -1355,11 +1380,15 @@ mod tests {
 
     #[test]
     fn test_serialization() {
+        let meta_manager = create_test_meta_manager();
         let columns = vec![
             ColumnDefinition::new("id".to_string(), LogicalType::Integer),
             ColumnDefinition::new("name".to_string(), LogicalType::Varchar),
         ];
-        let storage = Arc::new(create_table(&[LogicalType::Integer, LogicalType::Varchar]));
+        let storage = Arc::new(create_table_with_meta_manager(
+            &[LogicalType::Integer, LogicalType::Varchar],
+            meta_manager.clone(),
+        ));
         let expected_descriptor = storage.to_descriptor().unwrap();
 
         let entry = TableCatalogEntry::new(
@@ -1372,7 +1401,8 @@ mod tests {
         );
 
         let bytes = entry.serialize().unwrap();
-        let restored = TableCatalogEntry::deserialize(&bytes, "main".to_string(), None).unwrap();
+        let restored =
+            TableCatalogEntry::deserialize(&bytes, "main".to_string(), Some(meta_manager)).unwrap();
 
         assert_eq!(restored.name(), "items");
         assert_eq!(restored.columns.len(), 2);
@@ -1389,11 +1419,15 @@ mod tests {
 
     #[test]
     fn test_serialization_preserves_comment() {
+        let meta_manager = create_test_meta_manager();
         let columns = vec![ColumnDefinition::new(
             "id".to_string(),
             LogicalType::Integer,
         )];
-        let storage = Arc::new(create_table(&[LogicalType::Integer]));
+        let storage = Arc::new(create_table_with_meta_manager(
+            &[LogicalType::Integer],
+            meta_manager.clone(),
+        ));
 
         let entry = TableCatalogEntry::new(
             "main".to_string(),
@@ -1409,7 +1443,8 @@ mod tests {
             .set_comment(Some("persisted comment".to_string()));
 
         let bytes = entry.serialize().unwrap();
-        let restored = TableCatalogEntry::deserialize(&bytes, "main".to_string(), None).unwrap();
+        let restored =
+            TableCatalogEntry::deserialize(&bytes, "main".to_string(), Some(meta_manager)).unwrap();
 
         assert_eq!(
             restored.base.base.comment(),
@@ -1419,11 +1454,15 @@ mod tests {
 
     #[test]
     fn test_deserialize_rejects_legacy_storage_payload() {
+        let meta_manager = create_test_meta_manager();
         let columns = vec![ColumnDefinition::new(
             "id".to_string(),
             LogicalType::Integer,
         )];
-        let storage = Arc::new(create_table(&[LogicalType::Integer]));
+        let storage = Arc::new(create_table_with_meta_manager(
+            &[LogicalType::Integer],
+            meta_manager.clone(),
+        ));
 
         let entry = TableCatalogEntry::new(
             "main".to_string(),
@@ -1439,9 +1478,10 @@ mod tests {
         let descriptor_offset = descriptor_offset(&bytes);
         corrupted[descriptor_offset] = b'X';
 
-        let err = TableCatalogEntry::deserialize(&corrupted, "main".to_string(), None)
-            .unwrap_err()
-            .to_string();
+        let err =
+            TableCatalogEntry::deserialize(&corrupted, "main".to_string(), Some(meta_manager))
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("invalid table storage descriptor magic"));
     }
 

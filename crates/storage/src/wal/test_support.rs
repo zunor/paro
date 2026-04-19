@@ -31,6 +31,27 @@ pub fn write_flushed_create_schema_txn(
     )
 }
 
+/// Same as [`write_flushed_create_schema_txn`] but lets tests pick the journal
+/// logical LSN independently from the durable commit id.
+pub fn write_flushed_create_schema_txn_with_lsn(
+    writer: &WalWriter,
+    catalog_name: &str,
+    schema_name: &str,
+    txn_id: u64,
+    commit_id: u64,
+    lsn: u64,
+) -> Result<()> {
+    write_flushed_create_schema_txn_with_lsn_and_object_id(
+        writer,
+        catalog_name,
+        schema_name,
+        0,
+        txn_id,
+        commit_id,
+        lsn,
+    )
+}
+
 /// Same as [`write_flushed_create_schema_txn`] but allows the caller to control
 /// the catalog object identity stored in WAL.
 pub fn write_flushed_create_schema_txn_with_object_id(
@@ -40,6 +61,28 @@ pub fn write_flushed_create_schema_txn_with_object_id(
     object_id: u64,
     txn_id: u64,
     commit_id: u64,
+) -> Result<()> {
+    write_flushed_create_schema_txn_with_lsn_and_object_id(
+        writer,
+        catalog_name,
+        schema_name,
+        object_id,
+        txn_id,
+        commit_id,
+        txn_id,
+    )
+}
+
+/// Same as [`write_flushed_create_schema_txn_with_object_id`] but lets tests
+/// choose the journal logical LSN explicitly.
+pub fn write_flushed_create_schema_txn_with_lsn_and_object_id(
+    writer: &WalWriter,
+    catalog_name: &str,
+    schema_name: &str,
+    object_id: u64,
+    txn_id: u64,
+    commit_id: u64,
+    lsn: u64,
 ) -> Result<()> {
     let record = CommitRecord {
         txn_id,
@@ -63,8 +106,10 @@ pub fn write_flushed_create_schema_txn_with_object_id(
         apply_descriptors: vec![],
         deferred_tasks: vec![],
     };
+    // Most tests use txn_id as the journal-frame logical LSN. The durable
+    // commit visibility still comes from CommitRecord::commit_id.
     let entry = WalEntry::JournalRecord {
-        lsn: commit_id,
+        lsn,
         record: JournalRecord::Commit(record),
     };
     writer.write_entry(entry.wal_type(), &entry.serialize_data())?;

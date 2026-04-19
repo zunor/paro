@@ -4,8 +4,8 @@
 //! # WAL Entry Types
 //!
 //! On-disk type bytes for the supported WAL protocol. Historical per-DDL catalog opcodes
-//! (bytes 1-24), row-oriented tuple payloads (26-29), and the legacy multi-entry
-//! transaction envelope (43-48) are rejected at parse time.
+//! (bytes 1-24) and row-oriented tuple payloads (26-29) are rejected at parse time;
+//! catalog changes use the unified `Txn*` journal records only.
 
 /// WAL entry type enumeration (type byte on disk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -13,9 +13,6 @@
 pub enum WalType {
     /// Invalid/uninitialized entry
     Invalid = 0,
-
-    /// Set current table context (tablet / database WAL paths that still use USE_TABLE)
-    UseTable = 25,
 
     /// Rowset commit for versioned rowset lifecycle
     RowsetCommit = 30,
@@ -32,10 +29,21 @@ pub enum WalType {
     /// Binary-framed journal record
     JournalRecord = 49,
 
+    /// Unified transaction begin marker
+    TxnBegin = 43,
+    /// Unified transaction catalog op
+    TxnCatalogOp = 44,
+    /// Unified transaction data op
+    TxnDataOp = 45,
+    /// Unified transaction post-commit hook
+    TxnPostCommitHook = 46,
+    /// Unified transaction commit marker
+    TxnCommit = 47,
+    /// Unified transaction abort marker
+    TxnAbort = 48,
+
     /// WAL version header
     WalVersion = 98,
-    /// Checkpoint marker
-    Checkpoint = 99,
     /// Flush marker (sync point)
     WalFlush = 100,
 }
@@ -55,22 +63,22 @@ fn unsupported_historical_wal_opcode(value: u8) -> paro_common::error::ParoError
 }
 
 impl WalType {
-    /// Catalog mutations appear only inside `JournalRecord`.
+    /// Typed catalog mutations appear only as `TxnCatalogOp` inside a txn envelope.
     #[inline]
     pub fn is_catalog_operation(&self) -> bool {
-        matches!(self, WalType::JournalRecord)
+        matches!(self, WalType::TxnCatalogOp)
     }
 
     #[inline]
     pub fn is_data_operation(&self) -> bool {
         matches!(
             self,
-            WalType::UseTable
-                | WalType::RowsetCommit
+            WalType::RowsetCommit
                 | WalType::PrimaryDelete
                 | WalType::RowIdDelete
                 | WalType::CompactionPublish
                 | WalType::JournalRecord
+                | WalType::TxnDataOp
         )
     }
 
@@ -78,7 +86,15 @@ impl WalType {
     pub fn is_control_operation(&self) -> bool {
         matches!(
             self,
-            WalType::WalVersion | WalType::Checkpoint | WalType::WalFlush | WalType::JournalRecord
+            WalType::WalVersion
+                | WalType::WalFlush
+                | WalType::TxnBegin
+                | WalType::TxnCatalogOp
+                | WalType::TxnDataOp
+                | WalType::TxnPostCommitHook
+                | WalType::TxnCommit
+                | WalType::TxnAbort
+                | WalType::JournalRecord
         )
     }
 }
@@ -93,16 +109,21 @@ impl TryFrom<u8> for WalType {
         }
         match value {
             0 => Ok(WalType::Invalid),
-            25 => Ok(WalType::UseTable),
+            25 => Err(unsupported_historical_wal_opcode(value)),
             26..=29 => Err(unsupported_historical_wal_opcode(value)),
             30 => Ok(WalType::RowsetCommit),
             31 => Ok(WalType::PrimaryDelete),
             32 => Ok(WalType::RowIdDelete),
             33 => Ok(WalType::CompactionPublish),
-            43..=48 => Err(unsupported_historical_wal_opcode(value)),
+            43 => Ok(WalType::TxnBegin),
+            44 => Ok(WalType::TxnCatalogOp),
+            45 => Ok(WalType::TxnDataOp),
+            46 => Ok(WalType::TxnPostCommitHook),
+            47 => Ok(WalType::TxnCommit),
+            48 => Ok(WalType::TxnAbort),
             49 => Ok(WalType::JournalRecord),
             98 => Ok(WalType::WalVersion),
-            99 => Ok(WalType::Checkpoint),
+            99 => Err(unsupported_historical_wal_opcode(value)),
             100 => Ok(WalType::WalFlush),
             _ => Err(paro_error::serialization_error(format!(
                 "Invalid WAL type: {}",
@@ -126,12 +147,12 @@ mod tests {
     fn test_wal_type_conversion() {
         let types = [
             WalType::Invalid,
-            WalType::UseTable,
             WalType::RowsetCommit,
             WalType::CompactionPublish,
             WalType::RowIdDelete,
+            WalType::TxnBegin,
+            WalType::TxnCommit,
             WalType::JournalRecord,
-            WalType::Checkpoint,
             WalType::WalFlush,
         ];
 
@@ -144,17 +165,19 @@ mod tests {
 
     #[test]
     fn test_wal_type_categories() {
-        assert!(WalType::JournalRecord.is_catalog_operation());
+        assert!(WalType::TxnCatalogOp.is_catalog_operation());
         assert!(!WalType::RowIdDelete.is_catalog_operation());
+        assert!(WalType::TxnBegin.is_control_operation());
+        assert!(WalType::TxnCommit.is_control_operation());
         assert!(WalType::JournalRecord.is_control_operation());
 
         assert!(WalType::RowIdDelete.is_data_operation());
         assert!(WalType::CompactionPublish.is_data_operation());
+        assert!(WalType::TxnDataOp.is_data_operation());
         assert!(WalType::JournalRecord.is_data_operation());
+        assert!(!WalType::TxnCatalogOp.is_data_operation());
 
-        assert!(WalType::Checkpoint.is_control_operation());
         assert!(WalType::WalFlush.is_control_operation());
-        assert!(!WalType::UseTable.is_control_operation());
     }
 
     #[test]
@@ -194,13 +217,11 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_txn_envelope_rejected() {
-        for b in [43u8, 44, 45, 46, 47, 48] {
-            let err = WalType::try_from(b).expect_err("legacy txn envelope");
-            assert!(err.is_feature_not_supported());
-            assert!(err
-                .to_string()
-                .contains(&format!("unsupported historical WAL opcode {}", b)));
-        }
+    fn test_legacy_use_table_opcode_rejected() {
+        let err = WalType::try_from(25u8).expect_err("USE_TABLE");
+        assert!(err.is_feature_not_supported());
+        assert!(err
+            .to_string()
+            .contains("unsupported historical WAL opcode 25"));
     }
 }

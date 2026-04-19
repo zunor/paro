@@ -145,7 +145,7 @@ impl DeltaWriter {
         let rowset_id = tablet.next_rowset_id();
 
         // Flush writes directly into the canonical final rowset namespace.
-        let rowset_path = tablet.staged_rowset_path(txn_id, rowset_id);
+        let rowset_path = tablet.canonical_rowset_path(rowset_id);
         std::fs::create_dir_all(&rowset_path).map_err(|e| {
             paro_error::io_error(format!(
                 "Failed to create rowset path {:?}: {}",
@@ -388,15 +388,7 @@ impl DeltaWriter {
             } else {
                 self.tablet.rowset_commit_auto(rowset.clone())?;
             }
-            self.tablet
-                .find_rowset_by_id(rowset.rowset_id())
-                .ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "published rowset {} missing from tablet {}",
-                        rowset.rowset_id(),
-                        self.tablet.tablet_id()
-                    ))
-                })
+            Ok(rowset)
         })();
 
         if !publish_attempted {
@@ -410,13 +402,7 @@ impl DeltaWriter {
     /// Commit: finalize rowset and register it with the transaction (deferred publish).
     pub fn commit_in_transaction(self, txn: Arc<Transaction>) -> Result<RowsetSharedPtr> {
         let (tablet, rowset, primary_update) = self.finalize_for_transaction()?;
-        if let Err(err) = txn.add_pending_rowset(
-            tablet,
-            rowset.clone(),
-            primary_update,
-            Vec::new(),
-            Vec::new(),
-        ) {
+        if let Err(err) = txn.add_pending_rowset(tablet, rowset.clone(), primary_update) {
             let _ = std::fs::remove_dir_all(rowset.rowset_path());
             return Err(err);
         }
@@ -875,6 +861,7 @@ mod tests {
         tablet_schema::{KeysType, TabletColumn, TabletSchema},
         Tablet,
     };
+    use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::types::LogicalType;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -962,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_writer_delete_keys_persists_delete_vector() {
+    fn delta_writer_delete_keys_writes_wal_and_delvec() {
         let (tablet, tmp) = create_test_tablet();
         // Seed data
         let mut writer = DeltaWriter::open(tablet.clone(), 10).unwrap();
@@ -984,6 +971,10 @@ mod tests {
             .unwrap();
         assert_eq!(dv.cardinality(), 4);
         assert!(dv.is_deleted(0));
+
+        // WAL recorded
+        let wal_path = tablet.data_dir().join("tablet.wal");
+        assert!(WriteAheadLog::exists_for_seed(&wal_path));
 
         drop(tmp);
     }

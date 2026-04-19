@@ -108,12 +108,15 @@ impl InstanceRuntime {
         &self.tuning
     }
 
-    pub fn database_open_context(&self, checkpoint_wal_size: u64) -> DatabaseOpenContext {
+    pub fn database_open_context(
+        &self,
+        checkpoint: crate::config::CheckpointConfigOptions,
+    ) -> DatabaseOpenContext {
         DatabaseOpenContext {
             buffer_pool: Arc::clone(&self.buffer_pool),
             buffer_manager: Arc::clone(&self.buffer_manager),
             scheduler: Arc::clone(&self.scheduler),
-            checkpoint_wal_size,
+            checkpoint,
         }
     }
 

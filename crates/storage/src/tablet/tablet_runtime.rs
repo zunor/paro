@@ -14,16 +14,17 @@
 
 use super::delete_intent_store::DeleteIntentStore;
 use super::prepared_txn_registry::PreparedTxnRegistry;
-use super::shutdown_sweep;
 use super::statistics::TabletStatistics;
 use super::tablet_meta::TabletMeta;
 use super::tablet_schema::{ColumnId, TabletSchemaRef};
+use super::{shutdown_sweep, wal_replay};
 use crate::compaction::plan::types::CumulativePointAction;
 use crate::compaction::publish::record::{
     CompactionPublishConflict, CompactionPublishConflictReason, CompactionPublishRecord,
     RetiredInput,
 };
 use crate::meta::TabletMetaManager;
+use crate::metrics::storage_metrics;
 use crate::primary_key::{
     DeleteVector, PrimaryIndex, RowID, RssidManager, PERSISTENT_INDEX_FORMAT_VERSION,
 };
@@ -128,6 +129,34 @@ struct RetiredPendingGcEntry {
     rowset: RowsetSharedPtr,
     version: Version,
     rssids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointMaintenanceTicket {
+    pub lsn: u64,
+    pub maintenance_id: u64,
+}
+
+pub trait CheckpointPublishObserver: Send + Sync + std::fmt::Debug {
+    fn begin_compaction_publish(&self, tablet_id: TabletId) -> CheckpointMaintenanceTicket;
+    fn finish_compaction_publish(&self, ticket: CheckpointMaintenanceTicket);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointTabletFreezeMode {
+    Optimistic,
+    MetaLock,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointTabletSnapshot {
+    pub identity: TabletIdentity,
+    pub schema: TabletSchemaRef,
+    pub cumulative_point: i64,
+    pub max_version: i64,
+    pub visible_version: i64,
+    pub rowsets: Vec<RowsetSharedPtr>,
+    pub freeze_mode: CheckpointTabletFreezeMode,
 }
 
 /// Primary index update metadata for a newly built rowset.
@@ -281,7 +310,7 @@ pub struct Tablet {
     /// Database-level journal coordinator bound by managed runtime.
     journal_coordinator: RwLock<Option<Arc<JournalCoordinator>>>,
 
-    /// Database-level apply runtime bound by managed runtime.
+    /// Database-level journal apply runtime bound by managed runtime.
     journal_apply_runtime: RwLock<Option<Arc<JournalApplyRuntime>>>,
 
     /// Rowsets indexed by version (for version-based lookup)
@@ -305,7 +334,7 @@ pub struct Tablet {
     /// Cumulative compaction point (versions below this are base)
     cumulative_point: AtomicI64,
 
-    /// Maximum visible version reflected by rowsets and delete vectors.
+    /// Maximum committed version
     max_version: AtomicI64,
 
     /// Next rowset ID to assign
@@ -322,6 +351,15 @@ pub struct Tablet {
 
     /// Meta lock to synchronize metadata operations
     pub(super) meta_lock: RwLock<()>,
+
+    /// Lightweight mutation counter used by checkpoint optimistic capture.
+    checkpoint_capture_epoch: AtomicU64,
+
+    /// Bound checkpoint observer for compaction publish sequencing.
+    checkpoint_publish_observer: RwLock<Option<Arc<dyn CheckpointPublishObserver>>>,
+
+    /// Maintenance publish ids for visible and retired rowsets.
+    rowset_maintenance_ids: RwLock<HashMap<u64, u64>>,
 
     /// In-memory primary index (L0) for PRIMARY_KEYS model.
     pub(super) primary_index: RwLock<Arc<PrimaryIndex>>,
@@ -398,6 +436,9 @@ impl Tablet {
             applied_lsn: AtomicU64::new(applied_lsn),
             rssid_manager,
             meta_lock: RwLock::new(()),
+            checkpoint_capture_epoch: AtomicU64::new(0),
+            checkpoint_publish_observer: RwLock::new(None),
+            rowset_maintenance_ids: RwLock::new(HashMap::new()),
             primary_index: RwLock::new(primary_index),
             primary_index_flush_requested,
             primary_index_full: AtomicBool::new(true),
@@ -528,27 +569,30 @@ impl Tablet {
         self.journal_apply_runtime.read().unwrap().clone()
     }
 
+    pub fn bind_checkpoint_publish_observer(&self, observer: Arc<dyn CheckpointPublishObserver>) {
+        *self.checkpoint_publish_observer.write().unwrap() = Some(observer);
+    }
+
+    pub fn begin_checkpoint_compaction_publish(&self) -> Option<CheckpointMaintenanceTicket> {
+        self.checkpoint_publish_observer
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|observer| observer.begin_compaction_publish(self.tablet_id()))
+    }
+
+    pub fn finish_checkpoint_compaction_publish(&self, ticket: CheckpointMaintenanceTicket) {
+        if let Some(observer) = self.checkpoint_publish_observer.read().unwrap().as_ref() {
+            observer.finish_compaction_publish(ticket);
+        }
+    }
+
     pub fn rowsets_dir(&self) -> PathBuf {
         self.data_dir.join("rowsets")
     }
 
-    pub fn staged_root_dir(&self) -> PathBuf {
-        self.data_dir.join("_staged")
-    }
-
-    pub fn transaction_staging_dir(&self, txn_id: u64) -> PathBuf {
-        self.staged_root_dir()
-            .join("txn")
-            .join(format!("txn_{txn_id}"))
-    }
-
     pub fn compaction_staging_dir(&self) -> PathBuf {
-        self.staged_root_dir().join("compaction")
-    }
-
-    pub fn staged_rowset_path(&self, txn_id: u64, rowset_id: u64) -> PathBuf {
-        self.transaction_staging_dir(txn_id)
-            .join(format!("rowset_{rowset_id}"))
+        self.data_dir.join("_compaction")
     }
 
     pub fn canonical_rowset_path(&self, rowset_id: u64) -> PathBuf {
@@ -635,15 +679,14 @@ impl Tablet {
         Ok(stats)
     }
 
-    pub(crate) fn with_prepare_snapshot_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _guard = self.meta_lock.read().unwrap();
-        f()
-    }
-
     pub(crate) fn invalidate_statistics(&self) {
         self.statistics_dirty.store(true, Ordering::Release);
         let mut cache = self.statistics_cache.write().unwrap();
         *cache = None;
+    }
+
+    fn note_checkpoint_capture_mutation(&self) {
+        self.checkpoint_capture_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Get number of rowsets
@@ -853,8 +896,10 @@ impl Tablet {
         }
 
         let mut retired = self.retired_pending_gc.write().unwrap();
+        let mut maintenance_ids = self.rowset_maintenance_ids.write().unwrap();
         for rowset_id in removable {
             retired.remove(&rowset_id);
+            maintenance_ids.remove(&rowset_id);
         }
     }
 
@@ -927,29 +972,25 @@ impl Tablet {
             .values()
             .cloned()
             .collect();
+        {
+            let mut maintenance_ids = self.rowset_maintenance_ids.write().unwrap();
+            for rowset in &loaded_rowsets {
+                maintenance_ids.entry(rowset.rowset_id()).or_insert(0);
+            }
+        }
         for rowset in loaded_rowsets {
             self.ensure_rowset_rssids(&rowset);
         }
-        self.refresh_max_version_from_delete_vectors()?;
-        let mut refreshed_delete_stats = false;
-        let visible_version = self.max_version();
-        for rowset in self
-            .rs_version_map
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            rowset.load()?;
-            refreshed_delete_stats |= self.refresh_rowset_delete_stats(&rowset, visible_version)?;
-        }
 
-        // Rebuild primary index from persistent state and visible rowsets.
+        // Rebuild primary index from persistent index + WAL (best-effort).
         let rebuilt_persistent_index = self.rebuild_primary_index_from_persistent()?;
+        let replay_report = wal_replay::replay_primary_wal(self)?;
         crate::compaction::cleanup::reconcile_recovery_state(self);
+        if replay_report.replayed_missing_rowset_commit || replay_report.replayed_compaction_publish
+        {
+            self.repair_primary_index_after_replay()?;
+        }
         if rebuilt_persistent_index
-            || refreshed_delete_stats
             || self.meta.read().unwrap().row_id_format_version() != CURRENT_ROW_ID_FORMAT_VERSION
         {
             let mut meta = self.meta.write().unwrap();
@@ -1068,6 +1109,7 @@ impl Tablet {
 
     fn register_rowset_locked(&self, rowset: RowsetSharedPtr) {
         let version = rowset.version();
+        let rowset_id = rowset.rowset_id();
 
         // Add to version map
         {
@@ -1098,7 +1140,14 @@ impl Tablet {
             meta.add_rowset_meta(rs_meta);
         }
 
+        self.rowset_maintenance_ids
+            .write()
+            .unwrap()
+            .entry(rowset_id)
+            .or_insert(0);
+
         self.invalidate_statistics();
+        self.bump_rowset_epoch();
     }
 
     /// Commit a rowset with the given version.
@@ -1123,26 +1172,21 @@ impl Tablet {
     fn rowset_commit_locked(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
-        if version < current_max
-            || (version == current_max && self.get_rowset_by_version(version).is_some())
-        {
-            // A delete patch can advance max_version without publishing a new rowset at that
-            // version. Only treat the write as already committed when a rowset actually covers
-            // this version.
+        if version <= current_max {
+            // Already committed (idempotent)
             return Ok(());
         }
 
-        let published = self.promote_rowset_for_publish(&rowset, version)?;
-        self.apply_rowset_commit_locked(version, published)?;
+        self.apply_rowset_commit_locked(version, rowset)?;
         Ok(())
     }
 
     fn apply_rowset_commit_locked(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
         rowset.set_version(Version::singleton(version));
         self.validate_rowset_registration_locked(&rowset)?;
+        self.write_rowset_commit_wal(&rowset)?;
         rowset.make_visible()?;
         self.register_rowset_locked(rowset);
-        self.bump_rowset_epoch();
         self.save_meta()?;
 
         self.validate_version_graph()?;
@@ -1182,9 +1226,7 @@ impl Tablet {
     ) -> Result<()> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
-        if version < current_max
-            || (version == current_max && self.get_rowset_by_version(version).is_some())
-        {
+        if version <= current_max {
             return Ok(());
         }
 
@@ -1193,11 +1235,10 @@ impl Tablet {
         self.align_next_rowset_id(rowset.rowset_id());
         self.validate_rowset_registration_locked(&rowset)?;
         let prepared = self.prepare_primary_index_publish(&rowset, update)?;
-        let published = self.promote_rowset_for_publish(&rowset, version)?;
+        self.write_rowset_commit_wal(&rowset)?;
         self.apply_prepared_primary_index_publish(version, prepared)?;
-        published.make_visible()?;
-        self.register_rowset_locked(published);
-        self.bump_rowset_epoch();
+        rowset.make_visible()?;
+        self.register_rowset_locked(rowset);
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
         self.save_meta()?;
@@ -1205,55 +1246,22 @@ impl Tablet {
         Ok(())
     }
 
-    fn promote_rowset_for_publish(
-        &self,
-        rowset: &RowsetSharedPtr,
-        version: i64,
-    ) -> Result<RowsetSharedPtr> {
-        let source_path = rowset.rowset_path();
-        let final_path = self.canonical_rowset_path(rowset.rowset_id());
-        if source_path == final_path {
-            return Ok(rowset.clone());
-        }
-        if !final_path.exists() && source_path.exists() {
-            if let Some(parent) = final_path.parent() {
-                fs::create_dir_all(parent).map_err(|err| {
-                    paro_error::io_error(format!(
-                        "create rowset publish parent {}: {}",
-                        parent.display(),
-                        err
-                    ))
-                })?;
-            }
-            fs::rename(source_path, &final_path).map_err(|err| {
-                paro_error::io_error(format!(
-                    "publish staged rowset {} -> {}: {}",
-                    source_path.display(),
-                    final_path.display(),
-                    err
-                ))
-            })?;
-            Self::sync_parent_dir(&final_path)?;
-        }
-
-        self.load_replayed_rowset(
-            rowset.rowset_id(),
-            Version::singleton(version),
-            &final_path.to_string_lossy(),
-        )?
-        .ok_or_else(|| {
-            paro_error::io_error(format!(
-                "published rowset {} missing from {}",
-                rowset.rowset_id(),
-                final_path.display()
-            ))
-        })
-    }
-
     /// Apply row-id deletes and persist delete vectors.
     ///
     /// Loads existing segment delete vectors before applying locations so replaying
     /// multiple WAL RowIdDelete entries remains additive.
+    pub(crate) fn apply_row_id_delete_locations(
+        &self,
+        locations: &[(u64, u32, u32)],
+    ) -> Result<()> {
+        let physical_locations: Vec<_> = locations
+            .iter()
+            .copied()
+            .map(PhysicalRowRef::from)
+            .collect();
+        self.apply_row_id_delete_refs(&physical_locations)
+    }
+
     pub(crate) fn apply_row_id_delete_locations_idempotent_at_version(
         &self,
         locations: &[(u64, u32, u32)],
@@ -1269,21 +1277,13 @@ impl Tablet {
 
     pub(crate) fn apply_row_id_delete_refs(&self, locations: &[PhysicalRowRef]) -> Result<()> {
         let version = self.max_version.load(Ordering::Acquire);
-        self.apply_row_id_delete_refs_at_version(locations, version)
-    }
-
-    pub(crate) fn apply_row_id_delete_refs_at_version(
-        &self,
-        locations: &[PhysicalRowRef],
-        delete_version: i64,
-    ) -> Result<()> {
-        self.apply_row_id_delete_refs_internal(locations, delete_version, false)
+        self.apply_row_id_delete_refs_internal(locations, version, false)
     }
 
     fn apply_row_id_delete_refs_internal(
         &self,
         locations: &[PhysicalRowRef],
-        delete_version: i64,
+        version: i64,
         ignore_already_deleted: bool,
     ) -> Result<()> {
         if locations.is_empty() {
@@ -1320,6 +1320,11 @@ impl Tablet {
             };
 
             let key = location.segment_key();
+            let existing = DeleteVector::load_from_dir_at_version(
+                rowset.rowset_path(),
+                location.segment_id,
+                version,
+            )?;
             match pending.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
                     if o.get().is_deleted(location.row_offset) {
@@ -1337,12 +1342,7 @@ impl Tablet {
                     o.get_mut().mark_deleted(location.row_offset);
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
-                    let mut dv = DeleteVector::with_version(delete_version);
-                    let existing = DeleteVector::load_from_dir_at_version(
-                        rowset.rowset_path(),
-                        location.segment_id,
-                        delete_version,
-                    )?;
+                    let mut dv = DeleteVector::with_version(version);
                     if dv.is_deleted(location.row_offset) {
                         if ignore_already_deleted {
                             continue;
@@ -1376,8 +1376,7 @@ impl Tablet {
             }
         }
 
-        self.persist_delete_vectors(delete_version, pending)?;
-        self.repair_primary_index_after_replay()?;
+        self.persist_delete_vectors(version, pending)?;
         Ok(())
     }
 
@@ -1411,39 +1410,42 @@ impl Tablet {
         let had_updates = !updated_rowsets.is_empty();
         for rs_id in updated_rowsets {
             if let Some(rowset) = self.find_rowset_by_id(rs_id) {
-                let _ = self.refresh_rowset_delete_stats(&rowset, version)?;
+                self.refresh_rowset_delete_stats(&rowset, version)?;
             }
         }
         if had_updates {
-            self.max_version.fetch_max(version, Ordering::AcqRel);
-            self.bump_rowset_epoch();
             self.invalidate_statistics();
-            self.save_meta()?;
+            self.bump_rowset_epoch();
         }
         Ok(())
     }
 
-    fn refresh_rowset_delete_stats(&self, rowset: &RowsetSharedPtr, version: i64) -> Result<bool> {
+    fn refresh_rowset_delete_stats(&self, rowset: &RowsetSharedPtr, version: i64) -> Result<()> {
+        let segment_ids: Vec<u32> = {
+            let segments = rowset.segments();
+            if segments.is_empty() {
+                (0..rowset.rowset_meta().num_segments()).collect()
+            } else {
+                segments
+                    .iter()
+                    .map(|segment| segment.segment_id())
+                    .collect()
+            }
+        };
         let mut num_vectors = 0u32;
         let mut num_deleted_rows = 0u64;
-        for segment in rowset.segments() {
-            if let Some(dv) = DeleteVector::load_from_dir_at_version(
-                rowset.rowset_path(),
-                segment.segment_id(),
-                version,
-            )? {
+        for seg_id in segment_ids {
+            if let Some(dv) =
+                DeleteVector::load_from_dir_at_version(rowset.rowset_path(), seg_id, version)?
+            {
                 if dv.cardinality() > 0 {
                     num_vectors += 1;
                     num_deleted_rows += dv.cardinality();
                 }
             }
         }
-        let previous = (
-            rowset.rowset_meta().num_delete_vectors(),
-            rowset.rowset_meta().num_deleted_rows(),
-        );
         rowset.set_delete_stats(num_vectors, num_deleted_rows);
-        Ok(previous != (num_vectors, num_deleted_rows))
+        Ok(())
     }
 
     fn row_locations_for_rowset(rowset: &Rowset) -> Result<Vec<PhysicalRowRef>> {
@@ -1551,6 +1553,7 @@ impl Tablet {
         inputs: &[RowsetSharedPtr],
         retired_inputs: &[RetiredInput],
         output: RowsetSharedPtr,
+        output_maintenance_id: u64,
         cumulative_point_action: CumulativePointAction,
         allow_existing_output: bool,
     ) -> Result<()> {
@@ -1614,7 +1617,14 @@ impl Tablet {
             meta.add_rowset_meta(output_meta);
         }
 
-        self.bump_rowset_epoch();
+        {
+            let mut maintenance_ids = self.rowset_maintenance_ids.write().unwrap();
+            for rs in inputs {
+                maintenance_ids.entry(rs.rowset_id()).or_insert(0);
+            }
+            maintenance_ids.insert(output.rowset_id(), output_maintenance_id);
+        }
+
         self.invalidate_statistics();
         self.register_retired_inputs(&to_delete, retired_inputs);
 
@@ -1623,6 +1633,7 @@ impl Tablet {
         }
 
         self.validate_version_graph()?;
+        self.bump_rowset_epoch();
         Ok(())
     }
 
@@ -1665,6 +1676,159 @@ impl Tablet {
             .collect();
         result.sort_by_key(|rs| rs.start_version());
         Ok(result)
+    }
+
+    pub fn capture_checkpoint_snapshot(
+        self: &Arc<Self>,
+        checkpoint_commit_id: u64,
+        checkpoint_maintenance_id: u64,
+        optimistic_retries: usize,
+    ) -> Result<CheckpointTabletSnapshot> {
+        let visible_version = i64::try_from(checkpoint_commit_id)
+            .map_err(|_| paro_error::invalid_input("checkpoint commit id exceeds i64"))?;
+        let mut invalidated_optimistic_snapshots = 0usize;
+
+        for _ in 0..optimistic_retries {
+            let epoch_before = self.checkpoint_capture_epoch.load(Ordering::Acquire);
+            let guard = TabletReadGuard::pin(self, visible_version);
+            let snapshot = self.build_checkpoint_snapshot(
+                visible_version,
+                checkpoint_maintenance_id,
+                CheckpointTabletFreezeMode::Optimistic,
+            )?;
+            let epoch_after = self.checkpoint_capture_epoch.load(Ordering::Acquire);
+            drop(guard);
+            if epoch_before == epoch_after {
+                storage_metrics()
+                    .record_checkpoint_capture(false, invalidated_optimistic_snapshots);
+                return Ok(snapshot);
+            }
+            invalidated_optimistic_snapshots += 1;
+        }
+
+        let snapshot = self.with_meta_lock("capture checkpoint snapshot", || {
+            let _guard = TabletReadGuard::pin(self, visible_version);
+            self.build_checkpoint_snapshot(
+                visible_version,
+                checkpoint_maintenance_id,
+                CheckpointTabletFreezeMode::MetaLock,
+            )
+        })?;
+        storage_metrics().record_checkpoint_capture(true, invalidated_optimistic_snapshots);
+        Ok(snapshot)
+    }
+
+    pub fn capture_checkpoint_meta_bytes(
+        &self,
+        snapshot: &CheckpointTabletSnapshot,
+    ) -> Result<Vec<u8>> {
+        let mut meta = self.meta.read().unwrap().clone();
+        let existing_rowset_ids: Vec<u64> = meta
+            .rowset_metas()
+            .iter()
+            .chain(meta.inc_rowset_metas().iter())
+            .map(|rowset| rowset.rowset_id())
+            .collect();
+        for rowset_id in existing_rowset_ids {
+            meta.delete_rowset_meta(rowset_id);
+        }
+        meta.set_cumulative_layer_point(snapshot.cumulative_point);
+        for rowset in &snapshot.rowsets {
+            meta.add_rowset_meta(rowset.rowset_meta());
+        }
+        meta.serialize()
+    }
+
+    fn build_checkpoint_snapshot(
+        &self,
+        visible_version: i64,
+        checkpoint_maintenance_id: u64,
+        freeze_mode: CheckpointTabletFreezeMode,
+    ) -> Result<CheckpointTabletSnapshot> {
+        let schema = self.schema().ok_or_else(|| {
+            paro_error::internal("tablet schema missing during checkpoint capture")
+        })?;
+        let rowsets =
+            self.capture_checkpoint_rowsets(visible_version, checkpoint_maintenance_id)?;
+        Ok(CheckpointTabletSnapshot {
+            identity: TabletIdentity {
+                table_id: self.table_id(),
+                partition_id: self.partition_id(),
+                tablet_id: self.tablet_id(),
+                schema_id: schema.schema_id(),
+                schema_version: schema.schema_version(),
+            },
+            schema,
+            cumulative_point: self.cumulative_point(),
+            max_version: self.max_version(),
+            visible_version,
+            rowsets,
+            freeze_mode,
+        })
+    }
+
+    fn capture_checkpoint_rowsets(
+        &self,
+        visible_version: i64,
+        checkpoint_maintenance_id: u64,
+    ) -> Result<Vec<RowsetSharedPtr>> {
+        let visible_rowsets = self.capture_consistent_rowsets(visible_version)?;
+        let mut resolved = Vec::new();
+        let mut visited = HashSet::new();
+        for rowset in visible_rowsets {
+            self.expand_checkpoint_rowset(
+                &rowset,
+                checkpoint_maintenance_id,
+                &mut visited,
+                &mut resolved,
+            )?;
+        }
+        resolved.sort_by_key(|rowset| rowset.version());
+        Ok(resolved)
+    }
+
+    fn expand_checkpoint_rowset(
+        &self,
+        rowset: &RowsetSharedPtr,
+        checkpoint_maintenance_id: u64,
+        visited: &mut HashSet<u64>,
+        resolved: &mut Vec<RowsetSharedPtr>,
+    ) -> Result<()> {
+        if !visited.insert(rowset.rowset_id()) {
+            return Ok(());
+        }
+
+        let metadata = rowset.rowset_meta();
+        let maintenance_id = self
+            .rowset_maintenance_ids
+            .read()
+            .unwrap()
+            .get(&rowset.rowset_id())
+            .copied()
+            .unwrap_or(0);
+
+        if !metadata.is_compaction_output() || maintenance_id <= checkpoint_maintenance_id {
+            resolved.push(rowset.clone());
+            return Ok(());
+        }
+
+        for source_rowset_id in metadata.source_rowset_ids() {
+            let source_rowset = self.find_rowset_by_id(*source_rowset_id).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "checkpoint capture missing retired compaction input {} on tablet {}",
+                    source_rowset_id,
+                    self.tablet_id()
+                ))
+            })?;
+            self.expand_checkpoint_rowset(
+                &source_rowset,
+                checkpoint_maintenance_id,
+                visited,
+                resolved,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Get maximum continuous version from version 0
@@ -1787,7 +1951,6 @@ impl Tablet {
         if !data_dir.exists() {
             return Ok(());
         }
-        shutdown_sweep::mark_shutdown_meta_file(data_dir)?;
         shutdown_sweep::schedule_shutdown_sweep(data_dir, move_to_trash)
     }
 
@@ -1809,11 +1972,8 @@ impl Tablet {
         self.sync_runtime_meta_fields(&mut persisted);
         if let Some(manager) = &self.tablet_meta_manager {
             manager.save_tablet_meta(&persisted)?;
-            return Ok(());
         }
-
-        let meta_path = self.data_dir.join("tablet_meta");
-        Self::save_legacy_meta_file(&meta_path, &persisted)
+        Ok(())
     }
 
     fn sync_runtime_meta_fields(&self, meta: &mut TabletMeta) {
@@ -1823,36 +1983,31 @@ impl Tablet {
         meta.set_applied_lsn(self.applied_lsn());
     }
 
-    fn align_next_rowset_id(&self, rowset_id: u64) {
-        self.next_rowset_id
-            .fetch_max((rowset_id.saturating_add(1)) as i64, Ordering::SeqCst);
+    fn write_rowset_commit_wal(&self, rowset: &Rowset) -> Result<()> {
+        let wal = WriteAheadLog::new(self.wal_path())?;
+        wal.write_rowset_commit(
+            self.tablet_id(),
+            rowset.rowset_id(),
+            rowset.start_version(),
+            rowset.end_version(),
+            rowset.rowset_path().to_string_lossy().as_ref(),
+        )?;
+        wal.flush()?;
+        Ok(())
     }
 
-    fn refresh_max_version_from_delete_vectors(&self) -> Result<()> {
-        let rowsets: Vec<_> = self
-            .rs_version_map
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        let mut max_visible = self.max_version();
-
-        for rowset in rowsets {
-            for segment_id in 0..rowset.rowset_meta().num_segments() {
-                let chain =
-                    DeleteVector::load_versioned_from_dir(rowset.rowset_path(), segment_id)?;
-                if let Some(version) = chain.versions().last().map(DeleteVector::version) {
-                    max_visible = max_visible.max(version);
-                }
-            }
-        }
-
-        self.max_version.store(max_visible, Ordering::Release);
+    pub(crate) fn write_compaction_publish_wal(
+        &self,
+        record: &CompactionPublishRecord,
+    ) -> Result<()> {
+        let wal = WriteAheadLog::new(self.wal_path())?;
+        wal.write_compaction_publish(record)?;
+        wal.flush()?;
         Ok(())
     }
 
     pub(crate) fn bump_rowset_epoch(&self) -> u64 {
+        self.note_checkpoint_capture_mutation();
         self.rowset_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -1865,6 +2020,11 @@ impl Tablet {
             return Ok(());
         }
         self.save_meta()
+    }
+
+    fn align_next_rowset_id(&self, rowset_id: u64) {
+        self.next_rowset_id
+            .fetch_max((rowset_id.saturating_add(1)) as i64, Ordering::SeqCst);
     }
 
     fn resolve_loaded_rowset_path(&self, rowset_id: u64, stored_path: &str) -> PathBuf {
@@ -1888,10 +2048,10 @@ impl Tablet {
                 err
             ))
         })?;
-        fs::create_dir_all(data_dir.join("_staged")).map_err(|err| {
+        fs::create_dir_all(data_dir.join("_compaction")).map_err(|err| {
             paro_error::io_error(format!(
-                "create tablet staged root {}: {}",
-                data_dir.join("_staged").display(),
+                "create tablet compaction root {}: {}",
+                data_dir.join("_compaction").display(),
                 err
             ))
         })?;
@@ -1995,70 +2155,39 @@ impl Tablet {
         self.encode_row_locations(&locations)
     }
 
-    fn save_legacy_meta_file(path: &Path, meta: &TabletMeta) -> Result<()> {
-        let bytes = meta.serialize()?;
-        std::fs::write(path, bytes).map_err(|e| {
-            paro_error::internal(format!("Failed to save TabletMeta to {:?}: {}", path, e))
-        })
-    }
-
-    fn load_meta_from_legacy_file(data_dir: &Path) -> Result<TabletMeta> {
-        let meta_path = data_dir.join("tablet_meta");
-        let bytes = std::fs::read(&meta_path).map_err(|e| {
-            paro_error::internal(format!(
-                "Failed to load TabletMeta from {:?}: {}",
-                meta_path, e
-            ))
-        })?;
-        TabletMeta::deserialize(&bytes)
-    }
-
-    /// Open tablet metadata from the centralized metadata manager when available.
-    ///
-    /// Falls back to legacy `tablet_meta` file loading if manager is absent or
-    /// the manager does not contain this tablet yet.
+    /// Open tablet metadata from the centralized metadata manager.
     pub fn open(
         tablet_id: TabletId,
         data_dir: impl Into<PathBuf>,
-        tablet_meta_manager: Option<Arc<TabletMetaManager>>,
+        tablet_meta_manager: Arc<TabletMetaManager>,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        let mut meta = if let Some(manager) = &tablet_meta_manager {
-            match manager.load_tablet_meta(tablet_id)? {
-                Some(meta) => meta,
-                None => Self::load_meta_from_legacy_file(&data_dir)?,
-            }
-        } else {
-            Self::load_meta_from_legacy_file(&data_dir)?
-        };
+        let mut meta = tablet_meta_manager
+            .load_tablet_meta(tablet_id)?
+            .ok_or_else(|| {
+                paro_error::internal(format!(
+                    "tablet {} metadata missing from TabletMetaManager for {}",
+                    tablet_id,
+                    data_dir.display()
+                ))
+            })?;
 
         // Metadata is persisted in RUNNING state; reset to allow init on reload.
         if meta.tablet_state() != TabletState::NotReady {
             meta.set_tablet_state(TabletState::NotReady);
         }
-        let tablet = Self::create_from_meta(meta, tablet_meta_manager)?;
-        tablet.init()?;
-        Ok(tablet)
-    }
-
-    /// Load tablet from metadata file
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use Tablet::open(tablet_id, data_dir, tablet_meta_manager) instead."
-    )]
-    pub fn load(data_dir: impl Into<PathBuf>) -> Result<Self> {
-        let data_dir = data_dir.into();
-        let mut meta = Self::load_meta_from_legacy_file(&data_dir)?;
-        if meta.tablet_state() != TabletState::NotReady {
-            meta.set_tablet_state(TabletState::NotReady);
-        }
-        let tablet = Self::create_from_meta(meta, None)?;
+        let tablet = Self::create_from_meta(meta, Some(tablet_meta_manager))?;
         tablet.init()?;
         Ok(tablet)
     }
 }
 
 impl Tablet {
+    /// WAL path helper.
+    fn wal_path(&self) -> PathBuf {
+        self.data_dir.join("tablet.wal")
+    }
+
     fn load_replayed_rowset(
         &self,
         rowset_id: u64,
@@ -2173,14 +2302,11 @@ impl Tablet {
 
         // Skip if the version has already been recovered or superseded by a
         // compaction output that covers the same range.
-        if !self.should_replay_rowset_commit(&version) {
+        if !wal_replay::should_replay_rowset_commit(self, &version) {
             return Ok(());
         }
 
-        let replay_path = self.promote_rowset_replay_path(rowset_id, Path::new(rowset_path))?;
-        let Some(rowset) =
-            self.load_replayed_rowset(rowset_id, version, &replay_path.to_string_lossy())?
-        else {
+        let Some(rowset) = self.load_replayed_rowset(rowset_id, version, rowset_path)? else {
             return Ok(());
         };
 
@@ -2189,43 +2315,47 @@ impl Tablet {
         Ok(())
     }
 
-    fn promote_rowset_replay_path(&self, rowset_id: u64, source_path: &Path) -> Result<PathBuf> {
-        let canonical = self.canonical_rowset_path(rowset_id);
-        if source_path == canonical {
-            return Ok(canonical);
-        }
-        if canonical.exists() {
-            return Ok(canonical);
-        }
-        if !source_path.exists() {
-            return Ok(source_path.to_path_buf());
-        }
-        if let Some(parent) = canonical.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                paro_error::io_error(format!(
-                    "create rowset replay parent {}: {}",
-                    parent.display(),
-                    err
-                ))
-            })?;
-        }
-        fs::rename(source_path, &canonical).map_err(|err| {
-            paro_error::io_error(format!(
-                "promote staged rowset {} -> {}: {}",
-                source_path.display(),
-                canonical.display(),
-                err
-            ))
-        })?;
-        Self::sync_parent_dir(&canonical)?;
-        Ok(canonical)
-    }
+    pub(crate) fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
+        let maybe_output = self.find_rowset_by_id(record.output_rowset_id);
+        let live_inputs: Vec<_> = record
+            .replaced_inputs
+            .iter()
+            .filter_map(|rowset_id| self.find_rowset_by_id(*rowset_id))
+            .collect();
 
-    fn should_replay_rowset_commit(&self, version: &Version) -> bool {
-        let rs_map = self.rs_version_map.read().unwrap();
-        !rs_map
-            .keys()
-            .any(|existing_version| existing_version.contains_range(version))
+        if maybe_output.is_some() && live_inputs.is_empty() {
+            return Ok(());
+        }
+
+        let output = if let Some(existing) = maybe_output {
+            existing
+        } else {
+            self.load_replayed_rowset(
+                record.output_rowset_id,
+                record.output_version,
+                &record.output_rowset_path,
+            )?
+            .ok_or_else(|| {
+                paro_error::io_error(format!(
+                    "published compaction output {} missing from {} during replay",
+                    record.output_rowset_id, record.output_rowset_path
+                ))
+            })?
+        };
+
+        output.make_visible()?;
+        self.with_meta_lock("replay compaction publish", || {
+            self.install_compaction_publish_locked(
+                &live_inputs,
+                &[],
+                output.clone(),
+                0,
+                record.cumulative_point_action,
+                true,
+            )
+        })?;
+        self.save_meta()?;
+        Ok(())
     }
 
     pub(crate) fn apply_compaction_publish(&self, op: &TabletMutation) -> Result<()> {
@@ -2302,55 +2432,13 @@ impl Tablet {
                     .map(Self::retired_input_from_op)
                     .collect::<Vec<_>>(),
                 output.clone(),
+                0,
                 match cumulative_point_action {
                     CompactionCumulativePointAction::Preserve => CumulativePointAction::Preserve,
                     CompactionCumulativePointAction::AdvanceToOutputEndExclusive => {
                         CumulativePointAction::AdvanceToOutputEndExclusive
                     }
                 },
-                true,
-            )
-        })?;
-        self.save_meta()?;
-        self.validate_primary_index_consistency_after_compaction(output.as_ref())?;
-        Ok(())
-    }
-
-    pub(crate) fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
-        let maybe_output = self.find_rowset_by_id(record.output_rowset_id);
-        let live_inputs: Vec<_> = record
-            .replaced_inputs
-            .iter()
-            .filter_map(|rowset_id| self.find_rowset_by_id(*rowset_id))
-            .collect();
-
-        if maybe_output.is_some() && live_inputs.is_empty() {
-            return Ok(());
-        }
-
-        let output = if let Some(existing) = maybe_output {
-            existing
-        } else {
-            self.load_replayed_rowset(
-                record.output_rowset_id,
-                record.output_version,
-                &record.output_rowset_path,
-            )?
-            .ok_or_else(|| {
-                paro_error::io_error(format!(
-                    "published compaction output {} missing from {} during replay",
-                    record.output_rowset_id, record.output_rowset_path
-                ))
-            })?
-        };
-
-        output.make_visible()?;
-        self.with_meta_lock("replay compaction publish", || {
-            self.install_compaction_publish_locked(
-                &live_inputs,
-                &[],
-                output.clone(),
-                record.cumulative_point_action,
                 true,
             )
         })?;
@@ -2374,10 +2462,15 @@ pub type TabletRef = Arc<Tablet>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::plan::types::CumulativePointAction;
+    use crate::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
+    use crate::metrics::storage_metrics;
     use crate::primary_key::{PersistentIndex, PrimaryKeySerializer, RowID};
     use crate::rowset::RowsetMeta;
     use crate::rowset::{RowsetWriter, RowsetWriterContext};
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
+    use crate::wal::wal_entry::WalEntry;
+    use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
@@ -2390,6 +2483,15 @@ mod tests {
             TabletColumn::new(1, "name", LogicalType::Varchar),
         ];
         Arc::new(TabletSchema::new(1, columns, KeysType::PrimaryKeys).unwrap())
+    }
+
+    fn create_test_meta_manager(tmp: &TempDir) -> Arc<TabletMetaManager> {
+        let store: Arc<dyn MetadataStore> =
+            Arc::new(FileMetadataStore::new(tmp.path().join("meta")).unwrap());
+        Arc::new(TabletMetaManager::with_store_and_data_root(
+            store,
+            tmp.path(),
+        ))
     }
 
     #[test]
@@ -2479,7 +2581,16 @@ mod tests {
             .unwrap(),
         );
         let data_dir = tmp.path().to_string_lossy().to_string();
-        let tablet = Tablet::new(1, 100, 1000, schema.clone(), data_dir, None).unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let tablet = Tablet::new(
+            1,
+            100,
+            1000,
+            schema.clone(),
+            data_dir,
+            Some(manager.clone()),
+        )
+        .unwrap();
 
         let rowset_path = tmp.path().join("rowset_7");
         let context = crate::rowset::RowsetWriterContext::new(
@@ -2515,7 +2626,7 @@ mod tests {
 
         tablet.save_meta().unwrap();
 
-        let reopened = Tablet::open(1, tmp.path(), None).unwrap();
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
         assert_eq!(
             reopened.rssid_manager().rssid_for(rowset.rowset_id(), 0),
             Some(0)
@@ -2565,6 +2676,88 @@ mod tests {
             .unwrap();
         let rowsets = tablet.capture_consistent_rowsets(10).unwrap();
         assert_eq!(rowsets.len(), 4);
+    }
+
+    #[test]
+    fn checkpoint_snapshot_reuses_retired_inputs_for_post_cut_compaction_output() {
+        storage_metrics().reset_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = create_test_schema();
+        let tablet =
+            Arc::new(Tablet::new(1, 100, 1000, schema, dir.path().join("tablet"), None).unwrap());
+
+        let input_a = create_test_rowset(10, Version::singleton(0), tablet.tablet_id());
+        let input_b = create_test_rowset(11, Version::singleton(1), tablet.tablet_id());
+        tablet.add_rowset(input_a.clone()).unwrap();
+        tablet.add_rowset(input_b.clone()).unwrap();
+
+        let output = create_test_rowset(12, Version::new(0, 1), tablet.tablet_id());
+        output.mark_compaction_output(vec![10, 11]);
+        output.make_visible().unwrap();
+
+        tablet
+            .with_meta_lock("test compaction publish", || {
+                tablet.install_compaction_publish_locked(
+                    &[input_a.clone(), input_b.clone()],
+                    &[
+                        RetiredInput {
+                            rowset_id: 10,
+                            version: Version::singleton(0),
+                            rssids: vec![1],
+                        },
+                        RetiredInput {
+                            rowset_id: 11,
+                            version: Version::singleton(1),
+                            rssids: vec![2],
+                        },
+                    ],
+                    output,
+                    7,
+                    CumulativePointAction::Preserve,
+                    false,
+                )
+            })
+            .unwrap();
+
+        let snapshot = tablet
+            .capture_checkpoint_snapshot(1, 0, 0)
+            .expect("checkpoint snapshot should resolve through retired inputs");
+        let rowset_ids: Vec<_> = snapshot
+            .rowsets
+            .iter()
+            .map(|rowset| rowset.rowset_id())
+            .collect();
+        let metrics = storage_metrics().snapshot();
+        assert_eq!(snapshot.freeze_mode, CheckpointTabletFreezeMode::MetaLock);
+        assert_eq!(rowset_ids, vec![10, 11]);
+        assert_eq!(metrics.checkpoint_capture_optimistic_total, 0);
+        assert_eq!(metrics.checkpoint_capture_meta_lock_total, 1);
+        assert_eq!(metrics.checkpoint_capture_retry_total, 0);
+    }
+
+    #[test]
+    fn checkpoint_snapshot_records_optimistic_capture_metrics() {
+        storage_metrics().reset_for_tests();
+        let schema = create_test_schema();
+        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap());
+
+        tablet
+            .add_rowset(create_test_rowset(
+                1,
+                Version::singleton(0),
+                tablet.tablet_id(),
+            ))
+            .unwrap();
+
+        let snapshot = tablet
+            .capture_checkpoint_snapshot(0, 0, 1)
+            .expect("checkpoint snapshot should succeed optimistically");
+        let metrics = storage_metrics().snapshot();
+
+        assert_eq!(snapshot.freeze_mode, CheckpointTabletFreezeMode::Optimistic);
+        assert_eq!(metrics.checkpoint_capture_optimistic_total, 1);
+        assert_eq!(metrics.checkpoint_capture_meta_lock_total, 0);
+        assert_eq!(metrics.checkpoint_capture_retry_total, 0);
     }
 
     #[test]
@@ -2667,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tablet_init_discards_inconsistent_persistent_primary_index() {
+    fn test_tablet_init_rebuilds_primary_index_from_persistent() {
         let tmp = TempDir::new().unwrap();
         let schema = create_test_schema();
         let data_dir = tmp.path().to_string_lossy().to_string();
@@ -2682,77 +2875,7 @@ mod tests {
         let tablet = Tablet::create_from_meta(meta, None).unwrap();
         tablet.init().unwrap();
 
-        assert!(
-            tablet.lookup_primary_key(b"k1").unwrap().is_none(),
-            "persistent primary index is derived state and should be rebuilt from visible rowsets"
-        );
-    }
-
-    #[test]
-    fn test_rebuild_primary_index_from_persistent_when_applied_lsn_lags() {
-        let tmp = TempDir::new().unwrap();
-        let schema = create_test_schema();
-        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), None).unwrap());
-        tablet.init().unwrap();
-
-        let mut writer = crate::write::DeltaWriter::open(tablet.clone(), 10).unwrap();
-        writer
-            .write_chunk(&chunk_with_names(&[1], &["current"]))
-            .unwrap();
-        writer.commit().unwrap();
-
-        tablet.note_applied_lsn(27).unwrap();
-        tablet.persist_primary_index_snapshot().unwrap();
-
-        let serializer =
-            PrimaryKeySerializer::from_schema_ref(&tablet.schema().expect("tablet schema"))
-                .unwrap();
-        let key = serializer
-            .encode_row(&chunk_with_names(&[1], &["ignored"]), 0)
-            .unwrap();
-        let pi_dir = tmp.path().join("primary_index");
-        let mut persistent = PersistentIndex::new(&pi_dir).unwrap();
-        assert_eq!(persistent.applied_lsn(), 27);
-        persistent.set_applied_lsn(3).unwrap();
-
-        assert!(tablet.rebuild_primary_index_from_persistent().unwrap());
-        assert!(tablet.lookup_primary_key(&key).unwrap().is_some());
-
-        let persistent = PersistentIndex::new(&pi_dir).unwrap();
-        assert_eq!(persistent.applied_lsn(), 27);
-    }
-
-    #[test]
-    fn test_rebuild_primary_index_from_persistent_when_applied_lsn_aligned_reuses_snapshot() {
-        let tmp = TempDir::new().unwrap();
-        let schema = create_test_schema();
-        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), None).unwrap());
-        tablet.init().unwrap();
-
-        let mut writer = crate::write::DeltaWriter::open(tablet.clone(), 10).unwrap();
-        writer
-            .write_chunk(&chunk_with_names(&[1], &["current"]))
-            .unwrap();
-        writer.commit().unwrap();
-
-        tablet.note_applied_lsn(27).unwrap();
-        tablet.persist_primary_index_snapshot().unwrap();
-
-        let serializer =
-            PrimaryKeySerializer::from_schema_ref(&tablet.schema().expect("tablet schema"))
-                .unwrap();
-        let key = serializer
-            .encode_row(&chunk_with_names(&[1], &["current"]), 0)
-            .unwrap();
-        let pi_dir = tmp.path().join("primary_index");
-        let persistent = PersistentIndex::new(&pi_dir).unwrap();
-        assert_eq!(persistent.applied_lsn(), 27);
-
-        assert!(!tablet.rebuild_primary_index_from_persistent().unwrap());
-        assert!(tablet.lookup_primary_key(&key).unwrap().is_some());
-
-        let persistent = PersistentIndex::new(&pi_dir).unwrap();
-        assert_eq!(persistent.applied_lsn(), 27);
+        assert!(tablet.lookup_primary_key(b"k1").unwrap().is_some());
     }
 
     #[test]
@@ -2805,10 +2928,105 @@ mod tests {
     }
 
     #[test]
+    fn test_tablet_init_replays_rowset_commit_from_wal() {
+        let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let schema = create_test_schema();
+        let tablet = Tablet::new(
+            1,
+            100,
+            1000,
+            schema.clone(),
+            tmp.path(),
+            Some(manager.clone()),
+        )
+        .unwrap();
+        tablet.init().unwrap();
+        tablet.save_meta().unwrap();
+
+        let rowset_id = 77u64;
+        let rowset_path = tmp.path().join("rowset_replay_commit");
+        let context = RowsetWriterContext::new(
+            schema,
+            tablet.tablet_id(),
+            Version::singleton(0),
+            &rowset_path,
+        )
+        .with_rowset_id(rowset_id);
+        let mut writer = RowsetWriter::create(context).unwrap();
+        writer
+            .add_chunk(&[
+                crate::rowset::segment::ColumnData::new(1i64.to_le_bytes().to_vec(), 1),
+                crate::rowset::segment::ColumnData::new(
+                    {
+                        let mut bytes = Vec::new();
+                        bytes.extend_from_slice(&(3u32).to_le_bytes());
+                        bytes.extend_from_slice(b"abc");
+                        bytes
+                    },
+                    1,
+                ),
+            ])
+            .unwrap();
+        writer.build().unwrap();
+        drop(tablet);
+
+        let wal = WriteAheadLog::new(tmp.path().join("tablet.wal")).unwrap();
+        wal.write_rowset_commit(1, rowset_id, 0, 0, rowset_path.to_string_lossy().as_ref())
+            .unwrap();
+        wal.flush().unwrap();
+
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
+        let rowset = reopened.find_rowset_by_id(rowset_id).unwrap();
+        assert_eq!(rowset.version(), Version::singleton(0));
+        assert_eq!(reopened.max_version(), 0);
+    }
+
+    #[test]
+    fn test_tablet_init_replays_primary_delete_from_wal() {
+        let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let schema = create_test_schema();
+        let tablet =
+            Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), Some(manager.clone())).unwrap());
+        tablet.init().unwrap();
+
+        let mut writer = crate::write::DeltaWriter::open(tablet.clone(), 10).unwrap();
+        writer
+            .write_chunk(&chunk_with_names(&[1], &["old"]))
+            .unwrap();
+        writer.commit().unwrap();
+        tablet.save_meta().unwrap();
+
+        let serializer = PrimaryKeySerializer::from_schema_ref(&tablet.schema().unwrap()).unwrap();
+        let key = serializer
+            .encode_row(&chunk_with_names(&[1], &["ignored"]), 0)
+            .unwrap();
+
+        let wal = WriteAheadLog::new(tmp.path().join("tablet.wal")).unwrap();
+        let entry = WalEntry::PrimaryDelete { keys: vec![key] };
+        wal.writer()
+            .write_entry(entry.wal_type(), &entry.serialize_data())
+            .unwrap();
+        wal.flush().unwrap();
+
+        drop(tablet);
+        let tablet = Tablet::open(1, tmp.path(), manager).unwrap();
+
+        let serializer = PrimaryKeySerializer::from_schema_ref(&tablet.schema().unwrap()).unwrap();
+        let key = serializer
+            .encode_row(&chunk_with_names(&[1], &["ignored"]), 0)
+            .unwrap();
+        assert!(tablet.lookup_primary_key(&key).unwrap().is_none());
+    }
+
+    #[test]
     fn test_tablet_init_rebuilds_current_persistent_index_when_legacy_snapshot_exists() {
         let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
         let schema = create_test_schema();
-        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), None).unwrap());
+        let tablet =
+            Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), Some(manager.clone())).unwrap());
         tablet.init().unwrap();
         tablet.save_meta().unwrap();
 
@@ -2828,7 +3046,7 @@ mod tests {
         std::fs::write(pi_dir.join("sst_1.sst"), b"legacy").unwrap();
         drop(tablet);
 
-        let reopened = Tablet::open(1, tmp.path(), None).unwrap();
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
         let serializer =
             PrimaryKeySerializer::from_schema_ref(&reopened.schema().unwrap()).unwrap();
         let key = serializer
@@ -2853,8 +3071,10 @@ mod tests {
     #[test]
     fn test_tablet_init_repairs_primary_index_from_visible_rowsets() {
         let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
         let schema = create_test_schema();
-        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), None).unwrap());
+        let tablet =
+            Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), Some(manager.clone())).unwrap());
         tablet.init().unwrap();
         tablet.save_meta().unwrap();
 
@@ -2874,7 +3094,7 @@ mod tests {
         persistent.reset().unwrap();
 
         drop(tablet);
-        let reopened = Tablet::open(1, tmp.path(), None).unwrap();
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
         let serializer =
             PrimaryKeySerializer::from_schema_ref(&reopened.schema().unwrap()).unwrap();
         let key = serializer
@@ -2886,6 +3106,57 @@ mod tests {
         assert_eq!(reopened.snapshot_primary_index_entries().unwrap().len(), 1);
         assert_eq!(location.rowset_id, rowset2.rowset_id());
         assert_ne!(location.rowset_id, rowset1.rowset_id());
+    }
+
+    #[test]
+    fn test_tablet_init_replays_row_id_delete_from_wal() {
+        let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let schema = create_test_schema();
+        let data_dir = tmp.path().to_string_lossy().to_string();
+        let meta = TabletMeta::new(1, 100, 1000, schema.clone(), data_dir).unwrap();
+
+        let rowset_id = 1001u64;
+        let rowset_path = tmp.path().join(format!("rowset_{}", rowset_id));
+        std::fs::create_dir_all(&rowset_path).unwrap();
+
+        let tablet = Tablet::create_from_meta(meta, Some(manager.clone())).unwrap();
+        tablet.init().unwrap();
+
+        let rowset_meta = RowsetMeta::new(rowset_id, tablet.tablet_id(), Version::singleton(0));
+        let rowset = Arc::new(
+            crate::rowset::Rowset::create(schema.clone(), rowset_meta, rowset_path.clone())
+                .unwrap(),
+        );
+        tablet.add_rowset(rowset).unwrap();
+        tablet.save_meta().unwrap();
+        drop(tablet);
+
+        // Two RowIdDelete entries for the same segment must be merged during replay.
+        let wal_path = tmp.path().join("tablet.wal");
+        let wal = WriteAheadLog::new(&wal_path).unwrap();
+        let first = WalEntry::RowIdDelete {
+            locations: vec![(rowset_id, 0, 7)],
+        };
+        wal.writer()
+            .write_entry(first.wal_type(), &first.serialize_data())
+            .unwrap();
+        let second = WalEntry::RowIdDelete {
+            locations: vec![(rowset_id, 0, 9)],
+        };
+        wal.writer()
+            .write_entry(second.wal_type(), &second.serialize_data())
+            .unwrap();
+        wal.flush().unwrap();
+
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
+        assert!(reopened.find_rowset_by_id(rowset_id).is_some());
+
+        let dv = crate::primary_key::DeleteVector::load_from_dir(&rowset_path, 0)
+            .unwrap()
+            .unwrap();
+        assert!(dv.is_deleted(7));
+        assert!(dv.is_deleted(9));
     }
 
     fn wait_until_missing(path: &Path) {

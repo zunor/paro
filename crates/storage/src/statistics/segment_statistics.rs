@@ -79,7 +79,7 @@ mod tests {
         let stats = SegmentStatistics::new(LogicalType::Integer);
         assert_eq!(stats.logical_type(), &LogicalType::Integer);
         let base = stats.get();
-        assert!(!base.has_null());
+        assert!(!base.can_have_null());
     }
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
         assert_eq!(stats.logical_type(), &LogicalType::BigInt);
         // Unknown stats have has_null = true
         let retrieved = stats.get();
-        assert!(retrieved.has_null());
+        assert!(retrieved.can_have_null());
     }
 
     #[test]
