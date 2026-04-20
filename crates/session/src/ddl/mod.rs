@@ -589,12 +589,12 @@ impl SessionDdlBridge {
                         key: key.clone(),
                         change: DdlChange::DropIndex(DropIndexPayload { if_exists: false }),
                     },
-                    profile: DdlExecutionProfile::detach_index_runtime(),
+                    profile: DdlExecutionProfile::detach_index_state(),
                     catalog: Some(handle),
                     dependencies,
                     dml_targets: vec![self.table_key(schema_name, index.table_name.clone())],
                     staged_artifacts: Vec::new(),
-                    runtime_transitions: vec![RuntimeTransitionDescriptor::DetachIndexRuntime {
+                    runtime_transitions: vec![RuntimeTransitionDescriptor::DetachIndexState {
                         index: key,
                         table_name: index.table_name.clone(),
                         index_type: index.index_type.as_str().to_string(),
@@ -1482,12 +1482,12 @@ impl DdlApplyContext for SessionDdlBridge {
                         .map(|binding| binding.config.clone()),
                 }),
             },
-            profile: DdlExecutionProfile::attach_index_runtime(),
+            profile: DdlExecutionProfile::attach_index_state(),
             catalog: handle.catalog,
             dependencies: handle.dependencies,
             dml_targets: vec![self.entry_table_key(handle.table.as_ref())],
             staged_artifacts: Vec::new(),
-            runtime_transitions: vec![RuntimeTransitionDescriptor::AttachIndexRuntime {
+            runtime_transitions: vec![RuntimeTransitionDescriptor::AttachIndexState {
                 index: key,
                 table_name: handle.info.table_name.clone(),
                 index_type: handle.info.index_type.as_str().to_string(),

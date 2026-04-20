@@ -1,7 +1,9 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::compaction::execution::index_rebuild::CompactionIndexRebuilder;
+use crate::compaction::execution::index_rebuild::{
+    CompactionGenerationContext, CompactionIndexRebuilder,
+};
 use crate::compaction::plan::types::CompactionPlan;
 use crate::index::hnsw::{
     DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswConfig, HnswIndex,
@@ -499,6 +501,7 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
 
     fn rebuild(
         &self,
+        _generation_context: &CompactionGenerationContext,
         tablet: &Tablet,
         rowset: &RowsetSharedPtr,
         plan: &CompactionPlan,

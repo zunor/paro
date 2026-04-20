@@ -6,8 +6,9 @@
 use super::consistency_report::{
     build_recovery_consistency_report, log_recovery_consistency_report,
 };
-use super::index_restore::{reconcile_fulltext_index_coverage, restore_runtime_art_indexes};
+use super::index_restore::{restore_runtime_art_indexes, restore_search_registry_definitions};
 use crate::checkpoint::runtime::RecordWatermarks;
+use crate::search_registry::{register_search_definition, unregister_search_definition_by_name};
 use paro_catalog::collection::{InstallMode, StagedCatalogMutation};
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{
@@ -219,64 +220,21 @@ impl<'a> CatalogReplayHandler<'a> {
         }
     }
 
-    fn mark_declared_runtime_indexes(
-        storage: &TableHandle,
-        index_type: &str,
-        column_ids: &[u32],
-        fulltext_config: Option<&str>,
-    ) {
-        match IndexType::from_str(index_type) {
-            IndexType::ART => {
-                for column_id in column_ids {
-                    storage.mark_declared_art_index(*column_id);
-                }
-            }
-            IndexType::HNSW => {
-                for column_id in column_ids {
-                    storage.mark_declared_vector_index(*column_id);
-                }
-            }
-            IndexType::Sparse => {
-                for column_id in column_ids {
-                    storage.mark_declared_sparse_index(*column_id);
-                }
-            }
-            IndexType::FullText => {
-                let config = fulltext_config.unwrap_or("simple");
-                for column_id in column_ids {
-                    storage.mark_declared_fulltext_index_with_config(*column_id, config);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn unmark_declared_runtime_indexes(
         storage: &TableHandle,
+        index_name: &str,
         index_type: &str,
         column_ids: &[u32],
     ) -> paro_common::error::Result<()> {
         match IndexType::from_str(index_type) {
             IndexType::ART => {
                 for column_id in column_ids {
-                    storage.unmark_declared_art_index(*column_id);
-                    storage.remove_runtime_art_index(*column_id)?;
+                    storage.forget_art_index(*column_id);
+                    storage.drop_art_index(*column_id)?;
                 }
             }
-            IndexType::HNSW => {
-                for column_id in column_ids {
-                    storage.unmark_declared_vector_index(*column_id);
-                }
-            }
-            IndexType::Sparse => {
-                for column_id in column_ids {
-                    storage.unmark_declared_sparse_index(*column_id);
-                }
-            }
-            IndexType::FullText => {
-                for column_id in column_ids {
-                    storage.unmark_declared_fulltext_index(*column_id);
-                }
+            IndexType::HNSW | IndexType::Sparse | IndexType::FullText => {
+                unregister_search_definition_by_name(storage, index_type, index_name)?;
             }
             _ => {}
         }
@@ -289,12 +247,12 @@ impl<'a> CatalogReplayHandler<'a> {
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
         match transition {
-            RuntimeTransitionDescriptor::AttachIndexRuntime {
+            RuntimeTransitionDescriptor::AttachIndexState {
                 index,
                 table_name,
-                index_type,
-                column_ids,
-                fulltext_config,
+                index_type: _,
+                column_ids: _,
+                fulltext_config: _,
             } => {
                 let schema_name = index.schema.as_deref().ok_or_else(|| {
                     paro_error::serialization_error(
@@ -302,6 +260,16 @@ impl<'a> CatalogReplayHandler<'a> {
                     )
                 })?;
                 let schema = self.ensure_schema(schema_name, commit_id)?;
+                let index_entry = schema
+                    .get_index(
+                        self.transaction.transaction_id,
+                        self.transaction.start_time,
+                        &index.name,
+                    )
+                    .and_then(|entry| match &*entry {
+                        CatalogEntryEnum::Index(index) => Some(index.clone()),
+                        _ => None,
+                    });
                 if let Some(table_entry) = schema.get_table(
                     self.transaction.transaction_id,
                     self.transaction.start_time,
@@ -309,18 +277,15 @@ impl<'a> CatalogReplayHandler<'a> {
                 ) {
                     if let Some(table) = table_entry.as_ref().as_table() {
                         if let Some(storage) = table.get_storage() {
-                            Self::mark_declared_runtime_indexes(
-                                storage.as_ref(),
-                                index_type,
-                                column_ids,
-                                fulltext_config.as_deref(),
-                            );
+                            if let Some(entry) = index_entry.as_ref() {
+                                register_search_definition(storage.as_ref(), entry)?;
+                            }
                         }
                     }
                 }
                 Ok(())
             }
-            RuntimeTransitionDescriptor::DetachIndexRuntime {
+            RuntimeTransitionDescriptor::DetachIndexState {
                 index,
                 table_name,
                 index_type,
@@ -343,6 +308,7 @@ impl<'a> CatalogReplayHandler<'a> {
                             let _ = storage.remove_index(&index.name);
                             Self::unmark_declared_runtime_indexes(
                                 storage.as_ref(),
+                                &index.name,
                                 index_type,
                                 column_ids,
                             )?;
@@ -869,7 +835,7 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
     let replayed_deferred_tasks = handler.drain_replayed_deferred_tasks();
     catalog.rebuild_dependency_graph()?;
     restore_runtime_art_indexes(catalog);
-    reconcile_fulltext_index_coverage(catalog);
+    restore_search_registry_definitions(catalog);
     let report = build_recovery_consistency_report(catalog);
     log_recovery_consistency_report(&report);
     Ok(RecoveryReplayOutcome {
@@ -1206,132 +1172,6 @@ mod tests {
         assert_eq!(index.build_state(), IndexBuildState::Ready);
         assert_eq!(index.base.base.object_id.raw(), 43);
         assert_eq!(index.failure_reason(), None);
-    }
-
-    #[test]
-    fn test_reconcile_fulltext_index_coverage_marks_failed_on_incomplete() {
-        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
-        catalog.initialize(false);
-        ensure_main_schema(&catalog);
-
-        let storage = Arc::new(create_table(&[LogicalType::Varchar]));
-        let columns = vec![ColumnDefinition::new(
-            "content".to_string(),
-            LogicalType::Varchar,
-        )];
-        install_committed_table(&catalog, "main", "docs", columns, Arc::clone(&storage));
-
-        let insert = Chunk::from_vectors(vec![Vector::from_strings(&["vector db"])]);
-        storage.append(&insert).unwrap();
-
-        let txn = CatalogSnapshot::read_only(u64::MAX);
-        let schema = catalog.get_schema(&txn, "main").unwrap();
-        let table_entry = schema
-            .get_table(txn.transaction_id, txn.start_time, "docs")
-            .expect("docs table should exist");
-        let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
-            panic!("expected table entry");
-        };
-        let info = CreateIndexInfo::new(
-            "main".to_string(),
-            "docs".to_string(),
-            "idx_docs_fts".to_string(),
-            vec![LogicalIndex::new(0)],
-            vec![LogicalType::Varchar],
-        )
-        .with_index_type(IndexType::FullText)
-        .with_fulltext_options(LogicalIndex::new(0), "simple")
-        .with_build_state(IndexBuildState::Building);
-        let entry = Arc::new(CatalogEntryEnum::Index(Arc::new(IndexCatalogEntry::new(
-            info,
-            table.base.base.object_id.raw(),
-            0,
-            catalog.name().to_string(),
-        ))));
-        schema
-            .collection(CatalogType::Index)
-            .expect("index collection")
-            .install_committed(entry, InstallMode::RejectExisting)
-            .unwrap();
-
-        reconcile_fulltext_index_coverage(&catalog);
-
-        let entry = schema
-            .get_index(txn.transaction_id, txn.start_time, "idx_docs_fts")
-            .expect("index should exist");
-        let CatalogEntryEnum::Index(index) = entry.as_ref() else {
-            panic!("expected index entry");
-        };
-        assert_eq!(index.build_state(), IndexBuildState::Failed);
-        assert!(
-            index
-                .failure_reason()
-                .unwrap_or_default()
-                .contains("coverage incomplete"),
-            "unexpected failure reason: {:?}",
-            index.failure_reason()
-        );
-    }
-
-    #[test]
-    fn test_reconcile_fulltext_index_coverage_marks_ready_when_complete() {
-        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
-        catalog.initialize(false);
-        ensure_main_schema(&catalog);
-
-        let storage = Arc::new(create_table(&[LogicalType::Varchar]));
-        let columns = vec![ColumnDefinition::new(
-            "content".to_string(),
-            LogicalType::Varchar,
-        )];
-        install_committed_table(&catalog, "main", "docs", columns, Arc::clone(&storage));
-
-        let insert = Chunk::from_vectors(vec![Vector::from_strings(&["vector db"])]);
-        storage.append(&insert).unwrap();
-        storage.build_runtime_fulltext_index(0).unwrap();
-
-        let txn = CatalogSnapshot::read_only(u64::MAX);
-        let schema = catalog.get_schema(&txn, "main").unwrap();
-        let table_entry = schema
-            .get_table(txn.transaction_id, txn.start_time, "docs")
-            .expect("docs table should exist");
-        let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
-            panic!("expected table entry");
-        };
-        let info = CreateIndexInfo::new(
-            "main".to_string(),
-            "docs".to_string(),
-            "idx_docs_fts".to_string(),
-            vec![LogicalIndex::new(0)],
-            vec![LogicalType::Varchar],
-        )
-        .with_index_type(IndexType::FullText)
-        .with_fulltext_options(LogicalIndex::new(0), "simple")
-        .with_build_state(IndexBuildState::Building);
-        let entry = Arc::new(CatalogEntryEnum::Index(Arc::new(IndexCatalogEntry::new(
-            info,
-            table.base.base.object_id.raw(),
-            0,
-            catalog.name().to_string(),
-        ))));
-        schema
-            .collection(CatalogType::Index)
-            .expect("index collection")
-            .install_committed(entry, InstallMode::RejectExisting)
-            .unwrap();
-
-        reconcile_fulltext_index_coverage(&catalog);
-
-        let entry = schema
-            .get_index(txn.transaction_id, txn.start_time, "idx_docs_fts")
-            .expect("index should exist");
-        let CatalogEntryEnum::Index(index) = entry.as_ref() else {
-            panic!("expected index entry");
-        };
-        assert_eq!(index.build_state(), IndexBuildState::Ready);
-        let coverage = index.coverage().expect("coverage should be populated");
-        assert!(coverage.is_complete());
-        assert!(storage.has_fulltext_index_with_config(0, "simple"));
     }
 
     #[test]

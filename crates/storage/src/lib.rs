@@ -33,7 +33,7 @@ pub mod primary_key;
 pub mod row;
 mod rowid_resolver;
 pub mod rowset;
-mod search;
+pub mod search;
 pub mod statistics;
 pub mod table;
 pub mod tablet;

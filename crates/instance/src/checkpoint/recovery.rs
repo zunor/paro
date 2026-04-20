@@ -3,7 +3,7 @@
 
 use super::manifest_store::ManifestStore;
 use super::writers::CatalogWriter;
-use crate::recovery::{reconcile_fulltext_index_coverage, restore_runtime_art_indexes};
+use crate::recovery::{restore_runtime_art_indexes, restore_search_registry_definitions};
 use crate::storage_manager::StorageManager;
 use bincode::Options;
 use parking_lot::RwLock;
@@ -119,24 +119,21 @@ impl CheckpointRecovery {
         let mut skipped_missing = 0usize;
         let mut skipped_unsupported = 0usize;
         let mut needs_art_restore = false;
-        let mut needs_fulltext_reconcile = false;
-
         for task in deferred_tasks {
             if task.completed_lsn.unwrap_or(0) >= task.visible_lsn {
                 continue;
             }
 
             match (&task.task_key.task_kind, &task.task_key.scope) {
-                (DeferredTaskKind::BuildIndexRuntime, DeferredTaskScope::Object(object_id)) => {
+                (DeferredTaskKind::FinalizeIndexState, DeferredTaskScope::Object(object_id)) => {
                     match Self::find_index_type(catalog.as_ref(), &txn, *object_id) {
                         Some(IndexType::ART) => {
                             needs_art_restore = true;
                             actionable += 1;
                         }
-                        Some(IndexType::FullText) => {
-                            needs_fulltext_reconcile = true;
-                            actionable += 1;
-                        }
+                        Some(IndexType::FullText)
+                        | Some(IndexType::Sparse)
+                        | Some(IndexType::HNSW) => actionable += 1,
                         Some(_) => {
                             skipped_unsupported += 1;
                         }
@@ -153,7 +150,7 @@ impl CheckpointRecovery {
                         }
                     }
                 }
-                (DeferredTaskKind::BuildIndexRuntime, _) => {
+                (DeferredTaskKind::FinalizeIndexState, _) => {
                     skipped_unsupported += 1;
                 }
             }
@@ -162,16 +159,13 @@ impl CheckpointRecovery {
         if needs_art_restore {
             restore_runtime_art_indexes(catalog);
         }
-        if needs_fulltext_reconcile {
-            reconcile_fulltext_index_coverage(catalog);
-        }
+        restore_search_registry_definitions(catalog);
 
         if actionable > 0 {
             tracing::info!(
                 target: targets::CHECKPOINT,
                 actionable,
                 needs_art_restore,
-                needs_fulltext_reconcile,
                 skipped_missing,
                 skipped_unsupported,
                 "Checkpoint deferred task progress executed startup redelivery"
@@ -617,10 +611,6 @@ mod tests {
                 "vector db",
             ])]))
             .expect("append docs");
-        fulltext_storage
-            .build_runtime_fulltext_index(0)
-            .expect("build fulltext runtime");
-
         let read_txn = CatalogSnapshot::read_only(u64::MAX);
         let schema = catalog
             .get_schema(&read_txn, "public")
@@ -689,7 +679,7 @@ mod tests {
             &[
                 DeferredTaskProgress {
                     task_key: DeferredTaskKey {
-                        task_kind: DeferredTaskKind::BuildIndexRuntime,
+                        task_kind: DeferredTaskKind::FinalizeIndexState,
                         scope: DeferredTaskScope::Object(art_object_id),
                     },
                     visible_lsn: 10,
@@ -699,7 +689,7 @@ mod tests {
                 },
                 DeferredTaskProgress {
                     task_key: DeferredTaskKey {
-                        task_kind: DeferredTaskKind::BuildIndexRuntime,
+                        task_kind: DeferredTaskKind::FinalizeIndexState,
                         scope: DeferredTaskScope::Object(fulltext_object_id),
                     },
                     visible_lsn: 10,
@@ -709,7 +699,7 @@ mod tests {
                 },
                 DeferredTaskProgress {
                     task_key: DeferredTaskKey {
-                        task_kind: DeferredTaskKind::BuildIndexRuntime,
+                        task_kind: DeferredTaskKind::FinalizeIndexState,
                         scope: DeferredTaskScope::Object(users_object_id),
                     },
                     visible_lsn: 11,
@@ -719,7 +709,7 @@ mod tests {
                 },
                 DeferredTaskProgress {
                     task_key: DeferredTaskKey {
-                        task_kind: DeferredTaskKind::BuildIndexRuntime,
+                        task_kind: DeferredTaskKind::FinalizeIndexState,
                         scope: DeferredTaskScope::Object(art_object_id),
                     },
                     visible_lsn: 13,
@@ -753,10 +743,10 @@ mod tests {
             panic!("expected index entry");
         };
         assert_eq!(fulltext_index.build_state(), IndexBuildState::Ready);
-        assert!(fulltext_index
-            .coverage()
-            .expect("fulltext coverage")
-            .is_complete());
-        assert!(fulltext_storage.has_fulltext_index_with_config(0, "simple"));
+        let coverage = fulltext_index.coverage().expect("fulltext coverage");
+        assert_eq!(coverage.visible_segment_count, 1);
+        assert_eq!(coverage.indexed_segment_count, 0);
+        assert!(!coverage.is_complete());
+        assert!(fulltext_storage.fulltext_capability(0, "simple").is_some());
     }
 }

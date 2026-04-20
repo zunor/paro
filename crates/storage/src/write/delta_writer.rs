@@ -20,6 +20,7 @@ use crate::rowset::{
     rowset_writer::RowsetWriterSavepoint, save_base_rowids, ColumnData, RowsetSharedPtr,
     RowsetWriter, RowsetWriterBuilder, RowsetWriterContext,
 };
+use crate::search::write_path::{materialize_rowset_artifacts, SearchWritePlan};
 use crate::tablet::{
     KeysType, PrimaryIndexUpdate, TabletRef, TabletSchemaRef, TabletState, Version,
 };
@@ -68,6 +69,8 @@ pub struct DeltaWriter {
     partial_base_rowids_by_key: HashMap<Vec<u8>, RowID>,
     /// Base row-id chain for all partial rows flushed to the current rowset.
     partial_base_rowids: Vec<RowID>,
+    /// Durable search artifacts that should be materialized before publish.
+    search_write_plan: SearchWritePlan,
 }
 
 impl std::fmt::Debug for DeltaWriter {
@@ -107,7 +110,16 @@ impl DeltaWriter {
         txn_id: u64,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
-        Self::open_internal(tablet, txn_id, allocator, None)
+        Self::open_internal(tablet, txn_id, allocator, None, SearchWritePlan::default())
+    }
+
+    pub(crate) fn open_with_allocator_and_search_plan(
+        tablet: TabletRef,
+        txn_id: u64,
+        allocator: Arc<dyn Allocator>,
+        search_write_plan: SearchWritePlan,
+    ) -> Result<Self> {
+        Self::open_internal(tablet, txn_id, allocator, None, search_write_plan)
     }
 
     pub fn open_partial_with_allocator(
@@ -116,7 +128,13 @@ impl DeltaWriter {
         partial_update_columns: Vec<usize>,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
-        Self::open_internal(tablet, txn_id, allocator, Some(partial_update_columns))
+        Self::open_internal(
+            tablet,
+            txn_id,
+            allocator,
+            Some(partial_update_columns),
+            SearchWritePlan::default(),
+        )
     }
 
     fn open_internal(
@@ -124,6 +142,7 @@ impl DeltaWriter {
         txn_id: u64,
         allocator: Arc<dyn Allocator>,
         partial_update_columns: Option<Vec<usize>>,
+        search_write_plan: SearchWritePlan,
     ) -> Result<Self> {
         // Tablet must be runnable and have schema.
         let state = tablet.state();
@@ -214,7 +233,24 @@ impl DeltaWriter {
             partial_update_columns,
             partial_base_rowids_by_key: HashMap::new(),
             partial_base_rowids: Vec::new(),
+            search_write_plan,
         })
+    }
+
+    pub(crate) fn ensure_search_write_plan(
+        &mut self,
+        search_write_plan: &SearchWritePlan,
+    ) -> Result<()> {
+        if self.search_write_plan.is_empty() {
+            self.search_write_plan = search_write_plan.clone();
+            return Ok(());
+        }
+        if &self.search_write_plan == search_write_plan {
+            return Ok(());
+        }
+        Err(paro_error::invalid_input(
+            "conflicting search durable write plans for the same transactional writer",
+        ))
     }
 
     /// Version hint for this delta (actual version assigned on rowset_commit).
@@ -802,6 +838,7 @@ impl DeltaWriter {
             .take()
             .ok_or_else(|| paro_error::internal("rowset_writer missing"))?;
         let rowset = writer.build_shared()?;
+        materialize_rowset_artifacts(&rowset, &self.search_write_plan)?;
 
         let primary_update = if self.serializer.is_some() {
             Some(PrimaryIndexUpdate {

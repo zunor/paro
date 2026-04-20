@@ -4,7 +4,7 @@
 use super::*;
 use crate::index::{Predicate, PredicateResult, PredicateTree};
 use crate::rowset::page::CompressionType;
-use crate::table::index_runtime::IndexRuntime;
+use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
 use crate::tablet::TabletSchemaRef;
 use paro_common::runtime_value::Value;
@@ -247,7 +247,7 @@ fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
         PredicateResult::Unknown
     ));
 
-    IndexRuntime::build_runtime_art_index_for_segment(&segment, 0).unwrap();
+    RuntimeIndexes::rebuild_art_index_for_segment(&segment, 0).unwrap();
     assert!(segment.art_index(0).is_some());
 
     let mut art_iter =
@@ -271,7 +271,7 @@ fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
     let value = i32::from_le_bytes(batch[0].1.data[0..4].try_into().unwrap());
     assert_eq!(value, 107);
 
-    segment.remove_runtime_art_index(0);
+    segment.drop_art_index(0);
     assert!(segment.art_index(0).is_none());
 
     let removed_iter =

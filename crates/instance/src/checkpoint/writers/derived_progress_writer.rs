@@ -104,7 +104,7 @@ impl DerivedProgressWriter {
                     IndexBuildState::Ready => {}
                     IndexBuildState::Building => tasks.push(DeferredTaskProgress {
                         task_key: DeferredTaskKey {
-                            task_kind: DeferredTaskKind::BuildIndexRuntime,
+                            task_kind: DeferredTaskKind::FinalizeIndexState,
                             scope: DeferredTaskScope::Object(index.object_id().raw()),
                         },
                         visible_lsn: view.frontier.checkpoint_lsn,
@@ -114,7 +114,7 @@ impl DerivedProgressWriter {
                     }),
                     IndexBuildState::Failed => tasks.push(DeferredTaskProgress {
                         task_key: DeferredTaskKey {
-                            task_kind: DeferredTaskKind::BuildIndexRuntime,
+                            task_kind: DeferredTaskKind::FinalizeIndexState,
                             scope: DeferredTaskScope::Object(index.object_id().raw()),
                         },
                         visible_lsn: view.frontier.checkpoint_lsn,

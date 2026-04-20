@@ -706,6 +706,6 @@ mod tests {
 
     #[test]
     fn join_on_nested_outer_correlation_plans_without_remaining_subquery() {
-        let _ = planned_logical_operator(nested_case_sql("join_on_nested_outer"));
+        assert_planned_probe_succeeds("join_on_nested_outer");
     }
 }

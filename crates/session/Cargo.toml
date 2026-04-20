@@ -31,7 +31,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = "1.7"
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 serial_test = { workspace = true }

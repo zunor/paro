@@ -8,32 +8,27 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{ConjunctionExpression, Expression, ReferenceExpression};
 use paro_planner::operator::Projection as LogicalProjection;
 use paro_planner::operator::{
-    Filter as LogicalFilter, FullTextFilterScan, LogicalOperator, SearchDecision, SearchScan,
-    SearchType, TopN as LogicalTopN,
+    Filter as LogicalFilter, FullTextFilterScan, LogicalOperator, SearchCandidate, SearchDecision,
+    SearchScan, TopN as LogicalTopN,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::index::hnsw::types::{AcornParams, SearchParams, ACORN_MAX_SELECTIVITY_DEFAULT};
+use paro_storage::search::{FullTextIntent, FullTextQueryKind, SearchIntent};
 
 use super::generator::PhysicalPlanGenerator;
-use super::plan_filter::{
-    extract_fulltext_match, fulltext_index_pushdown_ready as fulltext_filter_pushdown_ready,
-};
-use super::plan_topn::{
-    extract_fulltext_score, extract_sparse_vector_distance, extract_vector_distance,
-    fulltext_index_pushdown_ready as fulltext_topk_pushdown_ready,
-    replace_fulltext_score_with_reference,
-};
+use super::plan_topn::replace_fulltext_score_with_reference;
 use super::predicate_builder;
 use crate::operator::filter::Filter as PhysicalFilter;
 use crate::operator::projection::Projection;
-use crate::operator::scan::adaptive_scan::{AdaptiveCandidatePlan, AdaptiveScanOperator};
-use crate::operator::scan::fulltext_scan::{
-    FullTextExecMode, FullTextScanBindData, PhysicalFullTextScan,
+use crate::operator::search::adaptive_search::{
+    AdaptiveSearchCandidatePlan, AdaptiveSearchOperator,
 };
-use crate::operator::scan::sparse_vector_scan::{
-    PhysicalSparseVectorScan, SparseVectorScanBindData,
+use crate::operator::search::fulltext_search::{
+    FullTextExecMode, FullTextQueryKind as ExecFullTextQueryKind, FullTextScanBindData,
+    PhysicalFullTextScan,
 };
-use crate::operator::scan::vector_scan::{PhysicalVectorScan, VectorScanBindData};
+use crate::operator::search::sparse_search::{PhysicalSparseVectorScan, SparseVectorScanBindData};
+use crate::operator::search::vector_search::{PhysicalVectorScan, VectorScanBindData};
 use crate::operator::PhysicalOperator;
 
 impl PhysicalPlanGenerator {
@@ -42,28 +37,35 @@ impl PhysicalPlanGenerator {
         search: &SearchScan,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         match &search.decision {
-            SearchDecision::IndexScan { search_type, .. } => {
-                self.create_search_index_plan(search, search_type)
+            SearchDecision::IndexScan { candidate, .. } => {
+                self.create_search_index_plan(search, candidate)
             }
-            SearchDecision::DeferToRuntime {
+            SearchDecision::Adaptive {
                 candidates,
-                sequential_cost,
+                sequential,
             } => {
-                if let Some(candidate) = best_fulltext_candidate(candidates) {
-                    return self.create_search_index_plan(search, &candidate.search_type);
-                }
                 let sequential_plan = self.create_search_sequential_plan(search)?;
-                let mut candidate_plans = Vec::with_capacity(candidates.len());
-                for candidate in candidates {
-                    candidate_plans.push(AdaptiveCandidatePlan {
-                        label: describe_search_type(&candidate.search_type),
-                        estimated_cost: candidate.estimated_cost,
-                        plan: self.create_search_index_plan(search, &candidate.search_type)?,
-                    });
-                }
-                Ok(Arc::new(AdaptiveScanOperator::new(
+                let sequential_cost = sequential
+                    .estimated_cost
+                    .map(|cost| cost.score)
+                    .unwrap_or(f64::INFINITY);
+                let candidate_plans = candidates
+                    .iter()
+                    .map(|candidate| {
+                        Ok(AdaptiveSearchCandidatePlan {
+                            label: describe_search_candidate(candidate),
+                            estimated_cost: candidate
+                                .estimated_cost()
+                                .map(|cost| cost.score)
+                                .unwrap_or(f64::INFINITY),
+                            prefer_hint: candidate.capability.prefer_hint,
+                            plan: self.create_search_index_plan(search, candidate)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(AdaptiveSearchOperator::new(
                     sequential_plan,
-                    *sequential_cost,
+                    sequential_cost,
                     candidate_plans,
                     search.output_names.clone(),
                 )))
@@ -76,29 +78,35 @@ impl PhysicalPlanGenerator {
         scan: &FullTextFilterScan,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         match &scan.decision {
-            SearchDecision::IndexScan { search_type, .. } => {
-                self.create_fulltext_filter_index_plan(scan, search_type)
+            SearchDecision::IndexScan { candidate, .. } => {
+                self.create_fulltext_filter_index_plan(scan, candidate)
             }
-            SearchDecision::DeferToRuntime {
+            SearchDecision::Adaptive {
                 candidates,
-                sequential_cost,
+                sequential,
             } => {
-                if let Some(candidate) = best_fulltext_candidate(candidates) {
-                    return self.create_fulltext_filter_index_plan(scan, &candidate.search_type);
-                }
                 let sequential_plan = self.create_fulltext_filter_sequential_plan(scan)?;
-                let mut candidate_plans = Vec::with_capacity(candidates.len());
-                for candidate in candidates {
-                    candidate_plans.push(AdaptiveCandidatePlan {
-                        label: describe_search_type(&candidate.search_type),
-                        estimated_cost: candidate.estimated_cost,
-                        plan: self
-                            .create_fulltext_filter_index_plan(scan, &candidate.search_type)?,
-                    });
-                }
-                Ok(Arc::new(AdaptiveScanOperator::new(
+                let sequential_cost = sequential
+                    .estimated_cost
+                    .map(|cost| cost.score)
+                    .unwrap_or(f64::INFINITY);
+                let candidate_plans = candidates
+                    .iter()
+                    .map(|candidate| {
+                        Ok(AdaptiveSearchCandidatePlan {
+                            label: describe_search_candidate(candidate),
+                            estimated_cost: candidate
+                                .estimated_cost()
+                                .map(|cost| cost.score)
+                                .unwrap_or(f64::INFINITY),
+                            prefer_hint: candidate.capability.prefer_hint,
+                            plan: self.create_fulltext_filter_index_plan(scan, candidate)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(AdaptiveSearchOperator::new(
                     sequential_plan,
-                    *sequential_cost,
+                    sequential_cost,
                     candidate_plans,
                     scan.get.names.clone(),
                 )))
@@ -109,32 +117,31 @@ impl PhysicalPlanGenerator {
     fn create_search_index_plan(
         &self,
         search: &SearchScan,
-        search_type: &SearchType,
+        candidate: &SearchCandidate,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        match search_type {
-            SearchType::HnswVector { .. } => self.create_hnsw_index_plan(search),
-            SearchType::SparseVector { .. } => self.create_sparse_index_plan(search),
-            SearchType::FullTextTopK { .. } => self.create_fulltext_topk_index_plan(search),
-            SearchType::FullTextFilter { .. } => Err(paro_error::internal(
-                "FullTextFilter candidate is invalid for SearchScan".to_string(),
-            )),
+        match &candidate.intent {
+            SearchIntent::Hnsw(intent) => self.create_hnsw_index_plan(search, intent, candidate),
+            SearchIntent::Sparse(intent) => {
+                self.create_sparse_index_plan(search, intent, candidate)
+            }
+            SearchIntent::FullText(intent) => {
+                self.create_fulltext_topk_index_plan(search, intent, candidate)
+            }
         }
     }
 
     fn create_fulltext_filter_index_plan(
         &self,
         scan: &FullTextFilterScan,
-        search_type: &SearchType,
+        candidate: &SearchCandidate,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        if !matches!(search_type, SearchType::FullTextFilter { .. }) {
+        let SearchIntent::FullText(intent) = &candidate.intent else {
             return Err(paro_error::internal(format!(
-                "invalid search type for FullTextFilterScan: {:?}",
-                search_type
+                "invalid search intent for FullTextFilterScan: {:?}",
+                candidate.intent
             )));
-        }
+        };
 
-        let match_info = extract_fulltext_match(&scan.match_expression, &scan.get)?
-            .ok_or_else(|| paro_error::internal("failed to extract fulltext filter query"))?;
         let table_entry = scan
             .get
             .get_table()
@@ -143,16 +150,7 @@ impl PhysicalPlanGenerator {
             .get_storage()
             .ok_or_else(|| paro_error::internal("Table storage unavailable for fulltext scan"))?
             .clone();
-        if !fulltext_filter_pushdown_ready(
-            self,
-            table_entry.as_ref(),
-            table_data.as_ref(),
-            &match_info,
-        ) {
-            return Err(paro_error::internal(
-                "FullTextFilterScan produced without a ready fulltext index".to_string(),
-            ));
-        }
+        ensure_planned_capability_still_exists(table_data.as_ref(), candidate)?;
 
         let (predicate_tree, mut residual) =
             predicate_builder::build_predicate_tree(&scan.other_predicates, &scan.get)?;
@@ -167,14 +165,17 @@ impl PhysicalPlanGenerator {
 
         let mut bind = FullTextScanBindData::new(
             table_data,
-            match_info.query_text,
+            intent.query.clone(),
             0,
-            match_info.text_column_id,
+            intent.column_id as usize,
             scan.get.column_ids.clone(),
         )
-        .with_query_options(match_info.query_kind, match_info.config)
-        .with_query_stats(match_info.query_stats)
-        .with_score_mode(match_info.score_mode)
+        .with_query_options(
+            map_fulltext_query_kind(intent.query_kind),
+            intent.config.clone(),
+        )
+        .with_query_stats(intent.query_stats)
+        .with_score_mode(intent.score_mode)
         .with_exec_mode(FullTextExecMode::Filter);
         if let Some(tree) = predicate_tree {
             bind = bind.with_predicates(tree);
@@ -191,12 +192,13 @@ impl PhysicalPlanGenerator {
         apply_physical_filter(base_scan, residual, scan.get.names.clone(), self)
     }
 
-    fn create_hnsw_index_plan(&self, search: &SearchScan) -> Result<Arc<dyn PhysicalOperator>> {
+    fn create_hnsw_index_plan(
+        &self,
+        search: &SearchScan,
+        intent: &paro_storage::search::HnswIntent,
+        candidate: &SearchCandidate,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
         let get = clear_runtime_filters(&search.get);
-        let (vector_col_id, query_vec) = extract_vector_distance(&search.score_expression, &get)?
-            .ok_or_else(|| {
-            paro_error::internal("failed to extract vector search parameters")
-        })?;
         let table_entry = get
             .get_table()
             .ok_or_else(|| paro_error::internal("Get missing table reference for vector scan"))?;
@@ -204,11 +206,7 @@ impl PhysicalPlanGenerator {
             .get_storage()
             .ok_or_else(|| paro_error::internal("Table storage unavailable for vector scan"))?
             .clone();
-        if !table_data.has_vector_index(vector_col_id as u32) {
-            return Err(paro_error::internal(
-                "SearchScan produced without an HNSW index".to_string(),
-            ));
-        }
+        ensure_planned_capability_still_exists(table_data.as_ref(), candidate)?;
 
         let (predicate_tree, mut residual) =
             predicate_builder::build_predicate_tree(&search.absorbed_predicates, &get)?;
@@ -216,9 +214,9 @@ impl PhysicalPlanGenerator {
 
         let mut bind = VectorScanBindData::new(
             table_data,
-            query_vec,
+            intent.query_vector.clone(),
             search.limit,
-            vector_col_id,
+            intent.column_id as usize,
             get.column_ids.clone(),
         );
         if let Some(tree) = predicate_tree {
@@ -248,12 +246,13 @@ impl PhysicalPlanGenerator {
         )))
     }
 
-    fn create_sparse_index_plan(&self, search: &SearchScan) -> Result<Arc<dyn PhysicalOperator>> {
+    fn create_sparse_index_plan(
+        &self,
+        search: &SearchScan,
+        intent: &paro_storage::search::SparseIntent,
+        candidate: &SearchCandidate,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
         let get = clear_runtime_filters(&search.get);
-        let (sparse_col_id, query_vec) =
-            extract_sparse_vector_distance(&search.score_expression, &get)?.ok_or_else(|| {
-                paro_error::internal("failed to extract sparse vector search parameters")
-            })?;
         let table_entry = get
             .get_table()
             .ok_or_else(|| paro_error::internal("Get missing table reference for sparse scan"))?;
@@ -261,11 +260,7 @@ impl PhysicalPlanGenerator {
             .get_storage()
             .ok_or_else(|| paro_error::internal("Table storage unavailable for sparse scan"))?
             .clone();
-        if !table_data.has_sparse_index(sparse_col_id as u32) {
-            return Err(paro_error::internal(
-                "SearchScan produced without a sparse vector index".to_string(),
-            ));
-        }
+        ensure_planned_capability_still_exists(table_data.as_ref(), candidate)?;
 
         let (predicate_tree, mut residual) =
             predicate_builder::build_predicate_tree(&search.absorbed_predicates, &get)?;
@@ -273,9 +268,9 @@ impl PhysicalPlanGenerator {
 
         let mut bind = SparseVectorScanBindData::new(
             table_data,
-            query_vec,
+            intent.query_vector.clone(),
             search.limit,
-            sparse_col_id,
+            intent.column_id as usize,
             get.column_ids.clone(),
         );
         if let Some(tree) = predicate_tree {
@@ -300,10 +295,10 @@ impl PhysicalPlanGenerator {
     fn create_fulltext_topk_index_plan(
         &self,
         search: &SearchScan,
+        intent: &FullTextIntent,
+        candidate: &SearchCandidate,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         let get = clear_runtime_filters(&search.get);
-        let score_info = extract_fulltext_score(&search.score_expression, &get)?
-            .ok_or_else(|| paro_error::internal("failed to extract fulltext search parameters"))?;
         let table_entry = get
             .get_table()
             .ok_or_else(|| paro_error::internal("Get missing table reference for fulltext scan"))?;
@@ -311,16 +306,7 @@ impl PhysicalPlanGenerator {
             .get_storage()
             .ok_or_else(|| paro_error::internal("Table storage unavailable for fulltext scan"))?
             .clone();
-        if !fulltext_topk_pushdown_ready(
-            self,
-            table_entry.as_ref(),
-            table_data.as_ref(),
-            &score_info,
-        ) {
-            return Err(paro_error::internal(
-                "SearchScan produced without a ready fulltext index".to_string(),
-            ));
-        }
+        ensure_planned_capability_still_exists(table_data.as_ref(), candidate)?;
 
         let (predicate_tree, mut residual) =
             predicate_builder::build_predicate_tree(&search.absorbed_predicates, &get)?;
@@ -328,14 +314,17 @@ impl PhysicalPlanGenerator {
 
         let mut bind = FullTextScanBindData::new(
             table_data,
-            score_info.query_text,
+            intent.query.clone(),
             search.limit,
-            score_info.text_column_id,
+            intent.column_id as usize,
             get.column_ids.clone(),
         )
-        .with_query_options(score_info.query_kind, score_info.config)
-        .with_query_stats(score_info.query_stats)
-        .with_score_mode(score_info.score_mode)
+        .with_query_options(
+            map_fulltext_query_kind(intent.query_kind),
+            intent.config.clone(),
+        )
+        .with_query_stats(intent.query_stats)
+        .with_score_mode(intent.score_mode)
         .with_exec_mode(FullTextExecMode::ScoreTopK)
         .with_emit_score(true);
         if let Some(tree) = predicate_tree {
@@ -459,36 +448,44 @@ fn apply_physical_filter(
     Ok(generator.annotate_schema(filter, generator.passthrough_schema(&child, output_names)))
 }
 
-fn describe_search_type(search_type: &SearchType) -> String {
-    match search_type {
-        SearchType::HnswVector { .. } => "hnsw_vector".to_string(),
-        SearchType::SparseVector { .. } => "sparse_vector".to_string(),
-        SearchType::FullTextTopK {
-            score_mode,
-            query_stats,
-            ..
-        } => format!(
-            "fulltext_topk(score_mode={}, query_terms={})",
-            score_mode.as_str(),
-            query_stats.effective_query_terms()
-        ),
-        SearchType::FullTextFilter { query_stats, .. } => format!(
-            "fulltext_filter(query_terms={})",
-            query_stats.effective_query_terms()
-        ),
+fn ensure_planned_capability_still_exists(
+    table_data: &paro_storage::table::table_handle::TableHandle,
+    candidate: &SearchCandidate,
+) -> Result<()> {
+    let Some(capability) = table_data.search_capability(&candidate.intent) else {
+        return Err(paro_error::internal(format!(
+            "planned search capability is no longer queryable: {:?}",
+            candidate.intent
+        )));
+    };
+    if !capability.is_queryable() {
+        return Err(paro_error::internal(format!(
+            "planned search capability lost queryable coverage: {:?}",
+            candidate.intent
+        )));
+    }
+    Ok(())
+}
+
+fn map_fulltext_query_kind(query_kind: FullTextQueryKind) -> ExecFullTextQueryKind {
+    match query_kind {
+        FullTextQueryKind::Legacy => ExecFullTextQueryKind::Legacy,
+        FullTextQueryKind::TsQuery => ExecFullTextQueryKind::TsQuery,
+        FullTextQueryKind::Plain => ExecFullTextQueryKind::Plain,
+        FullTextQueryKind::Phrase => ExecFullTextQueryKind::Phrase,
+        FullTextQueryKind::WebSearch => ExecFullTextQueryKind::WebSearch,
     }
 }
 
-fn best_fulltext_candidate<'a>(
-    candidates: &'a [paro_planner::operator::SearchCandidate],
-) -> Option<&'a paro_planner::operator::SearchCandidate> {
-    candidates
-        .iter()
-        .filter(|candidate| {
-            matches!(
-                candidate.search_type,
-                SearchType::FullTextTopK { .. } | SearchType::FullTextFilter { .. }
-            )
-        })
-        .min_by(|left, right| left.estimated_cost.total_cmp(&right.estimated_cost))
+fn describe_search_candidate(candidate: &SearchCandidate) -> String {
+    match &candidate.intent {
+        SearchIntent::Hnsw(intent) => format!("hnsw_vector(column_id={})", intent.column_id),
+        SearchIntent::Sparse(intent) => format!("sparse_vector(column_id={})", intent.column_id),
+        SearchIntent::FullText(intent) => format!(
+            "fulltext(column_id={}, score_mode={}, query_terms={})",
+            intent.column_id,
+            intent.score_mode.as_str(),
+            intent.query_stats.effective_query_terms()
+        ),
+    }
 }

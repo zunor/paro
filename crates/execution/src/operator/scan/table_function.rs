@@ -34,6 +34,7 @@ use crate::operator::{OrderPreservationType, PhysicalOperator};
 use crate::operator_type::PhysicalOperatorType;
 use crate::result_type::SourceResultType;
 use paro_storage::index::graph::GraphStatsProvider;
+use paro_storage::search::SearchIndexKind;
 use serde_json::json;
 
 /// Bind data for table function execution.
@@ -1201,9 +1202,16 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                         .and_then(|table| table.get_storage())
                                         .and_then(|storage| {
                                             idx.fulltext_binding().and_then(|binding| {
-                                                storage.fulltext_index_statistics(
-                                                    binding.column_id.index,
-                                                )
+                                                storage
+                                                    .fulltext_capability(
+                                                        binding.column_id.index,
+                                                        &binding.config,
+                                                    )
+                                                    .and_then(|capability| {
+                                                        capability
+                                                            .generation_stats
+                                                            .fulltext_index_statistics()
+                                                    })
                                             })
                                         });
                                     if let Some(stats) = stats {
@@ -1345,12 +1353,14 @@ fn populate_paro_storage_info(
                     .get(meta.column_id as usize)
                     .map(|column| column.logical_type.to_string())
                     .unwrap_or_else(|| "UNKNOWN".to_string());
+                let rowset_id = rowset.rowset_id();
+                let segment_id = segment.segment_id();
                 entries.push(StorageInfoData {
                     database_name: database_name.clone(),
                     schema_name: schema_name.clone(),
                     table_name: table.base.base.name.clone(),
-                    rowset_id: rowset.rowset_id().min(i64::MAX as u64) as i64,
-                    segment_id: segment.segment_id() as i64,
+                    rowset_id: rowset_id.min(i64::MAX as u64) as i64,
+                    segment_id: segment_id as i64,
                     column_id: meta.column_id as i64,
                     column_name,
                     column_type,
@@ -1370,9 +1380,27 @@ fn populate_paro_storage_info(
                     max_value: base_stats
                         .and_then(|stats| stats.max_value())
                         .map(|value| value.to_string()),
-                    has_hnsw_index: segment.hnsw_index(meta.column_id).is_some(),
-                    has_sparse_index: segment.sparse_index(meta.column_id).is_some(),
-                    has_fulltext_index: segment.fulltext_index(meta.column_id).is_some(),
+                    has_hnsw_index: segment.hnsw_index(meta.column_id).is_some()
+                        || storage.has_queryable_search_artifact(
+                            SearchIndexKind::Hnsw,
+                            rowset_id,
+                            segment_id,
+                            meta.column_id,
+                        ),
+                    has_sparse_index: segment.sparse_index(meta.column_id).is_some()
+                        || storage.has_queryable_search_artifact(
+                            SearchIndexKind::Sparse,
+                            rowset_id,
+                            segment_id,
+                            meta.column_id,
+                        ),
+                    has_fulltext_index: segment.fulltext_index(meta.column_id).is_some()
+                        || storage.has_queryable_search_artifact(
+                            SearchIndexKind::FullText,
+                            rowset_id,
+                            segment_id,
+                            meta.column_id,
+                        ),
                 });
             }
         }

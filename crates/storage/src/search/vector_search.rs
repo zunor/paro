@@ -1,317 +1,321 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BinaryHeap;
+use std::sync::Arc;
+use std::time::Instant;
 
-use crate::codec::vector_decoder;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{DistanceMetric, PreparedQuery};
 use crate::index::PredicateTree;
-use crate::rowset::SegmentSharedPtr;
-use crate::search::row_projection::{materialize_results, snapshot_epoch, ScoredRowRef};
-use crate::tablet::{ColumnId, TabletReadGuard, TabletRef};
-use paro_common::chunk::Chunk;
+use crate::search::capability::SearchIndexKind;
+use crate::search::cursor::{
+    OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
+};
+use crate::search::row_fetch::snapshot_epoch;
+use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
+use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
+use crate::search::telemetry::{
+    GenerationTelemetryEvent, NoopSearchTelemetryCollector, QueryTelemetryEvent,
+    SearchTelemetryCollector,
+};
+use crate::search::topk_merge::{ranked_rows_to_batch, RankedRow, TopKCollector};
+use crate::tablet::{ColumnId, TabletRef};
 use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use rayon::prelude::*;
 
-pub(crate) fn vector_search(
-    tablet: &TabletRef,
-    column_types: &[LogicalType],
+use super::budget::{ResourceBudget, SearchBatchConfig};
+use super::cursor::PhysicalRowRef;
+
+pub(crate) struct VectorSearchProvider {
+    tablet: TabletRef,
+    column_types: Vec<LogicalType>,
     column_id: usize,
-    query: &[f32],
+    query: Vec<f32>,
     k: usize,
-    params: &SearchParams,
-    predicate: Option<&PredicateTree>,
-    projected_columns: &[usize],
-    use_parallel: bool,
-) -> Result<Vec<Chunk>> {
-    if k == 0 {
-        return Ok(Vec::new());
-    }
-
-    let vector_dim = resolve_vector_dim(column_types, column_id)?;
-    validate_query_dim(query, vector_dim)?;
-    let distance = resolve_distance_metric(tablet, column_id);
-    let fallback_query = distance.prepare(query);
-    let (snapshot_epoch, _snapshot, segments) = load_visible_segments(tablet)?;
-
-    let storage_col_id = column_id as u32;
-    let per_segment_results: Vec<Vec<ScoredRowRef>> = if use_parallel {
-        segments
-            .par_iter()
-            .map(|segment| {
-                vector_search_on_segment(
-                    segment,
-                    storage_col_id,
-                    query,
-                    k,
-                    params,
-                    predicate,
-                    snapshot_epoch,
-                    vector_dim,
-                    distance,
-                    &fallback_query,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        let mut results = Vec::with_capacity(segments.len());
-        for segment in &segments {
-            results.push(vector_search_on_segment(
-                segment,
-                storage_col_id,
-                query,
-                k,
-                params,
-                predicate,
-                snapshot_epoch,
-                vector_dim,
-                distance,
-                &fallback_query,
-            )?);
-        }
-        results
-    };
-
-    let final_order = merge_segment_top_k(per_segment_results, k);
-
-    materialize_results(tablet, column_types, final_order, projected_columns, false)
+    params: SearchParams,
+    predicate: Option<PredicateTree>,
+    telemetry: Arc<dyn SearchTelemetryCollector>,
 }
 
-pub(crate) fn vector_search_many(
-    tablet: &TabletRef,
-    column_types: &[LogicalType],
-    column_id: usize,
-    queries: &[&[f32]],
-    k: usize,
-    params: &SearchParams,
-    predicate: Option<&PredicateTree>,
-    projected_columns: &[usize],
-    use_parallel: bool,
-) -> Result<Vec<Vec<Chunk>>> {
-    if queries.is_empty() {
-        return Ok(Vec::new());
-    }
-    if k == 0 {
-        return Ok(vec![Vec::new(); queries.len()]);
-    }
-
-    let vector_dim = resolve_vector_dim(column_types, column_id)?;
-    validate_query_dims(queries, vector_dim)?;
-    let distance = resolve_distance_metric(tablet, column_id);
-    let prepared_queries: Vec<PreparedQuery> = queries
-        .iter()
-        .map(|query| distance.prepare(query))
-        .collect();
-    let (snapshot_epoch, _snapshot, segments) = load_visible_segments(tablet)?;
-
-    let storage_col_id = column_id as u32;
-    let per_segment_results: Vec<Vec<Vec<ScoredRowRef>>> = if use_parallel {
-        segments
-            .par_iter()
-            .map(|segment| {
-                vector_search_many_on_segment(
-                    segment,
-                    storage_col_id,
-                    &prepared_queries,
-                    k,
-                    params,
-                    predicate,
-                    snapshot_epoch,
-                    vector_dim,
-                    distance,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        let mut results = Vec::with_capacity(segments.len());
-        for segment in &segments {
-            results.push(vector_search_many_on_segment(
-                segment,
-                storage_col_id,
-                &prepared_queries,
-                k,
-                params,
-                predicate,
-                snapshot_epoch,
-                vector_dim,
-                distance,
-            )?);
+impl VectorSearchProvider {
+    pub(crate) fn new(
+        tablet: TabletRef,
+        column_types: &[LogicalType],
+        column_id: usize,
+        query: &[f32],
+        k: usize,
+        params: SearchParams,
+        predicate: Option<PredicateTree>,
+    ) -> Self {
+        Self {
+            tablet,
+            column_types: column_types.to_vec(),
+            column_id,
+            query: query.to_vec(),
+            k,
+            params,
+            predicate,
+            telemetry: Arc::new(NoopSearchTelemetryCollector),
         }
-        results
-    };
+    }
 
-    let final_orders = merge_segment_top_k_many(per_segment_results, k, prepared_queries.len());
-    final_orders
-        .into_iter()
-        .map(|final_order| {
-            materialize_results(tablet, column_types, final_order, projected_columns, false)
+    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> Result<OpenedSearchCursor> {
+        if self.k == 0 {
+            return Ok(OpenedSearchCursor {
+                snapshot,
+                cursor: Box::new(ExhaustedVectorCursor),
+            });
+        }
+
+        let vector_dim = resolve_vector_dim(&self.column_types, self.column_id)?;
+        validate_query_dim(&self.query, vector_dim)?;
+        let distance = resolve_distance_metric(&self.tablet, self.column_id);
+        let prepared_query = distance.prepare(&self.query);
+        let cursor = VectorSearchCursor {
+            snapshot: snapshot.clone(),
+            tablet: self.tablet,
+            query: self.query,
+            prepared_query,
+            k: self.k,
+            storage_col_id: self.column_id as u32,
+            vector_dim,
+            distance,
+            params: self.params,
+            predicate: self.predicate,
+            telemetry: self.telemetry,
+            state: VectorCursorState::Pending,
+        };
+        Ok(OpenedSearchCursor {
+            snapshot,
+            cursor: Box::new(cursor),
         })
-        .collect()
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn vector_search_on_segment(
-    segment: &SegmentSharedPtr,
-    storage_col_id: u32,
-    query: &[f32],
+#[derive(Debug)]
+struct ExhaustedVectorCursor;
+
+impl SearchCursor for ExhaustedVectorCursor {
+    fn next_batch(
+        &mut self,
+        _batch: &SearchBatchConfig,
+        _budget: &mut ResourceBudget,
+    ) -> Result<SearchBatchState> {
+        Ok(SearchBatchState::Exhausted)
+    }
+}
+
+#[derive(Debug)]
+enum VectorCursorState {
+    Pending,
+    Ready { rows: Vec<RankedRow>, offset: usize },
+    Exhausted,
+}
+
+struct VectorSearchCursor {
+    snapshot: SearchReadSnapshot,
+    tablet: TabletRef,
+    query: Vec<f32>,
+    prepared_query: PreparedQuery,
     k: usize,
-    params: &SearchParams,
-    predicate: Option<&PredicateTree>,
-    snapshot_epoch: u64,
+    storage_col_id: u32,
     vector_dim: usize,
     distance: DistanceMetric,
-    prepared_query: &PreparedQuery,
-) -> Result<Vec<ScoredRowRef>> {
-    if segment.hnsw_index(storage_col_id).is_some() {
-        return segment
-            .vector_search_with_epoch(storage_col_id, query, k, params, snapshot_epoch, predicate)
-            .map(|results| {
-                results
-                    .into_iter()
-                    .map(|point| ScoredRowRef {
-                        score: point.score,
-                        segment: segment.clone(),
-                        row_id: point.idx as u32,
-                    })
-                    .collect()
-            });
-    }
+    params: SearchParams,
+    predicate: Option<PredicateTree>,
+    telemetry: Arc<dyn SearchTelemetryCollector>,
+    state: VectorCursorState,
+}
 
-    let delete_vector = segment.load_delete_vector_with_epoch(snapshot_epoch)?;
-    let mut fallback_iter =
-        crate::rowset::segment::SegmentIterator::new_with_delete_vector_and_predicate(
-            segment.as_ref(),
-            vec![storage_col_id],
-            delete_vector,
-            predicate.cloned(),
+impl std::fmt::Debug for VectorSearchCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorSearchCursor")
+            .field("storage_col_id", &self.storage_col_id)
+            .field("vector_dim", &self.vector_dim)
+            .field("k", &self.k)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl VectorSearchCursor {
+    fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
+        let started_at = Instant::now();
+        self.telemetry.record_generation(GenerationTelemetryEvent {
+            kind: SearchIndexKind::Hnsw,
+            definition_id: self.snapshot.generation.definition_id,
+            generation_id: self.snapshot.generation.generation_id,
+            build_epoch: self.snapshot.generation.build_epoch,
+            coverage: self.snapshot.generation.coverage.clone(),
+            artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
+        });
+        let per_segment = dispatch_segments(
+            SearchIndexKind::Hnsw,
+            self.snapshot.table_lease.visible_segments(),
+            budget.parallelism_slots.max(1),
+            self.telemetry.as_ref(),
+            |segment| {
+                let (rows, degraded) = self.search_segment(segment)?;
+                Ok(SegmentDispatchResult {
+                    candidates_produced: rows.len(),
+                    degraded,
+                    output: (rows, degraded),
+                })
+            },
         )?;
-    let mut fallback_vector = vec![0.0f32; vector_dim];
-    let mut min_heap: BinaryHeap<std::cmp::Reverse<ScoredRowRef>> = BinaryHeap::new();
 
-    while fallback_iter.has_next() {
-        let (row_ids, columns) = fallback_iter.next_batch(1024)?;
-        if row_ids.is_empty() {
-            break;
+        let mut collector = TopKCollector::new(self.k);
+        let mut candidates_produced = 0usize;
+        let mut degraded_segments = 0usize;
+        for (rows, degraded) in per_segment {
+            candidates_produced += rows.len();
+            degraded_segments += usize::from(degraded);
+            collector.extend(rows);
         }
-        let Some((_, batch)) = columns.first() else {
-            continue;
-        };
-        let bytes = &batch.data;
-
-        for (i, row_id) in row_ids.iter().enumerate() {
-            if vector_decoder::decode_f32_array_row(
-                bytes.as_ref(),
-                i,
-                vector_dim,
-                &mut fallback_vector,
-            )
-            .is_err()
-            {
-                continue;
-            }
-            let point = ScoredRowRef {
-                score: distance.similarity(prepared_query.as_slice(), &fallback_vector),
-                segment: segment.clone(),
-                row_id: *row_id,
-            };
-
-            push_top_k(&mut min_heap, point, k);
-        }
+        let peak_heap_items = collector.len();
+        let ranked_rows = collector.into_sorted_rows();
+        self.telemetry.record_query(QueryTelemetryEvent {
+            kind: SearchIndexKind::Hnsw,
+            segments_searched: self.snapshot.table_lease.visible_segment_count(),
+            candidates_produced,
+            rows_returned: ranked_rows.len(),
+            peak_heap_items,
+            degraded_segments,
+            elapsed: started_at.elapsed(),
+        });
+        Ok(ranked_rows)
     }
 
-    Ok(heap_into_sorted_vec(min_heap))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn vector_search_many_on_segment(
-    segment: &SegmentSharedPtr,
-    storage_col_id: u32,
-    prepared_queries: &[PreparedQuery],
-    k: usize,
-    params: &SearchParams,
-    predicate: Option<&PredicateTree>,
-    snapshot_epoch: u64,
-    vector_dim: usize,
-    distance: DistanceMetric,
-) -> Result<Vec<Vec<ScoredRowRef>>> {
-    if prepared_queries.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if segment.hnsw_index(storage_col_id).is_some() {
-        return segment
-            .vector_search_batch_with_epoch(
-                storage_col_id,
-                prepared_queries,
-                k,
-                params,
-                snapshot_epoch,
-                predicate,
-            )
-            .map(|results| {
-                results
-                    .into_iter()
-                    .map(|query_results| {
-                        query_results
-                            .into_iter()
-                            .map(|point| ScoredRowRef {
-                                score: point.score,
-                                segment: segment.clone(),
-                                row_id: point.idx as u32,
+    fn search_segment(&self, visible_segment: &VisibleSegment) -> Result<(Vec<RankedRow>, bool)> {
+        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
+        if visible_segment
+            .segment
+            .hnsw_index(self.storage_col_id)
+            .is_some()
+        {
+            return visible_segment
+                .segment
+                .vector_search_with_epoch(
+                    self.storage_col_id,
+                    &self.query,
+                    self.k,
+                    &self.params,
+                    snapshot_version,
+                    self.predicate.as_ref(),
+                )
+                .map(|rows| {
+                    (
+                        rows.into_iter()
+                            .map(|point| {
+                                RankedRow::new(
+                                    PhysicalRowRef::new(
+                                        visible_segment.rowset_id,
+                                        visible_segment.segment_id,
+                                        point.idx as u32,
+                                    ),
+                                    point.score,
+                                )
                             })
-                            .collect()
-                    })
-                    .collect()
-            });
-    }
-
-    let delete_vector = segment.load_delete_vector_with_epoch(snapshot_epoch)?;
-    let mut fallback_iter =
-        crate::rowset::segment::SegmentIterator::new_with_delete_vector_and_predicate(
-            segment.as_ref(),
-            vec![storage_col_id],
-            delete_vector,
-            predicate.cloned(),
-        )?;
-    let mut fallback_vector = vec![0.0f32; vector_dim];
-    let mut min_heaps: Vec<BinaryHeap<std::cmp::Reverse<ScoredRowRef>>> =
-        prepared_queries.iter().map(|_| BinaryHeap::new()).collect();
-
-    while fallback_iter.has_next() {
-        let (row_ids, columns) = fallback_iter.next_batch(1024)?;
-        if row_ids.is_empty() {
-            break;
+                            .collect(),
+                        false,
+                    )
+                });
         }
-        let Some((_, batch)) = columns.first() else {
-            continue;
-        };
-        let bytes = &batch.data;
 
-        for (i, row_id) in row_ids.iter().enumerate() {
-            if vector_decoder::decode_f32_array_row(
-                bytes.as_ref(),
-                i,
-                vector_dim,
-                &mut fallback_vector,
-            )
-            .is_err()
-            {
+        let row_ids = visible_row_ids(
+            visible_segment,
+            self.snapshot.table.visible_version,
+            self.predicate.as_ref(),
+        )?;
+        if row_ids.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let resolved = resolve_logical_rows(
+            &self.tablet,
+            self.snapshot.table.visible_version,
+            visible_segment,
+            &row_ids,
+            self.storage_col_id,
+        )?;
+        let column = resolved
+            .column(0)
+            .ok_or_else(|| paro_error::internal("resolved vector tail chunk missing column"))?;
+        let mut collector = TopKCollector::new(self.k);
+        let mut decoded = vec![0.0_f32; self.vector_dim];
+        for (offset, row_id) in row_ids.iter().copied().enumerate() {
+            let value = column.get_value(offset);
+            let Value::Array(values, _, _) = value else {
+                continue;
+            };
+            if values.len() != self.vector_dim {
                 continue;
             }
-            for (query_idx, prepared_query) in prepared_queries.iter().enumerate() {
-                let point = ScoredRowRef {
-                    score: distance.similarity(prepared_query.as_slice(), &fallback_vector),
-                    segment: segment.clone(),
-                    row_id: *row_id,
+            for (idx, value) in values.into_iter().enumerate() {
+                decoded[idx] = match value {
+                    Value::Float(v) => v,
+                    Value::Double(v) => v as f32,
+                    Value::TinyInt(v) => v as f32,
+                    Value::SmallInt(v) => v as f32,
+                    Value::Integer(v) => v as f32,
+                    Value::BigInt(v) => v as f32,
+                    Value::UTinyInt(v) => v as f32,
+                    Value::USmallInt(v) => v as f32,
+                    Value::UInteger(v) => v as f32,
+                    Value::UBigInt(v) => v as f32,
+                    _ => continue,
                 };
-                push_top_k(&mut min_heaps[query_idx], point, k);
+            }
+            collector.push(RankedRow::new(
+                PhysicalRowRef::new(
+                    visible_segment.rowset_id,
+                    visible_segment.segment_id,
+                    row_id,
+                ),
+                self.distance
+                    .similarity(self.prepared_query.as_slice(), &decoded),
+            ));
+        }
+
+        Ok((collector.into_sorted_rows(), true))
+    }
+}
+
+impl SearchCursor for VectorSearchCursor {
+    fn next_batch(
+        &mut self,
+        batch: &SearchBatchConfig,
+        budget: &mut ResourceBudget,
+    ) -> Result<SearchBatchState> {
+        if matches!(self.state, VectorCursorState::Pending) {
+            let ranked_rows = self.build_ranked_rows(budget)?;
+            self.state = if ranked_rows.is_empty() {
+                VectorCursorState::Exhausted
+            } else {
+                VectorCursorState::Ready {
+                    rows: ranked_rows,
+                    offset: 0,
+                }
+            };
+        }
+
+        match &mut self.state {
+            VectorCursorState::Pending => Err(paro_error::internal(
+                "vector cursor did not transition out of pending state",
+            )),
+            VectorCursorState::Exhausted => Ok(SearchBatchState::Exhausted),
+            VectorCursorState::Ready { rows, offset } => {
+                let row_limit = batch.row_limit.max(1);
+                let end = (*offset + row_limit).min(rows.len());
+                let candidate_batch = ranked_rows_to_batch(rows[*offset..end].to_vec());
+                *offset = end;
+                if *offset >= rows.len() {
+                    self.state = VectorCursorState::Exhausted;
+                }
+                Ok(SearchBatchState::Ready(candidate_batch))
             }
         }
     }
-
-    Ok(min_heaps.into_iter().map(heap_into_sorted_vec).collect())
 }
 
 fn resolve_vector_dim(column_types: &[LogicalType], column_id: usize) -> Result<usize> {
@@ -335,92 +339,13 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_query_dims(queries: &[&[f32]], vector_dim: usize) -> Result<()> {
-    for (idx, query) in queries.iter().enumerate() {
-        if query.len() != vector_dim {
-            return Err(paro_error::invalid_input(format!(
-                "query[{idx}] dimension mismatch: expected {}, got {}",
-                vector_dim,
-                query.len()
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn resolve_distance_metric(tablet: &TabletRef, column_id: usize) -> DistanceMetric {
     tablet
         .schema()
         .and_then(|schema| {
             schema
                 .column_by_id(column_id as ColumnId)
-                .map(|col| DistanceMetric::from_u8(col.hnsw_distance))
+                .map(|column| DistanceMetric::from_u8(column.hnsw_distance))
         })
         .unwrap_or(DistanceMetric::Euclidean)
-}
-
-fn load_visible_segments(
-    tablet: &TabletRef,
-) -> Result<(u64, TabletReadGuard, Vec<SegmentSharedPtr>)> {
-    let version = tablet.max_version();
-    let snapshot = TabletReadGuard::pin(tablet, version);
-    let rowsets = tablet.capture_consistent_rowsets(version)?;
-    let mut segments = Vec::new();
-    for rowset in &rowsets {
-        rowset.load()?;
-        segments.extend(rowset.segments());
-    }
-    Ok((snapshot_epoch(version), snapshot, segments))
-}
-
-fn push_top_k(
-    min_heap: &mut BinaryHeap<std::cmp::Reverse<ScoredRowRef>>,
-    point: ScoredRowRef,
-    k: usize,
-) {
-    if min_heap.len() < k {
-        min_heap.push(std::cmp::Reverse(point));
-    } else if let Some(peek) = min_heap.peek() {
-        if point > peek.0 {
-            min_heap.pop();
-            min_heap.push(std::cmp::Reverse(point));
-        }
-    }
-}
-
-fn heap_into_sorted_vec(
-    min_heap: BinaryHeap<std::cmp::Reverse<ScoredRowRef>>,
-) -> Vec<ScoredRowRef> {
-    min_heap
-        .into_sorted_vec()
-        .into_iter()
-        .map(|entry| entry.0)
-        .collect()
-}
-
-fn merge_segment_top_k(per_segment_results: Vec<Vec<ScoredRowRef>>, k: usize) -> Vec<ScoredRowRef> {
-    let mut min_heap = BinaryHeap::new();
-    for segment_results in per_segment_results {
-        for point in segment_results {
-            push_top_k(&mut min_heap, point, k);
-        }
-    }
-    heap_into_sorted_vec(min_heap)
-}
-
-fn merge_segment_top_k_many(
-    per_segment_results: Vec<Vec<Vec<ScoredRowRef>>>,
-    k: usize,
-    num_queries: usize,
-) -> Vec<Vec<ScoredRowRef>> {
-    let mut heaps: Vec<BinaryHeap<std::cmp::Reverse<ScoredRowRef>>> =
-        (0..num_queries).map(|_| BinaryHeap::new()).collect();
-    for segment_results in per_segment_results {
-        for (query_idx, query_results) in segment_results.into_iter().enumerate() {
-            for point in query_results {
-                push_top_k(&mut heaps[query_idx], point, k);
-            }
-        }
-    }
-    heaps.into_iter().map(heap_into_sorted_vec).collect()
 }

@@ -1,9 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Physical full-text scan operator.
-//!
-//! Performs full-text search using the full-text index and fetches the resulting rows.
+//! Physical full-text scan operator backed by a storage-owned search cursor.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -13,6 +11,10 @@ use paro_common::error::Result;
 use paro_common::types::LogicalType;
 
 use crate::execution_context::ExecutionContext;
+use crate::operator::search::driver::{
+    build_search_batch_config, build_search_resource_budget, search_get_data, SearchOperatorDriver,
+    SearchOperatorGlobalState, SearchOperatorLocalState,
+};
 use crate::operator::state::{GlobalSourceState, LocalSourceState, OperatorSourceInput};
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
@@ -25,6 +27,8 @@ use paro_storage::index::fulltext::query_parser::{
 use paro_storage::index::fulltext::text_index::GlobalFullTextStats;
 use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer};
 use paro_storage::index::PredicateTree;
+#[cfg(test)]
+use paro_storage::search::{ResourceBudget, SearchBatchConfig, SearchBatchState};
 use paro_storage::table::table_handle::TableHandle;
 
 const SIMPLE_CONFIG: &str = "simple";
@@ -46,7 +50,6 @@ pub enum FullTextExecMode {
     ScoreTopK,
 }
 
-/// Bind data for full-text scan.
 #[derive(Debug)]
 pub struct FullTextScanBindData {
     pub table_data: Arc<TableHandle>,
@@ -132,46 +135,6 @@ impl FullTextScanBindData {
     }
 }
 
-/// Global state for full-text scan.
-#[derive(Debug)]
-pub struct FullTextScanGlobalState {
-    result_chunks: Vec<Chunk>,
-    chunks_served: std::sync::atomic::AtomicUsize,
-}
-
-impl FullTextScanGlobalState {
-    fn new() -> Self {
-        Self {
-            result_chunks: Vec::new(),
-            chunks_served: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
-impl GlobalSourceState for FullTextScanGlobalState {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn max_threads(&self) -> usize {
-        1
-    }
-}
-
-#[derive(Debug, Default)]
-struct FullTextScanLocalState {}
-
-impl LocalSourceState for FullTextScanLocalState {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
 #[derive(Debug)]
 pub struct PhysicalFullTextScan {
     output_types: Vec<LogicalType>,
@@ -187,44 +150,12 @@ impl PhysicalFullTextScan {
         }
     }
 
-    fn execute_search(&self) -> Result<Vec<Chunk>> {
-        let table = &self.bind_data.table_data;
-        let column_id = self.bind_data.text_column_id;
-        let predicate = self.bind_data.predicates.as_ref();
-        let projected_columns = &self.bind_data.projected_columns;
-        let parsed_query = self.parse_query()?;
-
-        match self.bind_data.mode {
-            FullTextExecMode::Filter => {
-                table.fulltext_filter(column_id, &parsed_query, predicate, projected_columns)
-            }
-            FullTextExecMode::ScoreTopK => {
-                let global_stats = self.collect_global_stats();
-                let emit_score = self.bind_data.emit_score
-                    && matches!(self.bind_data.mode, FullTextExecMode::ScoreTopK);
-                table.fulltext_search_parsed(
-                    column_id,
-                    &parsed_query,
-                    self.bind_data.k,
-                    predicate,
-                    projected_columns,
-                    global_stats.as_ref(),
-                    self.bind_data.score_mode,
-                    emit_score,
-                )
-            }
-        }
-    }
-
     fn collect_global_stats(&self) -> Option<GlobalFullTextStats> {
-        let stats = self
-            .bind_data
+        self.bind_data
             .table_data
-            .fulltext_index_statistics(self.bind_data.text_column_id as u32)?;
-        Some(GlobalFullTextStats::from_totals(
-            stats.total_docs,
-            stats.total_terms,
-        ))
+            .fulltext_capability(self.bind_data.text_column_id as u32, &self.bind_data.config)?
+            .generation_stats
+            .fulltext_global_stats()
     }
 
     fn parse_query(&self) -> Result<ParsedQuery> {
@@ -253,6 +184,65 @@ impl PhysicalFullTextScan {
             }
             FullTextQueryKind::WebSearch => {
                 parse_websearch_to_tsquery(query, tokenizer, MIN_TOKEN_LEN, MAX_TOKEN_LEN)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn collect_test_chunks(&self) -> Result<Vec<Chunk>> {
+        let visible_version = self.bind_data.table_data.max_version();
+        let parsed_query = self.parse_query()?;
+        let opened = match self.bind_data.mode {
+            FullTextExecMode::Filter => self.bind_data.table_data.open_fulltext_filter_cursor(
+                self.bind_data.text_column_id,
+                &parsed_query,
+                &self.bind_data.config,
+                self.bind_data.predicates.clone(),
+                visible_version,
+            )?,
+            FullTextExecMode::ScoreTopK => self.bind_data.table_data.open_fulltext_search_cursor(
+                self.bind_data.text_column_id,
+                &parsed_query,
+                self.bind_data.k,
+                &self.bind_data.config,
+                self.bind_data.predicates.clone(),
+                self.collect_global_stats(),
+                self.bind_data.score_mode,
+                visible_version,
+            )?,
+        };
+
+        let row_limit_hint = match self.bind_data.mode {
+            FullTextExecMode::Filter => 1024,
+            FullTextExecMode::ScoreTopK => self.bind_data.k,
+        };
+        let batch_config = SearchBatchConfig {
+            row_limit: row_limit_hint.max(1).min(1024),
+            preferred_bytes: 1 << 20,
+        };
+        let mut budget = ResourceBudget {
+            memory_limit_bytes: 64 * 1024 * 1024,
+            heap_budget_items: row_limit_hint.max(1024),
+            parallelism_slots: 4,
+            cpu_step_budget: None,
+            context: None,
+        };
+        let mut cursor = opened.cursor;
+        let snapshot = opened.snapshot;
+        let mut chunks = Vec::new();
+        loop {
+            match cursor.next_batch(&batch_config, &mut budget)? {
+                SearchBatchState::Ready(batch) if batch.is_empty() => continue,
+                SearchBatchState::Ready(batch) => {
+                    chunks.push(self.bind_data.table_data.materialize_search_batch(
+                        &snapshot,
+                        batch,
+                        &self.bind_data.projected_columns,
+                        self.bind_data.emit_score
+                            && matches!(self.bind_data.mode, FullTextExecMode::ScoreTopK),
+                    )?)
+                }
+                SearchBatchState::Exhausted => return Ok(chunks),
             }
         }
     }
@@ -288,9 +278,44 @@ impl PhysicalOperator for PhysicalFullTextScan {
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
         ctx.check_cancelled()?;
-        let mut state = FullTextScanGlobalState::new();
-        state.result_chunks = self.execute_search()?;
-        Ok(Box::new(state))
+        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let parsed_query = self.parse_query()?;
+        let opened = match self.bind_data.mode {
+            FullTextExecMode::Filter => self.bind_data.table_data.open_fulltext_filter_cursor(
+                self.bind_data.text_column_id,
+                &parsed_query,
+                &self.bind_data.config,
+                self.bind_data.predicates.clone(),
+                visible_version,
+            )?,
+            FullTextExecMode::ScoreTopK => self.bind_data.table_data.open_fulltext_search_cursor(
+                self.bind_data.text_column_id,
+                &parsed_query,
+                self.bind_data.k,
+                &self.bind_data.config,
+                self.bind_data.predicates.clone(),
+                self.collect_global_stats(),
+                self.bind_data.score_mode,
+                visible_version,
+            )?,
+        };
+        let row_limit_hint = match self.bind_data.mode {
+            FullTextExecMode::Filter => 1024,
+            FullTextExecMode::ScoreTopK => self.bind_data.k,
+        };
+        let heap_budget_items = match self.bind_data.mode {
+            FullTextExecMode::Filter => 1024,
+            FullTextExecMode::ScoreTopK => self.bind_data.k,
+        };
+        let driver = SearchOperatorDriver::new(
+            self.bind_data.table_data.clone(),
+            opened,
+            build_search_batch_config(row_limit_hint),
+            build_search_resource_budget(ctx, heap_budget_items),
+            self.bind_data.projected_columns.clone(),
+            self.bind_data.emit_score && matches!(self.bind_data.mode, FullTextExecMode::ScoreTopK),
+        );
+        Ok(Box::new(SearchOperatorGlobalState::new(driver)))
     }
 
     fn get_local_source_state(
@@ -298,7 +323,7 @@ impl PhysicalOperator for PhysicalFullTextScan {
         _ctx: &ExecutionContext,
         _gstate: &dyn GlobalSourceState,
     ) -> Result<Box<dyn LocalSourceState>> {
-        Ok(Box::new(FullTextScanLocalState::default()))
+        Ok(Box::new(SearchOperatorLocalState))
     }
 
     fn get_data(
@@ -307,27 +332,13 @@ impl PhysicalOperator for PhysicalFullTextScan {
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
-        ctx.check_cancelled()?;
-        let gstate = input
-            .global_state
-            .as_any()
-            .downcast_ref::<FullTextScanGlobalState>()
-            .unwrap();
-
-        let served = gstate
-            .chunks_served
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if served < gstate.result_chunks.len() {
-            *chunk = gstate.result_chunks[served].clone();
-            Ok(SourceResultType::HaveMoreOutput)
-        } else {
-            Ok(SourceResultType::Finished)
-        }
+        search_get_data(ctx, chunk, input, self.types())
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -341,8 +352,10 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
     use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
+    use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
+    use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -374,6 +387,26 @@ mod tests {
                 .create_table(&[LogicalType::Integer, LogicalType::Varchar])
                 .unwrap(),
         );
+        let provider_config = json!({ "config": "simple" });
+        let expression = "to_tsvector('simple', col_1)".to_string();
+        let definition = SearchIndexDefinition {
+            definition_id: 1,
+            table_id: table.tablet().table_id(),
+            name: "__test_fulltext_search_simple".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![1],
+            expression: Some(expression.clone()),
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::FullText,
+                &[1],
+                Some(&expression),
+                &provider_config,
+            ),
+            provider_config,
+        };
+        table
+            .register_search_definition(definition)
+            .expect("register fulltext definition");
         table
             .append(&Chunk::from_vectors(vec![
                 Vector::from_i32(&[1, 2, 3, 4, 5]),
@@ -387,8 +420,34 @@ mod tests {
             ]))
             .expect("append");
         table
-            .build_runtime_fulltext_index(1)
-            .expect("build fulltext");
+    }
+
+    fn setup_empty_fulltext_table() -> Arc<TableHandle> {
+        let table = Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Integer, LogicalType::Varchar])
+                .unwrap(),
+        );
+        let provider_config = json!({ "config": "simple" });
+        let expression = "to_tsvector('simple', col_1)".to_string();
+        let definition = SearchIndexDefinition {
+            definition_id: 9,
+            table_id: table.tablet().table_id(),
+            name: "__test_fulltext_search_empty".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![1],
+            expression: Some(expression.clone()),
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::FullText,
+                &[1],
+                Some(&expression),
+                &provider_config,
+            ),
+            provider_config,
+        };
+        table
+            .register_search_definition(definition)
+            .expect("register empty fulltext definition");
         table
     }
 
@@ -400,7 +459,7 @@ mod tests {
             FullTextScanBindData::new(table.clone(), "vector database".to_string(), 1, 1, vec![0])
                 .with_exec_mode(FullTextExecMode::Filter),
         );
-        let filter_chunks = filter_scan.execute_search().expect("filter execute");
+        let filter_chunks = filter_scan.collect_test_chunks().expect("filter execute");
         let filter_ids: BTreeSet<i32> = collect_ids(&filter_chunks).into_iter().collect();
         assert_eq!(filter_ids, BTreeSet::from([1, 2, 3]));
         assert_eq!(filter_scan.estimated_cardinality(), table.total_rows());
@@ -409,7 +468,7 @@ mod tests {
             FullTextScanBindData::new(table.clone(), "vector database".to_string(), 10, 1, vec![0])
                 .with_exec_mode(FullTextExecMode::ScoreTopK),
         );
-        let score_chunks_all = score_scan_all.execute_search().expect("score execute");
+        let score_chunks_all = score_scan_all.collect_test_chunks().expect("score execute");
         let score_ids_all: BTreeSet<i32> = collect_ids(&score_chunks_all).into_iter().collect();
         assert_eq!(score_ids_all, filter_ids);
 
@@ -417,7 +476,7 @@ mod tests {
             FullTextScanBindData::new(table, "vector database".to_string(), 1, 1, vec![0])
                 .with_exec_mode(FullTextExecMode::ScoreTopK),
         );
-        let score_chunks_top1 = score_scan_top1.execute_search().expect("score top1");
+        let score_chunks_top1 = score_scan_top1.collect_test_chunks().expect("score top1");
         let score_ids_top1: BTreeSet<i32> = collect_ids(&score_chunks_top1).into_iter().collect();
         assert_eq!(score_ids_top1.len(), 1);
         assert!(score_ids_top1.is_subset(&score_ids_all));
@@ -435,7 +494,7 @@ mod tests {
 
         assert_eq!(scan.types(), &[LogicalType::Integer, LogicalType::Float]);
 
-        let chunks = scan.execute_search().expect("score execute");
+        let chunks = scan.collect_test_chunks().expect("score execute");
         let ids = collect_ids(&chunks);
         let scores = collect_scores(&chunks);
         assert_eq!(ids.len(), scores.len());
@@ -461,5 +520,21 @@ mod tests {
             FullTextScoreMode::CoverDensity
         ));
         assert_eq!(scan.bind_data.query_stats.effective_query_terms(), 2);
+    }
+
+    #[test]
+    fn empty_generation_collects_global_stats_from_capability_contract() {
+        let table = setup_empty_fulltext_table();
+        let scan = PhysicalFullTextScan::new(
+            FullTextScanBindData::new(table, "vector".to_string(), 1, 1, vec![0])
+                .with_exec_mode(FullTextExecMode::ScoreTopK),
+        );
+
+        let stats = scan
+            .collect_global_stats()
+            .expect("empty generation should still expose zeroed global stats");
+        assert_eq!(stats.total_docs, 0);
+        assert_eq!(stats.total_terms, 0);
+        assert_eq!(stats.avg_doc_length, 0.0);
     }
 }

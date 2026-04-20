@@ -98,11 +98,6 @@ impl IndexType {
         }
     }
 
-    /// Return true when CREATE INDEX should run full runtime data build.
-    pub fn requires_runtime_build(&self) -> bool {
-        false
-    }
-
     /// Return true when the index currently supports metadata-only staged creation.
     pub fn supports_metadata_only_build(&self) -> bool {
         matches!(

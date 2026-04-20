@@ -268,7 +268,7 @@ impl<'a> CommitPipeline<'a> {
 
         for op in ddl_changes {
             for transition in &op.runtime_transitions {
-                if let RuntimeTransitionDescriptor::AttachIndexRuntime {
+                if let RuntimeTransitionDescriptor::AttachIndexState {
                     index,
                     table_name,
                     index_type,
@@ -276,7 +276,7 @@ impl<'a> CommitPipeline<'a> {
                     fulltext_config,
                 } = transition
                 {
-                    tasks.push(DeferredTask::BuildIndexRuntime {
+                    tasks.push(DeferredTask::FinalizeIndexState {
                         index: index.clone(),
                         table_name: table_name.clone(),
                         index_type: index_type.clone(),

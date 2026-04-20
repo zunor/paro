@@ -12,10 +12,12 @@ use crate::operator::PhysicalOperator;
 use paro_common::error::Result;
 use paro_common::logging::targets;
 use paro_context::StatementContext;
-use paro_planner::operator::{ExplainMode, ExplainSpec, LogicalOperator};
-use paro_planner::operator::{SearchDecision, SearchType};
+use paro_planner::operator::{
+    ExplainMode, ExplainSpec, LogicalOperator, SearchCandidate, SearchDecision,
+};
 use paro_planner::plan::LogicalPlan;
 use paro_planner::verify::verify_physical_planner_invariants;
+use paro_storage::search::SearchIntent;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -439,67 +441,71 @@ impl PhysicalPlanGenerator {
     fn explain_search_info(&self, decision: &SearchDecision) -> ExplainSearchInfo {
         match decision {
             SearchDecision::IndexScan {
-                search_type,
-                estimated_cost,
+                candidate,
                 confidence,
             } => ExplainSearchInfo {
                 summary: format!(
                     "INDEX_SCAN {} cost={:.3}",
-                    Self::describe_search_type(search_type),
-                    estimated_cost
+                    Self::describe_search_candidate(candidate),
+                    candidate
+                        .estimated_cost()
+                        .map(|cost| cost.score)
+                        .unwrap_or(f64::INFINITY)
                 ),
                 confidence: Some(format!("{confidence:?}").to_uppercase()),
                 candidates: Vec::new(),
             },
-            SearchDecision::DeferToRuntime {
+            SearchDecision::Adaptive {
                 candidates,
-                sequential_cost,
+                sequential,
             } => ExplainSearchInfo {
                 summary: format!(
-                    "DEFER_TO_RUNTIME sequential_cost={:.3} candidates={}",
-                    sequential_cost,
+                    "ADAPTIVE_SELECT sequential_cost={:.3} candidates={}",
+                    sequential
+                        .estimated_cost
+                        .map(|cost| cost.score)
+                        .unwrap_or(f64::INFINITY),
                     candidates.len()
                 ),
                 confidence: None,
                 candidates: candidates
                     .iter()
                     .map(|candidate| {
-                        format!(
-                            "{} cost={:.3} threshold={}",
-                            Self::describe_search_type(&candidate.search_type),
-                            candidate.estimated_cost,
-                            candidate.threshold
-                        )
+                        let mut summary = format!(
+                            "{} cost={:.3}",
+                            Self::describe_search_candidate(candidate),
+                            candidate
+                                .estimated_cost()
+                                .map(|cost| cost.score)
+                                .unwrap_or(f64::INFINITY),
+                        );
+                        if let Some(prefer_hint) = candidate.capability.prefer_hint {
+                            summary.push_str(&format!(" prefer={prefer_hint:?}"));
+                        }
+                        summary
                     })
                     .collect(),
             },
         }
     }
 
-    fn describe_search_type(search_type: &SearchType) -> String {
-        match search_type {
-            SearchType::HnswVector { column_id } => format!("HNSW(column_id={column_id})"),
-            SearchType::SparseVector { column_id } => format!("SPARSE(column_id={column_id})"),
-            SearchType::FullTextTopK {
-                column_id,
-                score_mode,
-                query_stats,
-            } => {
-                format!(
-                    "FULLTEXT_TOPK(column_id={column_id}, score_mode={}, query_terms={})",
-                    score_mode.as_str(),
-                    query_stats.effective_query_terms()
-                )
-            }
-            SearchType::FullTextFilter {
-                column_id,
-                query_stats,
-            } => {
-                format!(
-                    "FULLTEXT_FILTER(column_id={column_id}, query_terms={})",
-                    query_stats.effective_query_terms()
-                )
-            }
+    fn describe_search_candidate(candidate: &SearchCandidate) -> String {
+        match &candidate.intent {
+            SearchIntent::Hnsw(intent) => format!(
+                "HNSW(column_id={}, generation_id={})",
+                intent.column_id, candidate.capability.generation_id
+            ),
+            SearchIntent::Sparse(intent) => format!(
+                "SPARSE(column_id={}, generation_id={})",
+                intent.column_id, candidate.capability.generation_id
+            ),
+            SearchIntent::FullText(intent) => format!(
+                "FULLTEXT(column_id={}, score_mode={}, query_terms={}, generation_id={})",
+                intent.column_id,
+                intent.score_mode.as_str(),
+                intent.query_stats.effective_query_terms(),
+                candidate.capability.generation_id
+            ),
         }
     }
 

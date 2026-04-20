@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeferredTask {
-    BuildIndexRuntime {
+    FinalizeIndexState {
         index: DdlObjectKey,
         table_name: String,
         index_type: String,

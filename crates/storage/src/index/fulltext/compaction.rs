@@ -1,21 +1,25 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::compaction::execution::index_rebuild::CompactionIndexRebuilder;
+use crate::compaction::execution::index_rebuild::{
+    CompactionGenerationContext, CompactionIndexRebuilder,
+};
 use crate::compaction::plan::types::CompactionPlan;
 use crate::rowset::RowsetSharedPtr;
-use crate::table::index_runtime::IndexRuntime;
+use crate::search::write_path::{
+    materialize_rowset_artifacts, FullTextWriteBinding, SearchWritePlan,
+};
 use crate::tablet::{ColumnId, Tablet};
 use paro_common::error::{self as paro_error, Result};
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Rebuilder for full-text runtime indexes during compaction.
+/// Rebuilder for durable full-text search payloads during compaction.
 ///
-/// Compaction output segments are rewritten without full-text payload pages.
-/// This rebuilder reconstructs runtime full-text indexes for columns that were
-/// indexed in compaction input rowsets.
+/// Compaction output segments are rewritten without search payload pages. This
+/// rebuilder re-materializes the durable full-text payload for columns that
+/// were indexed in compaction input rowsets.
 pub struct FullTextIndexRebuilder;
 
 impl FullTextIndexRebuilder {
@@ -74,6 +78,7 @@ impl CompactionIndexRebuilder for FullTextIndexRebuilder {
 
     fn rebuild(
         &self,
+        _generation_context: &CompactionGenerationContext,
         _tablet: &Tablet,
         rowset: &RowsetSharedPtr,
         plan: &CompactionPlan,
@@ -83,7 +88,14 @@ impl CompactionIndexRebuilder for FullTextIndexRebuilder {
         if indexed_columns.is_empty() {
             return Ok(());
         }
-        IndexRuntime::build_runtime_fulltext_indexes_for_rowset(rowset, &indexed_columns)
+        let plan = SearchWritePlan {
+            fulltext: indexed_columns
+                .into_iter()
+                .map(|(column_id, config)| FullTextWriteBinding { column_id, config })
+                .collect(),
+            sparse: Vec::new(),
+        };
+        materialize_rowset_artifacts(rowset, &plan)
     }
 }
 

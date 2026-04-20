@@ -13,7 +13,7 @@ pub struct DeferredTaskKey {
 /// Durable task families currently known to checkpoint recovery.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeferredTaskKind {
-    BuildIndexRuntime,
+    FinalizeIndexState,
 }
 
 /// Scope attached to one durable deferred task.

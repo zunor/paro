@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeTransitionDescriptor {
-    AttachIndexRuntime {
+    AttachIndexState {
         index: DdlObjectKey,
         table_name: String,
         index_type: String,
         column_ids: Vec<u32>,
         fulltext_config: Option<String>,
     },
-    DetachIndexRuntime {
+    DetachIndexState {
         index: DdlObjectKey,
         table_name: String,
         index_type: String,

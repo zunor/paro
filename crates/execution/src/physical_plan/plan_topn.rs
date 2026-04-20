@@ -15,17 +15,12 @@ use crate::operator::helper::order::Order;
 use crate::operator::helper::streaming_limit::StreamingLimit;
 use crate::operator::helper::topn::TopN;
 use crate::operator::projection::Projection;
-use crate::operator::scan::fulltext_scan::{
+use crate::operator::search::fulltext_search::{
     FullTextExecMode, FullTextQueryKind, FullTextScanBindData, PhysicalFullTextScan,
 };
-use crate::operator::scan::sparse_vector_scan::{
-    PhysicalSparseVectorScan, SparseVectorScanBindData,
-};
-use crate::operator::scan::vector_scan::{PhysicalVectorScan, VectorScanBindData};
+use crate::operator::search::sparse_search::{PhysicalSparseVectorScan, SparseVectorScanBindData};
+use crate::operator::search::vector_search::{PhysicalVectorScan, VectorScanBindData};
 use crate::operator::PhysicalOperator;
-use paro_catalog::entry::{
-    CatalogEntryEnum, CatalogType, IndexType as CatalogIndexType, TableCatalogEntry,
-};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -41,6 +36,7 @@ use paro_planner::plan::LogicalPlan;
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
 use paro_storage::index::hnsw::types::{AcornParams, SearchParams, ACORN_MAX_SELECTIVITY_DEFAULT};
 use paro_storage::rowset::SparseVector;
+use paro_storage::search::{HnswIntent, SearchIntent, SparseIntent};
 use paro_storage::table::table_handle::TableHandle;
 use std::sync::Arc;
 
@@ -168,7 +164,13 @@ impl PhysicalPlanGenerator {
             .ok_or_else(|| paro_error::internal("Table storage unavailable for vector scan"))?
             .clone();
 
-        if !table_data.has_vector_index(vector_col_id as u32) {
+        if table_data
+            .search_capability(&SearchIntent::Hnsw(HnswIntent {
+                column_id: vector_col_id as u32,
+                query_vector: query_vec.clone(),
+            }))
+            .is_none()
+        {
             return Ok(None);
         }
 
@@ -272,7 +274,13 @@ impl PhysicalPlanGenerator {
             .ok_or_else(|| paro_error::internal("Table storage unavailable for sparse scan"))?
             .clone();
 
-        if !table_data.has_sparse_index(sparse_col_id as u32) {
+        if table_data
+            .search_capability(&SearchIntent::Sparse(SparseIntent {
+                column_id: sparse_col_id as u32,
+                query_vector: query_vec.clone(),
+            }))
+            .is_none()
+        {
             return Ok(None);
         }
 
@@ -350,12 +358,7 @@ impl PhysicalPlanGenerator {
             .ok_or_else(|| paro_error::internal("Table storage unavailable for fulltext scan"))?
             .clone();
 
-        if !fulltext_index_pushdown_ready(
-            self,
-            table_entry.as_ref(),
-            table_data.as_ref(),
-            &score_info,
-        ) {
+        if !fulltext_index_pushdown_ready(table_data.as_ref(), &score_info) {
             return Ok(None);
         }
 
@@ -533,58 +536,12 @@ pub(crate) fn replace_fulltext_score_with_reference(
 }
 
 pub(crate) fn fulltext_index_pushdown_ready(
-    generator: &PhysicalPlanGenerator,
-    table_entry: &TableCatalogEntry,
     table_data: &TableHandle,
     info: &FullTextScoreInfo,
 ) -> bool {
-    let runtime_coverage = match table_data.fulltext_index_coverage(info.text_column_id as u32) {
-        Ok(coverage) => coverage,
-        Err(_) => return false,
-    };
-    if !runtime_coverage.is_complete() {
-        return false;
-    }
-
-    let txn = generator.context.catalog_txn_view();
-    let catalog = generator.context.catalog();
-    let schema = match catalog.get_schema(&txn, &table_entry.base.schema_name) {
-        Ok(schema) => schema,
-        Err(_) => return false,
-    };
-
-    for entry in schema
-        .collection(CatalogType::Index)
-        .expect("index collection")
-        .scan(txn.transaction_id, txn.start_time)
-    {
-        let CatalogEntryEnum::Index(index) = entry.as_ref() else {
-            continue;
-        };
-        if index.table_oid != table_entry.base.base.object_id.raw() {
-            continue;
-        }
-        if index.index_type != CatalogIndexType::FullText || !index.is_ready() {
-            continue;
-        }
-        let Some(binding) = index.fulltext_binding() else {
-            continue;
-        };
-        if binding.column_id.index != info.text_column_id as u32 {
-            continue;
-        }
-        if !binding.config.eq_ignore_ascii_case(&info.config) {
-            continue;
-        }
-        if let Some(coverage) = index.coverage() {
-            if !coverage.is_complete() {
-                continue;
-            }
-        }
-        return true;
-    }
-
-    false
+    table_data
+        .fulltext_capability(info.text_column_id as u32, &info.config)
+        .is_some()
 }
 
 fn order_expression_index(expr: &Expression) -> Option<usize> {

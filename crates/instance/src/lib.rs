@@ -16,6 +16,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod recovery;
 pub mod runtime;
+mod search_registry;
 pub mod storage_manager;
 pub mod valid_checker;
 

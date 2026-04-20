@@ -108,27 +108,8 @@ impl CreateIndex {
     }
 
     fn compute_index_coverage(&self) -> Result<Option<IndexCoverage>> {
-        if self.info.index_type != CatalogIndexType::FullText {
-            return Ok(None);
-        }
-        let binding = self.info.fulltext.as_ref().ok_or_else(|| {
-            paro_error::internal(format!(
-                "FullText index '{}' missing fulltext binding metadata",
-                self.info.name
-            ))
-        })?;
-        let storage = self.table.get_storage().ok_or_else(|| {
-            paro_error::internal(format!(
-                "Table '{}' has no storage. Cannot collect fulltext coverage.",
-                self.table.base.base.name
-            ))
-        })?;
-        let coverage = storage.fulltext_index_coverage(binding.column_id.index)?;
-        Ok(Some(IndexCoverage::from_counts(
-            coverage.visible_version,
-            coverage.visible_segment_count,
-            coverage.indexed_segment_count,
-        )))
+        let _ = CatalogIndexType::FullText;
+        Ok(None)
     }
 }
 

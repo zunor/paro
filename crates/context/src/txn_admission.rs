@@ -20,8 +20,8 @@ pub enum CatalogEffect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeEffect {
     None,
-    AttachIndexRuntime,
-    DetachIndexRuntime,
+    AttachIndexState,
+    DetachIndexState,
     RegisterGraphRuntime,
     UnregisterGraphRuntime,
 }
@@ -65,18 +65,18 @@ impl DdlExecutionProfile {
         }
     }
 
-    pub const fn attach_index_runtime() -> Self {
+    pub const fn attach_index_state() -> Self {
         Self {
             catalog: CatalogEffect::AttachSubobject,
-            runtime: RuntimeEffect::AttachIndexRuntime,
+            runtime: RuntimeEffect::AttachIndexState,
             mixed_dml: MixedDmlPolicy::Deny,
         }
     }
 
-    pub const fn detach_index_runtime() -> Self {
+    pub const fn detach_index_state() -> Self {
         Self {
             catalog: CatalogEffect::DetachSubobject,
-            runtime: RuntimeEffect::DetachIndexRuntime,
+            runtime: RuntimeEffect::DetachIndexState,
             mixed_dml: MixedDmlPolicy::AllowDisjoint,
         }
     }
@@ -305,7 +305,7 @@ mod tests {
         state
             .record_ddl(PendingDdlAdmission {
                 object: DdlObjectKey::new("main", Some("public"), "idx_t1", DdlObjectKind::Index),
-                profile: DdlExecutionProfile::attach_index_runtime(),
+                profile: DdlExecutionProfile::attach_index_state(),
                 dml_targets: vec![table("t1")],
             })
             .unwrap();

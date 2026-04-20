@@ -64,15 +64,7 @@ impl<'a> CatalogReplayHandler<'a> {
             paro_storage::index::IndexConstraintType::None
         };
 
-        let (build_state, failure_reason) = if index_type.requires_runtime_build() {
-            (
-                IndexBuildState::Failed,
-                Some(
-                    "WAL replay restored index metadata only; rerun CREATE INDEX to rebuild runtime data"
-                        .to_string(),
-                ),
-            )
-        } else if index_type == IndexType::FullText {
+        let (build_state, failure_reason) = if index_type == IndexType::FullText {
             (
                 IndexBuildState::Building,
                 Some(
@@ -80,8 +72,16 @@ impl<'a> CatalogReplayHandler<'a> {
                         .to_string(),
                 ),
             )
-        } else {
+        } else if index_type.supports_metadata_only_build() {
             (IndexBuildState::Ready, None)
+        } else {
+            (
+                IndexBuildState::Failed,
+                Some(
+                    "WAL replay restored index metadata only; rerun CREATE INDEX to rebuild runtime data"
+                        .to_string(),
+                ),
+            )
         };
 
         let mut info = CreateIndexInfo::new(

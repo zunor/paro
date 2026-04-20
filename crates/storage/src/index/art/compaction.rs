@@ -1,10 +1,12 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::compaction::execution::index_rebuild::CompactionIndexRebuilder;
+use crate::compaction::execution::index_rebuild::{
+    CompactionGenerationContext, CompactionIndexRebuilder,
+};
 use crate::compaction::plan::types::CompactionPlan;
 use crate::rowset::RowsetSharedPtr;
-use crate::table::index_runtime::IndexRuntime;
+use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::Tablet;
 use paro_common::error::Result;
 use std::sync::Arc;
@@ -37,6 +39,7 @@ impl CompactionIndexRebuilder for ArtIndexRebuilder {
 
     fn rebuild(
         &self,
+        _generation_context: &CompactionGenerationContext,
         tablet: &Tablet,
         rowset: &RowsetSharedPtr,
         _plan: &CompactionPlan,
@@ -45,7 +48,7 @@ impl CompactionIndexRebuilder for ArtIndexRebuilder {
         if art_columns.is_empty() {
             return Ok(());
         }
-        IndexRuntime::build_runtime_art_indexes_for_rowset(rowset, &art_columns)
+        RuntimeIndexes::rebuild_art_indexes_for_rowset(rowset, &art_columns)
     }
 }
 

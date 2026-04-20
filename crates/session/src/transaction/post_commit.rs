@@ -5,7 +5,7 @@ use super::commit::CommitOutcome;
 use super::ddl_changes::TransientCatalogRuntime;
 use crate::session::Session;
 use paro_catalog::entry::{
-    CatalogEntryEnum, IndexCatalogEntry, IndexCoverage, IndexType as CatalogIndexType, LogicalIndex,
+    CatalogEntryEnum, IndexCatalogEntry, IndexCoverage, IndexType as CatalogIndexType,
 };
 use paro_common::effect::{
     CleanupDescriptor, DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor,
@@ -14,13 +14,11 @@ use paro_common::effect::{
 use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
-use paro_common::types::LogicalType;
 use paro_storage::index::graph::{GraphProjectionIndex, GraphStorageGeneration};
-use paro_storage::index::hnsw::{
-    build_missing_hnsw_indexes_with_scheduler, DistanceMetric, HnswColumnBuildConfig, HnswConfig,
-};
+use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub struct PostCommitActions;
@@ -110,7 +108,7 @@ impl PostCommitActions {
                         outcome.commit_id,
                     );
                 }
-                DeferredTask::BuildIndexRuntime {
+                DeferredTask::FinalizeIndexState {
                     index,
                     table_name,
                     index_type,
@@ -121,12 +119,12 @@ impl PostCommitActions {
                         target: targets::WAL,
                         commit_id = outcome.commit_id,
                         deferred_task_lag_micros,
-                        task_kind = "build_index_runtime",
+                        task_kind = "finalize_index_state",
                         index = %index.name,
                         table = %table_name,
                         "Dispatching deferred task after durable commit"
                     );
-                    Self::build_index_runtime_task(
+                    Self::finalize_index_state_task(
                         session,
                         outcome,
                         &index,
@@ -152,7 +150,7 @@ impl PostCommitActions {
         Ok(())
     }
 
-    fn build_index_runtime_task(
+    fn finalize_index_state_task(
         session: &Session,
         outcome: &CommitOutcome,
         index: &paro_common::ddl::DdlObjectKey,
@@ -165,7 +163,7 @@ impl PostCommitActions {
             let matches_transition = op.runtime_transitions.iter().any(|transition| {
                 matches!(
                     transition,
-                    RuntimeTransitionDescriptor::AttachIndexRuntime {
+                    RuntimeTransitionDescriptor::AttachIndexState {
                         index: transition_index,
                         ..
                     } if transition_index == index
@@ -177,7 +175,7 @@ impl PostCommitActions {
 
             let Some(TransientCatalogRuntime::CreateIndex(action)) = op.transient_runtime.as_ref()
             else {
-                return Self::apply_descriptor_only_index_runtime(
+                return Self::finalize_index_state_from_catalog(
                     session,
                     index,
                     table_name,
@@ -201,7 +199,7 @@ impl PostCommitActions {
                     }
                     storage.add_index(built_index.clone())?;
                 } else {
-                    Self::attach_metadata_only_index_runtime(session, action)?;
+                    Self::finalize_index_state_from_action(session, action)?;
                 }
 
                 let coverage = Self::recompute_index_coverage(action)?;
@@ -210,7 +208,7 @@ impl PostCommitActions {
             })();
 
             if let Err(err) = apply_result {
-                Self::cleanup_failed_runtime_from_action(action);
+                Self::cleanup_failed_index_state_from_action(action);
                 action.entry.mark_failed(Some(err.to_string()));
                 return Err(err);
             }
@@ -218,7 +216,7 @@ impl PostCommitActions {
             return Ok(());
         }
 
-        Self::apply_descriptor_only_index_runtime(
+        Self::finalize_index_state_from_catalog(
             session,
             index,
             table_name,
@@ -228,8 +226,8 @@ impl PostCommitActions {
         )
     }
 
-    fn attach_metadata_only_index_runtime(
-        session: &Session,
+    fn finalize_index_state_from_action(
+        _session: &Session,
         action: &crate::transaction::ddl_changes::IndexPostCommitAction,
     ) -> Result<()> {
         let Some(storage) = action.table.get_storage() else {
@@ -246,47 +244,27 @@ impl PostCommitActions {
             return Ok(());
         };
 
-        Self::mark_declared_runtime_indexes(storage.as_ref(), &action.info);
-
-        if action.info.index_type == CatalogIndexType::HNSW {
-            Self::build_hnsw_indexes_parallel(session, action)?;
-        }
-        if action.info.index_type == CatalogIndexType::FullText {
-            for col in &action.info.column_ids {
-                let config = action
-                    .info
-                    .fulltext
-                    .as_ref()
-                    .and_then(|meta| {
-                        if meta.column_id.index == col.index {
-                            Some(meta.config.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or("simple");
-                storage.build_runtime_fulltext_index_with_config(col.index, config)?;
-            }
-        }
         if action.info.index_type == CatalogIndexType::ART {
             let [column_id] = action.info.column_ids.as_slice() else {
                 return Err(paro_error::not_supported(
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.build_runtime_art_index(column_id.index)?;
+            storage.rebuild_art_index(column_id.index)?;
         }
+
+        Self::register_search_definition_from_entry(storage.as_ref(), action.entry.as_ref())?;
 
         Ok(())
     }
 
-    fn apply_descriptor_only_index_runtime(
+    fn finalize_index_state_from_catalog(
         session: &Session,
         index: &paro_common::ddl::DdlObjectKey,
         table_name: &str,
         index_type: &str,
         column_ids: &[u32],
-        fulltext_config: Option<&str>,
+        _fulltext_config: Option<&str>,
     ) -> Result<()> {
         let txn = session.catalog_txn_view();
         let schema_name = index.schema.as_deref().ok_or_else(|| {
@@ -320,26 +298,32 @@ impl PostCommitActions {
                         "ART indexes currently require exactly one column",
                     ));
                 };
-                storage.mark_declared_art_index(*column_id);
-                if let Err(err) = storage.build_runtime_art_index(*column_id) {
-                    storage.unmark_declared_art_index(*column_id);
-                    let _ = storage.remove_runtime_art_index(*column_id);
+                storage.declare_art_index(*column_id);
+                if let Err(err) = storage.rebuild_art_index(*column_id) {
+                    storage.forget_art_index(*column_id);
+                    let _ = storage.drop_art_index(*column_id);
                     return Err(err);
                 }
                 return Ok(());
             }
 
-            Self::mark_declared_runtime_indexes_from_descriptor(
-                storage.as_ref(),
-                index_type,
-                column_ids,
-                fulltext_config,
-            );
+            let Some(entry) = Self::resolve_index_entry(session, index) else {
+                return Err(paro_error::internal(format!(
+                    "index '{}' disappeared before search registry registration",
+                    index.name
+                )));
+            };
+            Self::register_search_definition_from_entry(storage.as_ref(), entry.as_ref())?;
             Ok(())
         })();
 
         if let Err(err) = apply_result {
-            Self::cleanup_failed_runtime_from_descriptor(storage.as_ref(), index_type, column_ids);
+            Self::cleanup_failed_index_state_from_catalog(
+                storage.as_ref(),
+                &index.name,
+                index_type,
+                column_ids,
+            );
             if let Some(entry) = Self::resolve_index_entry(session, index) {
                 entry.mark_failed(Some(err.to_string()));
             }
@@ -408,8 +392,8 @@ impl PostCommitActions {
         transition: &RuntimeTransitionDescriptor,
     ) -> Result<()> {
         match transition {
-            RuntimeTransitionDescriptor::AttachIndexRuntime { .. } => Ok(()),
-            RuntimeTransitionDescriptor::DetachIndexRuntime {
+            RuntimeTransitionDescriptor::AttachIndexState { .. } => Ok(()),
+            RuntimeTransitionDescriptor::DetachIndexState {
                 index,
                 table_name,
                 index_type,
@@ -422,7 +406,7 @@ impl PostCommitActions {
                     return Ok(());
                 };
                 let _ = storage.remove_index(&index.name);
-                Self::unmark_declared_runtime_indexes(storage.as_ref(), index_type, column_ids)
+                Self::detach_index_state(storage.as_ref(), &index.name, index_type, column_ids)
             }
             RuntimeTransitionDescriptor::RegisterGraphRuntime { graph } => {
                 let schema_name = graph.schema.as_deref().ok_or_else(|| {
@@ -520,7 +504,7 @@ impl PostCommitActions {
         }
     }
 
-    fn cleanup_failed_runtime_from_action(
+    fn cleanup_failed_index_state_from_action(
         action: &crate::transaction::ddl_changes::IndexPostCommitAction,
     ) {
         let Some(storage) = action.table.get_storage() else {
@@ -532,207 +516,183 @@ impl PostCommitActions {
             .iter()
             .map(|column| column.index)
             .collect::<Vec<_>>();
-        Self::cleanup_failed_runtime_from_descriptor(
+        Self::cleanup_failed_index_state_from_catalog(
             storage.as_ref(),
+            &action.info.name,
             action.info.index_type.as_str(),
             &column_ids,
         );
     }
 
-    fn cleanup_failed_runtime_from_descriptor(
+    fn cleanup_failed_index_state_from_catalog(
         storage: &paro_storage::table::table_handle::TableHandle,
+        index_name: &str,
         index_type: &str,
         column_ids: &[u32],
     ) {
         match CatalogIndexType::from_str(index_type) {
             CatalogIndexType::ART => {
                 for column_id in column_ids {
-                    storage.unmark_declared_art_index(*column_id);
-                    let _ = storage.remove_runtime_art_index(*column_id);
+                    storage.forget_art_index(*column_id);
+                    let _ = storage.drop_art_index(*column_id);
                 }
             }
             CatalogIndexType::HNSW => {
-                for column_id in column_ids {
-                    storage.unmark_declared_vector_index(*column_id);
-                }
+                let _ = storage.unregister_search_definition_by_name(index_name);
             }
             CatalogIndexType::Sparse => {
-                for column_id in column_ids {
-                    storage.unmark_declared_sparse_index(*column_id);
-                }
+                let _ = storage.unregister_search_definition_by_name(index_name);
             }
             CatalogIndexType::FullText => {
-                for column_id in column_ids {
-                    storage.unmark_declared_fulltext_index(*column_id);
-                }
+                let _ = storage.unregister_search_definition_by_name(index_name);
             }
             _ => {}
         }
     }
 
-    fn unmark_declared_runtime_indexes(
+    fn detach_index_state(
         storage: &TableHandle,
+        index_name: &str,
         index_type: &str,
         column_ids: &[u32],
     ) -> Result<()> {
         match CatalogIndexType::from_str(index_type) {
             CatalogIndexType::ART => {
                 for column_id in column_ids {
-                    storage.unmark_declared_art_index(*column_id);
-                    storage.remove_runtime_art_index(*column_id)?;
+                    storage.forget_art_index(*column_id);
+                    storage.drop_art_index(*column_id)?;
                 }
             }
             CatalogIndexType::HNSW => {
-                for column_id in column_ids {
-                    storage.unmark_declared_vector_index(*column_id);
-                }
+                storage.unregister_search_definition_by_name(index_name)?;
             }
             CatalogIndexType::Sparse => {
-                for column_id in column_ids {
-                    storage.unmark_declared_sparse_index(*column_id);
-                }
+                storage.unregister_search_definition_by_name(index_name)?;
             }
             CatalogIndexType::FullText => {
-                for column_id in column_ids {
-                    storage.unmark_declared_fulltext_index(*column_id);
-                }
+                storage.unregister_search_definition_by_name(index_name)?;
             }
             _ => {}
         }
         Ok(())
-    }
-
-    fn build_hnsw_indexes_parallel(
-        session: &Session,
-        action: &crate::transaction::ddl_changes::IndexPostCommitAction,
-    ) -> Result<()> {
-        let storage = action.table.get_storage().ok_or_else(|| {
-            paro_error::internal(format!(
-                "table '{}' has no storage. cannot build HNSW index",
-                action.table.base.base.name
-            ))
-        })?;
-        let tablet = storage.tablet();
-        let schema = tablet.schema().ok_or_else(|| {
-            paro_error::internal(format!(
-                "table '{}' has no schema. cannot build HNSW index",
-                action.table.base.base.name
-            ))
-        })?;
-
-        let mut columns = Vec::new();
-        for column in &action.info.column_ids {
-            let column_id = column.index;
-            let schema_col = schema.column_by_id(column_id).ok_or_else(|| {
-                paro_error::column_not_found(format!(
-                    "HNSW index column {} not found in table schema",
-                    column_id
-                ))
-            })?;
-            match &schema_col.logical_type {
-                LogicalType::Array(inner, _dim) if matches!(inner.as_ref(), LogicalType::Float) => {
-                }
-                other => {
-                    return Err(paro_error::not_supported(format!(
-                        "HNSW index requires Array(Float, N), got {:?} for column {}",
-                        other, column_id
-                    )));
-                }
-            }
-
-            columns.push(HnswColumnBuildConfig::new(
-                column_id,
-                HnswConfig::new(schema_col.hnsw_m, schema_col.hnsw_ef_construct),
-                DistanceMetric::from_u8(schema_col.hnsw_distance),
-            ));
-        }
-
-        if columns.is_empty() {
-            return Ok(());
-        }
-
-        let visible_version = tablet.max_version();
-        let rowsets = tablet.capture_consistent_rowsets(visible_version)?;
-        if rowsets.is_empty() {
-            return Ok(());
-        }
-
-        build_missing_hnsw_indexes_with_scheduler(
-            &rowsets,
-            &columns,
-            session.instance.get_scheduler().clone(),
-        )?;
-        Ok(())
-    }
-
-    fn mark_declared_runtime_indexes(
-        storage: &paro_storage::table::table_handle::TableHandle,
-        info: &paro_catalog::entry::CreateIndexInfo,
-    ) {
-        for LogicalIndex { index, .. } in &info.column_ids {
-            match info.index_type {
-                CatalogIndexType::ART => storage.mark_declared_art_index(*index),
-                CatalogIndexType::HNSW => storage.mark_declared_vector_index(*index),
-                CatalogIndexType::Sparse => storage.mark_declared_sparse_index(*index),
-                CatalogIndexType::FullText => {
-                    let config = info
-                        .fulltext
-                        .as_ref()
-                        .and_then(|meta| {
-                            if meta.column_id.index == *index {
-                                Some(meta.config.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or("simple");
-                    storage.mark_declared_fulltext_index_with_config(*index, config);
-                }
-                _ => {}
-            }
-        }
     }
 
     fn recompute_index_coverage(
         action: &crate::transaction::ddl_changes::IndexPostCommitAction,
     ) -> Result<Option<IndexCoverage>> {
-        if action.info.index_type != CatalogIndexType::FullText {
-            return Ok(action.coverage.clone());
-        }
-
-        let Some(binding) = action.info.fulltext.as_ref() else {
-            return Ok(action.coverage.clone());
-        };
         let Some(storage) = action.table.get_storage() else {
             return Ok(action.coverage.clone());
         };
 
-        let coverage = storage.fulltext_index_coverage(binding.column_id.index)?;
-        Ok(Some(IndexCoverage::from_counts(
-            coverage.visible_version,
-            coverage.visible_segment_count,
-            coverage.indexed_segment_count,
-        )))
+        match action.info.index_type {
+            CatalogIndexType::HNSW | CatalogIndexType::Sparse | CatalogIndexType::FullText => {
+                let definition_id = action.entry.base.base.object_id.raw();
+                let Some(coverage) = storage.search_generation_coverage(definition_id)? else {
+                    return Ok(action.coverage.clone());
+                };
+                Ok(Some(IndexCoverage::from_counts(
+                    coverage.visible_version,
+                    coverage.visible_segment_count,
+                    coverage.indexed_segment_count,
+                )))
+            }
+            _ => Ok(action.coverage.clone()),
+        }
     }
 
-    fn mark_declared_runtime_indexes_from_descriptor(
+    fn register_search_definition_from_entry(
         storage: &paro_storage::table::table_handle::TableHandle,
-        index_type: &str,
-        column_ids: &[u32],
-        fulltext_config: Option<&str>,
-    ) {
-        let index_type = CatalogIndexType::from_str(index_type);
-        for column_id in column_ids {
-            match index_type {
-                CatalogIndexType::ART => storage.mark_declared_art_index(*column_id),
-                CatalogIndexType::HNSW => storage.mark_declared_vector_index(*column_id),
-                CatalogIndexType::Sparse => storage.mark_declared_sparse_index(*column_id),
-                CatalogIndexType::FullText => storage.mark_declared_fulltext_index_with_config(
-                    *column_id,
-                    fulltext_config.unwrap_or("simple"),
-                ),
-                _ => {}
+        entry: &IndexCatalogEntry,
+    ) -> Result<()> {
+        let Some(kind) = Self::search_kind(entry.index_type) else {
+            return Ok(());
+        };
+        let definition = SearchIndexDefinition {
+            definition_id: entry.base.base.object_id.raw(),
+            table_id: storage.tablet().table_id(),
+            name: entry.base.base.name.clone(),
+            kind,
+            column_ids: entry
+                .get_column_ids()
+                .iter()
+                .map(|column| column.index)
+                .collect(),
+            expression: Self::search_expression(entry),
+            provider_config: Self::search_provider_config(storage, entry)?,
+            config_fingerprint: 0,
+        };
+        let expression = definition.expression.clone();
+        let provider_config = definition.provider_config.clone();
+        let column_ids = definition.column_ids.clone();
+        let kind = definition.kind;
+        let definition = SearchIndexDefinition {
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                kind,
+                &column_ids,
+                expression.as_deref(),
+                &provider_config,
+            ),
+            ..definition
+        };
+        storage.register_search_definition(definition)
+    }
+
+    fn search_kind(index_type: CatalogIndexType) -> Option<SearchIndexKind> {
+        match index_type {
+            CatalogIndexType::HNSW => Some(SearchIndexKind::Hnsw),
+            CatalogIndexType::Sparse => Some(SearchIndexKind::Sparse),
+            CatalogIndexType::FullText => Some(SearchIndexKind::FullText),
+            _ => None,
+        }
+    }
+
+    fn search_expression(entry: &IndexCatalogEntry) -> Option<String> {
+        if entry.index_type != CatalogIndexType::FullText {
+            return None;
+        }
+        let binding = entry.fulltext_binding()?;
+        Some(format!(
+            "to_tsvector('{}', col_{})",
+            binding.config, binding.column_id.index
+        ))
+    }
+
+    fn search_provider_config(
+        storage: &paro_storage::table::table_handle::TableHandle,
+        entry: &IndexCatalogEntry,
+    ) -> Result<Value> {
+        match entry.index_type {
+            CatalogIndexType::HNSW => {
+                let [column] = entry.get_column_ids() else {
+                    return Err(paro_error::not_supported(
+                        "HNSW search definition requires exactly one indexed column",
+                    ));
+                };
+                let schema = storage
+                    .tablet()
+                    .schema()
+                    .ok_or_else(|| paro_error::internal("table schema missing for HNSW config"))?;
+                let column = schema.column_by_id(column.index).ok_or_else(|| {
+                    paro_error::column_not_found(format!(
+                        "HNSW index column {} not found in schema",
+                        column.index
+                    ))
+                })?;
+                Ok(json!({
+                    "m": column.hnsw_m,
+                    "ef_construct": column.hnsw_ef_construct,
+                    "distance": column.hnsw_distance,
+                }))
             }
+            CatalogIndexType::Sparse => Ok(json!({})),
+            CatalogIndexType::FullText => {
+                let config = entry
+                    .fulltext_binding()
+                    .map(|binding| binding.config.clone())
+                    .unwrap_or_else(|| "simple".to_string());
+                Ok(json!({ "config": config }))
+            }
+            _ => Ok(json!({})),
         }
     }
 }

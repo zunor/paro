@@ -6,7 +6,7 @@ use crate::compaction::compaction_manager::allocate_compaction_job_id;
 use crate::compaction::execution::job_orchestrator::run_job;
 use crate::compaction::plan::CompactionPlanner;
 use crate::compaction::publish::record::CompactionPublishRecord;
-use crate::table::index_runtime::IndexRuntime;
+use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::table::storage_descriptor::TableStorageDescriptor;
 use paro_common::allocator::default_allocator;
 use paro_common::effect::TabletMutation;
@@ -17,20 +17,14 @@ use std::time::Duration;
 const TABLE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl TableHandle {
-    fn restore_declared_runtime_indexes_for_rowset(&self, rowset_id: u64) -> Result<()> {
+    fn restore_runtime_indexes_for_rowset(&self, rowset_id: u64) -> Result<()> {
         let Some(rowset) = self.tablet().find_rowset_by_id(rowset_id) else {
             return Ok(());
         };
 
-        let fulltext_columns = self.declared_fulltext_columns_with_config();
-        if !fulltext_columns.is_empty() {
-            IndexRuntime::build_runtime_fulltext_indexes_for_rowset(&rowset, &fulltext_columns)?;
-        }
-
         let art_columns = self.declared_art_columns();
         if !art_columns.is_empty() {
-            if let Err(err) =
-                IndexRuntime::build_runtime_art_indexes_for_rowset(&rowset, &art_columns)
+            if let Err(err) = RuntimeIndexes::rebuild_art_indexes_for_rowset(&rowset, &art_columns)
             {
                 tracing::warn!(
                     error = %err,
@@ -89,7 +83,7 @@ impl TableHandle {
     ) -> Result<()> {
         self.tablet()
             .replay_rowset_commit(rowset_id, start_version, end_version, rowset_path)?;
-        self.restore_declared_runtime_indexes_for_rowset(rowset_id)?;
+        self.restore_runtime_indexes_for_rowset(rowset_id)?;
         self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
@@ -119,7 +113,7 @@ impl TableHandle {
 
     pub fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
         self.tablet().replay_compaction_publish(record)?;
-        self.restore_declared_runtime_indexes_for_rowset(record.output_rowset_id)?;
+        self.restore_runtime_indexes_for_rowset(record.output_rowset_id)?;
         self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
@@ -130,7 +124,7 @@ impl TableHandle {
             output_rowset_id, ..
         } = op
         {
-            self.restore_declared_runtime_indexes_for_rowset(*output_rowset_id)?;
+            self.restore_runtime_indexes_for_rowset(*output_rowset_id)?;
         }
         self.tablet().repair_primary_index_after_replay()?;
         Ok(())
