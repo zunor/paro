@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::any::Any;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
+use paro_storage::search::PreferHint;
 
 use crate::execution_context::ExecutionContext;
 use crate::operator::state::{GlobalSourceState, LocalSourceState, OperatorSourceInput};
@@ -15,17 +16,19 @@ use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
 use crate::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
 use crate::query_executor::executor::Executor;
+use crate::query_executor::stream::ResultHandler;
 use crate::result_type::SourceResultType;
 
 #[derive(Debug, Clone)]
-pub struct AdaptiveCandidatePlan {
+pub struct AdaptiveSearchCandidatePlan {
     pub label: String,
     pub estimated_cost: f64,
+    pub prefer_hint: Option<PreferHint>,
     pub plan: Arc<dyn PhysicalOperator>,
 }
 
 #[derive(Debug)]
-pub struct AdaptiveScanOperator {
+pub struct AdaptiveSearchOperator {
     output_types: Vec<LogicalType>,
     output_names: Vec<String>,
     selected_label: String,
@@ -35,12 +38,11 @@ pub struct AdaptiveScanOperator {
 }
 
 #[derive(Debug)]
-struct AdaptiveScanGlobalState {
-    result_chunks: Vec<Chunk>,
-    chunks_served: AtomicUsize,
+struct AdaptiveSearchGlobalState {
+    handler: Mutex<ResultHandler>,
 }
 
-impl GlobalSourceState for AdaptiveScanGlobalState {
+impl GlobalSourceState for AdaptiveSearchGlobalState {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -55,9 +57,9 @@ impl GlobalSourceState for AdaptiveScanGlobalState {
 }
 
 #[derive(Debug, Default)]
-struct AdaptiveScanLocalState;
+struct AdaptiveSearchLocalState;
 
-impl LocalSourceState for AdaptiveScanLocalState {
+impl LocalSourceState for AdaptiveSearchLocalState {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -67,36 +69,28 @@ impl LocalSourceState for AdaptiveScanLocalState {
     }
 }
 
-impl AdaptiveScanOperator {
+impl AdaptiveSearchOperator {
     pub fn new(
         sequential_plan: Arc<dyn PhysicalOperator>,
         sequential_cost: f64,
-        candidates: Vec<AdaptiveCandidatePlan>,
+        candidates: Vec<AdaptiveSearchCandidatePlan>,
         output_names: Vec<String>,
     ) -> Self {
-        if let Some(candidate) = candidates
-            .iter()
-            .filter(|candidate| candidate.label.starts_with("fulltext_"))
-            .min_by(|left, right| left.estimated_cost.total_cmp(&right.estimated_cost))
-        {
-            return Self {
-                output_types: candidate.plan.types().to_vec(),
-                output_names,
-                selected_label: candidate.label.clone(),
-                sequential_cost,
-                selected_cost: candidate.estimated_cost,
-                plan: candidate.plan.clone(),
-            };
-        }
-
         let mut selected_label = "sequential".to_string();
         let mut selected_cost = sequential_cost;
+        let mut selected_hint = None;
         let mut selected_plan = sequential_plan;
 
         for candidate in candidates {
-            if candidate.estimated_cost < selected_cost {
+            if candidate_beats_selected(
+                candidate.estimated_cost,
+                candidate.prefer_hint,
+                selected_cost,
+                selected_hint,
+            ) {
                 selected_label = candidate.label;
                 selected_cost = candidate.estimated_cost;
+                selected_hint = candidate.prefer_hint;
                 selected_plan = candidate.plan;
             }
         }
@@ -112,13 +106,41 @@ impl AdaptiveScanOperator {
     }
 }
 
-impl PhysicalOperator for AdaptiveScanOperator {
+fn prefer_hint_rank(hint: PreferHint) -> u8 {
+    match hint {
+        PreferHint::Latency => 3,
+        PreferHint::WarmCache => 2,
+        PreferHint::Recall => 1,
+    }
+}
+
+fn candidate_beats_selected(
+    candidate_cost: f64,
+    candidate_hint: Option<PreferHint>,
+    selected_cost: f64,
+    selected_hint: Option<PreferHint>,
+) -> bool {
+    if candidate_cost < selected_cost {
+        return true;
+    }
+
+    let max_cost = candidate_cost.abs().max(selected_cost.abs()).max(1.0);
+    let cost_gap = (candidate_cost - selected_cost).abs() / max_cost;
+    if cost_gap > 0.05 {
+        return false;
+    }
+
+    candidate_hint.map(prefer_hint_rank).unwrap_or(0)
+        > selected_hint.map(prefer_hint_rank).unwrap_or(0)
+}
+
+impl PhysicalOperator for AdaptiveSearchOperator {
     fn operator_type(&self) -> PhysicalOperatorType {
         PhysicalOperatorType::AdaptiveScan
     }
 
     fn explain_name(&self) -> String {
-        "ADAPTIVE_SCAN".to_string()
+        "ADAPTIVE_SEARCH".to_string()
     }
 
     fn explain_params(&self) -> Vec<String> {
@@ -150,6 +172,7 @@ impl PhysicalOperator for AdaptiveScanOperator {
         ctx: &ExecutionContext,
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
+        ctx.check_cancelled()?;
         let executor = Executor::new(ctx.session.clone());
         let compiled = CompiledStatement {
             physical_plan: self.plan.clone(),
@@ -162,16 +185,10 @@ impl PhysicalOperator for AdaptiveScanOperator {
                 .collect(),
             parameter_types: Vec::new(),
         };
-        let mut handler = executor.execute(compiled)?;
+        let handler = executor.execute(compiled)?;
 
-        let mut result_chunks = Vec::new();
-        while let Some(chunk) = handler.fetch()? {
-            result_chunks.push(chunk.clone());
-        }
-
-        Ok(Box::new(AdaptiveScanGlobalState {
-            result_chunks,
-            chunks_served: AtomicUsize::new(0),
+        Ok(Box::new(AdaptiveSearchGlobalState {
+            handler: Mutex::new(handler),
         }))
     }
 
@@ -180,27 +197,32 @@ impl PhysicalOperator for AdaptiveScanOperator {
         _ctx: &ExecutionContext,
         _gstate: &dyn GlobalSourceState,
     ) -> Result<Box<dyn LocalSourceState>> {
-        Ok(Box::new(AdaptiveScanLocalState))
+        Ok(Box::new(AdaptiveSearchLocalState))
     }
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
+        ctx.check_cancelled()?;
         let gstate = input
             .global_state
             .as_any()
-            .downcast_ref::<AdaptiveScanGlobalState>()
-            .expect("invalid adaptive scan global state");
+            .downcast_ref::<AdaptiveSearchGlobalState>()
+            .expect("invalid adaptive search global state");
 
-        let served = gstate.chunks_served.fetch_add(1, Ordering::SeqCst);
-        if served < gstate.result_chunks.len() {
-            *chunk = gstate.result_chunks[served].clone();
-            Ok(SourceResultType::HaveMoreOutput)
-        } else {
-            Ok(SourceResultType::Finished)
+        let mut handler = gstate.handler.lock().unwrap();
+        match handler.fetch()? {
+            Some(next_chunk) => {
+                *chunk = next_chunk.clone();
+                Ok(SourceResultType::HaveMoreOutput)
+            }
+            None => {
+                *chunk = Chunk::init_empty(self.types());
+                Ok(SourceResultType::Finished)
+            }
         }
     }
 

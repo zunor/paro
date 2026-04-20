@@ -35,8 +35,13 @@ EXPLAIN SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
-  ->  ADAPTIVE_SCAN on public.items
-        Search Decision: DEFER_TO_RUNTIME sequential_cost=4.000 candidates=1
+  ->  TOP_N  (rows=2)
+        Sort Key: L2_DISTANCE(emb, CAST('[1.0, 1.0, 1.0]' AS FLOAT[3])) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=4)
+              Output: id, L2_DISTANCE(emb, CAST('[1.0, 1.0, 1.0]' AS FLOAT[3]))
+              ->  ROWSET_SCAN on public.items
+                    Columns: id, emb
 
 SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 id

@@ -147,7 +147,7 @@ async fn bm25_ranking_is_stable_across_segments() {
 
 #[tokio::test]
 async fn restart_recovery_keeps_fulltext_index_usable() {
-    let base_dir = create_unique_test_dir("fulltext_runtime", "restart");
+    let base_dir = create_unique_test_dir("fulltext_search", "restart");
     let mut sink = CollectingSink::new();
 
     {
@@ -219,14 +219,14 @@ async fn restart_recovery_keeps_fulltext_index_usable() {
         )
         .await;
         let lines = explain_lines(&sink);
-        let has_fulltext_scan = lines
+        let has_fulltext_search_plan = lines
             .iter()
             .any(|line| line.to_ascii_uppercase().contains("FULLTEXT_SCAN"));
         let has_filter_fallback = lines
             .iter()
             .any(|line| line.to_ascii_uppercase().contains("FILTER"));
         assert!(
-            has_fulltext_scan || has_filter_fallback,
+            has_fulltext_search_plan || has_filter_fallback,
             "restarted plan should use index scan or filter fallback, actual:\n{}",
             lines.join("\n")
         );
@@ -272,7 +272,7 @@ async fn restart_recovery_keeps_fulltext_index_usable() {
 }
 
 #[tokio::test]
-async fn create_index_marks_fulltext_coverage_complete_after_post_commit_build() {
+async fn create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -311,8 +311,18 @@ async fn create_index_marks_fulltext_coverage_complete_after_post_commit_build()
     let extra_info = query_string_col(&sink, 1);
     assert_eq!(extra_info.len(), 1);
     assert!(
-        extra_info[0].contains("\"complete\":true"),
-        "fulltext index coverage should be complete after post-commit build, actual extra_info={}",
+        extra_info[0].contains("\"complete\":false"),
+        "late fulltext definition should stay tail-pending until bootstrap/catch-up materializes existing rowsets, actual extra_info={}",
+        extra_info[0]
+    );
+    assert!(
+        extra_info[0].contains("\"indexed_segment_count\":0"),
+        "late fulltext definition should not report existing segments as already materialized, actual extra_info={}",
+        extra_info[0]
+    );
+    assert!(
+        extra_info[0].contains("\"visible_segment_count\":1"),
+        "coverage should still describe the visible base segment set, actual extra_info={}",
         extra_info[0]
     );
 
@@ -396,7 +406,7 @@ async fn inserts_after_empty_fulltext_index_still_use_pushdown() {
 }
 
 #[tokio::test]
-async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_runtime() {
+async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_index_state() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, Arc::clone(&instance));
     let mut sink = CollectingSink::new();
@@ -421,7 +431,7 @@ async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_runtime
     .await;
 
     let hook = DeferredTaskRecoveryHook;
-    let task = DeferredTask::BuildIndexRuntime {
+    let task = DeferredTask::FinalizeIndexState {
         index: DdlObjectKey::new(
             session.current_database.catalog().name(),
             Some(session.current_schema()),
@@ -452,7 +462,7 @@ async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_runtime
 }
 
 #[tokio::test]
-async fn deferred_task_failure_marks_catalog_failed_without_aborting_recovery_hook() {
+async fn deferred_task_recovery_uses_catalog_fulltext_config_not_task_payload() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, Arc::clone(&instance));
     let mut sink = CollectingSink::new();
@@ -509,37 +519,42 @@ async fn deferred_task_failure_marks_catalog_failed_without_aborting_recovery_ho
         .expect("index entry should be created");
 
     let hook = DeferredTaskRecoveryHook;
+    let task = DeferredTask::FinalizeIndexState {
+        index: DdlObjectKey::new(
+            session.current_database.catalog().name(),
+            Some(session.current_schema()),
+            "idx_docs_redelivery_fail_fts",
+            DdlObjectKind::Index,
+        ),
+        table_name: "docs_redelivery_fail".to_string(),
+        index_type: "FULLTEXT".to_string(),
+        column_ids: vec![1],
+        // Recovery should trust the durable catalog entry/provider config rather than a stale
+        // deferred-task payload.
+        fulltext_config: Some("unsupported_lang".to_string()),
+    };
     let result = hook
         .run(
             &session.current_database,
-            &deferred_task_context(
-                &session,
-                DeferredTask::BuildIndexRuntime {
-                    index: DdlObjectKey::new(
-                        session.current_database.catalog().name(),
-                        Some(session.current_schema()),
-                        "idx_docs_redelivery_fail_fts",
-                        DdlObjectKind::Index,
-                    ),
-                    table_name: "docs_redelivery_fail".to_string(),
-                    index_type: "FULLTEXT".to_string(),
-                    column_ids: vec![1],
-                    fulltext_config: Some("unsupported_lang".to_string()),
-                },
-            ),
+            &deferred_task_context(&session, task.clone()),
         )
-        .expect("failed deferred task should be reported, not raised");
+        .expect("search deferred task redelivery should report via hook result");
 
     let index = lookup_index_entry(&session, "idx_docs_redelivery_fail_fts");
-    assert!(matches!(result, RecoveryHookResult::Failed { .. }));
-    assert_eq!(index.build_state(), IndexBuildState::Failed);
+    assert!(matches!(result, RecoveryHookResult::Rebuilt { .. }));
+    assert_ne!(index.build_state(), IndexBuildState::Failed);
     assert!(
-        index
-            .failure_reason()
-            .unwrap_or_default()
-            .contains("unsupported"),
-        "failed state should preserve the runtime build error"
+        index.failure_reason().is_none(),
+        "durable index metadata should win over stale task payload during recovery"
     );
+
+    let replayed_again = hook
+        .run(
+            &session.current_database,
+            &deferred_task_context(&session, task),
+        )
+        .expect("already-restored deferred task should skip cleanly");
+    assert!(matches!(replayed_again, RecoveryHookResult::Skipped { .. }));
 }
 
 #[tokio::test]

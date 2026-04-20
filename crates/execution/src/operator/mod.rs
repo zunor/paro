@@ -13,6 +13,7 @@ pub mod persistent;
 pub mod projection;
 pub mod result;
 pub mod scan;
+pub mod search;
 pub mod set;
 pub mod state;
 pub mod window;

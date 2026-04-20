@@ -6,7 +6,8 @@
 //! Route table operations to Tablet/Rowset pipeline.
 
 use crate::compaction::compaction_manager::CompactionManager;
-use crate::table::index_runtime::IndexRuntime;
+use crate::search::registry::SearchIndexRegistry;
+use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::{Tablet, TabletRef};
 use crate::wal::write_ahead_log::WriteAheadLog;
 use paro_common::types::LogicalType;
@@ -22,24 +23,12 @@ pub enum InsertOnConflictAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FullTextIndexCoverage {
-    pub visible_version: i64,
-    pub visible_segment_count: usize,
-    pub indexed_segment_count: usize,
-}
-
-impl FullTextIndexCoverage {
-    pub fn is_complete(&self) -> bool {
-        self.visible_segment_count == self.indexed_segment_count
-    }
-}
-
 /// Adapter layer visible to Catalog; internally owns a Tablet.
 pub struct TableHandle {
     runtime_tablet: TabletRef,
     column_types: Vec<LogicalType>,
-    pub(crate) index_runtime: IndexRuntime,
+    pub(crate) runtime_indexes: RuntimeIndexes,
+    pub(crate) search_registry: SearchIndexRegistry,
     compaction_manager: std::sync::RwLock<Option<Weak<CompactionManager>>>,
 }
 
@@ -54,10 +43,12 @@ pub struct TableColumnSpec {
 
 impl TableHandle {
     pub(crate) fn from_runtime_tablet(tablet: Tablet, column_types: Vec<LogicalType>) -> Self {
+        let runtime_tablet = Arc::new(tablet);
         Self {
-            runtime_tablet: Arc::new(tablet),
+            search_registry: SearchIndexRegistry::new(runtime_tablet.clone()),
+            runtime_tablet,
             column_types,
-            index_runtime: IndexRuntime::new(),
+            runtime_indexes: RuntimeIndexes::new(),
             compaction_manager: std::sync::RwLock::new(None),
         }
     }
@@ -105,6 +96,11 @@ impl TableHandle {
     pub fn bind_journal_apply_runtime(&self, runtime: Option<Arc<JournalApplyRuntime>>) {
         self.runtime_tablet.bind_journal_apply_runtime(runtime);
     }
+
+    #[cfg(test)]
+    pub(crate) fn search_registry(&self) -> &SearchIndexRegistry {
+        &self.search_registry
+    }
 }
 
 impl std::fmt::Debug for TableHandle {
@@ -112,7 +108,8 @@ impl std::fmt::Debug for TableHandle {
         f.debug_struct("TableHandle")
             .field("runtime_tablet", &self.runtime_tablet)
             .field("column_types", &self.column_types)
-            .field("index_runtime", &self.index_runtime)
+            .field("runtime_indexes", &self.runtime_indexes)
+            .field("search_registry", &self.search_registry)
             .field(
                 "has_bound_compaction_manager",
                 &self.bound_compaction_manager().is_some(),

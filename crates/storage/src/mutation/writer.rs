@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::chunk_encoder;
 use crate::primary_key::RowID;
-use crate::table::index_runtime::IndexRuntime;
+use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::table::table_handle::TableHandle;
 use crate::tablet::KeysType;
 use crate::transaction::txn::Transaction;
@@ -29,21 +29,22 @@ pub(crate) fn append_with_transaction(
 
     let tablet = table.tablet();
     let art_columns = table.declared_art_columns();
-    let fulltext_columns = table.declared_fulltext_columns_with_config();
+    let search_write_plan = table.search_write_plan()?;
 
     if let Some(txn) = txn {
         if !art_columns.is_empty() {
             txn.register_pending_art_columns(tablet.tablet_id(), art_columns)?;
         }
-        if !fulltext_columns.is_empty() {
-            txn.register_pending_fulltext_columns(tablet.tablet_id(), fulltext_columns)?;
-        }
-        txn.append_to_tablet(tablet, chunk)?;
+        txn.append_to_tablet(tablet, chunk, search_write_plan)?;
         return Ok(());
     }
 
-    let mut writer =
-        DeltaWriter::open_with_allocator(tablet.clone(), now_micros(), chunk.allocator().clone())?;
+    let mut writer = DeltaWriter::open_with_allocator_and_search_plan(
+        tablet.clone(),
+        now_micros(),
+        chunk.allocator().clone(),
+        search_write_plan,
+    )?;
     if tablet
         .schema()
         .map(|schema| schema.keys_type() == KeysType::PrimaryKeys)
@@ -55,12 +56,8 @@ pub(crate) fn append_with_transaction(
         writer.write(&cols)?;
     }
     let rowset = writer.commit()?;
-    if !fulltext_columns.is_empty() {
-        IndexRuntime::build_runtime_fulltext_indexes_for_rowset(&rowset, &fulltext_columns)?;
-    }
     if !art_columns.is_empty() {
-        if let Err(err) = IndexRuntime::build_runtime_art_indexes_for_rowset(&rowset, &art_columns)
-        {
+        if let Err(err) = RuntimeIndexes::rebuild_art_indexes_for_rowset(&rowset, &art_columns) {
             tracing::warn!(
                 error = %err,
                 "ART index backfill failed for committed rowset; queries will fallback to scan"

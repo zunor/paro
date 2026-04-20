@@ -279,7 +279,7 @@ impl Segment {
     }
 
     /// Remove a runtime ART index previously registered on this segment.
-    pub fn remove_runtime_art_index(&self, column_id: ColumnId) {
+    pub fn drop_art_index(&self, column_id: ColumnId) {
         if let Ok(mut guard) = self.indexes.predicate.runtime_art_indexes.write() {
             guard.remove(&column_id);
         }

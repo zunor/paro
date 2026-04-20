@@ -1,0 +1,192 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::rowset::RowsetId;
+use crate::tablet::ColumnId;
+
+use super::capability::SearchIndexKind;
+use super::stats::SegmentId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TailMutationKind {
+    Append,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TailRowImageRef {
+    WholeRowset,
+    PartialRowset {
+        touched_columns: Vec<ColumnId>,
+        base_rowids_segments: Vec<SegmentId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailPendingEntry {
+    pub rowset_id: RowsetId,
+    pub segment_ids: Vec<SegmentId>,
+    pub mutation: TailMutationKind,
+    pub row_count: u64,
+    pub row_image_ref: Option<TailRowImageRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TailPendingSet {
+    pub entries: Vec<TailPendingEntry>,
+}
+
+impl TailPendingSet {
+    pub fn is_empty(&self) -> bool {
+        self.coverage_rows() == 0
+    }
+
+    pub fn coverage_rowsets(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.mutation != TailMutationKind::Delete)
+            .map(|entry| entry.rowset_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn coverage_segments(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.mutation != TailMutationKind::Delete)
+            .flat_map(|entry| {
+                entry
+                    .segment_ids
+                    .iter()
+                    .copied()
+                    .map(move |segment_id| (entry.rowset_id, segment_id))
+            })
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn coverage_rows(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.mutation != TailMutationKind::Delete)
+            .map(|entry| entry.row_count)
+            .sum()
+    }
+
+    pub fn delete_rows(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.mutation == TailMutationKind::Delete)
+            .map(|entry| entry.row_count)
+            .sum()
+    }
+
+    pub fn without_rowsets(&self, removed: &BTreeSet<RowsetId>) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| !removed.contains(&entry.rowset_id))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactTailMergePolicy {
+    pub supported: bool,
+    pub soft_row_limit: u64,
+    pub hard_row_limit: u64,
+}
+
+impl ExactTailMergePolicy {
+    pub const fn exact_tail_merge_enabled(self, tail_rows: u64) -> bool {
+        self.supported && tail_rows <= self.hard_row_limit
+    }
+}
+
+pub const fn provider_tail_merge_policy(kind: SearchIndexKind) -> ExactTailMergePolicy {
+    match kind {
+        SearchIndexKind::Hnsw => ExactTailMergePolicy {
+            supported: true,
+            soft_row_limit: 4_096,
+            hard_row_limit: 16_384,
+        },
+        SearchIndexKind::Sparse => ExactTailMergePolicy {
+            supported: true,
+            soft_row_limit: 32_768,
+            hard_row_limit: 131_072,
+        },
+        SearchIndexKind::FullText => ExactTailMergePolicy {
+            supported: true,
+            soft_row_limit: 16_384,
+            hard_row_limit: 65_536,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        provider_tail_merge_policy, TailMutationKind, TailPendingEntry, TailPendingSet,
+        TailRowImageRef,
+    };
+    use crate::search::capability::SearchIndexKind;
+
+    #[test]
+    fn coverage_counts_ignore_delete_only_entries() {
+        let tail = TailPendingSet {
+            entries: vec![
+                TailPendingEntry {
+                    rowset_id: 1,
+                    segment_ids: vec![0, 1],
+                    mutation: TailMutationKind::Append,
+                    row_count: 10,
+                    row_image_ref: Some(TailRowImageRef::WholeRowset),
+                },
+                TailPendingEntry {
+                    rowset_id: 2,
+                    segment_ids: vec![0],
+                    mutation: TailMutationKind::Replace,
+                    row_count: 3,
+                    row_image_ref: Some(TailRowImageRef::PartialRowset {
+                        touched_columns: vec![1],
+                        base_rowids_segments: vec![0],
+                    }),
+                },
+                TailPendingEntry {
+                    rowset_id: 1,
+                    segment_ids: vec![0],
+                    mutation: TailMutationKind::Delete,
+                    row_count: 4,
+                    row_image_ref: None,
+                },
+            ],
+        };
+
+        assert_eq!(tail.coverage_rowsets(), 2);
+        assert_eq!(tail.coverage_segments(), 3);
+        assert_eq!(tail.coverage_rows(), 13);
+        assert_eq!(tail.delete_rows(), 4);
+    }
+
+    #[test]
+    fn provider_policies_encode_tail_merge_thresholds() {
+        let hnsw = provider_tail_merge_policy(SearchIndexKind::Hnsw);
+        assert!(hnsw.exact_tail_merge_enabled(2_048));
+        assert!(!hnsw.exact_tail_merge_enabled(32_768));
+
+        let sparse = provider_tail_merge_policy(SearchIndexKind::Sparse);
+        assert!(sparse.exact_tail_merge_enabled(65_536));
+
+        let fulltext = provider_tail_merge_policy(SearchIndexKind::FullText);
+        assert!(fulltext.exact_tail_merge_enabled(8_192));
+        assert!(!fulltext.exact_tail_merge_enabled(100_000));
+    }
+}

@@ -3,9 +3,22 @@
 
 use crate::compaction::plan::types::CompactionPlan;
 use crate::rowset::RowsetSharedPtr;
+use crate::search::manifest::ManifestStore;
+use crate::search::SearchGenerationId;
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
 use std::sync::{Arc, OnceLock, RwLock};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSearchGeneration {
+    pub definition_id: u64,
+    pub generation_id: SearchGenerationId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionGenerationContext {
+    pub active_generations: Vec<ActiveSearchGeneration>,
+}
 
 /// Trait for rebuilding secondary indexes during compaction.
 ///
@@ -28,6 +41,7 @@ pub trait CompactionIndexRebuilder: Send + Sync {
     /// Rebuild indexes for the given compaction output rowset.
     fn rebuild(
         &self,
+        generation_context: &CompactionGenerationContext,
         tablet: &Tablet,
         rowset: &RowsetSharedPtr,
         plan: &CompactionPlan,
@@ -86,6 +100,7 @@ fn ensure_default_rebuilders_registered() {
         let _ = crate::index::art::compaction::register_art_rebuilder();
         let _ = crate::index::hnsw::compaction::register_hnsw_rebuilder();
         let _ = crate::index::fulltext::compaction::register_fulltext_rebuilder();
+        let _ = crate::index::sparse::compaction::register_sparse_rebuilder();
     });
 }
 
@@ -105,6 +120,7 @@ pub fn rebuild_compaction_indexes(
     plan: &CompactionPlan,
 ) -> Result<()> {
     ensure_default_rebuilders_registered();
+    let generation_context = load_generation_context(tablet)?;
 
     let builders = CompactionIndexRegistry::global().list()?;
     if builders.is_empty() {
@@ -123,7 +139,7 @@ pub fn rebuild_compaction_indexes(
     rowset.load()?;
 
     if applicable.len() == 1 {
-        return applicable[0].rebuild(tablet, &rowset, plan);
+        return applicable[0].rebuild(&generation_context, tablet, &rowset, plan);
     }
 
     let mut errors = Vec::new();
@@ -131,7 +147,10 @@ pub fn rebuild_compaction_indexes(
         let mut handles = Vec::with_capacity(applicable.len());
         for builder in applicable {
             let rowset = rowset.clone();
-            handles.push(scope.spawn(move || builder.rebuild(tablet, &rowset, plan)));
+            let generation_context = generation_context.clone();
+            handles.push(
+                scope.spawn(move || builder.rebuild(&generation_context, tablet, &rowset, plan)),
+            );
         }
 
         for handle in handles {
@@ -148,6 +167,39 @@ pub fn rebuild_compaction_indexes(
     }
 
     Ok(())
+}
+
+fn load_generation_context(tablet: &Tablet) -> Result<CompactionGenerationContext> {
+    let manifests = ManifestStore::new(tablet.data_dir().to_path_buf());
+    let definitions_dir = manifests
+        .definition_dir(0)
+        .parent()
+        .map(|path| path.to_path_buf())
+        .ok_or_else(|| paro_error::internal("resolve search definition directory"))?;
+    if !definitions_dir.exists() {
+        return Ok(CompactionGenerationContext::default());
+    }
+
+    let mut active_generations = Vec::new();
+    for entry in std::fs::read_dir(&definitions_dir).map_err(|err| {
+        paro_error::io_error(format!("scan {}: {}", definitions_dir.display(), err))
+    })? {
+        let entry = entry.map_err(paro_error::io)?;
+        if !entry.file_type().map_err(paro_error::io)?.is_dir() {
+            continue;
+        }
+        let Ok(definition_id) = entry.file_name().to_string_lossy().parse::<u64>() else {
+            continue;
+        };
+        if let Some(manifest) = manifests.load_manifest(definition_id)? {
+            active_generations.push(ActiveSearchGeneration {
+                definition_id,
+                generation_id: manifest.root.generation_id,
+            });
+        }
+    }
+    active_generations.sort_by_key(|entry| entry.definition_id);
+    Ok(CompactionGenerationContext { active_generations })
 }
 
 #[cfg(test)]

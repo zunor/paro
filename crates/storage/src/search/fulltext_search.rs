@@ -1,177 +1,552 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BinaryHeap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Instant;
 
+use crate::index::fulltext::query_eval::matches_query;
 use crate::index::fulltext::query_parser::ParsedQuery;
+use crate::index::fulltext::scoring::score_document_from_tokens;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::GlobalFullTextStats;
+use crate::index::fulltext::tokenizer::tokenizer_from_config;
 use crate::index::PredicateTree;
-use crate::search::row_projection::{materialize_results, snapshot_epoch, ScoredRowRef};
-use crate::tablet::{TabletReadGuard, TabletRef};
-use paro_common::chunk::Chunk;
-use paro_common::error::Result;
-use paro_common::types::LogicalType;
+use crate::search::capability::SearchIndexKind;
+use crate::search::cursor::{
+    CandidateBatch, OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot,
+    VisibleSegment,
+};
+use crate::search::row_fetch::snapshot_epoch;
+use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
+use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
+use crate::search::telemetry::{
+    GenerationTelemetryEvent, NoopSearchTelemetryCollector, QueryTelemetryEvent,
+    SearchTelemetryCollector,
+};
+use crate::search::topk_merge::{ranked_rows_to_batch, RankedRow, TopKCollector};
+use crate::tablet::TabletRef;
+use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
 
-fn finalize_fulltext_heap(
-    min_heap: BinaryHeap<std::cmp::Reverse<ScoredRowRef>>,
-) -> Vec<ScoredRowRef> {
-    min_heap
-        .into_sorted_vec()
-        .into_iter()
-        .map(|entry| entry.0)
-        .collect()
-}
+use super::budget::{ResourceBudget, SearchBatchConfig};
+use super::cursor::PhysicalRowRef;
 
-pub(crate) fn fulltext_search(
-    tablet: &TabletRef,
-    column_types: &[LogicalType],
+pub(crate) struct FullTextTopKProvider {
+    tablet: TabletRef,
     column_id: usize,
-    query_text: &str,
+    query: ParsedQuery,
     k: usize,
-    predicate: Option<&PredicateTree>,
-    projected_columns: &[usize],
-    global_stats: Option<&GlobalFullTextStats>,
-) -> Result<Vec<Chunk>> {
-    let version = tablet.max_version();
-    let _snapshot = TabletReadGuard::pin(tablet, version);
-    let snapshot_epoch = snapshot_epoch(version);
-    let rowsets = tablet.capture_consistent_rowsets(version)?;
-    let mut min_heap: BinaryHeap<std::cmp::Reverse<ScoredRowRef>> = BinaryHeap::new();
-
-    for rowset in &rowsets {
-        rowset.load()?;
-        for segment in rowset.segments() {
-            let results = segment.fulltext_search_text_with_epoch(
-                column_id as u32,
-                query_text,
-                k,
-                snapshot_epoch,
-                predicate,
-                global_stats,
-                FullTextScoreMode::Bm25,
-            )?;
-
-            for point in results {
-                let scored = ScoredRowRef {
-                    score: point.score,
-                    segment: segment.clone(),
-                    row_id: point.idx as u32,
-                };
-
-                if min_heap.len() < k {
-                    min_heap.push(std::cmp::Reverse(scored));
-                } else if let Some(peek) = min_heap.peek() {
-                    if scored.score > peek.0.score {
-                        min_heap.pop();
-                        min_heap.push(std::cmp::Reverse(scored));
-                    }
-                }
-            }
-        }
-    }
-
-    materialize_results(
-        tablet,
-        column_types,
-        finalize_fulltext_heap(min_heap),
-        projected_columns,
-        false,
-    )
-}
-
-pub(crate) fn fulltext_filter(
-    tablet: &TabletRef,
-    column_types: &[LogicalType],
-    column_id: usize,
-    query: &ParsedQuery,
-    predicate: Option<&PredicateTree>,
-    projected_columns: &[usize],
-) -> Result<Vec<Chunk>> {
-    let version = tablet.max_version();
-    let _snapshot = TabletReadGuard::pin(tablet, version);
-    let snapshot_epoch = snapshot_epoch(version);
-    let rowsets = tablet.capture_consistent_rowsets(version)?;
-    let mut matched_rows = Vec::new();
-
-    for rowset in &rowsets {
-        rowset.load()?;
-        for segment in rowset.segments() {
-            let bitmap = segment.fulltext_filter_with_epoch(
-                column_id as u32,
-                query,
-                snapshot_epoch,
-                predicate,
-            )?;
-
-            for row_id in bitmap.iter() {
-                matched_rows.push(ScoredRowRef {
-                    score: 0.0,
-                    segment: segment.clone(),
-                    row_id,
-                });
-            }
-        }
-    }
-
-    materialize_results(tablet, column_types, matched_rows, projected_columns, false)
-}
-
-pub(crate) fn fulltext_search_parsed(
-    tablet: &TabletRef,
-    column_types: &[LogicalType],
-    column_id: usize,
-    query: &ParsedQuery,
-    k: usize,
-    predicate: Option<&PredicateTree>,
-    projected_columns: &[usize],
-    global_stats: Option<&GlobalFullTextStats>,
+    config: String,
+    predicate: Option<PredicateTree>,
+    global_stats: Option<GlobalFullTextStats>,
     score_mode: FullTextScoreMode,
-    emit_score: bool,
-) -> Result<Vec<Chunk>> {
-    let version = tablet.max_version();
-    let _snapshot = TabletReadGuard::pin(tablet, version);
-    let snapshot_epoch = snapshot_epoch(version);
-    let rowsets = tablet.capture_consistent_rowsets(version)?;
-    let mut min_heap: BinaryHeap<std::cmp::Reverse<ScoredRowRef>> = BinaryHeap::new();
+    telemetry: Arc<dyn SearchTelemetryCollector>,
+}
 
-    for rowset in &rowsets {
-        rowset.load()?;
-        for segment in rowset.segments() {
-            let results = segment.fulltext_search_with_epoch(
-                column_id as u32,
-                query,
-                k,
-                snapshot_epoch,
-                predicate,
-                global_stats,
-                score_mode,
-            )?;
-
-            for point in results {
-                let scored = ScoredRowRef {
-                    score: point.score,
-                    segment: segment.clone(),
-                    row_id: point.idx as u32,
-                };
-
-                if min_heap.len() < k {
-                    min_heap.push(std::cmp::Reverse(scored));
-                } else if let Some(peek) = min_heap.peek() {
-                    if scored.score > peek.0.score {
-                        min_heap.pop();
-                        min_heap.push(std::cmp::Reverse(scored));
-                    }
-                }
-            }
+impl FullTextTopKProvider {
+    pub(crate) fn new(
+        tablet: TabletRef,
+        column_id: usize,
+        query: &ParsedQuery,
+        k: usize,
+        config: &str,
+        predicate: Option<PredicateTree>,
+        global_stats: Option<GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
+    ) -> Self {
+        Self {
+            tablet,
+            column_id,
+            query: query.clone(),
+            k,
+            config: config.to_string(),
+            predicate,
+            global_stats,
+            score_mode,
+            telemetry: Arc::new(NoopSearchTelemetryCollector),
         }
     }
 
-    materialize_results(
-        tablet,
-        column_types,
-        finalize_fulltext_heap(min_heap),
-        projected_columns,
-        emit_score,
-    )
+    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> OpenedSearchCursor {
+        if self.k == 0 {
+            return OpenedSearchCursor {
+                snapshot,
+                cursor: Box::new(ExhaustedFullTextCursor),
+            };
+        }
+
+        OpenedSearchCursor {
+            snapshot: snapshot.clone(),
+            cursor: Box::new(FullTextTopKCursor {
+                snapshot,
+                tablet: self.tablet,
+                storage_col_id: self.column_id as u32,
+                query: self.query,
+                k: self.k,
+                config: self.config,
+                predicate: self.predicate,
+                global_stats: self.global_stats,
+                score_mode: self.score_mode,
+                telemetry: self.telemetry,
+                state: FullTextTopKState::Pending,
+            }),
+        }
+    }
+}
+
+pub(crate) struct FullTextFilterProvider {
+    tablet: TabletRef,
+    column_id: usize,
+    query: ParsedQuery,
+    config: String,
+    predicate: Option<PredicateTree>,
+    telemetry: Arc<dyn SearchTelemetryCollector>,
+}
+
+impl FullTextFilterProvider {
+    pub(crate) fn new(
+        tablet: TabletRef,
+        column_id: usize,
+        query: &ParsedQuery,
+        config: &str,
+        predicate: Option<PredicateTree>,
+    ) -> Self {
+        Self {
+            tablet,
+            column_id,
+            query: query.clone(),
+            config: config.to_string(),
+            predicate,
+            telemetry: Arc::new(NoopSearchTelemetryCollector),
+        }
+    }
+
+    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> OpenedSearchCursor {
+        OpenedSearchCursor {
+            snapshot: snapshot.clone(),
+            cursor: Box::new(FullTextFilterCursor {
+                snapshot,
+                tablet: self.tablet,
+                storage_col_id: self.column_id as u32,
+                query: self.query,
+                config: self.config,
+                predicate: self.predicate,
+                telemetry: self.telemetry,
+                next_segment: 0,
+                pending_rows: VecDeque::new(),
+                rows_emitted: 0,
+                candidates_produced: 0,
+                started_at: None,
+                finished: false,
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExhaustedFullTextCursor;
+
+impl SearchCursor for ExhaustedFullTextCursor {
+    fn next_batch(
+        &mut self,
+        _batch: &SearchBatchConfig,
+        _budget: &mut ResourceBudget,
+    ) -> Result<SearchBatchState> {
+        Ok(SearchBatchState::Exhausted)
+    }
+}
+
+#[derive(Debug)]
+enum FullTextTopKState {
+    Pending,
+    Ready { rows: Vec<RankedRow>, offset: usize },
+    Exhausted,
+}
+
+struct FullTextTopKCursor {
+    snapshot: SearchReadSnapshot,
+    tablet: TabletRef,
+    storage_col_id: u32,
+    query: ParsedQuery,
+    k: usize,
+    config: String,
+    predicate: Option<PredicateTree>,
+    global_stats: Option<GlobalFullTextStats>,
+    score_mode: FullTextScoreMode,
+    telemetry: Arc<dyn SearchTelemetryCollector>,
+    state: FullTextTopKState,
+}
+
+impl std::fmt::Debug for FullTextTopKCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullTextTopKCursor")
+            .field("storage_col_id", &self.storage_col_id)
+            .field("k", &self.k)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl FullTextTopKCursor {
+    fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
+        let started_at = Instant::now();
+        self.telemetry.record_generation(GenerationTelemetryEvent {
+            kind: SearchIndexKind::FullText,
+            definition_id: self.snapshot.generation.definition_id,
+            generation_id: self.snapshot.generation.generation_id,
+            build_epoch: self.snapshot.generation.build_epoch,
+            coverage: self.snapshot.generation.coverage.clone(),
+            artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
+        });
+        let per_segment = dispatch_segments(
+            SearchIndexKind::FullText,
+            self.snapshot.table_lease.visible_segments(),
+            budget.parallelism_slots.max(1),
+            self.telemetry.as_ref(),
+            |segment| {
+                let (rows, degraded) = self.search_segment(segment)?;
+                Ok(SegmentDispatchResult {
+                    candidates_produced: rows.len(),
+                    degraded,
+                    output: (rows, degraded),
+                })
+            },
+        )?;
+
+        let mut collector = TopKCollector::new(self.k);
+        let mut candidates_produced = 0usize;
+        let mut degraded_segments = 0usize;
+        for (rows, degraded) in per_segment {
+            candidates_produced += rows.len();
+            degraded_segments += usize::from(degraded);
+            collector.extend(rows);
+        }
+        let peak_heap_items = collector.len();
+        let ranked_rows = collector.into_sorted_rows();
+        self.telemetry.record_query(QueryTelemetryEvent {
+            kind: SearchIndexKind::FullText,
+            segments_searched: self.snapshot.table_lease.visible_segment_count(),
+            candidates_produced,
+            rows_returned: ranked_rows.len(),
+            peak_heap_items,
+            degraded_segments,
+            elapsed: started_at.elapsed(),
+        });
+        Ok(ranked_rows)
+    }
+
+    fn search_segment(&self, visible_segment: &VisibleSegment) -> Result<(Vec<RankedRow>, bool)> {
+        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
+        if visible_segment
+            .segment
+            .fulltext_index(self.storage_col_id)
+            .is_some()
+        {
+            return visible_segment
+                .segment
+                .fulltext_search_with_epoch(
+                    self.storage_col_id,
+                    &self.query,
+                    self.k,
+                    snapshot_version,
+                    self.predicate.as_ref(),
+                    self.global_stats.as_ref(),
+                    self.score_mode,
+                )
+                .map(|rows| {
+                    (
+                        rows.into_iter()
+                            .map(|point| {
+                                RankedRow::new(
+                                    PhysicalRowRef::new(
+                                        visible_segment.rowset_id,
+                                        visible_segment.segment_id,
+                                        point.idx as u32,
+                                    ),
+                                    point.score,
+                                )
+                            })
+                            .collect(),
+                        false,
+                    )
+                });
+        }
+
+        let row_ids = visible_row_ids(
+            visible_segment,
+            self.snapshot.table.visible_version,
+            self.predicate.as_ref(),
+        )?;
+        if row_ids.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let resolved = resolve_logical_rows(
+            &self.tablet,
+            self.snapshot.table.visible_version,
+            visible_segment,
+            &row_ids,
+            self.storage_col_id,
+        )?;
+        let column = resolved
+            .column(0)
+            .ok_or_else(|| paro_error::internal("resolved fulltext tail chunk missing column"))?;
+        let (_kind, tokenizer) = tokenizer_from_config(&self.config)?;
+        let mut collector = TopKCollector::new(self.k);
+        for (offset, row_id) in row_ids.iter().copied().enumerate() {
+            let Value::Varchar(text) = column.get_value(offset) else {
+                continue;
+            };
+            let tokens = tokenizer.tokenize_to_vec(&text);
+            if !matches_query(&tokens, &self.query) {
+                continue;
+            }
+            collector.push(RankedRow::new(
+                PhysicalRowRef::new(
+                    visible_segment.rowset_id,
+                    visible_segment.segment_id,
+                    row_id,
+                ),
+                score_document_from_tokens(self.score_mode, &tokens, &self.query),
+            ));
+        }
+        Ok((collector.into_sorted_rows(), true))
+    }
+}
+
+impl SearchCursor for FullTextTopKCursor {
+    fn next_batch(
+        &mut self,
+        batch: &SearchBatchConfig,
+        budget: &mut ResourceBudget,
+    ) -> Result<SearchBatchState> {
+        if matches!(self.state, FullTextTopKState::Pending) {
+            let ranked_rows = self.build_ranked_rows(budget)?;
+            self.state = if ranked_rows.is_empty() {
+                FullTextTopKState::Exhausted
+            } else {
+                FullTextTopKState::Ready {
+                    rows: ranked_rows,
+                    offset: 0,
+                }
+            };
+        }
+
+        match &mut self.state {
+            FullTextTopKState::Pending => Err(paro_error::internal(
+                "fulltext top-k cursor did not transition out of pending state",
+            )),
+            FullTextTopKState::Exhausted => Ok(SearchBatchState::Exhausted),
+            FullTextTopKState::Ready { rows, offset } => {
+                let row_limit = batch.row_limit.max(1);
+                let end = (*offset + row_limit).min(rows.len());
+                let candidate_batch = ranked_rows_to_batch(rows[*offset..end].to_vec());
+                *offset = end;
+                if *offset >= rows.len() {
+                    self.state = FullTextTopKState::Exhausted;
+                }
+                Ok(SearchBatchState::Ready(candidate_batch))
+            }
+        }
+    }
+}
+
+struct FullTextFilterCursor {
+    snapshot: SearchReadSnapshot,
+    tablet: TabletRef,
+    storage_col_id: u32,
+    query: ParsedQuery,
+    config: String,
+    predicate: Option<PredicateTree>,
+    telemetry: Arc<dyn SearchTelemetryCollector>,
+    next_segment: usize,
+    pending_rows: VecDeque<PhysicalRowRef>,
+    rows_emitted: usize,
+    candidates_produced: usize,
+    started_at: Option<Instant>,
+    finished: bool,
+}
+
+impl std::fmt::Debug for FullTextFilterCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullTextFilterCursor")
+            .field("storage_col_id", &self.storage_col_id)
+            .field("next_segment", &self.next_segment)
+            .field("pending_rows", &self.pending_rows.len())
+            .field("rows_emitted", &self.rows_emitted)
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+impl FullTextFilterCursor {
+    fn dispatch_next_segment_window(&mut self, budget: &ResourceBudget) -> Result<()> {
+        let segments = self.snapshot.table_lease.visible_segments();
+        if self.next_segment >= segments.len() {
+            return Ok(());
+        }
+
+        let window_width = budget.parallelism_slots.max(1);
+        let window_end = (self.next_segment + window_width).min(segments.len());
+        let window = &segments[self.next_segment..window_end];
+        self.next_segment = window_end;
+
+        let matches = dispatch_segments(
+            SearchIndexKind::FullText,
+            window,
+            window_width,
+            self.telemetry.as_ref(),
+            |segment| {
+                let (rows, degraded) = self.search_segment_rows(segment)?;
+                Ok(SegmentDispatchResult {
+                    candidates_produced: rows.len(),
+                    degraded,
+                    output: rows,
+                })
+            },
+        )?;
+
+        for rows in matches {
+            self.candidates_produced += rows.len();
+            self.pending_rows.extend(rows);
+        }
+        Ok(())
+    }
+
+    fn search_segment_rows(&self, segment: &VisibleSegment) -> Result<(Vec<PhysicalRowRef>, bool)> {
+        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
+        if segment
+            .segment
+            .fulltext_index(self.storage_col_id)
+            .is_some()
+        {
+            let bitmap = segment.segment.fulltext_filter_with_epoch(
+                self.storage_col_id,
+                &self.query,
+                snapshot_version,
+                self.predicate.as_ref(),
+            )?;
+            let mut rows = Vec::with_capacity(bitmap.len() as usize);
+            for row_id in bitmap.iter() {
+                rows.push(PhysicalRowRef::new(
+                    segment.rowset_id,
+                    segment.segment_id,
+                    row_id,
+                ));
+            }
+            return Ok((rows, false));
+        }
+
+        let row_ids = visible_row_ids(
+            segment,
+            self.snapshot.table.visible_version,
+            self.predicate.as_ref(),
+        )?;
+        if row_ids.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let resolved = resolve_logical_rows(
+            &self.tablet,
+            self.snapshot.table.visible_version,
+            segment,
+            &row_ids,
+            self.storage_col_id,
+        )?;
+        let column = resolved.column(0).ok_or_else(|| {
+            paro_error::internal("resolved fulltext filter tail chunk missing column")
+        })?;
+        let (_kind, tokenizer) = tokenizer_from_config(&self.config)?;
+        let mut rows = Vec::new();
+        for (offset, row_id) in row_ids.iter().copied().enumerate() {
+            let Value::Varchar(text) = column.get_value(offset) else {
+                continue;
+            };
+            let tokens = tokenizer.tokenize_to_vec(&text);
+            if matches_query(&tokens, &self.query) {
+                rows.push(PhysicalRowRef::new(
+                    segment.rowset_id,
+                    segment.segment_id,
+                    row_id,
+                ));
+            }
+        }
+        Ok((rows, true))
+    }
+
+    fn finish_if_needed(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let elapsed = self
+            .started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or_default();
+        self.telemetry.record_query(QueryTelemetryEvent {
+            kind: SearchIndexKind::FullText,
+            segments_searched: self.snapshot.table_lease.visible_segment_count(),
+            candidates_produced: self.candidates_produced,
+            rows_returned: self.rows_emitted,
+            peak_heap_items: 0,
+            degraded_segments: 0,
+            elapsed,
+        });
+    }
+}
+
+impl SearchCursor for FullTextFilterCursor {
+    fn next_batch(
+        &mut self,
+        batch: &SearchBatchConfig,
+        budget: &mut ResourceBudget,
+    ) -> Result<SearchBatchState> {
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+            self.telemetry.record_generation(GenerationTelemetryEvent {
+                kind: SearchIndexKind::FullText,
+                definition_id: self.snapshot.generation.definition_id,
+                generation_id: self.snapshot.generation.generation_id,
+                build_epoch: self.snapshot.generation.build_epoch,
+                coverage: self.snapshot.generation.coverage.clone(),
+                artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
+            });
+        }
+
+        let row_limit = batch.row_limit.max(1);
+        let mut rows = Vec::with_capacity(row_limit);
+
+        loop {
+            while rows.len() < row_limit {
+                let Some(row) = self.pending_rows.pop_front() else {
+                    break;
+                };
+                rows.push(row);
+            }
+
+            if rows.len() == row_limit {
+                self.rows_emitted += rows.len();
+                return Ok(SearchBatchState::Ready(CandidateBatch {
+                    rows,
+                    scores: Vec::new(),
+                }));
+            }
+
+            if self.next_segment >= self.snapshot.table_lease.visible_segment_count() {
+                if rows.is_empty() {
+                    self.finish_if_needed();
+                    return Ok(SearchBatchState::Exhausted);
+                }
+                self.rows_emitted += rows.len();
+                if self.pending_rows.is_empty() {
+                    self.finish_if_needed();
+                }
+                return Ok(SearchBatchState::Ready(CandidateBatch {
+                    rows,
+                    scores: Vec::new(),
+                }));
+            }
+
+            self.dispatch_next_segment_window(budget)?;
+        }
+    }
 }

@@ -64,7 +64,9 @@ impl PhysicalPlanGenerator {
         // 3-6. Build phase split:
         // - Future runtime-build index types: full scan/projection/filter/sort pipeline
         // - Current supported index types (ART/HNSW/Sparse/FullText): metadata-only
-        let child = if op.info.index_type.requires_runtime_build() {
+        let child = if op.info.index_type.supports_metadata_only_build() {
+            Arc::new(PhysicalDummyScan::new()) as Arc<dyn PhysicalOperator>
+        } else {
             let scan = self.create_index_table_scan(op)?;
             let projection = self.add_index_projection(op, scan)?;
 
@@ -81,8 +83,6 @@ impl PhysicalPlanGenerator {
             } else {
                 filtered
             }
-        } else {
-            Arc::new(PhysicalDummyScan::new()) as Arc<dyn PhysicalOperator>
         };
 
         // 7. Create CreateIndex operator

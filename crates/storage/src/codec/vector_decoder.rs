@@ -294,37 +294,6 @@ pub(crate) fn infer_batch_row_count(
     }
 }
 
-pub(crate) fn decode_f32_array_row(
-    data: &[u8],
-    row_idx: usize,
-    dim: usize,
-    out: &mut [f32],
-) -> Result<()> {
-    if out.len() < dim {
-        return Err(paro_error::invalid_input(
-            "Dense vector scratch buffer is smaller than dimension",
-        ));
-    }
-    let bytes_per_row = dim
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| paro_error::data_corrupted("Array row width overflow"))?;
-    let start = row_idx
-        .checked_mul(bytes_per_row)
-        .ok_or_else(|| paro_error::data_corrupted("Array row offset overflow"))?;
-    let end = start
-        .checked_add(bytes_per_row)
-        .ok_or_else(|| paro_error::data_corrupted("Array row end overflow"))?;
-    if end > data.len() {
-        return Err(paro_error::data_corrupted(
-            "Array row extends past batch buffer",
-        ));
-    }
-    for (dst, chunk) in out[..dim].iter_mut().zip(data[start..end].chunks_exact(4)) {
-        *dst = f32::from_le_bytes(chunk.try_into().expect("chunk size checked"));
-    }
-    Ok(())
-}
-
 pub(crate) fn apply_nulls(vector: &mut Vector, nulls: &[u8], rows: usize) -> Result<()> {
     if nulls.len() < rows {
         return Err(paro_error::data_corrupted(

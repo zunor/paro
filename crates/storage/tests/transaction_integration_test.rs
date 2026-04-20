@@ -23,6 +23,15 @@ fn create_table(types: &[LogicalType]) -> TableHandle {
     TableFactory::default().create_table(types).unwrap()
 }
 
+fn create_pk_table() -> TableHandle {
+    TableFactory::default()
+        .create_table_with_keys(
+            &[LogicalType::Integer, LogicalType::Integer],
+            KeysType::PrimaryKeys,
+        )
+        .unwrap()
+}
+
 fn create_test_meta_manager(temp_dir: &TempDir) -> Arc<TabletMetaManager> {
     let store: Arc<dyn MetadataStore> =
         Arc::new(FileMetadataStore::new(temp_dir.path().join("meta")).unwrap());
@@ -397,13 +406,16 @@ fn test_concurrent_upsert_same_primary_key_keeps_latest_committed_value_visible(
 #[test]
 fn test_transaction_memtable_reuse_single_rowset() {
     let metrics_before = storage_metrics().snapshot();
-    let (tablet, _tmp) = create_pk_tablet();
+    let table = create_pk_table();
+    let tablet = table.tablet();
     let tm = TransactionManager::new();
 
     let t1 = tm.begin_transaction().unwrap();
-    t1.append_to_tablet(tablet.clone(), &chunk_with_pairs(&[1], &[10]))
+    table
+        .append_with_transaction(&chunk_with_pairs(&[1], &[10]), Some(t1.clone()))
         .unwrap();
-    t1.append_to_tablet(tablet.clone(), &chunk_with_pairs(&[2], &[20]))
+    table
+        .append_with_transaction(&chunk_with_pairs(&[2], &[20]), Some(t1.clone()))
         .unwrap();
 
     // Before commit, writes are still transaction-local.
@@ -424,7 +436,8 @@ fn test_transaction_memtable_reuse_single_rowset() {
 #[test]
 fn test_transaction_memtable_flush_on_threshold_then_commit() {
     let metrics_before = storage_metrics().snapshot();
-    let (tablet, _tmp) = create_pk_tablet();
+    let table = create_pk_table();
+    let tablet = table.tablet();
     let tm = TransactionManager::new();
 
     let t1 = tm.begin_transaction().unwrap();
@@ -432,7 +445,8 @@ fn test_transaction_memtable_flush_on_threshold_then_commit() {
     let ids: Vec<i32> = (0..rows).collect();
     let vals: Vec<i32> = (0..rows).map(|v| v * 10).collect();
 
-    t1.append_to_tablet(tablet.clone(), &chunk_with_pairs(&ids, &vals))
+    table
+        .append_with_transaction(&chunk_with_pairs(&ids, &vals), Some(t1.clone()))
         .unwrap();
 
     // Threshold flush happens inside writer, but data is still uncommitted.

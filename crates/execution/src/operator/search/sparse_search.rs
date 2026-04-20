@@ -1,20 +1,20 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Physical sparse vector scan operator.
-//!
-//! Performs sparse vector search using the sparse index
-//! and fetches the resulting rows.
+//! Physical sparse vector scan operator backed by a storage-owned search cursor.
 
 use std::any::Any;
 use std::sync::Arc;
 
-use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 
 use crate::execution_context::ExecutionContext;
+use crate::operator::search::driver::{
+    build_search_batch_config, build_search_resource_budget, search_get_data, SearchOperatorDriver,
+    SearchOperatorGlobalState, SearchOperatorLocalState,
+};
 use crate::operator::state::{GlobalSourceState, LocalSourceState, OperatorSourceInput};
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
@@ -24,7 +24,6 @@ use paro_storage::index::PredicateTree;
 use paro_storage::rowset::SparseVector;
 use paro_storage::table::table_handle::TableHandle;
 
-/// Bind data for sparse vector scan.
 #[derive(Debug)]
 pub struct SparseVectorScanBindData {
     pub table_data: Arc<TableHandle>,
@@ -67,46 +66,6 @@ impl SparseVectorScanBindData {
     }
 }
 
-/// Global state for sparse vector scan.
-#[derive(Debug)]
-pub struct SparseVectorScanGlobalState {
-    result_chunks: Vec<Chunk>,
-    chunks_served: std::sync::atomic::AtomicUsize,
-}
-
-impl SparseVectorScanGlobalState {
-    fn new() -> Self {
-        Self {
-            result_chunks: Vec::new(),
-            chunks_served: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
-impl GlobalSourceState for SparseVectorScanGlobalState {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn max_threads(&self) -> usize {
-        1
-    }
-}
-
-#[derive(Debug, Default)]
-struct SparseVectorScanLocalState {}
-
-impl LocalSourceState for SparseVectorScanLocalState {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
 #[derive(Debug)]
 pub struct PhysicalSparseVectorScan {
     output_types: Vec<LogicalType>,
@@ -120,17 +79,6 @@ impl PhysicalSparseVectorScan {
             output_types,
             bind_data: Arc::new(bind_data),
         }
-    }
-
-    fn execute_search(&self) -> Result<Vec<Chunk>> {
-        let table = &self.bind_data.table_data;
-        let column_id = self.bind_data.sparse_column_id;
-        let query = &self.bind_data.query_vector;
-        let k = self.bind_data.k;
-        let predicate = self.bind_data.predicates.as_ref();
-        let projected_columns = &self.bind_data.projected_columns;
-
-        table.sparse_vector_search(column_id, query, k, predicate, projected_columns)
     }
 }
 
@@ -161,14 +109,25 @@ impl PhysicalOperator for PhysicalSparseVectorScan {
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
         ctx.check_cancelled()?;
-        let mut state = SparseVectorScanGlobalState::new();
-        let allocator = ctx.allocator(MemoryTag::VectorIndex);
-        state.result_chunks = self
-            .execute_search()?
-            .into_iter()
-            .map(|chunk| chunk.deep_copy_with_allocator(allocator.clone()))
-            .collect();
-        Ok(Box::new(state))
+        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let opened = self.bind_data.table_data.open_sparse_vector_search_cursor(
+            self.bind_data.sparse_column_id,
+            &self.bind_data.query_vector,
+            self.bind_data.k,
+            self.bind_data.predicates.clone(),
+            visible_version,
+        )?;
+        let batch_config = build_search_batch_config(self.bind_data.k);
+        let budget = build_search_resource_budget(ctx, self.bind_data.k);
+        let driver = SearchOperatorDriver::new(
+            self.bind_data.table_data.clone(),
+            opened,
+            batch_config,
+            budget,
+            self.bind_data.projected_columns.clone(),
+            false,
+        );
+        Ok(Box::new(SearchOperatorGlobalState::new(driver)))
     }
 
     fn get_local_source_state(
@@ -176,7 +135,7 @@ impl PhysicalOperator for PhysicalSparseVectorScan {
         _ctx: &ExecutionContext,
         _gstate: &dyn GlobalSourceState,
     ) -> Result<Box<dyn LocalSourceState>> {
-        Ok(Box::new(SparseVectorScanLocalState::default()))
+        Ok(Box::new(SearchOperatorLocalState))
     }
 
     fn get_data(
@@ -185,27 +144,13 @@ impl PhysicalOperator for PhysicalSparseVectorScan {
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
-        ctx.check_cancelled()?;
-        let gstate = input
-            .global_state
-            .as_any()
-            .downcast_ref::<SparseVectorScanGlobalState>()
-            .unwrap();
-
-        let served = gstate
-            .chunks_served
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if served < gstate.result_chunks.len() {
-            *chunk = gstate.result_chunks[served].clone();
-            Ok(SourceResultType::HaveMoreOutput)
-        } else {
-            Ok(SourceResultType::Finished)
-        }
+        search_get_data(ctx, chunk, input, self.types())
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }

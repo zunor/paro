@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::replay_handler::CatalogReplayHandler;
+use crate::search_registry::{
+    register_search_definition, unregister_search_definition_by_name,
+};
 use paro_catalog::entry::IndexType;
 use paro_common::effect::{
     ApplyDescriptor, CleanupDescriptor, RuntimeTransitionDescriptor, StagedArtifactDescriptor,
@@ -128,7 +131,7 @@ impl<'a> CatalogReplayHandler<'a> {
                 graph_registry.unregister(&runtime_key);
                 Ok(())
             }
-            RuntimeTransitionDescriptor::AttachIndexRuntime {
+            RuntimeTransitionDescriptor::AttachIndexState {
                 index,
                 table_name,
                 index_type,
@@ -141,6 +144,15 @@ impl<'a> CatalogReplayHandler<'a> {
                     )
                 })?;
                 let schema = self.ensure_schema(schema_name, commit_id)?;
+                let index_entry = schema.get_index(
+                    self.transaction.transaction_id,
+                    self.transaction.start_time,
+                    &index.name,
+                )
+                .and_then(|entry| match &*entry {
+                    paro_catalog::entry::CatalogEntryEnum::Index(index) => Some(index.clone()),
+                    _ => None,
+                });
                 if let Some(table_entry) = schema.get_table(
                     self.transaction.transaction_id,
                     self.transaction.start_time,
@@ -148,18 +160,15 @@ impl<'a> CatalogReplayHandler<'a> {
                 ) {
                     if let Some(table) = table_entry.as_ref().as_table() {
                         if let Some(storage) = table.get_storage() {
-                            Self::mark_declared_runtime_indexes(
-                                storage.as_ref(),
-                                index_type,
-                                column_ids,
-                                fulltext_config.as_deref(),
-                            );
+                            if let Some(entry) = index_entry.as_ref() {
+                                register_search_definition(storage.as_ref(), entry)?;
+                            }
                         }
                     }
                 }
                 Ok(())
             }
-            RuntimeTransitionDescriptor::DetachIndexRuntime {
+            RuntimeTransitionDescriptor::DetachIndexState {
                 index,
                 table_name,
                 index_type,
@@ -182,6 +191,7 @@ impl<'a> CatalogReplayHandler<'a> {
                             let _ = storage.remove_index(&index.name);
                             let _ = Self::unmark_declared_runtime_indexes(
                                 storage.as_ref(),
+                                &index.name,
                                 index_type,
                                 column_ids,
                                 fulltext_config.as_deref(),
@@ -215,29 +225,9 @@ impl<'a> CatalogReplayHandler<'a> {
         Ok(())
     }
 
-    fn mark_declared_runtime_indexes(
-        storage: &TableHandle,
-        index_type: &str,
-        column_ids: &[u32],
-        fulltext_config: Option<&str>,
-    ) {
-        let index_type = IndexType::from_str(index_type);
-        for column_id in column_ids {
-            match index_type {
-                IndexType::ART => storage.mark_declared_art_index(*column_id),
-                IndexType::HNSW => storage.mark_declared_vector_index(*column_id),
-                IndexType::Sparse => storage.mark_declared_sparse_index(*column_id),
-                IndexType::FullText => storage.mark_declared_fulltext_index_with_config(
-                    *column_id,
-                    fulltext_config.unwrap_or("simple"),
-                ),
-                _ => {}
-            }
-        }
-    }
-
     fn unmark_declared_runtime_indexes(
         storage: &TableHandle,
+        index_name: &str,
         index_type: &str,
         column_ids: &[u32],
         _fulltext_config: Option<&str>,
@@ -246,12 +236,13 @@ impl<'a> CatalogReplayHandler<'a> {
         for column_id in column_ids {
             match index_type {
                 IndexType::ART => {
-                    storage.unmark_declared_art_index(*column_id);
-                    storage.remove_runtime_art_index(*column_id)?;
+                    storage.forget_art_index(*column_id);
+                    storage.drop_art_index(*column_id)?;
                 }
-                IndexType::HNSW => storage.unmark_declared_vector_index(*column_id),
-                IndexType::Sparse => storage.unmark_declared_sparse_index(*column_id),
-                IndexType::FullText => storage.unmark_declared_fulltext_index(*column_id),
+                IndexType::HNSW | IndexType::Sparse | IndexType::FullText => {
+                    unregister_search_definition_by_name(storage, index_type.as_str(), index_name)?;
+                    break;
+                }
                 _ => {}
             }
         }

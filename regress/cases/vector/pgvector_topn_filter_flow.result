@@ -20,8 +20,13 @@ EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]' LIMIT 3;
 QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
-  ->  ADAPTIVE_SCAN on public.vector_topn_case
-        Search Decision: DEFER_TO_RUNTIME sequential_cost=5.000 candidates=1
+  ->  TOP_N  (rows=3)
+        Sort Key: L2_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
+        Limit: 3
+        ->  PROJECTION  (rows=5)
+              Output: id, L2_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3]))
+              ->  ROWSET_SCAN on public.vector_topn_case
+                    Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]', id LIMIT 3;
 id
@@ -33,8 +38,14 @@ EXPLAIN SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[
 QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
-  ->  ADAPTIVE_SCAN on public.vector_topn_case
-        Search Decision: DEFER_TO_RUNTIME sequential_cost=1.000 candidates=1
+  ->  TOP_N  (rows=1)
+        Sort Key: L1_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=1)
+              Output: id, L1_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3]))
+              ->  ROWSET_SCAN on public.vector_topn_case
+                    Columns: id, category, emb
+                    Filter: category = 'x'
 
 SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]', id LIMIT 2;
 id
@@ -45,8 +56,13 @@ EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]' LIMIT 3;
 QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
-  ->  ADAPTIVE_SCAN on public.vector_topn_case
-        Search Decision: DEFER_TO_RUNTIME sequential_cost=5.000 candidates=1
+  ->  TOP_N  (rows=3)
+        Sort Key: COSINE_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
+        Limit: 3
+        ->  PROJECTION  (rows=5)
+              Output: id, COSINE_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3]))
+              ->  ROWSET_SCAN on public.vector_topn_case
+                    Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]', id LIMIT 3;
 id
@@ -58,8 +74,13 @@ EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]' LIMIT 3;
 QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
-  ->  ADAPTIVE_SCAN on public.vector_topn_case
-        Search Decision: DEFER_TO_RUNTIME sequential_cost=5.000 candidates=1
+  ->  TOP_N  (rows=3)
+        Sort Key: NEG_INNER_PRODUCT(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
+        Limit: 3
+        ->  PROJECTION  (rows=5)
+              Output: id, NEG_INNER_PRODUCT(emb, CAST('[1,0,0]' AS FLOAT[3]))
+              ->  ROWSET_SCAN on public.vector_topn_case
+                    Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]', id LIMIT 3;
 id

@@ -3,6 +3,13 @@
 
 use super::table_handle::TableHandle;
 use crate::index::BoundIndex;
+use crate::rowset::RowsetId;
+use crate::search::write_path::SearchWritePlan;
+use crate::search::{
+    FullTextIntent, GenerationReadSnapshot, SearchBootstrapReport, SearchCapability,
+    SearchGenerationCoverage, SearchIndexDefinition, SearchIndexKind, SearchIntent,
+    SearchMaintenanceReport,
+};
 use crate::tablet::ColumnId;
 use paro_common::error::Result;
 use std::sync::Arc;
@@ -10,101 +17,62 @@ use std::sync::Arc;
 impl TableHandle {
     // ===== Index API facade =====
     pub fn index_count(&self) -> usize {
-        self.index_runtime.index_count()
+        self.runtime_indexes.index_count()
     }
 
     pub fn has_index(&self, name: &str) -> bool {
-        self.index_runtime.has_index(name)
+        self.runtime_indexes.has_index(name)
     }
 
     pub fn get_index(&self, name: &str) -> Option<Arc<dyn BoundIndex>> {
-        self.index_runtime.get_index(name)
+        self.runtime_indexes.get_index(name)
     }
 
     pub fn get_indexes(&self) -> Vec<Arc<dyn BoundIndex>> {
-        self.index_runtime.get_indexes()
+        self.runtime_indexes.get_indexes()
     }
 
     pub fn add_index(&self, index: Arc<dyn BoundIndex>) -> Result<()> {
-        self.index_runtime.add_index(index)
+        self.runtime_indexes.add_index(index)
     }
 
     pub fn remove_index(&self, name: &str) -> Option<Arc<dyn BoundIndex>> {
-        self.index_runtime.remove_index(name)
+        self.runtime_indexes.remove_index(name)
     }
 
     /// Record that a column declares an ART predicate index in table metadata.
-    pub fn mark_declared_art_index(&self, column_id: ColumnId) {
-        self.index_runtime
-            .mark_declared_art_index(&self.tablet(), column_id);
+    pub fn declare_art_index(&self, column_id: ColumnId) {
+        self.runtime_indexes
+            .declare_art_index(&self.tablet(), column_id);
     }
 
-    pub fn unmark_declared_art_index(&self, column_id: ColumnId) {
-        self.index_runtime
-            .unmark_declared_art_index(&self.tablet(), column_id);
+    pub fn forget_art_index(&self, column_id: ColumnId) {
+        self.runtime_indexes
+            .forget_art_index(&self.tablet(), column_id);
     }
 
-    /// Record that a column declares an HNSW vector index in table metadata.
-    pub fn mark_declared_vector_index(&self, column_id: ColumnId) {
-        self.index_runtime.mark_declared_vector_index(column_id);
+    pub fn register_search_definition(&self, definition: SearchIndexDefinition) -> Result<()> {
+        self.search_registry.install_definition(definition)
     }
 
-    pub fn unmark_declared_vector_index(&self, column_id: ColumnId) {
-        self.index_runtime.unmark_declared_vector_index(column_id);
+    pub fn unregister_search_definition(&self, definition_id: u64) -> Result<()> {
+        self.search_registry.drop_definition(definition_id)
     }
 
-    /// Record that a column declares a sparse vector index in table metadata.
-    pub fn mark_declared_sparse_index(&self, column_id: ColumnId) {
-        self.index_runtime.mark_declared_sparse_index(column_id);
+    pub fn unregister_search_definition_by_name(&self, name: &str) -> Result<()> {
+        self.search_registry.drop_definition_by_name(name)
     }
 
-    pub fn unmark_declared_sparse_index(&self, column_id: ColumnId) {
-        self.index_runtime.unmark_declared_sparse_index(column_id);
+    /// Rebuild ART indexes for all visible segments on a target column.
+    pub fn rebuild_art_index(&self, column_id: ColumnId) -> Result<()> {
+        self.runtime_indexes
+            .rebuild_art_index(&self.tablet(), column_id)
     }
 
-    /// Record that a column declares a full-text index in table metadata.
-    pub fn mark_declared_fulltext_index(&self, column_id: ColumnId) {
-        self.index_runtime.mark_declared_fulltext_index(column_id);
-    }
-
-    /// Record that a column declares a configured full-text index in table metadata.
-    pub fn mark_declared_fulltext_index_with_config(&self, column_id: ColumnId, config: &str) {
-        self.index_runtime
-            .mark_declared_fulltext_index_with_config(column_id, config);
-    }
-
-    pub fn unmark_declared_fulltext_index(&self, column_id: ColumnId) {
-        self.index_runtime.unmark_declared_fulltext_index(column_id);
-    }
-
-    /// Build runtime full-text indexes for all visible segments on a target column.
-    pub fn build_runtime_fulltext_index(&self, column_id: ColumnId) -> Result<()> {
-        self.index_runtime
-            .build_runtime_fulltext_index(&self.tablet(), column_id)
-    }
-
-    pub fn build_runtime_fulltext_index_with_config(
-        &self,
-        column_id: ColumnId,
-        config: &str,
-    ) -> Result<()> {
-        self.index_runtime.build_runtime_fulltext_index_with_config(
-            &self.tablet(),
-            column_id,
-            config,
-        )
-    }
-
-    /// Build runtime ART indexes for all visible segments on a target column.
-    pub fn build_runtime_art_index(&self, column_id: ColumnId) -> Result<()> {
-        self.index_runtime
-            .build_runtime_art_index(&self.tablet(), column_id)
-    }
-
-    /// Remove runtime ART indexes from all visible segments on a target column.
-    pub fn remove_runtime_art_index(&self, column_id: ColumnId) -> Result<()> {
+    /// Remove ART indexes from all visible segments on a target column.
+    pub fn drop_art_index(&self, column_id: ColumnId) -> Result<()> {
         for (_, segment) in self.collect_segments(self.max_version())? {
-            segment.remove_runtime_art_index(column_id);
+            segment.drop_art_index(column_id);
         }
         Ok(())
     }
@@ -114,40 +82,82 @@ impl TableHandle {
     }
 
     pub(crate) fn declared_art_columns(&self) -> Vec<ColumnId> {
-        self.index_runtime.declared_art_columns()
+        self.runtime_indexes.declared_art_columns()
     }
 
     /// Count runtime-visible secondary indexes across table-global and segment-local state.
-    pub fn recovery_runtime_index_count(&self) -> usize {
-        self.index_runtime
-            .recovery_runtime_index_count(&self.tablet())
+    pub fn recovery_index_count(&self) -> usize {
+        self.runtime_indexes.recovery_index_count(&self.tablet())
+            + self.search_registry.catalog_definition_count()
     }
 
-    pub(crate) fn declared_fulltext_columns_with_config(&self) -> Vec<(ColumnId, String)> {
-        self.index_runtime.declared_fulltext_columns_with_config()
+    pub(crate) fn search_write_plan(&self) -> Result<SearchWritePlan> {
+        self.search_registry.write_plan()
     }
 
-    /// Check if a column has a HNSW vector index.
-    pub fn has_vector_index(&self, column_id: ColumnId) -> bool {
-        self.index_runtime
-            .has_vector_index(&self.tablet(), column_id)
+    pub fn open_search_generation_snapshot(
+        &self,
+        definition_id: u64,
+    ) -> Result<Option<GenerationReadSnapshot>> {
+        self.search_registry.open_generation_snapshot(definition_id)
     }
 
-    /// Check if a column has a fulltext index.
-    pub fn has_fulltext_index(&self, column_id: ColumnId) -> bool {
-        self.index_runtime
-            .has_fulltext_index(&self.tablet(), column_id)
+    pub fn search_generation_coverage(
+        &self,
+        definition_id: u64,
+    ) -> Result<Option<SearchGenerationCoverage>> {
+        self.search_registry.generation_coverage(definition_id)
     }
 
-    /// Check if a column has a fulltext index matching query config.
-    pub fn has_fulltext_index_with_config(&self, column_id: ColumnId, config: &str) -> bool {
-        self.index_runtime
-            .has_fulltext_index_with_config(&self.tablet(), column_id, config)
+    pub fn bootstrap_search_generations(&self) -> Result<SearchBootstrapReport> {
+        self.search_registry.bootstrap_migration()
     }
 
-    /// Check if a column has a sparse vector index.
-    pub fn has_sparse_index(&self, column_id: ColumnId) -> bool {
-        self.index_runtime
-            .has_sparse_index(&self.tablet(), column_id)
+    pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
+        let mut report = self.search_registry.maintenance_sweep()?;
+        if report.compaction_requested && self.optimize_compact()? {
+            self.search_registry.ensure_fresh();
+            report = self.search_registry.maintenance_sweep()?;
+        }
+        Ok(report)
+    }
+
+    pub fn vector_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
+        self.search_registry
+            .capability(SearchIndexKind::Hnsw, column_id, None)
+    }
+
+    pub fn sparse_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
+        self.search_registry
+            .capability(SearchIndexKind::Sparse, column_id, None)
+    }
+
+    pub fn fulltext_capability(
+        &self,
+        column_id: ColumnId,
+        config: &str,
+    ) -> Option<SearchCapability> {
+        self.search_registry.fulltext_capability(column_id, config)
+    }
+
+    pub fn search_capability(&self, intent: &SearchIntent) -> Option<SearchCapability> {
+        match intent {
+            SearchIntent::Hnsw(intent) => self.vector_capability(intent.column_id),
+            SearchIntent::Sparse(intent) => self.sparse_capability(intent.column_id),
+            SearchIntent::FullText(FullTextIntent {
+                column_id, config, ..
+            }) => self.fulltext_capability(*column_id, config),
+        }
+    }
+
+    pub fn has_queryable_search_artifact(
+        &self,
+        kind: SearchIndexKind,
+        rowset_id: RowsetId,
+        segment_id: u32,
+        column_id: ColumnId,
+    ) -> bool {
+        self.search_registry
+            .has_queryable_artifact(kind, rowset_id, segment_id, column_id)
     }
 }

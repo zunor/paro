@@ -1,25 +1,22 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_catalog::entry::{
-    CatalogEntryEnum, CatalogType, IndexType as CatalogIndexType, TableCatalogEntry,
-};
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_context::StatementContext;
 use paro_planner::binder::deep_copy::deep_copy_plan;
 use paro_planner::expression::{Expression, OperatorType};
 use paro_planner::operator::{
-    build_fulltext_query_stats as build_planner_fulltext_query_stats, Confidence, Filter,
-    FullTextFilterScan, FullTextQueryStats, FullTextQueryStatsKind, FullTextScoreMode, Get,
-    LogicalOperator, Projection, SearchCandidate, SearchDecision, SearchScan, SearchType, TopN,
+    build_fulltext_query_stats, normalize_fulltext_config, Confidence, Filter, FullTextFilterScan,
+    FullTextQueryKind, FullTextScoreMode, Get, LogicalOperator, Projection, SearchCandidate,
+    SearchDecision, SearchScan, TopN,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_storage::statistics::{
-    FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
+use paro_storage::search::{
+    FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
+    SearchCostEstimate as PlannedSearchCostEstimate, SearchIntent, SearchRequestMode,
+    SequentialCapability, SparseIntent,
 };
-use paro_storage::table::table_handle::TableHandle;
 
 use crate::context::OptimizationContext;
 use crate::statistics::search_cost::{FullTextScanCostModel, VectorScanCostModel};
@@ -83,145 +80,125 @@ impl SearchOptimizer {
         let Some(pattern) = extract_topn_pattern(topn) else {
             return Ok(None);
         };
+        let Some((table_id, storage)) = get_search_storage(pattern.get) else {
+            return Ok(None);
+        };
 
-        if let Some(column_id) = extract_vector_distance_info(pattern.order_expr, pattern.get)? {
-            let Some(table) = pattern.get.get_table() else {
+        let candidate_filters = candidate_filters(&pattern.filters, pattern.get);
+        let base_rows = base_rows(pattern.get_plan, pattern.get);
+        let filtered = ctx.cost_model.estimate_filter_cardinality(
+            base_rows,
+            &candidate_filters,
+            &ctx.column_stats,
+        );
+        let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
+        let sequential = build_sequential_capability(table_id, filtered.expected);
+
+        if let Some(intent) = extract_vector_intent(pattern.order_expr, pattern.get)? {
+            let search_intent = SearchIntent::Hnsw(intent.clone());
+            let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
             };
-            let Some(storage) = table.get_storage() else {
-                return Ok(None);
-            };
-            if !storage.has_vector_index(column_id as u32) {
+            if !capability.is_queryable() {
                 return Ok(None);
             }
-            let Some(stats) = storage.hnsw_index_statistics(column_id as u32) else {
+            let Some(stats) = storage.hnsw_index_statistics(intent.column_id) else {
                 return Ok(None);
             };
-
-            let candidate_filters = candidate_filters(&pattern.filters, pattern.get);
-            let base_rows = base_rows(pattern.get_plan, pattern.get);
-            let filtered = ctx.cost_model.estimate_filter_cardinality(
-                base_rows,
-                &candidate_filters,
-                &ctx.column_stats,
-            );
-            let threshold = compute_hnsw_threshold(&stats, topn.limit);
-
-            let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
             let estimated_cost = VectorScanCostModel::estimate_hnsw_cost(
                 &stats,
                 topn.limit,
                 filter_selectivity,
                 topn.hnsw_ef_hint,
             );
-            let decision = build_decision(
-                SearchType::HnswVector {
-                    column_id: column_id as u32,
-                },
-                filtered,
-                threshold,
+            let request =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let candidate = build_search_candidate(
+                search_intent,
+                capability,
                 estimated_cost,
-                filtered.expected as f64,
+                filtered.expected,
             );
+            let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
+                return Ok(None);
+            };
             return Ok(Some(build_search_scan(
                 plan,
                 pattern,
+                request,
                 decision,
                 candidate_filters,
             )));
         }
 
-        if let Some((column_id, query_nnz)) =
-            extract_sparse_vector_distance_info(pattern.order_expr, pattern.get)?
-        {
-            let Some(table) = pattern.get.get_table() else {
+        if let Some(intent) = extract_sparse_intent(pattern.order_expr, pattern.get)? {
+            let search_intent = SearchIntent::Sparse(intent.clone());
+            let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
             };
-            let Some(storage) = table.get_storage() else {
-                return Ok(None);
-            };
-            if !storage.has_sparse_index(column_id as u32) {
+            if !capability.is_queryable() {
                 return Ok(None);
             }
-            let Some(stats) = storage.sparse_index_statistics(column_id as u32) else {
+            let Some(stats) = storage.sparse_index_statistics(intent.column_id) else {
                 return Ok(None);
             };
-
-            let candidate_filters = candidate_filters(&pattern.filters, pattern.get);
-            let base_rows = base_rows(pattern.get_plan, pattern.get);
-            let filtered = ctx.cost_model.estimate_filter_cardinality(
-                base_rows,
-                &candidate_filters,
-                &ctx.column_stats,
-            );
-            let threshold = compute_sparse_threshold(&stats, query_nnz);
-
-            let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
-            let estimated_cost =
-                VectorScanCostModel::estimate_sparse_cost(&stats, query_nnz, filter_selectivity);
-            let decision = build_decision(
-                SearchType::SparseVector {
-                    column_id: column_id as u32,
-                },
-                filtered,
-                threshold,
-                estimated_cost,
-                filtered.expected as f64,
-            );
-            return Ok(Some(build_search_scan(
-                plan,
-                pattern,
-                decision,
-                candidate_filters,
-            )));
-        }
-
-        if let Some(info) = extract_fulltext_score_info(pattern.order_expr, pattern.get)? {
-            let Some(table) = pattern.get.get_table() else {
-                return Ok(None);
-            };
-            let Some(storage) = table.get_storage() else {
-                return Ok(None);
-            };
-            if !fulltext_index_pushdown_ready(
-                ctx.session.as_ref(),
-                table.as_ref(),
-                storage.as_ref(),
-                info.column_id,
-                &info.config,
-            ) {
-                return Ok(None);
-            }
-            let Some(stats) = storage.fulltext_index_statistics(info.column_id as u32) else {
-                return Ok(None);
-            };
-
-            let candidate_filters = candidate_filters(&pattern.filters, pattern.get);
-            let base_rows = base_rows(pattern.get_plan, pattern.get);
-            let filtered = ctx.cost_model.estimate_filter_cardinality(
-                base_rows,
-                &candidate_filters,
-                &ctx.column_stats,
-            );
-            let threshold = compute_fulltext_threshold(&stats, &info.query_stats);
-
-            let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
-            let estimated_cost = FullTextScanCostModel::estimate_bm25_cost(
+            let estimated_cost = VectorScanCostModel::estimate_sparse_cost(
                 &stats,
-                &info.query_stats,
-                info.score_mode,
+                intent.query_vector.len(),
                 filter_selectivity,
             );
-            let decision = build_decision(
-                SearchType::fulltext_topk(info.column_id as u32, info.score_mode, info.query_stats),
-                filtered,
-                threshold,
+            let request =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let candidate = build_search_candidate(
+                search_intent,
+                capability,
                 estimated_cost,
-                filtered.expected as f64,
+                filtered.expected,
             );
+            let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
+                return Ok(None);
+            };
             return Ok(Some(build_search_scan(
                 plan,
                 pattern,
+                request,
+                decision,
+                candidate_filters,
+            )));
+        }
+
+        if let Some(intent) = extract_fulltext_score_intent(pattern.order_expr, pattern.get)? {
+            let search_intent = SearchIntent::FullText(intent.clone());
+            let Some(capability) = storage.search_capability(&search_intent) else {
+                return Ok(None);
+            };
+            if !capability.is_queryable() {
+                return Ok(None);
+            }
+            let Some(stats) = capability.generation_stats.fulltext_index_statistics() else {
+                return Ok(None);
+            };
+            let estimated_cost = FullTextScanCostModel::estimate_bm25_cost(
+                &stats,
+                &intent.query_stats,
+                intent.score_mode,
+                filter_selectivity,
+            );
+            let request =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let candidate = build_search_candidate(
+                search_intent,
+                capability,
+                estimated_cost,
+                filtered.expected,
+            );
+            let Some(decision) = select_search_decision(candidate, sequential) else {
+                return Ok(None);
+            };
+            return Ok(Some(build_search_scan(
+                plan,
+                pattern,
+                request,
                 decision,
                 candidate_filters,
             )));
@@ -239,28 +216,22 @@ impl SearchOptimizer {
         let LogicalOperator::Get(get) = &filter.child.operator else {
             return Ok(None);
         };
-        let Some(table) = get.get_table() else {
-            return Ok(None);
-        };
-        let Some(storage) = table.get_storage() else {
+        let Some((table_id, storage)) = get_search_storage(get) else {
             return Ok(None);
         };
 
         for (match_idx, expr) in filter.expressions.iter().enumerate() {
-            let Some(info) = extract_fulltext_match_info(expr, get)? else {
+            let Some(intent) = extract_fulltext_match_intent(expr, get)? else {
                 continue;
             };
-            if !fulltext_index_pushdown_ready(
-                ctx.session.as_ref(),
-                table.as_ref(),
-                storage.as_ref(),
-                info.column_id,
-                &info.config,
-            ) {
+            let search_intent = SearchIntent::FullText(intent.clone());
+            let Some(capability) = storage.search_capability(&search_intent) else {
+                continue;
+            };
+            if !capability.is_queryable() {
                 continue;
             }
-
-            let Some(stats) = storage.fulltext_index_statistics(info.column_id as u32) else {
+            let Some(stats) = capability.generation_stats.fulltext_index_statistics() else {
                 continue;
             };
 
@@ -271,19 +242,22 @@ impl SearchOptimizer {
                 &candidate_filters,
                 &ctx.column_stats,
             );
-            let threshold = compute_fulltext_threshold(&stats, &info.query_stats);
             let estimated_cost = FullTextScanCostModel::estimate_filter_cost(
                 &stats,
-                &info.query_stats,
+                &intent.query_stats,
                 estimate_selectivity(base_rows, filtered.expected),
             );
-            let decision = build_decision(
-                SearchType::fulltext_filter(info.column_id as u32, info.query_stats),
-                filtered,
-                threshold,
+            let candidate = build_search_candidate(
+                search_intent.clone(),
+                capability,
                 estimated_cost,
-                filtered.expected as f64,
+                filtered.expected,
             );
+            let sequential = build_sequential_capability(table_id, filtered.expected);
+            let Some(decision) = select_search_decision(candidate, sequential) else {
+                continue;
+            };
+            let request = build_filter_request(table_id, get, search_intent)?;
 
             let mut other_predicates = filter.expressions.clone();
             let match_expression = other_predicates.remove(match_idx);
@@ -292,6 +266,7 @@ impl SearchOptimizer {
                 stats: plan.stats,
                 operator: LogicalOperator::FullTextFilterScan(FullTextFilterScan {
                     get: get.clone(),
+                    request,
                     match_expression,
                     other_predicates,
                     residual_predicates: Vec::new(),
@@ -307,6 +282,7 @@ impl SearchOptimizer {
 fn build_search_scan(
     plan: LogicalPlan,
     pattern: TopNPattern<'_>,
+    request: NormalizedSearchRequest,
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
 ) -> LogicalPlan {
@@ -316,6 +292,7 @@ fn build_search_scan(
         operator: LogicalOperator::SearchScan(
             SearchScan::new(
                 pattern.get.clone(),
+                request,
                 decision,
                 pattern.projection.expressions.clone(),
                 pattern.projection.table_index,
@@ -331,29 +308,115 @@ fn build_search_scan(
     }
 }
 
-fn build_decision(
-    search_type: SearchType,
-    filtered: paro_planner::plan::CardinalityEstimate,
-    threshold: u64,
+fn build_search_candidate(
+    intent: SearchIntent,
+    capability: paro_storage::search::SearchCapability,
     estimated_cost: f64,
-    sequential_cost: f64,
-) -> SearchDecision {
-    if filtered.min > threshold {
-        SearchDecision::IndexScan {
-            search_type,
-            estimated_cost,
-            confidence: Confidence::High,
-        }
-    } else {
-        SearchDecision::DeferToRuntime {
-            candidates: vec![SearchCandidate {
-                search_type,
-                estimated_cost,
-                threshold,
-            }],
-            sequential_cost,
-        }
+    estimated_rows: u64,
+) -> SearchCandidate {
+    let capability = capability.with_estimated_cost(
+        PlannedSearchCostEstimate::new(estimated_cost).with_rows(estimated_rows),
+    );
+    SearchCandidate { intent, capability }
+}
+
+fn build_sequential_capability(table_id: u64, estimated_rows: u64) -> SequentialCapability {
+    SequentialCapability {
+        table_id,
+        estimated_cost: None,
     }
+    .with_estimated_cost(
+        PlannedSearchCostEstimate::new(estimated_rows.max(1) as f64).with_rows(estimated_rows),
+    )
+}
+
+fn select_search_decision(
+    candidate: SearchCandidate,
+    sequential: SequentialCapability,
+) -> Option<SearchDecision> {
+    let candidate_cost = candidate.estimated_cost()?.score;
+    let sequential_cost = sequential.estimated_cost?.score;
+    if !candidate_cost.is_finite() || !sequential_cost.is_finite() {
+        return None;
+    }
+    if candidate_cost >= sequential_cost {
+        return None;
+    }
+
+    let ratio = candidate_cost / sequential_cost.max(1.0);
+    if ratio <= 0.60 {
+        Some(SearchDecision::IndexScan {
+            candidate,
+            confidence: Confidence::High,
+        })
+    } else if ratio <= 0.80 {
+        Some(SearchDecision::IndexScan {
+            candidate,
+            confidence: Confidence::Medium,
+        })
+    } else {
+        Some(SearchDecision::Adaptive {
+            candidates: vec![candidate],
+            sequential,
+        })
+    }
+}
+
+fn build_topk_request(
+    table_id: u64,
+    get: &Get,
+    limit: usize,
+    intent: SearchIntent,
+) -> Result<NormalizedSearchRequest> {
+    let request = NormalizedSearchRequest {
+        table_id,
+        mode: SearchRequestMode::TopK { limit },
+        predicate: None,
+        projections: projection_spec(get, matches!(intent, SearchIntent::FullText(_))),
+        intents: vec![intent],
+        fusion: None,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn build_filter_request(
+    table_id: u64,
+    get: &Get,
+    intent: SearchIntent,
+) -> Result<NormalizedSearchRequest> {
+    let request = NormalizedSearchRequest {
+        table_id,
+        mode: SearchRequestMode::Filter,
+        predicate: None,
+        projections: projection_spec(get, false),
+        intents: vec![intent],
+        fusion: None,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn projection_spec(get: &Get, include_score: bool) -> ProjectionSpec {
+    ProjectionSpec {
+        columns: get
+            .column_ids
+            .iter()
+            .map(|&column_id| column_id as u32)
+            .collect(),
+        include_score,
+    }
+}
+
+fn get_search_storage(
+    get: &Get,
+) -> Option<(
+    u64,
+    std::sync::Arc<paro_storage::table::table_handle::TableHandle>,
+)> {
+    let table = get.get_table()?;
+    let storage = table.get_storage()?.clone();
+    Some((storage.tablet_id(), storage))
 }
 
 fn estimate_selectivity(base_rows: u64, filtered_rows: u64) -> f64 {
@@ -362,40 +425,6 @@ fn estimate_selectivity(base_rows: u64, filtered_rows: u64) -> f64 {
     } else {
         (filtered_rows as f64 / base_rows as f64).clamp(0.0, 1.0)
     }
-}
-
-fn compute_hnsw_threshold(stats: &HnswIndexStatistics, limit: usize) -> u64 {
-    let indexed = stats.num_indexed_vectors.max(1) as u64;
-    indexed
-        .min((indexed / 32).max(limit.max(1) as u64 * 8))
-        .max(1)
-}
-
-fn compute_sparse_threshold(stats: &SparseIndexStatistics, query_nnz: usize) -> u64 {
-    let indexed = stats.num_indexed_vectors.max(1) as u64;
-    let avg_posting = if stats.num_posting_lists == 0 {
-        1
-    } else {
-        (stats.total_postings / stats.num_posting_lists).max(1) as u64
-    };
-    indexed
-        .min(avg_posting.max(query_nnz.max(1) as u64 * 8))
-        .max(1)
-}
-
-fn compute_fulltext_threshold(
-    stats: &FullTextIndexStatistics,
-    query_stats: &FullTextQueryStats,
-) -> u64 {
-    let total_docs = stats.total_docs.max(1) as u64;
-    let avg_posting = if stats.unique_terms == 0 {
-        1
-    } else {
-        (stats.total_postings / stats.unique_terms as u64).max(1)
-    };
-    total_docs
-        .min(avg_posting.saturating_mul(query_stats.effective_query_terms() as u64))
-        .max(1)
 }
 
 fn base_rows(get_plan: &LogicalPlan, get: &Get) -> u64 {
@@ -476,7 +505,7 @@ fn find_filters_and_get_plan(mut plan: &LogicalPlan) -> Option<(Vec<Expression>,
     }
 }
 
-fn extract_vector_distance_info(expr: &Expression, get: &Get) -> Result<Option<usize>> {
+fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswIntent>> {
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
@@ -493,20 +522,30 @@ fn extract_vector_distance_info(expr: &Expression, get: &Get) -> Result<Option<u
 
     let (left, right) = (&func.children[0], &func.children[1]);
     if let Some(column_idx) = extract_scan_col_idx(left) {
-        if extract_query_vector(right)?.is_some() {
-            return Ok(resolve_vector_column(get, column_idx));
+        if let Some(query_vector) = extract_query_vector(right)? {
+            return Ok(
+                resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
+                    column_id,
+                    query_vector,
+                }),
+            );
         }
     }
     if let Some(column_idx) = extract_scan_col_idx(right) {
-        if extract_query_vector(left)?.is_some() {
-            return Ok(resolve_vector_column(get, column_idx));
+        if let Some(query_vector) = extract_query_vector(left)? {
+            return Ok(
+                resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
+                    column_id,
+                    query_vector,
+                }),
+            );
         }
     }
 
     Ok(None)
 }
 
-fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<usize> {
+fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
     if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
         return None;
     }
@@ -515,7 +554,7 @@ fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<usize> {
     {
         return None;
     }
-    Some(get.column_ids[column_idx])
+    Some(get.column_ids[column_idx] as u32)
 }
 
 fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
@@ -615,10 +654,7 @@ fn parse_vector_literal(input: &str) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn extract_sparse_vector_distance_info(
-    expr: &Expression,
-    get: &Get,
-) -> Result<Option<(usize, usize)>> {
+fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIntent>> {
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
@@ -629,63 +665,52 @@ fn extract_sparse_vector_distance_info(
     }
     let (left, right) = (&func.children[0], &func.children[1]);
     if let Some(column_idx) = extract_scan_col_idx(left) {
-        if let Some(query_nnz) = extract_query_sparse_vector_nnz(right)? {
+        if let Some(query_vector) = extract_query_sparse_vector(right)? {
             return Ok(
-                resolve_sparse_column(get, column_idx).map(|column_id| (column_id, query_nnz))
+                resolve_sparse_column(get, column_idx).map(|column_id| SparseIntent {
+                    column_id,
+                    query_vector,
+                }),
             );
         }
     }
     if let Some(column_idx) = extract_scan_col_idx(right) {
-        if let Some(query_nnz) = extract_query_sparse_vector_nnz(left)? {
+        if let Some(query_vector) = extract_query_sparse_vector(left)? {
             return Ok(
-                resolve_sparse_column(get, column_idx).map(|column_id| (column_id, query_nnz))
+                resolve_sparse_column(get, column_idx).map(|column_id| SparseIntent {
+                    column_id,
+                    query_vector,
+                }),
             );
         }
     }
     Ok(None)
 }
 
-fn resolve_sparse_column(get: &Get, column_idx: usize) -> Option<usize> {
+fn resolve_sparse_column(get: &Get, column_idx: usize) -> Option<u32> {
     if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
         return None;
     }
     matches!(get.column_types[column_idx], LogicalType::Varchar)
-        .then_some(get.column_ids[column_idx])
+        .then_some(get.column_ids[column_idx] as u32)
 }
 
-fn extract_query_sparse_vector_nnz(expr: &Expression) -> Result<Option<usize>> {
+fn extract_query_sparse_vector(
+    expr: &Expression,
+) -> Result<Option<paro_storage::rowset::SparseVector>> {
     match expr {
         Expression::Constant(constant) => {
             if let Value::Varchar(value) = &constant.value {
-                return Ok(Some(
-                    paro_storage::rowset::SparseVector::parse(value)?.dims.len(),
-                ));
+                return Ok(Some(paro_storage::rowset::SparseVector::parse(value)?));
             }
             Ok(None)
         }
-        Expression::Cast(cast) => extract_query_sparse_vector_nnz(cast.child.as_ref()),
+        Expression::Cast(cast) => extract_query_sparse_vector(cast.child.as_ref()),
         _ => Ok(None),
     }
 }
 
-#[derive(Clone)]
-struct FullTextQueryInfo {
-    column_id: usize,
-    score_mode: FullTextScoreMode,
-    query_stats: FullTextQueryStats,
-    config: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FullTextQueryKind {
-    Legacy,
-    TsQuery,
-    Plain,
-    Phrase,
-    WebSearch,
-}
-
-fn extract_fulltext_score_info(expr: &Expression, get: &Get) -> Result<Option<FullTextQueryInfo>> {
+fn extract_fulltext_score_intent(expr: &Expression, get: &Get) -> Result<Option<FullTextIntent>> {
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
@@ -713,7 +738,7 @@ fn extract_fulltext_score_info(expr: &Expression, get: &Get) -> Result<Option<Fu
     }
 }
 
-fn extract_fulltext_match_info(expr: &Expression, get: &Get) -> Result<Option<FullTextQueryInfo>> {
+fn extract_fulltext_match_intent(expr: &Expression, get: &Get) -> Result<Option<FullTextIntent>> {
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
@@ -739,7 +764,7 @@ fn extract_fulltext_query_from_column_and_string(
     get: &Get,
     query_kind: FullTextQueryKind,
     score_mode: FullTextScoreMode,
-) -> Result<Option<FullTextQueryInfo>> {
+) -> Result<Option<FullTextIntent>> {
     if func.children.len() != 2 {
         return Ok(None);
     }
@@ -747,22 +772,26 @@ fn extract_fulltext_query_from_column_and_string(
     if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(left)) {
         if let Some(query_text) = extract_query_string(right)? {
             let query_stats = build_fulltext_query_stats(&query_text, SIMPLE_CONFIG, query_kind)?;
-            return Ok(Some(FullTextQueryInfo {
+            return Ok(Some(FullTextIntent {
                 column_id,
-                score_mode,
+                query: query_text,
+                query_kind,
                 query_stats,
                 config: SIMPLE_CONFIG.to_string(),
+                score_mode,
             }));
         }
     }
     if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(right)) {
         if let Some(query_text) = extract_query_string(left)? {
             let query_stats = build_fulltext_query_stats(&query_text, SIMPLE_CONFIG, query_kind)?;
-            return Ok(Some(FullTextQueryInfo {
+            return Ok(Some(FullTextIntent {
                 column_id,
-                score_mode,
+                query: query_text,
+                query_kind,
                 query_stats,
                 config: SIMPLE_CONFIG.to_string(),
+                score_mode,
             }));
         }
     }
@@ -773,7 +802,7 @@ fn extract_internal_fulltext_query(
     func: &paro_planner::expression::FunctionExpression,
     get: &Get,
     score_mode: FullTextScoreMode,
-) -> Result<Option<FullTextQueryInfo>> {
+) -> Result<Option<FullTextIntent>> {
     if func.children.len() != 2 {
         return Ok(None);
     }
@@ -788,11 +817,13 @@ fn extract_internal_fulltext_query(
         return Ok(None);
     }
     let query_stats = build_fulltext_query_stats(&query_text, &tsq_config, query_kind)?;
-    Ok(Some(FullTextQueryInfo {
-        column_id,
-        score_mode,
+    Ok(Some(FullTextIntent {
+        column_id: column_id as u32,
+        query: query_text,
+        query_kind,
         query_stats,
         config: tsv_config,
+        score_mode,
     }))
 }
 
@@ -826,7 +857,7 @@ fn extract_tsvector_source(expr: &Expression, get: &Get) -> Result<Option<(usize
     let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(text_expr)) else {
         return Ok(None);
     };
-    Ok(Some((column_id, config)))
+    Ok(Some((column_id as usize, config)))
 }
 
 fn extract_tsquery_source(
@@ -873,36 +904,13 @@ fn extract_tsquery_source(
     Ok(Some((query_text, config, query_kind)))
 }
 
-fn normalize_fulltext_config(config: &str) -> Option<String> {
-    let normalized = config.trim().to_ascii_lowercase();
-    (!normalized.is_empty()).then_some(normalized)
-}
-
-fn build_fulltext_query_stats(
-    query_text: &str,
-    config: &str,
-    query_kind: FullTextQueryKind,
-) -> Result<FullTextQueryStats> {
-    build_planner_fulltext_query_stats(query_text, config, map_query_stats_kind(query_kind))
-}
-
-fn map_query_stats_kind(query_kind: FullTextQueryKind) -> FullTextQueryStatsKind {
-    match query_kind {
-        FullTextQueryKind::Legacy => FullTextQueryStatsKind::Legacy,
-        FullTextQueryKind::TsQuery => FullTextQueryStatsKind::TsQuery,
-        FullTextQueryKind::Plain => FullTextQueryStatsKind::Plain,
-        FullTextQueryKind::Phrase => FullTextQueryStatsKind::Phrase,
-        FullTextQueryKind::WebSearch => FullTextQueryStatsKind::WebSearch,
-    }
-}
-
-fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<usize> {
+fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<u32> {
     let column_idx = column_idx?;
     if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
         return None;
     }
     matches!(get.column_types[column_idx], LogicalType::Varchar)
-        .then_some(get.column_ids[column_idx])
+        .then_some(get.column_ids[column_idx] as u32)
 }
 
 fn extract_scan_col_idx(expr: &Expression) -> Option<usize> {
@@ -928,62 +936,6 @@ fn strip_casts(mut expr: &Expression) -> &Expression {
         expr = cast.child.as_ref();
     }
     expr
-}
-
-fn fulltext_index_pushdown_ready(
-    session: &StatementContext,
-    table_entry: &TableCatalogEntry,
-    table_data: &TableHandle,
-    column_id: usize,
-    config: &str,
-) -> bool {
-    let runtime_coverage = match table_data.fulltext_index_coverage(column_id as u32) {
-        Ok(coverage) => coverage,
-        Err(_) => return false,
-    };
-    if !runtime_coverage.is_complete() {
-        return false;
-    }
-
-    let txn = session.catalog_txn_view();
-    let catalog = session.catalog();
-    let schema = match catalog.get_schema(&txn, &table_entry.base.schema_name) {
-        Ok(schema) => schema,
-        Err(_) => return false,
-    };
-
-    for entry in schema
-        .collection(CatalogType::Index)
-        .expect("index collection")
-        .scan(txn.transaction_id, txn.start_time)
-    {
-        let CatalogEntryEnum::Index(index) = entry.as_ref() else {
-            continue;
-        };
-        if index.table_oid != table_entry.base.base.object_id.raw() {
-            continue;
-        }
-        if index.index_type != CatalogIndexType::FullText || !index.is_ready() {
-            continue;
-        }
-        let Some(binding) = index.fulltext_binding() else {
-            continue;
-        };
-        if binding.column_id.index != column_id as u32 {
-            continue;
-        }
-        if !binding.config.eq_ignore_ascii_case(config) {
-            continue;
-        }
-        if let Some(coverage) = index.coverage() {
-            if !coverage.is_complete() {
-                continue;
-            }
-        }
-        return true;
-    }
-
-    false
 }
 
 #[cfg(test)]
@@ -1026,7 +978,8 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_function::scalar::ScalarFunction;
     use paro_planner::expression::{ColumnRefExpression, ConstantExpression, FunctionExpression};
-    use paro_planner::operator::{ColumnBinding, SearchType};
+    use paro_planner::operator::ColumnBinding;
+    use paro_storage::search::FullTextQueryStats;
 
     fn noop_scalar(
         _input: &paro_common::chunk::Chunk,
@@ -1045,19 +998,29 @@ mod tests {
     }
 
     #[test]
-    fn decision_defer_is_used_for_overlapping_cardinality() {
-        let decision = build_decision(
-            SearchType::HnswVector { column_id: 1 },
-            paro_planner::plan::CardinalityEstimate {
-                min: 10,
-                expected: 50,
-                max: 100,
+    fn adaptive_decision_is_used_for_close_costs() {
+        let decision = select_search_decision(
+            SearchCandidate {
+                intent: SearchIntent::Hnsw(HnswIntent {
+                    column_id: 1,
+                    query_vector: vec![1.0, 2.0],
+                }),
+                capability: paro_storage::search::SearchCapability {
+                    definition_id: 1,
+                    table_id: 7,
+                    kind: paro_storage::search::SearchIndexKind::Hnsw,
+                    generation_id: 2,
+                    coverage: paro_storage::search::CoverageState::Complete,
+                    config_fingerprint: 0,
+                    generation_stats: Default::default(),
+                    execution_modes: Default::default(),
+                    estimated_cost: Some(PlannedSearchCostEstimate::new(95.0)),
+                    prefer_hint: None,
+                },
             },
-            40,
-            12.0,
-            50.0,
+            build_sequential_capability(7, 100),
         );
-        assert!(matches!(decision, SearchDecision::DeferToRuntime { .. }));
+        assert!(matches!(decision, Some(SearchDecision::Adaptive { .. })));
     }
 
     #[test]
@@ -1082,24 +1045,59 @@ mod tests {
             LogicalType::Boolean,
         ));
 
-        let info = extract_fulltext_match_info(&expr, &get).unwrap().unwrap();
-        assert_eq!(info.column_id, 0);
-        assert_eq!(info.score_mode, FullTextScoreMode::Bm25);
-        assert_eq!(info.query_stats.term_count, 2);
-        assert_eq!(info.query_stats.effective_query_terms(), 2);
+        let intent = extract_fulltext_match_intent(&expr, &get).unwrap().unwrap();
+        assert_eq!(intent.column_id, 0);
+        assert_eq!(intent.score_mode, FullTextScoreMode::Bm25);
+        assert_eq!(intent.query, "hello world");
+        assert_eq!(intent.query_stats.term_count, 2);
+        assert_eq!(intent.query_stats.effective_query_terms(), 2);
     }
 
     #[test]
     fn rebuild_topn_from_search_uses_score_projection_index() {
         let search = SearchScan::new(
             Get::new_without_table(1, vec!["v".to_string()], vec![LogicalType::Varchar]),
+            NormalizedSearchRequest {
+                table_id: 1,
+                mode: SearchRequestMode::TopK { limit: 3 },
+                predicate: None,
+                projections: ProjectionSpec {
+                    columns: vec![0],
+                    include_score: true,
+                },
+                intents: vec![SearchIntent::FullText(FullTextIntent {
+                    column_id: 0,
+                    query: "graph".to_string(),
+                    query_kind: FullTextQueryKind::Legacy,
+                    query_stats: FullTextQueryStats::new(1),
+                    config: "simple".to_string(),
+                    score_mode: FullTextScoreMode::Bm25,
+                })],
+                fusion: None,
+            },
             SearchDecision::IndexScan {
-                search_type: SearchType::fulltext_topk(
-                    0,
-                    FullTextScoreMode::Bm25,
-                    FullTextQueryStats::new(1),
-                ),
-                estimated_cost: 1.0,
+                candidate: SearchCandidate {
+                    intent: SearchIntent::FullText(FullTextIntent {
+                        column_id: 0,
+                        query: "graph".to_string(),
+                        query_kind: FullTextQueryKind::Legacy,
+                        query_stats: FullTextQueryStats::new(1),
+                        config: "simple".to_string(),
+                        score_mode: FullTextScoreMode::Bm25,
+                    }),
+                    capability: paro_storage::search::SearchCapability {
+                        definition_id: 1,
+                        table_id: 1,
+                        kind: paro_storage::search::SearchIndexKind::FullText,
+                        generation_id: 1,
+                        coverage: paro_storage::search::CoverageState::Complete,
+                        config_fingerprint: 0,
+                        generation_stats: Default::default(),
+                        execution_modes: Default::default(),
+                        estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
+                        prefer_hint: None,
+                    },
+                },
                 confidence: Confidence::High,
             },
             vec![

@@ -5,9 +5,9 @@
 //!
 //! Coordinates undo tracking, staged writes, commit, rollback, and cleanup.
 
-use crate::index::fulltext::tokenizer::TokenizerKind;
 use crate::rowset::RowsetSharedPtr;
-use crate::table::index_runtime::IndexRuntime;
+use crate::search::write_path::SearchWritePlan;
+use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState};
 use crate::transaction::undo_buffer::{ActiveTransactionState, UndoBuffer};
 use crate::wal::wal_entry::WalEntry;
@@ -71,7 +71,6 @@ pub struct StorageSavepointMark {
     pub pending_ops_len: usize,
     pub pending_dml_tables: BTreeSet<u64>,
     pub pending_art_columns: HashMap<u64, BTreeSet<u32>>,
-    pub pending_fulltext_columns: HashMap<u64, HashMap<u32, String>>,
     pub pending_graph_dml: HashMap<u64, GraphTableDmlDelta>,
     pub writer_marks: HashMap<u64, DeltaWriterSavepoint>,
 }
@@ -135,10 +134,6 @@ pub struct Transaction {
     /// Transaction-scoped writers for per-tablet MemTable reuse.
     pending_writers: Mutex<HashMap<u64, DeltaWriter>>,
 
-    /// Per-tablet full-text indexed columns and config that need runtime index
-    /// build when pending writers are finalized into rowsets.
-    pending_fulltext_columns: Mutex<HashMap<u64, HashMap<u32, String>>>,
-
     /// Per-tablet ART indexed columns that need runtime index build when
     /// pending writers are finalized into rowsets.
     pending_art_columns: Mutex<HashMap<u64, BTreeSet<u32>>>,
@@ -184,7 +179,6 @@ impl Transaction {
             pending_ops: Mutex::new(Vec::new()),
             pending_dml_tables: Mutex::new(BTreeSet::new()),
             pending_writers: Mutex::new(HashMap::new()),
-            pending_fulltext_columns: Mutex::new(HashMap::new()),
             pending_art_columns: Mutex::new(HashMap::new()),
             pending_graph_dml: Mutex::new(HashMap::new()),
             prepared_storage_state: Mutex::new(None),
@@ -233,13 +227,6 @@ impl Transaction {
                 paro_error::internal(format!("failed to lock pending art columns: {}", e))
             })?
             .clone();
-        let pending_fulltext_columns = self
-            .pending_fulltext_columns
-            .lock()
-            .map_err(|e| {
-                paro_error::internal(format!("failed to lock pending fulltext columns: {}", e))
-            })?
-            .clone();
         let pending_graph_dml = self
             .pending_graph_dml
             .lock()
@@ -258,7 +245,6 @@ impl Transaction {
             pending_ops_len,
             pending_dml_tables,
             pending_art_columns,
-            pending_fulltext_columns,
             pending_graph_dml,
             writer_marks,
         })
@@ -314,9 +300,6 @@ impl Transaction {
         *self.pending_art_columns.lock().map_err(|e| {
             paro_error::internal(format!("failed to lock pending art columns: {}", e))
         })? = mark.pending_art_columns.clone();
-        *self.pending_fulltext_columns.lock().map_err(|e| {
-            paro_error::internal(format!("failed to lock pending fulltext columns: {}", e))
-        })? = mark.pending_fulltext_columns.clone();
         *self.pending_graph_dml.lock().map_err(|e| {
             paro_error::internal(format!("failed to lock pending graph dml: {}", e))
         })? = mark.pending_graph_dml.clone();
@@ -508,48 +491,21 @@ impl Transaction {
     }
 
     /// Append a chunk using a transaction-scoped DeltaWriter (MemTable reuse).
-    pub fn append_to_tablet(&self, tablet: TabletRef, chunk: &Chunk) -> Result<()> {
+    pub(crate) fn append_to_tablet(
+        &self,
+        tablet: TabletRef,
+        chunk: &Chunk,
+        search_write_plan: SearchWritePlan,
+    ) -> Result<()> {
         if chunk.size() == 0 {
             return Ok(());
         }
-        self.with_tablet_writer(tablet, chunk.allocator().clone(), |writer| {
-            writer.write_chunk(chunk)
-        })?;
-        Ok(())
-    }
-
-    /// Register declared full-text columns for a tablet.
-    ///
-    /// These columns will be used to build runtime full-text indexes on
-    /// transaction-private rowsets before commit visibility.
-    pub fn register_pending_fulltext_columns(
-        &self,
-        tablet_id: u64,
-        columns: Vec<(u32, String)>,
-    ) -> Result<()> {
-        if columns.is_empty() {
-            return Ok(());
-        }
-
-        let mut pending = self.pending_fulltext_columns.lock().map_err(|e| {
-            paro_error::internal(format!("failed to lock pending fulltext columns: {}", e))
-        })?;
-        let entry = pending.entry(tablet_id).or_default();
-        for (column_id, config) in columns {
-            let normalized = TokenizerKind::from_config(&config)?
-                .config_name()
-                .to_string();
-            if let Some(existing) = entry.get(&column_id) {
-                if !existing.eq_ignore_ascii_case(&normalized) {
-                    return Err(paro_error::invalid_input(format!(
-                        "conflicting full-text config for column {}: '{}' vs '{}'",
-                        column_id, existing, normalized
-                    )));
-                }
-                continue;
-            }
-            entry.insert(column_id, normalized);
-        }
+        self.with_tablet_writer(
+            tablet,
+            chunk.allocator().clone(),
+            search_write_plan,
+            |writer| writer.write_chunk(chunk),
+        )?;
         Ok(())
     }
 
@@ -580,23 +536,11 @@ impl Transaction {
             .collect())
     }
 
-    fn take_pending_fulltext_columns(&self, tablet_id: u64) -> Result<Vec<(u32, String)>> {
-        let mut pending = self.pending_fulltext_columns.lock().map_err(|e| {
-            paro_error::internal(format!("failed to lock pending fulltext columns: {}", e))
-        })?;
-        let mut columns: Vec<(u32, String)> = pending
-            .remove(&tablet_id)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        columns.sort_unstable_by_key(|(column_id, _)| *column_id);
-        Ok(columns)
-    }
-
     fn with_tablet_writer<F, R>(
         &self,
         tablet: TabletRef,
         allocator: Arc<dyn Allocator>,
+        search_write_plan: SearchWritePlan,
         f: F,
     ) -> Result<R>
     where
@@ -623,12 +567,18 @@ impl Transaction {
             .lock()
             .map_err(|e| paro_error::internal(format!("failed to lock pending writers: {}", e)))?;
         if let std::collections::hash_map::Entry::Vacant(e) = writers.entry(tablet_id) {
-            let writer = DeltaWriter::open_with_allocator(tablet.clone(), self.id, allocator)?;
+            let writer = DeltaWriter::open_with_allocator_and_search_plan(
+                tablet.clone(),
+                self.id,
+                allocator,
+                search_write_plan.clone(),
+            )?;
             e.insert(writer);
         }
         let writer = writers
             .get_mut(&tablet_id)
             .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
+        writer.ensure_search_write_plan(&search_write_plan)?;
         let result = f(writer)?;
         self.bump_mutation_generation();
         self.set_read_write();
@@ -646,25 +596,15 @@ impl Transaction {
         for (tablet_id, writer) in pending {
             let (tablet, rowset, primary_update) = writer.finalize_for_transaction()?;
             let art_columns = self.take_pending_art_columns(tablet_id)?;
-            let fulltext_columns = self.take_pending_fulltext_columns(tablet_id)?;
 
             if tablet.state() == TabletState::Shutdown {
                 let _ = std::fs::remove_dir_all(rowset.rowset_path());
                 continue;
             }
 
-            if !fulltext_columns.is_empty() {
-                if let Err(err) = IndexRuntime::build_runtime_fulltext_indexes_for_rowset(
-                    &rowset,
-                    &fulltext_columns,
-                ) {
-                    let _ = std::fs::remove_dir_all(rowset.rowset_path());
-                    return Err(err);
-                }
-            }
             if !art_columns.is_empty() {
                 if let Err(err) =
-                    IndexRuntime::build_runtime_art_indexes_for_rowset(&rowset, &art_columns)
+                    RuntimeIndexes::rebuild_art_indexes_for_rowset(&rowset, &art_columns)
                 {
                     tracing::warn!(
                         error = %err,
@@ -691,9 +631,6 @@ impl Transaction {
             let _ = writer.cancel();
         }
         if let Ok(mut pending) = self.pending_art_columns.lock() {
-            pending.clear();
-        }
-        if let Ok(mut pending) = self.pending_fulltext_columns.lock() {
             pending.clear();
         }
     }
@@ -1011,9 +948,6 @@ impl Transaction {
         if let Ok(mut pending) = self.pending_art_columns.lock() {
             pending.clear();
         }
-        if let Ok(mut pending) = self.pending_fulltext_columns.lock() {
-            pending.clear();
-        }
         if let Ok(mut pending) = self.pending_dml_tables.lock() {
             pending.clear();
         }
@@ -1049,9 +983,6 @@ impl Transaction {
         self.commit_prepared_storage(commit_id)?;
 
         if let Ok(mut pending) = self.pending_art_columns.lock() {
-            pending.clear();
-        }
-        if let Ok(mut pending) = self.pending_fulltext_columns.lock() {
             pending.clear();
         }
         if let Ok(mut pending) = self.pending_dml_tables.lock() {
@@ -1428,12 +1359,14 @@ mod tests {
         txn.append_to_tablet(
             tablet.clone(),
             &Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), Vector::from_i32(&[10, 20])]),
+            SearchWritePlan::default(),
         )
         .expect("append first batch");
         let mark = txn.mark_savepoint().expect("mark savepoint");
         txn.append_to_tablet(
             tablet,
             &Chunk::from_vectors(vec![Vector::from_i32(&[3, 4]), Vector::from_i32(&[30, 40])]),
+            SearchWritePlan::default(),
         )
         .expect("append second batch");
 

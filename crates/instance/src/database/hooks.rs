@@ -8,9 +8,10 @@
 
 use crate::database::handle::DatabaseHandle;
 use crate::lifecycle::startup_report::StartupPolicy;
+use crate::search_registry::register_search_definition;
 use paro_catalog::entry::{
-    graph_schema_fingerprint, CatalogEntryEnum, CreatePropertyGraphInfo, IndexBuildState,
-    IndexCatalogEntry, IndexType as CatalogIndexType, PropertyGraphCatalogEntry,
+    graph_schema_fingerprint, CatalogEntryEnum, CreatePropertyGraphInfo, IndexCatalogEntry,
+    IndexType as CatalogIndexType, PropertyGraphCatalogEntry,
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::chunk::Chunk;
@@ -19,7 +20,6 @@ use paro_common::error as paro_error;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
-use paro_common::types::LogicalType;
 use paro_execution::operator::ddl::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
     schedule_property_graph_background_rebuild,
@@ -29,9 +29,6 @@ use paro_storage::index::graph::{
     EdgeBuildInput, GraphBuildInput, GraphManifest, GraphProjectionIndex,
     GraphProjectionIndexManager, GraphState, GraphStatistics, GraphStorageGeneration,
     VertexBuildInput, VertexKey,
-};
-use paro_storage::index::hnsw::{
-    build_missing_hnsw_indexes_with_scheduler, DistanceMetric, HnswColumnBuildConfig, HnswConfig,
 };
 use paro_storage::tablet::TabletReaderParams;
 use std::collections::HashMap;
@@ -135,13 +132,13 @@ impl RecoveryHook for DeferredTaskRecoveryHook {
 
         for task in &ctx.replayed_deferred_tasks {
             let delivery = match task {
-                DeferredTask::BuildIndexRuntime {
+                DeferredTask::FinalizeIndexState {
                     index,
                     table_name,
                     index_type,
                     column_ids,
                     fulltext_config,
-                } => replay_build_index_runtime_task(
+                } => replay_finalize_index_state_task(
                     db,
                     ctx,
                     index,
@@ -214,19 +211,19 @@ impl RecoveryHook for FullTextRecoveryHook {
         _ctx: &RecoveryHookContext,
     ) -> anyhow::Result<RecoveryHookResult> {
         Ok(RecoveryHookResult::Skipped {
-            reason: "fulltext runtime recovery is already reconciled during WAL replay".to_string(),
+            reason: "search generation recovery already restores fulltext queryability".to_string(),
         })
     }
 }
 
-fn replay_build_index_runtime_task(
+fn replay_finalize_index_state_task(
     db: &Arc<DatabaseHandle>,
-    ctx: &RecoveryHookContext,
+    _ctx: &RecoveryHookContext,
     index: &paro_common::ddl::DdlObjectKey,
     table_name: &str,
     index_type: &str,
     column_ids: &[u32],
-    fulltext_config: Option<&str>,
+    _fulltext_config: Option<&str>,
 ) -> anyhow::Result<DeferredTaskDelivery> {
     let txn = CatalogSnapshot::default();
     let Some(schema_name) = index.schema.as_deref() else {
@@ -269,20 +266,33 @@ fn replay_build_index_runtime_task(
             _ => None,
         });
 
-    if let Some(reason) = index_runtime_skip_reason(
-        storage.as_ref(),
-        index_entry.as_ref(),
-        index_type,
-        column_ids,
-        fulltext_config,
-    ) {
-        return Ok(DeferredTaskDelivery::Skipped(format!(
-            "index {} skipped: {}",
-            index.name, reason
-        )));
+    match CatalogIndexType::from_str(index_type) {
+        CatalogIndexType::HNSW | CatalogIndexType::Sparse | CatalogIndexType::FullText => {
+            let index_entry = index_entry.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "search index {} disappeared before recovery hook registry install",
+                    index.name
+                )
+            })?;
+            if storage
+                .search_generation_coverage(index_entry.base.base.object_id.raw())
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?
+                .is_some()
+            {
+                return Ok(DeferredTaskDelivery::Skipped(format!(
+                    "index {} on {}.{} already restored",
+                    index.name, schema_name, table_name
+                )));
+            }
+            register_search_definition(storage.as_ref(), index_entry.as_ref())
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            return Ok(DeferredTaskDelivery::Executed(format!(
+                "index {} on {}.{} restored via search generation registry",
+                index.name, schema_name, table_name
+            )));
+        }
+        _ => {}
     }
-
-    mark_declared_runtime_indexes(storage.as_ref(), index_type, column_ids, fulltext_config);
 
     match CatalogIndexType::from_str(index_type) {
         CatalogIndexType::ART => {
@@ -292,85 +302,18 @@ fn replay_build_index_runtime_task(
                     index.name
                 ));
             };
-            if let Err(err) = storage.build_runtime_art_index(*column_id) {
-                storage.unmark_declared_art_index(*column_id);
-                let _ = storage.remove_runtime_art_index(*column_id);
-                mark_index_runtime_failed(
+            if let Err(err) = storage.rebuild_art_index(*column_id) {
+                storage.forget_art_index(*column_id);
+                let _ = storage.drop_art_index(*column_id);
+                mark_index_state_failed(
                     index_entry.as_ref(),
                     format!("ART runtime restore failed: {}", err),
                 );
                 return Err(anyhow::anyhow!(err.to_string()));
             }
         }
-        CatalogIndexType::FullText => {
-            let config = fulltext_config.unwrap_or("simple");
-            for column_id in column_ids {
-                if let Err(err) =
-                    storage.build_runtime_fulltext_index_with_config(*column_id, config)
-                {
-                    mark_index_runtime_failed(
-                        index_entry.as_ref(),
-                        format!("FULLTEXT runtime restore failed: {}", err),
-                    );
-                    return Err(anyhow::anyhow!(err.to_string()));
-                }
-            }
-        }
-        CatalogIndexType::HNSW => {
-            let tablet = storage.tablet();
-            let schema = tablet
-                .schema()
-                .ok_or_else(|| anyhow::anyhow!("table {} has no schema", table_name))?;
-            let mut columns = Vec::new();
-            for &column_id in column_ids {
-                let schema_col = schema.column_by_id(column_id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "HNSW column {} missing from table {}",
-                        column_id,
-                        table_name
-                    )
-                })?;
-                match &schema_col.logical_type {
-                    LogicalType::Array(inner, _dim) if matches!(**inner, LogicalType::Float) => {}
-                    other => {
-                        return Err(anyhow::anyhow!(
-                            "HNSW index {} requires Array(Float, N), got {:?} for column {}",
-                            index.name,
-                            other,
-                            column_id
-                        ))
-                    }
-                }
-                columns.push(HnswColumnBuildConfig::new(
-                    column_id,
-                    HnswConfig::new(schema_col.hnsw_m, schema_col.hnsw_ef_construct),
-                    DistanceMetric::from_u8(schema_col.hnsw_distance),
-                ));
-            }
-            let rowsets = tablet
-                .capture_consistent_rowsets(tablet.max_version())
-                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-            if rowsets.is_empty() {
-                return Ok(DeferredTaskDelivery::Skipped(format!(
-                    "index {} skipped: table {}.{} has no visible rowsets",
-                    index.name, schema_name, table_name
-                )));
-            }
-            if let Err(err) =
-                build_missing_hnsw_indexes_with_scheduler(&rowsets, &columns, ctx.scheduler.clone())
-            {
-                mark_index_runtime_failed(
-                    index_entry.as_ref(),
-                    format!("HNSW runtime restore failed: {}", err),
-                );
-                return Err(anyhow::anyhow!(err.to_string()));
-            }
-        }
-        CatalogIndexType::Sparse => {
-            return Ok(DeferredTaskDelivery::Skipped(format!(
-                "index {} skipped: sparse runtime state is already persistent",
-                index.name
-            )))
+        CatalogIndexType::FullText | CatalogIndexType::HNSW | CatalogIndexType::Sparse => {
+            unreachable!("search indexes return early")
         }
         _ => {
             return Ok(DeferredTaskDelivery::Skipped(format!(
@@ -380,47 +323,18 @@ fn replay_build_index_runtime_task(
         }
     }
 
+    if let Some(index_entry) = index_entry.as_ref() {
+        register_search_definition(storage.as_ref(), index_entry.as_ref())
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    }
+
     Ok(DeferredTaskDelivery::Executed(format!(
         "index {} on {}.{} redelivered as {} runtime build",
         index.name, schema_name, table_name, index_type
     )))
 }
 
-fn index_runtime_skip_reason(
-    storage: &paro_storage::table::table_handle::TableHandle,
-    index_entry: Option<&Arc<IndexCatalogEntry>>,
-    index_type: &str,
-    column_ids: &[u32],
-    fulltext_config: Option<&str>,
-) -> Option<String> {
-    let index_entry = index_entry?;
-    if index_entry.build_state() != IndexBuildState::Ready {
-        return None;
-    }
-
-    match CatalogIndexType::from_str(index_type) {
-        CatalogIndexType::FullText => {
-            let config = fulltext_config.unwrap_or("simple");
-            let complete = column_ids.iter().all(|column_id| {
-                storage
-                    .fulltext_index_coverage(*column_id)
-                    .map(|coverage| {
-                        coverage.visible_segment_count == coverage.indexed_segment_count
-                            && storage.has_fulltext_index_with_config(*column_id, config)
-                    })
-                    .unwrap_or(false)
-            });
-            if complete {
-                return Some("full-text runtime already converged".to_string());
-            }
-            None
-        }
-        CatalogIndexType::Sparse => Some("sparse runtime state is already persistent".to_string()),
-        _ => None,
-    }
-}
-
-fn mark_index_runtime_failed(index_entry: Option<&Arc<IndexCatalogEntry>>, reason: String) {
+fn mark_index_state_failed(index_entry: Option<&Arc<IndexCatalogEntry>>, reason: String) {
     if let Some(index_entry) = index_entry {
         index_entry.mark_failed(Some(reason));
     }
@@ -558,29 +472,6 @@ fn replay_graph_dml_maintenance_task(
         "graph maintenance redelivered for {} graph(s)",
         touched
     )))
-}
-
-fn mark_declared_runtime_indexes(
-    storage: &paro_storage::table::table_handle::TableHandle,
-    index_type: &str,
-    column_ids: &[u32],
-    fulltext_config: Option<&str>,
-) {
-    let index_type = CatalogIndexType::from_str(index_type);
-    for column_id in column_ids {
-        match index_type {
-            CatalogIndexType::ART => storage.mark_declared_art_index(*column_id),
-            CatalogIndexType::HNSW => storage.mark_declared_vector_index(*column_id),
-            CatalogIndexType::Sparse => storage.mark_declared_sparse_index(*column_id),
-            CatalogIndexType::FullText => {
-                storage.mark_declared_fulltext_index_with_config(
-                    *column_id,
-                    fulltext_config.unwrap_or("simple"),
-                );
-            }
-            _ => {}
-        }
-    }
 }
 
 fn graph_update_hits_columns(

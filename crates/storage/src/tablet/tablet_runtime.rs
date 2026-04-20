@@ -2679,6 +2679,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn checkpoint_snapshot_reuses_retired_inputs_for_post_cut_compaction_output() {
         storage_metrics().reset_for_tests();
         let dir = tempfile::tempdir().unwrap();
@@ -2736,6 +2737,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn checkpoint_snapshot_records_optimistic_capture_metrics() {
         storage_metrics().reset_for_tests();
         let schema = create_test_schema();

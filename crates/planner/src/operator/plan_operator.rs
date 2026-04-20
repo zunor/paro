@@ -912,8 +912,8 @@ mod tests {
     use crate::expression::{AggregateExpression, ConstantExpression, Expression};
     use crate::operator::{
         Aggregate, AnyJoin, ComparisonJoin, DelimGet, DependentJoin, EmptyResult, ExpandDirection,
-        Explain, ExplainSpec, ExpressionGet, Join, JoinType, SearchDecision, SearchScan,
-        SearchType,
+        Explain, ExplainSpec, ExpressionGet, Join, JoinType, SearchCandidate, SearchDecision,
+        SearchScan,
     };
     use crate::plan::LogicalPlan;
     use paro_catalog::entry::{ColumnDefinition, EdgeTableInfo, TableCatalogEntry};
@@ -921,6 +921,10 @@ mod tests {
     use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::copy::{register_copy_functions, CopyFunctionBindData, CopyOptions};
     use paro_parser::ast::CopySource;
+    use paro_storage::search::{
+        CoverageState, ExecutionModes, GenerationStats, HnswIntent, NormalizedSearchRequest,
+        ProjectionSpec, SearchCapability, SearchIndexKind, SearchIntent, SearchRequestMode,
+    };
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
 
@@ -1440,9 +1444,39 @@ mod tests {
                 vec!["embedding".to_string(), "body".to_string()],
                 vec![LogicalType::Float, LogicalType::Varchar],
             ),
+            NormalizedSearchRequest {
+                table_id: 10,
+                mode: SearchRequestMode::TopK { limit: 5 },
+                predicate: None,
+                projections: ProjectionSpec {
+                    columns: vec![0, 1],
+                    include_score: false,
+                },
+                intents: vec![SearchIntent::Hnsw(HnswIntent {
+                    column_id: 1,
+                    query_vector: vec![0.1, 0.2],
+                })],
+                fusion: None,
+            },
             SearchDecision::IndexScan {
-                search_type: SearchType::HnswVector { column_id: 1 },
-                estimated_cost: 1.0,
+                candidate: SearchCandidate {
+                    intent: SearchIntent::Hnsw(HnswIntent {
+                        column_id: 1,
+                        query_vector: vec![0.1, 0.2],
+                    }),
+                    capability: SearchCapability {
+                        definition_id: 1,
+                        table_id: 10,
+                        kind: SearchIndexKind::Hnsw,
+                        generation_id: 1,
+                        coverage: CoverageState::Complete,
+                        config_fingerprint: 0,
+                        generation_stats: GenerationStats::default(),
+                        execution_modes: ExecutionModes::default(),
+                        estimated_cost: None,
+                        prefer_hint: None,
+                    },
+                },
                 confidence: crate::operator::Confidence::High,
             },
             vec![Expression::Constant(ConstantExpression::new(

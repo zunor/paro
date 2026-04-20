@@ -1,13 +1,45 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::table_handle::{FullTextIndexCoverage, TableHandle};
+use super::table_handle::TableHandle;
 use crate::statistics::{
     BaseStatistics, ColumnStatistics, FullTextIndexStatistics, HnswIndexStatistics,
     SparseIndexStatistics,
 };
 use crate::tablet::ColumnId;
-use paro_common::error::Result;
+
+fn merge_fulltext_index_stats(
+    agg: Option<FullTextIndexStatistics>,
+    incoming: FullTextIndexStatistics,
+) -> Option<FullTextIndexStatistics> {
+    Some(match agg {
+        None => incoming,
+        Some(mut merged) => {
+            merged.total_docs = merged.total_docs.saturating_add(incoming.total_docs);
+            merged.total_terms = merged.total_terms.saturating_add(incoming.total_terms);
+            merged.unique_terms = merged.unique_terms.saturating_add(incoming.unique_terms);
+            merged.total_postings = merged
+                .total_postings
+                .saturating_add(incoming.total_postings);
+            merged.max_posting_list_len = merged
+                .max_posting_list_len
+                .max(incoming.max_posting_list_len);
+            if merged.min_posting_list_len == 0 {
+                merged.min_posting_list_len = incoming.min_posting_list_len;
+            } else if incoming.min_posting_list_len > 0 {
+                merged.min_posting_list_len = merged
+                    .min_posting_list_len
+                    .min(incoming.min_posting_list_len);
+            }
+            merged.avg_doc_length = if merged.total_docs == 0 {
+                0.0
+            } else {
+                merged.total_terms as f32 / merged.total_docs as f32
+            };
+            merged
+        }
+    })
+}
 
 impl TableHandle {
     pub fn column_statistics(&self, column_index: usize) -> Option<BaseStatistics> {
@@ -42,14 +74,85 @@ impl TableHandle {
 
     /// Aggregate HNSW index statistics across visible rowsets.
     pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<HnswIndexStatistics> {
-        self.index_runtime
-            .hnsw_index_statistics(&self.tablet(), column_id)
+        let visible = self.max_version();
+        let rowsets = self.tablet().capture_consistent_rowsets(visible).ok()?;
+
+        let mut agg: Option<HnswIndexStatistics> = None;
+        for rowset in rowsets {
+            if rowset.load().is_err() {
+                continue;
+            }
+            for segment in rowset.segments() {
+                let Some(stats) = segment.hnsw_index_statistics(column_id) else {
+                    continue;
+                };
+                agg = Some(match agg {
+                    None => stats.clone(),
+                    Some(mut merged) => {
+                        merged.num_indexed_vectors = merged
+                            .num_indexed_vectors
+                            .saturating_add(stats.num_indexed_vectors);
+                        merged.dimension = merged.dimension.max(stats.dimension);
+                        merged.max_level = merged.max_level.max(stats.max_level);
+                        merged.m = merged.m.max(stats.m);
+                        merged.ef_construction = merged.ef_construction.max(stats.ef_construction);
+                        merged.graph_size_bytes = merged
+                            .graph_size_bytes
+                            .saturating_add(stats.graph_size_bytes);
+                        merged.storage_size_bytes = merged
+                            .storage_size_bytes
+                            .saturating_add(stats.storage_size_bytes);
+                        merged
+                    }
+                });
+            }
+        }
+
+        agg
     }
 
     /// Aggregate sparse vector index statistics across visible rowsets.
     pub fn sparse_index_statistics(&self, column_id: ColumnId) -> Option<SparseIndexStatistics> {
-        self.index_runtime
-            .sparse_index_statistics(&self.tablet(), column_id)
+        let visible = self.max_version();
+        let rowsets = self.tablet().capture_consistent_rowsets(visible).ok()?;
+
+        let mut agg: Option<SparseIndexStatistics> = None;
+        for rowset in rowsets {
+            if rowset.load().is_err() {
+                continue;
+            }
+            for segment in rowset.segments() {
+                let Some(stats) = segment.sparse_index_statistics(column_id) else {
+                    continue;
+                };
+                agg = Some(match agg {
+                    None => stats.clone(),
+                    Some(mut merged) => {
+                        merged.num_indexed_vectors = merged
+                            .num_indexed_vectors
+                            .saturating_add(stats.num_indexed_vectors);
+                        merged.num_unique_dimensions = merged
+                            .num_unique_dimensions
+                            .max(stats.num_unique_dimensions);
+                        merged.num_posting_lists = merged
+                            .num_posting_lists
+                            .saturating_add(stats.num_posting_lists);
+                        merged.total_postings =
+                            merged.total_postings.saturating_add(stats.total_postings);
+                        merged
+                    }
+                });
+            }
+        }
+
+        agg.map(|mut merged| {
+            merged.avg_vector_nnz = if merged.num_indexed_vectors == 0 {
+                0.0
+            } else {
+                merged.total_postings as f32 / merged.num_indexed_vectors as f32
+            };
+            merged
+        })
     }
 
     /// Aggregate full-text index statistics across visible rowsets.
@@ -57,14 +160,31 @@ impl TableHandle {
         &self,
         column_id: ColumnId,
     ) -> Option<FullTextIndexStatistics> {
-        self.index_runtime
-            .fulltext_index_statistics(&self.tablet(), column_id)
-    }
+        let visible = self.max_version();
+        let rowsets = self.tablet().capture_consistent_rowsets(visible).ok()?;
 
-    /// Return visible/indexed segment coverage for full-text index payloads.
-    pub fn fulltext_index_coverage(&self, column_id: ColumnId) -> Result<FullTextIndexCoverage> {
-        self.index_runtime
-            .fulltext_index_coverage(&self.tablet(), column_id)
+        let mut agg: Option<FullTextIndexStatistics> = None;
+        for rowset in rowsets {
+            if let Ok(rowset_stats) = rowset.statistics() {
+                if let Some(stats) = rowset_stats.fulltext_index(column_id) {
+                    agg = merge_fulltext_index_stats(agg, stats.clone());
+                    continue;
+                }
+            }
+
+            if rowset.load().is_err() {
+                continue;
+            }
+
+            for segment in rowset.segments() {
+                let Some(stats) = segment.fulltext_index_statistics(column_id) else {
+                    continue;
+                };
+                agg = merge_fulltext_index_stats(agg, stats);
+            }
+        }
+
+        agg
     }
 
     fn base_stats_from_column_stats(

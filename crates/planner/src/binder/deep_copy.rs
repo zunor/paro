@@ -516,6 +516,7 @@ impl LogicalPlanDeepCopy {
                 self.remap_table_index(bind_shared, &mut projection_table_index);
                 LogicalOperator::SearchScan(SearchScanNode {
                     get,
+                    request: s.request.clone(),
                     decision: s.decision.clone(),
                     projections: s.projections.clone(),
                     output_names: s.output_names.clone(),
@@ -533,6 +534,7 @@ impl LogicalPlanDeepCopy {
                 self.remap_table_index(bind_shared, &mut get.table_index);
                 LogicalOperator::FullTextFilterScan(FtScanNode {
                     get,
+                    request: s.request.clone(),
                     match_expression: s.match_expression.clone(),
                     other_predicates: s.other_predicates.clone(),
                     residual_predicates: s.residual_predicates.clone(),

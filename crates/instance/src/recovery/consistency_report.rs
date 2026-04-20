@@ -103,7 +103,7 @@ pub fn build_recovery_consistency_report(catalog: &Arc<ParoCatalog>) -> Recovery
                 report.tablet_id = Some(storage.tablet_id());
                 report.rowset_count = Some(storage.rowset_count());
                 report.max_version = Some(storage.max_version());
-                let runtime_index_count = storage.recovery_runtime_index_count();
+                let runtime_index_count = storage.recovery_index_count();
                 report.runtime_index_count = Some(runtime_index_count);
 
                 if let Err(err) = storage.validate_version_graph() {
