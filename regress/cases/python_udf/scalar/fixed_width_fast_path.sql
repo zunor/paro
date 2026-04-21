@@ -6,6 +6,7 @@
 
 DROP FUNCTION IF EXISTS py_numpy_fast(INTEGER);
 
+-- @normalize regress_paths
 CREATE FUNCTION py_numpy_fast(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 IMMUTABLE

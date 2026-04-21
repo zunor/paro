@@ -8,7 +8,10 @@ from paro_runtime_worker.column_decoder import ColumnDecoder
 from paro_runtime_worker.column_encoder import ColumnEncoder
 from paro_runtime_worker.control import ControlLoop, SubmissionState
 from paro_runtime_worker.protocol.control_header import ControlHeader, ControlMessageKind
+from paro_runtime_worker.trusted_lane import SubInterpreterExecutor
 from paro_udf.column import Column, SlowPathWarning
+
+_HAS_SUBINTERPRETERS = SubInterpreterExecutor().available
 
 
 def _write_module(tmpdir: Path) -> Path:
@@ -197,6 +200,10 @@ class ControlLoopTests(unittest.TestCase):
                 warnings.simplefilter("ignore", SlowPathWarning)
                 self.assertEqual(decoded.columns[0].materialize_py(), [100, 200])
 
+    @unittest.skipUnless(
+        _HAS_SUBINTERPRETERS,
+        "sub-interpreter execution is unavailable in this Python runtime",
+    )
     def test_control_loop_executes_in_subinterpreter_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             module_path = _write_module(Path(tmp_dir))
@@ -235,6 +242,10 @@ class ControlLoopTests(unittest.TestCase):
                 warnings.simplefilter("ignore", SlowPathWarning)
                 self.assertEqual(decoded.columns[0].materialize_py(), [4, 8])
 
+    @unittest.skipUnless(
+        _HAS_SUBINTERPRETERS,
+        "sub-interpreter execution is unavailable in this Python runtime",
+    )
     def test_subinterpreter_policy_blocks_disallowed_imports(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             module_path = _write_module(Path(tmp_dir))

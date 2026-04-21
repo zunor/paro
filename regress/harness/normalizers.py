@@ -27,6 +27,9 @@ _JSON_BYTES_FIELD_RE = re.compile(
     r'"(Memory|Disk|Peak Memory|Temp Storage|Total Temp Storage|peak_memory_bytes|temp_storage_bytes)"\s*:\s*\d+'
 )
 _COPY_ROWCOUNT_RE = re.compile(r"^COPY\s+\d+$")
+_REGRESS_PATH_RE = re.compile(
+    r"(?<!<repo>)/(?:[^'\"\s)]+/)*regress/(?:report/fixtures|fixtures)/[^'\"\s)]+"
+)
 
 
 def normalize_explain_operator_timing(lines: list[str]) -> list[str]:
@@ -108,9 +111,26 @@ def normalize_copy_rowcount(lines: list[str]) -> list[str]:
     return result
 
 
+def normalize_regress_paths(lines: list[str]) -> list[str]:
+    """Normalize workspace-specific regress fixture paths to a stable repo placeholder."""
+
+    def _replace(match: re.Match[str]) -> str:
+        path = match.group(0)
+        suffix_idx = path.find("/regress/")
+        if suffix_idx == -1:
+            return path
+        return f"<repo>{path[suffix_idx:]}"
+
+    result: list[str] = []
+    for line in lines:
+        result.append(_REGRESS_PATH_RE.sub(_replace, line))
+    return result
+
+
 # stable: normalize per-operator timing volatility.
 # stable: normalize summary timing volatility.
 # stable: normalize runtime byte volatility for spill/memory observability.
+# stable: normalize repo-local regress fixture/report absolute paths.
 # transitional: legacy alias kept for gradual migration from explain_runtime.
 NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_operator_timing": normalize_explain_operator_timing,
@@ -121,6 +141,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_external_runtime": normalize_explain_external_runtime,
     "explain_runtime": normalize_explain_runtime,
     "copy_rowcount": normalize_copy_rowcount,
+    "regress_paths": normalize_regress_paths,
 }
 
 
@@ -157,5 +178,6 @@ __all__ = [
     "normalize_explain_runtime",
     "normalize_explain_runtime_bytes",
     "normalize_explain_summary_timing",
+    "normalize_regress_paths",
     "normalizer_profiles",
 ]

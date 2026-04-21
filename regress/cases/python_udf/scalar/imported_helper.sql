@@ -6,6 +6,7 @@
 
 DROP FUNCTION IF EXISTS py_imported(INTEGER);
 
+-- @normalize regress_paths
 CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 IMMUTABLE

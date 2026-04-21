@@ -128,6 +128,36 @@ def test_apply_copy_rowcount_normalizer_rewrites_copy_status_lines() -> None:
     ]
 
 
+def test_apply_regress_paths_normalizer_rewrites_workspace_specific_fixture_paths() -> None:
+    lines = [
+        (
+            "IMPORTS "
+            "('/home/runner/work/paro/paro/regress/report/fixtures/python_udf/scalar/"
+            "fixed_width_fast_path/python_udf/modules/fake_numpy/numpy.py')"
+        ),
+        (
+            "ERROR: Python runtime is misconfigured for CREATE FUNCTION "
+            "(SQLSTATE=39P04; DETAIL=failed to bootstrap Python interpreter "
+            "'/Users/linjunhong/workspace/paro/regress/fixtures/python_udf/bin/"
+            "python_misconfigured.py': simulated misconfigured python runtime)"
+        ),
+    ]
+
+    assert apply_normalizers(lines, ("regress_paths",)) == [
+        (
+            "IMPORTS "
+            "('<repo>/regress/report/fixtures/python_udf/scalar/fixed_width_fast_path/"
+            "python_udf/modules/fake_numpy/numpy.py')"
+        ),
+        (
+            "ERROR: Python runtime is misconfigured for CREATE FUNCTION "
+            "(SQLSTATE=39P04; DETAIL=failed to bootstrap Python interpreter "
+            "'<repo>/regress/fixtures/python_udf/bin/python_misconfigured.py': "
+            "simulated misconfigured python runtime)"
+        ),
+    ]
+
+
 def test_normalizers_preserve_structure_and_non_target_fields() -> None:
     lines = [
         "QUERY PLAN",
@@ -166,6 +196,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_external_runtime",
         "explain_runtime",
         "copy_rowcount",
+        "regress_paths",
     )
 
 

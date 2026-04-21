@@ -1,13 +1,14 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -50,6 +51,8 @@ use crate::operator::external::runtime_bridge::{
 
 const DEFAULT_PYTHON_BIN: &str = "python3";
 const PYTHON_BIN_ENV: &str = "PARO_PYTHON_BIN";
+
+static SUBINTERPRETER_SUPPORT_CACHE: OnceLock<Mutex<HashMap<OsString, bool>>> = OnceLock::new();
 
 pub fn build_project_runtime_bridge(
     session: &Arc<StatementContext>,
@@ -450,7 +453,7 @@ fn bind_runtime(
                 restricted_wasm_ready: false,
                 mediated_sandbox_ready: false,
                 microvm_ready: false,
-                subinterpreter_ready: true,
+                subinterpreter_ready: python_subinterpreter_supported(),
                 compiled_kernel_ready: true,
                 remote_ready: false,
                 local_io_uring_ready: false,
@@ -465,6 +468,27 @@ fn bind_runtime(
         compiled_kernel_kind: artifact.compiled_kernel_kind.clone(),
         subinterpreter_policy,
     })
+}
+
+fn python_binary() -> OsString {
+    env::var_os(PYTHON_BIN_ENV).unwrap_or_else(|| OsString::from(DEFAULT_PYTHON_BIN))
+}
+
+fn python_subinterpreter_supported() -> bool {
+    let python_bin = python_binary();
+    let cache = SUBINTERPRETER_SUPPORT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().get(&python_bin).copied() {
+        return cached;
+    }
+    let supported = Command::new(&python_bin)
+        .arg("-c")
+        .arg("from concurrent import interpreters")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    cache.lock().insert(python_bin, supported);
+    supported
 }
 
 fn compiled_kernel_requirement_error(
@@ -2136,6 +2160,7 @@ mod tests {
     #[test]
     fn project_bridge_uses_trusted_subinterpreter_backend_when_profile_requests_it() {
         let ctx = test_ctx();
+        let subinterpreter_supported = super::python_subinterpreter_supported();
         let expression = scalar_expression(scalar_spec_with_profile(
             "py_subinterp_double",
             r#"
@@ -2159,7 +2184,11 @@ def batch(ctx, a):
             std::slice::from_ref(&expression),
         )
         .expect("build bridge");
-        assert!(bridge.explain().backend.contains("subinterpreter"));
+        if subinterpreter_supported {
+            assert!(bridge.explain().backend.contains("subinterpreter"));
+        } else {
+            assert!(bridge.explain().backend.contains("process"));
+        }
 
         let batch_policy = batch_policy(&bridge);
         let input = integer_input(&[3, 4]);

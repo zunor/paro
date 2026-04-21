@@ -1,10 +1,11 @@
 DROP FUNCTION IF EXISTS py_numpy_fast(INTEGER);
 DROP FUNCTION
 
+-- @normalize regress_paths
 CREATE FUNCTION py_numpy_fast(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 IMMUTABLE
-IMPORTS ('/Users/linjunhong/workspace/paro/regress/report/fixtures/python_udf/scalar/fixed_width_fast_path/python_udf/modules/fake_numpy/numpy.py')
+IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/fixed_width_fast_path/python_udf/modules/fake_numpy/numpy.py')
 AS $$
 import numpy
 return a.to_numpy() + 7

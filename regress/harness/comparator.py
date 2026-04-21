@@ -293,27 +293,29 @@ def build_transcript(query_outputs: Sequence[QueryOutput], *, precision: int = 6
             block_lines.append(directive)
         if output.normalizers:
             block_lines.append(render_normalize_directive(output.normalizers))
-        block_lines.append(output.sql)
+        body_lines = [output.sql]
 
         if output.copy_direction is not None:
-            block_lines.append("-- @copydata")
-            block_lines.extend(output.copy_data_lines)
+            body_lines.append("-- @copydata")
+            body_lines.extend(output.copy_data_lines)
             if output.copy_fail_message is not None:
-                block_lines.append(f"-- @copyfail {output.copy_fail_message}")
+                body_lines.append(f"-- @copyfail {output.copy_fail_message}")
             if output.status and _should_render_copy_status(output.status):
-                block_lines.append("-- @copystatus")
-                block_lines.append(output.status)
+                body_lines.append("-- @copystatus")
+                body_lines.append(output.status)
         elif output.is_statement:
-            rows = []
-            columns = []
             if output.status and output.status != "OK":
-                block_lines.append(output.status)
+                body_lines.append(output.status)
         elif output.mode == "hash":
-            block_lines.append(_hash_summary(output, precision=precision))
+            body_lines.append(_hash_summary(output, precision=precision))
         else:
             # Query with results
-            block_lines.append("\t".join(_encode_text(column) for column in output.columns))
-            block_lines.extend(_encode_row(output, row_index, precision=precision) for row_index in range(len(output.rows)))
+            body_lines.append("\t".join(_encode_text(column) for column in output.columns))
+            body_lines.extend(_encode_row(output, row_index, precision=precision) for row_index in range(len(output.rows)))
+
+        if output.normalizers:
+            body_lines = apply_normalizers(body_lines, tuple(output.normalizers))
+        block_lines.extend(body_lines)
 
         chunks.append("\n".join(block_lines))
 
@@ -457,16 +459,18 @@ def _compare_one_block(index: int, expected: ResultBlock, actual: ResultBlock) -
             line_no=expected.line_no,
         )
 
-    if expected.sql.strip() != actual.sql.strip():
+    profiles = expected.normalizers or actual.normalizers
+    expected_sql = _normalize_sql_text(expected.sql, profiles)
+    actual_sql = _normalize_sql_text(actual.sql, profiles)
+
+    if expected_sql.strip() != actual_sql.strip():
         return _format_block_message(
             index,
             expected.sql,
             "SQL mismatch between expected and actual transcript blocks",
-            [expected.sql],
-            [actual.sql],
+            [expected_sql],
+            [actual_sql],
         )
-
-    profiles = expected.normalizers or actual.normalizers
     expected_lines = apply_normalizers(list(expected.raw_result_lines), profiles)
     actual_lines = apply_normalizers(list(actual.raw_result_lines), profiles)
 
@@ -491,6 +495,13 @@ def _compare_one_block(index: int, expected: ResultBlock, actual: ResultBlock) -
             line_no=expected.line_no
         )
     return None
+
+
+def _normalize_sql_text(sql: str, profiles: tuple[str, ...]) -> str:
+    lines = sql.splitlines()
+    if not lines:
+        lines = [sql]
+    return "\n".join(apply_normalizers(lines, profiles))
 
 
 def _compare_hash_block(

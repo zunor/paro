@@ -14,6 +14,7 @@ SELECT py_misconfigured_probe(1);
 -- @control restart profile=python_misconfigured
 SELECT 20 + 22;
 
+-- @normalize regress_paths
 CREATE FUNCTION py_misconfigured_new(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 AS $$return [value for value in a.materialize_py()]$$;
