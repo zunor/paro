@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn two_level_nested_correlated_exists_plans_without_remaining_subquery() {
-        let _ = planned_logical_operator(nested_case_sql("two_level_exists"));
+        assert_planned_probe_succeeds("two_level_exists");
     }
 
     #[test]
@@ -681,17 +681,17 @@ mod tests {
 
     #[test]
     fn union_set_operation_with_outer_correlation_plans_without_remaining_subquery() {
-        let _ = planned_logical_operator(nested_case_sql("setop_union_outer"));
+        assert_planned_probe_succeeds("setop_union_outer");
     }
 
     #[test]
     fn intersect_set_operation_with_outer_correlation_plans_without_remaining_subquery() {
-        let _ = planned_logical_operator(nested_case_sql("setop_intersect_outer"));
+        assert_planned_probe_succeeds("setop_intersect_outer");
     }
 
     #[test]
     fn except_set_operation_with_outer_correlation_plans_without_remaining_subquery() {
-        let _ = planned_logical_operator(nested_case_sql("setop_except_outer"));
+        assert_planned_probe_succeeds("setop_except_outer");
     }
 
     #[test]

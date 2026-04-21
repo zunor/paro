@@ -16,6 +16,7 @@
 use paro_planner::expression::Expression;
 use paro_planner::expression::{ComparisonExpression, ComparisonType};
 use paro_planner::operator::LogicalOperator;
+use paro_routine::BuiltinIntrinsicId;
 
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};
@@ -38,9 +39,10 @@ impl ExpressionMatcher for MoveConstantsMatcher {
             }
             // Match commutative functions (+, *) with constant on left
             Expression::Function(func) => {
-                let name = func.function.name.as_str();
-                if matches!(name, "+" | "*")
-                    && func.children.len() == 2
+                if matches!(
+                    func.builtin_intrinsic(),
+                    Some(BuiltinIntrinsicId::Add | BuiltinIntrinsicId::Multiply)
+                ) && func.children.len() == 2
                     && matches!(&func.children[0], Expression::Constant(_))
                     && !matches!(&func.children[1], Expression::Constant(_))
                 {
@@ -137,6 +139,7 @@ fn move_function_constant(func: &paro_planner::expression::FunctionExpression) -
         function: func.function.clone(),
         children: new_children,
         return_type: func.return_type.clone(),
+        routine_meta: func.routine_meta.clone(),
     })))
 }
 
@@ -179,31 +182,29 @@ mod tests {
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "+".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![left, right],
-            return_type: LogicalType::Integer,
-        })
+            ),
+            vec![left, right],
+            LogicalType::Integer,
+        ))
     }
 
     fn make_multiply(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "*".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![left, right],
-            return_type: LogicalType::Integer,
-        })
+            ),
+            vec![left, right],
+            LogicalType::Integer,
+        ))
     }
 
     fn make_comparison(

@@ -153,6 +153,22 @@ pub struct DropSequencePayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CreateRoutinePayload {
+    #[serde(default)]
+    pub object_id: u64,
+    #[serde(default)]
+    pub routine_id: u64,
+    pub spec_json: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DropRoutinePayload {
+    pub if_exists: bool,
+    pub arg_types: Vec<LogicalType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AlterEntryPayload {
     pub sql: String,
 }
@@ -187,6 +203,8 @@ pub enum DdlChange {
     DropPropertyGraph(DropPropertyGraphPayload),
     CreateSequence(CreateSequencePayload),
     DropSequence(DropSequencePayload),
+    CreateRoutine(CreateRoutinePayload),
+    DropRoutine(DropRoutinePayload),
     AlterEntry(AlterEntryPayload),
 }
 

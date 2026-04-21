@@ -1,0 +1,18 @@
+DROP FUNCTION IF EXISTS py_arrow_capsule(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_arrow_capsule(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+AS $$return a.__arrow_c_array__()$$;
+CREATE FUNCTION
+
+SELECT py_arrow_capsule(v)
+FROM (VALUES (8), (13)) AS t(v)
+ORDER BY 1;
+py_arrow_capsule(v)
+8
+13
+
+DROP FUNCTION py_arrow_capsule(INTEGER);
+DROP FUNCTION

@@ -17,6 +17,8 @@ paro-scheduler = { workspace = true }
 paro-catalog = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }
+paro-routine = { workspace = true }
+paro-external-runtime = { workspace = true }
 paro-parser = { workspace = true }
 paro-execution = { workspace = true }
 

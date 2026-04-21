@@ -271,13 +271,9 @@ pub enum Statement {
     ShowGrantsOfRole(ShowGranteesOfRoleStmt),
     Revoke(RevokeStmt),
 
-    // UDF
-    CreateUDF(CreateUDFStmt),
-    DropUDF {
-        if_exists: bool,
-        udf_name: Identifier,
-    },
-    AlterUDF(AlterUDFStmt),
+    // Functions
+    CreateFunction(CreateFunctionStmt),
+    DropFunction(DropFunctionStmt),
 
     // RowAccessPolicy
     CreateRowAccessPolicy(CreateRowAccessPolicyStmt),
@@ -578,9 +574,8 @@ impl Statement {
             | Statement::DropRole { .. }
             | Statement::Grant(..)
             | Statement::Revoke(..)
-            | Statement::CreateUDF(..)
-            | Statement::DropUDF { .. }
-            | Statement::AlterUDF(..)
+            | Statement::CreateFunction(..)
+            | Statement::DropFunction(..)
             | Statement::CreateRowAccessPolicy(..)
             | Statement::DropRowAccessPolicy(..)
             | Statement::CreateTag(..)
@@ -952,18 +947,8 @@ impl Display for Statement {
             Statement::ShowObjectPrivileges(stmt) => write!(f, "{stmt}")?,
             Statement::ShowGrantsOfRole(stmt) => write!(f, "{stmt}")?,
             Statement::Revoke(stmt) => write!(f, "{stmt}")?,
-            Statement::CreateUDF(stmt) => write!(f, "{stmt}")?,
-            Statement::DropUDF {
-                if_exists,
-                udf_name,
-            } => {
-                write!(f, "DROP FUNCTION")?;
-                if *if_exists {
-                    write!(f, " IF EXISTS")?;
-                }
-                write!(f, " {udf_name}")?;
-            }
-            Statement::AlterUDF(stmt) => write!(f, "{stmt}")?,
+            Statement::CreateFunction(stmt) => write!(f, "{stmt}")?,
+            Statement::DropFunction(stmt) => write!(f, "{stmt}")?,
             Statement::CreateRowAccessPolicy(stmt) => write!(f, "{stmt}")?,
             Statement::DescRowAccessPolicy(stmt) => write!(f, "{stmt}")?,
             Statement::DropRowAccessPolicy(stmt) => write!(f, "{stmt}")?,

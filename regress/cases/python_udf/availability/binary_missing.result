@@ -1,0 +1,30 @@
+DROP FUNCTION IF EXISTS py_missing_probe(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_missing_probe(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value + 2 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_missing_probe(1);
+py_missing_probe(1)
+3
+
+SELECT 7 * 6;
+7 * 6
+42
+
+CREATE FUNCTION py_missing_new(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value for value in a.materialize_py()]$$;
+ERROR: Python runtime interpreter is missing for CREATE FUNCTION (SQLSTATE=39P04; DETAIL=Python interpreter '__paro_missing_python__' was not found)
+
+SELECT py_missing_probe(1);
+ERROR: Python runtime interpreter is missing for external routine execution (SQLSTATE=XX000)
+
+SELECT py_missing_probe(1);
+py_missing_probe(1)
+3
+
+DROP FUNCTION py_missing_probe(INTEGER);
+DROP FUNCTION

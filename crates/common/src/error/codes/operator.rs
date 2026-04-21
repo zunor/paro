@@ -11,3 +11,4 @@ pub const CRASH_SHUTDOWN: SqlState = SqlState::new(*b"57P02");
 pub const CANNOT_CONNECT_NOW: SqlState = SqlState::new(*b"57P03");
 pub const DATABASE_DROPPED: SqlState = SqlState::new(*b"57P04");
 pub const IDLE_SESSION_TIMEOUT: SqlState = SqlState::new(*b"57P05");
+pub const STATEMENT_TIMEOUT: SqlState = SqlState::new(*b"57P06");

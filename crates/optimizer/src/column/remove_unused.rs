@@ -255,7 +255,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 let layout_sensitive = proj
                     .output_names
                     .iter()
-                    .any(|name| name.starts_with("__corr_"));
+                    .any(|name| name.starts_with("__corr_") || name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
                 if !self.everything_referenced && !layout_sensitive {
                     self.clear_unused_expressions(

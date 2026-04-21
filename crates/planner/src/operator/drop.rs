@@ -59,6 +59,7 @@ impl Drop {
             DropType::Index => "DROP_INDEX",
             DropType::View => "DROP_VIEW",
             DropType::Sequence => "DROP_SEQUENCE",
+            DropType::Routine => "DROP_FUNCTION",
         }
     }
 }
@@ -75,6 +76,7 @@ mod tests {
             object_name: name.to_string(),
             if_exists: false,
             cascade: false,
+            routine_arg_types: Vec::new(),
         }
     }
 
@@ -136,5 +138,14 @@ mod tests {
 
         assert_eq!(op.drop_type(), DropType::View);
         assert_eq!(op.name(), "DROP_VIEW");
+    }
+
+    #[test]
+    fn test_logical_drop_routine() {
+        let info = create_test_drop_info(DropType::Routine, "py_add");
+        let op = Drop::new(info);
+
+        assert_eq!(op.drop_type(), DropType::Routine);
+        assert_eq!(op.name(), "DROP_FUNCTION");
     }
 }

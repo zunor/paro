@@ -19,6 +19,7 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
     let base = TestStatementContextBuilder::minimal()
         .with_current_database("paro")
         .with_search_path(search_path)
+        .with_visible_version(u64::MAX)
         .build();
     base.catalog().initialize(false);
 
@@ -39,6 +40,7 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
             infra: base.services.infra.clone(),
             cast_functions: Arc::new(cast_functions),
             graph_index: base.services.graph_index.clone(),
+            python_runtime: base.services.python_runtime.clone(),
             governance: base.services.governance.clone(),
             plan_cache: base.services.plan_cache.clone(),
             connection_info: base.services.connection_info.clone(),

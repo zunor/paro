@@ -9,6 +9,7 @@ use super::query::BoundQuery;
 
 pub use crate::binder::bind::statement::alter::BoundAlterEntryInfo;
 pub use crate::binder::bind::statement::copy::BoundCopyInfo;
+pub use crate::binder::bind::statement::create_function::BoundCreateRoutineInfo;
 pub use crate::binder::bind::statement::create_index::BoundCreateIndexInfo;
 pub use crate::binder::bind::statement::create_property_graph::BoundCreatePropertyGraphInfo;
 pub use crate::binder::bind::statement::create_schema::BoundCreateSchemaInfo;
@@ -26,6 +27,7 @@ pub use crate::binder::bind::statement::update::BoundUpdateInfo;
 #[derive(Debug)]
 pub enum BoundStatementKind {
     CreateTable(BoundCreateTableInfo),
+    CreateRoutine(BoundCreateRoutineInfo),
     CreateSequence(BoundCreateSequenceInfo),
     CreateSchema(BoundCreateSchemaInfo),
     CreateIndex(BoundCreateIndexInfo),

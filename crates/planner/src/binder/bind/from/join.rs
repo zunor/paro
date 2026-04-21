@@ -92,6 +92,14 @@ fn extract_lateral_metadata(table_ref: &BoundFromItem) -> (bool, Vec<CorrelatedC
                     .any(|corr| corr.depth == 1);
             (is_lateral, subquery.correlated_columns.clone())
         }
+        BoundFromItem::ExternalRoutine(routine) => {
+            let is_lateral = routine.lateral
+                && routine
+                    .correlated_columns
+                    .iter()
+                    .any(|corr| corr.depth == 1);
+            (is_lateral, routine.correlated_columns.clone())
+        }
         _ => (false, Vec::new()),
     }
 }
@@ -107,6 +115,7 @@ fn collect_tableref_indices_recursive(table_ref: &BoundFromItem, indices: &mut V
         BoundFromItem::BaseTable(base) => indices.push(base.table_index),
         BoundFromItem::Subquery(subquery) => indices.push(subquery.subquery_index),
         BoundFromItem::TableFunction(function) => indices.push(function.table_index),
+        BoundFromItem::ExternalRoutine(routine) => indices.push(routine.table_index),
         BoundFromItem::CTE(cte) => indices.push(cte.table_index),
         BoundFromItem::GraphTable(graph) => indices.push(graph.table_index),
         BoundFromItem::Join(join) => {
@@ -385,6 +394,22 @@ fn find_column_in_tableref(
             Err(paro_error::syntax(format!(
                 "Column '{}' not found in table function '{}'",
                 column_name, tf_ref.alias
+            )))
+        }
+        BoundFromItem::ExternalRoutine(routine_ref) => {
+            for (col_idx, col_name) in routine_ref.column_names.iter().enumerate() {
+                if col_name.eq_ignore_ascii_case(column_name) {
+                    return Ok(create_col_ref(
+                        binder,
+                        routine_ref.table_index,
+                        col_idx,
+                        routine_ref.column_types[col_idx].clone(),
+                    ));
+                }
+            }
+            Err(paro_error::syntax(format!(
+                "Column '{}' not found in routine '{}'",
+                column_name, routine_ref.alias
             )))
         }
         BoundFromItem::CTE(cte_ref) => {

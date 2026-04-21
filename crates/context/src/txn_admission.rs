@@ -251,6 +251,7 @@ fn describe_object(target: &DdlObjectKey) -> String {
         DdlObjectKind::View => format!("view \"{}.{}\"", schema, target.name),
         DdlObjectKind::Index => format!("index \"{}.{}\"", schema, target.name),
         DdlObjectKind::Sequence => format!("sequence \"{}.{}\"", schema, target.name),
+        DdlObjectKind::Routine => format!("routine \"{}.{}\"", schema, target.name),
         DdlObjectKind::PropertyGraph => format!("property graph \"{}.{}\"", schema, target.name),
         DdlObjectKind::Database => format!("database \"{}\"", target.name),
     }

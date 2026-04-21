@@ -249,6 +249,8 @@ pub enum OperatorResultType {
 pub enum OperatorFinalizeResultType {
     /// Have more output to produce.
     HaveMoreOutput,
+    /// Finalization is currently blocked.
+    Blocked,
     /// Finalization is finished.
     Finished,
 }
@@ -937,6 +939,10 @@ mod tests {
         );
         assert_ne!(
             OperatorFinalizeResultType::HaveMoreOutput,
+            OperatorFinalizeResultType::Blocked
+        );
+        assert_ne!(
+            OperatorFinalizeResultType::Blocked,
             OperatorFinalizeResultType::Finished
         );
     }

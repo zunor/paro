@@ -36,6 +36,14 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
                 verify_expression(expr)?;
             }
         }
+        LogicalOperator::ExternalProject(project) => {
+            for expr in &project.expressions {
+                verify_expression(&expr.expression)?;
+            }
+        }
+        LogicalOperator::ExternalTable(table) => {
+            verify_expression(&table.call_expression)?;
+        }
         LogicalOperator::Limit(limit) => {
             if let Some(expr) = &limit.limit {
                 verify_expression(expr)?;

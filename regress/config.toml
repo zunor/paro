@@ -9,3 +9,21 @@ float_precision = 6
 write_actual = true
 update = false
 jobs = 1
+
+[runtime_profiles.default]
+
+[runtime_profiles.python_disabled.env]
+PARO_PYTHON_RUNTIME_DISABLED = "1"
+
+[runtime_profiles.python_binary_missing.env]
+PARO_PYTHON_BIN = "__paro_missing_python__"
+
+[runtime_profiles.python_misconfigured.env]
+PARO_PYTHON_BIN = "fixtures/python_udf/bin/python_misconfigured.py"
+
+[runtime_profiles.python_worker_crash.env]
+PARO_PYTHON_BIN = "fixtures/python_udf/bin/python_probe_only.py"
+
+[runtime_profiles.auth_matrix.env]
+PARO_CREATE_ROUTINE_USERS = "paro,routine_builder"
+PARO_CREATE_ELEVATED_ROUTINE_USERS = "paro"

@@ -245,6 +245,25 @@ impl RewriteCorrelatedExpressions {
                 proj.child = Box::new(self.rewrite_logical_plan(*proj.child));
                 LogicalOperator::Projection(proj)
             }
+            LogicalOperator::ExternalProject(mut project) => {
+                project.expressions = project
+                    .expressions
+                    .into_iter()
+                    .map(|mut expr| {
+                        expr.expression = self.rewrite_expression(expr.expression);
+                        expr
+                    })
+                    .collect();
+                project.child = Box::new(self.rewrite_logical_plan(*project.child));
+                LogicalOperator::ExternalProject(project)
+            }
+            LogicalOperator::ExternalTable(mut table) => {
+                table.call_expression = self.rewrite_expression(table.call_expression);
+                table.child = table
+                    .child
+                    .map(|child| Box::new(self.rewrite_logical_plan(*child)));
+                LogicalOperator::ExternalTable(table)
+            }
             LogicalOperator::Aggregate(mut agg) => {
                 agg.groups = agg
                     .groups
@@ -394,6 +413,7 @@ impl RewriteCorrelatedExpressions {
             | LogicalOperator::ExpressionGet(_)
             | LogicalOperator::DelimGet(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSchema(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateIndex(_)

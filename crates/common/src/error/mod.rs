@@ -54,6 +54,7 @@ pub mod codes;
 mod make_catalog;
 mod make_constraint;
 mod make_data;
+mod make_external_routine;
 mod make_internal;
 mod make_resource;
 mod make_syntax;
@@ -107,6 +108,16 @@ pub use make_data::out_of_range;
 pub use make_data::overflow;
 pub use make_data::sequence_generator_error;
 pub use make_data::string_too_long;
+
+// External routine errors
+pub use make_external_routine::artifact_not_ready;
+pub use make_external_routine::contract_violation;
+pub use make_external_routine::epoch_mismatch;
+pub use make_external_routine::external_protocol_mismatch;
+pub use make_external_routine::python_exception;
+pub use make_external_routine::python_runtime_unavailable;
+pub use make_external_routine::sandbox_violation;
+pub use make_external_routine::worker_failure;
 
 // Constraint violations
 pub use make_constraint::check_violation;

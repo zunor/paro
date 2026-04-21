@@ -967,6 +967,72 @@ impl DependentJoinFlattener {
                     visible_columns: Self::all_columns_visible(original_projection_count),
                 })
             }
+            LogicalOperator::ExternalProject(mut project) => {
+                let PushDownResult {
+                    plan: child,
+                    base_binding,
+                    visible_columns,
+                } =
+                    self.push_down_dependent_join_internal(binder, *project.child, lateral_depth)?;
+                let rewriter = RewriteCorrelatedExpressions::new_recursive(
+                    base_binding,
+                    correlated_map.clone(),
+                    lateral_depth,
+                );
+                project.expressions = project
+                    .expressions
+                    .into_iter()
+                    .map(|mut expr| {
+                        expr.expression = rewriter.rewrite_expression(expr.expression);
+                        expr
+                    })
+                    .collect();
+                project.child = Box::new(child);
+                Ok(PushDownResult {
+                    plan: LogicalPlan {
+                        id,
+                        stats,
+                        operator: LogicalOperator::ExternalProject(project),
+                    },
+                    base_binding,
+                    visible_columns,
+                })
+            }
+            LogicalOperator::ExternalTable(mut table) => {
+                if let Some(child) = table.child.take() {
+                    let PushDownResult {
+                        plan: child,
+                        base_binding,
+                        visible_columns,
+                    } = self.push_down_dependent_join_internal(binder, *child, lateral_depth)?;
+                    let rewriter = RewriteCorrelatedExpressions::new_recursive(
+                        base_binding,
+                        correlated_map.clone(),
+                        lateral_depth,
+                    );
+                    table.call_expression = rewriter.rewrite_expression(table.call_expression);
+                    table.child = Some(Box::new(child));
+                    Ok(PushDownResult {
+                        plan: LogicalPlan {
+                            id,
+                            stats,
+                            operator: LogicalOperator::ExternalTable(table),
+                        },
+                        base_binding,
+                        visible_columns,
+                    })
+                } else {
+                    Ok(PushDownResult {
+                        plan: LogicalPlan {
+                            id,
+                            stats,
+                            operator: LogicalOperator::ExternalTable(table),
+                        },
+                        base_binding: ColumnBinding::new(0, 0),
+                        visible_columns: Self::all_columns_visible(0),
+                    })
+                }
+            }
             LogicalOperator::Aggregate(mut agg) => {
                 let PushDownResult {
                     plan: child,
@@ -1595,6 +1661,7 @@ impl DependentJoinFlattener {
             }
             other @ (LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
             | LogicalOperator::CreateIndex(_)

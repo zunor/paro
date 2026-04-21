@@ -11,6 +11,7 @@ use crate::expression::Expression;
 use paro_catalog::entry::{PropertyGraphCatalogEntry, TableCatalogEntry};
 use paro_common::types::LogicalType;
 use paro_parser::ast::PathMode;
+use paro_routine::BoundRoutineCallMeta;
 
 use super::query::BoundQuery;
 
@@ -20,6 +21,7 @@ pub enum BoundFromItem {
     Join(BoundJoin),
     Subquery(BoundFromSubquery),
     TableFunction(BoundTableFunction),
+    ExternalRoutine(BoundExternalRoutine),
     CTE(BoundFromCTE),
     GraphTable(BoundFromGraphTable),
 }
@@ -129,4 +131,17 @@ pub struct BoundTableFunction {
     pub is_in_out_function: bool,
     pub child_table: Option<Box<BoundFromItem>>,
     pub with_ordinality: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundExternalRoutine {
+    pub alias: String,
+    pub column_names: Vec<String>,
+    pub column_types: Vec<LogicalType>,
+    pub table_index: usize,
+    pub call_expression: Expression,
+    pub bound_arguments: Vec<Expression>,
+    pub call: BoundRoutineCallMeta,
+    pub lateral: bool,
+    pub correlated_columns: Vec<CorrelatedColumnInfo>,
 }

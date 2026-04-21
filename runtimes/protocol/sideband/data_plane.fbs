@@ -1,0 +1,56 @@
+namespace paro.protocol.sideband;
+
+table BufferLease {
+  buffer_index:ushort;
+  offset:ulong;
+  len:ulong;
+  alignment:uint;
+  generation:ulong;
+  device:string;
+}
+
+table ScalarValueRef {
+  kind:string;
+  string_value:string;
+  signed_value:long;
+  unsigned_value:ulong;
+}
+
+table ColumnLayout {
+  layout_kind:string;
+  values:BufferLease;
+  offsets:BufferLease;
+  data:BufferLease;
+  indices:BufferLease;
+  offset_width:string;
+  stride:uint;
+  start:long;
+  step:long;
+  constant_value:ScalarValueRef;
+}
+
+table ColumnDescriptor {
+  name:string;
+  logical_type:string;
+  encoding:string;
+  population_mode:string;
+  nullable:bool;
+  validity:BufferLease;
+  layout:ColumnLayout;
+  children:[ColumnDescriptor];
+}
+
+table ColumnBatchLease {
+  version:ushort;
+  lease_id:ulong;
+  row_count:uint;
+  state:string;
+  owner_worker_epoch:ulong;
+  owner_host_epoch:ulong;
+  owner_query_epoch:ulong;
+  completion_fence:ulong;
+  payload_checksum:uint;
+  columns:[ColumnDescriptor];
+}
+
+root_type ColumnBatchLease;

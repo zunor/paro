@@ -5,6 +5,7 @@ mod alter;
 mod codec;
 mod graph;
 mod index;
+mod routine;
 mod schema;
 mod sequence;
 mod table;
@@ -29,14 +30,16 @@ pub(super) fn catalog_apply_phase(change: &DdlChangeRecord) -> CatalogApplyPhase
         | DdlChange::CreateView(_)
         | DdlChange::CreateIndex(_)
         | DdlChange::CreatePropertyGraph(_)
-        | DdlChange::CreateSequence(_) => CatalogApplyPhase::Create,
+        | DdlChange::CreateSequence(_)
+        | DdlChange::CreateRoutine(_) => CatalogApplyPhase::Create,
         DdlChange::AlterEntry(_) => CatalogApplyPhase::Alter,
         DdlChange::DropSchema(_)
         | DdlChange::DropTable(_)
         | DdlChange::DropView(_)
         | DdlChange::DropIndex(_)
         | DdlChange::DropPropertyGraph(_)
-        | DdlChange::DropSequence(_) => CatalogApplyPhase::Drop,
+        | DdlChange::DropSequence(_)
+        | DdlChange::DropRoutine(_) => CatalogApplyPhase::Drop,
     }
 }
 
@@ -152,11 +155,23 @@ impl<'a> CatalogReplayHandler<'a> {
                 })?;
                 self.replay_create_sequence(schema_name, &op.change.key.name, payload, commit_id)
             }
+            DdlChange::CreateRoutine(payload) => {
+                let schema_name = op.change.key.schema.as_deref().ok_or_else(|| {
+                    paro_error::serialization_error("catalog txn CREATE FUNCTION missing schema")
+                })?;
+                self.replay_create_routine(schema_name, &op.change.key.name, payload, commit_id)
+            }
             DdlChange::DropSequence(_) => {
                 let schema_name = op.change.key.schema.as_deref().ok_or_else(|| {
                     paro_error::serialization_error("catalog txn DROP SEQUENCE missing schema")
                 })?;
                 self.replay_drop_sequence(schema_name, &op.change.key.name, commit_id)
+            }
+            DdlChange::DropRoutine(payload) => {
+                let schema_name = op.change.key.schema.as_deref().ok_or_else(|| {
+                    paro_error::serialization_error("catalog txn DROP FUNCTION missing schema")
+                })?;
+                self.replay_drop_routine(schema_name, &op.change.key.name, payload, commit_id)
             }
             DdlChange::AlterEntry(payload) => self.replay_alter_entry(&payload.sql, commit_id),
         }

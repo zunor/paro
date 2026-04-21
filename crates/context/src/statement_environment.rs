@@ -8,6 +8,8 @@ pub struct StatementAuthContext {
     pub active_role: Option<String>,
     pub tenant: Option<String>,
     pub authenticated_user: Option<String>,
+    pub can_create_routine: bool,
+    pub can_create_elevated_routine: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

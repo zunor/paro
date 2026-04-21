@@ -1,0 +1,12 @@
+[package]
+name = "paro-routine"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "paro_routine"
+path = "src/lib.rs"
+
+[dependencies]
+paro-common = { workspace = true }
+serde = { workspace = true }

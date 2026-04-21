@@ -88,13 +88,17 @@ check-parallel: ## Run with --jobs (JOBS=N, default 4)
 	$(RUNNER) --jobs $(JOBS)
 
 ci: ## CI mode: compare-only, emit *.result.actual
+ifdef FILE
+	PARO_UPDATE=0 PARO_WRITE_ACTUAL=1 $(RUNNER) --verbose --filter "$(FILE)"
+else
 	PARO_UPDATE=0 PARO_WRITE_ACTUAL=1 $(RUNNER) --verbose
+endif
 
 # ── Unit Tests ───────────────────────────────────────────────
 .PHONY: unit
 
 unit: ## Run harness unit tests
-	$(PYTHON) -m unittest discover -s unit -p 'test_*.py' -v
+	$(PYTHON) -m pytest unit -q
 
 # ── Utilities ────────────────────────────────────────────────
 .PHONY: ping clean help

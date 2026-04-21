@@ -40,6 +40,14 @@ pub enum PhysicalOperatorType {
     Filter,
     /// PROJECTION (SELECT columns)
     Projection,
+    /// External row-preserving routine projection
+    ExternalProject,
+    /// External relation-expanding routine breaker
+    ExternalTable,
+    /// Reserved external aggregate path
+    ExternalAggregate,
+    /// Reserved external window path
+    ExternalWindow,
 
     // ========== Scans ==========
     /// Rowset scan (Paro storage engine)
@@ -115,6 +123,8 @@ pub enum PhysicalOperatorType {
     CreateTableAs,
     /// CREATE INDEX
     CreateIndex,
+    /// CREATE FUNCTION
+    CreateRoutine,
     /// ALTER
     Alter,
     /// CREATE SEQUENCE
@@ -173,6 +183,10 @@ impl PhysicalOperatorType {
             Self::PerfectHashGroupBy => "PERFECT_HASH_GROUP_BY",
             Self::Filter => "FILTER",
             Self::Projection => "PROJECTION",
+            Self::ExternalProject => "EXTERNAL_PROJECT",
+            Self::ExternalTable => "EXTERNAL_TABLE",
+            Self::ExternalAggregate => "EXTERNAL_AGGREGATE",
+            Self::ExternalWindow => "EXTERNAL_WINDOW",
             Self::RowsetScan => "ROWSET_SCAN",
             Self::VectorScan => "VECTOR_SCAN",
             Self::SparseVectorScan => "SPARSE_VECTOR_SCAN",
@@ -206,6 +220,7 @@ impl PhysicalOperatorType {
             Self::CreateTable => "CREATE_TABLE",
             Self::CreateTableAs => "CREATE_TABLE_AS",
             Self::CreateIndex => "CREATE_INDEX",
+            Self::CreateRoutine => "CREATE_ROUTINE",
             Self::Alter => "ALTER",
             Self::CreateSequence => "CREATE_SEQUENCE",
             Self::CreateView => "CREATE_VIEW",
@@ -247,10 +262,12 @@ impl PhysicalOperatorType {
                 | Self::Alter
                 | Self::CreateSequence
                 | Self::CreateSchema
+                | Self::CreateRoutine
                 | Self::CreatePropertyGraph
                 | Self::DropPropertyGraph
                 | Self::RefreshPropertyGraph
                 | Self::GraphScan
+                | Self::ExternalTable
                 | Self::EmptyResult
         )
     }
@@ -267,6 +284,7 @@ impl PhysicalOperatorType {
                 | Self::CreateTableAs
                 | Self::CreateIndex
                 | Self::CreateView
+                | Self::CreateRoutine
                 | Self::Drop
                 | Self::OrderBy
                 | Self::TopN
@@ -278,6 +296,7 @@ impl PhysicalOperatorType {
                 | Self::LeftDelimJoin
                 | Self::RightDelimJoin
                 | Self::Window
+                | Self::ExternalTable
                 | Self::Cte
                 | Self::RecursiveCte
         )

@@ -12,8 +12,9 @@ pub use cte::{
     CTEBindInfo, CTEBindState, CTEBindStatus, CTEMaterialize, RecursiveCTE, WithCTE, CTE,
 };
 pub use from::{
-    BoundBaseTable, BoundFromCTE, BoundFromGraphTable, BoundFromItem, BoundFromSubquery,
-    BoundGraphColumn, BoundGraphPattern, BoundJoin, BoundTableFunction, JoinType,
+    BoundBaseTable, BoundExternalRoutine, BoundFromCTE, BoundFromGraphTable, BoundFromItem,
+    BoundFromSubquery, BoundGraphColumn, BoundGraphPattern, BoundJoin, BoundTableFunction,
+    JoinType,
 };
 pub use query::{
     BoundQuery, BoundSelect, BoundSetOperation, BoundValues, DistinctModifier, DistinctType,

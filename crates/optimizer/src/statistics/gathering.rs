@@ -59,6 +59,12 @@ impl StatisticsGathering {
             LogicalOperator::DelimGet(_) => Some(CardinalityEstimate::exact(1)),
             LogicalOperator::TableFunctionGet(_) => Some(CardinalityEstimate::exact(100)),
             LogicalOperator::Projection(proj) => proj.child.stats.estimated_cardinality,
+            LogicalOperator::ExternalProject(project) => project.child.stats.estimated_cardinality,
+            LogicalOperator::ExternalTable(table) => table
+                .child
+                .as_ref()
+                .and_then(|child| child.stats.estimated_cardinality)
+                .or(Some(CardinalityEstimate::exact(100))),
             LogicalOperator::Order(order) => order.child.stats.estimated_cardinality,
             LogicalOperator::Window(window) => window.child.stats.estimated_cardinality,
             LogicalOperator::Distinct(distinct) => {
@@ -186,6 +192,7 @@ impl StatisticsGathering {
             LogicalOperator::CopyTo(_) => Some(CardinalityEstimate::exact(1)),
             LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
             | LogicalOperator::CreateIndex(_)
@@ -381,6 +388,17 @@ impl StatisticsGathering {
                 .iter()
                 .map(|expr| expression_statistics(expr, ctx))
                 .collect(),
+            LogicalOperator::ExternalProject(project) => {
+                let mut stats = collect_output_stats(project.child.as_ref(), ctx);
+                stats.extend(
+                    project
+                        .expressions
+                        .iter()
+                        .map(|expr| expression_statistics(&expr.expression, ctx)),
+                );
+                stats
+            }
+            LogicalOperator::ExternalTable(table) => unknown_stats_for_types(&table.returned_types),
             LogicalOperator::Aggregate(agg) => {
                 let mut stats = Vec::new();
                 stats.extend(

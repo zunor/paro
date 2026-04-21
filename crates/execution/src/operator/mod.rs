@@ -5,6 +5,7 @@
 
 pub mod aggregate;
 pub mod ddl;
+pub mod external;
 pub mod filter;
 pub mod graph;
 pub mod helper;
@@ -343,6 +344,9 @@ pub trait PhysicalOperator: Send + Sync + fmt::Debug {
     }
 
     /// Final execute to flush cached results.
+    ///
+    /// Row-producing finalize can now return `Blocked` when the operator needs
+    /// to suspend an asynchronous tail flush and resume later.
     fn final_execute(
         &self,
         _ctx: &ExecutionContext,

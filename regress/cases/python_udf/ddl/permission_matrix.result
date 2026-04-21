@@ -1,0 +1,69 @@
+DROP FUNCTION IF EXISTS py_builder_ok(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_builder_definer(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_builder_trusted(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_reader_denied(INTEGER);
+DROP FUNCTION
+
+SELECT current_user();
+current_user()
+paro
+
+SELECT current_user();
+current_user()
+routine_builder
+
+CREATE FUNCTION py_builder_ok(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value + 10 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_builder_ok(1);
+py_builder_ok(1)
+11
+
+CREATE FUNCTION py_builder_definer(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+SECURITY DEFINER
+AS $$return [value for value in a.materialize_py()]$$;
+ERROR: SECURITY DEFINER routine creation requires elevated routine privilege (SQLSTATE=42501)
+
+CREATE FUNCTION py_builder_trusted(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+CAPABILITY PROFILE trusted_subinterpreter
+AS $$return [value for value in a.materialize_py()]$$;
+ERROR: capability profile override requires elevated routine privilege (SQLSTATE=42501)
+
+SELECT current_user();
+current_user()
+alice
+
+CREATE FUNCTION py_reader_denied(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value for value in a.materialize_py()]$$;
+ERROR: CREATE FUNCTION ... LANGUAGE python requires CREATE ROUTINE privilege (SQLSTATE=42501)
+
+SELECT py_builder_ok(1);
+py_builder_ok(1)
+11
+
+SELECT current_user();
+current_user()
+paro
+
+DROP FUNCTION py_builder_ok(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_builder_definer(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_builder_trusted(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_reader_denied(INTEGER);
+DROP FUNCTION

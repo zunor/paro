@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import argparse
 import logging
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -31,6 +32,7 @@ _STATUS_PASS = "PASS"
 _STATUS_FAIL = "FAIL"
 _STATUS_SKIP = "SKIP"
 _STATUS_NEW = "NEW"
+_FIXTURE_TOKEN_RE = re.compile(r"\{\{\s*fixture:([^}]+?)\s*\}\}")
 
 
 def _is_color_enabled() -> bool:
@@ -51,6 +53,22 @@ class RunnerError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ConnectionTarget:
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+
+
+@dataclass(frozen=True)
+class RuntimeProfile:
+    name: str
+    env: Mapping[str, str]
+    unset: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RunnerConfig:
     host: str
     port: int
@@ -66,6 +84,8 @@ class RunnerConfig:
     config_path: Path
     root_dir: Path
     report_dir: Path
+    runtime_profiles: Mapping[str, RuntimeProfile]
+    managed_runtime_env: tuple[str, ...]
 
     @property
     def cases_dir(self) -> Path:
@@ -86,6 +106,24 @@ class RunnerConfig:
     @property
     def actuals_dir(self) -> Path:
         return self.report_dir / "actuals"
+
+    @property
+    def fixtures_dir(self) -> Path:
+        return self.root_dir / "fixtures"
+
+    @property
+    def staged_fixtures_dir(self) -> Path:
+        return self.report_dir / "fixtures"
+
+    @property
+    def default_connection(self) -> ConnectionTarget:
+        return ConnectionTarget(
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+        )
 
 
 @dataclass(frozen=True)
@@ -221,9 +259,14 @@ def resolve_config(
 
     config_path = args.config if args.config is not None else root / "config.toml"
     config_data = _load_toml(config_path)
+    config_dir = config_path.parent
 
     connection = _get_table(config_data, "connection")
     test = _get_table(config_data, "test")
+    runtime_profiles, managed_runtime_env = _parse_runtime_profiles(
+        config_data,
+        config_dir=config_dir,
+    )
 
     host = _as_str(connection.get("host", "127.0.0.1"), field="connection.host")
     port = _as_int(connection.get("port", 6432), field="connection.port")
@@ -295,7 +338,69 @@ def resolve_config(
         config_path=config_path,
         root_dir=root,
         report_dir=report_dir,
+        runtime_profiles=runtime_profiles,
+        managed_runtime_env=managed_runtime_env,
     )
+
+
+def _parse_runtime_profiles(
+    config_data: Mapping[str, Any],
+    *,
+    config_dir: Path,
+) -> tuple[dict[str, RuntimeProfile], tuple[str, ...]]:
+    runtime_profiles_data = _get_optional_table(config_data, "runtime_profiles")
+    runtime_profiles: dict[str, RuntimeProfile] = {
+        "default": RuntimeProfile(name="default", env={}, unset=())
+    }
+    managed_env: list[str] = []
+
+    for profile_name, raw_profile in runtime_profiles_data.items():
+        if not isinstance(raw_profile, dict):
+            raise RunnerError(
+                f"[runtime_profiles.{profile_name}] must be a table"
+            )
+
+        env_table = _get_optional_table(raw_profile, "env")
+        env_map: dict[str, str] = {}
+        for key, value in env_table.items():
+            env_value = _as_str(
+                value,
+                field=f"runtime_profiles.{profile_name}.env.{key}",
+            )
+            env_map[key] = _resolve_runtime_profile_value(env_value, config_dir=config_dir)
+            if key not in managed_env:
+                managed_env.append(key)
+
+        unset_values = raw_profile.get("unset", [])
+        if not isinstance(unset_values, list) or any(
+            not isinstance(value, str) for value in unset_values
+        ):
+            raise RunnerError(
+                f"runtime_profiles.{profile_name}.unset must be an array of strings"
+            )
+
+        unset = tuple(unset_values)
+        for key in unset:
+            if key not in managed_env:
+                managed_env.append(key)
+
+        runtime_profiles[profile_name] = RuntimeProfile(
+            name=profile_name,
+            env=env_map,
+            unset=unset,
+        )
+
+    return runtime_profiles, tuple(managed_env)
+
+
+def _resolve_runtime_profile_value(value: str, *, config_dir: Path) -> str:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate.as_posix()
+    resolved = (config_dir / candidate).resolve()
+    if resolved.exists():
+        return resolved.as_posix()
+    return value
 
 
 def discover_case_files(cases_dir: Path, filter_pattern: str | None = None) -> list[Path]:
@@ -318,6 +423,7 @@ def prepare_report_dir(report_dir: Path):
         shutil.rmtree(report_dir)
     report_dir.mkdir(parents=True)
     (report_dir / "actuals").mkdir()
+    (report_dir / "fixtures").mkdir()
 
 
 def setup_logging(log_path: Path, verbose: bool):
@@ -341,6 +447,7 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
 
     try:
         blocks = parse_sql_file(case_path)
+        blocks = _prepare_case_blocks(case_path, blocks, config)
         stats.total = len([b for b in blocks if b.kind in ("query", "statement")]) # Simplified count
 
         execution = execute_blocks(
@@ -422,6 +529,80 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
             detail=str(exc),
             error_info=error_info
         ), stats
+
+
+def _prepare_case_blocks(case_path: Path, blocks: List[Any], config: RunnerConfig) -> List[Any]:
+    staged_fixtures = _stage_case_fixtures(case_path, blocks, config)
+    if not staged_fixtures:
+        return list(blocks)
+
+    prepared_blocks = []
+    for block in blocks:
+        sql = _substitute_fixture_tokens(
+            block.sql,
+            staged_fixtures,
+            case_path=case_path,
+            line_no=block.line_no,
+        )
+        if sql == block.sql:
+            prepared_blocks.append(block)
+        else:
+            prepared_blocks.append(replace(block, sql=sql))
+    return prepared_blocks
+
+
+def _stage_case_fixtures(
+    case_path: Path,
+    blocks: Iterable[Any],
+    config: RunnerConfig,
+) -> dict[str, Path]:
+    fixture_refs = []
+    for block in blocks:
+        for fixture_ref in getattr(block, "fixture_refs", ()):
+            if fixture_ref not in fixture_refs:
+                fixture_refs.append(fixture_ref)
+
+    if not fixture_refs:
+        return {}
+
+    case_stage_root = config.staged_fixtures_dir / case_path.relative_to(config.cases_dir).with_suffix("")
+    staged_paths: dict[str, Path] = {}
+    for fixture_ref in fixture_refs:
+        source = config.fixtures_dir / fixture_ref
+        if not source.exists():
+            raise ExecutionError(
+                f"fixture '{fixture_ref}' declared by {case_path.relative_to(config.root_dir).as_posix()} "
+                f"does not exist under {config.fixtures_dir.as_posix()}"
+            )
+
+        destination = case_stage_root / fixture_ref
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, destination)
+        staged_paths[fixture_ref] = destination
+    return staged_paths
+
+
+def _substitute_fixture_tokens(
+    sql: str,
+    staged_fixtures: Mapping[str, Path],
+    *,
+    case_path: Path,
+    line_no: int,
+) -> str:
+    def replace_token(match: re.Match[str]) -> str:
+        fixture_ref = match.group(1).strip()
+        staged_path = staged_fixtures.get(fixture_ref)
+        if staged_path is None:
+            raise ExecutionError(
+                f"fixture token '{fixture_ref}' at line {line_no} in "
+                f"{case_path.as_posix()} was not staged"
+            )
+        return staged_path.as_posix()
+
+    return _FIXTURE_TOKEN_RE.sub(replace_token, sql)
 
 
 def run_cases(conn: Any, case_files: Iterable[Path], config: RunnerConfig, reporter: Reporter) -> list[CaseOutcome]:
@@ -513,20 +694,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-def _open_connection(config: RunnerConfig) -> Any:
+def _open_connection(
+    config: RunnerConfig,
+    target: ConnectionTarget | None = None,
+) -> Any:
     psycopg = _import_psycopg()
+    connection = target or config.default_connection
     try:
         conn = psycopg.connect(
-            host=config.host,
-            port=config.port,
-            dbname=config.database,
-            user=config.user,
-            password=config.password,
+            host=connection.host,
+            port=connection.port,
+            dbname=connection.database,
+            user=connection.user,
+            password=connection.password,
         )
     except Exception as exc:  # pragma: no cover - depends on runtime DB environment.
         raise RunnerError(
             "failed to connect to Paro server "
-            f"({config.host}:{config.port}/{config.database}): {exc}"
+            f"({connection.host}:{connection.port}/{connection.database} as {connection.user}): {exc}"
         ) from exc
 
     conn.autocommit = True
@@ -535,19 +720,28 @@ def _open_connection(config: RunnerConfig) -> Any:
 
 def _handle_control_block(conn: Any, block: Any, config: RunnerConfig) -> Any:
     action = (block.control_action or "").lower()
+    options = _parse_control_options(block)
     if action == "restart":
-        return _restart_server(conn, config)
+        return _restart_server(conn, config, options=options)
+    if action == "connect":
+        return _reconnect(conn, config, options=options)
     raise ExecutionError(
         f"unsupported control action at line {block.line_no}: {block.control_action}"
     )
 
 
-def _restart_server(conn: Any, config: RunnerConfig) -> Any:
+def _restart_server(conn: Any, config: RunnerConfig, *, options: Mapping[str, str]) -> Any:
     if config.host not in {"localhost", "127.0.0.1"}:
         raise ExecutionError(
             f"restart control only supports local Paro servers, got host={config.host!r}"
         )
 
+    profile_name = options.get("profile", "default")
+    profile = config.runtime_profiles.get(profile_name)
+    if profile is None:
+        raise ExecutionError(f"unknown runtime profile: {profile_name}")
+
+    connection = _connection_target_from_active(conn, config)
     listener_pid = _discover_listener_pid(config.port)
     command = _discover_process_command(listener_pid)
 
@@ -561,25 +755,114 @@ def _restart_server(conn: Any, config: RunnerConfig) -> Any:
     _wait_for_port_state(config.port, listening=False, timeout_seconds=10.0)
 
     log_handle = config.log_path.open("a", encoding="utf-8")
-    process = subprocess.Popen(
-        shlex.split(command),
-        cwd=config.root_dir.parent,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    try:
+        process = subprocess.Popen(
+            shlex.split(command),
+            cwd=config.root_dir.parent,
+            env=_build_runtime_profile_env(config, profile),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        log_handle.close()
     logging.info("Restarted Paro listener pid=%s with command=%s", process.pid, command)
 
     deadline = time.time() + 15.0
     last_error: Exception | None = None
     while time.time() < deadline:
         try:
-            return _open_connection(config)
+            return _open_connection(config, connection)
         except Exception as exc:  # pragma: no cover - depends on runtime DB environment.
             last_error = exc
             time.sleep(0.2)
 
     raise ExecutionError(f"failed to reconnect after restart: {last_error}")
+
+
+def _reconnect(conn: Any, config: RunnerConfig, *, options: Mapping[str, str]) -> Any:
+    try:
+        current = _connection_target_from_active(conn, config)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    target = ConnectionTarget(
+        host=options.get("host", current.host),
+        port=_parse_control_port(options.get("port", str(current.port))),
+        database=options.get("database", current.database),
+        user=options.get("user", current.user),
+        password=options.get("password", current.password),
+    )
+    return _open_connection(config, target)
+
+
+def _parse_control_options(block: Any) -> dict[str, str]:
+    options: dict[str, str] = {}
+    for raw_arg in getattr(block, "control_args", ()):
+        if "=" not in raw_arg:
+            raise ExecutionError(
+                f"control argument '{raw_arg}' at line {block.line_no} must use key=value syntax"
+            )
+        key, value = raw_arg.split("=", 1)
+        key = key.strip().lower()
+        if not key:
+            raise ExecutionError(
+                f"control argument '{raw_arg}' at line {block.line_no} is missing a key"
+            )
+        options[key] = value
+    return options
+
+
+def _connection_target_from_active(conn: Any, config: RunnerConfig) -> ConnectionTarget:
+    info = getattr(conn, "info", None)
+    host = _first_non_empty(getattr(info, "host", None), config.host)
+    database = _first_non_empty(getattr(info, "dbname", None), config.database)
+    user = _first_non_empty(getattr(info, "user", None), config.user)
+    port_value = getattr(info, "port", None)
+    try:
+        port = int(port_value) if port_value not in (None, "") else config.port
+    except (TypeError, ValueError):
+        port = config.port
+    return ConnectionTarget(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=config.password,
+    )
+
+
+def _build_runtime_profile_env(
+    config: RunnerConfig,
+    profile: RuntimeProfile,
+) -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in config.managed_runtime_env:
+        environment.pop(key, None)
+    for key in profile.unset:
+        environment.pop(key, None)
+    environment.update(profile.env)
+    return environment
+
+
+def _first_non_empty(value: Any, fallback: str) -> str:
+    if value is None:
+        return fallback
+    text = str(value)
+    return text if text else fallback
+
+
+def _parse_control_port(raw_port: str) -> int:
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise ExecutionError(f"invalid control port value: {raw_port!r}") from exc
+    if port <= 0:
+        raise ExecutionError(f"invalid control port value: {raw_port!r}")
+    return port
 
 
 def _discover_listener_pid(port: int) -> int:
@@ -613,9 +896,14 @@ def _discover_process_command(pid: int) -> str:
 def _wait_for_process_exit(pid: int, *, timeout_seconds: float) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        status = result.stdout.strip()
+        if result.returncode != 0 or not status or status.startswith("Z"):
             return
         time.sleep(0.1)
     raise ExecutionError(f"timed out waiting for pid {pid} to exit")
@@ -732,6 +1020,15 @@ def _get_table(data: Mapping[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key, {})
     if not isinstance(value, dict):
         raise RunnerError(f"config section [{key}] must be a table")
+    return value
+
+
+def _get_optional_table(data: Mapping[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RunnerError(f"{key} must be a table")
     return value
 
 

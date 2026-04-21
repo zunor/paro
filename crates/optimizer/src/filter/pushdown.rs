@@ -345,10 +345,11 @@ impl FilterPushdown {
     }
 
     /// Check if a filter is volatile through a projection.
-    fn is_volatile_through_projection(_proj: &Projection, _expr: &Expression) -> bool {
-        // Projection pushdown currently treats expressions as non-volatile until
-        // the planner exposes volatility metadata.
-        false
+    fn is_volatile_through_projection(proj: &Projection, expr: &Expression) -> bool {
+        if expr.contains_external_routine() {
+            return true;
+        }
+        projection_reference_crosses_execution_boundary(proj, expr)
     }
 
     /// Replace projection bindings in an expression.
@@ -892,6 +893,77 @@ impl FilterPushdown {
 
         let result = LogicalOperator::SetOperation(setop);
         self.push_final_filters(result)
+    }
+}
+
+fn projection_reference_crosses_execution_boundary(proj: &Projection, expr: &Expression) -> bool {
+    match expr {
+        Expression::ColumnRef(col) => {
+            col.binding.table_index == proj.table_index
+                && proj
+                    .expressions
+                    .get(col.binding.column_index)
+                    .is_some_and(Expression::contains_external_routine)
+        }
+        Expression::Function(func) => func
+            .children
+            .iter()
+            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
+        Expression::Cast(cast) => {
+            projection_reference_crosses_execution_boundary(proj, cast.child.as_ref())
+        }
+        Expression::Comparison(comp) => {
+            projection_reference_crosses_execution_boundary(proj, comp.left.as_ref())
+                || projection_reference_crosses_execution_boundary(proj, comp.right.as_ref())
+        }
+        Expression::Conjunction(conj) => conj
+            .children
+            .iter()
+            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
+        Expression::Operator(op) => op
+            .children
+            .iter()
+            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
+        Expression::Case(case) => {
+            projection_reference_crosses_execution_boundary(proj, case.check.as_ref())
+                || projection_reference_crosses_execution_boundary(
+                    proj,
+                    case.result_if_true.as_ref(),
+                )
+                || projection_reference_crosses_execution_boundary(
+                    proj,
+                    case.result_if_false.as_ref(),
+                )
+        }
+        Expression::Aggregate(agg) => {
+            agg.children
+                .iter()
+                .any(|child| projection_reference_crosses_execution_boundary(proj, child))
+                || agg.filter.as_ref().is_some_and(|filter| {
+                    projection_reference_crosses_execution_boundary(proj, filter.as_ref())
+                })
+                || agg.order_bys.iter().any(|order| {
+                    projection_reference_crosses_execution_boundary(proj, &order.expression)
+                })
+        }
+        Expression::Window(window) => {
+            window
+                .children
+                .iter()
+                .any(|child| projection_reference_crosses_execution_boundary(proj, child))
+                || window
+                    .partitions
+                    .iter()
+                    .any(|part| projection_reference_crosses_execution_boundary(proj, part))
+                || window.orders.iter().any(|order| {
+                    projection_reference_crosses_execution_boundary(proj, &order.expression)
+                })
+        }
+        Expression::Subquery(subquery) => subquery
+            .children
+            .iter()
+            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
+        Expression::Constant(_) | Expression::Reference(_) => false,
     }
 }
 

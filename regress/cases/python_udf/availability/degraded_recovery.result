@@ -1,0 +1,28 @@
+DROP FUNCTION IF EXISTS py_degraded_probe(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_degraded_probe(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value + 4 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_degraded_probe(1);
+py_degraded_probe(1)
+5
+
+SELECT py_degraded_probe(1);
+ERROR: python worker closed stdout unexpectedly (status: Some(ExitStatus(unix_wait_status(24832)))) (SQLSTATE=XX000)
+
+SELECT py_degraded_probe(1);
+ERROR: Python runtime is degraded and unavailable for external routine execution: python worker closed stdout unexpectedly (status: Some(ExitStatus(unix_wait_status(24832)))) (SQLSTATE=XX000)
+
+SELECT 6 * 7;
+6 * 7
+42
+
+SELECT py_degraded_probe(1);
+py_degraded_probe(1)
+5
+
+DROP FUNCTION py_degraded_probe(INTEGER);
+DROP FUNCTION

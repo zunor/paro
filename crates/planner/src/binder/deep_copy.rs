@@ -232,6 +232,37 @@ impl LogicalPlanDeepCopy {
                     child: Box::new(child),
                 })
             }
+            LogicalOperator::ExternalProject(p) => {
+                let child = self.copy_plan(p.child.as_ref(), bind_shared);
+                let mut project_index = p.project_index;
+                self.remap_table_index(bind_shared, &mut project_index);
+                LogicalOperator::ExternalProject(crate::operator::LogicalExternalProject {
+                    project_index,
+                    expressions: p.expressions.clone(),
+                    output_names: p.output_names.clone(),
+                    returned_types: p.returned_types.clone(),
+                    child: Box::new(child),
+                    cost: p.cost,
+                })
+            }
+            LogicalOperator::ExternalTable(t) => {
+                let mut table_index = t.table_index;
+                self.remap_table_index(bind_shared, &mut table_index);
+                LogicalOperator::ExternalTable(crate::operator::LogicalExternalTable {
+                    table_index,
+                    output_columns: t.output_columns.clone(),
+                    returned_types: t.returned_types.clone(),
+                    call_expression: t.call_expression.clone(),
+                    call: t.call.clone(),
+                    child: t
+                        .child
+                        .as_ref()
+                        .map(|child| Box::new(self.copy_plan(child.as_ref(), bind_shared))),
+                    lateral: t.lateral,
+                    parameterized: t.parameterized,
+                    cost: t.cost,
+                })
+            }
             LogicalOperator::Limit(l) => {
                 let child = self.copy_plan(l.child.as_ref(), bind_shared);
                 LogicalOperator::Limit(LimNode {
@@ -261,6 +292,7 @@ impl LogicalPlanDeepCopy {
             }
             LogicalOperator::Alter(c) => LogicalOperator::Alter(c.clone()),
             LogicalOperator::CreateTable(c) => LogicalOperator::CreateTable(c.clone()),
+            LogicalOperator::CreateRoutine(c) => LogicalOperator::CreateRoutine(c.clone()),
             LogicalOperator::CreateSequence(c) => LogicalOperator::CreateSequence(c.clone()),
             LogicalOperator::CreateSchema(c) => LogicalOperator::CreateSchema(c.clone()),
             LogicalOperator::CreateIndex(c) => LogicalOperator::CreateIndex(c.clone()),

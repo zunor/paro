@@ -6,7 +6,7 @@ use crate::collection::{
 };
 use crate::entry::{
     CatalogEntryEnum, CatalogObjectId, CatalogType, IndexCatalogEntry, PropertyGraphCatalogEntry,
-    SequenceCatalogEntry, TableCatalogEntry, ViewCatalogEntry,
+    RoutineCatalogEntry, SequenceCatalogEntry, TableCatalogEntry, ViewCatalogEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_storage::meta::TabletMetaManager;
@@ -21,6 +21,7 @@ pub(crate) struct SchemaContents {
     pub(crate) indexes: Arc<CatalogCollection>,
     pub(crate) property_graphs: Arc<CatalogCollection>,
     pub(crate) functions: Arc<CatalogCollection>,
+    pub(crate) routines: Arc<CatalogCollection>,
     pub(crate) table_functions: Arc<CatalogCollection>,
     pub(crate) copy_functions: Arc<CatalogCollection>,
     pub(crate) sequences: Arc<CatalogCollection>,
@@ -65,6 +66,11 @@ impl SchemaContents {
                 CollectionLockKey::schema_family(schema_object_id, CollectionFamily::Functions),
                 Arc::clone(&gc_epoch),
             ),
+            routines: CatalogCollection::new(
+                format!("{}.routines", schema_prefix),
+                CollectionLockKey::schema_family(schema_object_id, CollectionFamily::Routines),
+                Arc::clone(&gc_epoch),
+            ),
             table_functions: CatalogCollection::new(
                 format!("{}.table_functions", schema_prefix),
                 CollectionLockKey::schema_family(
@@ -103,6 +109,7 @@ impl SchemaContents {
             CatalogType::Index => Some(&self.indexes),
             CatalogType::PropertyGraph => Some(&self.property_graphs),
             CatalogType::Sequence => Some(&self.sequences),
+            CatalogType::Routine => Some(&self.routines),
             CatalogType::ScalarFunction | CatalogType::AggregateFunction => Some(&self.functions),
             CatalogType::TableFunction => Some(&self.table_functions),
             CatalogType::CopyFunction => Some(&self.copy_functions),
@@ -207,6 +214,15 @@ impl SchemaContents {
                 _ => Ok(None),
             },
         )?;
+        self.write_entry_block(
+            &mut buffer,
+            &self.routines,
+            snapshot_ts,
+            |entry| match entry {
+                CatalogEntryEnum::Routine(routine) => routine.serialize_to_bytes().map(Some),
+                _ => Ok(None),
+            },
+        )?;
 
         Ok(buffer)
     }
@@ -243,6 +259,10 @@ impl SchemaContents {
             let sequence = SequenceCatalogEntry::deserialize(&entry_bytes, catalog.to_string())?;
             Ok(Arc::new(CatalogEntryEnum::Sequence(Arc::new(sequence))))
         })?;
+        self.read_entry_block(&mut cursor, |entry_bytes| {
+            let routine = RoutineCatalogEntry::deserialize(&entry_bytes, catalog.to_string())?;
+            Ok(Arc::new(CatalogEntryEnum::Routine(Arc::new(routine))))
+        })?;
 
         if cursor.position() != payload.len() as u64 {
             return Err(paro_error::internal(format!(
@@ -262,6 +282,7 @@ impl SchemaContents {
             &self.indexes,
             &self.property_graphs,
             &self.functions,
+            &self.routines,
             &self.table_functions,
             &self.copy_functions,
             &self.sequences,

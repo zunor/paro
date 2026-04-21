@@ -759,43 +759,96 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
         },
     );
 
-    let create_udf = map_res(
+    let create_function = map_res(
         rule! {
             CREATE ~ ( OR ~ ^REPLACE )? ~ FUNCTION ~ ( IF ~ ^NOT ~ ^EXISTS )?
-            ~ #ident ~ #udf_definition
-            ~ ( DESC ~ ^"=" ~ ^#literal_string )?
+            ~ #function_name_ref
+            ~ "(" ~ #comma_separated_list0(function_argument) ~ ")"
+            ~ RETURNS ~ #function_return
+            ~ #create_function_option*
+            ~ AS ~ ^(#code_string | #literal_string)
         },
-        |(_, opt_or_replace, _, opt_if_not_exists, udf_name, definition, opt_description)| {
+        |(
+            _,
+            opt_or_replace,
+            _,
+            opt_if_not_exists,
+            name,
+            _,
+            arguments,
+            _,
+            _,
+            return_type,
+            options,
+            _,
+            definition,
+        )| {
             let create_option =
                 parse_create_option(opt_or_replace.is_some(), opt_if_not_exists.is_some())?;
-            Ok(Statement::CreateUDF(CreateUDFStmt {
+            let mut language = None;
+            let mut volatility = None;
+            let mut strict = false;
+            let mut security = FunctionSecurity::Invoker;
+            let mut handler = None;
+            let mut packages = Vec::new();
+            let mut imports = Vec::new();
+            let mut rows = None;
+            let mut capability_profile = None;
+
+            for option in options {
+                match option {
+                    CreateFunctionOption::Language(value) => language = Some(value),
+                    CreateFunctionOption::Volatility(value) => volatility = Some(value),
+                    CreateFunctionOption::Strict => strict = true,
+                    CreateFunctionOption::Security(value) => security = value,
+                    CreateFunctionOption::Handler(value) => handler = Some(value),
+                    CreateFunctionOption::Packages(value) => packages = value,
+                    CreateFunctionOption::Imports(value) => imports = value,
+                    CreateFunctionOption::Rows(value) => rows = Some(value),
+                    CreateFunctionOption::CapabilityProfile(value) => {
+                        capability_profile = Some(value)
+                    }
+                }
+            }
+
+            let Some(language) = language else {
+                return Err(nom::Err::Failure(ErrorKind::Other(
+                    "CREATE FUNCTION requires LANGUAGE",
+                )));
+            };
+
+            if rows.is_some() && !matches!(return_type, FunctionReturn::Table(_)) {
+                return Err(nom::Err::Failure(ErrorKind::Other(
+                    "ROWS is only valid for RETURNS TABLE routines",
+                )));
+            }
+
+            Ok(Statement::CreateFunction(CreateFunctionStmt {
                 create_option,
-                udf_name,
-                description: opt_description.map(|(_, _, description)| description),
+                name,
+                arguments,
+                return_type,
+                language,
+                volatility,
+                strict,
+                security,
+                handler,
+                packages,
+                imports,
+                rows,
+                capability_profile,
                 definition,
             }))
         },
     );
-    let drop_udf = map(
+    let drop_function = map(
         rule! {
-            DROP ~ FUNCTION ~ ( IF ~ ^EXISTS )? ~ #ident
+            DROP ~ FUNCTION ~ ( IF ~ ^EXISTS )? ~ #function_identity
         },
-        |(_, _, opt_if_exists, udf_name)| Statement::DropUDF {
-            if_exists: opt_if_exists.is_some(),
-            udf_name,
-        },
-    );
-    let alter_udf = map(
-        rule! {
-            ALTER ~ FUNCTION
-            ~ #ident ~ #udf_definition
-            ~ ( DESC ~ ^"=" ~ ^#literal_string )?
-        },
-        |(_, _, udf_name, definition, opt_description)| {
-            Statement::AlterUDF(AlterUDFStmt {
-                udf_name,
-                description: opt_description.map(|(_, _, description)| description),
-                definition,
+        |(_, _, opt_if_exists, identity)| {
+            Statement::DropFunction(DropFunctionStmt {
+                if_exists: opt_if_exists.is_some(),
+                identity,
             })
         },
     );
@@ -1754,7 +1807,7 @@ AS
                 | #create_row_access : "`CREATE ROW ACCESS POLICY [ IF NOT EXISTS ] <name> AS ( <arg_name> <arg_type> [ , ... ] ) RETURNS BOOLEAN -> <body> [ COMMENT = '<string_literal>' ]`"
                 | #acl_create_user : "`CREATE [OR REPLACE] USER [IF NOT EXISTS] '<username>' IDENTIFIED [WITH <auth_type>] [BY <password>] [WITH <user_option>, ...]`"
                 | #acl_create_role : "`CREATE ROLE [IF NOT EXISTS] <role_name> [COMMENT ='<string_literal>']`"
-                | #create_udf : "`CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`"
+                | #create_function : "`CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] [<database>.][<schema>.]<name>(<arg_name arg_type>, ...) RETURNS <type> LANGUAGE <language> [IMMUTABLE|STABLE|VOLATILE] [STRICT] [SECURITY INVOKER|DEFINER] [HANDLER '<handler>'] [PACKAGES ('pkg', ...)] [IMPORTS ('uri', ...)] [ROWS <n>] [CAPABILITY PROFILE <profile>] AS <code>`"
                 | #create_data_mask_policy: "`CREATE MASKING POLICY [IF NOT EXISTS] mask_name as (val1 val_type1 [, val type]) return type -> case`"
                 | #create_network_policy: "`CREATE NETWORK POLICY [IF NOT EXISTS] name ALLOWED_IP_LIST = ('ip1' [, 'ip2']) [BLOCKED_IP_LIST = ('ip1' [, 'ip2'])] [COMMENT = '<string_literal>']`"
                 | #create_password_policy: "`CREATE PASSWORD POLICY [IF NOT EXISTS] name [PASSWORD_MIN_LENGTH = <u64_literal>] ... [COMMENT = '<string_literal>']`"
@@ -1791,7 +1844,7 @@ AS
                 | #drop_row_access : "`DROP ROW ACCESS POLICY [ IF EXISTS ] <name>`"
                 | #acl_drop_user : "`DROP USER [IF EXISTS] '<username>'`"
                 | #acl_drop_role : "`DROP ROLE [IF EXISTS] <role_name>`"
-                | #drop_udf : "`DROP FUNCTION [IF EXISTS] <udf_name>`"
+                | #drop_function : "`DROP FUNCTION [IF EXISTS] [<database>.][<schema>.]<name>(<arg_type>, ...)`"
                 | #drop_data_mask_policy: "`DROP MASKING POLICY [IF EXISTS] mask_name`"
                 | #drop_network_policy: "`DROP NETWORK POLICY [IF EXISTS] name`"
                 | #drop_password_policy: "`DROP PASSWORD POLICY [IF EXISTS] name`"
@@ -1817,7 +1870,6 @@ AS
             | #alter_view : "`ALTER VIEW [<database>.]<view> [(<column>, ...)] AS SELECT ...`"
             | #acl_alter_user : "`ALTER USER ('<username>' | USER()) [IDENTIFIED [WITH <auth_type>] [BY <password>]] [WITH <user_option>, ...]`"
             | #acl_alter_role : "`ALTER ROLE [IF EXISTS] <role_name> SET COMMENT = '<string_literal>' | UNSET COMMENT`"
-            | #alter_udf : "`ALTER FUNCTION <udf_name> <udf_definition> [DESC = <description>]`"
             | #alter_network_policy: "`ALTER NETWORK POLICY [IF EXISTS] name SET [ALLOWED_IP_LIST = ('ip1' [, 'ip2'])] [BLOCKED_IP_LIST = ('ip1' [, 'ip2'])] [COMMENT = '<string_literal>']`"
             | #alter_password_policy: "`ALTER PASSWORD POLICY [IF EXISTS] name SET [PASSWORD_MIN_LENGTH = <u64_literal>] ... [COMMENT = '<string_literal>']`"
             | #alter_pipe : "`ALTER PIPE [ IF EXISTS ] <name> SET <option> = <value>` | REFRESH <option> = <value>`"
@@ -3776,356 +3828,163 @@ pub fn table_reference_with_alias(i: Input) -> IResult<TableReference> {
     .parse(i)
 }
 
-pub fn udaf_state_field(i: Input) -> IResult<UDAFStateField> {
+fn function_name_ref(i: Input) -> IResult<FunctionName> {
     map(
         rule! {
-            #ident
-            ~ #type_name
-            : "`<state name> <type>`"
+            #dot_separated_idents_1_to_3
         },
-        |(name, type_name)| UDAFStateField { name, type_name },
+        |(database, schema, name)| FunctionName {
+            database,
+            schema,
+            name,
+        },
     )
     .parse(i)
 }
 
-pub fn udf_header(i: Input) -> IResult<(String, String)> {
+fn function_argument(i: Input) -> IResult<FunctionArgument> {
+    let named = map(
+        rule! {
+            #ident ~ ^#type_name
+        },
+        |(name, data_type)| FunctionArgument {
+            name: Some(name),
+            data_type,
+        },
+    );
+    let unnamed = map(rule! { #type_name }, |data_type| FunctionArgument {
+        name: None,
+        data_type,
+    });
+
+    rule!(#named | #unnamed).parse(i)
+}
+
+fn function_table_column(i: Input) -> IResult<FunctionTableColumn> {
     map(
         rule! {
-            #literal_string ~ #match_text("=") ~ ^#literal_string
+            #ident ~ ^#type_name
         },
-        |(k, _, v)| (k, v),
+        |(name, data_type)| FunctionTableColumn { name, data_type },
     )
     .parse(i)
 }
 
-pub fn udf_script_or_address(i: Input) -> IResult<(String, bool)> {
-    let script = map(
+fn function_return(i: Input) -> IResult<FunctionReturn> {
+    let scalar = map(rule! { #type_name }, FunctionReturn::Scalar);
+    let table = map(
         rule! {
-            AS ~ ^(#code_string | #literal_string)
+            TABLE ~ "(" ~ #comma_separated_list0(function_table_column) ~ ")"
         },
-        |(_, code)| (code, true),
+        |(_, _, columns, _)| FunctionReturn::Table(columns),
     );
 
-    let address = map(
+    rule!(#table | #scalar).parse(i)
+}
+
+#[derive(Clone)]
+enum CreateFunctionOption {
+    Language(Identifier),
+    Volatility(FunctionVolatility),
+    Strict,
+    Security(FunctionSecurity),
+    Handler(String),
+    Packages(Vec<String>),
+    Imports(Vec<String>),
+    Rows(u64),
+    CapabilityProfile(Identifier),
+}
+
+fn create_function_option(i: Input) -> IResult<CreateFunctionOption> {
+    let language = map(
         rule! {
-            ADDRESS ~ ^"=" ~ ^#literal_string
+            LANGUAGE ~ #ident
         },
-        |(_, _, address)| (address, false),
+        |(_, language)| CreateFunctionOption::Language(language),
+    );
+    let immutable = value(
+        CreateFunctionOption::Volatility(FunctionVolatility::Immutable),
+        rule! { IMMUTABLE },
+    );
+    let stable = value(
+        CreateFunctionOption::Volatility(FunctionVolatility::Stable),
+        rule! { #match_text("STABLE") },
+    );
+    let volatile = value(
+        CreateFunctionOption::Volatility(FunctionVolatility::Volatile),
+        rule! { VOLATILE },
+    );
+    let strict = value(
+        CreateFunctionOption::Strict,
+        rule! { #match_text("STRICT") },
+    );
+    let security_invoker = value(
+        CreateFunctionOption::Security(FunctionSecurity::Invoker),
+        rule! {
+            #match_text("SECURITY") ~ #match_text("INVOKER")
+        },
+    );
+    let security_definer = value(
+        CreateFunctionOption::Security(FunctionSecurity::Definer),
+        rule! {
+            #match_text("SECURITY") ~ #match_text("DEFINER")
+        },
+    );
+    let handler = map(
+        rule! {
+            HANDLER ~ ^#literal_string
+        },
+        |(_, handler)| CreateFunctionOption::Handler(handler),
+    );
+    let packages = map(
+        rule! {
+            PACKAGES ~ "(" ~ #comma_separated_list0(literal_string) ~ ")"
+        },
+        |(_, _, packages, _)| CreateFunctionOption::Packages(packages),
+    );
+    let imports = map(
+        rule! {
+            IMPORTS ~ "(" ~ #comma_separated_list0(literal_string) ~ ")"
+        },
+        |(_, _, imports, _)| CreateFunctionOption::Imports(imports),
+    );
+    let rows = map(
+        rule! {
+            ROWS ~ #literal_u64
+        },
+        |(_, rows)| CreateFunctionOption::Rows(rows),
+    );
+    let capability_profile = map(
+        rule! {
+            #match_text("CAPABILITY") ~ #match_text("PROFILE") ~ #ident
+        },
+        |(_, _, profile)| CreateFunctionOption::CapabilityProfile(profile),
     );
 
     rule!(
-        #script: "AS <language_codes>"
-        | #address: "ADDRESS=<udf_server_address>"
+        #language
+        | #immutable
+        | #stable
+        | #volatile
+        | #strict
+        | #security_invoker
+        | #security_definer
+        | #handler
+        | #packages
+        | #imports
+        | #rows
+        | #capability_profile
     )
     .parse(i)
 }
 
-pub fn udf_definition(i: Input) -> IResult<UDFDefinition> {
-    enum ReturnBody {
-        Scalar(TypeName),
-        Table(Vec<(Identifier, TypeName)>),
-    }
-
-    fn return_body(i: Input) -> IResult<ReturnBody> {
-        let scalar = map(
-            rule! {
-                #type_name
-            },
-            ReturnBody::Scalar,
-        );
-        let table = map(
-            rule! {
-                TABLE ~ "(" ~ #comma_separated_list0(udtf_arg) ~ ")"
-            },
-            |(_, _, arg_types, _)| ReturnBody::Table(arg_types),
-        );
-
-        rule!(
-            #scalar: "<return_type>"
-            | #table: "TABLE (<return_type>, ...)"
-        )
-        .parse(i)
-    }
-
-    enum FuncBody {
-        Sql(String),
-        Server {
-            address: String,
-            handler: String,
-            headers: BTreeMap<String, String>,
-            language: String,
-            immutable: Option<bool>,
-        },
-    }
-
-    fn func_body(i: Input) -> IResult<FuncBody> {
-        let sql = map(
-            rule! {
-                AS ~ ^#code_string
-            },
-            |(_, sql)| FuncBody::Sql(sql),
-        );
-        let server = map(
-            rule! {
-                LANGUAGE ~ #ident
-                ~ (#udf_immutable)?
-                ~ HANDLER ~ ^"=" ~ ^#literal_string
-                ~ ( HEADERS ~ ^"=" ~ "(" ~ #comma_separated_list0(udf_header) ~ ")" )?
-                ~ ADDRESS ~ ^"=" ~ ^#literal_string
-            },
-            |(_, language, immutable, _, _, handler, headers, _, _, address)| FuncBody::Server {
-                address,
-                handler,
-                headers: headers
-                    .map(|(_, _, _, headers, _)| BTreeMap::from_iter(headers))
-                    .unwrap_or_default(),
-                language: language.to_string(),
-                immutable,
-            },
-        );
-
-        rule!(
-            #sql: "AS <sql>"
-            | #server: "LANGUAGE <language> HANDLER=<handler> ADDRESS=<udf_server_address>"
-        )
-        .parse(i)
-    }
-
-    let lambda_udf = map(
+fn function_identity(i: Input) -> IResult<FunctionIdentity> {
+    map(
         rule! {
-            AS ~ #lambda_udf_params
-            ~ "->" ~ #expr
+            #function_name_ref ~ "(" ~ #comma_separated_list0(type_name) ~ ")"
         },
-        |(_, parameters, _, definition)| UDFDefinition::LambdaUDF {
-            parameters,
-            definition: Box::new(definition),
-        },
-    );
-
-    let udf = map_res(
-        rule! {
-            #udf_args
-            ~ RETURNS ~ #type_name
-            ~ LANGUAGE ~ #ident
-            ~ (#udf_immutable)?
-            ~ ( IMPORTS ~ ^"=" ~ "(" ~ #comma_separated_list0(literal_string) ~ ")" )?
-            ~ ( PACKAGES ~ ^"=" ~ "(" ~ #comma_separated_list0(literal_string) ~ ")" )?
-            ~ HANDLER ~ ^"=" ~ ^#literal_string
-            ~ ( HEADERS ~ ^"=" ~ "(" ~ #comma_separated_list0(udf_header) ~ ")" )?
-            ~ #udf_script_or_address
-        },
-        |(
-            arg_types,
-            _,
-            return_type,
-            _,
-            language,
-            immutable,
-            imports,
-            packages,
-            _,
-            _,
-            handler,
-            headers,
-            address_or_code,
-        )| {
-            if address_or_code.1 {
-                Ok(UDFDefinition::UDFScript {
-                    arg_types,
-                    return_type,
-                    code: address_or_code.0,
-                    imports: imports
-                        .map(|(_, _, _, imports, _)| imports)
-                        .unwrap_or_default(),
-                    packages: packages
-                        .map(|(_, _, _, packages, _)| packages)
-                        .unwrap_or_default(),
-                    handler,
-                    language: language.to_string(),
-                    // TODO inject runtime_version by user
-                    // Now we use fixed runtime version
-                    runtime_version: "".to_string(),
-                    immutable,
-                })
-            } else {
-                Ok(UDFDefinition::UDFServer {
-                    arg_types,
-                    return_type,
-                    address: address_or_code.0,
-                    handler,
-                    language: language.to_string(),
-                    headers: headers
-                        .map(|(_, _, _, headers, _)| BTreeMap::from_iter(headers))
-                        .unwrap_or_default(),
-                    immutable,
-                })
-            }
-        },
-    );
-
-    let scalar_udf_or_udtf = map_res(
-        rule! {
-            "(" ~ #comma_separated_list0(udtf_arg) ~ ")"
-            ~ RETURNS ~ ^#return_body
-            ~ #func_body
-        },
-        |(_, arg_types, _, _, return_body, func_body)| {
-            let definition = match (return_body, func_body) {
-                (ReturnBody::Scalar(return_type), FuncBody::Sql(sql)) => UDFDefinition::ScalarUDF {
-                    arg_types,
-                    definition: sql,
-                    return_type,
-                },
-                (ReturnBody::Scalar(_), FuncBody::Server { .. }) => {
-                    return Err(nom::Err::Failure(ErrorKind::Other(
-                        "ScalarUDF unsupported external Server",
-                    )));
-                }
-                (ReturnBody::Table(return_types), FuncBody::Sql(sql)) => UDFDefinition::UDTFSql {
-                    arg_types,
-                    return_types,
-                    sql,
-                },
-                (
-                    ReturnBody::Table(return_types),
-                    FuncBody::Server {
-                        address,
-                        handler,
-                        headers,
-                        language,
-                        immutable,
-                    },
-                ) => UDFDefinition::UDTFServer {
-                    arg_types,
-                    return_types,
-                    address,
-                    handler,
-                    headers,
-                    language,
-                    immutable,
-                },
-            };
-            Ok(definition)
-        },
-    );
-
-    let udaf = map_res(
-        rule! {
-            #udf_args
-            ~ STATE ~ "{" ~ #comma_separated_list0(udaf_state_field) ~ "}"
-            ~ RETURNS ~ #type_name
-            ~ LANGUAGE ~ #ident
-            ~ ( IMPORTS ~ ^"=" ~ "(" ~ #comma_separated_list0(literal_string) ~ ")" )?
-            ~ ( PACKAGES ~ ^"=" ~ "(" ~ #comma_separated_list0(literal_string) ~ ")" )?
-            ~ ( HEADERS ~ ^"=" ~ "(" ~ #comma_separated_list0(udf_header) ~ ")" )?
-            ~ #udf_script_or_address
-        },
-        |(
-            arg_types,
-            _,
-            _,
-            state_types,
-            _,
-            _,
-            return_type,
-            _,
-            language,
-            imports,
-            packages,
-            headers,
-            address_or_code,
-        )| {
-            if address_or_code.1 {
-                Ok(UDFDefinition::UDAFScript {
-                    arg_types,
-                    state_fields: state_types,
-                    return_type,
-                    code: address_or_code.0,
-                    language: language.to_string(),
-                    imports: imports
-                        .map(|(_, _, _, imports, _)| imports)
-                        .unwrap_or_default(),
-                    packages: packages
-                        .map(|(_, _, _, packages, _)| packages)
-                        .unwrap_or_default(),
-                    // TODO inject runtime_version by user
-                    // Now we use fixed runtime version
-                    runtime_version: "".to_string(),
-                })
-            } else {
-                Ok(UDFDefinition::UDAFServer {
-                    arg_types,
-                    state_fields: state_types,
-                    return_type,
-                    address: address_or_code.0,
-                    headers: headers
-                        .map(|(_, _, _, headers, _)| BTreeMap::from_iter(headers))
-                        .unwrap_or_default(),
-                    language: language.to_string(),
-                })
-            }
-        },
-    );
-
-    rule!(
-        #lambda_udf: "AS (<parameter [parameter type]>, ...) -> <definition expr>"
-        | #udaf: "(<[arg_name] arg_type>, ...) STATE {<state_field>, ...} RETURNS <return_type> LANGUAGE <language> { ADDRESS=<udf_server_address> | AS <language_codes> } "
-        | #udf: "(<[arg_name] arg_type>, ...) RETURNS <return_type> LANGUAGE <language> HANDLER=<handler> { ADDRESS=<udf_server_address> | AS <language_codes> } "
-        | #scalar_udf_or_udtf: "(<arg_name arg_type>, ...) RETURNS <return body> { AS <sql> | LANGUAGE <language> HANDLER=<handler> ADDRESS=<udf_server_address> } }"
-    ).parse(i)
-}
-
-fn lambda_udf_params(i: Input) -> IResult<LambdaUDFParams> {
-    let names = map(
-        rule! {
-            "(" ~ #comma_separated_list0(ident) ~ ")"
-        },
-        |(_, names, _)| LambdaUDFParams::Names(names),
-    );
-    let name_with_types = map(
-        rule! {
-            "(" ~ #comma_separated_list0(udtf_arg) ~ ")"
-        },
-        |(_, name_with_types, _)| LambdaUDFParams::NameWithTypes(name_with_types),
-    );
-
-    rule!(
-        #names: "(<arg_name>, ...)"
-        | #name_with_types: "(<arg_name arg_type>, ...)"
+        |(name, _, arg_types, _)| FunctionIdentity { name, arg_types },
     )
-    .parse(i)
-}
-
-fn udf_args(i: Input) -> IResult<UDFArgs> {
-    let types = map(
-        rule! {
-            "(" ~ #comma_separated_list0(type_name) ~ ")"
-        },
-        |(_, types, _)| UDFArgs::Types(types),
-    );
-    let name_with_types = map(
-        rule! {
-            "(" ~ #comma_separated_list0(udtf_arg) ~ ")"
-        },
-        |(_, name_with_types, _)| UDFArgs::NameWithTypes(name_with_types),
-    );
-
-    rule!(
-        #types: "(<arg_type>, ...)"
-        | #name_with_types: "(<arg_name arg_type>, ...)"
-    )
-    .parse(i)
-}
-
-fn udtf_arg(i: Input) -> IResult<(Identifier, TypeName)> {
-    map(rule! { #ident ~ ^#type_name }, |(name, ty)| (name, ty)).parse(i)
-}
-
-fn udf_immutable(i: Input) -> IResult<bool> {
-    alt((
-        value(false, rule! { VOLATILE }),
-        value(true, rule! { IMMUTABLE }),
-    ))
     .parse(i)
 }
 

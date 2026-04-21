@@ -9,6 +9,7 @@ use crate::{
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::search_path::CatalogSearchEntry;
 use paro_common::identity::DatabaseType;
+use paro_external_runtime::host::PythonRuntimeProvider;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferPool, StandardBufferManager, TemporaryMemoryManager};
@@ -73,6 +74,9 @@ pub struct TestStatementContextBuilder {
     current_database: String,
     current_schema: String,
     current_user: String,
+    can_create_routine: Option<bool>,
+    can_create_elevated_routine: Option<bool>,
+    python_runtime: Option<Arc<dyn PythonRuntimeProvider>>,
     visible_version: u64,
 }
 
@@ -85,6 +89,9 @@ impl TestStatementContextBuilder {
             current_database: "test".to_string(),
             current_schema: "public".to_string(),
             current_user: "paro".to_string(),
+            can_create_routine: None,
+            can_create_elevated_routine: None,
+            python_runtime: None,
             visible_version: 0,
         }
     }
@@ -123,12 +130,34 @@ impl TestStatementContextBuilder {
         self
     }
 
+    pub fn with_routine_creation_privilege(mut self, allowed: bool) -> Self {
+        self.can_create_routine = Some(allowed);
+        self
+    }
+
+    pub fn with_elevated_routine_creation_privilege(mut self, allowed: bool) -> Self {
+        self.can_create_elevated_routine = Some(allowed);
+        self
+    }
+
+    pub fn with_python_runtime(mut self, python_runtime: Arc<dyn PythonRuntimeProvider>) -> Self {
+        self.python_runtime = Some(python_runtime);
+        self
+    }
+
     pub fn with_visible_version(mut self, visible_version: u64) -> Self {
         self.visible_version = visible_version;
         self
     }
 
     pub fn build(self) -> Arc<StatementContext> {
+        let current_user = self.current_user;
+        let can_create_routine = self
+            .can_create_routine
+            .unwrap_or_else(|| current_user.eq_ignore_ascii_case("paro"));
+        let can_create_elevated_routine = self
+            .can_create_elevated_routine
+            .unwrap_or(can_create_routine);
         let buffer_pool = BufferPool::new_arc(64 * 1024 * 1024);
         let buffer_manager = Arc::new(StandardBufferManager::new_with_pool(
             buffer_pool.clone(),
@@ -161,9 +190,14 @@ impl TestStatementContextBuilder {
             env: StatementEnvironment {
                 current_database: self.current_database.clone(),
                 current_schema: self.current_schema,
-                current_user: self.current_user,
+                current_user: current_user.clone(),
                 search_path: self.search_path,
-                auth: StatementAuthContext::default(),
+                auth: StatementAuthContext {
+                    authenticated_user: Some(current_user),
+                    can_create_routine,
+                    can_create_elevated_routine,
+                    ..StatementAuthContext::default()
+                },
             },
             txn: StatementView {
                 visible_version: self.visible_version,
@@ -194,6 +228,7 @@ impl TestStatementContextBuilder {
                 infra: execution_resources,
                 cast_functions: Arc::new(CastFunctionSet::new()),
                 graph_index: graph_manager.clone(),
+                python_runtime: self.python_runtime,
                 governance: crate::QueryResourceGovernance::default(),
                 plan_cache: None,
                 connection_info: None,

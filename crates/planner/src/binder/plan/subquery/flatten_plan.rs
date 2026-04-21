@@ -28,6 +28,16 @@ pub(crate) fn flatten_dependent_joins_in_plan(
             proj.child = Box::new(flatten_dependent_joins_in_plan(binder, *proj.child)?);
             LogicalOperator::Projection(proj)
         }
+        LogicalOperator::ExternalProject(mut project) => {
+            project.child = Box::new(flatten_dependent_joins_in_plan(binder, *project.child)?);
+            LogicalOperator::ExternalProject(project)
+        }
+        LogicalOperator::ExternalTable(mut table) => {
+            if let Some(child) = table.child.take() {
+                table.child = Some(Box::new(flatten_dependent_joins_in_plan(binder, *child)?));
+            }
+            LogicalOperator::ExternalTable(table)
+        }
         LogicalOperator::Aggregate(mut agg) => {
             agg.child = Box::new(flatten_dependent_joins_in_plan(binder, *agg.child)?);
             LogicalOperator::Aggregate(agg)
@@ -118,6 +128,7 @@ pub(crate) fn flatten_dependent_joins_in_plan(
         | LogicalOperator::DelimGet(_)
         | LogicalOperator::Alter(_)
         | LogicalOperator::CreateTable(_)
+        | LogicalOperator::CreateRoutine(_)
         | LogicalOperator::CreateSequence(_)
         | LogicalOperator::CreateSchema(_)
         | LogicalOperator::CreateIndex(_)

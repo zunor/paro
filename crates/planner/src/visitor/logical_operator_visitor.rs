@@ -169,6 +169,14 @@ where
                 callback(expr);
             }
         }
+        LogicalOperator::ExternalProject(project) => {
+            for expr in &mut project.expressions {
+                callback(&mut expr.expression);
+            }
+        }
+        LogicalOperator::ExternalTable(table) => {
+            callback(&mut table.call_expression);
+        }
         LogicalOperator::Limit(limit) => {
             if let Some(ref mut expr) = limit.limit {
                 callback(expr);
@@ -325,6 +333,7 @@ where
         // DDL and other operators without expressions
         LogicalOperator::Alter(_)
         | LogicalOperator::CreateTable(_)
+        | LogicalOperator::CreateRoutine(_)
         | LogicalOperator::CreateSequence(_)
         | LogicalOperator::CreateSchema(_)
         | LogicalOperator::CreateIndex(_)

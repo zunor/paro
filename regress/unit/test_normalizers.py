@@ -22,6 +22,20 @@ def test_apply_explain_operator_timing_normalizer_rewrites_actual_time() -> None
     ]
 
 
+def test_apply_explain_operator_counters_normalizer_rewrites_rows_and_loops() -> None:
+    lines = [
+        "FILTER  (actual time=<time-range> rows=14000 loops=7)",
+        "->  SEQ_SCAN on t  (actual time=<time-range> rows=3 loops=2)",
+        '{"actual":{"rows":14000,"loops":7,"startup_time_ms":0.018,"total_time_ms":0.024}}',
+    ]
+
+    assert apply_normalizers(lines, ("explain_operator_counters",)) == [
+        "FILTER  (actual time=<time-range> rows=<rows> loops=<loops>)",
+        "->  SEQ_SCAN on t  (actual time=<time-range> rows=<rows> loops=<loops>)",
+        '{"actual":{"rows": 0,"loops": 0,"startup_time_ms":0.018,"total_time_ms":0.024}}',
+    ]
+
+
 def test_apply_explain_summary_timing_normalizer_rewrites_summary_lines() -> None:
     lines = [
         "Planning Time: 12.34 ms",
@@ -57,6 +71,32 @@ def test_apply_explain_runtime_bytes_normalizer_rewrites_only_target_fields() ->
         "Total Temp Storage: <bytes>",
         "Rows Returned: 2",
         '{"actual":{"peak_memory_bytes": 0,"temp_storage_bytes": 0},"summary":{"Total Temp Storage": 0}}',
+    ]
+
+
+def test_apply_explain_routine_ids_normalizer_rewrites_catalog_ids_only() -> None:
+    lines = [
+        "Routines: py_explain[10315@1]",
+        "Routine: py_scale[2048@7]",
+        "Runtime: submissions=1 blocked=0 input_rows=2 output_rows=2",
+    ]
+
+    assert apply_normalizers(lines, ("explain_routine_ids",)) == [
+        "Routines: py_explain[<routine-id>@1]",
+        "Routine: py_scale[<routine-id>@7]",
+        "Runtime: submissions=1 blocked=0 input_rows=2 output_rows=2",
+    ]
+
+
+def test_apply_explain_external_runtime_normalizer_rewrites_latency_line() -> None:
+    lines = [
+        "Latency(us): acquire=1 queue=0 kernel=34738 encode_decode=34693",
+        "Data Plane: 20 bytes, warm=0 cold=1 retired=0",
+    ]
+
+    assert apply_normalizers(lines, ("explain_external_runtime",)) == [
+        "Latency(us): acquire=<us> queue=<us> kernel=<us> encode_decode=<us>",
+        "Data Plane: 20 bytes, warm=0 cold=1 retired=0",
     ]
 
 
@@ -119,8 +159,11 @@ def test_normalizers_preserve_structure_and_non_target_fields() -> None:
 def test_normalizer_profiles_returns_registered_names() -> None:
     assert normalizer_profiles() == (
         "explain_operator_timing",
+        "explain_operator_counters",
         "explain_summary_timing",
         "explain_runtime_bytes",
+        "explain_routine_ids",
+        "explain_external_runtime",
         "explain_runtime",
         "copy_rowcount",
     )

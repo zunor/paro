@@ -1,0 +1,22 @@
+DROP FUNCTION IF EXISTS py_expand(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_expand(a INTEGER) RETURNS TABLE (value INTEGER)
+LANGUAGE python
+AS $$
+output = []
+for value in a.materialize_py():
+    output.extend((value, value + 100))
+return output
+$$;
+CREATE FUNCTION
+
+SELECT *
+FROM py_expand(1)
+ORDER BY 1;
+py_expand.value
+1
+101
+
+DROP FUNCTION py_expand(INTEGER);
+DROP FUNCTION

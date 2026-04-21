@@ -225,6 +225,7 @@ impl ParoError {
     #[inline]
     pub fn is_query_canceled(&self) -> bool {
         self.is(super::codes::operator::QUERY_CANCELED)
+            || self.is(super::codes::operator::STATEMENT_TIMEOUT)
     }
 
     /// Returns true if this indicates an undefined object (table, column, etc.).

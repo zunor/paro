@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "lease_id": 42,
+  "row_count": 3,
+  "state": "Committed",
+  "ownership": {
+    "owner_worker_epoch": 9,
+    "owner_host_epoch": 3,
+    "owner_query_epoch": 17
+  },
+  "completion_fence": 11,
+  "payload_checksum": 991,
+  "columns": [
+    {
+      "name": "numbers",
+      "logical_type": "Int64",
+      "encoding": "Flat",
+      "population_mode": "Eager",
+      "nullable": false,
+      "validity": null,
+      "layout": {
+        "FixedWidth": {
+          "values": {
+            "buffer_index": 0,
+            "offset": 0,
+            "len": 24,
+            "alignment": 8,
+            "generation": 0,
+            "device": "Host"
+          },
+          "stride": 8
+        }
+      },
+      "children": []
+    },
+    {
+      "name": "labels",
+      "logical_type": "Varchar",
+      "encoding": "Flat",
+      "population_mode": "Eager",
+      "nullable": true,
+      "validity": {
+        "buffer_index": 0,
+        "offset": 24,
+        "len": 1,
+        "alignment": 1,
+        "generation": 0,
+        "device": "Host"
+      },
+      "layout": {
+        "VarLen": {
+          "offsets": {
+            "buffer_index": 1,
+            "offset": 32,
+            "len": 16,
+            "alignment": 4,
+            "generation": 0,
+            "device": "Host"
+          },
+          "data": {
+            "buffer_index": 2,
+            "offset": 48,
+            "len": 11,
+            "alignment": 1,
+            "generation": 0,
+            "device": "Host"
+          },
+          "offset_width": "U32"
+        }
+      },
+      "children": []
+    },
+    {
+      "name": "groups",
+      "logical_type": {
+        "List": "Int32"
+      },
+      "encoding": "List",
+      "population_mode": "Eager",
+      "nullable": false,
+      "validity": null,
+      "layout": {
+        "List": {
+          "offsets": {
+            "buffer_index": 3,
+            "offset": 64,
+            "len": 16,
+            "alignment": 4,
+            "generation": 0,
+            "device": "Host"
+          },
+          "offset_width": "U32"
+        }
+      },
+      "children": [
+        {
+          "name": "element",
+          "logical_type": "Int32",
+          "encoding": "Flat",
+          "population_mode": "Eager",
+          "nullable": false,
+          "validity": null,
+          "layout": {
+            "FixedWidth": {
+              "values": {
+                "buffer_index": 4,
+                "offset": 80,
+                "len": 24,
+                "alignment": 4,
+                "generation": 0,
+                "device": "Host"
+              },
+              "stride": 4
+            }
+          },
+          "children": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "paro-external-abi"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "paro_external_abi"
+path = "src/lib.rs"
+
+[dependencies]
+ordered-float = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -7,6 +7,7 @@ use crate::runtime::runtime_tuning::RuntimeTuning;
 use crate::runtime::session_registry::SessionExecutionRegistry;
 use crate::runtime::{InstanceRuntime, InstanceRuntimeResources};
 use crate::{BootConfig, DatabaseFileSystem, InstanceConfig};
+use paro_external_runtime::host::ExternalRuntimeHost;
 use paro_function::register_system_buffer_manager;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, StandardBufferManager, TemporaryMemoryManager};
@@ -20,6 +21,7 @@ pub(crate) struct RuntimeResources {
     session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
     db_file_system: Arc<DatabaseFileSystem>,
+    python_runtime: Arc<ExternalRuntimeHost>,
 }
 
 impl RuntimeResources {
@@ -53,6 +55,7 @@ impl RuntimeResources {
             session_registry: Arc::new(SessionExecutionRegistry::new()),
             object_cache: Arc::new(ObjectCache::new()),
             db_file_system,
+            python_runtime: Arc::new(ExternalRuntimeHost::new()),
         }
     }
 
@@ -71,6 +74,7 @@ impl RuntimeResources {
                 session_registry: self.session_registry,
                 object_cache: self.object_cache,
                 db_file_system: self.db_file_system,
+                python_runtime: self.python_runtime,
             },
             RuntimeTuning::from_options(&config.options),
         );

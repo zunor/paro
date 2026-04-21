@@ -11,12 +11,15 @@ pub enum LogicalOperatorType {
     Get,
     Filter,
     Projection,
+    ExternalProject,
+    ExternalTable,
     Limit,
     Order,
     /// TopN (optimized ORDER BY + LIMIT)
     TopN,
     Alter,
     CreateTable,
+    CreateRoutine,
     CreateSequence,
     CreateSchema,
     /// CREATE INDEX operation

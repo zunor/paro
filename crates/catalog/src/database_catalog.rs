@@ -234,6 +234,7 @@ impl ParoCatalog {
             CatalogType::View,
             CatalogType::Index,
             CatalogType::PropertyGraph,
+            CatalogType::Routine,
             CatalogType::ScalarFunction,
             CatalogType::TableFunction,
             CatalogType::CopyFunction,
@@ -376,6 +377,9 @@ impl ParoCatalog {
             }
             CatalogType::Sequence => {
                 schema.get_sequence(transaction.transaction_id, transaction.start_time, name)
+            }
+            CatalogType::Routine => {
+                schema.get_routine(transaction.transaction_id, transaction.start_time, name)
             }
             CatalogType::ScalarFunction | CatalogType::AggregateFunction => {
                 schema.get_function(transaction.transaction_id, transaction.start_time, name)

@@ -19,6 +19,7 @@ use paro_context::{StatementCancelReason, StatementTimeoutDriver};
 use paro_instance::{DatabaseCloseAction, Instance};
 use paro_session::{CollectingSink, Session, StatementCompletion, TestSessionBuilder};
 use query_i64_col::query_i64_col;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -59,6 +60,25 @@ fn create_test_session_with_timeout_driver(driver: Arc<dyn StatementTimeoutDrive
     TestSessionBuilder::minimal()
         .with_timeout_driver(driver)
         .build()
+}
+
+fn run_async_test_with_large_stack<Fut>(name: &str, future: Fut)
+where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            runtime.block_on(future);
+        })
+        .expect("spawn large-stack test thread")
+        .join()
+        .expect("join large-stack test thread");
 }
 
 #[tokio::test]
@@ -172,8 +192,7 @@ async fn prepare_rejects_duplicate_statement_name() {
     assert!(err.contains("prepared statement \"stmt1\" already exists"));
 }
 
-#[tokio::test]
-async fn cursor_lifecycle_matches_holdability() {
+async fn run_cursor_lifecycle_matches_holdability() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -246,6 +265,14 @@ async fn cursor_lifecycle_matches_holdability() {
     )
     .await;
     assert_eq!(query_i64_col(&sink, 0), vec![0]);
+}
+
+#[test]
+fn cursor_lifecycle_matches_holdability() {
+    run_async_test_with_large_stack(
+        "prepared-statement-cursor-lifecycle",
+        run_cursor_lifecycle_matches_holdability(),
+    );
 }
 
 #[tokio::test]

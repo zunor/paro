@@ -11,6 +11,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::CardinalityEstimate;
+use paro_routine::BuiltinIntrinsicId;
 use paro_storage::statistics::ColumnStatistics;
 
 const MIN_SELECTIVITY: f64 = 0.000_001;
@@ -93,19 +94,29 @@ impl CostModel {
                 }
                 _ => self.defaults.predicate,
             },
-            Expression::Function(function) => {
-                let name = function.function.name.to_ascii_lowercase();
-                if name.contains("fulltext") || name == "match" || name == "bm25" {
-                    self.defaults.fulltext_match
-                } else if name.contains("distance")
-                    || name.contains("cosine")
-                    || name.contains("l2")
-                {
-                    self.defaults.vector_topk_fraction
-                } else {
-                    self.defaults.predicate
-                }
-            }
+            Expression::Function(function) => match function.builtin_intrinsic() {
+                Some(
+                    BuiltinIntrinsicId::FullTextMatch
+                    | BuiltinIntrinsicId::FullTextMatchInternal
+                    | BuiltinIntrinsicId::Bm25
+                    | BuiltinIntrinsicId::Bm25ScoreInternal
+                    | BuiltinIntrinsicId::TsRank
+                    | BuiltinIntrinsicId::TsRankCd
+                    | BuiltinIntrinsicId::ToTsVector
+                    | BuiltinIntrinsicId::PlainToTsQuery
+                    | BuiltinIntrinsicId::ToTsQuery
+                    | BuiltinIntrinsicId::PhraseToTsQuery
+                    | BuiltinIntrinsicId::WebSearchToTsQuery,
+                ) => self.defaults.fulltext_match,
+                Some(
+                    BuiltinIntrinsicId::L2Distance
+                    | BuiltinIntrinsicId::L1Distance
+                    | BuiltinIntrinsicId::CosineDistance
+                    | BuiltinIntrinsicId::NegativeInnerProduct
+                    | BuiltinIntrinsicId::SparseDistance,
+                ) => self.defaults.vector_topk_fraction,
+                _ => self.defaults.predicate,
+            },
             _ => self.defaults.predicate,
         };
         clamp_selectivity(selectivity)

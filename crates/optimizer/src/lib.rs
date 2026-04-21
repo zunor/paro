@@ -16,6 +16,7 @@ pub mod aggregate;
 pub mod column;
 pub mod cte;
 pub mod expression;
+pub mod external;
 pub mod filter;
 pub mod graph;
 pub mod join;

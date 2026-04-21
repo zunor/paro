@@ -7,7 +7,8 @@ use crate::execution_context::ExecutionContext;
 use crate::operator::state::{OperatorSinkCombineInput, OperatorSinkInput, OperatorSourceInput};
 use crate::operator::PhysicalOperator;
 use crate::result_type::{
-    OperatorResultType, SinkCombineResultType, SinkResultType, SourceResultType,
+    OperatorFinalizeResultType, OperatorResultType, SinkCombineResultType, SinkResultType,
+    SourceResultType,
 };
 use crate::thread_context::ThreadContext;
 use paro_common::allocator::MemoryTag;
@@ -59,6 +60,14 @@ enum FinalizeState {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProduceResult {
+    Output(usize),
+    Empty,
+    Blocked,
+    Finished,
+}
+
 pub struct PipelineExecutor {
     session: Arc<StatementContext>,
     thread: ThreadContext,
@@ -72,6 +81,8 @@ pub struct PipelineExecutor {
     pending_sink_chunk: Option<Chunk>,
     source_done: bool,
     flush_done: bool,
+    flush_operator_idx: usize,
+    flush_resume_idx: Option<usize>,
     finalize_state: FinalizeState,
     pub interrupt_state: InterruptState,
     pub budget: Option<ExecutionBudget>,
@@ -138,7 +149,12 @@ impl PipelineExecutor {
         gstates: Arc<PipelineGlobalStates>,
         interrupt_state: InterruptState,
     ) -> Result<Self> {
-        let ctx = ExecutionContext::new(session.clone(), &thread, Some(pipeline.as_ref()));
+        let ctx = ExecutionContext::with_interrupt_state(
+            session.clone(),
+            &thread,
+            Some(pipeline.as_ref()),
+            interrupt_state.clone(),
+        );
         // Ensure source state is initialized (respecting dependencies)
         pipeline.reset_source(&ctx, false)?;
         let lstates = PipelineLocalStates::new(&ctx, &pipeline, &gstates)?;
@@ -167,6 +183,8 @@ impl PipelineExecutor {
             pending_sink_chunk: None,
             source_done: false,
             flush_done: false,
+            flush_operator_idx: 0,
+            flush_resume_idx: None,
             finalize_state: FinalizeState::Idle,
             interrupt_state,
             budget: None,
@@ -241,10 +259,11 @@ impl PipelineExecutor {
 
             let source_result = {
                 self.start_profile(source.as_ref());
-                let ctx = ExecutionContext::new(
+                let ctx = ExecutionContext::with_interrupt_state(
                     self.session.clone(),
                     &self.thread,
                     Some(self.pipeline.as_ref()),
+                    self.interrupt_state.clone(),
                 );
                 let mut source_guard = self.gstates.source.lock();
                 let gstate = source_guard
@@ -362,21 +381,30 @@ impl PipelineExecutor {
         }
 
         loop {
-            let out_idx = self.produce_next_output_from(input, start_idx)?;
-            let Some(idx) = out_idx else {
-                return Ok(PipelineExecuteResult::NotFinished);
-            };
-
-            let out_chunk = self.intermediate_chunks[idx].clone();
-            let sink_result = self.sink_chunk(sink, &out_chunk)?;
-            match sink_result {
-                SinkResultType::NeedMoreInput => {}
-                SinkResultType::Finished => return Ok(PipelineExecuteResult::Finished),
-                SinkResultType::Blocked => return Ok(PipelineExecuteResult::Blocked),
-                SinkResultType::Interrupted => return Ok(PipelineExecuteResult::Interrupted),
-            }
-            if self.in_process.is_empty() {
-                return Ok(PipelineExecuteResult::NotFinished);
+            match self.produce_next_output_from(input, start_idx)? {
+                ProduceResult::Output(idx) => {
+                    let out_chunk = self.intermediate_chunks[idx].clone();
+                    let sink_result = self.sink_chunk(sink, &out_chunk)?;
+                    match sink_result {
+                        SinkResultType::NeedMoreInput => {
+                            if self.in_process.is_empty() {
+                                return Ok(PipelineExecuteResult::NotFinished);
+                            }
+                        }
+                        SinkResultType::Finished => return Ok(PipelineExecuteResult::Finished),
+                        SinkResultType::Blocked => return Ok(PipelineExecuteResult::Blocked),
+                        SinkResultType::Interrupted => {
+                            return Ok(PipelineExecuteResult::Interrupted)
+                        }
+                    }
+                }
+                ProduceResult::Empty => {
+                    if self.in_process.is_empty() {
+                        return Ok(PipelineExecuteResult::NotFinished);
+                    }
+                }
+                ProduceResult::Blocked => return Ok(PipelineExecuteResult::Blocked),
+                ProduceResult::Finished => return Ok(PipelineExecuteResult::Finished),
             }
         }
     }
@@ -385,7 +413,7 @@ impl PipelineExecutor {
         &mut self,
         input: &Chunk,
         start_idx: usize,
-    ) -> Result<Option<usize>> {
+    ) -> Result<ProduceResult> {
         let operators = self.pipeline.get_operators();
         let op_count = operators.len();
         if op_count == 0 {
@@ -401,10 +429,11 @@ impl PipelineExecutor {
                 if let Some(node_id) = node_id {
                     self.thread.start_operator(node_id);
                 }
-                let ctx = ExecutionContext::new(
+                let ctx = ExecutionContext::with_interrupt_state(
                     self.session.clone(),
                     &self.thread,
                     Some(self.pipeline.as_ref()),
+                    self.interrupt_state.clone(),
                 );
                 let mut ops_guard = self.gstates.operators.lock();
                 let ops_gstates = ops_guard
@@ -436,25 +465,25 @@ impl PipelineExecutor {
                 }
                 OperatorResultType::NeedMoreInput => {}
                 OperatorResultType::Finished => {
-                    return Ok(None);
+                    return Ok(ProduceResult::Finished);
                 }
                 OperatorResultType::Blocked => {
                     self.in_process.push(current_idx);
-                    return Ok(None);
+                    return Ok(ProduceResult::Blocked);
                 }
             }
 
             if self.intermediate_chunks[current_idx].size() == 0 {
                 current_idx = match self.in_process.pop() {
                     Some(next_idx) => next_idx,
-                    None => return Ok(None),
+                    None => return Ok(ProduceResult::Empty),
                 };
                 continue;
             }
 
             current_idx += 1;
             if current_idx >= op_count {
-                return Ok(Some(op_count - 1));
+                return Ok(ProduceResult::Output(op_count - 1));
             }
         }
     }
@@ -469,8 +498,15 @@ impl PipelineExecutor {
             return Ok(PipelineExecuteResult::Finished);
         }
 
-        for (idx, op) in operators.iter().enumerate() {
+        if let Some(resume_idx) = self.flush_resume_idx.take() {
+            self.flush_operator_idx = resume_idx;
+        }
+
+        while self.flush_operator_idx < op_count {
+            let idx = self.flush_operator_idx;
+            let op = &operators[idx];
             if !op.requires_final_execute() {
+                self.flush_operator_idx += 1;
                 continue;
             }
 
@@ -481,10 +517,11 @@ impl PipelineExecutor {
 
                 let finalize_result = {
                     self.start_profile(op.as_ref());
-                    let ctx = ExecutionContext::new(
+                    let ctx = ExecutionContext::with_interrupt_state(
                         self.session.clone(),
                         &self.thread,
                         Some(self.pipeline.as_ref()),
+                        self.interrupt_state.clone(),
                     );
                     let mut ops_guard = self.gstates.operators.lock();
                     let ops_gstates = ops_guard
@@ -505,13 +542,36 @@ impl PipelineExecutor {
                 if flush_chunk.size() > 0 {
                     match self.push_input_from(&flush_chunk, idx + 1, sink)? {
                         PipelineExecuteResult::NotFinished => {}
-                        res => return Ok(res),
+                        PipelineExecuteResult::Blocked => {
+                            if finalize_result == OperatorFinalizeResultType::Finished {
+                                self.flush_resume_idx = Some(idx + 1);
+                            }
+                            return Ok(PipelineExecuteResult::Blocked);
+                        }
+                        PipelineExecuteResult::Interrupted => {
+                            if finalize_result == OperatorFinalizeResultType::Finished {
+                                self.flush_resume_idx = Some(idx + 1);
+                            }
+                            return Ok(PipelineExecuteResult::Interrupted);
+                        }
+                        PipelineExecuteResult::Finished => {
+                            if finalize_result == OperatorFinalizeResultType::Finished {
+                                self.flush_operator_idx = idx + 1;
+                            }
+                            return Ok(PipelineExecuteResult::Finished);
+                        }
                     }
                 }
 
                 match finalize_result {
-                    crate::result_type::OperatorFinalizeResultType::HaveMoreOutput => continue,
-                    crate::result_type::OperatorFinalizeResultType::Finished => break,
+                    OperatorFinalizeResultType::HaveMoreOutput => continue,
+                    OperatorFinalizeResultType::Blocked => {
+                        return Ok(PipelineExecuteResult::Blocked)
+                    }
+                    OperatorFinalizeResultType::Finished => {
+                        self.flush_operator_idx += 1;
+                        break;
+                    }
                 }
             }
         }
@@ -536,10 +596,11 @@ impl PipelineExecutor {
 
         let mut sink_input =
             OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &self.interrupt_state);
-        let ctx = ExecutionContext::new(
+        let ctx = ExecutionContext::with_interrupt_state(
             self.session.clone(),
             &self.thread,
             Some(self.pipeline.as_ref()),
+            self.interrupt_state.clone(),
         );
         let sink_result = sink.sink(&ctx, chunk, &mut sink_input)?;
         if let Some(node_id) = node_id {
@@ -576,10 +637,11 @@ impl PipelineExecutor {
                         lstate.as_mut(),
                         &self.interrupt_state,
                     );
-                    let ctx = ExecutionContext::new(
+                    let ctx = ExecutionContext::with_interrupt_state(
                         self.session.clone(),
                         &self.thread,
                         Some(self.pipeline.as_ref()),
+                        self.interrupt_state.clone(),
                     );
                     match sink.combine(&ctx, &mut combine_input)? {
                         SinkCombineResultType::Finished => {
@@ -623,10 +685,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    use parking_lot::Mutex;
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_scheduler::task::{InterruptDoneSignalState, InterruptState};
 
     use super::{PipelineExecuteResult, PipelineExecutor};
     use crate::execution_context::ExecutionContext;
@@ -747,6 +811,347 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SingleRowSource {
+        emitted: AtomicBool,
+        types: Vec<LogicalType>,
+    }
+
+    impl SingleRowSource {
+        fn new() -> Self {
+            Self {
+                emitted: AtomicBool::new(false),
+                types: vec![LogicalType::Integer],
+            }
+        }
+    }
+
+    impl PhysicalOperator for SingleRowSource {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::RowsetScan
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            chunk: &mut Chunk,
+            _input: &mut OperatorSourceInput,
+        ) -> Result<SourceResultType> {
+            if self.emitted.swap(true, Ordering::SeqCst) {
+                chunk.set_cardinality(0);
+                return Ok(SourceResultType::Finished);
+            }
+
+            let output = chunk
+                .column_mut(0)
+                .expect("single row source output column");
+            output.set_i32(0, 7);
+            chunk.set_cardinality(1);
+            Ok(SourceResultType::HaveMoreOutput)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct EmptySource {
+        types: Vec<LogicalType>,
+    }
+
+    impl EmptySource {
+        fn new() -> Self {
+            Self { types: vec![] }
+        }
+    }
+
+    impl PhysicalOperator for EmptySource {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::RowsetScan
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            chunk: &mut Chunk,
+            _input: &mut OperatorSourceInput,
+        ) -> Result<SourceResultType> {
+            chunk.set_cardinality(0);
+            Ok(SourceResultType::Finished)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingSink {
+        rows: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        types: Vec<LogicalType>,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self {
+                rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                types: Vec::new(),
+            }
+        }
+    }
+
+    impl PhysicalOperator for CountingSink {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::ResultCollector
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            chunk: &Chunk,
+            _input: &mut crate::operator::state::OperatorSinkInput,
+        ) -> Result<SinkResultType> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.rows.fetch_add(chunk.size(), Ordering::SeqCst);
+            Ok(SinkResultType::NeedMoreInput)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct FinishImmediatelyOperator {
+        types: Vec<LogicalType>,
+    }
+
+    impl FinishImmediatelyOperator {
+        fn new() -> Self {
+            Self {
+                types: vec![LogicalType::Integer],
+            }
+        }
+    }
+
+    impl PhysicalOperator for FinishImmediatelyOperator {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::Projection
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: &Chunk,
+            chunk: &mut Chunk,
+            _gstate: &dyn crate::operator::state::GlobalOperatorState,
+            _state: &mut dyn crate::operator::state::OperatorState,
+        ) -> Result<crate::result_type::OperatorResultType> {
+            chunk.set_cardinality(0);
+            Ok(crate::result_type::OperatorResultType::Finished)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct BlockOnceOperator {
+        blocked: AtomicBool,
+        seen_interrupt: Arc<Mutex<Option<InterruptState>>>,
+        types: Vec<LogicalType>,
+    }
+
+    impl BlockOnceOperator {
+        fn new(seen_interrupt: Arc<Mutex<Option<InterruptState>>>) -> Self {
+            Self {
+                blocked: AtomicBool::new(false),
+                seen_interrupt,
+                types: vec![LogicalType::Integer],
+            }
+        }
+    }
+
+    impl std::fmt::Debug for BlockOnceOperator {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BlockOnceOperator")
+                .field("blocked", &self.blocked.load(Ordering::SeqCst))
+                .field("types", &self.types)
+                .finish()
+        }
+    }
+
+    impl PhysicalOperator for BlockOnceOperator {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::Projection
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn execute(
+            &self,
+            ctx: &ExecutionContext,
+            _input: &Chunk,
+            chunk: &mut Chunk,
+            _gstate: &dyn crate::operator::state::GlobalOperatorState,
+            _state: &mut dyn crate::operator::state::OperatorState,
+        ) -> Result<crate::result_type::OperatorResultType> {
+            chunk.set_cardinality(0);
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                *self.seen_interrupt.lock() = Some(ctx.interrupt_state().clone());
+                return Ok(crate::result_type::OperatorResultType::Blocked);
+            }
+            Ok(crate::result_type::OperatorResultType::NeedMoreInput)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct BlockingFinalExecuteOperator {
+        finalized_once: AtomicBool,
+        seen_interrupt: Arc<Mutex<Option<InterruptState>>>,
+        final_calls: Arc<std::sync::atomic::AtomicUsize>,
+        types: Vec<LogicalType>,
+    }
+
+    impl BlockingFinalExecuteOperator {
+        fn new(
+            seen_interrupt: Arc<Mutex<Option<InterruptState>>>,
+            final_calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                finalized_once: AtomicBool::new(false),
+                seen_interrupt,
+                final_calls,
+                types: vec![LogicalType::Integer],
+            }
+        }
+    }
+
+    impl std::fmt::Debug for BlockingFinalExecuteOperator {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BlockingFinalExecuteOperator")
+                .field(
+                    "finalized_once",
+                    &self.finalized_once.load(Ordering::SeqCst),
+                )
+                .field("final_calls", &self.final_calls.load(Ordering::SeqCst))
+                .field("types", &self.types)
+                .finish()
+        }
+    }
+
+    impl PhysicalOperator for BlockingFinalExecuteOperator {
+        fn operator_type(&self) -> PhysicalOperatorType {
+            PhysicalOperatorType::Projection
+        }
+
+        fn types(&self) -> &[LogicalType] {
+            &self.types
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: &Chunk,
+            chunk: &mut Chunk,
+            _gstate: &dyn crate::operator::state::GlobalOperatorState,
+            _state: &mut dyn crate::operator::state::OperatorState,
+        ) -> Result<crate::result_type::OperatorResultType> {
+            chunk.set_cardinality(0);
+            Ok(crate::result_type::OperatorResultType::NeedMoreInput)
+        }
+
+        fn requires_final_execute(&self) -> bool {
+            true
+        }
+
+        fn final_execute(
+            &self,
+            ctx: &ExecutionContext,
+            chunk: &mut Chunk,
+            _gstate: &dyn crate::operator::state::GlobalOperatorState,
+            _state: &mut dyn crate::operator::state::OperatorState,
+        ) -> Result<crate::result_type::OperatorFinalizeResultType> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.finalized_once.swap(true, Ordering::SeqCst) {
+                *self.seen_interrupt.lock() = Some(ctx.interrupt_state().clone());
+                let output = chunk
+                    .column_mut(0)
+                    .expect("blocking final execute output column");
+                output.set_i32(0, 99);
+                chunk.set_cardinality(1);
+                return Ok(crate::result_type::OperatorFinalizeResultType::Blocked);
+            }
+
+            chunk.set_cardinality(0);
+            Ok(crate::result_type::OperatorFinalizeResultType::Finished)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
     #[test]
     fn flushes_explain_profiler_before_executor_returns_finished() {
         let session = test_session();
@@ -776,5 +1181,106 @@ mod tests {
             .expect("profiler stats should be flushed before drop");
         assert_eq!(stats.output_rows, 1);
         assert_eq!(stats.loops, 2);
+    }
+
+    #[test]
+    fn regular_operator_finished_propagates_out_of_executor() {
+        let session = test_session();
+        let pipeline = Arc::new(Pipeline::new());
+        let source = Arc::new(SingleRowSource::new()) as Arc<dyn PhysicalOperator>;
+        let operator = Arc::new(FinishImmediatelyOperator::new()) as Arc<dyn PhysicalOperator>;
+        let sink = Arc::new(CountingSink::new());
+        let sink_rows = sink.rows.clone();
+
+        pipeline.set_source(source);
+        pipeline.add_operator(operator);
+        pipeline.set_sink(sink as Arc<dyn PhysicalOperator>);
+
+        let mut executor =
+            PipelineExecutor::new(session, 0, 1, pipeline).expect("create pipeline executor");
+
+        let result = executor.execute().expect("execute pipeline");
+        assert_eq!(result, PipelineExecuteResult::Finished);
+        assert_eq!(sink_rows.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn regular_operator_blocked_uses_execution_context_interrupt_state() {
+        let session = test_session();
+        let pipeline = Arc::new(Pipeline::new());
+        let source = Arc::new(SingleRowSource::new()) as Arc<dyn PhysicalOperator>;
+        let seen_interrupt = Arc::new(Mutex::new(None));
+        let operator =
+            Arc::new(BlockOnceOperator::new(seen_interrupt.clone())) as Arc<dyn PhysicalOperator>;
+        let sink = Arc::new(PassthroughSink::new()) as Arc<dyn PhysicalOperator>;
+
+        pipeline.set_source(source);
+        pipeline.add_operator(operator);
+        pipeline.set_sink(sink);
+
+        let mut executor =
+            PipelineExecutor::new(session, 0, 1, pipeline).expect("create pipeline executor");
+        let signal = InterruptDoneSignalState::new();
+        executor.interrupt_state = InterruptState::with_signal(signal.downgrade());
+
+        let first = executor.execute().expect("execute pipeline");
+        assert_eq!(first, PipelineExecuteResult::Blocked);
+
+        let interrupt = seen_interrupt
+            .lock()
+            .take()
+            .expect("operator should observe execution interrupt state");
+        interrupt
+            .callback()
+            .expect("signal-backed interrupt callback should succeed");
+        signal.await_signal();
+
+        let second = executor.execute().expect("resume pipeline");
+        assert_eq!(second, PipelineExecuteResult::Finished);
+    }
+
+    #[test]
+    fn final_execute_blocked_preserves_flush_progress_and_output() {
+        let session = test_session();
+        let pipeline = Arc::new(Pipeline::new());
+        let source = Arc::new(EmptySource::new()) as Arc<dyn PhysicalOperator>;
+        let seen_interrupt = Arc::new(Mutex::new(None));
+        let final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let operator = Arc::new(BlockingFinalExecuteOperator::new(
+            seen_interrupt.clone(),
+            final_calls.clone(),
+        )) as Arc<dyn PhysicalOperator>;
+        let sink = Arc::new(CountingSink::new());
+        let sink_rows = sink.rows.clone();
+        let sink_calls = sink.calls.clone();
+
+        pipeline.set_source(source);
+        pipeline.add_operator(operator);
+        pipeline.set_sink(sink as Arc<dyn PhysicalOperator>);
+
+        let mut executor =
+            PipelineExecutor::new(session, 0, 1, pipeline).expect("create pipeline executor");
+        let signal = InterruptDoneSignalState::new();
+        executor.interrupt_state = InterruptState::with_signal(signal.downgrade());
+
+        let first = executor.execute().expect("execute pipeline");
+        assert_eq!(first, PipelineExecuteResult::Blocked);
+        assert_eq!(sink_rows.load(Ordering::SeqCst), 1);
+        assert_eq!(sink_calls.load(Ordering::SeqCst), 1);
+
+        let interrupt = seen_interrupt
+            .lock()
+            .take()
+            .expect("final execute should observe execution interrupt state");
+        interrupt
+            .callback()
+            .expect("signal-backed interrupt callback should succeed");
+        signal.await_signal();
+
+        let second = executor.execute().expect("resume pipeline");
+        assert_eq!(second, PipelineExecuteResult::Finished);
+        assert_eq!(sink_rows.load(Ordering::SeqCst), 1);
+        assert_eq!(sink_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
     }
 }

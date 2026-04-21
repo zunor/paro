@@ -4,6 +4,7 @@
 //! Plans DDL statements into logical operators.
 
 use crate::binder::bind::statement::alter::BoundAlterEntryInfo;
+use crate::binder::bind::statement::create_function::BoundCreateRoutineInfo;
 use crate::binder::bind::statement::create_index::BoundCreateIndexInfo;
 use crate::binder::bind::statement::create_property_graph::BoundCreatePropertyGraphInfo;
 use crate::binder::bind::statement::create_schema::BoundCreateSchemaInfo;
@@ -15,8 +16,8 @@ use crate::binder::bind::statement::drop_property_graph::BoundDropPropertyGraphI
 use crate::binder::bind::statement::refresh_property_graph::BoundRefreshPropertyGraphInfo;
 use crate::binder::Binder;
 use crate::operator::{
-    Alter, CreateIndex, CreatePropertyGraph, CreateSchema, CreateSequence, CreateTable, CreateView,
-    Drop, DropPropertyGraph, LogicalOperator, RefreshPropertyGraph,
+    Alter, CreateIndex, CreatePropertyGraph, CreateRoutine, CreateSchema, CreateSequence,
+    CreateTable, CreateView, Drop, DropPropertyGraph, LogicalOperator, RefreshPropertyGraph,
 };
 use paro_common::error::Result;
 
@@ -27,6 +28,14 @@ impl Binder {
     ) -> Result<LogicalOperator> {
         let op = CreateTable::new(info);
         Ok(LogicalOperator::CreateTable(op))
+    }
+
+    pub(crate) fn plan_create_routine(
+        &mut self,
+        info: BoundCreateRoutineInfo,
+    ) -> Result<LogicalOperator> {
+        let op = CreateRoutine::new(info);
+        Ok(LogicalOperator::CreateRoutine(op))
     }
 
     pub(crate) fn plan_create_sequence(

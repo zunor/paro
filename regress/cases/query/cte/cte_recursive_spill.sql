@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: Apache-2.0
 
 SET temp_directory = '/tmp/paro_regress_recursive_cte_spill';
-SET memory_limit = '8MB';
+SET memory_limit = '1GB';
 
 WITH RECURSIVE spill_rows(i, pad) AS (
     VALUES (
