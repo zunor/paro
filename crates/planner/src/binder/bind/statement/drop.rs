@@ -15,14 +15,14 @@
 //! - CASCADE/RESTRICT not fully implemented
 //! - No dependency checking
 
+use crate::binder::ir::BoundStatementKind;
+use crate::binder::Binder;
 use paro_catalog::entry::CatalogType;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::types::LogicalType;
 use paro_parser::ast::{
     DropIndexStmt, DropSchemaStmt, DropSequenceStmt, DropTableStmt, DropViewStmt,
 };
-
-use crate::binder::ir::BoundStatementKind;
-use crate::binder::Binder;
 
 /// The type of object being dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub enum DropType {
     Index,
     View,
     Sequence,
+    Routine,
 }
 
 /// Information about a bound DROP statement.
@@ -49,6 +50,8 @@ pub struct BoundDropInfo {
     pub if_exists: bool,
     /// Whether CASCADE was specified.
     pub cascade: bool,
+    /// Signature argument types for overload-aware drops such as DROP FUNCTION.
+    pub routine_arg_types: Vec<LogicalType>,
 }
 
 /// Bind a DROP TABLE statement.
@@ -103,6 +106,7 @@ pub fn bind_drop_table(
                 object_name,
                 if_exists: true,
                 cascade: false,
+                routine_arg_types: Vec::new(),
             }));
         } else {
             return Err(paro_error::catalog(format!(
@@ -136,6 +140,7 @@ pub fn bind_drop_table(
                         object_name,
                         if_exists: true,
                         cascade: false,
+                        routine_arg_types: Vec::new(),
                     }));
                 } else {
                     return Err(e);
@@ -151,6 +156,7 @@ pub fn bind_drop_table(
         object_name,
         if_exists: drop_table.if_exists,
         cascade: false,
+        routine_arg_types: Vec::new(),
     }))
 }
 
@@ -180,6 +186,7 @@ pub fn bind_drop_schema(binder: &mut Binder, stmt: DropSchemaStmt) -> Result<Bou
         object_name: schema_name,
         if_exists: stmt.if_exists,
         cascade: stmt.cascade,
+        routine_arg_types: Vec::new(),
     }))
 }
 
@@ -285,6 +292,7 @@ pub fn bind_drop_index(
         object_name,
         if_exists: drop_index.if_exists,
         cascade: false,
+        routine_arg_types: Vec::new(),
     }))
 }
 
@@ -321,6 +329,7 @@ pub fn bind_drop_view(binder: &mut Binder, drop_view: DropViewStmt) -> Result<Bo
         object_name,
         if_exists: drop_view.if_exists,
         cascade: false,
+        routine_arg_types: Vec::new(),
     }))
 }
 
@@ -355,5 +364,6 @@ pub fn bind_drop_sequence(
         object_name,
         if_exists: drop_sequence.if_exists,
         cascade: false,
+        routine_arg_types: Vec::new(),
     }))
 }

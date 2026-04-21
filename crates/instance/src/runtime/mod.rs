@@ -4,6 +4,7 @@
 use crate::database::opener::DatabaseOpenContext;
 use crate::file_system::DatabaseFileSystem;
 use crate::{BootConfig, Instance};
+use paro_external_runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{
@@ -33,6 +34,7 @@ pub struct InstanceRuntime {
     session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
     db_file_system: Arc<DatabaseFileSystem>,
+    python_runtime: Arc<ExternalRuntimeHost>,
     tuning: RuntimeTuning,
 }
 
@@ -45,6 +47,7 @@ pub(crate) struct InstanceRuntimeResources {
     pub(crate) session_registry: Arc<SessionExecutionRegistry>,
     pub(crate) object_cache: Arc<ObjectCache>,
     pub(crate) db_file_system: Arc<DatabaseFileSystem>,
+    pub(crate) python_runtime: Arc<ExternalRuntimeHost>,
 }
 
 impl InstanceRuntime {
@@ -58,6 +61,7 @@ impl InstanceRuntime {
             session_registry,
             object_cache,
             db_file_system,
+            python_runtime,
         } = resources;
         Self {
             buffer_pool,
@@ -68,6 +72,7 @@ impl InstanceRuntime {
             session_registry,
             object_cache,
             db_file_system,
+            python_runtime,
             tuning,
         }
     }
@@ -102,6 +107,14 @@ impl InstanceRuntime {
 
     pub fn db_file_system(&self) -> &Arc<DatabaseFileSystem> {
         &self.db_file_system
+    }
+
+    pub fn python_runtime(&self) -> &Arc<ExternalRuntimeHost> {
+        &self.python_runtime
+    }
+
+    pub fn python_runtime_status(&self) -> PythonRuntimeStatus {
+        self.python_runtime.status()
     }
 
     pub fn tuning(&self) -> &RuntimeTuning {
@@ -208,6 +221,14 @@ impl Instance {
 
     pub fn get_file_system(&self) -> &Arc<DatabaseFileSystem> {
         self.runtime.db_file_system()
+    }
+
+    pub fn python_runtime(&self) -> &Arc<ExternalRuntimeHost> {
+        self.runtime.python_runtime()
+    }
+
+    pub fn python_runtime_status(&self) -> PythonRuntimeStatus {
+        self.runtime.python_runtime_status()
     }
 
     pub fn boot_config(&self) -> &Arc<BootConfig> {

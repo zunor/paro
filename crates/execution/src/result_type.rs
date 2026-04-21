@@ -40,12 +40,15 @@ impl fmt::Display for OperatorResultType {
 ///
 /// Used when operators need to flush cached results:
 /// - `HaveMoreOutput`: Contains more cached results
+/// - `Blocked`: Finalize is currently blocked and should be resumed later
 /// - `Finished`: All cached data has been flushed
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OperatorFinalizeResultType {
     /// Operator has more cached output
     HaveMoreOutput = 0,
+    /// Operator finalize is currently blocked
+    Blocked,
     /// Operator has finished flushing
     Finished,
 }
@@ -54,6 +57,7 @@ impl fmt::Display for OperatorFinalizeResultType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HaveMoreOutput => write!(f, "HAVE_MORE_OUTPUT"),
+            Self::Blocked => write!(f, "BLOCKED"),
             Self::Finished => write!(f, "FINISHED"),
         }
     }

@@ -465,10 +465,7 @@ impl FoldableConstantMatcher {
         match expr {
             Expression::Constant(_) => true,
             Expression::Function(func) => {
-                // Function is foldable if all children are foldable
-                // and the function is deterministic (not volatile)
-                // For now, assume all functions are deterministic
-                func.children.iter().all(Self::is_foldable)
+                func.is_foldable_native() && func.children.iter().all(Self::is_foldable)
             }
             Expression::Cast(cast) => Self::is_foldable(&cast.child),
             Expression::Comparison(comp) => {
@@ -704,33 +701,31 @@ mod tests {
         let matcher =
             FunctionExpressionMatcher::with_function(Box::new(SpecificFunctionMatcher::new("add")));
 
-        let func_expr = Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        let func_expr = Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "add".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![make_constant(1), make_constant(2)],
-            return_type: LogicalType::Integer,
-        });
+            ),
+            vec![make_constant(1), make_constant(2)],
+            LogicalType::Integer,
+        ));
 
         let mut bindings = Vec::new();
         assert!(matcher.matches(&func_expr, &mut bindings));
 
         // Wrong function name
-        let wrong_func = Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        let wrong_func = Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "subtract".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![make_constant(1), make_constant(2)],
-            return_type: LogicalType::Integer,
-        });
+            ),
+            vec![make_constant(1), make_constant(2)],
+            LogicalType::Integer,
+        ));
 
         bindings.clear();
         assert!(!matcher.matches(&wrong_func, &mut bindings));

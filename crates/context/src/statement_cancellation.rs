@@ -225,4 +225,26 @@ mod tests {
             .expect_err("statement should be cancelled");
         assert!(err.is_query_canceled());
     }
+
+    #[test]
+    fn check_uses_distinct_statement_timeout_sqlstate() {
+        let connection_token = CancellationToken::new();
+        let statement_token = connection_token.child_token();
+        let cancel_reason = Arc::new(OnceLock::new());
+        let cancellation = StatementCancellation::from_parts(
+            connection_token,
+            statement_token.clone(),
+            Some(Duration::from_secs(1)),
+            cancel_reason.clone(),
+            Arc::new(NoopStatementTimeoutDriver),
+        );
+
+        let _ = cancel_reason.set(StatementCancelReason::StatementTimeout);
+        statement_token.cancel();
+        let err = cancellation
+            .check()
+            .expect_err("statement timeout should be surfaced as an error");
+        assert!(err.is_query_canceled());
+        assert!(err.is(paro_common::error::codes::operator::STATEMENT_TIMEOUT));
+    }
 }

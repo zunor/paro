@@ -3,9 +3,9 @@
 
 use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
-    QueryResources, RuntimeLimits, SessionMetadataProvider, StatementCancellation,
-    StatementEnvironment, StatementExecutionTracker, StatementOptions, StatementView,
-    TxnAdmissionState, WriteGuard,
+    QueryResources, RuntimeLimits, SessionMetadataProvider, StatementAuthContext,
+    StatementCancellation, StatementEnvironment, StatementExecutionTracker, StatementOptions,
+    StatementView, TxnAdmissionState, WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -13,6 +13,7 @@ use paro_catalog::search_path::CatalogSearchEntry;
 use paro_common::allocator::{Allocator, BufferAllocator, MemoryTag};
 use paro_common::identity::GraphId;
 use paro_common::runtime_value::Value;
+use paro_external_runtime::host::PythonRuntimeStatus;
 use paro_storage::meta::TabletMetaManager;
 use std::sync::Arc;
 
@@ -69,6 +70,10 @@ impl StatementContext {
         &self.env.search_path
     }
 
+    pub fn auth(&self) -> &StatementAuthContext {
+        &self.env.auth
+    }
+
     pub fn is_interrupted(&self) -> bool {
         self.cancellation.is_cancelled()
     }
@@ -106,6 +111,29 @@ impl StatementContext {
 
     pub fn query_governance(&self) -> &crate::QueryResourceGovernance {
         &self.services.governance
+    }
+
+    pub fn python_runtime_status(&self) -> Option<PythonRuntimeStatus> {
+        self.services
+            .python_runtime
+            .as_ref()
+            .map(|provider| provider.status())
+    }
+
+    pub fn ensure_python_runtime_ready_for_ddl(&self) -> paro_common::error::Result<()> {
+        if let Some(provider) = &self.services.python_runtime {
+            provider.ensure_ready_for_ddl()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn ensure_python_runtime_ready_for_execution(&self) -> paro_common::error::Result<()> {
+        if let Some(provider) = &self.services.python_runtime {
+            provider.ensure_ready_for_execution()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn shared_plan_cache(&self) -> Option<&Arc<dyn crate::SharedPlanCacheHandle>> {

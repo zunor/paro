@@ -25,10 +25,13 @@ paro-parser = { workspace = true }
 paro-catalog = { workspace = true }
 paro-context = { workspace = true }
 paro-function = { workspace = true }
+paro-routine = { workspace = true }
 paro-storage = { workspace = true }
 ethnum = { workspace = true }
+itertools = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 paro-context = { workspace = true, features = ["test-support"] }
+paro-external-runtime = { workspace = true }
 paro-instance = { workspace = true }

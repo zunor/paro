@@ -1515,6 +1515,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f4779c6901a562440c3786d08192c6fbda7c1c2060edd10006b05ee35d10f2d"
 dependencies = [
  "num-traits",
+ "rand 0.8.5",
+ "serde",
 ]
 
 [[package]]
@@ -1544,10 +1546,13 @@ dependencies = [
 name = "paro-catalog"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "paro-common",
  "paro-function",
  "paro-parser",
+ "paro-routine",
  "paro-storage",
+ "serde",
 ]
 
 [[package]]
@@ -1588,6 +1593,7 @@ version = "0.1.0"
 dependencies = [
  "paro-catalog",
  "paro-common",
+ "paro-external-runtime",
  "paro-function",
  "paro-scheduler",
  "paro-storage",
@@ -1604,14 +1610,39 @@ dependencies = [
  "paro-catalog",
  "paro-common",
  "paro-context",
+ "paro-external-abi",
+ "paro-external-runtime",
  "paro-function",
  "paro-optimizer",
  "paro-parser",
  "paro-planner",
+ "paro-routine",
  "paro-scheduler",
  "paro-storage",
  "serde_json",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "paro-external-abi"
+version = "0.1.0"
+dependencies = [
+ "ordered-float",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "paro-external-runtime"
+version = "0.1.0"
+dependencies = [
+ "paro-common",
+ "paro-external-abi",
+ "paro-routine",
+ "serde",
+ "thiserror 2.0.17",
  "tracing",
 ]
 
@@ -1640,9 +1671,11 @@ dependencies = [
  "paro-common",
  "paro-context",
  "paro-execution",
+ "paro-external-runtime",
  "paro-function",
  "paro-journal",
  "paro-parser",
+ "paro-routine",
  "paro-scheduler",
  "paro-storage",
  "rand 0.8.5",
@@ -1676,6 +1709,7 @@ dependencies = [
  "paro-function",
  "paro-parser",
  "paro-planner",
+ "paro-routine",
  "paro-storage",
  "tracing",
 ]
@@ -1720,14 +1754,25 @@ name = "paro-planner"
 version = "0.1.0"
 dependencies = [
  "ethnum",
+ "itertools 0.13.0",
  "paro-catalog",
  "paro-common",
  "paro-context",
+ "paro-external-runtime",
  "paro-function",
  "paro-instance",
  "paro-parser",
+ "paro-routine",
  "paro-storage",
  "tracing",
+]
+
+[[package]]
+name = "paro-routine"
+version = "0.1.0"
+dependencies = [
+ "paro-common",
+ "serde",
 ]
 
 [[package]]
@@ -1783,6 +1828,7 @@ dependencies = [
  "paro-journal",
  "paro-parser",
  "paro-planner",
+ "paro-routine",
  "paro-scheduler",
  "paro-storage",
  "serde_json",
@@ -2130,6 +2176,7 @@ dependencies = [
  "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "serde",
 ]
 
 [[package]]
@@ -2169,6 +2216,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.16",
+ "serde",
 ]
 
 [[package]]

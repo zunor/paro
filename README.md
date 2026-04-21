@@ -39,9 +39,28 @@ psql -h 127.0.0.1 -p 6432 -d postgres
 
 `make run` compiles and starts `parod` on `127.0.0.1:6432` by default.
 
+Python UDF support is intentionally optional. `make run` does not create a Python
+environment, does not probe the worker runtime on the boot path, and does not
+require a local Python interpreter for the database to start serving ordinary SQL.
+
 > Requires Rust ≥ 1.85. `psql` ≥ 14 is recommended; older versions may work but are not regularly tested.
 >
 > Override the listen address with `PARO_HOST` / `PARO_PORT` if needed, for example `make run PARO_HOST=0.0.0.0`. Authentication is not implemented yet, so do not expose Paro to untrusted networks.
+
+## Python UDF Development
+
+Project-level entry points:
+
+- `make python-udf-unit` runs ABI/runtime Rust tests plus Python worker and SDK unit tests.
+- `make python-udf-startup-smoke` verifies `parod` still starts when the Python runtime is disabled.
+- `make python-udf-regress` runs the dedicated SQL gate on the real worker / artifact execution path.
+- `make python-udf-ci` runs the dedicated Python UDF unit, startup, and SQL-regress flow end-to-end.
+
+More focused docs live here:
+
+- [`regress/README.md`](regress/README.md) for SQL regression structure and fixture staging
+- [`runtimes/python-worker/README.md`](runtimes/python-worker/README.md) for the worker-side loop and tests
+- [`python/paro_udf/README.md`](python/paro_udf/README.md) for the user-facing SDK
 
 ## Query Example
 

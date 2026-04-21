@@ -6,6 +6,7 @@
 //!
 
 use paro_common::types::LogicalType;
+use paro_routine::RoutineCallIdentity;
 
 use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
@@ -61,6 +62,49 @@ impl Expression {
             }
         }
         self.return_type()
+    }
+
+    pub fn contains_external_routine(&self) -> bool {
+        match self {
+            Expression::Function(expr) => {
+                expr.crosses_execution_boundary()
+                    || expr.children.iter().any(Self::contains_external_routine)
+            }
+            Expression::Cast(expr) => expr.child.contains_external_routine(),
+            Expression::Conjunction(expr) => {
+                expr.children.iter().any(Self::contains_external_routine)
+            }
+            Expression::Case(expr) => {
+                expr.check.contains_external_routine()
+                    || expr.result_if_true.contains_external_routine()
+                    || expr.result_if_false.contains_external_routine()
+            }
+            Expression::Comparison(expr) => {
+                expr.left.contains_external_routine() || expr.right.contains_external_routine()
+            }
+            Expression::Operator(expr) => expr.children.iter().any(Self::contains_external_routine),
+            Expression::Aggregate(expr) => {
+                expr.children.iter().any(Self::contains_external_routine)
+                    || expr
+                        .filter
+                        .as_ref()
+                        .is_some_and(|filter| filter.contains_external_routine())
+                    || expr
+                        .order_bys
+                        .iter()
+                        .any(|order| order.expression.contains_external_routine())
+            }
+            Expression::Subquery(expr) => expr.children.iter().any(Self::contains_external_routine),
+            Expression::Window(expr) => {
+                expr.children.iter().any(Self::contains_external_routine)
+                    || expr.partitions.iter().any(Self::contains_external_routine)
+                    || expr
+                        .orders
+                        .iter()
+                        .any(|order| order.expression.contains_external_routine())
+            }
+            Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => false,
+        }
     }
 
     /// Recursively replace ColumnRef expressions using the provided mapping function.
@@ -329,8 +373,9 @@ impl Expression {
             }
             (Expression::Constant(a), Expression::Constant(b)) => a.value == b.value,
             (Expression::Function(a), Expression::Function(b)) => {
-                a.function.name == b.function.name
-                    && a.function.arguments == b.function.arguments
+                routine_identities_equal(a.routine_identity(), b.routine_identity(), || {
+                    a.function.name == b.function.name
+                }) && a.function.arguments == b.function.arguments
                     && a.children.len() == b.children.len()
                     && a.children
                         .iter()
@@ -414,5 +459,16 @@ impl Expression {
             }
             _ => false,
         }
+    }
+}
+
+fn routine_identities_equal(
+    left: Option<&RoutineCallIdentity>,
+    right: Option<&RoutineCallIdentity>,
+    fallback: impl FnOnce() -> bool,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => fallback(),
     }
 }

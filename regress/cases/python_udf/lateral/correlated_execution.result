@@ -1,0 +1,28 @@
+DROP FUNCTION IF EXISTS py_scale(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_scale(a INTEGER) RETURNS TABLE (value INTEGER)
+LANGUAGE python
+AS $$return [value * 10 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT t.x, s.value
+FROM (VALUES (1), (2), (3)) AS t(x)
+CROSS JOIN LATERAL py_scale(t.x) AS s
+ORDER BY 1, 2;
+t.x	s.value
+1	10
+2	20
+3	30
+
+SELECT t.x, s.value
+FROM (VALUES (1), (2), (3)) AS t(x)
+LEFT JOIN LATERAL py_scale(t.x) AS s ON true
+ORDER BY 1, 2;
+t.x	s.value
+1	10
+2	20
+3	30
+
+DROP FUNCTION py_scale(INTEGER);
+DROP FUNCTION

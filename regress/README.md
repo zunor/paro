@@ -10,8 +10,10 @@ regress/
 │   ├── ddl/
 │   ├── dml/
 │   ├── errors/
+│   ├── python_udf/
 │   ├── types/
 │   └── …
+├── fixtures/        # staged test-only inputs for narrow cases such as python_udf
 ├── harness/         # parser, executor and comparator (pure Python)
 ├── unit/            # unit tests for the harness itself
 ├── report/          # generated after each run (gitignored)
@@ -41,6 +43,12 @@ make check FILE=query/select
 
 > You can also invoke these from the **project root**:
 > `make regress`, `make regress FILE=types`, etc.
+
+Python UDF specific entry points also exist at the project root:
+
+- `make python-udf-regress`
+- `make python-udf-startup-smoke`
+- `make python-udf-ci`
 
 ---
 
@@ -108,6 +116,7 @@ Directives are SQL comments that control the runner's behaviour.
 | `-- @statement ok` | Force a block to be treated as a statement (rarely needed). |
 | `-- @statement error <pattern>` | Validate that an error matches a specific regex/SQLSTATE. |
 | `-- @normalize <profiles>` | Apply registered text normalizers before comparison. Unknown profiles fail during parse. |
+| `-- @control <action> [key=value …]` | Execute a harness-side control action such as `restart` or `connect` before the next SQL block. |
 
 ### Normalize Profiles
 
@@ -119,6 +128,8 @@ product-contract problems. Current registered profiles are:
 | `explain_operator_timing` | Normalize EXPLAIN ANALYZE per-operator timing text | `actual time=...` | Stable |
 | `explain_summary_timing` | Normalize EXPLAIN summary timing text | `Planning Time: ...`, `Execution Time: ...` | Stable |
 | `explain_runtime_bytes` | Normalize volatile spill/memory byte fields | `Memory: ...`, `Disk: ...`, `Peak Memory: ...`, `Temp Storage: ...` | Stable |
+| `explain_routine_ids` | Normalize catalog ids embedded in routine labels | `Routine: name[id@generation]`, `Routines: ...` | Stable |
+| `explain_external_runtime` | Normalize volatile external runtime latency fields | `Latency(us): acquire=... queue=... kernel=... encode_decode=...` | Stable |
 | `explain_runtime` | Legacy alias combining operator + summary timing normalization | `actual time=...`, `Planning Time: ...`, `Execution Time: ...` | Transitional |
 
 Notes:
@@ -135,6 +146,56 @@ Example:
 ```sql
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT * FROM t ORDER BY id;
+```
+
+### Control Blocks
+
+`@control` is intentionally small and only exists for SQL E2E scenarios that need
+runner-managed orchestration rather than product SQL syntax.
+
+Current actions are:
+
+| Action | Example | Purpose |
+|--------|---------|---------|
+| `restart` | `-- @control restart profile=python_disabled` | Restart the local `parod` listener with a named runtime profile from `config.toml`. |
+| `connect` | `-- @control connect user=routine_builder` | Reconnect using a different startup identity or connection override. |
+
+Notes:
+
+- `restart` only works against a local Paro listener (`localhost` / `127.0.0.1`).
+- Runtime profiles live under `[runtime_profiles.<name>]` in `regress/config.toml`.
+- Profile-managed environment keys are cleared before each restart, so switching back to `profile=default` returns to a clean runtime state.
+- `connect` preserves the current connection target unless you override fields such as `user`, `database`, `host`, `port`, or `password`.
+
+### Python UDF Fixtures
+
+Python UDF SQL cases live under `cases/python_udf/` and mirror the long-term topic
+split from the design docs:
+
+- `ddl/`
+- `scalar/`
+- `table/`
+- `aggregate/`
+- `window/`
+- `transaction/`
+- `lateral/`
+- `errors/`
+- `explain/`
+- `availability/`
+
+Reusable Python modules, packages, and data belong under `fixtures/python_udf/`.
+The fixture contract is intentionally narrow:
+
+1. Declare staged roots with `-- @fixture python_udf/modules/basic_math`
+2. Reference the staged location with `{{fixture:python_udf/modules/basic_math}}`
+3. Keep artifact resolution and worker bootstrap on the real product path; fixture staging only copies files into the run-local report area
+
+Example:
+
+```sql
+-- @fixture python_udf/modules/basic_math
+-- @query file
+FILE '{{fixture:python_udf/modules/basic_math}}/basic_math.py';
 ```
 
 ### Example

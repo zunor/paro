@@ -155,6 +155,16 @@ impl PhysicalOperator for Drop {
                     },
                 )?;
             }
+            DropType::Routine => {
+                ddl.apply_drop_routine(
+                    self.info.schema_name.clone(),
+                    self.info.object_name.clone(),
+                    paro_catalog::entry::DropRoutineInfo {
+                        arg_types: self.info.routine_arg_types.clone(),
+                        if_exists: self.info.if_exists,
+                    },
+                )?;
+            }
         }
 
         Ok(SourceResultType::Finished)

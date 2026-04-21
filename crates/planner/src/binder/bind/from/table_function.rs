@@ -5,14 +5,22 @@
 //! Non-constant arguments still require constant folding before bind.
 
 use crate::binder::bind::expr;
-use crate::binder::ir::{BoundFromItem, BoundTableFunction};
+use crate::binder::ir::{BoundExternalRoutine, BoundFromItem, BoundTableFunction};
+use crate::binder::plan::subquery::{
+    split_child_correlated_columns, CorrelationBoundaryMode, CorrelationProjectionMode,
+};
 use crate::binder::Binder;
 use crate::expression::*;
-use paro_catalog::entry::CatalogType;
+use paro_catalog::entry::{CatalogEntryEnum, CatalogType, StoredRoutineOverload};
 use paro_common::error::{self as paro_error, Result};
 use paro_function::table::{TableFunction, TableFunctionBindInput};
 use paro_parser::ast::{Expr, Identifier, TableAlias};
+use paro_routine::{
+    BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineFamily,
+    RoutineReturn,
+};
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
 /// Bind a table function reference.
@@ -27,59 +35,29 @@ pub fn bind_table_function_ref(
     args: Vec<Expr>,
     named_params: Vec<(Identifier, Expr)>,
     alias: Option<TableAlias>,
+    lateral: bool,
     with_ordinality: bool,
 ) -> Result<BoundFromItem> {
-    // 1. Bind the function arguments first (recursive binding of expressions)
+    // 1. Look up the native table function entry before enforcing native-only
+    // constant-argument semantics. External table routines can accept bound
+    // expressions and correlated columns.
+    let Some(entry) = lookup_catalog_entry(binder, CatalogType::TableFunction, function_name)?
+    else {
+        return bind_external_table_routine_ref(
+            binder,
+            function_name,
+            args,
+            alias,
+            lateral,
+            with_ordinality,
+        );
+    };
+
+    // 2. Bind the function arguments first (recursive binding of expressions)
     let (bound_args, arg_values, arg_types) = bind_function_arguments(binder, &args)?;
 
-    // 2. Bind named parameters
+    // 3. Bind named parameters
     let (bound_named_args, named_param_values) = bind_named_parameters(binder, &named_params)?;
-
-    // 3. Look up the table function in the catalog and find matching overload
-    let search_path = binder.session_context().search_path();
-    let mut entry = None;
-
-    for search_entry in search_path {
-        // Resolve catalog
-        let catalog_name = if search_entry.catalog.is_empty() {
-            binder.catalog().name().to_string()
-        } else {
-            search_entry.catalog.clone()
-        };
-
-        // Get the catalog for this entry
-        let catalog = if catalog_name == binder.catalog().name() {
-            Some(binder.catalog())
-        } else {
-            binder
-                .session_context()
-                .database(&catalog_name)
-                .map(|db| db.catalog.clone())
-        };
-
-        if let Some(catalog) = catalog {
-            // Lookup schema and entry
-            if let Ok(schema) = catalog.get_schema(&binder.catalog_txn_view(), &search_entry.schema)
-            {
-                if let Some(e) = schema
-                    .collection(CatalogType::TableFunction)
-                    .expect("table function collection")
-                    .get_entry(
-                        binder.catalog_txn_view().transaction_id,
-                        binder.catalog_txn_view().start_time,
-                        function_name,
-                    )
-                {
-                    entry = Some(e);
-                    break;
-                }
-            }
-        }
-    }
-
-    let entry = entry.ok_or_else(|| {
-        paro_error::catalog(format!("Table function '{}' not found", function_name))
-    })?;
 
     let tf_entry = entry.as_table_function().ok_or_else(|| {
         paro_error::catalog(format!("'{}' is not a table function", function_name))
@@ -183,6 +161,237 @@ pub fn bind_table_function_ref(
         child_table: None,
         with_ordinality,
     }))
+}
+
+fn lookup_catalog_entry(
+    binder: &Binder,
+    catalog_type: CatalogType,
+    name: &str,
+) -> Result<Option<Arc<CatalogEntryEnum>>> {
+    let search_path = binder.session_context().search_path();
+    for search_entry in search_path {
+        let catalog_name = if search_entry.catalog.is_empty() {
+            binder.catalog().name().to_string()
+        } else {
+            search_entry.catalog.clone()
+        };
+
+        let catalog = if catalog_name == binder.catalog().name() {
+            Some(binder.catalog())
+        } else {
+            binder
+                .session_context()
+                .database(&catalog_name)
+                .map(|db| db.catalog.clone())
+        };
+
+        let Some(catalog) = catalog else {
+            continue;
+        };
+        let Ok(schema) = catalog.get_schema(&binder.catalog_txn_view(), &search_entry.schema)
+        else {
+            continue;
+        };
+        let Some(entry) = schema
+            .collection(catalog_type)
+            .expect("catalog collection")
+            .get_entry(
+                binder.catalog_txn_view().transaction_id,
+                binder.catalog_txn_view().start_time,
+                name,
+            )
+        else {
+            continue;
+        };
+        return Ok(Some(entry));
+    }
+
+    Ok(None)
+}
+
+fn bind_external_table_routine_ref(
+    binder: &mut Binder,
+    function_name: &str,
+    args: Vec<Expr>,
+    alias: Option<TableAlias>,
+    lateral: bool,
+    with_ordinality: bool,
+) -> Result<BoundFromItem> {
+    if with_ordinality {
+        return Err(paro_error::not_implemented(
+            "WITH ORDINALITY for external table routines",
+        ));
+    }
+
+    let Some(entry) = lookup_catalog_entry(binder, CatalogType::Routine, function_name)? else {
+        return Err(paro_error::catalog(format!(
+            "Table function '{}' not found",
+            function_name
+        )));
+    };
+
+    let CatalogEntryEnum::Routine(routine_entry) = &*entry else {
+        return Err(paro_error::catalog(format!(
+            "'{}' is not a routine",
+            function_name
+        )));
+    };
+
+    let mut child_binder = binder.create_child();
+    let mut bound_arguments = Vec::with_capacity(args.len());
+    let mut argument_types = Vec::with_capacity(args.len());
+    for arg in args {
+        let bound = expr::bind_expression(&mut child_binder, arg)?;
+        argument_types.push(bound.return_type());
+        bound_arguments.push(bound);
+    }
+
+    let overload = routine_entry.resolve(&argument_types)?;
+    let split = split_child_correlated_columns(
+        mem::take(&mut child_binder.correlated_columns),
+        CorrelationBoundaryMode::ScopeBoundary,
+    );
+    let correlated_columns = if lateral {
+        split.projected_correlations(CorrelationProjectionMode::IncludeDepthOnePropagated)
+    } else {
+        split.local_to_child_parent.clone()
+    };
+    binder.correlated_columns.extend(split.propagate_to_parent);
+
+    if !lateral && !correlated_columns.is_empty() {
+        return Err(paro_error::syntax(
+            "Table routine in FROM cannot reference outer columns without LATERAL",
+        ));
+    }
+
+    let target_types = overload
+        .spec
+        .arguments
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+    let mut final_arguments = Vec::with_capacity(bound_arguments.len());
+    for (index, arg) in bound_arguments.into_iter().enumerate() {
+        if argument_types[index] != target_types[index] {
+            final_arguments.push(CastExpression::add_cast_if_needed(
+                arg,
+                target_types[index].clone(),
+                &binder.cast_functions,
+            )?);
+        } else {
+            final_arguments.push(arg);
+        }
+    }
+
+    let (column_names, column_types) = match (&overload.spec.family, &overload.spec.return_type) {
+        (RoutineFamily::TableBatch, RoutineReturn::Table(columns)) => (
+            columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>(),
+            columns
+                .iter()
+                .map(|column| column.data_type.clone())
+                .collect::<Vec<_>>(),
+        ),
+        (RoutineFamily::ScalarBatch, _) => {
+            return Err(paro_error::not_implemented(format!(
+                "Scalar routine '{}' cannot bind through FROM",
+                function_name
+            )));
+        }
+        (RoutineFamily::AggregateBatch, _) => {
+            return Err(paro_error::not_implemented(format!(
+                "Aggregate routine '{}' binds through a dedicated external aggregate path",
+                function_name
+            )));
+        }
+        (RoutineFamily::WindowBatch, _) => {
+            return Err(paro_error::not_implemented(format!(
+                "Window routine '{}' binds through a dedicated external window path",
+                function_name
+            )));
+        }
+        _ => {
+            return Err(paro_error::internal(format!(
+                "routine '{}' has inconsistent family/return contract",
+                function_name
+            )));
+        }
+    };
+
+    let (table_alias, final_names, final_types) =
+        determine_alias_and_columns(function_name, &column_names, &column_types, alias)?;
+    let table_index = binder.bind_context.generate_table_index();
+    binder.bind_context.add_binding(
+        table_alias.clone(),
+        table_index,
+        final_names.clone(),
+        final_types.clone(),
+    );
+
+    let routine_meta = routine_meta_from_overload(&overload);
+    let call_expression = Expression::Function(
+        FunctionExpression::new(
+            external_table_placeholder(function_name, &target_types, &column_types),
+            final_arguments.clone(),
+            final_types
+                .first()
+                .cloned()
+                .unwrap_or(paro_common::types::LogicalType::Unknown),
+        )
+        .with_routine_meta(routine_meta.clone()),
+    );
+
+    Ok(BoundFromItem::ExternalRoutine(BoundExternalRoutine {
+        alias: table_alias,
+        column_names: final_names,
+        column_types: final_types,
+        table_index,
+        call_expression,
+        bound_arguments: final_arguments,
+        call: routine_meta,
+        lateral,
+        correlated_columns,
+    }))
+}
+
+fn routine_meta_from_overload(overload: &StoredRoutineOverload) -> BoundRoutineCallMeta {
+    BoundRoutineCallMeta {
+        identity: RoutineCallIdentity::Catalog {
+            routine_id: overload.spec.identity.id,
+            generation: overload.spec.identity.generation,
+        },
+        semantics: overload.spec.semantics.clone(),
+        boundary: ExecutionBoundary {
+            placement: PlacementClass::External,
+            may_block: overload.spec.semantics.may_block,
+            row_semantics: overload.spec.semantics.row_semantics.clone(),
+        },
+        spec: Some(overload.spec.clone()),
+    }
+}
+
+fn external_table_placeholder(
+    name: &str,
+    arguments: &[paro_common::types::LogicalType],
+    return_columns: &[paro_common::types::LogicalType],
+) -> paro_function::scalar::BoundScalarFunction {
+    let return_type = return_columns
+        .first()
+        .cloned()
+        .unwrap_or(paro_common::types::LogicalType::Unknown);
+    paro_function::scalar::ScalarFunction::new(
+        name.to_string(),
+        arguments.to_vec(),
+        return_type,
+        |_, _, _| {
+            Err(paro_error::internal(
+                "external table routine reached native scalar executor before physical lowering",
+            ))
+        },
+    )
+    .into()
 }
 
 /// Bind function arguments.
@@ -557,6 +766,9 @@ fn get_input_table_info(
             (subquery.column_types.clone(), subquery.column_names.clone())
         }
         BoundFromItem::TableFunction(tf) => (tf.column_types.clone(), tf.column_names.clone()),
+        BoundFromItem::ExternalRoutine(routine) => {
+            (routine.column_types.clone(), routine.column_names.clone())
+        }
         BoundFromItem::Join(join) => {
             // For joins, combine columns from both sides
             let (left_types, left_names) = get_input_table_info(&join.left);

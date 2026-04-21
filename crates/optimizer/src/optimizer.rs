@@ -16,6 +16,7 @@ use paro_planner::plan::LogicalPlan;
 use tracing::debug;
 
 use crate::context::OptimizationContext;
+use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
     BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CteFilterPusherPass,
@@ -27,6 +28,7 @@ use crate::pipeline_passes::{
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
+use crate::statistics::gathering::StatisticsGathering;
 use crate::verify::verify_logical_plan;
 
 pub struct Optimizer {
@@ -76,10 +78,21 @@ impl Optimizer {
         );
 
         let optimized = self.optimize_plan(plan)?;
+        let lowering = ExternalRoutineLoweringPass::lower(optimized, &self.ctx.bind_context)?;
+        let mut optimized = lowering.plan;
+
+        if lowering.changed {
+            self.ctx.column_stats.clear();
+            optimized = StatisticsGathering::new().gather(optimized, &mut self.ctx)?;
+            if self.ctx.verify_enabled {
+                verify_logical_plan(&self.ctx.bind_context, &optimized)?;
+            }
+        }
 
         debug!(
             target: targets::OPTIMIZER,
             elapsed_ms = started_at.elapsed().as_millis(),
+            external_lowering = lowering.changed,
             "Optimization completed"
         );
         publish_optimizer_profile_snapshot(

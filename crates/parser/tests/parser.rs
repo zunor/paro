@@ -58,7 +58,7 @@ fn test_reserved_error() {
             content_type VARCHAR,
             etag VARCHAR,
             truncated BOOLEAN
-           ) LANGUAGE python HANDLER='ai_list_files' address='https://api.bendml.com'"#];
+           ) LANGUAGE python HANDLER 'ai_list_files' AS $$return {'path': []}$$"#];
 
     for case in cases {
         run_parser(file, statement_body, case);

@@ -13,3 +13,6 @@ paro-common = { workspace = true }
 paro-parser = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }
+paro-routine = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }

@@ -222,3 +222,41 @@ SELECT 1;
     assert blocks[0].control_action == "restart"
     assert blocks[0].control_args == ()
     assert blocks[1].kind == "query"
+
+
+def test_parse_control_block_with_key_value_args() -> None:
+    sql = """
+-- @control connect user=routine_builder database=postgres
+SELECT current_user();
+"""
+
+    blocks = parse_sql_text(sql)
+    assert len(blocks) == 2
+    assert blocks[0].kind == "control"
+    assert blocks[0].control_action == "connect"
+    assert blocks[0].control_args == ("user=routine_builder", "database=postgres")
+    assert blocks[1].kind == "query"
+
+
+def test_parse_fixture_directive_applies_to_next_sql_block() -> None:
+    sql = """
+-- @fixture python_udf/modules/basic_math
+-- @query file
+FILE '{{fixture:python_udf/modules/basic_math}}/basic_math.py';
+
+SELECT 1;
+"""
+
+    blocks = parse_sql_text(sql)
+    assert len(blocks) == 2
+    assert blocks[0].fixture_refs == ("python_udf/modules/basic_math",)
+    assert blocks[1].fixture_refs == ()
+
+
+def test_parse_fixture_rejects_path_traversal() -> None:
+    sql = """
+-- @fixture ../outside
+SELECT 1;
+"""
+    with pytest.raises(ParseError, match="fixture path must stay within regress/fixtures"):
+        parse_sql_text(sql)

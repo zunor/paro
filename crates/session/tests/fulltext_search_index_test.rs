@@ -17,6 +17,7 @@ mod unique_test_dir;
 use paro_common::runtime_value::Value;
 use paro_instance::{DatabaseCloseAction, Instance};
 use paro_session::{CollectingSink, Session};
+use std::future::Future;
 use std::sync::Arc;
 
 use exec_ok::exec_ok;
@@ -78,6 +79,25 @@ fn lookup_index_entry(session: &Session, index_name: &str) -> Arc<IndexCatalogEn
         CatalogEntryEnum::Index(index) => index.clone(),
         other => panic!("expected index entry, got {other:?}"),
     }
+}
+
+fn run_async_test_with_large_stack<Fut>(name: &str, future: Fut)
+where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            runtime.block_on(future);
+        })
+        .expect("spawn large-stack test thread")
+        .join()
+        .expect("join large-stack test thread");
 }
 
 #[tokio::test]
@@ -145,8 +165,7 @@ async fn bm25_ranking_is_stable_across_segments() {
     assert_eq!(query_i64_col(&sink, 0), vec![1, 100]);
 }
 
-#[tokio::test]
-async fn restart_recovery_keeps_fulltext_index_usable() {
+async fn run_restart_recovery_keeps_fulltext_index_usable() {
     let base_dir = create_unique_test_dir("fulltext_search", "restart");
     let mut sink = CollectingSink::new();
 
@@ -271,8 +290,15 @@ async fn restart_recovery_keeps_fulltext_index_usable() {
     let _ = std::fs::remove_dir_all(&base_dir);
 }
 
-#[tokio::test]
-async fn create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
+#[test]
+fn restart_recovery_keeps_fulltext_index_usable() {
+    run_async_test_with_large_stack(
+        "fulltext-restart-recovery",
+        run_restart_recovery_keeps_fulltext_index_usable(),
+    );
+}
+
+async fn run_create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -344,6 +370,14 @@ async fn create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pendi
             .any(|line| line.to_ascii_uppercase().contains("FULLTEXT_SCAN")),
         "fulltext index should be eligible for pushdown after create index, actual:\n{}",
         lines.join("\n")
+    );
+}
+
+#[test]
+fn create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
+    run_async_test_with_large_stack(
+        "fulltext-create-index-coverage",
+        run_create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending(),
     );
 }
 

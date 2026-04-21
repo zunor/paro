@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_catalog::entry::{
-    AlterEntryInfo, CreateIndexInfo, CreatePropertyGraphInfo, CreateSchemaInfo, CreateSequenceInfo,
-    CreateTableInfo, CreateViewInfo, DropEntryInfo, IndexCoverage, TableCatalogEntry,
+    AlterEntryInfo, CreateIndexInfo, CreatePropertyGraphInfo, CreateRoutineInfo, CreateSchemaInfo,
+    CreateSequenceInfo, CreateTableInfo, CreateViewInfo, DropEntryInfo, DropRoutineInfo,
+    IndexCoverage, TableCatalogEntry,
 };
 use paro_common::effect::StagingArtifactId;
 use paro_common::error::Result;
@@ -30,6 +31,7 @@ pub trait DdlApplyContext: Send + Sync {
     fn apply_create_table(&self, info: CreateTableInfo) -> Result<()>;
     fn apply_create_schema(&self, info: CreateSchemaInfo) -> Result<()>;
     fn apply_create_sequence(&self, info: CreateSequenceInfo) -> Result<()>;
+    fn apply_create_routine(&self, info: CreateRoutineInfo) -> Result<()>;
     fn apply_create_view(&self, info: CreateViewInfo) -> Result<()>;
     fn apply_create_property_graph(
         &self,
@@ -62,4 +64,10 @@ pub trait DdlApplyContext: Send + Sync {
         sql: String,
     ) -> Result<()>;
     fn apply_drop(&self, schema_name: String, info: DropEntryInfo) -> Result<()>;
+    fn apply_drop_routine(
+        &self,
+        schema_name: String,
+        name: String,
+        info: DropRoutineInfo,
+    ) -> Result<()>;
 }

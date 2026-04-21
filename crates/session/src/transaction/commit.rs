@@ -232,20 +232,22 @@ impl<'a> CommitPipeline<'a> {
 
         let max_seen_object_id = ddl_changes
             .iter()
-            .filter_map(|op| match &op.record.change {
-                DdlChange::CreateSchema(payload) => Some(payload.object_id),
-                DdlChange::CreateTable(payload) => Some(payload.object_id),
-                DdlChange::CreateView(payload) => Some(payload.object_id),
-                DdlChange::CreateIndex(payload) => Some(payload.object_id),
-                DdlChange::CreatePropertyGraph(payload) => Some(payload.object_id),
-                DdlChange::CreateSequence(payload) => Some(payload.object_id),
+            .flat_map(|op| match &op.record.change {
+                DdlChange::CreateSchema(payload) => vec![payload.object_id],
+                DdlChange::CreateTable(payload) => vec![payload.object_id],
+                DdlChange::CreateView(payload) => vec![payload.object_id],
+                DdlChange::CreateIndex(payload) => vec![payload.object_id],
+                DdlChange::CreatePropertyGraph(payload) => vec![payload.object_id],
+                DdlChange::CreateSequence(payload) => vec![payload.object_id],
+                DdlChange::CreateRoutine(payload) => vec![payload.object_id, payload.routine_id],
                 DdlChange::DropSchema(_)
                 | DdlChange::DropTable(_)
                 | DdlChange::DropView(_)
                 | DdlChange::DropIndex(_)
                 | DdlChange::DropPropertyGraph(_)
                 | DdlChange::DropSequence(_)
-                | DdlChange::AlterEntry(_) => None,
+                | DdlChange::DropRoutine(_)
+                | DdlChange::AlterEntry(_) => Vec::new(),
             })
             .max()
             .unwrap_or(0);

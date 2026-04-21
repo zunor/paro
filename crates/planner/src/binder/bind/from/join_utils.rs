@@ -48,6 +48,16 @@ fn collect_table_bindings_recursive(op: &LogicalOperator, bindings: &mut HashSet
         LogicalOperator::Projection(proj) => {
             collect_table_bindings_recursive(&proj.child.operator, bindings);
         }
+        LogicalOperator::ExternalProject(project) => {
+            bindings.insert(project.project_index);
+            collect_table_bindings_recursive(&project.child.operator, bindings);
+        }
+        LogicalOperator::ExternalTable(table) => {
+            bindings.insert(table.table_index);
+            if let Some(child) = &table.child {
+                collect_table_bindings_recursive(&child.operator, bindings);
+            }
+        }
         LogicalOperator::Limit(limit) => {
             collect_table_bindings_recursive(&limit.child.operator, bindings);
         }
@@ -125,6 +135,7 @@ fn collect_table_bindings_recursive(op: &LogicalOperator, bindings: &mut HashSet
         }
         LogicalOperator::Alter(_)
         | LogicalOperator::CreateTable(_)
+        | LogicalOperator::CreateRoutine(_)
         | LogicalOperator::CreateSequence(_)
         | LogicalOperator::CreateSchema(_)
         | LogicalOperator::CreateIndex(_)

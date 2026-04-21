@@ -15,6 +15,7 @@
 //! │       ├── ViewCatalogEntry
 //! │       ├── IndexCatalogEntry
 //! │       ├── SequenceCatalogEntry
+//! │       ├── RoutineCatalogEntry
 //! │       ├── ScalarFunctionCatalogEntry
 //! │       ├── AggregateFunctionCatalogEntry
 //! │       ├── TableFunctionCatalogEntry
@@ -30,6 +31,7 @@ mod copy_function;
 mod function;
 mod index;
 mod property_graph;
+mod routine;
 mod schema;
 mod sequence;
 mod table;
@@ -57,6 +59,7 @@ pub use property_graph::{
     graph_schema_fingerprint, CreatePropertyGraphInfo, EdgeTableInfo, PropertyGraphCatalogEntry,
     VertexTableInfo,
 };
+pub use routine::{CreateRoutineInfo, DropRoutineInfo, RoutineCatalogEntry, StoredRoutineOverload};
 pub use schema::{
     AlterEntryAction, AlterEntryInfo, ColumnCommentUpdate, CreateSchemaInfo, DropEntryInfo,
     DropSchemaInfo, SchemaEntry,
@@ -86,6 +89,7 @@ pub enum CatalogEntryEnum {
     Index(Arc<IndexCatalogEntry>),
     PropertyGraph(Arc<PropertyGraphCatalogEntry>),
     Sequence(Arc<SequenceCatalogEntry>),
+    Routine(Arc<RoutineCatalogEntry>),
     ScalarFunction(Arc<ScalarFunctionCatalogEntry>),
     AggregateFunction(Arc<AggregateFunctionCatalogEntry>),
     TableFunction(Arc<TableFunctionCatalogEntry>),
@@ -103,6 +107,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(_) => CatalogType::Index,
             CatalogEntryEnum::PropertyGraph(_) => CatalogType::PropertyGraph,
             CatalogEntryEnum::Sequence(_) => CatalogType::Sequence,
+            CatalogEntryEnum::Routine(_) => CatalogType::Routine,
             CatalogEntryEnum::ScalarFunction(_) => CatalogType::ScalarFunction,
             CatalogEntryEnum::AggregateFunction(_) => CatalogType::AggregateFunction,
             CatalogEntryEnum::TableFunction(_) => CatalogType::TableFunction,
@@ -120,6 +125,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => &e.base.base.name,
             CatalogEntryEnum::PropertyGraph(e) => &e.base.base.name,
             CatalogEntryEnum::Sequence(e) => &e.base.base.name,
+            CatalogEntryEnum::Routine(e) => &e.base.base.name,
             CatalogEntryEnum::ScalarFunction(e) => &e.base.base.name,
             CatalogEntryEnum::AggregateFunction(e) => &e.base.base.name,
             CatalogEntryEnum::TableFunction(e) => &e.base.base.name,
@@ -137,6 +143,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => e.base.base.object_id,
             CatalogEntryEnum::PropertyGraph(e) => e.base.base.object_id,
             CatalogEntryEnum::Sequence(e) => e.base.base.object_id,
+            CatalogEntryEnum::Routine(e) => e.base.base.object_id,
             CatalogEntryEnum::ScalarFunction(e) => e.base.base.object_id,
             CatalogEntryEnum::AggregateFunction(e) => e.base.base.object_id,
             CatalogEntryEnum::TableFunction(e) => e.base.base.object_id,
@@ -154,6 +161,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => e.base.base.timestamp(),
             CatalogEntryEnum::PropertyGraph(e) => e.base.base.timestamp(),
             CatalogEntryEnum::Sequence(e) => e.base.base.timestamp(),
+            CatalogEntryEnum::Routine(e) => e.base.base.timestamp(),
             CatalogEntryEnum::ScalarFunction(e) => e.base.base.timestamp(),
             CatalogEntryEnum::AggregateFunction(e) => e.base.base.timestamp(),
             CatalogEntryEnum::TableFunction(e) => e.base.base.timestamp(),
@@ -171,6 +179,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => e.base.base.is_deleted(),
             CatalogEntryEnum::PropertyGraph(e) => e.base.base.is_deleted(),
             CatalogEntryEnum::Sequence(e) => e.base.base.is_deleted(),
+            CatalogEntryEnum::Routine(e) => e.base.base.is_deleted(),
             CatalogEntryEnum::ScalarFunction(e) => e.base.base.is_deleted(),
             CatalogEntryEnum::AggregateFunction(e) => e.base.base.is_deleted(),
             CatalogEntryEnum::TableFunction(e) => e.base.base.is_deleted(),
@@ -188,6 +197,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => e.base.base.internal,
             CatalogEntryEnum::PropertyGraph(e) => e.base.base.internal,
             CatalogEntryEnum::Sequence(e) => e.base.base.internal,
+            CatalogEntryEnum::Routine(e) => e.base.base.internal,
             CatalogEntryEnum::ScalarFunction(e) => e.base.base.internal,
             CatalogEntryEnum::AggregateFunction(e) => e.base.base.internal,
             CatalogEntryEnum::TableFunction(e) => e.base.base.internal,
@@ -205,6 +215,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => &e.base.base.catalog,
             CatalogEntryEnum::PropertyGraph(e) => &e.base.base.catalog,
             CatalogEntryEnum::Sequence(e) => &e.base.base.catalog,
+            CatalogEntryEnum::Routine(e) => &e.base.base.catalog,
             CatalogEntryEnum::ScalarFunction(e) => &e.base.base.catalog,
             CatalogEntryEnum::AggregateFunction(e) => &e.base.base.catalog,
             CatalogEntryEnum::TableFunction(e) => &e.base.base.catalog,
@@ -222,6 +233,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => e.to_sql(),
             CatalogEntryEnum::PropertyGraph(e) => e.to_sql(),
             CatalogEntryEnum::Sequence(e) => e.to_sql(),
+            CatalogEntryEnum::Routine(e) => e.to_sql(),
             CatalogEntryEnum::ScalarFunction(e) => {
                 format!("-- SCALAR FUNCTION {} (built-in)", e.base.base.name)
             }
@@ -286,6 +298,13 @@ impl CatalogEntryEnum {
         }
     }
 
+    pub fn as_routine(&self) -> Option<&RoutineCatalogEntry> {
+        match self {
+            CatalogEntryEnum::Routine(e) => Some(e),
+            _ => None,
+        }
+    }
+
     /// Try to get as scalar function entry
     pub fn as_scalar_function(&self) -> Option<&ScalarFunctionCatalogEntry> {
         match self {
@@ -334,6 +353,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => Some(e.base.schema_name.as_str()),
             CatalogEntryEnum::PropertyGraph(e) => Some(e.base.schema_name.as_str()),
             CatalogEntryEnum::Sequence(e) => Some(e.base.schema_name.as_str()),
+            CatalogEntryEnum::Routine(e) => Some(e.base.schema_name.as_str()),
             CatalogEntryEnum::ScalarFunction(e) => Some(e.base.schema_name.as_str()),
             CatalogEntryEnum::AggregateFunction(e) => Some(e.base.schema_name.as_str()),
             CatalogEntryEnum::TableFunction(e) => Some(e.base.schema_name.as_str()),
@@ -350,6 +370,7 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Index(e) => e.base.dependencies(),
             CatalogEntryEnum::PropertyGraph(e) => e.base.dependencies(),
             CatalogEntryEnum::Sequence(e) => e.base.dependencies(),
+            CatalogEntryEnum::Routine(e) => e.base.dependencies(),
             CatalogEntryEnum::ScalarFunction(e) => e.base.dependencies(),
             CatalogEntryEnum::AggregateFunction(e) => e.base.dependencies(),
             CatalogEntryEnum::TableFunction(e) => e.base.dependencies(),
@@ -400,6 +421,14 @@ impl CatalogEntryEnum {
             CatalogEntryEnum::Sequence(e) => CatalogObjectRef::in_schema(
                 e.base.base.object_id,
                 CatalogType::Sequence,
+                e.base.base.catalog.clone(),
+                schema_id,
+                e.base.schema_name.clone(),
+                e.base.base.name.clone(),
+            ),
+            CatalogEntryEnum::Routine(e) => CatalogObjectRef::in_schema(
+                e.base.base.object_id,
+                CatalogType::Routine,
                 e.base.base.catalog.clone(),
                 schema_id,
                 e.base.schema_name.clone(),

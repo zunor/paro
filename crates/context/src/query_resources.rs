@@ -4,6 +4,7 @@
 use crate::ExecutionResources;
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
+use paro_external_runtime::host::PythonRuntimeProvider;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_storage::index::graph::{
     GraphProjectionIndexManager, GraphReadSnapshot, GraphStatistics, GraphStorageGeneration,
@@ -50,6 +51,7 @@ pub struct QueryResources {
     pub infra: Arc<ExecutionResources>,
     pub cast_functions: Arc<CastFunctionSet>,
     pub graph_index: Arc<dyn GraphIndexProvider>,
+    pub python_runtime: Option<Arc<dyn PythonRuntimeProvider>>,
     pub governance: QueryResourceGovernance,
     pub plan_cache: Option<Arc<dyn SharedPlanCacheHandle>>,
     pub connection_info: Option<Arc<dyn ConnectionInfoProvider>>,

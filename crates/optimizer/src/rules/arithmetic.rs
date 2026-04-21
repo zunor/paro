@@ -15,6 +15,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::{ConstantExpression, Expression};
 use paro_planner::operator::LogicalOperator;
+use paro_routine::BuiltinIntrinsicId;
 
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};
@@ -29,8 +30,16 @@ impl ExpressionMatcher for ArithmeticSimplificationMatcher {
         };
 
         // Only match arithmetic operators
-        let name = func.function.name.as_str();
-        if !matches!(name, "+" | "-" | "*" | "/" | "//") {
+        if !matches!(
+            func.builtin_intrinsic(),
+            Some(
+                BuiltinIntrinsicId::Add
+                    | BuiltinIntrinsicId::Subtract
+                    | BuiltinIntrinsicId::Multiply
+                    | BuiltinIntrinsicId::Divide
+                    | BuiltinIntrinsicId::IntegerDivide
+            )
+        ) {
             return false;
         }
 
@@ -117,7 +126,6 @@ impl Rule for ArithmeticSimplificationRule {
             return RuleResult::NoChange;
         };
 
-        let name = func.function.name.as_str();
         let return_type = func.return_type.clone();
 
         // Get both children
@@ -141,11 +149,13 @@ impl Rule for ArithmeticSimplificationRule {
                 })));
             }
         }
-        match name {
-            "+" => simplify_add_expr(left, right),
-            "-" => simplify_subtract_expr(left, right),
-            "*" => simplify_multiply_expr(left, right, &return_type),
-            "/" | "//" => simplify_divide_expr(left, right, &return_type),
+        match func.builtin_intrinsic() {
+            Some(BuiltinIntrinsicId::Add) => simplify_add_expr(left, right),
+            Some(BuiltinIntrinsicId::Subtract) => simplify_subtract_expr(left, right),
+            Some(BuiltinIntrinsicId::Multiply) => simplify_multiply_expr(left, right, &return_type),
+            Some(BuiltinIntrinsicId::Divide | BuiltinIntrinsicId::IntegerDivide) => {
+                simplify_divide_expr(left, right, &return_type)
+            }
             _ => RuleResult::NoChange,
         }
     }
@@ -319,59 +329,55 @@ mod tests {
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "+".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![left, right],
-            return_type: LogicalType::Integer,
-        })
+            ),
+            vec![left, right],
+            LogicalType::Integer,
+        ))
     }
 
     fn make_subtract(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "-".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![left, right],
-            return_type: LogicalType::Integer,
-        })
+            ),
+            vec![left, right],
+            LogicalType::Integer,
+        ))
     }
 
     fn make_multiply(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "*".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![left, right],
-            return_type: LogicalType::Integer,
-        })
+            ),
+            vec![left, right],
+            LogicalType::Integer,
+        ))
     }
 
     fn make_divide(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression {
-            function: ScalarFunction::new(
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
                 "/".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
                 LogicalType::Integer,
                 dummy_fn,
-            )
-            .into(),
-            children: vec![left, right],
-            return_type: LogicalType::Integer,
-        })
+            ),
+            vec![left, right],
+            LogicalType::Integer,
+        ))
     }
 
     #[test]

@@ -163,6 +163,22 @@ impl PhysicalPlanGenerator {
                 }
             }
 
+            // LOGICAL_EXTERNAL_PROJECT
+            LogicalOperator::ExternalProject(project) => {
+                let child = self.create_plan_from_logical_plan(project.child.as_ref())?;
+                self.create_plan_external_project(project, child)
+            }
+
+            // LOGICAL_EXTERNAL_TABLE
+            LogicalOperator::ExternalTable(table) => {
+                let child = table
+                    .child
+                    .as_ref()
+                    .map(|child| self.create_plan_from_logical_plan(child.as_ref()))
+                    .transpose()?;
+                self.create_plan_external_table(table, child)
+            }
+
             // LOGICAL_FILTER
             LogicalOperator::Filter(filter) => {
                 let child = self.create_plan_from_logical_plan(filter.child.as_ref())?;
@@ -223,6 +239,11 @@ impl PhysicalPlanGenerator {
             // LOGICAL_CREATE_TABLE
             LogicalOperator::CreateTable(create_table) => {
                 self.create_plan_create_table(create_table)
+            }
+
+            // LOGICAL_CREATE_ROUTINE
+            LogicalOperator::CreateRoutine(create_routine) => {
+                self.create_plan_create_routine(create_routine)
             }
 
             // LOGICAL_ALTER

@@ -39,6 +39,7 @@ class Block:
     kind: str
     line_no: int
     sql: str
+    fixture_refs: Tuple[str, ...] = ()
 
     statement_expect: Optional[str] = None
     expected_count: Optional[int] = None
@@ -76,6 +77,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
     lines = text.splitlines()
     blocks: List[Block] = []
     pending_normalizers: Tuple[str, ...] = ()
+    pending_fixtures: Tuple[str, ...] = ()
 
     idx = 0
     while idx < len(lines):
@@ -99,6 +101,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                         kind="query",
                         line_no=idx + 1,
                         sql=sql,
+                        fixture_refs=pending_fixtures,
                         query_mode="nosort",
                         normalizers=pending_normalizers,
                     )
@@ -109,17 +112,27 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                         kind="statement",
                         line_no=idx + 1,
                         sql=sql,
+                        fixture_refs=pending_fixtures,
                         statement_expect="ok",
                         normalizers=pending_normalizers,
                     )
                 )
             pending_normalizers = ()
+            pending_fixtures = ()
             idx = next_idx
             continue
 
         name, arg = directive
         name = name.lower()
         line_no = idx + 1
+
+        if name == "fixture":
+            pending_fixtures = _append_fixture_ref(
+                pending_fixtures,
+                _parse_fixture_arg(arg, source, line_no),
+            )
+            idx += 1
+            continue
 
         if name == "normalize":
             pending_normalizers = _parse_normalize_arg(arg, source, line_no)
@@ -133,16 +146,26 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     kind="control",
                     line_no=line_no,
                     sql="",
+                    fixture_refs=pending_fixtures,
                     control_action=action,
                     control_args=control_args,
                 )
             )
+            pending_fixtures = ()
             idx += 1
             continue
 
         if name in {"setup", "teardown"}:
             sql, next_idx = _consume_sql_statement(lines, idx + 1, source, line_no)
-            blocks.append(Block(kind=name, line_no=line_no, sql=sql))
+            blocks.append(
+                Block(
+                    kind=name,
+                    line_no=line_no,
+                    sql=sql,
+                    fixture_refs=pending_fixtures,
+                )
+            )
+            pending_fixtures = ()
             idx = next_idx
             continue
 
@@ -161,6 +184,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     kind="statement",
                     line_no=line_no,
                     sql=sql,
+                    fixture_refs=pending_fixtures,
                     statement_expect=expect,
                     expected_count=expected_count,
                     error_pattern=error_pattern,
@@ -168,6 +192,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                 )
             )
             pending_normalizers = ()
+            pending_fixtures = ()
             idx = next_idx
             continue
 
@@ -186,12 +211,14 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     kind="query",
                     line_no=line_no,
                     sql=sql,
+                    fixture_refs=pending_fixtures,
                     query_mode=mode,
                     epsilon=epsilon,
                     normalizers=normalizers,
                 )
             )
             pending_normalizers = ()
+            pending_fixtures = ()
             idx = next_idx
             continue
 
@@ -219,6 +246,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     kind="copy",
                     line_no=line_no,
                     sql=sql,
+                    fixture_refs=pending_fixtures,
                     copy_direction=direction,
                     copy_data_lines=copy_data_lines,
                     copy_fail_message=copy_fail_message,
@@ -226,6 +254,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                 )
             )
             pending_normalizers = ()
+            pending_fixtures = ()
             idx = next_idx
             continue
 
@@ -236,12 +265,30 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
 
             next_content = _next_content_line(lines, idx + 1)
             if next_content is None or _parse_directive_line(lines[next_content]) is not None:
-                blocks.append(Block(kind=name, line_no=line_no, sql="", engine=engine))
+                blocks.append(
+                    Block(
+                        kind=name,
+                        line_no=line_no,
+                        sql="",
+                        fixture_refs=pending_fixtures,
+                        engine=engine,
+                    )
+                )
+                pending_fixtures = ()
                 idx += 1
                 continue
 
             sql, next_idx = _consume_sql_statement(lines, idx + 1, source, line_no)
-            blocks.append(Block(kind=name, line_no=line_no, sql=sql, engine=engine))
+            blocks.append(
+                Block(
+                    kind=name,
+                    line_no=line_no,
+                    sql=sql,
+                    fixture_refs=pending_fixtures,
+                    engine=engine,
+                )
+            )
+            pending_fixtures = ()
             idx = next_idx
             continue
 
@@ -332,6 +379,24 @@ def _parse_normalize_arg(arg: str, source: str, line_no: int) -> Tuple[str, ...]
                 f"known profiles: {allowed}."
             )
     return tuple(profiles)
+
+
+def _parse_fixture_arg(arg: str, source: str, line_no: int) -> str:
+    fixture = arg.strip()
+    if not fixture:
+        raise ParseError(f"{source}:{line_no}: '@fixture' requires a fixture path.")
+    fixture_path = Path(fixture)
+    if fixture_path.is_absolute() or any(part == ".." for part in fixture_path.parts):
+        raise ParseError(
+            f"{source}:{line_no}: fixture path must stay within regress/fixtures, got {fixture!r}."
+        )
+    return fixture_path.as_posix()
+
+
+def _append_fixture_ref(existing: Tuple[str, ...], fixture: str) -> Tuple[str, ...]:
+    if fixture in existing:
+        return existing
+    return existing + (fixture,)
 
 
 def _consume_trailing_normalize_directives(

@@ -1,0 +1,13 @@
+namespace paro.protocol.sideband;
+
+table PythonTraceback {
+  exception_type:string;
+  message:string;
+  formatted_traceback:string;
+  module:string;
+  handler:string;
+  batch_id:ulong;
+  truncated:bool;
+}
+
+root_type PythonTraceback;

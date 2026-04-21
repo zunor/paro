@@ -1,0 +1,42 @@
+DROP FUNCTION IF EXISTS py_tx(INTEGER);
+DROP FUNCTION
+
+BEGIN;
+BEGIN
+
+CREATE FUNCTION py_tx(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value + 1 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_tx(1);
+py_tx(1)
+2
+
+ROLLBACK;
+ROLLBACK
+
+SELECT py_tx(1);
+ERROR: Function 'py_tx' not found in search path (SQLSTATE=42601)
+
+BEGIN;
+BEGIN
+
+CREATE FUNCTION py_tx(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value + 5 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+COMMIT;
+COMMIT
+
+SELECT py_tx(1);
+py_tx(1)
+6
+
+SELECT py_tx(1);
+py_tx(1)
+6
+
+DROP FUNCTION py_tx(INTEGER);
+DROP FUNCTION

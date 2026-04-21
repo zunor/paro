@@ -36,7 +36,7 @@ pub fn query_canceled() -> ParoError {
 pub fn statement_timeout() -> ParoError {
     ParoError::new(ErrorData::new(
         Severity::Error,
-        codes::operator::QUERY_CANCELED,
+        codes::operator::STATEMENT_TIMEOUT,
         "canceling statement due to statement timeout",
     ))
 }

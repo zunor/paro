@@ -231,6 +231,7 @@ impl Planner {
                 returns_result_set: false,
             },
             BoundStatementKind::CreateTable(_)
+            | BoundStatementKind::CreateRoutine(_)
             | BoundStatementKind::CreateSequence(_)
             | BoundStatementKind::CreateSchema(_)
             | BoundStatementKind::CreateIndex(_)

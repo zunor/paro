@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_common::error::Result;
+use paro_planner::expression::Expression;
 use paro_planner::operator::LogicalOperator;
 use paro_planner::plan::LogicalPlan;
 
@@ -27,13 +28,7 @@ impl ReorderFilter {
         } = plan;
         let operator = match operator {
             LogicalOperator::Filter(mut filter) => {
-                filter.expressions.sort_by(|left, right| {
-                    let left_sel = ctx.cost_model.estimate_selectivity(left, &ctx.column_stats);
-                    let right_sel = ctx
-                        .cost_model
-                        .estimate_selectivity(right, &ctx.column_stats);
-                    left_sel.total_cmp(&right_sel)
-                });
+                filter.expressions = reorder_with_external_fences(filter.expressions, ctx);
                 LogicalOperator::Filter(filter)
             }
             other => other,
@@ -44,6 +39,38 @@ impl ReorderFilter {
             operator,
         }
     }
+}
+
+fn reorder_with_external_fences(
+    expressions: Vec<Expression>,
+    ctx: &OptimizationContext,
+) -> Vec<Expression> {
+    let mut reordered = Vec::with_capacity(expressions.len());
+    let mut native_segment = Vec::new();
+
+    for expr in expressions {
+        if expr.contains_external_routine() {
+            sort_filter_segment(&mut native_segment, ctx);
+            reordered.append(&mut native_segment);
+            reordered.push(expr);
+        } else {
+            native_segment.push(expr);
+        }
+    }
+
+    sort_filter_segment(&mut native_segment, ctx);
+    reordered.append(&mut native_segment);
+    reordered
+}
+
+fn sort_filter_segment(expressions: &mut [Expression], ctx: &OptimizationContext) {
+    expressions.sort_by(|left, right| {
+        let left_sel = ctx.cost_model.estimate_selectivity(left, &ctx.column_stats);
+        let right_sel = ctx
+            .cost_model
+            .estimate_selectivity(right, &ctx.column_stats);
+        left_sel.total_cmp(&right_sel)
+    });
 }
 
 impl Default for ReorderFilter {

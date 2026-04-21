@@ -316,6 +316,9 @@ impl Binder {
             AstStatement::CreateTable(create_table) => {
                 bind::statement::create_table::bind_create_table(self, create_table)
             }
+            AstStatement::CreateFunction(stmt) => {
+                bind::statement::create_function::bind_create_function(self, stmt)
+            }
             AstStatement::CreateSequence(stmt) => {
                 bind::statement::create_sequence::bind_create_sequence(self, stmt)
             }
@@ -349,6 +352,9 @@ impl Binder {
             }
             AstStatement::DropView(drop_view) => {
                 bind::statement::drop::bind_drop_view(self, drop_view)
+            }
+            AstStatement::DropFunction(stmt) => {
+                bind::statement::drop_function::bind_drop_function(self, stmt)
             }
             AstStatement::DropSequence(drop_sequence) => {
                 bind::statement::drop::bind_drop_sequence(self, drop_sequence)
@@ -396,6 +402,7 @@ impl Binder {
             BoundStatementKind::Query(node) => self.plan_query(*node),
             BoundStatementKind::Insert(info) => self.plan_insert(info),
             BoundStatementKind::CreateTable(info) => self.plan_create_table(info),
+            BoundStatementKind::CreateRoutine(info) => self.plan_create_routine(info),
             BoundStatementKind::CreateSequence(info) => self.plan_create_sequence(info),
             BoundStatementKind::CreateSchema(info) => self.plan_create_schema(info),
             BoundStatementKind::CreateIndex(info) => self.plan_create_index(info),
@@ -429,6 +436,7 @@ impl Binder {
                 ..
             } => bind::from::base_table::bind_base_table(self, database, schema, table, alias),
             TableReference::TableFunction {
+                lateral,
                 name,
                 params,
                 named_params,
@@ -443,6 +451,7 @@ impl Binder {
                     params,
                     named_params,
                     alias,
+                    lateral,
                     with_ordinality,
                 )
             }

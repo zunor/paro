@@ -9,14 +9,33 @@ use crate::expression::{
     OrderByExpression,
 };
 use paro_catalog::database_catalog::ParoCatalog;
-use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
+use paro_catalog::entry::{CatalogEntryEnum, CatalogType, StoredRoutineOverload};
 use paro_catalog::mvcc::CatalogSnapshot;
+use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::Vector;
 use paro_function::scalar::cast::CastFunctionSet;
-use paro_function::scalar::ScalarBindInput;
+use paro_function::scalar::{
+    ExpressionState, FunctionNullHandling, FunctionSideEffects, FunctionStability, ScalarBindInput,
+    ScalarFunction,
+};
 use paro_parser::ast::{Expr, OrderByExpr};
+use paro_routine::{
+    BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineFamily,
+    RoutineNullPolicy, RoutineReturn, RoutineSemantics, RoutineSideEffects, RoutineStability,
+};
+
+enum ResolvedScalarCallable {
+    Native(std::sync::Arc<CatalogEntryEnum>),
+    Routine(StoredRoutineOverload),
+}
+
+enum ResolvedAggregateCallable {
+    Native(std::sync::Arc<CatalogEntryEnum>),
+    Routine(StoredRoutineOverload),
+}
 
 /// Bind a function call expression.
 ///
@@ -41,19 +60,54 @@ pub fn bind_function(
     filter: Option<Expr>,
     order_bys: Vec<OrderByExpr>,
 ) -> Result<Expression> {
-    let entry = lookup_function_entry(
-        binder,
-        schema,
-        name,
-        distinct || filter.is_some() || !order_bys.is_empty(),
-    )?;
+    if distinct || filter.is_some() || !order_bys.is_empty() {
+        return bind_aggregate_function(binder, schema, name, args, distinct, filter, order_bys);
+    }
 
-    match &*entry {
-        CatalogEntryEnum::ScalarFunction(func_entry) => {
-            reject_non_aggregate_modifiers(name, distinct, filter.as_ref(), &order_bys)?;
+    let aggregate_args = args.clone();
+    match bind_scalar_or_routine(binder, schema, name, args) {
+        Ok(expression) => Ok(expression),
+        Err(scalar_error) => match bind_aggregate_function(
+            binder,
+            schema,
+            name,
+            aggregate_args,
+            distinct,
+            filter,
+            order_bys,
+        ) {
+            Ok(expression) => Ok(expression),
+            Err(aggregate_error) => {
+                if scalar_error.message().contains("not a scalar function")
+                    || scalar_error.message().contains("not found")
+                {
+                    Err(aggregate_error)
+                } else {
+                    Err(scalar_error)
+                }
+            }
+        },
+    }
+}
 
-            let (mut bound_args, arg_types) =
-                bind_arguments(args, |arg| expr::bind_expression(binder, arg))?;
+fn bind_scalar_or_routine(
+    binder: &mut Binder,
+    schema: Option<&str>,
+    name: &str,
+    args: Vec<Expr>,
+) -> Result<Expression> {
+    let (mut bound_args, arg_types) =
+        bind_arguments(args, |arg| expr::bind_expression(binder, arg))?;
+
+    match resolve_scalar_callable(binder, schema, name, &arg_types)? {
+        ResolvedScalarCallable::Native(entry) => {
+            let CatalogEntryEnum::ScalarFunction(func_entry) = &*entry else {
+                let schema_name = schema.unwrap_or("public");
+                return Err(paro_error::catalog(format!(
+                    "{}.{} is not a scalar function",
+                    schema_name, name
+                )));
+            };
 
             let (scalar_func, target_types) = func_entry.functions.bind(&arg_types)?;
             validate_non_literal_target_types(name, &target_types, false)?;
@@ -76,12 +130,35 @@ pub fn bind_function(
                 return_type,
             )))
         }
-        CatalogEntryEnum::AggregateFunction(agg_entry) => {
-            let cast_functions = binder.cast_functions.clone();
-            let mut aggregate_binder = AggregateBinder::new(binder);
+        ResolvedScalarCallable::Routine(overload) => {
+            bind_external_scalar_routine(name, overload, &arg_types, &mut bound_args, binder)
+        }
+    }
+}
 
-            let (mut bound_args, arg_types) =
-                bind_arguments(args, |arg| aggregate_binder.bind(arg))?;
+fn bind_aggregate_function(
+    binder: &mut Binder,
+    schema: Option<&str>,
+    name: &str,
+    args: Vec<Expr>,
+    distinct: bool,
+    filter: Option<Expr>,
+    order_bys: Vec<OrderByExpr>,
+) -> Result<Expression> {
+    let cast_functions = binder.cast_functions.clone();
+    let mut aggregate_binder = AggregateBinder::new(binder);
+
+    let (mut bound_args, arg_types) = bind_arguments(args, |arg| aggregate_binder.bind(arg))?;
+
+    match resolve_aggregate_callable(aggregate_binder.base.binder, schema, name, &arg_types)? {
+        ResolvedAggregateCallable::Native(entry) => {
+            let CatalogEntryEnum::AggregateFunction(agg_entry) = &*entry else {
+                let schema_name = schema.unwrap_or("public");
+                return Err(paro_error::catalog(format!(
+                    "{}.{} is not an aggregate function",
+                    schema_name, name
+                )));
+            };
 
             let (agg_func, target_types) = agg_entry.functions.bind(&arg_types)?;
             validate_non_literal_target_types(name, &target_types, true)?;
@@ -118,41 +195,21 @@ pub fn bind_function(
                     .with_bind_info(bind_info),
             ))
         }
-        _ => {
-            let schema_name = schema.unwrap_or("public");
-            Err(paro_error::catalog(format!(
-                "{}.{} is not a function",
-                schema_name, name
-            )))
-        }
+        ResolvedAggregateCallable::Routine(overload) => match overload.spec.family {
+            RoutineFamily::AggregateBatch => Err(paro_error::not_implemented(format!(
+                "Aggregate routine '{}' binds through a dedicated external aggregate lowering path",
+                name
+            ))),
+            RoutineFamily::WindowBatch => Err(paro_error::not_implemented(format!(
+                "Window routine '{}' cannot bind as an aggregate",
+                name
+            ))),
+            _ => Err(paro_error::syntax(format!(
+                "Routine '{}' does not support aggregate syntax",
+                name
+            ))),
+        },
     }
-}
-
-fn reject_non_aggregate_modifiers(
-    name: &str,
-    distinct: bool,
-    filter: Option<&Expr>,
-    order_bys: &[OrderByExpr],
-) -> Result<()> {
-    if distinct {
-        return Err(paro_error::syntax(format!(
-            "DISTINCT is only supported for aggregate functions: {}",
-            name
-        )));
-    }
-    if filter.is_some() {
-        return Err(paro_error::syntax(format!(
-            "FILTER is only supported for aggregate functions: {}",
-            name
-        )));
-    }
-    if !order_bys.is_empty() {
-        return Err(paro_error::syntax(format!(
-            "WITHIN GROUP ORDER BY is only supported for aggregate functions: {}",
-            name
-        )));
-    }
-    Ok(())
 }
 
 fn bind_arguments<F>(
@@ -274,26 +331,21 @@ fn validate_non_literal_return_type(
     Ok(())
 }
 
-/// Look up a function entry in the catalog with schema resolution.
-///
-/// # Schema Resolution Strategy
-/// - If `schema` is specified, only search in that schema
-/// - If `schema` is None, search in the default search path (pg_catalog, public)
-fn lookup_function_entry(
+fn resolve_scalar_callable(
     binder: &Binder,
     schema: Option<&str>,
     name: &str,
-    prefers_aggregate: bool,
-) -> Result<std::sync::Arc<CatalogEntryEnum>> {
+    arg_types: &[LogicalType],
+) -> Result<ResolvedScalarCallable> {
     let transaction = binder.catalog_txn_view();
 
     if let Some(schema_name) = schema {
-        return lookup_function_entry_in_schema(
+        return resolve_scalar_callable_in_schema(
             binder,
             &transaction,
             schema_name,
             name,
-            prefers_aggregate,
+            arg_types,
         )
         .map_err(|_| {
             paro_error::catalog(format!("Function '{}.{}' not found", schema_name, name))
@@ -320,12 +372,12 @@ fn lookup_function_entry(
         };
 
         if let Some(catalog) = catalog {
-            if let Ok(entry) = lookup_catalog_function_entry(
+            if let Ok(entry) = resolve_scalar_callable_in_catalog(
                 catalog.as_ref(),
                 &transaction,
                 &search_entry.schema,
                 name,
-                prefers_aggregate,
+                arg_types,
             ) {
                 return Ok(entry);
             }
@@ -338,42 +390,271 @@ fn lookup_function_entry(
     )))
 }
 
-fn lookup_function_entry_in_schema(
+fn resolve_aggregate_callable(
+    binder: &Binder,
+    schema: Option<&str>,
+    name: &str,
+    arg_types: &[LogicalType],
+) -> Result<ResolvedAggregateCallable> {
+    let transaction = binder.catalog_txn_view();
+
+    if let Some(schema_name) = schema {
+        return resolve_aggregate_callable_in_schema(
+            binder,
+            &transaction,
+            schema_name,
+            name,
+            arg_types,
+        )
+        .map_err(|_| {
+            paro_error::catalog(format!("Function '{}.{}' not found", schema_name, name))
+        });
+    }
+
+    for search_entry in binder.session_context().search_path() {
+        let catalog_name = if search_entry.catalog.is_empty() {
+            binder.catalog().name().to_string()
+        } else {
+            search_entry.catalog.clone()
+        };
+
+        let catalog = if catalog_name == binder.catalog().name() {
+            Some(binder.catalog())
+        } else {
+            binder
+                .session_context()
+                .database(&catalog_name)
+                .map(|db| db.catalog.clone())
+        };
+
+        if let Some(catalog) = catalog {
+            if let Ok(entry) = resolve_aggregate_callable_in_catalog(
+                catalog.as_ref(),
+                &transaction,
+                &search_entry.schema,
+                name,
+                arg_types,
+            ) {
+                return Ok(entry);
+            }
+        }
+    }
+
+    Err(paro_error::catalog(format!(
+        "Function '{}' not found in search path",
+        name
+    )))
+}
+
+fn resolve_scalar_callable_in_schema(
     binder: &Binder,
     transaction: &CatalogSnapshot,
     schema_name: &str,
     name: &str,
-    prefers_aggregate: bool,
-) -> std::result::Result<std::sync::Arc<CatalogEntryEnum>, ()> {
-    lookup_catalog_function_entry(
+    arg_types: &[LogicalType],
+) -> std::result::Result<ResolvedScalarCallable, ()> {
+    resolve_scalar_callable_in_catalog(
         binder.catalog().as_ref(),
         transaction,
         schema_name,
         name,
-        prefers_aggregate,
+        arg_types,
     )
 }
 
-fn lookup_catalog_function_entry(
+fn resolve_scalar_callable_in_catalog(
     catalog: &ParoCatalog,
     transaction: &CatalogSnapshot,
     schema_name: &str,
     name: &str,
-    prefers_aggregate: bool,
-) -> std::result::Result<std::sync::Arc<CatalogEntryEnum>, ()> {
-    let search_order = if prefers_aggregate {
-        [CatalogType::AggregateFunction, CatalogType::ScalarFunction]
-    } else {
-        [CatalogType::ScalarFunction, CatalogType::AggregateFunction]
-    };
+    arg_types: &[LogicalType],
+) -> std::result::Result<ResolvedScalarCallable, ()> {
+    if let Ok(entry) =
+        catalog.get_any_entry(transaction, schema_name, CatalogType::ScalarFunction, name)
+    {
+        if let CatalogEntryEnum::ScalarFunction(func_entry) = &*entry {
+            if func_entry.functions.bind(arg_types).is_ok() {
+                return Ok(ResolvedScalarCallable::Native(entry));
+            }
+        }
+    }
 
-    for catalog_type in search_order {
-        if let Ok(entry) = catalog.get_any_entry(transaction, schema_name, catalog_type, name) {
-            return Ok(entry);
+    if let Ok(entry) = catalog.get_any_entry(transaction, schema_name, CatalogType::Routine, name) {
+        if let CatalogEntryEnum::Routine(routine_entry) = &*entry {
+            if let Ok(overload) = routine_entry.resolve(arg_types) {
+                return Ok(ResolvedScalarCallable::Routine(overload.clone()));
+            }
         }
     }
 
     Err(())
+}
+
+fn resolve_aggregate_callable_in_schema(
+    binder: &Binder,
+    transaction: &CatalogSnapshot,
+    schema_name: &str,
+    name: &str,
+    arg_types: &[LogicalType],
+) -> std::result::Result<ResolvedAggregateCallable, ()> {
+    resolve_aggregate_callable_in_catalog(
+        binder.catalog().as_ref(),
+        transaction,
+        schema_name,
+        name,
+        arg_types,
+    )
+}
+
+fn resolve_aggregate_callable_in_catalog(
+    catalog: &ParoCatalog,
+    transaction: &CatalogSnapshot,
+    schema_name: &str,
+    name: &str,
+    arg_types: &[LogicalType],
+) -> std::result::Result<ResolvedAggregateCallable, ()> {
+    if let Ok(entry) = catalog.get_any_entry(
+        transaction,
+        schema_name,
+        CatalogType::AggregateFunction,
+        name,
+    ) {
+        if let CatalogEntryEnum::AggregateFunction(func_entry) = &*entry {
+            if func_entry.functions.bind(arg_types).is_ok() {
+                return Ok(ResolvedAggregateCallable::Native(entry));
+            }
+        }
+    }
+
+    if let Ok(entry) = catalog.get_any_entry(transaction, schema_name, CatalogType::Routine, name) {
+        if let CatalogEntryEnum::Routine(routine_entry) = &*entry {
+            if let Ok(overload) = routine_entry.resolve(arg_types) {
+                return Ok(ResolvedAggregateCallable::Routine(overload.clone()));
+            }
+        }
+    }
+
+    Err(())
+}
+
+fn bind_external_scalar_routine(
+    name: &str,
+    overload: StoredRoutineOverload,
+    arg_types: &[LogicalType],
+    bound_args: &mut Vec<Expression>,
+    binder: &Binder,
+) -> Result<Expression> {
+    let target_types = overload
+        .spec
+        .arguments
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+    apply_implicit_casts(
+        bound_args,
+        arg_types,
+        &target_types,
+        binder.cast_functions.as_ref(),
+    )?;
+
+    let return_type = match (&overload.spec.family, &overload.spec.return_type) {
+        (RoutineFamily::ScalarBatch, RoutineReturn::Scalar(return_type)) => return_type.clone(),
+        (RoutineFamily::TableBatch, RoutineReturn::Table(_)) => {
+            return Err(paro_error::not_implemented(format!(
+                "Table routine '{}' binds through FROM/LATERAL and late lowering, not scalar expression context",
+                name
+            )));
+        }
+        (RoutineFamily::AggregateBatch, _) => {
+            return Err(paro_error::not_implemented(format!(
+                "Aggregate routine '{}' binds through a dedicated external aggregate lowering path",
+                name
+            )));
+        }
+        (RoutineFamily::WindowBatch, _) => {
+            return Err(paro_error::not_implemented(format!(
+                "Window routine '{}' binds through a dedicated external window lowering path",
+                name
+            )));
+        }
+        _ => {
+            return Err(paro_error::internal(format!(
+                "routine '{}' has inconsistent family/return contract",
+                name
+            )));
+        }
+    };
+
+    validate_non_literal_return_type(name, &return_type, false)?;
+    let bound_function =
+        external_scalar_placeholder(name, &target_types, &return_type, &overload.spec.semantics);
+    let routine_meta = BoundRoutineCallMeta {
+        identity: RoutineCallIdentity::Catalog {
+            routine_id: overload.spec.identity.id,
+            generation: overload.spec.identity.generation,
+        },
+        semantics: overload.spec.semantics.clone(),
+        boundary: ExecutionBoundary {
+            placement: PlacementClass::External,
+            may_block: overload.spec.semantics.may_block,
+            row_semantics: overload.spec.semantics.row_semantics.clone(),
+        },
+        spec: Some(overload.spec.clone()),
+    };
+    Ok(Expression::Function(
+        FunctionExpression::new(bound_function, std::mem::take(bound_args), return_type)
+            .with_routine_meta(routine_meta),
+    ))
+}
+
+fn external_scalar_placeholder(
+    name: &str,
+    arguments: &[LogicalType],
+    return_type: &LogicalType,
+    semantics: &RoutineSemantics,
+) -> paro_function::scalar::BoundScalarFunction {
+    ScalarFunction::new(
+        name.to_string(),
+        arguments.to_vec(),
+        return_type.clone(),
+        external_scalar_placeholder_execute,
+    )
+    .with_stability(map_routine_stability(semantics.stability.clone()))
+    .with_null_handling(map_routine_null_policy(semantics.null_policy.clone()))
+    .with_side_effects(map_routine_side_effects(semantics.side_effects.clone()))
+    .into()
+}
+
+fn external_scalar_placeholder_execute(
+    _input: &Chunk,
+    _state: &dyn ExpressionState,
+    _result: &mut Vector,
+) -> Result<()> {
+    Err(paro_error::internal(
+        "external routine reached native scalar executor before late lowering",
+    ))
+}
+
+fn map_routine_stability(stability: RoutineStability) -> FunctionStability {
+    match stability {
+        RoutineStability::Immutable => FunctionStability::Consistent,
+        RoutineStability::Stable => FunctionStability::ConsistentWithinQuery,
+        RoutineStability::Volatile => FunctionStability::Volatile,
+    }
+}
+
+fn map_routine_null_policy(policy: RoutineNullPolicy) -> FunctionNullHandling {
+    match policy {
+        RoutineNullPolicy::Strict => FunctionNullHandling::DefaultNullHandling,
+        RoutineNullPolicy::CalledOnNullInput => FunctionNullHandling::SpecialHandling,
+    }
+}
+
+fn map_routine_side_effects(side_effects: RoutineSideEffects) -> FunctionSideEffects {
+    match side_effects {
+        RoutineSideEffects::None => FunctionSideEffects::NoSideEffects,
+        RoutineSideEffects::HasSideEffects => FunctionSideEffects::HasSideEffects,
+    }
 }
 
 #[cfg(test)]

@@ -51,6 +51,27 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
                 )?;
                 Ok(found)
             }
+            LogicalOperator::ExternalProject(project) => {
+                let mut found = self.plan_one_pass(&mut project.child.operator)?;
+                for expr in &mut project.expressions {
+                    found |= self.binder.plan_current_layer_subqueries(
+                        &mut expr.expression,
+                        &mut project.child.operator,
+                    )?;
+                }
+                Ok(found)
+            }
+            LogicalOperator::ExternalTable(table) => {
+                let mut found = false;
+                if let Some(child) = &mut table.child {
+                    found |= self.plan_one_pass(&mut child.operator)?;
+                    found |= self.binder.plan_current_layer_subqueries(
+                        &mut table.call_expression,
+                        &mut child.operator,
+                    )?;
+                }
+                Ok(found)
+            }
             LogicalOperator::Limit(limit) => {
                 let mut found = self.plan_one_pass(&mut limit.child.operator)?;
                 if let Some(expr) = &mut limit.limit {
@@ -182,6 +203,7 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
             LogicalOperator::Get(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
             | LogicalOperator::CreateIndex(_)

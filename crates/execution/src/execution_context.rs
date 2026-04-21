@@ -8,6 +8,7 @@ use crate::thread_context::ThreadContext;
 use paro_common::allocator::{Allocator, ArenaAllocator, BufferAllocator, MemoryTag};
 use paro_common::error::Result;
 use paro_context::StatementContext;
+use paro_scheduler::task::InterruptState;
 use std::sync::Arc;
 
 /// Execution context for operator execution.
@@ -23,6 +24,9 @@ pub struct ExecutionContext<'a> {
 
     /// Reference to the pipeline (optional).
     pub pipeline: Option<&'a Pipeline>,
+
+    /// Interrupt state used by operators that may block and later resume.
+    interrupt_state: InterruptState,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -38,10 +42,21 @@ impl<'a> ExecutionContext<'a> {
         thread: &'a ThreadContext,
         pipeline: Option<&'a Pipeline>,
     ) -> Self {
+        Self::with_interrupt_state(session, thread, pipeline, InterruptState::new())
+    }
+
+    /// Create a new ExecutionContext with an explicit interrupt state.
+    pub fn with_interrupt_state(
+        session: Arc<StatementContext>,
+        thread: &'a ThreadContext,
+        pipeline: Option<&'a Pipeline>,
+        interrupt_state: InterruptState,
+    ) -> Self {
         Self {
             session,
             thread,
             pipeline,
+            interrupt_state,
         }
     }
 
@@ -79,6 +94,12 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn is_interrupted(&self) -> bool {
         self.session.is_interrupted()
+    }
+
+    /// Get the interrupt state associated with this execution path.
+    #[inline]
+    pub fn interrupt_state(&self) -> &InterruptState {
+        &self.interrupt_state
     }
 
     #[inline]

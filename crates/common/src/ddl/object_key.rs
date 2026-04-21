@@ -10,6 +10,7 @@ pub enum DdlObjectKind {
     View,
     Index,
     Sequence,
+    Routine,
     PropertyGraph,
     Database,
 }

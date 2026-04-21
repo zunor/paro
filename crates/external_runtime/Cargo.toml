@@ -1,0 +1,16 @@
+[package]
+name = "paro-external-runtime"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "paro_external_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+paro-common = { workspace = true }
+paro-external-abi = { workspace = true }
+paro-routine = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,42 @@
+DROP FUNCTION IF EXISTS py_fail(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_bad_contract(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION IF EXISTS py_missing_import(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_fail(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$raise ValueError("boom from worker")$$;
+CREATE FUNCTION
+
+SELECT py_fail(1);
+ERROR: ValueError: boom from worker (SQLSTATE=XX000)
+
+CREATE FUNCTION py_bad_contract(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return ["oops" for _ in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_bad_contract(1);
+ERROR: error: required argument is not an integer (SQLSTATE=XX000)
+
+CREATE FUNCTION py_missing_import(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMPORTS ('/tmp/paro/python_udf/does_not_exist.py')
+AS $$return [value for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_missing_import(1);
+ERROR: import '/tmp/paro/python_udf/does_not_exist.py' does not exist on the local filesystem (SQLSTATE=39P05)
+
+DROP FUNCTION py_fail(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_bad_contract(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_missing_import(INTEGER);
+DROP FUNCTION

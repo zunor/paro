@@ -8,6 +8,7 @@
 //! scans use multiple tasks sharing the same pipeline global state.
 
 use parking_lot::Mutex;
+use paro_scheduler::task::InterruptState;
 use paro_scheduler::task::ProducerToken;
 use paro_scheduler::task::Task;
 use paro_scheduler::task::TaskExecutionMode;
@@ -68,6 +69,8 @@ pub struct PipelineTask {
     blocked: AtomicBool,
     /// Producer token for rescheduling
     token: Mutex<Option<ProducerToken>>,
+    /// Interrupt state linked to the scheduled task.
+    interrupt_state: InterruptState,
     /// persistent executor
     executor: Option<PipelineExecutor>,
 }
@@ -88,6 +91,7 @@ impl PipelineTask {
             finished: false,
             blocked: AtomicBool::new(false),
             token: Mutex::new(None),
+            interrupt_state: InterruptState::new(),
             executor: None,
         }
     }
@@ -119,12 +123,13 @@ impl Task for PipelineTask {
         // Initialize executor if needed
         if self.executor.is_none() {
             let total_threads = self.pipeline.compute_max_threads();
-            self.executor = Some(PipelineExecutor::with_global_states(
+            self.executor = Some(PipelineExecutor::with_interrupt_state(
                 gstates.client.clone(),
                 self.task_idx,
                 total_threads,
                 self.pipeline.clone(),
                 gstates.clone(),
+                self.interrupt_state.clone(),
             )?);
         }
 
@@ -176,6 +181,13 @@ impl Task for PipelineTask {
         *self.token.lock() = Some(token);
     }
 
+    fn set_interrupt_state(&mut self, interrupt_state: InterruptState) {
+        self.interrupt_state = interrupt_state.clone();
+        if let Some(executor) = self.executor.as_mut() {
+            executor.interrupt_state = interrupt_state;
+        }
+    }
+
     fn get_token(&self) -> Option<ProducerToken> {
         self.token.lock().clone()
     }
@@ -224,12 +236,13 @@ impl PipelineTask {
         if self.executor.is_none() {
             // Use thread_id from context, and gstates.client for session
             let total_threads = self.pipeline.compute_max_threads();
-            self.executor = Some(PipelineExecutor::with_global_states(
+            self.executor = Some(PipelineExecutor::with_interrupt_state(
                 gstates.client.clone(),
                 ctx.thread_id(),
                 total_threads,
                 self.pipeline.clone(),
                 gstates.clone(),
+                self.interrupt_state.clone(),
             )?);
         }
 

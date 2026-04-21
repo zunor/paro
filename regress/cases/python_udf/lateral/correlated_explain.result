@@ -1,0 +1,44 @@
+DROP FUNCTION IF EXISTS py_scale(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_scale(a INTEGER) RETURNS TABLE (value INTEGER)
+LANGUAGE python
+AS $$return [value * 10 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+-- @normalize explain_routine_ids
+EXPLAIN
+SELECT t.x, s.value
+FROM (VALUES (1), (2), (3)) AS t(x)
+CROSS JOIN LATERAL py_scale(t.x) AS s
+ORDER BY 1, 2;
+QUERY PLAN
+ORDER_BY  (rows=30)
+  Sort Key: x ASC NULLS LAST, value ASC NULLS LAST
+  ->  PROJECTION  (rows=30)
+        Output: x, value
+        ->  NESTED_LOOP_JOIN  (rows=30)
+              Join Type: INNER
+              Join Condition: col_2 IS NOT DISTINCT FROM col0
+              ->  EXTERNAL_TABLE  (rows=100)
+                    Routine: py_scale[10319@1]
+                    Language: python
+                    Backend: process@local_shm
+                    Batch Target: 262144 bytes (max accumulation 4194304 bytes)
+                    Flow Control: visible_batches<=16 visible_bytes<=4194304 credit_step=65536
+                    Env Artifact: artifact-c83121d53d99acc1-cbf29ce484222325-cbf29ce484222325
+                    Artifact Validation: ready(batch@v1)
+                    Correlation: lateral=true parameterized=true (outer batch + parameter columns)
+                    Cost: startup=0.000, per_row=0.000, bytes=0.000, queue_risk=0.000
+                    ->  PROJECTION
+                          Output: delim_1, delim_1
+                          ->  CROSS_PRODUCT
+                                Join Type: CROSS
+                                ->  DUMMY_SCAN
+                                ->  COLUMN_DATA_SCAN  (rows=1)
+              ->  PROJECTION  (rows=3)
+                    Output: col0
+                    ->  EXPRESSION_SCAN  (rows=3)
+
+DROP FUNCTION py_scale(INTEGER);
+DROP FUNCTION

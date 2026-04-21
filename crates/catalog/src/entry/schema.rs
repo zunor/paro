@@ -11,8 +11,9 @@ use super::catalog_entry::{
 };
 use super::{
     AggregateFunctionCatalogEntry, CatalogEntryEnum, CopyFunctionCatalogEntry, CreateIndexInfo,
-    CreatePropertyGraphInfo, CreateSequenceInfo, CreateViewInfo, IndexCatalogEntry,
-    PropertyGraphCatalogEntry, ScalarFunctionCatalogEntry, SequenceCatalogEntry, TableCatalogEntry,
+    CreatePropertyGraphInfo, CreateRoutineInfo, CreateSequenceInfo, CreateViewInfo,
+    DropRoutineInfo, IndexCatalogEntry, PropertyGraphCatalogEntry, RoutineCatalogEntry,
+    ScalarFunctionCatalogEntry, SequenceCatalogEntry, StoredRoutineOverload, TableCatalogEntry,
     TableFunctionCatalogEntry, ViewCatalogEntry,
 };
 use crate::collection::{CatalogCollection, EntryLookup, SimilarCatalogEntry};
@@ -22,6 +23,7 @@ use crate::default::DefaultGenerator;
 use crate::mvcc::CatalogSnapshot;
 use crate::schema::contents::SchemaContents;
 use paro_common::error::{self as paro_error, Result};
+use paro_routine::{RoutineId, RoutineIdentity};
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::tablet::Tablet;
 use std::collections::HashSet;
@@ -63,6 +65,10 @@ impl EntryLookupInfo {
 
     pub fn function(name: String) -> Self {
         Self::new(CatalogType::ScalarFunction, name)
+    }
+
+    pub fn routine(name: String) -> Self {
+        Self::new(CatalogType::Routine, name)
     }
 
     pub fn table_function(name: String) -> Self {
@@ -591,6 +597,17 @@ impl SchemaEntry {
             .get_entry(transaction_id, start_time, name)
     }
 
+    pub fn get_routine(
+        &self,
+        transaction_id: u64,
+        start_time: u64,
+        name: &str,
+    ) -> Option<Arc<CatalogEntryEnum>> {
+        self.contents
+            .routines
+            .get_entry(transaction_id, start_time, name)
+    }
+
     /// Get a table function from this schema.
     pub fn get_table_function(
         &self,
@@ -653,6 +670,54 @@ impl SchemaEntry {
         self.contents
             .sequences
             .get_entry(transaction_id, start_time, name)
+    }
+
+    pub fn drop_routine(
+        &self,
+        transaction: &CatalogSnapshot,
+        name: &str,
+        info: &DropRoutineInfo,
+    ) -> Result<bool> {
+        let timestamp = transaction.write_timestamp()?;
+        let collection = self.require_collection(CatalogType::Routine)?;
+        let Some(existing_entry) =
+            self.get_routine(transaction.transaction_id, transaction.start_time, name)
+        else {
+            return Ok(false);
+        };
+        let Some(existing_routine) = existing_entry.as_routine() else {
+            return Err(paro_error::wrong_object_type("routine", name));
+        };
+
+        let Some(index) = existing_routine
+            .overloads()
+            .iter()
+            .position(|overload| overload.spec.signature().exact_match(&info.arg_types))
+        else {
+            return Ok(false);
+        };
+
+        if existing_routine.overloads().len() == 1 {
+            return collection
+                .stage_drop(transaction, name)
+                .map(|handle| handle.is_some());
+        }
+
+        let mut overloads = existing_routine.overloads().to_vec();
+        overloads.remove(index);
+        let replacement = Arc::new(CatalogEntryEnum::Routine(Arc::new(
+            RoutineCatalogEntry::with_overloads(
+                self.base.catalog.clone(),
+                self.base.name.clone(),
+                name.to_string(),
+                existing_routine.base.base.object_id,
+                timestamp,
+                overloads,
+            ),
+        )));
+        collection
+            .stage_replace(transaction, name, replacement)
+            .map(|handle| handle.is_some())
     }
 
     /// Get an index from this schema.
@@ -1042,6 +1107,101 @@ impl SchemaEntry {
         self.add_entry_internal(transaction, catalog_entry, on_conflict)
     }
 
+    pub fn create_routine(
+        &self,
+        transaction: &CatalogSnapshot,
+        info: CreateRoutineInfo,
+    ) -> Result<Option<Arc<CatalogEntryEnum>>> {
+        let timestamp = transaction.write_timestamp()?;
+        let collection = self.require_collection(CatalogType::Routine)?;
+        let existing = self.contents.routines.get_entry(
+            transaction.transaction_id,
+            transaction.start_time,
+            &info.name,
+        );
+        let signature = info.signature();
+
+        let (catalog_entry, replace_existing) = if let Some(existing_entry) = existing {
+            let Some(existing_routine) = existing_entry.as_routine() else {
+                return Err(paro_error::wrong_object_type("routine", &info.name));
+            };
+
+            let mut overloads = existing_routine.overloads().to_vec();
+            if let Some(index) = overloads.iter().position(|overload| {
+                overload
+                    .spec
+                    .signature()
+                    .exact_match(&signature.argument_types)
+            }) {
+                match info.on_conflict {
+                    OnCreateConflict::ErrorOnConflict => {
+                        return Err(paro_error::object_exists("routine", &info.name));
+                    }
+                    OnCreateConflict::IgnoreOnConflict => return Ok(None),
+                    OnCreateConflict::ReplaceOnConflict | OnCreateConflict::AlterOnConflict => {
+                        let previous = &overloads[index];
+                        overloads[index] = StoredRoutineOverload {
+                            spec: info.materialize_spec(
+                                RoutineIdentity {
+                                    id: previous.spec.identity.id,
+                                    generation: previous.spec.identity.generation + 1,
+                                },
+                                self.base.name.clone(),
+                                info.name.clone(),
+                            ),
+                            sql: info.sql.clone(),
+                        };
+                    }
+                }
+            } else {
+                overloads.push(StoredRoutineOverload {
+                    spec: info.materialize_spec(
+                        RoutineIdentity {
+                            id: RoutineId::from_raw(allocate_object_id().raw()),
+                            generation: 1,
+                        },
+                        self.base.name.clone(),
+                        info.name.clone(),
+                    ),
+                    sql: info.sql.clone(),
+                });
+            }
+
+            let entry = Arc::new(CatalogEntryEnum::Routine(Arc::new(
+                RoutineCatalogEntry::with_overloads(
+                    self.base.catalog.clone(),
+                    self.base.name.clone(),
+                    info.name.clone(),
+                    existing_routine.base.base.object_id,
+                    timestamp,
+                    overloads,
+                ),
+            )));
+            (entry, true)
+        } else {
+            let entry = Arc::new(CatalogEntryEnum::Routine(Arc::new(
+                RoutineCatalogEntry::new(info, timestamp, self.base.catalog.clone()),
+            )));
+            (entry, false)
+        };
+
+        if replace_existing {
+            match collection.stage_replace(transaction, catalog_entry.name(), catalog_entry.clone())
+            {
+                Ok(Some(_)) => Ok(Some(catalog_entry)),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            }
+        } else {
+            match collection.stage_create(transaction, catalog_entry.name(), catalog_entry.clone())
+            {
+                Ok(Some(_)) => Ok(Some(catalog_entry)),
+                Ok(None) => Err(paro_error::object_exists("routine", catalog_entry.name())),
+                Err(err) => Err(err),
+            }
+        }
+    }
+
     pub fn create_table_function(
         &self,
         transaction: &CatalogSnapshot,
@@ -1342,6 +1502,7 @@ impl SchemaEntry {
             CatalogType::View,
             CatalogType::Index,
             CatalogType::PropertyGraph,
+            CatalogType::Routine,
             CatalogType::ScalarFunction,
             CatalogType::TableFunction,
             CatalogType::CopyFunction,
@@ -1546,6 +1707,7 @@ mod tests {
         assert!(schema.collection(CatalogType::Index).is_some());
         assert!(schema.collection(CatalogType::PropertyGraph).is_some());
         assert!(schema.collection(CatalogType::Sequence).is_some());
+        assert!(schema.collection(CatalogType::Routine).is_some());
         assert!(schema.collection(CatalogType::ScalarFunction).is_some());
         assert!(schema.collection(CatalogType::TableFunction).is_some());
         assert!(schema.collection(CatalogType::CopyFunction).is_some());

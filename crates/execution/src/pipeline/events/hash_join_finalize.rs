@@ -6,6 +6,7 @@
 //! Event for running hash-join sink finalize in its own scheduler stage.
 
 use paro_scheduler::event::Event;
+use paro_scheduler::task::InterruptState;
 use paro_scheduler::task::Task;
 use paro_scheduler::task::TaskExecutionMode;
 use paro_scheduler::task::TaskExecutionResult;
@@ -71,6 +72,8 @@ pub struct HashJoinFinalizeTask {
     event: Arc<HashJoinFinalizeEvent>,
     /// Whether task has completed.
     finished: bool,
+    /// Interrupt state linked to the scheduled task.
+    interrupt_state: InterruptState,
 }
 
 impl HashJoinFinalizeTask {
@@ -79,6 +82,7 @@ impl HashJoinFinalizeTask {
         Self {
             event,
             finished: false,
+            interrupt_state: InterruptState::new(),
         }
     }
 }
@@ -100,9 +104,8 @@ impl Task for HashJoinFinalizeTask {
 
             let sink_guard = global_states.sink.lock();
             if let Some(sink_state) = sink_guard.as_ref() {
-                let interrupt_state = paro_scheduler::task::InterruptState::new();
                 let finalize_input =
-                    OperatorSinkFinalizeInput::new(sink_state.as_ref(), &interrupt_state);
+                    OperatorSinkFinalizeInput::new(sink_state.as_ref(), &self.interrupt_state);
                 match sink.finalize(&finalize_input)? {
                     SinkFinalizeType::Ready | SinkFinalizeType::NoOutputPossible => {}
                     SinkFinalizeType::Blocked => return Ok(TaskExecutionResult::Blocked),
@@ -116,5 +119,9 @@ impl Task for HashJoinFinalizeTask {
 
     fn task_type(&self) -> &str {
         "HashJoinFinalizeTask"
+    }
+
+    fn set_interrupt_state(&mut self, interrupt_state: InterruptState) {
+        self.interrupt_state = interrupt_state;
     }
 }

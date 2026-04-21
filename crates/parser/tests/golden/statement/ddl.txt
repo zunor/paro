@@ -8109,933 +8109,864 @@ AttachTable(
 
 
 ---------- Input ----------
-CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p));
+CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python AS $$return [not value for value in p.materialize_py()]$$;
 ---------- Output ---------
-CREATE FUNCTION IF NOT EXISTS isnotempty AS (p) -> NOT is_null(p)
+CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python AS $$
+return [not value for value in p.materialize_py()]
+$$
 ---------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
+CreateFunction(
+    CreateFunctionStmt {
         create_option: CreateIfNotExists,
-        udf_name: Identifier {
-            span: Some(
-                30..40,
-            ),
-            name: "isnotempty",
-            quote: None,
-            ident_type: None,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    30..40,
+                ),
+                name: "isnotempty",
+                quote: None,
+                ident_type: None,
+            },
         },
-        description: None,
-        definition: LambdaUDF {
-            parameters: Names(
-                [
+        arguments: [
+            FunctionArgument {
+                name: Some(
                     Identifier {
                         span: Some(
-                            44..45,
+                            41..42,
                         ),
                         name: "p",
                         quote: None,
                         ident_type: None,
                     },
-                ],
-            ),
-            definition: UnaryOp {
-                span: Some(
-                    50..53,
                 ),
-                op: Not,
-                expr: FunctionCall {
-                    span: Some(
-                        54..64,
-                    ),
-                    func: FunctionCall {
-                        distinct: false,
-                        schema: None,
-                        name: Identifier {
-                            span: Some(
-                                54..61,
-                            ),
-                            name: "is_null",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        args: [
-                            ColumnRef {
-                                span: Some(
-                                    62..63,
-                                ),
-                                column: ColumnRef {
-                                    schema: None,
-                                    table: None,
-                                    column: Name(
-                                        Identifier {
-                                            span: Some(
-                                                62..63,
-                                            ),
-                                            name: "p",
-                                            quote: None,
-                                            ident_type: None,
-                                        },
-                                    ),
-                                },
-                            },
-                        ],
-                        params: [],
-                        order_by: [],
-                        filter: None,
-                        window: None,
-                        lambda: None,
-                    },
-                },
+                data_type: Boolean,
             },
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE FUNCTION IF NOT EXISTS isnotempty AS(p INT) -> not(is_null(p));
----------- Output ---------
-CREATE FUNCTION IF NOT EXISTS isnotempty AS (p Int32) -> NOT is_null(p)
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: CreateIfNotExists,
-        udf_name: Identifier {
-            span: Some(
-                30..40,
-            ),
-            name: "isnotempty",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: LambdaUDF {
-            parameters: NameWithTypes(
-                [
-                    (
-                        Identifier {
-                            span: Some(
-                                44..45,
-                            ),
-                            name: "p",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        Int32,
-                    ),
-                ],
-            ),
-            definition: UnaryOp {
-                span: Some(
-                    54..57,
-                ),
-                op: Not,
-                expr: FunctionCall {
-                    span: Some(
-                        58..68,
-                    ),
-                    func: FunctionCall {
-                        distinct: false,
-                        schema: None,
-                        name: Identifier {
-                            span: Some(
-                                58..65,
-                            ),
-                            name: "is_null",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        args: [
-                            ColumnRef {
-                                span: Some(
-                                    66..67,
-                                ),
-                                column: ColumnRef {
-                                    schema: None,
-                                    table: None,
-                                    column: Name(
-                                        Identifier {
-                                            span: Some(
-                                                66..67,
-                                            ),
-                                            name: "p",
-                                            quote: None,
-                                            ident_type: None,
-                                        },
-                                    ),
-                                },
-                            },
-                        ],
-                        params: [],
-                        order_by: [],
-                        filter: None,
-                        window: None,
-                        lambda: None,
-                    },
-                },
-            },
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE OR REPLACE FUNCTION isnotempty_test_replace AS(p) -> not(is_null(p))  DESC = 'This is a description';
----------- Output ---------
-CREATE OR REPLACE FUNCTION isnotempty_test_replace AS (p) -> NOT is_null(p) DESC = 'This is a description'
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: CreateOrReplace,
-        udf_name: Identifier {
-            span: Some(
-                27..50,
-            ),
-            name: "isnotempty_test_replace",
-            quote: None,
-            ident_type: None,
-        },
-        description: Some(
-            "This is a description",
+        ],
+        return_type: Scalar(
+            Boolean,
         ),
-        definition: LambdaUDF {
-            parameters: Names(
-                [
-                    Identifier {
-                        span: Some(
-                            54..55,
-                        ),
-                        name: "p",
-                        quote: None,
-                        ident_type: None,
-                    },
-                ],
+        language: Identifier {
+            span: Some(
+                77..83,
             ),
-            definition: UnaryOp {
+            name: "python",
+            quote: None,
+            ident_type: None,
+        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: None,
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "return [not value for value in p.materialize_py()]",
+    },
+)
+
+
+---------- Input ----------
+CREATE FUNCTION IF NOT EXISTS isnotempty(p INT) RETURNS BOOLEAN LANGUAGE python IMMUTABLE AS $$return [value is not None for value in p.materialize_py()]$$;
+---------- Output ---------
+CREATE FUNCTION IF NOT EXISTS isnotempty(p Int32) RETURNS BOOLEAN LANGUAGE python IMMUTABLE AS $$
+return [value is not None for value in p.materialize_py()]
+$$
+---------- AST ------------
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: CreateIfNotExists,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
                 span: Some(
-                    60..63,
+                    30..40,
                 ),
-                op: Not,
-                expr: FunctionCall {
-                    span: Some(
-                        64..74,
-                    ),
-                    func: FunctionCall {
-                        distinct: false,
-                        schema: None,
-                        name: Identifier {
-                            span: Some(
-                                64..71,
-                            ),
-                            name: "is_null",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        args: [
-                            ColumnRef {
-                                span: Some(
-                                    72..73,
-                                ),
-                                column: ColumnRef {
-                                    schema: None,
-                                    table: None,
-                                    column: Name(
-                                        Identifier {
-                                            span: Some(
-                                                72..73,
-                                            ),
-                                            name: "p",
-                                            quote: None,
-                                            ident_type: None,
-                                        },
-                                    ),
-                                },
-                            },
-                        ],
-                        params: [],
-                        order_by: [],
-                        filter: None,
-                        window: None,
-                        lambda: None,
-                    },
-                },
+                name: "isnotempty",
+                quote: None,
+                ident_type: None,
             },
         },
-    },
-)
-
-
----------- Input ----------
-CREATE OR REPLACE FUNCTION isnotempty_test_replace (p STRING) RETURNS BOOL AS $$ not(is_null(p)) $$;
----------- Output ---------
-CREATE OR REPLACE FUNCTION isnotempty_test_replace (p STRING) RETURNS BOOLEAN AS $$
-not(is_null(p))
-$$
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: CreateOrReplace,
-        udf_name: Identifier {
-            span: Some(
-                27..50,
-            ),
-            name: "isnotempty_test_replace",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: ScalarUDF {
-            arg_types: [
-                (
+        arguments: [
+            FunctionArgument {
+                name: Some(
                     Identifier {
                         span: Some(
-                            52..53,
+                            41..42,
                         ),
                         name: "p",
                         quote: None,
                         ident_type: None,
                     },
-                    String,
                 ),
-            ],
-            definition: "not(is_null(p))",
-            return_type: Boolean,
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';
----------- Output ---------
-CREATE FUNCTION binary_reverse ( BINARY ) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815'
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: Create,
-        udf_name: Identifier {
-            span: Some(
-                16..30,
-            ),
-            name: "binary_reverse",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: UDFServer {
-            arg_types: Types(
-                [
-                    Binary,
-                ],
-            ),
-            return_type: Binary,
-            address: "http://0.0.0.0:8815",
-            handler: "binary_reverse",
-            headers: {},
-            language: "python",
-            immutable: None,
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE FUNCTION binary_reverse (arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';
----------- Output ---------
-CREATE FUNCTION binary_reverse ( arg0 BINARY ) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815'
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: Create,
-        udf_name: Identifier {
-            span: Some(
-                16..30,
-            ),
-            name: "binary_reverse",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: UDFServer {
-            arg_types: NameWithTypes(
-                [
-                    (
-                        Identifier {
-                            span: Some(
-                                32..36,
-                            ),
-                            name: "arg0",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        Binary,
-                    ),
-                ],
-            ),
-            return_type: Binary,
-            address: "http://0.0.0.0:8815",
-            handler: "binary_reverse",
-            headers: {},
-            language: "python",
-            immutable: None,
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' HEADERS = ('X-Authorization' = '123') ADDRESS = 'http://0.0.0.0:8815';
----------- Output ---------
-CREATE FUNCTION binary_reverse ( BINARY ) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' HEADERS = ('X-Authorization' = '123') ADDRESS = 'http://0.0.0.0:8815'
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: Create,
-        udf_name: Identifier {
-            span: Some(
-                16..30,
-            ),
-            name: "binary_reverse",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: UDFServer {
-            arg_types: Types(
-                [
-                    Binary,
-                ],
-            ),
-            return_type: Binary,
-            address: "http://0.0.0.0:8815",
-            handler: "binary_reverse",
-            headers: {
-                "X-Authorization": "123",
+                data_type: Int32,
             },
-            language: "python",
-            immutable: None,
+        ],
+        return_type: Scalar(
+            Boolean,
+        ),
+        language: Identifier {
+            span: Some(
+                73..79,
+            ),
+            name: "python",
+            quote: None,
+            ident_type: None,
         },
+        volatility: Some(
+            Immutable,
+        ),
+        strict: false,
+        security: Invoker,
+        handler: None,
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "return [value is not None for value in p.materialize_py()]",
     },
 )
 
 
 ---------- Input ----------
-CREATE FUNCTION binary_reverse_table () RETURNS TABLE (c1 int) AS $$ select * from binary_reverse $$;
+CREATE OR REPLACE FUNCTION isnotempty_test_replace(p STRING) RETURNS BOOLEAN LANGUAGE python STRICT AS $$return [value is not None and value != '' for value in p.materialize_py()]$$;
 ---------- Output ---------
-CREATE FUNCTION binary_reverse_table () RETURNS TABLE (c1 Int32) AS $$
-select * from binary_reverse
+CREATE OR REPLACE FUNCTION isnotempty_test_replace(p STRING) RETURNS BOOLEAN LANGUAGE python STRICT AS $$
+return [value is not None and value != '' for value in p.materialize_py()]
 $$
 ---------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: Create,
-        udf_name: Identifier {
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: CreateOrReplace,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    27..50,
+                ),
+                name: "isnotempty_test_replace",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            51..52,
+                        ),
+                        name: "p",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: String,
+            },
+        ],
+        return_type: Scalar(
+            Boolean,
+        ),
+        language: Identifier {
             span: Some(
-                16..36,
+                86..92,
             ),
-            name: "binary_reverse_table",
+            name: "python",
             quote: None,
             ident_type: None,
         },
-        description: None,
-        definition: UDTFSql {
-            arg_types: [],
-            return_types: [
-                (
+        volatility: None,
+        strict: true,
+        security: Invoker,
+        handler: None,
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "return [value is not None and value != '' for value in p.materialize_py()]",
+    },
+)
+
+
+---------- Input ----------
+CREATE OR REPLACE FUNCTION binary_reverse(arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER 'binary_reverse' AS $$return arg0$$;
+---------- Output ---------
+CREATE OR REPLACE FUNCTION binary_reverse(arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER 'binary_reverse' AS $$
+return arg0
+$$
+---------- AST ------------
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: CreateOrReplace,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    27..41,
+                ),
+                name: "binary_reverse",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
                     Identifier {
                         span: Some(
-                            55..57,
+                            42..46,
+                        ),
+                        name: "arg0",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Binary,
+            },
+        ],
+        return_type: Scalar(
+            Binary,
+        ),
+        language: Identifier {
+            span: Some(
+                79..85,
+            ),
+            name: "python",
+            quote: None,
+            ident_type: None,
+        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: Some(
+            "binary_reverse",
+        ),
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "return arg0",
+    },
+)
+
+
+---------- Input ----------
+CREATE FUNCTION binary_reverse(arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER 'binary_reverse' PACKAGES ('numpy') IMPORTS ('@ss/abc') AS $$return arg0$$;
+---------- Output ---------
+CREATE FUNCTION binary_reverse(arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER 'binary_reverse' PACKAGES ('numpy') IMPORTS ('@ss/abc') AS $$
+return arg0
+$$
+---------- AST ------------
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: Create,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    16..30,
+                ),
+                name: "binary_reverse",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            31..35,
+                        ),
+                        name: "arg0",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Binary,
+            },
+        ],
+        return_type: Scalar(
+            Binary,
+        ),
+        language: Identifier {
+            span: Some(
+                68..74,
+            ),
+            name: "python",
+            quote: None,
+            ident_type: None,
+        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: Some(
+            "binary_reverse",
+        ),
+        packages: [
+            "numpy",
+        ],
+        imports: [
+            "@ss/abc",
+        ],
+        rows: None,
+        capability_profile: None,
+        definition: "return arg0",
+    },
+)
+
+
+---------- Input ----------
+CREATE FUNCTION binary_reverse_table() RETURNS TABLE (c1 INT) LANGUAGE python ROWS 16 AS $$return {'c1': [1, 2]}$$;
+---------- Output ---------
+CREATE FUNCTION binary_reverse_table() RETURNS TABLE (c1 Int32) LANGUAGE python ROWS 16 AS $$
+return {'c1': [1, 2]}
+$$
+---------- AST ------------
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: Create,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    16..36,
+                ),
+                name: "binary_reverse_table",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [],
+        return_type: Table(
+            [
+                FunctionTableColumn {
+                    name: Identifier {
+                        span: Some(
+                            54..56,
                         ),
                         name: "c1",
                         quote: None,
                         ident_type: None,
                     },
-                    Int32,
-                ),
+                    data_type: Int32,
+                },
             ],
-            sql: "select * from binary_reverse",
-        },
-    },
-)
-
-
----------- Input ----------
-ALTER FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';
----------- Output ---------
-ALTER FUNCTION binary_reverse ( BINARY ) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815'
----------- AST ------------
-AlterUDF(
-    AlterUDFStmt {
-        udf_name: Identifier {
+        ),
+        language: Identifier {
             span: Some(
-                15..29,
+                71..77,
             ),
-            name: "binary_reverse",
+            name: "python",
             quote: None,
             ident_type: None,
         },
-        description: None,
-        definition: UDFServer {
-            arg_types: Types(
-                [
-                    Binary,
-                ],
-            ),
-            return_type: Binary,
-            address: "http://0.0.0.0:8815",
-            handler: "binary_reverse",
-            headers: {},
-            language: "python",
-            immutable: None,
-        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: None,
+        packages: [],
+        imports: [],
+        rows: Some(
+            16,
+        ),
+        capability_profile: None,
+        definition: "return {'c1': [1, 2]}",
     },
 )
 
 
 ---------- Input ----------
-CREATE OR REPLACE FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';
+CREATE OR REPLACE FUNCTION addone(i INT) RETURNS INT LANGUAGE python HANDLER 'addone_py' AS $$\nreturn i + 1\n$$;
 ---------- Output ---------
-CREATE OR REPLACE FUNCTION binary_reverse ( BINARY ) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815'
+CREATE OR REPLACE FUNCTION addone(i Int32) RETURNS Int32 LANGUAGE python HANDLER 'addone_py' AS $$
+\nreturn i + 1\n
+$$
 ---------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
+CreateFunction(
+    CreateFunctionStmt {
         create_option: CreateOrReplace,
-        udf_name: Identifier {
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    27..33,
+                ),
+                name: "addone",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            34..35,
+                        ),
+                        name: "i",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Int32,
+            },
+        ],
+        return_type: Scalar(
+            Int32,
+        ),
+        language: Identifier {
             span: Some(
-                27..41,
+                62..68,
             ),
-            name: "binary_reverse",
+            name: "python",
             quote: None,
             ident_type: None,
         },
-        description: None,
-        definition: UDFServer {
-            arg_types: Types(
-                [
-                    Binary,
-                ],
-            ),
-            return_type: Binary,
-            address: "http://0.0.0.0:8815",
-            handler: "binary_reverse",
-            headers: {},
-            language: "python",
-            immutable: None,
-        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: Some(
+            "addone_py",
+        ),
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "\\nreturn i + 1\\n",
     },
 )
 
 
 ---------- Input ----------
-create or replace function addone(int)
+CREATE OR REPLACE FUNCTION addone(i INT) RETURNS INT LANGUAGE python IMPORTS ('@ss/abc') PACKAGES ('numpy', 'pandas') HANDLER 'addone_py' CAPABILITY PROFILE trusted_subinterpreter AS $$\nreturn i + 1\n$$;
+---------- Output ---------
+CREATE OR REPLACE FUNCTION addone(i Int32) RETURNS Int32 LANGUAGE python HANDLER 'addone_py' PACKAGES ('numpy', 'pandas') IMPORTS ('@ss/abc') CAPABILITY PROFILE trusted_subinterpreter AS $$
+\nreturn i + 1\n
+$$
+---------- AST ------------
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: CreateOrReplace,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    27..33,
+                ),
+                name: "addone",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            34..35,
+                        ),
+                        name: "i",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Int32,
+            },
+        ],
+        return_type: Scalar(
+            Int32,
+        ),
+        language: Identifier {
+            span: Some(
+                62..68,
+            ),
+            name: "python",
+            quote: None,
+            ident_type: None,
+        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: Some(
+            "addone_py",
+        ),
+        packages: [
+            "numpy",
+            "pandas",
+        ],
+        imports: [
+            "@ss/abc",
+        ],
+        rows: None,
+        capability_profile: Some(
+            Identifier {
+                span: Some(
+                    157..179,
+                ),
+                name: "trusted_subinterpreter",
+                quote: None,
+                ident_type: None,
+            },
+        ),
+        definition: "\\nreturn i + 1\\n",
+    },
+)
+
+
+---------- Input ----------
+CREATE FUNCTION py_definer(a INT) RETURNS INT LANGUAGE python STABLE SECURITY DEFINER AS $$return a$$;
+---------- Output ---------
+CREATE FUNCTION py_definer(a Int32) RETURNS Int32 LANGUAGE python STABLE SECURITY DEFINER AS $$
+return a
+$$
+---------- AST ------------
+CreateFunction(
+    CreateFunctionStmt {
+        create_option: Create,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    16..26,
+                ),
+                name: "py_definer",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            27..28,
+                        ),
+                        name: "a",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Int32,
+            },
+        ],
+        return_type: Scalar(
+            Int32,
+        ),
+        language: Identifier {
+            span: Some(
+                55..61,
+            ),
+            name: "python",
+            quote: None,
+            ident_type: None,
+        },
+        volatility: Some(
+            Stable,
+        ),
+        strict: false,
+        security: Definer,
+        handler: None,
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "return a",
+    },
+)
+
+
+---------- Input ----------
+create or replace function addone(i int)
 returns int
 language python
-handler = 'addone_py'
+handler 'addone_py'
 as
 $$
 def addone_py(i):
 return i+1
 $$;
 ---------- Output ---------
-CREATE OR REPLACE FUNCTION addone ( Int32 ) RETURNS Int32 LANGUAGE python IMPORTS = () PACKAGES = () HANDLER = 'addone_py' AS $$
+CREATE OR REPLACE FUNCTION addone(i Int32) RETURNS Int32 LANGUAGE python HANDLER 'addone_py' AS $$
 def addone_py(i):
 return i+1
 $$
 ---------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
+CreateFunction(
+    CreateFunctionStmt {
         create_option: CreateOrReplace,
-        udf_name: Identifier {
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    27..33,
+                ),
+                name: "addone",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            34..35,
+                        ),
+                        name: "i",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Int32,
+            },
+        ],
+        return_type: Scalar(
+            Int32,
+        ),
+        language: Identifier {
             span: Some(
-                27..33,
+                62..68,
             ),
-            name: "addone",
+            name: "python",
             quote: None,
             ident_type: None,
         },
-        description: None,
-        definition: UDFScript {
-            arg_types: Types(
-                [
-                    Int32,
-                ],
-            ),
-            return_type: Int32,
-            code: "def addone_py(i):\nreturn i+1",
-            imports: [],
-            packages: [],
-            handler: "addone_py",
-            language: "python",
-            runtime_version: "",
-            immutable: None,
-        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: Some(
+            "addone_py",
+        ),
+        packages: [],
+        imports: [],
+        rows: None,
+        capability_profile: None,
+        definition: "def addone_py(i):\nreturn i+1",
     },
 )
 
 
 ---------- Input ----------
-create or replace function addone(int)
+create or replace function addone(i int)
 returns int
 language python
-imports = ('@ss/abc')
-packages = ('numpy', 'pandas')
-handler = 'addone_py'
-as '@data/abc/a.py';
+imports ('@ss/abc')
+packages ('numpy', 'pandas')
+handler 'addone_py'
+as
+$$
+def addone_py(i):
+return i+1
+$$;
 ---------- Output ---------
-CREATE OR REPLACE FUNCTION addone ( Int32 ) RETURNS Int32 LANGUAGE python IMPORTS = ('@ss/abc') PACKAGES = ('numpy','pandas') HANDLER = 'addone_py' AS $$
-@data/abc/a.py
+CREATE OR REPLACE FUNCTION addone(i Int32) RETURNS Int32 LANGUAGE python HANDLER 'addone_py' PACKAGES ('numpy', 'pandas') IMPORTS ('@ss/abc') AS $$
+def addone_py(i):
+return i+1
 $$
 ---------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
+CreateFunction(
+    CreateFunctionStmt {
         create_option: CreateOrReplace,
-        udf_name: Identifier {
-            span: Some(
-                27..33,
-            ),
-            name: "addone",
-            quote: None,
-            ident_type: None,
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    27..33,
+                ),
+                name: "addone",
+                quote: None,
+                ident_type: None,
+            },
         },
-        description: None,
-        definition: UDFScript {
-            arg_types: Types(
-                [
-                    Int32,
-                ],
-            ),
-            return_type: Int32,
-            code: "@data/abc/a.py",
-            imports: [
-                "@ss/abc",
-            ],
-            packages: [
-                "numpy",
-                "pandas",
-            ],
-            handler: "addone_py",
-            language: "python",
-            runtime_version: "",
-            immutable: None,
-        },
-    },
-)
-
-
----------- Input ----------
-DROP FUNCTION binary_reverse;
----------- Output ---------
-DROP FUNCTION binary_reverse
----------- AST ------------
-DropUDF {
-    if_exists: false,
-    udf_name: Identifier {
-        span: Some(
-            14..28,
-        ),
-        name: "binary_reverse",
-        quote: None,
-        ident_type: None,
-    },
-}
-
-
----------- Input ----------
-DROP FUNCTION isnotempty;
----------- Output ---------
-DROP FUNCTION isnotempty
----------- AST ------------
-DropUDF {
-    if_exists: false,
-    udf_name: Identifier {
-        span: Some(
-            14..24,
-        ),
-        name: "isnotempty",
-        quote: None,
-        ident_type: None,
-    },
-}
-
-
----------- Input ----------
-CREATE FUNCTION IF NOT EXISTS my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';
----------- Output ---------
-CREATE FUNCTION IF NOT EXISTS my_agg ( Int32 ) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815'
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: CreateIfNotExists,
-        udf_name: Identifier {
-            span: Some(
-                30..36,
-            ),
-            name: "my_agg",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: UDAFServer {
-            arg_types: Types(
-                [
-                    Int32,
-                ],
-            ),
-            state_fields: [
-                UDAFStateField {
-                    name: Identifier {
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
                         span: Some(
-                            51..52,
-                        ),
-                        name: "s",
-                        quote: None,
-                        ident_type: None,
-                    },
-                    type_name: String,
-                },
-            ],
-            return_type: Boolean,
-            address: "http://0.0.0.0:8815",
-            headers: {},
-            language: "javascript",
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE FUNCTION IF NOT EXISTS my_agg (INT) STATE { s STRING, i INT NOT NULL } RETURNS BOOLEAN LANGUAGE javascript AS 'some code';
----------- Output ---------
-CREATE FUNCTION IF NOT EXISTS my_agg ( Int32 ) STATE { s STRING, i Int32 NOT NULL } RETURNS BOOLEAN LANGUAGE javascript IMPORTS = () PACKAGES = () AS $$
-some code
-$$
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: CreateIfNotExists,
-        udf_name: Identifier {
-            span: Some(
-                30..36,
-            ),
-            name: "my_agg",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: UDAFScript {
-            arg_types: Types(
-                [
-                    Int32,
-                ],
-            ),
-            state_fields: [
-                UDAFStateField {
-                    name: Identifier {
-                        span: Some(
-                            51..52,
-                        ),
-                        name: "s",
-                        quote: None,
-                        ident_type: None,
-                    },
-                    type_name: String,
-                },
-                UDAFStateField {
-                    name: Identifier {
-                        span: Some(
-                            61..62,
+                            34..35,
                         ),
                         name: "i",
                         quote: None,
                         ident_type: None,
                     },
-                    type_name: NotNull(
-                        Int32,
-                    ),
-                },
-            ],
-            return_type: Boolean,
-            imports: [],
-            packages: [],
-            code: "some code",
-            language: "javascript",
-            runtime_version: "",
-        },
-    },
-)
-
-
----------- Input ----------
-CREATE FUNCTION IF NOT EXISTS my_agg (a INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';
----------- Output ---------
-CREATE FUNCTION IF NOT EXISTS my_agg ( a Int32 ) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815'
----------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
-        create_option: CreateIfNotExists,
-        udf_name: Identifier {
+                ),
+                data_type: Int32,
+            },
+        ],
+        return_type: Scalar(
+            Int32,
+        ),
+        language: Identifier {
             span: Some(
-                30..36,
+                62..68,
             ),
-            name: "my_agg",
+            name: "python",
             quote: None,
             ident_type: None,
         },
-        description: None,
-        definition: UDAFServer {
-            arg_types: NameWithTypes(
-                [
-                    (
-                        Identifier {
-                            span: Some(
-                                38..39,
-                            ),
-                            name: "a",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        Int32,
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: Some(
+            "addone_py",
+        ),
+        packages: [
+            "numpy",
+            "pandas",
+        ],
+        imports: [
+            "@ss/abc",
+        ],
+        rows: None,
+        capability_profile: None,
+        definition: "def addone_py(i):\nreturn i+1",
+    },
+)
+
+
+---------- Input ----------
+DROP FUNCTION binary_reverse(BINARY);
+---------- Output ---------
+DROP FUNCTION binary_reverse(BINARY)
+---------- AST ------------
+DropFunction(
+    DropFunctionStmt {
+        if_exists: false,
+        identity: FunctionIdentity {
+            name: FunctionName {
+                database: None,
+                schema: None,
+                name: Identifier {
+                    span: Some(
+                        14..28,
                     ),
-                ],
-            ),
-            state_fields: [
-                UDAFStateField {
-                    name: Identifier {
-                        span: Some(
-                            53..54,
-                        ),
-                        name: "s",
-                        quote: None,
-                        ident_type: None,
-                    },
-                    type_name: String,
+                    name: "binary_reverse",
+                    quote: None,
+                    ident_type: None,
                 },
+            },
+            arg_types: [
+                Binary,
             ],
-            return_type: Boolean,
-            address: "http://0.0.0.0:8815",
-            headers: {},
-            language: "javascript",
         },
     },
 )
 
 
 ---------- Input ----------
-CREATE FUNCTION IF NOT EXISTS my_agg (a INT) STATE { s STRING, i INT NOT NULL } RETURNS BOOLEAN LANGUAGE javascript AS 'some code';
+DROP FUNCTION isnotempty(BOOLEAN);
 ---------- Output ---------
-CREATE FUNCTION IF NOT EXISTS my_agg ( a Int32 ) STATE { s STRING, i Int32 NOT NULL } RETURNS BOOLEAN LANGUAGE javascript IMPORTS = () PACKAGES = () AS $$
-some code
+DROP FUNCTION isnotempty(BOOLEAN)
+---------- AST ------------
+DropFunction(
+    DropFunctionStmt {
+        if_exists: false,
+        identity: FunctionIdentity {
+            name: FunctionName {
+                database: None,
+                schema: None,
+                name: Identifier {
+                    span: Some(
+                        14..24,
+                    ),
+                    name: "isnotempty",
+                    quote: None,
+                    ident_type: None,
+                },
+            },
+            arg_types: [
+                Boolean,
+            ],
+        },
+    },
+)
+
+
+---------- Input ----------
+CREATE FUNCTION IF NOT EXISTS py_series(a INT) RETURNS TABLE (value INT) LANGUAGE python ROWS 4 AS $$return {'value': [1, 2, 3, 4]}$$;
+---------- Output ---------
+CREATE FUNCTION IF NOT EXISTS py_series(a Int32) RETURNS TABLE (value Int32) LANGUAGE python ROWS 4 AS $$
+return {'value': [1, 2, 3, 4]}
 $$
 ---------- AST ------------
-CreateUDF(
-    CreateUDFStmt {
+CreateFunction(
+    CreateFunctionStmt {
         create_option: CreateIfNotExists,
-        udf_name: Identifier {
+        name: FunctionName {
+            database: None,
+            schema: None,
+            name: Identifier {
+                span: Some(
+                    30..39,
+                ),
+                name: "py_series",
+                quote: None,
+                ident_type: None,
+            },
+        },
+        arguments: [
+            FunctionArgument {
+                name: Some(
+                    Identifier {
+                        span: Some(
+                            40..41,
+                        ),
+                        name: "a",
+                        quote: None,
+                        ident_type: None,
+                    },
+                ),
+                data_type: Int32,
+            },
+        ],
+        return_type: Table(
+            [
+                FunctionTableColumn {
+                    name: Identifier {
+                        span: Some(
+                            62..67,
+                        ),
+                        name: "value",
+                        quote: None,
+                        ident_type: None,
+                    },
+                    data_type: Int32,
+                },
+            ],
+        ),
+        language: Identifier {
             span: Some(
-                30..36,
+                82..88,
             ),
-            name: "my_agg",
+            name: "python",
             quote: None,
             ident_type: None,
         },
-        description: None,
-        definition: UDAFScript {
-            arg_types: NameWithTypes(
-                [
-                    (
-                        Identifier {
-                            span: Some(
-                                38..39,
-                            ),
-                            name: "a",
-                            quote: None,
-                            ident_type: None,
-                        },
-                        Int32,
-                    ),
-                ],
-            ),
-            state_fields: [
-                UDAFStateField {
-                    name: Identifier {
-                        span: Some(
-                            53..54,
-                        ),
-                        name: "s",
-                        quote: None,
-                        ident_type: None,
-                    },
-                    type_name: String,
-                },
-                UDAFStateField {
-                    name: Identifier {
-                        span: Some(
-                            63..64,
-                        ),
-                        name: "i",
-                        quote: None,
-                        ident_type: None,
-                    },
-                    type_name: NotNull(
-                        Int32,
-                    ),
-                },
-            ],
-            return_type: Boolean,
-            imports: [],
-            packages: [],
-            code: "some code",
-            language: "javascript",
-            runtime_version: "",
-        },
-    },
-)
-
-
----------- Input ----------
-ALTER FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript AS 'some code';
----------- Output ---------
-ALTER FUNCTION my_agg ( Int32 ) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript IMPORTS = () PACKAGES = () AS $$
-some code
-$$
----------- AST ------------
-AlterUDF(
-    AlterUDFStmt {
-        udf_name: Identifier {
-            span: Some(
-                15..21,
-            ),
-            name: "my_agg",
-            quote: None,
-            ident_type: None,
-        },
-        description: None,
-        definition: UDAFScript {
-            arg_types: Types(
-                [
-                    Int32,
-                ],
-            ),
-            state_fields: [
-                UDAFStateField {
-                    name: Identifier {
-                        span: Some(
-                            36..37,
-                        ),
-                        name: "s",
-                        quote: None,
-                        ident_type: None,
-                    },
-                    type_name: String,
-                },
-            ],
-            return_type: Boolean,
-            imports: [],
-            packages: [],
-            code: "some code",
-            language: "javascript",
-            runtime_version: "",
-        },
+        volatility: None,
+        strict: false,
+        security: Invoker,
+        handler: None,
+        packages: [],
+        imports: [],
+        rows: Some(
+            4,
+        ),
+        capability_profile: None,
+        definition: "return {'value': [1, 2, 3, 4]}",
     },
 )
 

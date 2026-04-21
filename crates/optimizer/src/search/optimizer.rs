@@ -12,6 +12,7 @@ use paro_planner::operator::{
     SearchDecision, SearchScan, TopN,
 };
 use paro_planner::plan::LogicalPlan;
+use paro_routine::BuiltinIntrinsicId;
 use paro_storage::search::{
     FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
     SearchCostEstimate as PlannedSearchCostEstimate, SearchIntent, SearchRequestMode,
@@ -511,10 +512,14 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    let name = func.function.name.to_ascii_lowercase();
     if !matches!(
-        name.as_str(),
-        "l2_distance" | "l1_distance" | "cosine_distance" | "neg_inner_product"
+        func.builtin_intrinsic(),
+        Some(
+            BuiltinIntrinsicId::L2Distance
+                | BuiltinIntrinsicId::L1Distance
+                | BuiltinIntrinsicId::CosineDistance
+                | BuiltinIntrinsicId::NegativeInnerProduct
+        )
     ) || func.children.len() != 2
     {
         return Ok(None);
@@ -660,7 +665,11 @@ fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIn
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    if !func.function.name.eq_ignore_ascii_case("sparse_distance") || func.children.len() != 2 {
+    if !matches!(
+        func.builtin_intrinsic(),
+        Some(BuiltinIntrinsicId::SparseDistance)
+    ) || func.children.len() != 2
+    {
         return Ok(None);
     }
     let (left, right) = (&func.children[0], &func.children[1]);
@@ -716,24 +725,19 @@ fn extract_fulltext_score_intent(expr: &Expression, get: &Get) -> Result<Option<
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    let name = func.function.name.to_ascii_lowercase();
-    if !matches!(
-        name.as_str(),
-        "bm25" | "bm25_score_internal" | "ts_rank" | "ts_rank_cd"
-    ) {
-        return Ok(None);
-    }
-    match name.as_str() {
-        "bm25" => extract_fulltext_query_from_column_and_string(
+    match func.builtin_intrinsic() {
+        Some(BuiltinIntrinsicId::Bm25) => extract_fulltext_query_from_column_and_string(
             func,
             get,
             FullTextQueryKind::Legacy,
             FullTextScoreMode::Bm25,
         ),
-        "bm25_score_internal" | "ts_rank" => {
+        Some(BuiltinIntrinsicId::Bm25ScoreInternal | BuiltinIntrinsicId::TsRank) => {
             extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25)
         }
-        "ts_rank_cd" => extract_internal_fulltext_query(func, get, FullTextScoreMode::CoverDensity),
+        Some(BuiltinIntrinsicId::TsRankCd) => {
+            extract_internal_fulltext_query(func, get, FullTextScoreMode::CoverDensity)
+        }
         _ => Ok(None),
     }
 }
@@ -744,18 +748,17 @@ fn extract_fulltext_match_intent(expr: &Expression, get: &Get) -> Result<Option<
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    let name = func.function.name.to_ascii_lowercase();
-    if !matches!(name.as_str(), "fulltext_match" | "fulltext_match_internal") {
-        return Ok(None);
-    }
-    match name.as_str() {
-        "fulltext_match" => extract_fulltext_query_from_column_and_string(
+    match func.builtin_intrinsic() {
+        Some(BuiltinIntrinsicId::FullTextMatch) => extract_fulltext_query_from_column_and_string(
             func,
             get,
             FullTextQueryKind::Legacy,
             FullTextScoreMode::Bm25,
         ),
-        _ => extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25),
+        Some(BuiltinIntrinsicId::FullTextMatchInternal) => {
+            extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -833,7 +836,10 @@ fn extract_tsvector_source(expr: &Expression, get: &Get) -> Result<Option<(usize
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    if !func.function.name.eq_ignore_ascii_case("to_tsvector") {
+    if !matches!(
+        func.builtin_intrinsic(),
+        Some(BuiltinIntrinsicId::ToTsVector)
+    ) {
         return Ok(None);
     }
 
@@ -868,14 +874,6 @@ fn extract_tsquery_source(
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    let name = func.function.name.to_ascii_lowercase();
-    if !matches!(
-        name.as_str(),
-        "plainto_tsquery" | "to_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery"
-    ) {
-        return Ok(None);
-    }
-
     let (config_expr, query_expr) = match func.children.as_slice() {
         [query] => (None, query),
         [config, query] => (Some(config), query),
@@ -894,11 +892,11 @@ fn extract_tsquery_source(
     let Some(query_text) = extract_query_string(query_expr)? else {
         return Ok(None);
     };
-    let query_kind = match name.as_str() {
-        "to_tsquery" => FullTextQueryKind::TsQuery,
-        "plainto_tsquery" => FullTextQueryKind::Plain,
-        "phraseto_tsquery" => FullTextQueryKind::Phrase,
-        "websearch_to_tsquery" => FullTextQueryKind::WebSearch,
+    let query_kind = match func.builtin_intrinsic() {
+        Some(BuiltinIntrinsicId::ToTsQuery) => FullTextQueryKind::TsQuery,
+        Some(BuiltinIntrinsicId::PlainToTsQuery) => FullTextQueryKind::Plain,
+        Some(BuiltinIntrinsicId::PhraseToTsQuery) => FullTextQueryKind::Phrase,
+        Some(BuiltinIntrinsicId::WebSearchToTsQuery) => FullTextQueryKind::WebSearch,
         _ => return Ok(None),
     };
     Ok(Some((query_text, config, query_kind)))

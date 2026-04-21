@@ -1141,8 +1141,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn named_statement_and_portal_support_row_limited_execute() {
+    async fn run_named_statement_and_portal_support_row_limited_execute() {
         let instance = paro_instance::Instance::new_in_memory();
         let mut session = Session::new(1, instance);
         let mut responder = TestResponder::default();
@@ -1211,6 +1210,23 @@ mod tests {
             .events
             .iter()
             .any(|event| event == "complete:SELECT 1"));
+    }
+
+    #[test]
+    fn named_statement_and_portal_support_row_limited_execute() {
+        std::thread::Builder::new()
+            .name("session-row-limited-execute".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build current-thread runtime");
+                runtime.block_on(run_named_statement_and_portal_support_row_limited_execute());
+            })
+            .expect("spawn large-stack test thread")
+            .join()
+            .expect("join large-stack test thread");
     }
 
     #[tokio::test]

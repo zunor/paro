@@ -78,6 +78,10 @@ impl<T: Task> Task for EventTask<T> {
         self.inner.set_token(token);
     }
 
+    fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
+        self.inner.set_interrupt_state(interrupt_state);
+    }
+
     fn get_token(&self) -> Option<ProducerToken> {
         self.token.clone().or_else(|| self.inner.get_token())
     }
@@ -129,12 +133,29 @@ impl BoxedEventTask {
     /// Note: This consumes the Arc and returns a new BoxedEventTask.
     /// The original task is moved into the BoxedEventTask.
     pub fn from_arc_mutex(task: Arc<Mutex<dyn Task>>, event: Arc<Event>) -> Arc<Mutex<dyn Task>> {
-        Arc::new(Mutex::new(BoxedEventTask {
+        let inner_task = task.clone();
+        let wrapped: Arc<Mutex<dyn Task>> = Arc::new(Mutex::new(BoxedEventTask {
             inner: Box::new(ArcMutexTaskWrapper { task }),
             event,
             event_notified: false,
             token: None,
-        }))
+        }));
+
+        let callback_task = wrapped.clone();
+        let callback = Arc::new(move || {
+            let mut task_lock = callback_task.lock();
+            task_lock.reschedule()?;
+            if let Some(token) = task_lock.get_token() {
+                drop(task_lock);
+                token.schedule_task(callback_task.clone());
+            }
+            Ok(())
+        });
+        inner_task
+            .lock()
+            .set_interrupt_state(crate::task::InterruptState::with_callback(callback));
+
+        wrapped
     }
 
     /// Get a reference to the event.
@@ -158,6 +179,10 @@ impl Task for BoxedEventTask {
     fn set_token(&mut self, token: ProducerToken) {
         self.token = Some(token.clone());
         self.inner.set_token(token);
+    }
+
+    fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
+        self.inner.set_interrupt_state(interrupt_state);
     }
 
     fn get_token(&self) -> Option<ProducerToken> {
@@ -195,6 +220,10 @@ impl Task for ArcMutexTaskWrapper {
         self.task.lock().set_token(token);
     }
 
+    fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
+        self.task.lock().set_interrupt_state(interrupt_state);
+    }
+
     fn get_token(&self) -> Option<ProducerToken> {
         self.task.lock().get_token()
     }
@@ -220,6 +249,8 @@ impl Task for ArcMutexTaskWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex as ParkingMutex;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingTask {
@@ -403,5 +434,79 @@ mod tests {
         task2.execute(TaskExecutionMode::ProcessAll).unwrap();
         assert!(event.is_finished());
         assert_eq!(event.finished_task_count(), 2);
+    }
+
+    #[test]
+    fn boxed_event_task_reschedules_the_wrapped_task_via_interrupt_state() {
+        struct InterruptAwareBlockingTask {
+            state: Arc<ParkingMutex<Option<crate::task::InterruptState>>>,
+            token: Option<ProducerToken>,
+            blocked_once: bool,
+        }
+
+        impl Task for InterruptAwareBlockingTask {
+            fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
+                if !self.blocked_once {
+                    self.blocked_once = true;
+                    Ok(TaskExecutionResult::Blocked)
+                } else {
+                    Ok(TaskExecutionResult::Finished)
+                }
+            }
+
+            fn set_token(&mut self, token: ProducerToken) {
+                self.token = Some(token);
+            }
+
+            fn get_token(&self) -> Option<ProducerToken> {
+                self.token.clone()
+            }
+
+            fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
+                *self.state.lock() = Some(interrupt_state);
+            }
+
+            fn deschedule(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn reschedule(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn task_type(&self) -> &str {
+                "InterruptAwareBlockingTask"
+            }
+        }
+
+        let event = Event::new();
+        event.set_tasks(1);
+
+        let scheduler = Arc::new(crate::scheduler::TaskScheduler::new());
+        let token = scheduler.create_producer();
+        let interrupt_state = Arc::new(ParkingMutex::new(None));
+        let inner: Arc<Mutex<dyn Task>> = Arc::new(Mutex::new(InterruptAwareBlockingTask {
+            state: interrupt_state.clone(),
+            token: None,
+            blocked_once: false,
+        }));
+        let wrapped = BoxedEventTask::from_arc_mutex(inner, event.clone());
+
+        scheduler.schedule_task_with_token(&token, wrapped);
+        let marker = AtomicBool::new(true);
+
+        scheduler.execute_tasks_for_producer(&token, &marker, 1);
+        assert!(!event.is_finished());
+
+        let callback = interrupt_state
+            .lock()
+            .take()
+            .expect("wrapped task should receive a scheduler-linked interrupt state");
+        callback
+            .callback()
+            .expect("interrupt callback should reschedule wrapped task");
+
+        scheduler.execute_tasks_for_producer(&token, &marker, 1);
+        assert!(event.is_finished());
     }
 }

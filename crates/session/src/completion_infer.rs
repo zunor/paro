@@ -136,9 +136,8 @@ pub fn infer_statement_completion(stmt: &Statement, rows: usize) -> StatementCom
         Statement::ShowFileFormats => StatementCompletion::Show,
         Statement::Presign(_) => custom("PRESIGN"),
 
-        Statement::CreateUDF(_) => custom("CREATE FUNCTION"),
-        Statement::DropUDF { .. } => custom("DROP FUNCTION"),
-        Statement::AlterUDF(_) => custom("ALTER FUNCTION"),
+        Statement::CreateFunction(_) => custom("CREATE FUNCTION"),
+        Statement::DropFunction(_) => custom("DROP FUNCTION"),
 
         Statement::CreateUser(_) => custom("CREATE USER"),
         Statement::DropUser { .. } => custom("DROP USER"),

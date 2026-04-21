@@ -6,6 +6,7 @@
 pub mod alter;
 pub mod create_index;
 pub mod create_property_graph;
+pub mod create_routine;
 pub mod create_schema;
 pub mod create_sequence;
 pub mod create_table;

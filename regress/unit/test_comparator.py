@@ -246,6 +246,38 @@ def test_compare_allows_normalize_with_hash_mode(tmp_path: Path) -> None:
     compare_result_file(expected_path=expected_file, query_outputs=[actual], write_actual=False)
 
 
+def test_compare_applies_normalizers_before_sql_diff(tmp_path: Path) -> None:
+    expected = _query_output(
+        sql=(
+            "CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER\n"
+            "LANGUAGE python\n"
+            "IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/imported_helper/"
+            "python_udf/modules/basic_math/basic_math.py')\n"
+            "AS $$return [1]$$;"
+        ),
+        normalizers=("regress_paths",),
+        is_statement=True,
+        status="CREATE FUNCTION",
+    )
+    actual = _query_output(
+        sql=(
+            "CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER\n"
+            "LANGUAGE python\n"
+            "IMPORTS ('/home/runner/work/paro/paro/regress/report/fixtures/python_udf/"
+            "scalar/imported_helper/python_udf/modules/basic_math/basic_math.py')\n"
+            "AS $$return [1]$$;"
+        ),
+        normalizers=("regress_paths",),
+        is_statement=True,
+        status="CREATE FUNCTION",
+    )
+
+    expected_file = tmp_path / "normalize_sql.result"
+    expected_file.write_text(build_transcript([expected]), encoding="utf-8")
+
+    compare_result_file(expected_path=expected_file, query_outputs=[actual], write_actual=False)
+
+
 def test_compare_json_mode_canonicalizes_object_key_order(tmp_path: Path) -> None:
     expected = _query_output(
         mode="json",

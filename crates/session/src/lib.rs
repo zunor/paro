@@ -4,6 +4,7 @@
 //! PostgreSQL-style session/front-end routing, prepared state, and transaction-aware execution.
 
 mod active_query;
+mod auth_policy;
 mod completion;
 mod completion_infer;
 mod config;

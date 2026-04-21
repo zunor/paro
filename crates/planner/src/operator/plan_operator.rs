@@ -13,11 +13,12 @@ use crate::plan::LogicalPlan;
 
 use super::{
     Aggregate, Alter, CTERef, ColumnBinding, CopyTo, CreateIndex, CreatePropertyGraph,
-    CreateSchema, CreateSequence, CreateTable, CreateView, Delete, DelimGet, DependentJoin,
-    Distinct, Drop, DropPropertyGraph, EmptyResult, Explain, ExpressionGet, Filter,
+    CreateRoutine, CreateSchema, CreateSequence, CreateTable, CreateView, Delete, DelimGet,
+    DependentJoin, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain, ExpressionGet, Filter,
     FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert, Join, Limit,
-    LogicalOperatorType, MaterializedCTE, Order, Projection, RecursiveCTE, RefreshPropertyGraph,
-    SearchScan, SetOpType, SetOperation, TableFunctionGet, TopN, Update, Window,
+    LogicalExternalProject, LogicalExternalTable, LogicalOperatorType, MaterializedCTE, Order,
+    Projection, RecursiveCTE, RefreshPropertyGraph, SearchScan, SetOpType, SetOperation,
+    TableFunctionGet, TopN, Update, Window,
 };
 
 /// The LogicalOperator represents a node in the logical query plan.
@@ -29,6 +30,10 @@ pub enum LogicalOperator {
     Filter(Filter),
     /// Project columns/expressions
     Projection(Projection),
+    /// Row-preserving external routine layer
+    ExternalProject(LogicalExternalProject),
+    /// Relation-expanding external routine source
+    ExternalTable(LogicalExternalTable),
     /// Top N / Limit / Offset
     Limit(Limit),
     /// Order By
@@ -37,6 +42,8 @@ pub enum LogicalOperator {
     TopN(TopN),
     /// Create Table
     CreateTable(CreateTable),
+    /// Create Routine
+    CreateRoutine(CreateRoutine),
     /// Alter existing catalog entry
     Alter(Alter),
     /// Create Sequence
@@ -123,6 +130,8 @@ impl LogicalOperator {
                 project_names(&child_names, &op.projection_map)
             }
             LogicalOperator::Projection(op) => op.output_names.clone(),
+            LogicalOperator::ExternalProject(op) => op.output_names.clone(),
+            LogicalOperator::ExternalTable(op) => op.output_columns.clone(),
             LogicalOperator::Limit(op) => op.child.output_names(),
             LogicalOperator::Order(op) => {
                 let child_names = op.child.output_names();
@@ -130,6 +139,7 @@ impl LogicalOperator {
             }
             LogicalOperator::TopN(op) => op.child.output_names(),
             LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
@@ -241,10 +251,13 @@ impl LogicalOperator {
             LogicalOperator::Get(_) => LogicalOperatorType::Get,
             LogicalOperator::Filter(_) => LogicalOperatorType::Filter,
             LogicalOperator::Projection(_) => LogicalOperatorType::Projection,
+            LogicalOperator::ExternalProject(_) => LogicalOperatorType::ExternalProject,
+            LogicalOperator::ExternalTable(_) => LogicalOperatorType::ExternalTable,
             LogicalOperator::Limit(_) => LogicalOperatorType::Limit,
             LogicalOperator::Order(_) => LogicalOperatorType::Order,
             LogicalOperator::TopN(_) => LogicalOperatorType::TopN,
             LogicalOperator::CreateTable(_) => LogicalOperatorType::CreateTable,
+            LogicalOperator::CreateRoutine(_) => LogicalOperatorType::CreateRoutine,
             LogicalOperator::Alter(_) => LogicalOperatorType::Alter,
             LogicalOperator::CreateSequence(_) => LogicalOperatorType::CreateSequence,
             LogicalOperator::CreateSchema(_) => LogicalOperatorType::CreateSchema,
@@ -305,10 +318,13 @@ impl LogicalOperator {
                 }
             }
             LogicalOperator::Projection(op) => op.returned_types.clone(),
+            LogicalOperator::ExternalProject(op) => op.returned_types.clone(),
+            LogicalOperator::ExternalTable(op) => op.returned_types.clone(),
             LogicalOperator::Limit(op) => op.child.types(),
             LogicalOperator::Order(op) => op.child.types(),
             LogicalOperator::TopN(op) => op.child.types(),
             LogicalOperator::CreateTable(_) => vec![],
+            LogicalOperator::CreateRoutine(_) => vec![],
             LogicalOperator::Alter(_) => vec![],
             LogicalOperator::CreateSequence(_) => vec![],
             LogicalOperator::CreateSchema(_) => vec![],
@@ -360,10 +376,13 @@ impl LogicalOperator {
             LogicalOperator::Get(_) => vec![],
             LogicalOperator::Filter(op) => vec![op.child.as_ref()],
             LogicalOperator::Projection(op) => vec![op.child.as_ref()],
+            LogicalOperator::ExternalProject(op) => vec![op.child.as_ref()],
+            LogicalOperator::ExternalTable(op) => op.child.as_deref().into_iter().collect(),
             LogicalOperator::Limit(op) => vec![op.child.as_ref()],
             LogicalOperator::Order(op) => vec![op.child.as_ref()],
             LogicalOperator::TopN(op) => vec![op.child.as_ref()],
             LogicalOperator::CreateTable(_) => vec![],
+            LogicalOperator::CreateRoutine(_) => vec![],
             LogicalOperator::Alter(_) => vec![],
             LogicalOperator::CreateSequence(_) => vec![],
             LogicalOperator::CreateSchema(_) => vec![],
@@ -408,10 +427,19 @@ impl LogicalOperator {
             LogicalOperator::Get(_) => ControlFlow::Continue(()),
             LogicalOperator::Filter(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::Projection(op) => visit_boxed_child(&mut op.child, &mut f),
+            LogicalOperator::ExternalProject(op) => visit_boxed_child(&mut op.child, &mut f),
+            LogicalOperator::ExternalTable(op) => {
+                if let Some(child) = &mut op.child {
+                    visit_boxed_child(child, &mut f)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
             LogicalOperator::Limit(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::Order(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::TopN(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::CreateTable(_) => ControlFlow::Continue(()),
+            LogicalOperator::CreateRoutine(_) => ControlFlow::Continue(()),
             LogicalOperator::Alter(_) => ControlFlow::Continue(()),
             LogicalOperator::CreateSequence(_) => ControlFlow::Continue(()),
             LogicalOperator::CreateSchema(_) => ControlFlow::Continue(()),
@@ -487,6 +515,16 @@ impl LogicalOperator {
                 op.child = try_map_boxed_child(op.child, f)?;
                 Ok(LogicalOperator::Projection(op))
             }
+            LogicalOperator::ExternalProject(mut op) => {
+                op.child = try_map_boxed_child(op.child, f)?;
+                Ok(LogicalOperator::ExternalProject(op))
+            }
+            LogicalOperator::ExternalTable(mut op) => {
+                if let Some(child) = op.child.take() {
+                    op.child = Some(try_map_boxed_child(child, f)?);
+                }
+                Ok(LogicalOperator::ExternalTable(op))
+            }
             LogicalOperator::Limit(mut op) => {
                 op.child = try_map_boxed_child(op.child, f)?;
                 Ok(LogicalOperator::Limit(op))
@@ -500,6 +538,7 @@ impl LogicalOperator {
                 Ok(LogicalOperator::TopN(op))
             }
             LogicalOperator::CreateTable(op) => Ok(LogicalOperator::CreateTable(op)),
+            LogicalOperator::CreateRoutine(op) => Ok(LogicalOperator::CreateRoutine(op)),
             LogicalOperator::Alter(op) => Ok(LogicalOperator::Alter(op)),
             LogicalOperator::CreateSequence(op) => Ok(LogicalOperator::CreateSequence(op)),
             LogicalOperator::CreateSchema(op) => Ok(LogicalOperator::CreateSchema(op)),
@@ -634,6 +673,17 @@ impl LogicalOperator {
             LogicalOperator::Projection(proj) => {
                 Self::generate_column_bindings(proj.table_index, proj.expressions.len())
             }
+            LogicalOperator::ExternalProject(external) => {
+                let mut bindings = external.child.get_column_bindings();
+                let base = bindings.len();
+                for i in 0..external.expressions.len() {
+                    bindings.push(ColumnBinding::new(external.project_index, base + i));
+                }
+                bindings
+            }
+            LogicalOperator::ExternalTable(external) => {
+                Self::generate_column_bindings(external.table_index, external.returned_types.len())
+            }
             LogicalOperator::Limit(limit) => {
                 // Limit passes through child's bindings unchanged
                 limit.child.get_column_bindings()
@@ -746,6 +796,7 @@ impl LogicalOperator {
             }
             // DDL operations don't produce column bindings
             LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
@@ -785,6 +836,8 @@ impl LogicalOperator {
         match self {
             LogicalOperator::Get(get) => vec![get.table_index],
             LogicalOperator::Projection(proj) => vec![proj.table_index],
+            LogicalOperator::ExternalProject(external) => vec![external.project_index],
+            LogicalOperator::ExternalTable(external) => vec![external.table_index],
             LogicalOperator::Aggregate(agg) => {
                 let mut indices = Vec::new();
                 if !agg.groups.is_empty() {
@@ -830,6 +883,7 @@ impl LogicalOperator {
             | LogicalOperator::Update(_)
             | LogicalOperator::CopyTo(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)

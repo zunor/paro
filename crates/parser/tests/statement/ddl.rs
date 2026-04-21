@@ -215,21 +215,20 @@ fn test_ddl_statements() {
         r#"DROP NOTIFICATION INTEGRATION SampleNotification"#,
         r#"DESC NOTIFICATION INTEGRATION SampleNotification"#,
         r#"attach table t 's3://a' connection=(access_key_id ='x' secret_access_key ='y' endpoint_url='http://127.0.0.1:9900')"#,
-        r#"CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p));"#,
-        r#"CREATE FUNCTION IF NOT EXISTS isnotempty AS(p INT) -> not(is_null(p));"#,
-        r#"CREATE OR REPLACE FUNCTION isnotempty_test_replace AS(p) -> not(is_null(p))  DESC = 'This is a description';"#,
-        r#"CREATE OR REPLACE FUNCTION isnotempty_test_replace (p STRING) RETURNS BOOL AS $$ not(is_null(p)) $$;"#,
-        r#"CREATE FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE FUNCTION binary_reverse (arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' HEADERS = ('X-Authorization' = '123') ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE FUNCTION binary_reverse_table () RETURNS TABLE (c1 int) AS $$ select * from binary_reverse $$;"#,
-        r#"ALTER FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE OR REPLACE FUNCTION binary_reverse (BINARY) RETURNS BINARY LANGUAGE python HANDLER = 'binary_reverse' ADDRESS = 'http://0.0.0.0:8815';"#,
+        r#"CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python AS $$return [not value for value in p.materialize_py()]$$;"#,
+        r#"CREATE FUNCTION IF NOT EXISTS isnotempty(p INT) RETURNS BOOLEAN LANGUAGE python IMMUTABLE AS $$return [value is not None for value in p.materialize_py()]$$;"#,
+        r#"CREATE OR REPLACE FUNCTION isnotempty_test_replace(p STRING) RETURNS BOOLEAN LANGUAGE python STRICT AS $$return [value is not None and value != '' for value in p.materialize_py()]$$;"#,
+        r#"CREATE OR REPLACE FUNCTION binary_reverse(arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER 'binary_reverse' AS $$return arg0$$;"#,
+        r#"CREATE FUNCTION binary_reverse(arg0 BINARY) RETURNS BINARY LANGUAGE python HANDLER 'binary_reverse' PACKAGES ('numpy') IMPORTS ('@ss/abc') AS $$return arg0$$;"#,
+        r#"CREATE FUNCTION binary_reverse_table() RETURNS TABLE (c1 INT) LANGUAGE python ROWS 16 AS $$return {'c1': [1, 2]}$$;"#,
+        r#"CREATE OR REPLACE FUNCTION addone(i INT) RETURNS INT LANGUAGE python HANDLER 'addone_py' AS $$\nreturn i + 1\n$$;"#,
+        r#"CREATE OR REPLACE FUNCTION addone(i INT) RETURNS INT LANGUAGE python IMPORTS ('@ss/abc') PACKAGES ('numpy', 'pandas') HANDLER 'addone_py' CAPABILITY PROFILE trusted_subinterpreter AS $$\nreturn i + 1\n$$;"#,
+        r#"CREATE FUNCTION py_definer(a INT) RETURNS INT LANGUAGE python STABLE SECURITY DEFINER AS $$return a$$;"#,
         r#"
-            create or replace function addone(int)
+            create or replace function addone(i int)
             returns int
             language python
-            handler = 'addone_py'
+            handler 'addone_py'
             as
             $$
             def addone_py(i):
@@ -237,21 +236,21 @@ fn test_ddl_statements() {
             $$;
         "#,
         r#"
-            create or replace function addone(int)
+            create or replace function addone(i int)
             returns int
             language python
-            imports = ('@ss/abc')
-            packages = ('numpy', 'pandas')
-            handler = 'addone_py'
-            as '@data/abc/a.py';
+            imports ('@ss/abc')
+            packages ('numpy', 'pandas')
+            handler 'addone_py'
+            as
+            $$
+            def addone_py(i):
+            return i+1
+            $$;
         "#,
-        r#"DROP FUNCTION binary_reverse;"#,
-        r#"DROP FUNCTION isnotempty;"#,
-        r#"CREATE FUNCTION IF NOT EXISTS my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE FUNCTION IF NOT EXISTS my_agg (INT) STATE { s STRING, i INT NOT NULL } RETURNS BOOLEAN LANGUAGE javascript AS 'some code';"#,
-        r#"CREATE FUNCTION IF NOT EXISTS my_agg (a INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE FUNCTION IF NOT EXISTS my_agg (a INT) STATE { s STRING, i INT NOT NULL } RETURNS BOOLEAN LANGUAGE javascript AS 'some code';"#,
-        r#"ALTER FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript AS 'some code';"#,
+        r#"DROP FUNCTION binary_reverse(BINARY);"#,
+        r#"DROP FUNCTION isnotempty(BOOLEAN);"#,
+        r#"CREATE FUNCTION IF NOT EXISTS py_series(a INT) RETURNS TABLE (value INT) LANGUAGE python ROWS 4 AS $$return {'value': [1, 2, 3, 4]}$$;"#,
         r#"CREATE OR REPLACE DICTIONARY my_catalog.my_database.my_dictionary
             (
                 user_name String,
@@ -346,9 +345,9 @@ fn test_ddl_statement_errors() {
         r#"alter schema system x rename to db"#,
         r#"show columns from db1.t from ctl.db"#,
         r#"CREATE CONNECTION IF NOT EXISTS my_conn"#,
-        r#"CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p)"#,
-        r#"CREATE FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript HANDLER = 'my_agg' ADDRESS = 'http://0.0.0.0:8815';"#,
-        r#"CREATE FUNCTION my_agg (INT) STATE { s STRIN } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';"#,
+        r#"CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python HANDLER 'batch';"#,
+        r#"CREATE FUNCTION py_missing_language(a INT) RETURNS INT AS $$return a$$;"#,
+        r#"CREATE FUNCTION py_bad_rows(a INT) RETURNS TABLE (value INT) LANGUAGE python ROWS nope AS $$return {'value': [1]}$$;"#,
         r#"drop table :a"#,
         r#"drop table IDENTIFIER(a)"#,
         r#"drop table IDENTIFIER(:a)"#,

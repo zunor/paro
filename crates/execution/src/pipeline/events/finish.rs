@@ -9,6 +9,7 @@ use crate::operator::state::{OperatorFinalizeInput, OperatorSinkFinalizeInput};
 use crate::result_type::{OperatorFinalResultType, SinkFinalizeType};
 use parking_lot::Mutex;
 use paro_scheduler::event::Event;
+use paro_scheduler::task::InterruptState;
 use paro_scheduler::task::Task;
 use paro_scheduler::task::TaskExecutionMode;
 use paro_scheduler::task::TaskExecutionResult;
@@ -92,6 +93,8 @@ pub struct PipelineFinishTask {
     sink_finalize_started: bool,
     /// Whether the task has completed
     finished: bool,
+    /// Interrupt state linked to the scheduled task.
+    interrupt_state: InterruptState,
 }
 
 impl PipelineFinishTask {
@@ -102,6 +105,7 @@ impl PipelineFinishTask {
             operator_idx: 0,
             sink_finalize_started: false,
             finished: false,
+            interrupt_state: InterruptState::new(),
         }
     }
 
@@ -119,8 +123,6 @@ impl Task for PipelineFinishTask {
 
         let pipeline = self.event.pipeline();
         let global_states = self.event.global_states();
-        let interrupt_state = paro_scheduler::task::InterruptState::new();
-
         let operators = pipeline.get_operators();
         while self.operator_idx < operators.len() {
             let op = &operators[self.operator_idx];
@@ -143,7 +145,7 @@ impl Task for PipelineFinishTask {
                     ))
                 })?;
                 let finalize_input =
-                    OperatorFinalizeInput::new(op_gstate.as_ref(), &interrupt_state);
+                    OperatorFinalizeInput::new(op_gstate.as_ref(), &self.interrupt_state);
                 op.operator_finalize(&finalize_input)?
             };
 
@@ -165,7 +167,7 @@ impl Task for PipelineFinishTask {
             let sink_guard = global_states.sink.lock();
             if let Some(sink_state) = sink_guard.as_ref() {
                 let finalize_input =
-                    OperatorSinkFinalizeInput::new(sink_state.as_ref(), &interrupt_state);
+                    OperatorSinkFinalizeInput::new(sink_state.as_ref(), &self.interrupt_state);
                 let result = sink.finalize(&finalize_input)?;
 
                 match result {
@@ -185,6 +187,10 @@ impl Task for PipelineFinishTask {
 
     fn task_type(&self) -> &str {
         "PipelineFinishTask"
+    }
+
+    fn set_interrupt_state(&mut self, interrupt_state: InterruptState) {
+        self.interrupt_state = interrupt_state;
     }
 }
 

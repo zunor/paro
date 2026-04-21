@@ -80,6 +80,15 @@ impl ExpressionRewriter {
                     .collect();
                 proj.expressions = new_exprs;
             }
+            LogicalOperator::ExternalProject(project) => {
+                for expr in &mut project.expressions {
+                    expr.expression = self.rewrite_expression(expr.expression.clone(), &rule_ctx);
+                }
+            }
+            LogicalOperator::ExternalTable(table) => {
+                table.call_expression =
+                    self.rewrite_expression(table.call_expression.clone(), &rule_ctx);
+            }
             LogicalOperator::Aggregate(agg) => {
                 let new_groups: Vec<_> = agg
                     .groups
@@ -206,6 +215,7 @@ impl ExpressionRewriter {
             | LogicalOperator::CopyTo(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
             | LogicalOperator::CreateIndex(_)

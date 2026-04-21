@@ -111,6 +111,13 @@ impl DelimJoinElimination {
             LogicalOperator::Projection(proj) => {
                 Self::remove_first_redundant_join(&mut proj.child.operator)
             }
+            LogicalOperator::ExternalProject(project) => {
+                Self::remove_first_redundant_join(&mut project.child.operator)
+            }
+            LogicalOperator::ExternalTable(table) => table
+                .child
+                .as_mut()
+                .and_then(|child| Self::remove_first_redundant_join(&mut child.operator)),
             LogicalOperator::Limit(limit) => {
                 Self::remove_first_redundant_join(&mut limit.child.operator)
             }
@@ -182,6 +189,7 @@ impl DelimJoinElimination {
             | LogicalOperator::CTERef(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)
             | LogicalOperator::CreateSchema(_)
             | LogicalOperator::CreateIndex(_)

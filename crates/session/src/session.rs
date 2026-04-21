@@ -4,6 +4,7 @@
 //! Live session state, `StatementContext` integration, and front-end entry points.
 
 use crate::active_query::{ActiveQueryContext, QueryProgress};
+use crate::auth_policy::SessionAuthPolicy;
 use crate::config::SessionConfig;
 use crate::ddl::SessionDdlBridge;
 use crate::execution_control::{ConnectionShutdownReason, SessionExecutionControl};
@@ -63,6 +64,8 @@ pub struct Session {
     pub(crate) effective_settings: HashMap<String, Value>,
     /// Session-level state (search_path, user, prepared statements, etc.)
     pub state: SessionState,
+    /// Boot-time routine privilege policy derived from the startup environment.
+    auth_policy: SessionAuthPolicy,
     /// Shared session-scoped metadata mirror for pg_settings / pg_prepared_statements / pg_cursors.
     pub session_metadata: Arc<SharedSessionMetadataState>,
     /// Data for the currently running transaction
@@ -206,13 +209,16 @@ impl Session {
             None
         };
 
+        let current_user = self.current_user().to_string();
+        let auth = self.auth_policy.auth_context_for_user(&current_user);
+
         Arc::new(StatementContext {
             env: StatementEnvironment {
                 current_database: self.current_database.name().to_string(),
                 current_schema: self.current_schema().to_string(),
-                current_user: self.current_user().to_string(),
+                current_user: current_user.clone(),
                 search_path: self.search_path().get().to_vec(),
-                auth: paro_context::StatementAuthContext::default(),
+                auth,
             },
             txn: StatementView {
                 id: self.transaction_id(),
@@ -245,6 +251,7 @@ impl Session {
                 }),
                 cast_functions: self.instance.cast_functions().clone(),
                 graph_index: self.instance.graph_manager().clone(),
+                python_runtime: Some(self.instance.python_runtime().clone()),
                 governance: paro_context::QueryResourceGovernance::default(),
                 plan_cache: None,
                 connection_info: None,
@@ -309,6 +316,7 @@ impl Session {
             config: SessionConfig::default(),
             effective_settings: HashMap::new(),
             state: SessionState::new(&default_db_name, &user_name),
+            auth_policy: SessionAuthPolicy::from_env(),
             session_metadata: Arc::new(SharedSessionMetadataState::default()),
             transaction: SessionTransaction::new(),
             execution_control,

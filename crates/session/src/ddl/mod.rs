@@ -5,19 +5,20 @@ use paro_catalog::dependency::{DependencyDelta, DependencyGraph};
 use paro_catalog::entry::{
     AlterEntryAction, AlterEntryInfo, CatalogEntryEnum, CatalogObjectId, CatalogObjectRef,
     CatalogType, ColumnDefinition, Constraint, ConstraintType, CreateIndexInfo,
-    CreatePropertyGraphInfo, CreateSchemaInfo, CreateSequenceInfo, CreateTableInfo, CreateViewInfo,
-    Dependency, DependencyType, DropEntryInfo, IndexBuildState, IndexCatalogEntry,
-    OnCreateConflict, PropertyGraphCatalogEntry, SchemaEntry, SequenceCatalogEntry,
+    CreatePropertyGraphInfo, CreateRoutineInfo, CreateSchemaInfo, CreateSequenceInfo,
+    CreateTableInfo, CreateViewInfo, Dependency, DependencyType, DropEntryInfo, DropRoutineInfo,
+    IndexBuildState, IndexCatalogEntry, OnCreateConflict, PropertyGraphCatalogEntry,
+    RoutineCatalogEntry, SchemaEntry, SequenceCatalogEntry, StoredRoutineOverload,
     TableCatalogEntry, ViewCatalogEntry,
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::ddl::{
-    AlterEntryPayload, CreateIndexPayload, CreatePropertyGraphPayload, CreateSchemaPayload,
-    CreateSequencePayload, CreateTablePayload, CreateViewPayload, DdlChange, DdlChangeRecord,
-    DdlDependencyObjectRef, DdlDependencyRef, DdlObjectKey, DdlObjectKind, DdlStorageDescriptor,
-    DdlWalColumnInfo, DdlWalConstraint, DropIndexPayload, DropPropertyGraphPayload,
-    DropSchemaPayload, DropSequencePayload, DropTablePayload, DropViewPayload,
-    PropertyGraphEdgePayload, PropertyGraphVertexPayload,
+    AlterEntryPayload, CreateIndexPayload, CreatePropertyGraphPayload, CreateRoutinePayload,
+    CreateSchemaPayload, CreateSequencePayload, CreateTablePayload, CreateViewPayload, DdlChange,
+    DdlChangeRecord, DdlDependencyObjectRef, DdlDependencyRef, DdlObjectKey, DdlObjectKind,
+    DdlStorageDescriptor, DdlWalColumnInfo, DdlWalConstraint, DropIndexPayload,
+    DropPropertyGraphPayload, DropRoutinePayload, DropSchemaPayload, DropSequencePayload,
+    DropTablePayload, DropViewPayload, PropertyGraphEdgePayload, PropertyGraphVertexPayload,
 };
 use paro_common::effect::{
     CleanupDescriptor, RuntimeTransitionDescriptor, StagedArtifactDescriptor, StagingArtifactId,
@@ -253,6 +254,7 @@ impl SessionDdlBridge {
             CatalogEntryEnum::Index(index) => index.base.base.object_id.raw(),
             CatalogEntryEnum::PropertyGraph(graph) => graph.base.base.object_id.raw(),
             CatalogEntryEnum::Sequence(sequence) => sequence.base.base.object_id.raw(),
+            CatalogEntryEnum::Routine(routine) => routine.base.base.object_id.raw(),
             other => {
                 return Err(paro_error::internal(format!(
                     "staged {} entry for \"{}\" has unsupported type {}",
@@ -314,6 +316,85 @@ impl SessionDdlBridge {
         }
         delta.add_dependencies(object_ref.id, &entry.dependency_list());
         Ok(delta)
+    }
+
+    fn stage_create_routine_handle(
+        &self,
+        schema: &SchemaEntry,
+        txn: &CatalogSnapshot,
+        info: &CreateRoutineInfo,
+    ) -> Result<Option<paro_catalog::collection::StagedCatalogMutation>> {
+        let collection = schema
+            .collection(CatalogType::Routine)
+            .expect("routine collection");
+        let timestamp = txn.write_timestamp()?;
+        let existing = schema.get_routine(self.txn_id, self.start_time, &info.name);
+
+        if let Some(existing_entry) = existing {
+            let existing_routine = existing_entry
+                .as_routine()
+                .ok_or_else(|| paro_error::wrong_object_type("routine", &info.name))?;
+            let mut overloads = existing_routine.overloads().to_vec();
+            if let Some(index) = overloads.iter().position(|overload| {
+                overload
+                    .spec
+                    .signature()
+                    .exact_match(&info.signature().argument_types)
+            }) {
+                match info.on_conflict {
+                    OnCreateConflict::ErrorOnConflict => {
+                        return Err(paro_error::object_exists("routine", &info.name));
+                    }
+                    OnCreateConflict::IgnoreOnConflict => return Ok(None),
+                    OnCreateConflict::ReplaceOnConflict | OnCreateConflict::AlterOnConflict => {
+                        let previous = &overloads[index];
+                        overloads[index] = StoredRoutineOverload {
+                            spec: info.materialize_spec(
+                                paro_routine::RoutineIdentity {
+                                    id: previous.spec.identity.id,
+                                    generation: previous.spec.identity.generation + 1,
+                                },
+                                schema.base.name.clone(),
+                                info.name.clone(),
+                            ),
+                            sql: info.sql.clone(),
+                        };
+                    }
+                }
+            } else {
+                let scratch = RoutineCatalogEntry::new(
+                    info.clone(),
+                    timestamp,
+                    self.db.catalog().name().to_string(),
+                );
+                let generated =
+                    scratch.overloads().first().cloned().ok_or_else(|| {
+                        paro_error::internal("new routine entry missing overload")
+                    })?;
+                overloads.push(generated);
+            }
+
+            let replacement = Arc::new(CatalogEntryEnum::Routine(Arc::new(
+                RoutineCatalogEntry::with_overloads(
+                    self.db.catalog().name().to_string(),
+                    schema.base.name.clone(),
+                    info.name.clone(),
+                    existing_routine.base.base.object_id,
+                    timestamp,
+                    overloads,
+                ),
+            )));
+            return collection.stage_replace(txn, &info.name, replacement);
+        }
+
+        let entry = Arc::new(CatalogEntryEnum::Routine(Arc::new(
+            RoutineCatalogEntry::new(
+                info.clone(),
+                timestamp,
+                self.db.catalog().name().to_string(),
+            ),
+        )));
+        collection.stage_create(txn, &info.name, entry)
     }
 
     fn rename_dependency_delta(
@@ -967,6 +1048,78 @@ impl DdlApplyContext for SessionDdlBridge {
         Ok(())
     }
 
+    fn apply_create_routine(&self, mut info: CreateRoutineInfo) -> Result<()> {
+        self.txn_write.begin_object_ddl()?;
+        info.catalog = self.db.catalog().name().to_string();
+        let signature = info.signature();
+        let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
+        let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
+        let handle = self.stage_create_routine_handle(schema.as_ref(), &txn, &info)?;
+
+        if let Some(handle) = handle {
+            let object_id = Self::staged_entry_object_id(&handle, "CREATE FUNCTION", &info.name)?;
+            let Some(entry) = handle.entry() else {
+                return Err(paro_error::internal(format!(
+                    "staged CREATE FUNCTION entry for \"{}\" is missing routine payload",
+                    info.name
+                )));
+            };
+            let Some(routine) = entry.as_routine() else {
+                return Err(paro_error::internal(format!(
+                    "staged CREATE FUNCTION entry for \"{}\" is not a routine",
+                    info.name
+                )));
+            };
+            let overload = routine
+                .find_exact(&signature.argument_types)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "staged CREATE FUNCTION entry for \"{}\" is missing overload {:?}",
+                        info.name, signature.argument_types
+                    ))
+                })?;
+            let spec_json = serde_json::to_string(&overload.spec).map_err(|error| {
+                paro_error::serialization_error(format!(
+                    "failed to encode routine spec for \"{}\": {}",
+                    info.name, error
+                ))
+            })?;
+            let dependencies = Some(Self::created_entry_dependency_delta(
+                &handle,
+                Some(schema.as_ref()),
+                "CREATE FUNCTION",
+                &info.name,
+            )?);
+            self.record_change(PreparedCatalogOp {
+                record: DdlChangeRecord {
+                    key: DdlObjectKey::new(
+                        self.db.name(),
+                        Some(info.schema.clone()),
+                        info.name.clone(),
+                        DdlObjectKind::Routine,
+                    ),
+                    change: DdlChange::CreateRoutine(CreateRoutinePayload {
+                        object_id,
+                        routine_id: overload.spec.identity.id.raw(),
+                        spec_json,
+                        sql: overload.sql.clone(),
+                    }),
+                },
+                profile: DdlExecutionProfile::metadata_only(),
+                catalog: Some(handle),
+                dependencies,
+                dml_targets: Vec::new(),
+                staged_artifacts: Vec::new(),
+                runtime_transitions: Vec::new(),
+                cleanups: Vec::new(),
+                post_commit_hooks: Vec::new(),
+                transient_runtime: None,
+            })?;
+        }
+
+        Ok(())
+    }
+
     fn apply_alter_entry(
         &self,
         schema_name: String,
@@ -1338,6 +1491,108 @@ impl DdlApplyContext for SessionDdlBridge {
                 transient_runtime: None,
             })?;
         }
+        Ok(())
+    }
+
+    fn apply_drop_routine(
+        &self,
+        schema_name: String,
+        name: String,
+        info: DropRoutineInfo,
+    ) -> Result<()> {
+        self.txn_write.begin_object_ddl()?;
+        let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
+        let schema = self.db.catalog().get_schema(&txn, &schema_name)?;
+        let existing_entry = schema.get_routine(self.txn_id, self.start_time, &name);
+
+        let Some(existing_entry) = existing_entry else {
+            if info.if_exists {
+                return Ok(());
+            }
+            return Err(paro_error::function_not_found(format!(
+                "{}({})",
+                name,
+                info.arg_types
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+
+        let existing_routine = existing_entry
+            .as_routine()
+            .ok_or_else(|| paro_error::wrong_object_type("routine", &name))?;
+        if existing_routine.find_exact(&info.arg_types).is_none() {
+            if info.if_exists {
+                return Ok(());
+            }
+            return Err(paro_error::function_not_found(format!(
+                "{}({})",
+                name,
+                info.arg_types
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        let handle = if existing_routine.overloads().len() == 1 {
+            schema
+                .collection(CatalogType::Routine)
+                .expect("routine collection")
+                .stage_drop(&txn, &name)?
+        } else {
+            let mut overloads = existing_routine.overloads().to_vec();
+            overloads.retain(|overload| !overload.spec.signature().exact_match(&info.arg_types));
+            let replacement = Arc::new(CatalogEntryEnum::Routine(Arc::new(
+                RoutineCatalogEntry::with_overloads(
+                    self.db.catalog().name().to_string(),
+                    schema.base.name.clone(),
+                    name.clone(),
+                    existing_routine.base.base.object_id,
+                    txn.write_timestamp()?,
+                    overloads,
+                ),
+            )));
+            schema
+                .collection(CatalogType::Routine)
+                .expect("routine collection")
+                .stage_replace(&txn, &name, replacement)?
+        };
+
+        if let Some(handle) = handle {
+            let dependencies = if existing_routine.overloads().len() == 1 {
+                Some(self.planned_drop_delta(&txn, existing_routine.base.base.object_id)?)
+            } else {
+                None
+            };
+            self.record_change(PreparedCatalogOp {
+                record: DdlChangeRecord {
+                    key: DdlObjectKey::new(
+                        self.db.name(),
+                        Some(schema_name),
+                        name,
+                        DdlObjectKind::Routine,
+                    ),
+                    change: DdlChange::DropRoutine(DropRoutinePayload {
+                        if_exists: info.if_exists,
+                        arg_types: info.arg_types,
+                    }),
+                },
+                profile: DdlExecutionProfile::metadata_only(),
+                catalog: Some(handle),
+                dependencies,
+                dml_targets: Vec::new(),
+                staged_artifacts: Vec::new(),
+                runtime_transitions: Vec::new(),
+                cleanups: Vec::new(),
+                post_commit_hooks: Vec::new(),
+                transient_runtime: None,
+            })?;
+        }
+
         Ok(())
     }
 

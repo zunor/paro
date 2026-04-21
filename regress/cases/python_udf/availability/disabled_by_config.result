@@ -1,0 +1,30 @@
+DROP FUNCTION IF EXISTS py_disabled_probe(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_disabled_probe(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value + 1 for value in a.materialize_py()]$$;
+CREATE FUNCTION
+
+SELECT py_disabled_probe(1);
+py_disabled_probe(1)
+2
+
+SELECT 41 + 1;
+41 + 1
+42
+
+CREATE FUNCTION py_disabled_new(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+AS $$return [value for value in a.materialize_py()]$$;
+ERROR: Python runtime is disabled by configuration for CREATE FUNCTION (SQLSTATE=39P04; DETAIL=Python runtime is disabled by configuration)
+
+SELECT py_disabled_probe(1);
+ERROR: Python runtime is disabled by configuration for external routine execution (SQLSTATE=XX000)
+
+SELECT py_disabled_probe(1);
+py_disabled_probe(1)
+2
+
+DROP FUNCTION py_disabled_probe(INTEGER);
+DROP FUNCTION

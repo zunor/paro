@@ -1,0 +1,30 @@
+namespace paro.protocol.sideband;
+
+table RuntimeContract {
+  sdk_version:string;
+  worker_protocol_version:ushort;
+  abi_version:ushort;
+  supported_transports:[string];
+}
+
+table ArtifactValidationState {
+  state:string;
+  validated_handler:string;
+  protocol_version:ushort;
+  reason:string;
+}
+
+table ResolvedEnvArtifact {
+  id:string;
+  platform:string;
+  python_abi:string;
+  env_fingerprint:string;
+  wheel_lock_digest:string;
+  imports_digest:string;
+  build_recipe_digest:string;
+  runtime_contract:RuntimeContract;
+  validation:ArtifactValidationState;
+  filesystem_root:string;
+}
+
+root_type ResolvedEnvArtifact;

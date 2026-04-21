@@ -42,7 +42,7 @@ LIMIT 3;
 SET temp_directory = '/tmp/paro_regress_explain_topn';
 SET force_external = true;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE
 SELECT id
 FROM explain_analyze_topn_rt

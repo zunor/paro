@@ -450,6 +450,7 @@ impl CatalogCollection {
             CatalogEntryEnum::Index(e) => e.base.base.set_timestamp(timestamp),
             CatalogEntryEnum::PropertyGraph(e) => e.base.base.set_timestamp(timestamp),
             CatalogEntryEnum::Sequence(e) => e.base.base.set_timestamp(timestamp),
+            CatalogEntryEnum::Routine(e) => e.base.base.set_timestamp(timestamp),
             CatalogEntryEnum::ScalarFunction(e) => e.base.base.set_timestamp(timestamp),
             CatalogEntryEnum::AggregateFunction(e) => e.base.base.set_timestamp(timestamp),
             CatalogEntryEnum::TableFunction(e) => e.base.base.set_timestamp(timestamp),
@@ -466,6 +467,7 @@ impl CatalogCollection {
             CatalogEntryEnum::Index(e) => e.base.base.set_deleted(deleted),
             CatalogEntryEnum::PropertyGraph(e) => e.base.base.set_deleted(deleted),
             CatalogEntryEnum::Sequence(e) => e.base.base.set_deleted(deleted),
+            CatalogEntryEnum::Routine(e) => e.base.base.set_deleted(deleted),
             CatalogEntryEnum::ScalarFunction(e) => e.base.base.set_deleted(deleted),
             CatalogEntryEnum::AggregateFunction(e) => e.base.base.set_deleted(deleted),
             CatalogEntryEnum::TableFunction(e) => e.base.base.set_deleted(deleted),
@@ -1170,6 +1172,9 @@ impl CatalogCollection {
             )),
             CatalogEntryEnum::PropertyGraph(_) => Err(paro_error::not_implemented(
                 "Renaming property graphs is not yet fully implemented",
+            )),
+            CatalogEntryEnum::Routine(_) => Err(paro_error::not_implemented(
+                "Renaming routines is not yet fully implemented",
             )),
         }
     }

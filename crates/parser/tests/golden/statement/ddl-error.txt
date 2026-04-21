@@ -202,44 +202,40 @@ error:
 
 
 ---------- Input ----------
-CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p)
+CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python HANDLER 'batch';
 ---------- Output ---------
 error: 
-  --> SQL:1:51
+  --> SQL:1:100
   |
-1 | CREATE FUNCTION IF NOT EXISTS isnotempty AS(p) -> not(is_null(p)
-  | ------                                   --       ^^^
-  | |                                        |        |
-  | |                                        |        expecting an operand
-  | |                                        |        while parsing expression
-  | |                                        while parsing AS (<parameter [parameter type]>, ...) -> <definition expr>
-  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`
+1 | CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python HANDLER 'batch';
+  | ------                                                                                             ^ unexpected `;`, expecting `AS`, `LANGUAGE`, `IMMUTABLE`, `STABLE`, `VOLATILE`, `STRICT`, `SECURITY`, `HANDLER`, `PACKAGES`, `IMPORTS`, `ROWS`, or `CAPABILITY`
+  | |                                                                                                   
+  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] [<database>.][<schema>.]<name>(<arg_name arg_type>, ...) RETURNS <type> LANGUAGE <language> [IMMUTABLE|STABLE|VOLATILE] [STRICT] [SECURITY INVOKER|DEFINER] [HANDLER '<handler>'] [PACKAGES ('pkg', ...)] [IMPORTS ('uri', ...)] [ROWS <n>] [CAPABILITY PROFILE <profile>] AS <code>`
 
 
 ---------- Input ----------
-CREATE FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript HANDLER = 'my_agg' ADDRESS = 'http://0.0.0.0:8815';
+CREATE FUNCTION py_missing_language(a INT) RETURNS INT AS $$return a$$;
 ---------- Output ---------
 error: 
-  --> SQL:1:85
+  --> SQL:1:1
   |
-1 | CREATE FUNCTION my_agg (INT) STATE { s STRING } RETURNS BOOLEAN LANGUAGE javascript HANDLER = 'my_agg' ADDRESS = 'http://0.0.0.0:8815';
-  | ------                 -                                                            ^^^^^^^ unexpected `HANDLER`. it's reserved keyword, you may avoid using it, expecting `HEADERS`, `ADDRESS`, `PACKAGES`, `AS`, or `IMPORTS`
-  | |                      |                                                             
-  | |                      while parsing (<[arg_name] arg_type>, ...) STATE {<state_field>, ...} RETURNS <return_type> LANGUAGE <language> { ADDRESS=<udf_server_address> | AS <language_codes> } 
-  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`
+1 | CREATE FUNCTION py_missing_language(a INT) RETURNS INT AS $$return a$$;
+  | ^^^^^^
+  | |
+  | CREATE FUNCTION requires LANGUAGE
+  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] [<database>.][<schema>.]<name>(<arg_name arg_type>, ...) RETURNS <type> LANGUAGE <language> [IMMUTABLE|STABLE|VOLATILE] [STRICT] [SECURITY INVOKER|DEFINER] [HANDLER '<handler>'] [PACKAGES ('pkg', ...)] [IMPORTS ('uri', ...)] [ROWS <n>] [CAPABILITY PROFILE <profile>] AS <code>`
 
 
 ---------- Input ----------
-CREATE FUNCTION my_agg (INT) STATE { s STRIN } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';
+CREATE FUNCTION py_bad_rows(a INT) RETURNS TABLE (value INT) LANGUAGE python ROWS nope AS $$return {'value': [1]}$$;
 ---------- Output ---------
 error: 
-  --> SQL:1:40
+  --> SQL:1:83
   |
-1 | CREATE FUNCTION my_agg (INT) STATE { s STRIN } RETURNS BOOLEAN LANGUAGE javascript ADDRESS = 'http://0.0.0.0:8815';
-  | ------                 -               ^^^^^ unexpected `STRIN`, expecting `STRING`, `SIGNED`, `STRUCT`, `INTERVAL`, `TINYINT`, `VARIANT`, `SMALLINT`, `TINYBLOB`, `VARBINARY`, `INT8`, `UINT`, `TIME`, `JSON`, `INT16`, `INT32`, `INT64`, `UINT8`, `JSONB`, `BIGINT`, `UINT16`, `UINT32`, `UINT64`, `BINARY`, `HUGEINT`, `INTEGER`, `UHUGEINT`, `DATETIME`, `NUMERIC`, `TIMESTAMP`, `UNSIGNED`, `STAGE_LOCATION`, `TIMESTAMPTZ`, `TIMESTAMP_TZ`, `REAL`, `LIST`, `DATE`, `UUID`, `CHAR`, `TEXT`, `ARRAY`, `TUPLE`, `VECTOR`, `BOOLEAN`, `DECIMAL`, `VARCHAR`, `LONGBLOB`, `NULLABLE`, `CHARACTER`, `GEOGRAPHY`, `MEDIUMBLOB`, `BITMAP`, `TSQUERY`, `TSVECTOR`, `}`, `BOOL`, `INT`, `FLOAT32`, `FLOAT`, `FLOAT64`, `DOUBLE`, or 3 more ...
-  | |                      |                
-  | |                      while parsing (<[arg_name] arg_type>, ...) STATE {<state_field>, ...} RETURNS <return_type> LANGUAGE <language> { ADDRESS=<udf_server_address> | AS <language_codes> } 
-  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <udf_name> <udf_definition> [DESC = <description>]`
+1 | CREATE FUNCTION py_bad_rows(a INT) RETURNS TABLE (value INT) LANGUAGE python ROWS nope AS $$return {'value': [1]}$$;
+  | ------                                                                            ^^^^ unexpected `nope`, expecting <PGLiteralHex>, <LiteralInteger>, <MySQLLiteralHex>, or `AS`
+  | |                                                                                  
+  | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] [<database>.][<schema>.]<name>(<arg_name arg_type>, ...) RETURNS <type> LANGUAGE <language> [IMMUTABLE|STABLE|VOLATILE] [STRICT] [SECURITY INVOKER|DEFINER] [HANDLER '<handler>'] [PACKAGES ('pkg', ...)] [IMPORTS ('uri', ...)] [ROWS <n>] [CAPABILITY PROFILE <profile>] AS <code>`
 
 
 ---------- Input ----------

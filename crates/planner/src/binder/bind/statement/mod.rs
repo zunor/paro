@@ -5,6 +5,7 @@
 
 pub mod alter;
 pub mod copy;
+pub mod create_function;
 pub mod create_index;
 pub mod create_property_graph;
 pub mod create_schema;
@@ -13,6 +14,7 @@ pub mod create_table;
 pub mod create_view;
 pub mod delete;
 pub mod drop;
+pub mod drop_function;
 pub mod drop_property_graph;
 pub mod explain;
 pub mod insert;

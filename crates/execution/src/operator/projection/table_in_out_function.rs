@@ -362,7 +362,7 @@ impl PhysicalOperator for TableInOutFunction {
             return match result {
                 TableInOutResultType::NeedMoreInput => Ok(OperatorResultType::NeedMoreInput),
                 TableInOutResultType::HaveMoreOutput => Ok(OperatorResultType::HaveMoreOutput),
-                TableInOutResultType::Blocked => Ok(OperatorResultType::HaveMoreOutput),
+                TableInOutResultType::Blocked => Ok(OperatorResultType::Blocked),
                 TableInOutResultType::Finished => Ok(OperatorResultType::Finished),
             };
         }
@@ -373,7 +373,7 @@ impl PhysicalOperator for TableInOutFunction {
         match result {
             TableInOutResultType::NeedMoreInput => Ok(OperatorResultType::NeedMoreInput),
             TableInOutResultType::HaveMoreOutput => Ok(OperatorResultType::HaveMoreOutput),
-            TableInOutResultType::Blocked => Ok(OperatorResultType::HaveMoreOutput),
+            TableInOutResultType::Blocked => Ok(OperatorResultType::Blocked),
             TableInOutResultType::Finished => Ok(OperatorResultType::Finished),
         }
     }
@@ -414,6 +414,7 @@ impl PhysicalOperator for TableInOutFunction {
             OperatorFinalizeResultType::HaveMoreOutput => {
                 Ok(ExecFinalizeResultType::HaveMoreOutput)
             }
+            OperatorFinalizeResultType::Blocked => Ok(ExecFinalizeResultType::Blocked),
             OperatorFinalizeResultType::Finished => Ok(ExecFinalizeResultType::Finished),
         }
     }

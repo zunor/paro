@@ -43,7 +43,7 @@ impl ProducerToken {
 ///
 /// This will happen transparently to the operator, as the operator only needs to return
 /// a BLOCKED result and call the callback using the InterruptState.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterruptMode {
     /// No blocking mode is specified, an error will be thrown when the operator blocks.
     /// Should only be used when manually calling operators of which is known they will never block.
@@ -55,6 +55,8 @@ pub enum InterruptMode {
     /// The caller has blocked awaiting some synchronization primitive to wait for the callback.
     /// Used for code paths without Task.
     Blocking,
+    /// A callback closure is provided and owns the reschedule logic.
+    Callback,
 }
 
 /// Synchronization primitive used to await a callback in InterruptMode::Blocking.
@@ -133,6 +135,7 @@ pub struct InterruptState {
     mode: InterruptMode,
     task: Option<Weak<parking_lot::Mutex<dyn Task>>>,
     signal_state: Option<WeakInterruptDoneSignalState>,
+    callback: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 impl InterruptState {
@@ -142,6 +145,7 @@ impl InterruptState {
             mode: InterruptMode::NoInterrupts,
             task: None,
             signal_state: None,
+            callback: None,
         }
     }
 
@@ -151,6 +155,7 @@ impl InterruptState {
             mode: InterruptMode::Task,
             task: Some(task),
             signal_state: None,
+            callback: None,
         }
     }
 
@@ -160,6 +165,17 @@ impl InterruptState {
             mode: InterruptMode::Blocking,
             task: None,
             signal_state: Some(signal_state),
+            callback: None,
+        }
+    }
+
+    /// Create a new interrupt state with a callback closure.
+    pub fn with_callback(callback: Arc<dyn Fn() -> Result<()> + Send + Sync>) -> Self {
+        Self {
+            mode: InterruptMode::Callback,
+            task: None,
+            signal_state: None,
+            callback: Some(callback),
         }
     }
 
@@ -193,6 +209,11 @@ impl InterruptState {
                 }
                 Ok(())
             }
+            InterruptMode::Callback => self
+                .callback
+                .as_ref()
+                .ok_or_else(|| paro_error::internal("Interrupt callback closure missing"))?(
+            ),
         }
     }
 }
@@ -304,6 +325,9 @@ pub trait Task: Send + Sync {
 
     /// Set the producer token for the task.
     fn set_token(&mut self, _token: ProducerToken) {}
+
+    /// Inject the interrupt state that should be used when this task blocks.
+    fn set_interrupt_state(&mut self, _interrupt_state: InterruptState) {}
 
     /// Get the producer token for the task.
     fn get_token(&self) -> Option<ProducerToken> {
