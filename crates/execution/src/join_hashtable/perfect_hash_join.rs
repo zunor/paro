@@ -145,7 +145,8 @@ impl PerfectHashJoinExecutor {
 
         // 1. Initialize result chunk and validity
         let build_types = &ht.build_types;
-        let mut build_data = Chunk::initialize(build_types, build_size);
+        let mut build_data =
+            Chunk::try_initialize(build_types, build_size, ht.allocator().clone())?;
         build_data.set_cardinality(build_size);
 
         let mut build_validity = vec![false; build_size];
@@ -205,8 +206,8 @@ impl PerfectHashJoinExecutor {
             return Ok(());
         }
 
-        let mut build_sel = SelectionVector::incremental(count);
-        let mut probe_sel = SelectionVector::incremental(count);
+        let mut build_sel = SelectionVector::try_incremental(count, result.allocator().clone())?;
+        let mut probe_sel = SelectionVector::try_incremental(count, result.allocator().clone())?;
         let mut match_count = 0;
 
         let key_vector = &keys.data[0];
@@ -241,19 +242,19 @@ impl PerfectHashJoinExecutor {
             result.set_cardinality(match_count);
             let left_col_count = lhs_output.column_count();
             for i in 0..left_col_count {
-                result.data[i] = Arc::new(Vector::dictionary(
+                result.data[i] = Arc::new(Vector::try_dictionary(
                     lhs_output.data[i].clone(),
                     probe_sel.clone(),
-                ));
+                )?);
             }
 
             // 2. Dictionary RHS output
             if let Some(build_data) = &self.build_data {
                 for i in 0..build_data.column_count() {
-                    result.data[left_col_count + i] = Arc::new(Vector::dictionary(
+                    result.data[left_col_count + i] = Arc::new(Vector::try_dictionary(
                         build_data.data[i].clone(),
                         build_sel.clone(),
-                    ));
+                    )?);
                 }
             }
         } else {

@@ -86,51 +86,51 @@ FROM peers AS p
 JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
-CTE (actual time=0.255..0.261 rows=5 loops=1)
+CTE (actual time=<time-range> rows=5 loops=1)
   CTE Name: base
   Materialization: MATERIALIZED
   Reference Count: 3
   Materialized Rows: 5
-  ->  EXPRESSION_SCAN  (rows=5) (actual time=0.227..0.279 rows=5 loops=2)
-  ->  PROJECTION (actual time=1.324..1.338 rows=2 loops=1)
+  ->  EXPRESSION_SCAN  (rows=5) (actual time=<time-range> rows=5 loops=2)
+  ->  PROJECTION (actual time=<time-range> rows=2 loops=1)
         Output: p.id, p.peer_id, a.total
-        ->  ORDER_BY (actual time=1.135..1.357 rows=4 loops=3)
+        ->  ORDER_BY (actual time=<time-range> rows=4 loops=3)
               Sort Key: expr_1 ASC NULLS LAST, expr_2 ASC NULLS LAST
               Sort Method: quicksort
               Spilled: false
               Peak Memory: 0 B
-              ->  PROJECTION (actual time=1.112..1.132 rows=2 loops=1)
+              ->  PROJECTION (actual time=<time-range> rows=2 loops=1)
                     Output: expr_1, expr_2, expr_2, expr_1, expr_2
-                    ->  FILTER (actual time=1.089..1.112 rows=2 loops=1)
+                    ->  FILTER (actual time=<time-range> rows=2 loops=1)
                           Filter: (expr_3 = expr_1)
-                          ->  CROSS_PRODUCT  (rows=1000000) (actual time=0.556..1.088 rows=9 loops=2)
+                          ->  CROSS_PRODUCT  (rows=1000000) (actual time=<time-range> rows=9 loops=2)
                                 Join Type: CROSS
-                                ->  PROJECTION (actual time=1.069..1.081 rows=2 loops=1)
+                                ->  PROJECTION (actual time=<time-range> rows=2 loops=1)
                                       Output: id, id, grp
-                                      ->  PROJECTION (actual time=1.056..1.068 rows=2 loops=1)
+                                      ->  PROJECTION (actual time=<time-range> rows=2 loops=1)
                                             Output: id, id, grp
-                                            ->  FILTER (actual time=0.813..1.055 rows=2 loops=1)
+                                            ->  FILTER (actual time=<time-range> rows=2 loops=1)
                                                   Filter: ((grp = grp) AND (id < id))
-                                                  ->  CROSS_PRODUCT (actual time=0.380..0.813 rows=30 loops=2)
+                                                  ->  CROSS_PRODUCT (actual time=<time-range> rows=30 loops=2)
                                                         Join Type: CROSS
-                                                        ->  CTE_SCAN (actual time=0.770..1.200 rows=5 loops=2)
+                                                        ->  CTE_SCAN (actual time=<time-range> rows=5 loops=2)
                                                               CTE Name: base
-                                                        ->  CTE_SCAN (actual time=0.359..0.404 rows=5 loops=2)
+                                                        ->  CTE_SCAN (actual time=<time-range> rows=5 loops=2)
                                                               CTE Name: base
-                                ->  PROJECTION (actual time=0.545..0.555 rows=3 loops=1)
+                                ->  PROJECTION (actual time=<time-range> rows=3 loops=1)
                                       Output: ref_2, sum
-                                      ->  PROJECTION (actual time=0.534..0.544 rows=3 loops=1)
+                                      ->  PROJECTION (actual time=<time-range> rows=3 loops=1)
                                             Output: ref_2, sum
-                                            ->  HASH_GROUP_BY (actual time=0.413..0.570 rows=8 loops=3)
+                                            ->  HASH_GROUP_BY (actual time=<time-range> rows=8 loops=3)
                                                   Group Key: grp
                                                   Aggregates: SUM(amount)
                                                   Spilled: false
-                                                  Peak Memory: 57.6 MB
-                                                  ->  PROJECTION (actual time=0.400..0.412 rows=5 loops=1)
+                                                  Peak Memory: 0 B
+                                                  ->  PROJECTION (actual time=<time-range> rows=5 loops=1)
                                                         Output: grp, amount
-                                                        ->  CTE_SCAN (actual time=0.379..0.448 rows=5 loops=2)
+                                                        ->  CTE_SCAN (actual time=<time-range> rows=5 loops=2)
                                                               CTE Name: base
-Execution Time: 0.145 ms
+Execution Time: <time-ms>
 Rows Returned: 2
 
 WITH base(id, grp, amount) AS MATERIALIZED (
@@ -175,34 +175,34 @@ walk(node, depth) AS (
 )
 SELECT node, depth FROM walk ORDER BY depth, node;
 QUERY PLAN
-PROJECTION  (rows=1) (actual time=1.888..1.897 rows=5 loops=1)
+PROJECTION  (rows=1) (actual time=<time-range> rows=5 loops=1)
   Output: node, depth
-  ->  ORDER_BY  (rows=1) (actual time=0.294..1.910 rows=10 loops=5)
+  ->  ORDER_BY  (rows=1) (actual time=<time-range> rows=10 loops=5)
         Sort Key: depth ASC NULLS LAST, node ASC NULLS LAST
         Sort Method: quicksort
         Spilled: false
         Peak Memory: 0 B
-        ->  PROJECTION  (rows=1) (actual time=0.278..1.354 rows=5 loops=3)
+        ->  PROJECTION  (rows=1) (actual time=<time-range> rows=5 loops=3)
               Output: node, depth, depth, node
-              ->  PROJECTION  (rows=1) (actual time=0.269..1.350 rows=5 loops=3)
+              ->  PROJECTION  (rows=1) (actual time=<time-range> rows=5 loops=3)
                     Output: node, depth
-                    ->  RECURSIVE_CTE  (rows=1) (actual time=0.158..1.788 rows=10 loops=7)
+                    ->  RECURSIVE_CTE  (rows=1) (actual time=<time-range> rows=10 loops=7)
                           CTE Name: walk
                           Set Operation: UNION ALL
                           Iterations: 2
-                          ->  EXPRESSION_SCAN  (rows=1) (actual time=0.146..0.177 rows=1 loops=2)
-                          ->  PROJECTION (actual time=0.610..1.146 rows=4 loops=2)
+                          ->  EXPRESSION_SCAN  (rows=1) (actual time=<time-range> rows=1 loops=2)
+                          ->  PROJECTION (actual time=<time-range> rows=4 loops=2)
                                 Output: expr_2, +(depth, 1)
-                                ->  FILTER (actual time=0.589..1.131 rows=4 loops=2)
+                                ->  FILTER (actual time=<time-range> rows=4 loops=2)
                                       Filter: (node = expr_1)
-                                      ->  CROSS_PRODUCT  (rows=1000000) (actual time=0.448..1.474 rows=30 loops=5)
+                                      ->  CROSS_PRODUCT  (rows=1000000) (actual time=<time-range> rows=30 loops=5)
                                             Join Type: CROSS
-                                            ->  FILTER (actual time=0.568..1.583 rows=3 loops=3)
+                                            ->  FILTER (actual time=<time-range> rows=3 loops=3)
                                                   Filter: (depth < 2)
-                                                  ->  CTE_SCAN (actual time=0.556..1.592 rows=5 loops=6)
+                                                  ->  CTE_SCAN (actual time=<time-range> rows=5 loops=6)
                                                         CTE Name: walk
-                                            ->  PROJECTION (actual time=0.436..1.472 rows=15 loops=3)
+                                            ->  PROJECTION (actual time=<time-range> rows=15 loops=3)
                                                   Output: col0, col1
-                                                  ->  EXPRESSION_SCAN (actual time=0.419..1.485 rows=15 loops=6)
-Execution Time: 0.110 ms
+                                                  ->  EXPRESSION_SCAN (actual time=<time-range> rows=15 loops=6)
+Execution Time: <time-ms>
 Rows Returned: 5

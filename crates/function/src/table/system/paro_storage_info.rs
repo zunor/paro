@@ -153,6 +153,7 @@ fn paro_storage_info_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoStorageInfoGlobalState>());
@@ -292,7 +293,7 @@ fn paro_storage_info_function(
         ),
     ] {
         if let Some(col) = output.column_mut(idx) {
-            *col = Vector::from_strings(&values);
+            *col = Vector::try_from_strings(&values, output_allocator.clone())?;
         }
     }
 
@@ -307,7 +308,7 @@ fn paro_storage_info_function(
         (14usize, &distinct_counts),
     ] {
         if let Some(col) = output.column_mut(idx) {
-            *col = Vector::from_i64(values);
+            *col = Vector::try_from_i64(values, output_allocator.clone())?;
         }
     }
 
@@ -317,7 +318,7 @@ fn paro_storage_info_function(
         (19usize, &has_fulltext),
     ] {
         if let Some(col) = output.column_mut(idx) {
-            *col = Vector::from_bool(values);
+            *col = Vector::try_from_bool(values, output_allocator.clone())?;
         }
     }
 

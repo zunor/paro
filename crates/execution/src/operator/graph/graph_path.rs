@@ -83,8 +83,9 @@ pub fn collect_prefix_path(input: &Chunk, row: usize, spec: &PathEmitSpec) -> Ma
 
 pub fn materialize_path_vectors(
     paths: &[MaterializedPath],
-) -> (Arc<Vector>, Arc<Vector>, Arc<Vector>) {
-    let mut length_vec = Vector::with_capacity(LogicalType::BigInt, paths.len());
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
+) -> paro_common::error::Result<(Arc<Vector>, Arc<Vector>, Arc<Vector>)> {
+    let mut length_vec = Vector::try_new(LogicalType::BigInt, paths.len(), allocator.clone())?;
     length_vec.set_len(paths.len());
 
     let vertex_lists = paths
@@ -100,22 +101,25 @@ pub fn materialize_path_vectors(
         length_vec.set_i64(idx, path.length);
     }
 
-    (
+    Ok((
         Arc::new(length_vec),
-        Arc::new(build_path_list_vector(&vertex_lists)),
-        Arc::new(build_path_list_vector(&edge_lists)),
-    )
+        Arc::new(build_path_list_vector(&vertex_lists, allocator.clone())?),
+        Arc::new(build_path_list_vector(&edge_lists, allocator)?),
+    ))
 }
 
-fn build_path_list_vector(rows: &[&[PathElementRef]]) -> Vector {
+fn build_path_list_vector(
+    rows: &[&[PathElementRef]],
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
+) -> paro_common::error::Result<Vector> {
     let list_type = path_element_list_type();
     let struct_type = path_element_struct_type();
     let total_children = rows.iter().map(|row| row.len()).sum::<usize>();
 
-    let mut list_vec = Vector::with_capacity(list_type, rows.len());
+    let mut list_vec = Vector::try_new(list_type, rows.len(), allocator.clone())?;
     list_vec.set_len(rows.len());
 
-    let mut child_vec = Vector::with_capacity(struct_type, total_children.max(1));
+    let mut child_vec = Vector::try_new(struct_type, total_children.max(1), allocator)?;
     child_vec.set_count(total_children);
     let children = child_vec
         .children_mut()
@@ -145,7 +149,7 @@ fn build_path_list_vector(rows: &[&[PathElementRef]]) -> Vector {
     }
 
     list_vec.set_child(Arc::new(child_vec));
-    list_vec
+    Ok(list_vec)
 }
 
 unsafe fn write_list_entry(vector: &mut Vector, idx: usize, offset: u32, length: u32) {
@@ -211,7 +215,9 @@ mod tests {
             },
         ];
 
-        let (_len, vertices, edges) = materialize_path_vectors(&paths);
+        let (_len, vertices, edges) =
+            materialize_path_vectors(&paths, paro_common::test_utils::test_allocator())
+                .expect("materialize path vectors");
         assert_eq!(
             vertices.get_value(0).to_string(),
             path_elements_to_value(&paths[0].vertices).to_string()

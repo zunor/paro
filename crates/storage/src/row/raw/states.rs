@@ -4,9 +4,10 @@
 //! State objects used by the raw row append/scan substrate.
 
 use crate::buffer::{BlockId, BufferHandle};
+use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::types::{ArrayType, LogicalType};
-use paro_common::vector::{DecodedVector, SelectionVector, ValidityMask, Vector, VECTOR_SIZE};
-use std::sync::Mutex;
+use paro_common::vector::{DecodedVectorOwned, SelectionVector, ValidityMask, Vector, VECTOR_SIZE};
+use std::sync::{Arc, Mutex};
 
 /// Block pinning behavior for raw row operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -139,7 +140,7 @@ impl RawRowPinState {
 #[derive(Debug)]
 pub struct CombinedListData {
     /// Combined decoded format for accessing combined list data
-    pub combined_data: DecodedVector,
+    pub combined_data: DecodedVectorOwned,
     /// Selection data for combined entries
     pub selection_data: Option<SelectionVector>,
     /// Combined list entries
@@ -160,7 +161,7 @@ impl CombinedListData {
     /// Create a new CombinedListData with default values.
     pub fn new() -> Self {
         Self {
-            combined_data: DecodedVector::empty(),
+            combined_data: DecodedVectorOwned::empty(),
             selection_data: None,
             combined_list_entries: vec![ListEntry::default(); VECTOR_SIZE],
             combined_validity: ValidityMask::new(VECTOR_SIZE),
@@ -177,7 +178,7 @@ impl Default for CombinedListData {
 /// Vector format for raw row operations.
 ///
 /// This structure provides decoded access to vector data, handling different
-/// vector types (Flat, Constant, Dictionary) transparently through DecodedVector.
+/// vector types (Flat, Constant, Dictionary) transparently through DecodedVectorOwned.
 ///
 ///
 /// # Key Design
@@ -192,7 +193,7 @@ pub struct RawRowVectorFormat {
     /// Owned original selection vector
     pub original_owned_sel: Option<SelectionVector>,
     /// Decoded vector access for data reads
-    pub decoded: DecodedVector,
+    pub decoded: DecodedVectorOwned,
     /// Child formats for nested types (STRUCT, LIST, ARRAY)
     pub children: Vec<RawRowVectorFormat>,
     /// Combined list data for within-collection operations
@@ -302,7 +303,7 @@ impl RawRowVectorFormat {
         Self {
             original_sel: None,
             original_owned_sel: None,
-            decoded: DecodedVector::empty(),
+            decoded: DecodedVectorOwned::empty(),
             children: Vec::new(),
             combined_list_data: None,
             array_list_entries: None,
@@ -384,13 +385,18 @@ impl Default for RawRowChunkState {
 impl RawRowChunkState {
     /// Create a new chunk state.
     pub fn new() -> Self {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
         Self {
             vector_data: Vec::new(),
             column_ids: Vec::new(),
-            row_locations: Vector::new(LogicalType::UBigInt), // Pointer as u64
-            heap_locations: Vector::new(LogicalType::UBigInt),
-            heap_sizes: Vector::new(LogicalType::UBigInt),
-            utility_sel: SelectionVector::with_capacity(VECTOR_SIZE),
+            row_locations: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
+                .expect("row location vector allocation failed"),
+            heap_locations: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
+                .expect("heap location vector allocation failed"),
+            heap_sizes: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
+                .expect("heap size vector allocation failed"),
+            utility_sel: SelectionVector::try_with_capacity(VECTOR_SIZE, allocator)
+                .expect("utility selection allocation failed"),
             chunk_part_indices: Vec::new(),
             array_cast_vectors: Vec::new(),
         }
@@ -398,13 +404,18 @@ impl RawRowChunkState {
 
     /// Create a chunk state for specific columns.
     pub fn with_columns(column_ids: Vec<usize>) -> Self {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
         Self {
             vector_data: Vec::new(),
             column_ids,
-            row_locations: Vector::new(LogicalType::UBigInt),
-            heap_locations: Vector::new(LogicalType::UBigInt),
-            heap_sizes: Vector::new(LogicalType::UBigInt),
-            utility_sel: SelectionVector::with_capacity(VECTOR_SIZE),
+            row_locations: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
+                .expect("row location vector allocation failed"),
+            heap_locations: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
+                .expect("heap location vector allocation failed"),
+            heap_sizes: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
+                .expect("heap size vector allocation failed"),
+            utility_sel: SelectionVector::try_with_capacity(VECTOR_SIZE, allocator)
+                .expect("utility selection allocation failed"),
             chunk_part_indices: Vec::new(),
             array_cast_vectors: Vec::new(),
         }
@@ -458,8 +469,10 @@ impl RawRowChunkState {
             }
             if Self::contains_array_type(logical_type) {
                 let list_type = ArrayType::convert_to_list(logical_type);
-                self.array_cast_vectors[col_idx] =
-                    Some(Vector::with_capacity(list_type, VECTOR_SIZE));
+                self.array_cast_vectors[col_idx] = Some(
+                    Vector::try_new(list_type, VECTOR_SIZE, self.utility_sel.allocator().clone())
+                        .expect("array cast vector allocation failed"),
+                );
             } else {
                 self.array_cast_vectors[col_idx] = None;
             }
@@ -488,7 +501,7 @@ impl RawRowChunkState {
 
     /// Convert Chunk vectors to decoded format.
     ///
-    /// This populates vector_data with DecodedVector for each column,
+    /// This populates vector_data with DecodedVectorOwned for each column,
     /// enabling uniform access to vector data regardless of the underlying
     /// vector type (Flat, Constant, Dictionary, etc.).
     ///
@@ -498,7 +511,7 @@ impl RawRowChunkState {
     ///
     /// # Example
     /// ```ignore
-    /// let chunk = Chunk::from_vectors(vec![vec1, vec2]);
+    /// let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![vec1, vec2]);
     /// state.decode(&chunk);
     /// // Now state.vector_data[0] and state.vector_data[1] contain decoded formats
     /// ```
@@ -640,6 +653,7 @@ impl RawRowParallelScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::*;
 
     #[test]
     fn test_pin_properties_default() {
@@ -774,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_raw_row_vector_format_from_flat_vector() {
-        let vec = Vector::from_i32(&[10, 20, 30, 40]);
+        let vec = test_i32_vector(&[10, 20, 30, 40]);
         let format = RawRowVectorFormat::from_vector(&vec, 4);
 
         // Check that decoded format is set up correctly
@@ -794,7 +808,7 @@ mod tests {
     fn test_raw_row_vector_format_from_constant_vector() {
         use paro_common::types::LogicalType;
 
-        let vec = Vector::constant(LogicalType::Integer, 42i32, 4);
+        let vec = test_constant_vector(LogicalType::Integer, 42i32, 4);
         let format = RawRowVectorFormat::from_vector(&vec, 4);
 
         // For constant vectors, all selections point to 0
@@ -815,8 +829,8 @@ mod tests {
         use paro_common::types::LogicalType;
         use std::sync::Arc;
 
-        let child = Arc::new(Vector::from_i32(&[1, 2, 3, 4, 5, 6]));
-        let array = Vector::from_array(LogicalType::Integer, child, 2, 3);
+        let child = Arc::new(test_i32_vector(&[1, 2, 3, 4, 5, 6]));
+        let array = paro_common::test_utils::test_array_vector(LogicalType::Integer, child, 2, 3);
         let format = RawRowVectorFormat::from_vector(&array, 2);
 
         let entries = format
@@ -843,9 +857,14 @@ mod tests {
         use paro_common::types::LogicalType;
         use std::sync::Arc;
 
-        let child = Arc::new(Vector::from_i32(&[10, 11, 20, 21, 30, 31]));
-        let array = Arc::new(Vector::from_array(LogicalType::Integer, child, 3, 2));
-        let dict_array = Vector::dictionary(array, vec![2]);
+        let child = Arc::new(test_i32_vector(&[10, 11, 20, 21, 30, 31]));
+        let array = Arc::new(paro_common::test_utils::test_array_vector(
+            LogicalType::Integer,
+            child,
+            3,
+            2,
+        ));
+        let dict_array = paro_common::test_utils::test_dictionary(array, vec![2]);
 
         let format = RawRowVectorFormat::from_vector(&dict_array, 1);
         let entries = format
@@ -880,15 +899,14 @@ mod tests {
 
     #[test]
     fn test_chunk_state_decode() {
-        use paro_common::chunk::Chunk;
         use std::sync::Arc;
 
         let mut state = RawRowChunkState::new();
 
         // Create a chunk with two columns
-        let vec1 = Vector::from_i32(&[1, 2, 3]);
-        let vec2 = Vector::from_i64(&[100, 200, 300]);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(vec1), Arc::new(vec2)]);
+        let vec1 = test_i32_vector(&[1, 2, 3]);
+        let vec2 = test_i64_vector(&[100, 200, 300]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(vec1), Arc::new(vec2)]);
 
         // Convert to decoded format
         state.decode(&chunk);

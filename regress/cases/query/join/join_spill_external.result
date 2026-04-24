@@ -172,24 +172,24 @@ FROM join_spill_skew_l l
 LEFT JOIN join_spill_skew_r r
   ON l.k = r.k;
 QUERY PLAN
-PROJECTION  (rows=1) (actual time=2125.496..2125.501 rows=1 loops=1)
+PROJECTION  (rows=1) (actual time=<time-range> rows=1 loops=1)
   Output: count
-  ->  UNGROUPED_AGGREGATE  (rows=1) (actual time=307.358..2125.508 rows=3001001 loops=1518)
+  ->  UNGROUPED_AGGREGATE  (rows=1) (actual time=<time-range> rows=3001001 loops=1518)
         Aggregates: COUNT(v)
-        Peak Memory: 80 B
-        ->  PROJECTION (actual time=307.347..2124.104 rows=3001000 loops=1516)
+        Peak Memory: <bytes>
+        ->  PROJECTION (actual time=<time-range> rows=3001000 loops=1516)
               Output: v
-              ->  HASH_JOIN  (rows=900000) (actual time=5.278..2125.378 rows=3004000 loops=1519)
+              ->  HASH_JOIN  (rows=900000) (actual time=<time-range> rows=3004000 loops=1519)
                     Join Type: LEFT
                     Join Condition: k = k
                     Spilled: true
-                    Peak Memory: 57.6 MB
-                    Temp Storage: 128 B
-                    ->  ROWSET_SCAN on public.join_spill_skew_l l (actual time=297.026..307.392 rows=3000 loops=2)
+                    Peak Memory: <bytes>
+                    Temp Storage: <bytes>
+                    ->  ROWSET_SCAN on public.join_spill_skew_l l (actual time=<time-range> rows=3000 loops=2)
                           Columns: k
-                    ->  ROWSET_SCAN on public.join_spill_skew_r r (actual time=0.216..9.374 rows=3000 loops=2)
+                    ->  ROWSET_SCAN on public.join_spill_skew_r r (actual time=<time-range> rows=3000 loops=2)
                           Columns: k, v
-Execution Time: 0.066 ms
+Execution Time: <time-ms>
 Rows Returned: 1
 
 SET force_external = DEFAULT;

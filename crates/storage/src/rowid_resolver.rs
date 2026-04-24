@@ -51,7 +51,7 @@ where
         ));
     }
     if rowids.is_empty() || column_ids.is_empty() {
-        return Ok(Chunk::with_allocator(allocator));
+        return Chunk::try_new(allocator);
     }
 
     let schema = tablet
@@ -160,11 +160,7 @@ where
 
     let mut output_vectors = Vec::with_capacity(column_ids.len());
     for (&column_id, output_type) in column_ids.iter().zip(output_types.iter()) {
-        let mut vector = Vector::with_capacity_and_allocator(
-            output_type.clone(),
-            rowids.len(),
-            allocator.clone(),
-        );
+        let mut vector = Vector::try_new(output_type.clone(), rowids.len(), allocator.clone())?;
         for group in &group_results {
             if let Some(batch) = group
                 .col_data
@@ -212,5 +208,5 @@ where
         output_vectors.push(Arc::new(vector));
     }
 
-    Ok(Chunk::from_arc_vectors(output_vectors))
+    Ok(Chunk::from_arc_vectors(output_vectors, allocator))
 }

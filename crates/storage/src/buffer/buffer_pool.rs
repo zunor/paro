@@ -348,6 +348,33 @@ impl BufferPool {
         self.memory_usage.sub(tag, size);
     }
 
+    fn sub_used_memory_saturating(&self, tag: MemoryTag, size: usize) -> usize {
+        if size == 0 {
+            return 0;
+        }
+
+        let mut current = self.used_memory.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return 0;
+            }
+
+            let actual = current.min(size);
+            match self.used_memory.compare_exchange_weak(
+                current,
+                current - actual,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.memory_usage.sub_saturating(tag, actual);
+                    return actual;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Update used memory by a delta amount.
     ///
     /// This is used by BufferPoolReservation to adjust memory usage.
@@ -359,6 +386,10 @@ impl BufferPool {
         } else if delta < 0 {
             self.sub_used_memory_checked(tag, (-delta) as usize, "update_used_memory");
         }
+    }
+
+    pub(crate) fn release_reserved_memory(&self, tag: MemoryTag, size: usize) {
+        self.sub_used_memory_saturating(tag, size);
     }
 
     /// Update memory limit at runtime.
@@ -909,12 +940,15 @@ impl BufferPool {
                             std::sync::Arc::<BlockHandle>::as_ptr(block) as *mut BlockHandle;
                         let block_mut = unsafe { &mut *block_ptr };
 
+                        let block_size = block.size();
                         let block_tag = block.tag();
                         if let Ok(Some(taken_buffer)) = block_mut
                             .unload_and_take_block(has_temp_dir, |bid, data| {
                                 self.write_to_temporary_file(bid, block_tag, data)
                             })
                         {
+                            reservation.resize(0);
+                            self.sub_used_memory_saturating(block_tag, block_size);
                             // Resize buffer if it's larger than needed
                             let resized_buffer =
                                 Self::resize_buffer_if_needed(taken_buffer, extra_memory);

@@ -47,17 +47,17 @@ impl UnaryOperator<f64, f64> for AbsOpF64 {
 }
 
 fn abs_i32(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<i32, i32, AbsOpI32>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<i32, i32, AbsOpI32>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
 fn abs_i64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<i64, i64, AbsOpI64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<i64, i64, AbsOpI64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
 fn abs_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, AbsOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, AbsOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -101,7 +101,7 @@ impl UnaryOperator<f64, f64> for CeilOpF64 {
 }
 
 fn ceil_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, CeilOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, CeilOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -140,7 +140,7 @@ impl UnaryOperator<f64, f64> for FloorOpF64 {
 }
 
 fn floor_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, FloorOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, FloorOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -171,7 +171,7 @@ impl UnaryOperator<f64, f64> for RoundOpF64 {
 }
 
 fn round_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, RoundOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, RoundOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -198,7 +198,7 @@ fn round_precision(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vec
         &input.data[1],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -237,7 +237,7 @@ impl UnaryOperator<f64, f64> for TruncOpF64 {
 }
 
 fn trunc_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, TruncOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, TruncOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -264,7 +264,7 @@ fn trunc_precision(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vec
         &input.data[1],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -339,17 +339,17 @@ impl UnaryOperator<f64, i32> for SignOpF64 {
 }
 
 fn sign_i32(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<i32, i32, SignOpI32>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<i32, i32, SignOpI32>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
 fn sign_i64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<i64, i64, SignOpI64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<i64, i64, SignOpI64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
 fn sign_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, i32, SignOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, i32, SignOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -393,7 +393,7 @@ impl UnaryOperator<f64, f64> for ExpOpF64 {
 }
 
 fn exp_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, ExpOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, ExpOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -431,7 +431,7 @@ fn pow_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> 
         &input.data[1],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -470,7 +470,7 @@ impl UnaryOperator<f64, f64> for SqrtOpF64 {
 }
 
 fn sqrt_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, SqrtOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, SqrtOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -500,7 +500,7 @@ impl UnaryOperator<f64, f64> for CbrtOpF64 {
 }
 
 fn cbrt_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, CbrtOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, CbrtOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -539,24 +539,33 @@ mod tests {
     }
 
     fn create_f64_chunk(values: &[f64]) -> Chunk {
-        let vec = Vector::from_f64(values);
-        Chunk::from_vectors(vec![vec])
+        let vec = paro_common::test_utils::test_f64_vector_with_allocator(
+            values,
+            paro_common::test_utils::test_allocator(),
+        );
+        paro_common::test_utils::test_chunk_from_vectors(vec![vec])
     }
 
     fn create_i32_chunk(values: &[i32]) -> Chunk {
-        let vec = Vector::from_i32(values);
-        Chunk::from_vectors(vec![vec])
+        let vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            values,
+            paro_common::test_utils::test_allocator(),
+        );
+        paro_common::test_utils::test_chunk_from_vectors(vec![vec])
     }
 
     fn create_i64_chunk(values: &[i64]) -> Chunk {
-        let vec = Vector::from_i64(values);
-        Chunk::from_vectors(vec![vec])
+        let vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            values,
+            paro_common::test_utils::test_allocator(),
+        );
+        paro_common::test_utils::test_chunk_from_vectors(vec![vec])
     }
 
     #[test]
     fn test_abs_i32() {
         let chunk = create_i32_chunk(&[-5, 0, 10, -100]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         abs_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -569,7 +578,7 @@ mod tests {
     #[test]
     fn test_abs_f64() {
         let chunk = create_f64_chunk(&[-3.14, 0.0, 2.71, -100.5]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         abs_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -582,7 +591,7 @@ mod tests {
     #[test]
     fn test_ceil() {
         let chunk = create_f64_chunk(&[1.1, 1.9, -1.1, -1.9, 2.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         ceil_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -596,7 +605,7 @@ mod tests {
     #[test]
     fn test_floor() {
         let chunk = create_f64_chunk(&[1.1, 1.9, -1.1, -1.9, 2.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         floor_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -610,7 +619,7 @@ mod tests {
     #[test]
     fn test_round() {
         let chunk = create_f64_chunk(&[1.4, 1.5, 1.6, -1.4, -1.5, -1.6]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         round_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -624,10 +633,19 @@ mod tests {
 
     #[test]
     fn test_round_precision() {
-        let values = Vector::from_f64(&[std::f64::consts::PI, std::f64::consts::E, 123.456]);
-        let precision = Vector::from_i32(&[2, 3, -1]);
-        let chunk = Chunk::from_vectors(vec![values, precision]);
-        let mut result = Vector::new(LogicalType::Double);
+        let values = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[std::f64::consts::PI, std::f64::consts::E, 123.456],
+            paro_common::test_utils::test_allocator(),
+        );
+        let precision = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2, 3, -1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![values, precision],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         round_precision(&chunk, &MockState, &mut result).unwrap();
 
@@ -639,7 +657,7 @@ mod tests {
     #[test]
     fn test_trunc() {
         let chunk = create_f64_chunk(&[1.9, -1.9, 2.0, -2.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         trunc_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -652,7 +670,7 @@ mod tests {
     #[test]
     fn test_sign_i32() {
         let chunk = create_i32_chunk(&[-5, 0, 10]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         sign_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -664,7 +682,7 @@ mod tests {
     #[test]
     fn test_sign_f64() {
         let chunk = create_f64_chunk(&[-3.14, 0.0, 2.71, f64::NAN]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         sign_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -677,7 +695,7 @@ mod tests {
     #[test]
     fn test_exp() {
         let chunk = create_f64_chunk(&[0.0, 1.0, 2.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         exp_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -688,10 +706,16 @@ mod tests {
 
     #[test]
     fn test_pow() {
-        let base = Vector::from_f64(&[2.0, 3.0, 10.0]);
-        let exp = Vector::from_f64(&[3.0, 2.0, 0.0]);
-        let chunk = Chunk::from_vectors(vec![base, exp]);
-        let mut result = Vector::new(LogicalType::Double);
+        let base = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[2.0, 3.0, 10.0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let exp = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[3.0, 2.0, 0.0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![base, exp]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         pow_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -703,7 +727,7 @@ mod tests {
     #[test]
     fn test_sqrt() {
         let chunk = create_f64_chunk(&[4.0, 9.0, 16.0, 2.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         sqrt_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -716,7 +740,7 @@ mod tests {
     #[test]
     fn test_cbrt() {
         let chunk = create_f64_chunk(&[8.0, 27.0, -8.0, 1.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         cbrt_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -729,7 +753,7 @@ mod tests {
     #[test]
     fn test_abs_i64() {
         let chunk = create_i64_chunk(&[-5, 0, 10, -100]);
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         abs_i64(&chunk, &MockState, &mut result).unwrap();
 

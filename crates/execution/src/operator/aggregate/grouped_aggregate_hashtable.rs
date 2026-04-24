@@ -6,7 +6,7 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
-use paro_common::allocator::{default_allocator, ArenaAllocator};
+use paro_common::allocator::{Allocator, ArenaAllocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -228,12 +228,14 @@ impl GroupedAggregateHashTable {
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         Self::with_capacity(
             group_types,
             aggregate_objects,
             aggregate_inputs,
             MIN_CAPACITY,
+            allocator,
         )
     }
 
@@ -252,6 +254,7 @@ impl GroupedAggregateHashTable {
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         initial_capacity: usize,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         validate_aggregate_inputs(&aggregate_objects, &aggregate_inputs)?;
         let layout = TupleLayout::build(&group_types, &aggregate_objects)?;
@@ -284,7 +287,7 @@ impl GroupedAggregateHashTable {
             aggregate_inputs,
             aggregate_return_types,
             varlen_heap: VarlenHeap::new(),
-            aggregate_allocator: ArenaAllocator::new(Arc::new(default_allocator())),
+            aggregate_allocator: ArenaAllocator::new(allocator),
             inline_key_layout,
             count: 0,
             capacity,
@@ -300,11 +303,15 @@ impl GroupedAggregateHashTable {
         self.capacity
     }
 
+    pub fn allocator(&self) -> Arc<dyn Allocator> {
+        self.aggregate_allocator.get_allocator().clone()
+    }
+
     /// Hash grouped keys using Paro vector hash implementation.
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
         self.validate_group_chunk(groups)?;
         let count = groups.size();
-        let mut hashes = Vector::with_capacity(LogicalType::UBigInt, count);
+        let mut hashes = Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
         hashes.set_count(count);
         if count == 0 {
             return Ok(hashes);
@@ -322,7 +329,8 @@ impl GroupedAggregateHashTable {
         })?;
         VectorOperations::hash(first.as_ref(), &mut hashes, count);
 
-        let mut column_hashes = Vector::with_capacity(LogicalType::UBigInt, count);
+        let mut column_hashes =
+            Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
         for group_idx in 1..self.layout.group_count() {
             let group_column = groups.column(group_idx).ok_or_else(|| {
                 paro_error::internal(format!(
@@ -359,14 +367,15 @@ impl GroupedAggregateHashTable {
 
         if groups.size() == 0 {
             addresses.set_count(0);
-            *new_groups = SelectionVector::from_indices(Vec::new());
+            *new_groups =
+                SelectionVector::try_from_indices(Vec::new(), groups.allocator().clone())?;
             return Ok(0);
         }
 
         self.ensure_capacity_for(groups.size())?;
         self.ensure_row_storage_capacity(groups.size())?;
 
-        let hash_format = hashes.decode(groups.size());
+        let hash_format = hashes.try_decode(groups.size())?;
         let hash_data = hash_format.get_data::<u64>();
 
         addresses.set_count(groups.size());
@@ -459,7 +468,7 @@ impl GroupedAggregateHashTable {
         }
 
         if !new_state_ptrs.is_empty() {
-            let new_addresses = pointer_vector_from_slice(&new_state_ptrs);
+            let new_addresses = pointer_vector_from_slice(&new_state_ptrs, self.allocator())?;
             initialize_states(
                 &self.state_layout,
                 &self.aggregate_objects,
@@ -468,7 +477,8 @@ impl GroupedAggregateHashTable {
             )?;
         }
 
-        *new_groups = SelectionVector::from_indices(new_group_rows);
+        *new_groups =
+            SelectionVector::try_from_indices(new_group_rows, groups.allocator().clone())?;
         Ok(new_groups.len())
     }
 
@@ -537,9 +547,10 @@ impl GroupedAggregateHashTable {
             let batch_size = (other.count - row_offset).min(VECTOR_SIZE);
 
             let groups = other.materialize_groups(row_offset, batch_size)?;
-            let mut hashes = Vector::with_capacity(LogicalType::UBigInt, batch_size);
+            let mut hashes = Vector::try_new(LogicalType::UBigInt, batch_size, self.allocator())?;
             hashes.set_count(batch_size);
-            let mut source_addresses = Vector::with_capacity(LogicalType::BigInt, batch_size);
+            let mut source_addresses =
+                Vector::try_new(LogicalType::BigInt, batch_size, self.allocator())?;
             source_addresses.set_count(batch_size);
             unsafe {
                 let hash_data = hashes.flat_data_mut::<u64>();
@@ -551,8 +562,9 @@ impl GroupedAggregateHashTable {
                 }
             }
 
-            let mut target_addresses = Vector::with_capacity(LogicalType::BigInt, batch_size);
-            let mut new_groups = SelectionVector::with_capacity(batch_size);
+            let mut target_addresses =
+                Vector::try_new(LogicalType::BigInt, batch_size, self.allocator())?;
+            let mut new_groups = SelectionVector::try_with_capacity(batch_size, self.allocator())?;
             self.find_or_create_groups(&groups, &hashes, &mut target_addresses, &mut new_groups)?;
 
             if !self.aggregate_objects.is_empty() {
@@ -612,7 +624,8 @@ impl GroupedAggregateHashTable {
         }
 
         if aggregate_count > 0 {
-            let mut state_addresses = Vector::with_capacity(LogicalType::BigInt, batch_size);
+            let mut state_addresses =
+                Vector::try_new(LogicalType::BigInt, batch_size, result.allocator().clone())?;
             state_addresses.set_count(batch_size);
             unsafe {
                 let address_data = state_addresses.flat_data_mut::<*mut u8>();
@@ -621,7 +634,11 @@ impl GroupedAggregateHashTable {
                 }
             }
 
-            let mut aggregate_chunk = Chunk::initialize(&self.aggregate_return_types, batch_size);
+            let mut aggregate_chunk = Chunk::try_initialize(
+                &self.aggregate_return_types,
+                batch_size,
+                result.allocator().clone(),
+            )?;
             let mut input_data = AggregateInputData::new(
                 None,
                 &mut self.aggregate_allocator,
@@ -663,7 +680,7 @@ impl GroupedAggregateHashTable {
             return Ok(());
         }
 
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, self.count);
+        let mut addresses = Vector::try_new(LogicalType::BigInt, self.count, self.allocator())?;
         addresses.set_count(self.count);
         unsafe {
             let address_data = addresses.flat_data_mut::<*mut u8>();
@@ -692,10 +709,13 @@ impl GroupedAggregateHashTable {
     }
 
     pub fn memory_usage(&self) -> usize {
+        self.external_accounted_memory_usage() + self.aggregate_allocator.allocation_size()
+    }
+
+    pub fn external_accounted_memory_usage(&self) -> usize {
         self.entries.capacity() * size_of::<AggregateHTEntry>()
             + self.data.capacity() * size_of::<u64>()
             + self.varlen_heap.len()
-            + self.aggregate_allocator.allocation_size()
     }
 
     pub fn resize(&mut self, new_capacity: usize) -> Result<()> {
@@ -849,7 +869,7 @@ row_width {}/{} agg_state_offset {}/{}",
             ))
         })?;
 
-        let address_format = addresses.decode(addresses.len());
+        let address_format = addresses.try_decode(addresses.len())?;
         let address_data = address_format.get_data::<*mut u8>();
         for row_idx in 0..row_count {
             let physical_idx = address_format.sel().get(row_idx);
@@ -966,7 +986,7 @@ row_width {}/{} agg_state_offset {}/{}",
     }
 
     fn materialize_groups(&self, start_row: usize, count: usize) -> Result<Chunk> {
-        let mut groups = Chunk::initialize(&self.layout.group_types, count);
+        let mut groups = Chunk::try_initialize(&self.layout.group_types, count, self.allocator())?;
         groups.set_cardinality(count);
         for row_idx in 0..count {
             let source_ptr = self.row_ptr(start_row + row_idx);
@@ -1181,8 +1201,8 @@ fn validate_filter(filter: &SelectionVector, payload_rows: usize) -> Result<()> 
     Ok(())
 }
 
-fn pointer_vector_from_slice(ptrs: &[*mut u8]) -> Vector {
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ptrs.len());
+fn pointer_vector_from_slice(ptrs: &[*mut u8], allocator: Arc<dyn Allocator>) -> Result<Vector> {
+    let mut result = Vector::try_new(LogicalType::BigInt, ptrs.len(), allocator)?;
     result.set_count(ptrs.len());
     unsafe {
         let result_data = result.flat_data_mut::<*mut u8>();
@@ -1190,7 +1210,7 @@ fn pointer_vector_from_slice(ptrs: &[*mut u8]) -> Vector {
             *result_data.add(idx) = *ptr;
         }
     }
-    result
+    Ok(result)
 }
 
 fn normalize_capacity(capacity: usize) -> Result<usize> {
@@ -1337,7 +1357,7 @@ mod tests {
         let mut types = table.layout.group_types.clone();
         types.extend(table.aggregate_return_types.clone());
         let mut position = HTScanPosition::default();
-        let mut chunk = Chunk::initialize(&types, VECTOR_SIZE);
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(&types, VECTOR_SIZE);
         let mut rows = Vec::new();
         while table
             .scan(&mut position, &mut chunk)
@@ -1377,20 +1397,34 @@ mod tests {
             vec![make_sum_object()],
             vec![vec![0]],
             8,
+            paro_common::test_utils::test_allocator(),
         )
         .expect("create grouped hash table");
 
-        let groups = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 1, 3, 2])]);
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 1, 3, 2],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let hashes = table.hash_groups(&groups).expect("hash groups");
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, groups.size());
-        let mut new_groups = SelectionVector::with_capacity(groups.size());
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
         let new_group_count = table
             .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
             .expect("find/create groups");
         assert_eq!(new_group_count, 3);
         assert_eq!(new_groups.as_slice(), &[0, 1, 3]);
 
-        let payload = Chunk::from_vectors(vec![Vector::from_i64(&[10, 20, 5, 7, 8])]);
+        let payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[10, 20, 5, 7, 8],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         table
             .update_aggregates(&payload, &addresses, None)
             .expect("update aggregates");
@@ -1407,19 +1441,33 @@ mod tests {
             vec![LogicalType::Integer],
             vec![make_sum_object()],
             vec![vec![0]],
+            paro_common::test_utils::test_allocator(),
         )
         .expect("create grouped hash table");
 
-        let groups = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let hashes = table.hash_groups(&groups).expect("hash groups");
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, groups.size());
-        let mut new_groups = SelectionVector::with_capacity(groups.size());
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
         table
             .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
             .expect("find/create");
 
-        let payload = Chunk::from_vectors(vec![Vector::from_i64(&[10, 20, 30])]);
-        let filter = SelectionVector::from_indices(vec![0, 2]);
+        let payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[10, 20, 30],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let filter = paro_common::test_utils::test_selection(vec![0, 2]);
         table
             .update_aggregates(&payload, &addresses, Some(&filter))
             .expect("filtered update");
@@ -1435,19 +1483,39 @@ mod tests {
             vec![LogicalType::Integer, LogicalType::Varchar],
             vec![make_sum_object()],
             vec![vec![0]],
+            paro_common::test_utils::test_allocator(),
         )
         .expect("create grouped hash table");
 
-        let mut strings = Vector::from_strings(&["a", "n", "a", "b", "b"]);
+        let mut strings = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "n", "a", "b", "b"],
+            paro_common::test_utils::test_allocator(),
+        );
         strings.set_null(1, true);
-        let groups = Chunk::from_vectors(vec![Vector::from_i32(&[1, 1, 1, 2, 2]), strings]);
+        let groups = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 1, 1, 2, 2],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                strings,
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         let hashes = table.hash_groups(&groups).expect("hash groups");
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, groups.size());
-        let mut new_groups = SelectionVector::with_capacity(groups.size());
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
         table
             .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
             .expect("find/create");
-        let payload = Chunk::from_vectors(vec![Vector::from_i64(&[1, 2, 3, 4, 5])]);
+        let payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[1, 2, 3, 4, 5],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         table
             .update_aggregates(&payload, &addresses, None)
             .expect("update");
@@ -1480,15 +1548,27 @@ mod tests {
 
     #[test]
     fn grouped_hash_table_resizes_and_reuses_entries() {
-        let mut table =
-            GroupedAggregateHashTable::with_capacity(vec![LogicalType::Integer], vec![], vec![], 8)
-                .expect("create grouped hash table");
+        let mut table = GroupedAggregateHashTable::with_capacity(
+            vec![LogicalType::Integer],
+            vec![],
+            vec![],
+            8,
+            paro_common::test_utils::test_allocator(),
+        )
+        .expect("create grouped hash table");
 
         let values = (0..50).map(|v| v as i32).collect::<Vec<_>>();
-        let groups = Chunk::from_vectors(vec![Vector::from_i32(&values)]);
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let hashes = table.hash_groups(&groups).expect("hash groups");
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, groups.size());
-        let mut new_groups = SelectionVector::with_capacity(groups.size());
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
         let new_group_count = table
             .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
             .expect("first insertion");
@@ -1497,8 +1577,10 @@ mod tests {
         assert!(table.capacity() > 8);
 
         let base_memory = table.memory_usage();
-        let mut probe_addresses = Vector::with_capacity(LogicalType::BigInt, groups.size());
-        let mut probe_new_groups = SelectionVector::with_capacity(groups.size());
+        let mut probe_addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut probe_new_groups =
+            paro_common::test_utils::test_selection_with_capacity(groups.size());
         let second_new = table
             .find_or_create_groups(
                 &groups,
@@ -1519,19 +1601,31 @@ mod tests {
             vec![LogicalType::Integer],
             vec![make_sum_object()],
             vec![vec![0]],
+            paro_common::test_utils::test_allocator(),
         )
         .expect("left table");
         let mut right = GroupedAggregateHashTable::new(
             vec![LogicalType::Integer],
             vec![make_sum_object()],
             vec![vec![0]],
+            paro_common::test_utils::test_allocator(),
         )
         .expect("right table");
 
-        let left_groups = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2])]);
+        let left_groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let left_hashes = left.hash_groups(&left_groups).expect("left hashes");
-        let mut left_addresses = Vector::with_capacity(LogicalType::BigInt, left_groups.size());
-        let mut left_new_groups = SelectionVector::with_capacity(left_groups.size());
+        let mut left_addresses = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::BigInt,
+            left_groups.size(),
+        );
+        let mut left_new_groups =
+            paro_common::test_utils::test_selection_with_capacity(left_groups.size());
         left.find_or_create_groups(
             &left_groups,
             &left_hashes,
@@ -1539,14 +1633,30 @@ mod tests {
             &mut left_new_groups,
         )
         .expect("left find/create");
-        let left_payload = Chunk::from_vectors(vec![Vector::from_i64(&[10, 20])]);
+        let left_payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[10, 20],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         left.update_aggregates(&left_payload, &left_addresses, None)
             .expect("left update");
 
-        let right_groups = Chunk::from_vectors(vec![Vector::from_i32(&[2, 3, 2])]);
+        let right_groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[2, 3, 2],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let right_hashes = right.hash_groups(&right_groups).expect("right hashes");
-        let mut right_addresses = Vector::with_capacity(LogicalType::BigInt, right_groups.size());
-        let mut right_new_groups = SelectionVector::with_capacity(right_groups.size());
+        let mut right_addresses = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::BigInt,
+            right_groups.size(),
+        );
+        let mut right_new_groups =
+            paro_common::test_utils::test_selection_with_capacity(right_groups.size());
         right
             .find_or_create_groups(
                 &right_groups,
@@ -1555,7 +1665,13 @@ mod tests {
                 &mut right_new_groups,
             )
             .expect("right find/create");
-        let right_payload = Chunk::from_vectors(vec![Vector::from_i64(&[7, 8, 1])]);
+        let right_payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[7, 8, 1],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         right
             .update_aggregates(&right_payload, &right_addresses, None)
             .expect("right update");
@@ -1575,17 +1691,31 @@ mod tests {
             vec![LogicalType::Integer],
             vec![make_sum_object()],
             vec![vec![0]],
+            paro_common::test_utils::test_allocator(),
         )
         .expect("create grouped hash table");
 
-        let groups = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let hashes = table.hash_groups(&groups).expect("hash groups");
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, groups.size());
-        let mut new_groups = SelectionVector::with_capacity(groups.size());
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
         table
             .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
             .expect("find/create groups");
-        let payload = Chunk::from_vectors(vec![Vector::from_i64(&[4, 5, 6])]);
+        let payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[4, 5, 6],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         table
             .update_aggregates(&payload, &addresses, None)
             .expect("update aggregates");

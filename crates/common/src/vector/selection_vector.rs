@@ -3,7 +3,26 @@
 
 use super::{AllocationSet, VectorBuffer};
 use crate::allocator::Allocator;
+use crate::error::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static SELECTION_MATERIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub fn selection_materialization_count() -> u64 {
+    SELECTION_MATERIALIZATION_COUNT.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn reset_selection_materialization_count() {
+    SELECTION_MATERIALIZATION_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_selection_materialization() {
+    SELECTION_MATERIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Selection vector - maps logical indices to physical indices.
 ///
@@ -18,36 +37,33 @@ pub struct SelectionVector {
 
 impl SelectionVector {
     /// Create a deep copy of this selection vector.
-    pub fn deep_copy(&self) -> Self {
-        Self {
-            buffer: self.buffer.deep_copy(),
+    pub fn try_deep_copy(&self) -> Result<Self> {
+        Ok(Self {
+            buffer: self.buffer.try_deep_copy()?,
             count: self.count,
-        }
+        })
     }
 
     /// Ensure the selection vector is exclusively owned (Copy-on-Write).
-    pub fn make_exclusive(&mut self) {
-        self.buffer.make_exclusive();
-    }
-    /// Create a new selection vector with capacity.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buffer: VectorBuffer::new(std::mem::size_of::<u32>(), capacity),
-            count: 0,
-        }
+    pub fn try_make_exclusive(&mut self) -> Result<()> {
+        self.buffer.try_make_exclusive()
     }
 
     /// Create with custom allocator.
-    pub fn with_allocator(capacity: usize, allocator: Arc<dyn Allocator>) -> Self {
-        Self {
-            buffer: VectorBuffer::with_allocator(std::mem::size_of::<u32>(), capacity, allocator),
+    pub fn try_with_capacity(capacity: usize, allocator: Arc<dyn Allocator>) -> Result<Self> {
+        Ok(Self {
+            buffer: VectorBuffer::try_with_allocator(
+                std::mem::size_of::<u32>(),
+                capacity,
+                allocator,
+            )?,
             count: 0,
-        }
+        })
     }
 
     /// Create incremental selection (0, 1, 2, ...).
-    pub fn incremental(count: usize) -> Self {
-        let mut sv = Self::with_capacity(count);
+    pub fn try_incremental(count: usize, allocator: Arc<dyn Allocator>) -> Result<Self> {
+        let mut sv = Self::try_with_capacity(count, allocator)?;
         sv.count = count;
 
         // SAFETY: We allocated space for `count` u32s.
@@ -57,13 +73,13 @@ impl SelectionVector {
                 *ptr.add(i) = i as u32;
             }
         }
-        sv
+        Ok(sv)
     }
 
     /// Create constant selection (all zeros) for constant vectors.
     /// All indices point to position 0.
-    pub fn constant(count: usize) -> Self {
-        let mut sv = Self::with_capacity(count);
+    pub fn try_constant(count: usize, allocator: Arc<dyn Allocator>) -> Result<Self> {
+        let mut sv = Self::try_with_capacity(count, allocator)?;
         sv.count = count;
 
         // SAFETY: We allocated space for `count` u32s.
@@ -75,13 +91,13 @@ impl SelectionVector {
                 *ptr.add(i) = 0;
             }
         }
-        sv
+        Ok(sv)
     }
 
     /// Create from indices.
-    pub fn from_indices(indices: Vec<u32>) -> Self {
+    pub fn try_from_indices(indices: Vec<u32>, allocator: Arc<dyn Allocator>) -> Result<Self> {
         let count = indices.len();
-        let mut sv = Self::with_capacity(count);
+        let mut sv = Self::try_with_capacity(count, allocator)?;
         sv.count = count;
 
         if count > 0 {
@@ -91,7 +107,7 @@ impl SelectionVector {
                 std::ptr::copy_nonoverlapping(indices.as_ptr(), dst, count);
             }
         }
-        sv
+        Ok(sv)
     }
 
     /// Get index at position.
@@ -107,14 +123,42 @@ impl SelectionVector {
 
     /// Set index at position.
     #[inline]
-    pub fn set(&mut self, idx: usize, value: usize) {
+    pub fn try_set(&mut self, idx: usize, value: usize) -> Result<()> {
         debug_assert!(idx < self.count, "Index out of bounds");
-        self.make_exclusive();
+        self.try_make_exclusive()?;
         // SAFETY: Bounds checked in debug mode.
         unsafe {
             let ptr = self.buffer.data() as *mut u32;
             *ptr.add(idx) = value as u32;
         }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set(&mut self, idx: usize, value: usize) {
+        self.try_set(idx, value)
+            .expect("selection vector copy-on-write allocation failed");
+    }
+
+    pub(crate) fn try_fill_offset_from(
+        &mut self,
+        offset: usize,
+        selection: &SelectionVector,
+        count: usize,
+    ) -> Result<()> {
+        debug_assert!(count <= self.count, "Output selection length is too small");
+        debug_assert!(
+            count <= selection.len(),
+            "Input selection length is too small"
+        );
+        self.try_make_exclusive()?;
+        unsafe {
+            let dst = self.buffer.data() as *mut u32;
+            for i in 0..count {
+                *dst.add(i) = (offset + selection.get(i)) as u32;
+            }
+        }
+        Ok(())
     }
 
     /// Length of selection vector.
@@ -130,8 +174,16 @@ impl SelectionVector {
         self.buffer.size()
     }
 
+    pub fn allocator(&self) -> &Arc<dyn Allocator> {
+        self.buffer.allocator()
+    }
+
     pub(crate) fn collect_allocation_size(&self, allocations: &mut AllocationSet) -> usize {
         self.buffer.collect_allocation_size(allocations)
+    }
+
+    pub(crate) fn collect_allocation_entries(&self, entries: &mut Vec<(usize, usize)>) {
+        self.buffer.collect_allocation_entries(entries);
     }
 
     /// Set the length of the selection vector.
@@ -153,8 +205,10 @@ impl SelectionVector {
     /// Merge this selection vector with another one.
     /// Resulting selection maps 0..other.count -> physical indices.
     /// new_indices[i] = self.get(other.get(i))
-    pub fn slice(&self, other: &SelectionVector, count: usize) -> SelectionVector {
-        let mut result = SelectionVector::with_allocator(count, self.buffer.allocator().clone());
+    pub fn try_slice(&self, other: &SelectionVector, count: usize) -> Result<SelectionVector> {
+        record_selection_materialization();
+        let mut result =
+            SelectionVector::try_with_capacity(count, self.buffer.allocator().clone())?;
         result.count = count;
 
         unsafe {
@@ -167,18 +221,196 @@ impl SelectionVector {
                 *res_ptr.add(i) = *self_ptr.add(idx_in_self);
             }
         }
-        result
+        Ok(result)
     }
-}
 
-impl From<Vec<u32>> for SelectionVector {
-    fn from(indices: Vec<u32>) -> Self {
-        Self::from_indices(indices)
+    /// Slice a contiguous logical range from this selection vector.
+    pub fn try_slice_range(&self, offset: usize, count: usize) -> Result<SelectionVector> {
+        record_selection_materialization();
+        debug_assert!(
+            offset + count <= self.count,
+            "selection range out of bounds"
+        );
+        let mut result =
+            SelectionVector::try_with_capacity(count, self.buffer.allocator().clone())?;
+        result.count = count;
+
+        if count > 0 {
+            unsafe {
+                let src = (self.buffer.data() as *const u32).add(offset);
+                let dst = result.buffer.data() as *mut u32;
+                std::ptr::copy_nonoverlapping(src, dst, count);
+            }
+        }
+        Ok(result)
     }
 }
 
 impl From<&SelectionVector> for SelectionVector {
     fn from(sel: &SelectionVector) -> Self {
         sel.clone()
+    }
+}
+
+/// Logical-to-physical row mapping carried by dictionary vectors and decoded
+/// views.
+///
+/// `Range` is intentionally first-class so hot range slices can compose without
+/// allocating a materialized `SelectionVector`.
+#[derive(Debug, Clone, Default)]
+pub enum VectorSelection {
+    #[default]
+    None,
+    Materialized(SelectionVector),
+    Range {
+        offset: usize,
+        count: usize,
+    },
+}
+
+impl VectorSelection {
+    #[inline]
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    #[inline]
+    pub fn materialized(selection: SelectionVector) -> Self {
+        Self::Materialized(selection)
+    }
+
+    #[inline]
+    pub fn range(offset: usize, count: usize) -> Self {
+        Self::Range { offset, count }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Materialized(sel) => sel.len(),
+            Self::Range { count, .. } => *count,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn as_materialized(&self) -> Option<&SelectionVector> {
+        match self {
+            Self::Materialized(sel) => Some(sel),
+            Self::None | Self::Range { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn physical_index(&self, idx: usize) -> usize {
+        match self {
+            Self::None => idx,
+            Self::Materialized(sel) => sel.get(idx),
+            Self::Range { offset, .. } => offset + idx,
+        }
+    }
+
+    #[inline]
+    pub fn allocation_identity(&self) -> Option<usize> {
+        match self {
+            Self::Materialized(sel) => sel.allocation_identity(),
+            Self::None | Self::Range { .. } => None,
+        }
+    }
+
+    pub fn try_make_exclusive(&mut self) -> Result<()> {
+        if let Self::Materialized(sel) = self {
+            sel.try_make_exclusive()?;
+        }
+        Ok(())
+    }
+
+    pub fn collect_allocation_size(&self, allocations: &mut super::AllocationSet) -> usize {
+        match self {
+            Self::Materialized(sel) => sel.collect_allocation_size(allocations),
+            Self::None | Self::Range { .. } => 0,
+        }
+    }
+
+    pub fn collect_allocation_entries(&self, entries: &mut Vec<(usize, usize)>) {
+        if let Self::Materialized(sel) = self {
+            sel.collect_allocation_entries(entries);
+        }
+    }
+
+    pub fn try_materialize(&self, allocator: Arc<dyn Allocator>) -> Result<SelectionVector> {
+        match self {
+            Self::None => SelectionVector::try_incremental(0, allocator),
+            Self::Materialized(sel) => Ok(sel.clone()),
+            Self::Range { offset, count } => {
+                record_selection_materialization();
+                let mut selection = SelectionVector::try_with_capacity(*count, allocator)?;
+                selection.set_len(*count);
+                unsafe {
+                    let ptr = selection.buffer.data() as *mut u32;
+                    for i in 0..*count {
+                        *ptr.add(i) = (*offset + i) as u32;
+                    }
+                }
+                Ok(selection)
+            }
+        }
+    }
+
+    pub fn try_compose(&self, selection: VectorSelection) -> Result<VectorSelection> {
+        match (self, selection) {
+            (Self::None, selection) => Ok(selection),
+            (Self::Materialized(child), Self::Materialized(sel)) => {
+                Ok(Self::Materialized(child.try_slice(&sel, sel.len())?))
+            }
+            (Self::Materialized(child), Self::Range { offset, count }) => {
+                Ok(Self::Materialized(child.try_slice_range(offset, count)?))
+            }
+            (Self::Range { offset, .. }, Self::Materialized(sel)) => {
+                record_selection_materialization();
+                let mut result =
+                    SelectionVector::try_with_capacity(sel.len(), sel.allocator().clone())?;
+                result.set_len(sel.len());
+                unsafe {
+                    let dst = result.buffer.data() as *mut u32;
+                    for i in 0..sel.len() {
+                        *dst.add(i) = (offset + sel.get(i)) as u32;
+                    }
+                }
+                Ok(Self::Materialized(result))
+            }
+            (
+                Self::Range { offset, .. },
+                Self::Range {
+                    offset: child_offset,
+                    count,
+                },
+            ) => Ok(Self::Range {
+                offset: offset + child_offset,
+                count,
+            }),
+            (Self::Materialized(child), Self::None) => Ok(Self::Materialized(child.clone())),
+            (Self::Range { offset, count }, Self::None) => Ok(Self::Range {
+                offset: *offset,
+                count: *count,
+            }),
+        }
+    }
+}
+
+impl From<SelectionVector> for VectorSelection {
+    fn from(selection: SelectionVector) -> Self {
+        Self::Materialized(selection)
+    }
+}
+
+impl From<&SelectionVector> for VectorSelection {
+    fn from(selection: &SelectionVector) -> Self {
+        Self::Materialized(selection.clone())
     }
 }

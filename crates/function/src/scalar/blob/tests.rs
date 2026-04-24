@@ -9,7 +9,6 @@ mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     #[test]
     fn test_order_modifiers_parse() {
@@ -33,12 +32,12 @@ mod tests {
     #[test]
     fn test_sort_key_encode_integers() {
         // Create a chunk with integers
-        let mut vec = Vector::new(LogicalType::Integer);
+        let mut vec = paro_common::test_utils::test_vector(LogicalType::Integer);
         vec.set_i32(0, 1);
         vec.set_i32(1, 2);
         vec.set_i32(2, 3);
 
-        let chunk = Chunk::from_arc_vectors(vec![vec.into()]);
+        let chunk = paro_common::test_utils::test_chunk_from_arc_vectors(vec![vec.into()]);
 
         let modifiers = vec![OrderModifiers {
             ascending: true,
@@ -58,12 +57,12 @@ mod tests {
     #[test]
     fn test_sort_key_encode_integers_desc() {
         // Create a chunk with integers
-        let mut vec = Vector::new(LogicalType::Integer);
+        let mut vec = paro_common::test_utils::test_vector(LogicalType::Integer);
         vec.set_i32(0, 1);
         vec.set_i32(1, 2);
         vec.set_i32(2, 3);
 
-        let chunk = Chunk::from_arc_vectors(vec![vec.into()]);
+        let chunk = paro_common::test_utils::test_chunk_from_arc_vectors(vec![vec.into()]);
 
         let modifiers = vec![OrderModifiers {
             ascending: false, // Descending
@@ -83,12 +82,12 @@ mod tests {
     #[test]
     fn test_sort_key_encode_strings() {
         // Create a chunk with strings
-        let mut vec = Vector::new(LogicalType::Varchar);
+        let mut vec = paro_common::test_utils::test_vector(LogicalType::Varchar);
         vec.set_string(0, "apple");
         vec.set_string(1, "banana");
         vec.set_string(2, "cherry");
 
-        let chunk = Chunk::from_arc_vectors(vec![vec.into()]);
+        let chunk = paro_common::test_utils::test_chunk_from_arc_vectors(vec![vec.into()]);
 
         let modifiers = vec![OrderModifiers {
             ascending: true,
@@ -108,12 +107,12 @@ mod tests {
     #[test]
     fn test_sort_key_encode_nulls() {
         // Create a chunk with NULLs
-        let mut vec = Vector::new(LogicalType::Integer);
+        let mut vec = paro_common::test_utils::test_vector(LogicalType::Integer);
         vec.set_i32(0, 1);
         vec.set_null(1, true);
         vec.set_i32(2, 3);
 
-        let chunk = Chunk::from_arc_vectors(vec![vec.into()]);
+        let chunk = paro_common::test_utils::test_chunk_from_arc_vectors(vec![vec.into()]);
 
         // Test NULLS LAST
         let modifiers_last = vec![OrderModifiers {
@@ -147,17 +146,20 @@ mod tests {
     #[test]
     fn test_sort_key_encode_multi_column() {
         // Create a chunk with two columns
-        let mut vec1 = Vector::new(LogicalType::Integer);
+        let mut vec1 = paro_common::test_utils::test_vector(LogicalType::Integer);
         vec1.set_i32(0, 1);
         vec1.set_i32(1, 1);
         vec1.set_i32(2, 2);
 
-        let mut vec2 = Vector::new(LogicalType::Varchar);
+        let mut vec2 = paro_common::test_utils::test_vector(LogicalType::Varchar);
         vec2.set_string(0, "b");
         vec2.set_string(1, "a");
         vec2.set_string(2, "c");
 
-        let chunk = Chunk::from_arc_vectors(vec![vec1.into(), vec2.into()]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![vec1.into(), vec2.into()],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let modifiers = vec![
             OrderModifiers {
@@ -187,12 +189,12 @@ mod tests {
             precision: 6,
             scale: 2,
         };
-        let mut vec = Vector::new(decimal_type.clone());
+        let mut vec = paro_common::test_utils::test_vector(decimal_type.clone());
         vec.set_value(0, &Value::Decimal(-125, 6, 2));
         vec.set_value(1, &Value::Decimal(250, 6, 2));
         vec.set_value(2, &Value::Decimal(850, 6, 2));
 
-        let chunk = Chunk::from_arc_vectors(vec![vec.into()]);
+        let chunk = paro_common::test_utils::test_chunk_from_arc_vectors(vec![vec.into()]);
         let modifiers = vec![OrderModifiers {
             ascending: true,
             nulls_first: false,

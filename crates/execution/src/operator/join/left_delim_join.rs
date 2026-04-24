@@ -4,15 +4,17 @@
 //! Physical left delim join.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::AccountedHashSet;
 
 use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
-use crate::operator::join::delim_join::{DelimJoin, DelimKey};
+use crate::operator::join::delim_join::{
+    delim_materialized_memory_context, new_delim_seen_set, DelimJoin, DelimKey,
+};
 use crate::operator::scan::column_data_scan::MaterializedChunkCollection;
 use crate::operator::state::OperatorSinkFinalizeInput;
 use crate::operator::state::{
@@ -40,7 +42,7 @@ impl LeftDelimJoin {
 struct LeftDelimJoinGlobalSinkState {
     input_collection: Arc<MaterializedChunkCollection>,
     delim_collection: Arc<MaterializedChunkCollection>,
-    seen_keys: Mutex<HashSet<DelimKey>>,
+    seen_keys: Mutex<AccountedHashSet<DelimKey>>,
 }
 
 impl GlobalSinkState for LeftDelimJoinGlobalSinkState {
@@ -116,10 +118,15 @@ impl PhysicalOperator for LeftDelimJoin {
     }
 
     fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        let input_collection = Arc::new(MaterializedChunkCollection::new(
+        let memory = delim_materialized_memory_context(_ctx);
+        let input_collection = Arc::new(MaterializedChunkCollection::with_memory(
             self.base.input.types().to_vec(),
+            memory.clone(),
         ));
-        let delim_collection = Arc::new(MaterializedChunkCollection::new(self.base.delim_types()));
+        let delim_collection = Arc::new(MaterializedChunkCollection::with_memory(
+            self.base.delim_types(),
+            memory,
+        ));
 
         input_collection.reset()?;
         delim_collection.reset()?;
@@ -134,7 +141,7 @@ impl PhysicalOperator for LeftDelimJoin {
         Ok(Box::new(LeftDelimJoinGlobalSinkState {
             input_collection,
             delim_collection,
-            seen_keys: Mutex::new(HashSet::new()),
+            seen_keys: Mutex::new(new_delim_seen_set(_ctx)),
         }))
     }
 
@@ -171,7 +178,7 @@ impl PhysicalOperator for LeftDelimJoin {
 
         gstate
             .input_collection
-            .append(chunk.deep_copy_with_allocator(chunk.allocator().clone()))?;
+            .append(chunk.try_deep_copy(chunk.allocator().clone())?)?;
 
         let delim_chunk = self.base.evaluate_delim_chunk(
             ctx,
@@ -182,13 +189,13 @@ impl PhysicalOperator for LeftDelimJoin {
             .seen_keys
             .lock()
             .map_err(|e| paro_error::internal(format!("Failed to lock delim seen-key set: {e}")))?;
-        let unique_chunk = self.base.select_new_delim_rows(&delim_chunk, &mut seen);
+        let unique_chunk = self.base.select_new_delim_rows(&delim_chunk, &mut seen)?;
         drop(seen);
 
         if unique_chunk.size() > 0 {
             gstate
                 .delim_collection
-                .append(unique_chunk.deep_copy_with_allocator(unique_chunk.allocator().clone()))?;
+                .append(unique_chunk.try_deep_copy(unique_chunk.allocator().clone())?)?;
         }
 
         Ok(SinkResultType::NeedMoreInput)
@@ -260,7 +267,7 @@ mod tests {
     };
     use crate::operator::PhysicalOperator;
     use crate::thread_context::ThreadContext;
-    use paro_common::chunk::Chunk;
+
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
@@ -317,7 +324,8 @@ mod tests {
         let interrupt = InterruptState::default();
         let mut sink_input = OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
 
-        let mut input_chunk = Chunk::initialize(&[LogicalType::Integer], 3);
+        let mut input_chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
         input_chunk.set_cardinality(3);
         input_chunk
             .column_mut(0)
@@ -373,7 +381,7 @@ mod tests {
             .expect("local source");
         let mut source_input =
             OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 2);
+        let mut out = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
         let source_result = scan_op
             .get_data(&ctx, &mut out, &mut source_input)
             .expect("get data");
@@ -390,7 +398,8 @@ mod tests {
     #[test]
     fn materialized_chunk_collection_snapshot_clones_chunks() {
         let collection = MaterializedChunkCollection::new(vec![LogicalType::Integer]);
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 1);
         chunk.set_cardinality(1);
         chunk
             .column_mut(0)

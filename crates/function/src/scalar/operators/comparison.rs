@@ -113,8 +113,7 @@ where
     T: Copy + 'static,
     OP: BinaryOperator<T, T, bool>,
 {
-    BinaryExecutor::execute::<T, T, bool, OP>(&chunk.data[0], &chunk.data[1], result, chunk.size());
-    Ok(())
+    BinaryExecutor::execute::<T, T, bool, OP>(&chunk.data[0], &chunk.data[1], result, chunk.size())
 }
 
 fn add_comparison_signatures<OP: 'static>(set: &mut ScalarFunctionSet, name: &str)

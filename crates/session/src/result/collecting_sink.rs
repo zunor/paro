@@ -230,7 +230,7 @@ impl ResultSink for CollectingSink {
         if let Some(result) = self.results.last_mut() {
             result
                 .chunks
-                .push(chunk.deep_copy_with_allocator(chunk.allocator().clone()));
+                .push(chunk.try_deep_copy(chunk.allocator().clone())?);
         }
         Ok(())
     }

@@ -183,6 +183,7 @@ fn paro_logs_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoLogsGlobalState>());
@@ -224,35 +225,35 @@ fn paro_logs_function(
 
     if count > 0 {
         // Column 0: timestamp (BIGINT)
-        let ts_vec = Vector::from_i64(&timestamps);
+        let ts_vec = Vector::try_from_i64(&timestamps, output_allocator.clone())?;
         if let Some(col) = output.column_mut(0) {
             *col = ts_vec;
         }
 
         // Column 1: level (VARCHAR)
         let level_refs: Vec<&str> = levels.iter().map(|s| s.as_str()).collect();
-        let level_vec = Vector::from_strings(&level_refs);
+        let level_vec = Vector::try_from_strings(&level_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(1) {
             *col = level_vec;
         }
 
         // Column 2: target (VARCHAR)
         let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
-        let target_vec = Vector::from_strings(&target_refs);
+        let target_vec = Vector::try_from_strings(&target_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(2) {
             *col = target_vec;
         }
 
         // Column 3: message (VARCHAR)
         let message_refs: Vec<&str> = messages.iter().map(|s| s.as_str()).collect();
-        let message_vec = Vector::from_strings(&message_refs);
+        let message_vec = Vector::try_from_strings(&message_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(3) {
             *col = message_vec;
         }
 
         // Column 4: fields (VARCHAR)
         let fields_refs: Vec<&str> = fields_json.iter().map(|s| s.as_str()).collect();
-        let fields_vec = Vector::from_strings(&fields_refs);
+        let fields_vec = Vector::try_from_strings(&fields_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(4) {
             *col = fields_vec;
         }

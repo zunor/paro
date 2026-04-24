@@ -7,6 +7,7 @@
 
 use crate::scalar::executor::typed_loops::{execute_ternary_view, prepare_result};
 use crate::scalar::executor::TernaryOperator;
+use paro_common::error::Result;
 use paro_common::vector::{Vector, VectorType};
 
 pub struct TernaryExecutor;
@@ -20,7 +21,8 @@ impl TernaryExecutor {
         c_vec: &Vector,
         result: &mut Vector,
         count: usize,
-    ) where
+    ) -> Result<()>
+    where
         A: Copy + 'static,
         B: Copy + 'static,
         C: Copy + 'static,
@@ -28,17 +30,17 @@ impl TernaryExecutor {
         OP: TernaryOperator<A, B, C, RESULT>,
     {
         if count == 0 {
-            prepare_result(result, VectorType::Flat, 0);
-            return;
+            prepare_result(result, VectorType::Flat, 0)?;
+            return Ok(());
         }
 
         if a_vec.vector_type() == VectorType::Constant
             && b_vec.vector_type() == VectorType::Constant
             && c_vec.vector_type() == VectorType::Constant
         {
-            Self::execute_constant::<A, B, C, RESULT, OP>(a_vec, b_vec, c_vec, result, count);
+            Self::execute_constant::<A, B, C, RESULT, OP>(a_vec, b_vec, c_vec, result, count)
         } else {
-            Self::execute_view::<A, B, C, RESULT, OP>(a_vec, b_vec, c_vec, result, count);
+            Self::execute_view::<A, B, C, RESULT, OP>(a_vec, b_vec, c_vec, result, count)
         }
     }
 
@@ -48,14 +50,15 @@ impl TernaryExecutor {
         c_vec: &Vector,
         result: &mut Vector,
         count: usize,
-    ) where
+    ) -> Result<()>
+    where
         A: Copy + 'static,
         B: Copy + 'static,
         C: Copy + 'static,
         RESULT: Copy,
         OP: TernaryOperator<A, B, C, RESULT>,
     {
-        prepare_result(result, VectorType::Constant, count);
+        prepare_result(result, VectorType::Constant, count)?;
         if a_vec.validity().is_valid(0)
             && b_vec.validity().is_valid(0)
             && c_vec.validity().is_valid(0)
@@ -69,6 +72,7 @@ impl TernaryExecutor {
         } else {
             result.validity_mut().set_null(0);
         }
+        Ok(())
     }
 
     fn execute_view<A, B, C, RESULT, OP>(
@@ -77,14 +81,15 @@ impl TernaryExecutor {
         c: &Vector,
         result: &mut Vector,
         count: usize,
-    ) where
+    ) -> Result<()>
+    where
         A: Copy + 'static,
         B: Copy + 'static,
         C: Copy + 'static,
         RESULT: Copy,
         OP: TernaryOperator<A, B, C, RESULT>,
     {
-        execute_ternary_view::<A, B, C, RESULT, OP>(a, b, c, result, count);
+        execute_ternary_view::<A, B, C, RESULT, OP>(a, b, c, result, count)
     }
 }
 
@@ -104,10 +109,27 @@ mod tests {
 
     #[test]
     fn test_execute_mixed_constant_dictionary() {
-        let values = Vector::dictionary(Arc::new(Vector::from_i64(&[5, 15, 25])), vec![0, 2, 1]);
-        let low = Vector::constant(LogicalType::BigInt, 10_i64, 3);
-        let high = Vector::constant(LogicalType::BigInt, 20_i64, 3);
-        let mut result = Vector::with_capacity(LogicalType::Boolean, 3);
+        let values = paro_common::test_utils::test_dictionary(
+            Arc::new(paro_common::test_utils::test_i64_vector_with_allocator(
+                &[5, 15, 25],
+                paro_common::test_utils::test_allocator(),
+            )),
+            vec![0, 2, 1],
+        );
+        let low = paro_common::test_utils::test_constant_with_allocator(
+            LogicalType::BigInt,
+            10_i64,
+            3,
+            paro_common::test_utils::test_allocator(),
+        );
+        let high = paro_common::test_utils::test_constant_with_allocator(
+            LogicalType::BigInt,
+            20_i64,
+            3,
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, 3);
 
         TernaryExecutor::execute::<i64, i64, i64, bool, BetweenOp>(
             &values,
@@ -115,7 +137,8 @@ mod tests {
             &high,
             &mut result,
             3,
-        );
+        )
+        .expect("ternary executor should succeed");
 
         assert_eq!(result.vector_type(), VectorType::Flat);
         assert_eq!(result.get_bool(0), Some(false));
@@ -125,10 +148,24 @@ mod tests {
 
     #[test]
     fn test_execute_sequence_fallback() {
-        let values = Vector::sequence(5, 5, 4);
-        let low = Vector::from_i64(&[0, 8, 10, 18]);
-        let high = Vector::constant(LogicalType::BigInt, 15_i64, 4);
-        let mut result = Vector::with_capacity(LogicalType::Boolean, 4);
+        let values = paro_common::test_utils::test_sequence_with_allocator(
+            5,
+            5,
+            4,
+            paro_common::test_utils::test_allocator(),
+        );
+        let low = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[0, 8, 10, 18],
+            paro_common::test_utils::test_allocator(),
+        );
+        let high = paro_common::test_utils::test_constant_with_allocator(
+            LogicalType::BigInt,
+            15_i64,
+            4,
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, 4);
 
         TernaryExecutor::execute::<i64, i64, i64, bool, BetweenOp>(
             &values,
@@ -136,7 +173,8 @@ mod tests {
             &high,
             &mut result,
             4,
-        );
+        )
+        .expect("ternary executor should succeed");
 
         assert_eq!(result.get_bool(0), Some(true));
         assert_eq!(result.get_bool(1), Some(true));

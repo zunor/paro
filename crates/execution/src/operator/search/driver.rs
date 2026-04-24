@@ -161,7 +161,7 @@ pub(crate) fn search_get_data(
             Ok(SourceResultType::HaveMoreOutput)
         }
         None => {
-            *chunk = Chunk::init_empty(output_types);
+            *chunk = Chunk::try_init_empty(output_types, chunk.allocator().clone())?;
             Ok(SourceResultType::Finished)
         }
     }

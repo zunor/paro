@@ -100,6 +100,7 @@ fn init_global(
 }
 
 fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let Some(state) = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoPgSettingsGlobalState>())
@@ -128,28 +129,28 @@ fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableF
     let contexts: Vec<&str> = slice.iter().map(|row| row.context.as_str()).collect();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&names);
+        *col = Vector::try_from_strings(&names, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_strings(&settings);
+        *col = Vector::try_from_strings(&settings, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_nullable_strings(&units);
+        *col = Vector::try_from_nullable_strings(&units, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
-        *col = Vector::from_strings(&categories);
+        *col = Vector::try_from_strings(&categories, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(4) {
-        *col = Vector::from_nullable_strings(&short_descs);
+        *col = Vector::try_from_nullable_strings(&short_descs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(5) {
-        *col = Vector::from_strings(&sources);
+        *col = Vector::try_from_strings(&sources, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(6) {
-        *col = Vector::from_strings(&vartypes);
+        *col = Vector::try_from_strings(&vartypes, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(7) {
-        *col = Vector::from_strings(&contexts);
+        *col = Vector::try_from_strings(&contexts, output_allocator.clone())?;
     }
 
     output.set_cardinality(batch_size);

@@ -330,8 +330,10 @@ impl PhysicalOperator for PhysicalGraphScan {
         }
         let end = std::cmp::min(start.saturating_add(GRAPH_SCAN_BATCH), num_vertices);
         let batch_size = (end - start) as usize;
-        let mut local_ids = Vector::with_capacity(LogicalType::UBigInt, batch_size);
-        let mut rowids = Vector::with_capacity(LogicalType::UBigInt, batch_size);
+        let mut local_ids =
+            Vector::try_new(LogicalType::UBigInt, batch_size, chunk.allocator().clone())?;
+        let mut rowids =
+            Vector::try_new(LogicalType::UBigInt, batch_size, chunk.allocator().clone())?;
         local_ids.set_len(batch_size);
         rowids.set_len(batch_size);
 
@@ -346,7 +348,10 @@ impl PhysicalOperator for PhysicalGraphScan {
             state.finished = true;
         }
 
-        *chunk = Chunk::from_arc_vectors(vec![Arc::new(local_ids), Arc::new(rowids)]);
+        *chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(local_ids), Arc::new(rowids)],
+            chunk.allocator().clone(),
+        );
         chunk.set_cardinality(batch_size);
 
         if state.finished {
@@ -394,8 +399,8 @@ impl PhysicalGraphScan {
             ))
         })?;
 
-        let mut local_ids = Vector::with_capacity(LogicalType::UBigInt, 2048);
-        let mut rowids = Vector::with_capacity(LogicalType::UBigInt, 2048);
+        let mut local_ids = Vector::try_new(LogicalType::UBigInt, 2048, chunk.allocator().clone())?;
+        let mut rowids = Vector::try_new(LogicalType::UBigInt, 2048, chunk.allocator().clone())?;
         local_ids.set_len(2048);
         rowids.set_len(2048);
         let mut out_row = 0usize;
@@ -415,7 +420,11 @@ impl PhysicalGraphScan {
                     // Evaluate filter on this chunk
                     let mut filter_executor =
                         ExpressionExecutor::with_expressions(&scan_state.filter_exprs);
-                    let mut filter_result = Chunk::initialize(&[LogicalType::Boolean], scan_size);
+                    let mut filter_result = Chunk::try_initialize(
+                        &[LogicalType::Boolean],
+                        scan_size,
+                        scan_chunk.allocator().clone(),
+                    )?;
                     filter_executor.execute_all_into(&scan_chunk, ctx, &mut filter_result)?;
                     let bool_col = filter_result.column(0).ok_or_else(|| {
                         paro_error::internal("Missing boolean column from filter evaluation")
@@ -472,7 +481,10 @@ impl PhysicalGraphScan {
 
         local_ids.set_len(out_row);
         rowids.set_len(out_row);
-        *chunk = Chunk::from_arc_vectors(vec![Arc::new(local_ids), Arc::new(rowids)]);
+        *chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(local_ids), Arc::new(rowids)],
+            chunk.allocator().clone(),
+        );
         chunk.set_cardinality(out_row);
 
         if state.finished {

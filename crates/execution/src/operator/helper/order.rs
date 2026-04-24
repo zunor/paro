@@ -200,6 +200,7 @@ impl Order {
             spilled: Some(sort_sink_state.is_external()),
             peak_memory_bytes: Some(sort_sink_state.peak_reservation() as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 }

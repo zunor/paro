@@ -5,14 +5,16 @@ use std::mem::size_of;
 use std::ptr;
 use std::sync::Arc;
 
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant, MemoryReleaseHandle,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_storage::buffer::{
-    BufferPool, BufferPoolReservation, MemoryTag, DEFAULT_BLOCK_ALLOC_SIZE,
-};
+use paro_storage::buffer::{BufferPool, MemoryTag, DEFAULT_BLOCK_ALLOC_SIZE};
 use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::{RowLayout, RowValidityType};
 
@@ -176,13 +178,14 @@ impl BuildRowLayout {
 /// The varlen / nested heap owners stored alongside the slab intentionally share the same
 /// lifetime so callers must not retain row pointers after the owning `HashBuildStore` drops.
 struct BuildBlock {
-    data: Box<[u8]>,
+    data: paro_common::memory::GrantBuffer,
+    memory: MemoryAccountingContext,
     row_width: usize,
     row_count: usize,
     max_rows: usize,
     heap_bytes: usize,
     used_bytes: usize,
-    reservation: BufferPoolReservation,
+    heap_releases: Vec<MemoryReleaseHandle>,
     owned_bytes: Vec<Box<[u8]>>,
     // These boxed values back row pointers written into the slab, so their
     // allocation addresses must remain stable even if the Vec grows.
@@ -191,21 +194,26 @@ struct BuildBlock {
 }
 
 impl BuildBlock {
-    fn new(pool: &Arc<BufferPool>, tag: MemoryTag, max_rows: usize, row_width: usize) -> Self {
+    fn new(
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        max_rows: usize,
+        row_width: usize,
+    ) -> Result<Self> {
         let allocated_bytes = max_rows.saturating_mul(row_width);
-        let mut reservation = BufferPoolReservation::new(tag, pool);
-        reservation.resize(allocated_bytes);
-        Self {
-            data: vec![0u8; allocated_bytes].into_boxed_slice(),
+        let data = memory.allocate_zeroed_buffer(allocator, allocated_bytes)?;
+        Ok(Self {
+            data,
+            memory,
             row_width,
             row_count: 0,
             max_rows,
             heap_bytes: 0,
             used_bytes: 0,
-            reservation,
+            heap_releases: Vec::new(),
             owned_bytes: Vec::new(),
             owned_values: Vec::new(),
-        }
+        })
     }
 
     fn can_accept(&self) -> bool {
@@ -225,10 +233,15 @@ impl BuildBlock {
     #[inline]
     fn row_ptr_mut(&mut self, row_idx: usize) -> *mut u8 {
         debug_assert!(row_idx < self.max_rows);
-        unsafe { self.data.as_mut_ptr().add(row_idx * self.row_width) }
+        unsafe { self.data.as_ptr().add(row_idx * self.row_width) }
     }
 
-    fn append_row<F>(&mut self, layout: &BuildRowLayout, write_row: F) -> Result<*mut u8>
+    fn append_row<F>(
+        &mut self,
+        layout: &BuildRowLayout,
+        estimated_heap_bytes: usize,
+        write_row: F,
+    ) -> Result<*mut u8>
     where
         F: FnOnce(*mut u8, &mut Vec<Box<[u8]>>, &mut Vec<Box<Value>>, &mut usize) -> Result<()>,
     {
@@ -252,12 +265,24 @@ impl BuildBlock {
         }
 
         let mut row_used_bytes = self.row_width;
-        write_row(
+        let heap_release = if estimated_heap_bytes == 0 {
+            None
+        } else {
+            Some(self.memory.retain(estimated_heap_bytes)?)
+        };
+
+        let write_result = write_row(
             row_ptr,
             &mut self.owned_bytes,
             &mut self.owned_values,
             &mut row_used_bytes,
-        )?;
+        );
+        if let Err(err) = write_result {
+            if let Some(release) = heap_release {
+                release.release();
+            }
+            return Err(err);
+        }
 
         if let Some(heap_size_offset) = layout.base().heap_size_offset() {
             let heap_used = row_used_bytes.saturating_sub(self.row_width) as u64;
@@ -266,12 +291,31 @@ impl BuildBlock {
             }
         }
 
-        self.row_count += 1;
         let row_heap_bytes = row_used_bytes.saturating_sub(self.row_width);
+        match heap_release {
+            Some(release) if row_heap_bytes == estimated_heap_bytes => {
+                self.heap_releases.push(release);
+            }
+            Some(release) if row_heap_bytes == 0 => {
+                release.release();
+            }
+            Some(release) if row_heap_bytes < estimated_heap_bytes => {
+                release.release();
+                self.heap_releases.push(self.memory.retain(row_heap_bytes)?);
+            }
+            Some(release) => {
+                self.heap_releases.push(release);
+                self.heap_releases
+                    .push(self.memory.retain(row_heap_bytes - estimated_heap_bytes)?);
+            }
+            None if row_heap_bytes > 0 => {
+                self.heap_releases.push(self.memory.retain(row_heap_bytes)?);
+            }
+            None => {}
+        }
+        self.row_count += 1;
         self.heap_bytes = self.heap_bytes.saturating_add(row_heap_bytes);
         self.used_bytes = self.used_bytes.saturating_add(row_used_bytes);
-        self.reservation
-            .resize(self.data.len().saturating_add(self.heap_bytes));
         Ok(row_ptr)
     }
 }
@@ -288,8 +332,9 @@ impl std::fmt::Debug for BuildBlock {
 
 impl Drop for BuildBlock {
     fn drop(&mut self) {
-        self.reservation.resize(0);
-        let _ = self.reservation.take();
+        for release in &self.heap_releases {
+            release.release();
+        }
     }
 }
 
@@ -299,22 +344,59 @@ pub struct BuildStoreScanState {
     row_idx: usize,
 }
 
-#[derive(Debug)]
 pub struct HashBuildStore {
     layout: BuildRowLayout,
     buffer_pool: Arc<BufferPool>,
+    allocator: Arc<dyn Allocator>,
     tag: MemoryTag,
-    blocks: Vec<BuildBlock>,
+    memory: MemoryAccountingContext,
+    blocks: AccountedVec<BuildBlock>,
     count: u32,
 }
 
+impl std::fmt::Debug for HashBuildStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashBuildStore")
+            .field("layout", &self.layout)
+            .field("buffer_pool", &self.buffer_pool)
+            .field("allocator", &self.allocator.name())
+            .field("tag", &self.tag)
+            .field("memory", &self.memory)
+            .field("blocks", &self.blocks)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 impl HashBuildStore {
-    pub fn new(buffer_pool: Arc<BufferPool>, layout: BuildRowLayout, tag: MemoryTag) -> Self {
+    pub fn new(
+        buffer_pool: Arc<BufferPool>,
+        allocator: Arc<dyn Allocator>,
+        layout: BuildRowLayout,
+        tag: MemoryTag,
+    ) -> Self {
+        let memory =
+            MemoryAccountingContext::detached(tag, MemoryAccountingClass::default_for_tag(tag));
+        Self::new_with_memory(buffer_pool, allocator, layout, tag, memory)
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        allocator: Arc<dyn Allocator>,
+        layout: BuildRowLayout,
+        tag: MemoryTag,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        let block_metadata_memory = memory.with_class(MemoryAccountingClass::Metadata);
+        let blocks =
+            accounted_vec_for_context(&block_metadata_memory, tag, MemoryAccountingClass::Metadata);
         Self {
             layout,
             buffer_pool,
+            allocator,
             tag,
-            blocks: Vec::new(),
+            memory,
+            blocks,
             count: 0,
         }
     }
@@ -351,7 +433,10 @@ impl HashBuildStore {
         }
 
         self.count = self.count.saturating_add(other.count);
-        self.blocks.extend(other.blocks);
+        let mut other_blocks = other.blocks;
+        for block in other_blocks.drain() {
+            self.blocks.try_push(block)?;
+        }
         Ok(())
     }
 
@@ -392,43 +477,48 @@ impl HashBuildStore {
 
         let layout = self.layout.clone();
         for row_idx in 0..chunk.size() {
-            let block = self.ensure_current_block();
-            block.append_row(&layout, |row_ptr, owned_bytes, owned_values, used_bytes| {
-                for (col_idx, column) in base_columns.iter().enumerate() {
-                    unsafe {
-                        unsafe_api::write_vector_value(
-                            layout.base(),
-                            row_ptr,
-                            col_idx,
-                            column.as_ref(),
-                            row_idx,
-                            owned_bytes,
-                            owned_values,
-                            used_bytes,
-                        )
-                    }?;
-                }
+            let estimated_heap_bytes = estimate_row_heap_bytes(&layout, &base_columns, row_idx);
+            let block = self.ensure_current_block()?;
+            block.append_row(
+                &layout,
+                estimated_heap_bytes,
+                |row_ptr, owned_bytes, owned_values, used_bytes| {
+                    for (col_idx, column) in base_columns.iter().enumerate() {
+                        unsafe {
+                            unsafe_api::write_vector_value(
+                                layout.base(),
+                                row_ptr,
+                                col_idx,
+                                column.as_ref(),
+                                row_idx,
+                                owned_bytes,
+                                owned_values,
+                                used_bytes,
+                            )
+                        }?;
+                    }
 
-                let hash = hash_vector.get_u64(row_idx).ok_or_else(|| {
-                    paro_error::internal("HashBuildStore hash must not be NULL".to_string())
-                })?;
-                layout.set_hash(row_ptr, hash);
-                layout.set_next(row_ptr, ptr::null());
+                    let hash = hash_vector.get_u64(row_idx).ok_or_else(|| {
+                        paro_error::internal("HashBuildStore hash must not be NULL".to_string())
+                    })?;
+                    layout.set_hash(row_ptr, hash);
+                    layout.set_next(row_ptr, ptr::null());
 
-                let found = found_vector
-                    .as_ref()
-                    .and_then(|vector| vector.get_bool(row_idx))
-                    .unwrap_or(false);
-                layout.set_found(row_ptr, found);
-                Ok(())
-            })?;
+                    let found = found_vector
+                        .as_ref()
+                        .and_then(|vector| vector.get_bool(row_idx))
+                        .unwrap_or(false);
+                    layout.set_found(row_ptr, found);
+                    Ok(())
+                },
+            )?;
             appended += 1;
         }
         self.count = self.count.saturating_add(appended as u32);
         Ok(appended)
     }
 
-    fn ensure_current_block(&mut self) -> &mut BuildBlock {
+    fn ensure_current_block(&mut self) -> Result<&mut BuildBlock> {
         if self
             .blocks
             .last()
@@ -437,20 +527,21 @@ impl HashBuildStore {
         {
             let rows_per_block =
                 (DEFAULT_BLOCK_ALLOC_SIZE / self.layout.build_row_width().max(1)).max(1);
-            self.blocks.push(BuildBlock::new(
-                &self.buffer_pool,
-                self.tag,
+            let block = BuildBlock::new(
+                self.allocator.clone(),
+                self.memory.clone(),
                 rows_per_block,
                 self.layout.build_row_width(),
-            ));
+            )?;
+            self.blocks.try_push(block)?;
         }
-        self.blocks.last_mut().expect("build block must exist")
+        Ok(self.blocks.last_mut().expect("build block must exist"))
     }
 
     pub fn build_pointer_chains(&mut self, entries: &mut [HtEntry], bitmask: usize) -> bool {
         let mut has_long_chains = false;
 
-        for block in &mut self.blocks {
+        for block in self.blocks.iter_mut() {
             for row_idx in 0..block.row_count() {
                 let row_ptr = block.row_ptr_mut(row_idx);
                 let hash = self.layout.hash(row_ptr);
@@ -487,7 +578,7 @@ impl HashBuildStore {
         output: &mut Chunk,
     ) -> Result<usize> {
         ensure_chunk(output, self.layout.spill_types(), VECTOR_SIZE)?;
-        output.reset();
+        output.try_reset(output.allocator().clone())?;
 
         let mut scanned = 0usize;
         while state.block_idx < self.blocks.len() && scanned < VECTOR_SIZE {
@@ -513,16 +604,21 @@ impl HashBuildStore {
     where
         F: FnMut(&Chunk) -> Result<()>,
     {
-        let layout = self.layout;
-        let mut chunk = Chunk::new();
-        for block in self.blocks {
+        let HashBuildStore {
+            layout,
+            allocator,
+            mut blocks,
+            ..
+        } = self;
+        let mut chunk = Chunk::try_new(allocator.clone())?;
+        for block in blocks.drain() {
             let row_count = block.row_count();
             if row_count == 0 {
                 continue;
             }
 
             ensure_chunk(&mut chunk, layout.spill_types(), row_count)?;
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
             for scanned in 0..row_count {
                 Self::write_spill_row(&layout, block.row_ptr(scanned), &mut chunk, scanned);
             }
@@ -540,7 +636,7 @@ impl HashBuildStore {
         output: &mut Chunk,
     ) -> Result<usize> {
         ensure_chunk(output, build_types, VECTOR_SIZE)?;
-        output.reset();
+        output.try_reset(output.allocator().clone())?;
 
         let mut scanned = 0usize;
         while state.block_idx < self.blocks.len() && scanned < VECTOR_SIZE {
@@ -614,18 +710,83 @@ fn ensure_chunk(output: &mut Chunk, types: &[LogicalType], capacity: usize) -> R
         || output.types() != types
         || output.capacity() < capacity
     {
-        *output = Chunk::initialize(types, capacity);
+        *output = Chunk::try_initialize(types, capacity, output.allocator().clone())?;
     } else {
-        output.reset();
+        output.try_reset(output.allocator().clone())?;
     }
     Ok(())
+}
+
+fn accounted_vec_for_context<T>(
+    memory: &MemoryAccountingContext,
+    tag: MemoryTag,
+    class: MemoryAccountingClass,
+) -> AccountedVec<T> {
+    let grant = if let Some(owner) = memory.owner() {
+        MemoryGrant::new(0, memory.domain(), owner)
+            .expect("zero-byte metadata grant should not fail")
+    } else {
+        MemoryGrant::detached(usize::MAX / 4, memory.domain())
+    };
+    AccountedVec::new_with_accounting(grant, tag, class)
+}
+
+fn estimate_row_heap_bytes(
+    layout: &BuildRowLayout,
+    columns: &[&Arc<paro_common::vector::Vector>],
+    row_idx: usize,
+) -> usize {
+    layout
+        .base()
+        .types()
+        .iter()
+        .enumerate()
+        .map(|(col_idx, logical_type)| {
+            if columns[col_idx].is_null(row_idx) {
+                return 0;
+            }
+            let value = columns[col_idx].get_value(row_idx);
+            estimate_value_heap_bytes(logical_type, &value)
+        })
+        .sum()
+}
+
+fn estimate_value_heap_bytes(logical_type: &LogicalType, value: &Value) -> usize {
+    match (logical_type, value) {
+        (
+            LogicalType::Varchar
+            | LogicalType::VarcharCollation(_)
+            | LogicalType::TsVector
+            | LogicalType::TsQuery
+            | LogicalType::Json
+            | LogicalType::Jsonb
+            | LogicalType::StringLiteral,
+            Value::Varchar(value),
+        ) => {
+            if value.len() > 12 {
+                value.len()
+            } else {
+                0
+            }
+        }
+        (LogicalType::Blob, Value::Blob(value)) => {
+            if value.len() > 12 {
+                value.len()
+            } else {
+                0
+            }
+        }
+        (LogicalType::List(_) | LogicalType::Array(_, _) | LogicalType::Struct(_), value) => {
+            std::mem::size_of::<Value>().saturating_add(value.allocation_size())
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
-    use paro_common::vector::Vector;
 
     fn create_test_store(
         equality_types: Vec<LogicalType>,
@@ -634,6 +795,7 @@ mod tests {
     ) -> HashBuildStore {
         HashBuildStore::new(
             Arc::new(BufferPool::new(32 * 1024 * 1024)),
+            paro_common::test_utils::test_allocator(),
             BuildRowLayout::new(equality_types, build_types, has_found_flag),
             MemoryTag::HashTable,
         )
@@ -641,26 +803,28 @@ mod tests {
 
     #[test]
     fn stores_rows_contiguously_with_fixed_stride() {
-        let mut keys = Vector::new(LogicalType::Integer);
+        let mut keys = paro_common::test_utils::test_vector(LogicalType::Integer);
         keys.set_i32(0, 1);
         keys.set_i32(1, 2);
         keys.set_i32(2, 3);
         keys.set_count(3);
 
-        let mut payload = Vector::new(LogicalType::Integer);
+        let mut payload = paro_common::test_utils::test_vector(LogicalType::Integer);
         payload.set_i32(0, 10);
         payload.set_i32(1, 20);
         payload.set_i32(2, 30);
         payload.set_count(3);
 
-        let mut hashes = Vector::new(LogicalType::UBigInt);
+        let mut hashes = paro_common::test_utils::test_vector(LogicalType::UBigInt);
         hashes.set_u64(0, 101);
         hashes.set_u64(1, 202);
         hashes.set_u64(2, 303);
         hashes.set_count(3);
 
-        let chunk =
-            Chunk::from_arc_vectors(vec![Arc::new(keys), Arc::new(payload), Arc::new(hashes)]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(keys), Arc::new(payload), Arc::new(hashes)],
+            paro_common::test_utils::test_allocator(),
+        );
         let mut store = create_test_store(
             vec![LogicalType::Integer],
             vec![LogicalType::Integer],
@@ -676,32 +840,35 @@ mod tests {
 
     #[test]
     fn varlen_spill_scan_round_trips_without_boxing_values() {
-        let mut keys = Vector::new(LogicalType::Integer);
+        let mut keys = paro_common::test_utils::test_vector(LogicalType::Integer);
         keys.set_i32(0, 1);
         keys.set_i32(1, 2);
         keys.set_count(2);
 
-        let mut payload = Vector::new(LogicalType::Varchar);
+        let mut payload = paro_common::test_utils::test_vector(LogicalType::Varchar);
         payload.set_string(0, "this string is long enough to spill");
         payload.set_string(1, "short");
         payload.set_count(2);
 
-        let mut found = Vector::new(LogicalType::Boolean);
+        let mut found = paro_common::test_utils::test_vector(LogicalType::Boolean);
         found.set_bool(0, true);
         found.set_bool(1, false);
         found.set_count(2);
 
-        let mut hashes = Vector::new(LogicalType::UBigInt);
+        let mut hashes = paro_common::test_utils::test_vector(LogicalType::UBigInt);
         hashes.set_u64(0, 501);
         hashes.set_u64(1, 502);
         hashes.set_count(2);
 
-        let chunk = Chunk::from_arc_vectors(vec![
-            Arc::new(keys),
-            Arc::new(payload),
-            Arc::new(found),
-            Arc::new(hashes),
-        ]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![
+                Arc::new(keys),
+                Arc::new(payload),
+                Arc::new(found),
+                Arc::new(hashes),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         let mut store =
             create_test_store(vec![LogicalType::Integer], vec![LogicalType::Varchar], true);
         store.append_chunk(&chunk).unwrap();
@@ -720,7 +887,8 @@ mod tests {
         );
 
         let mut scan_state = BuildStoreScanState::default();
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let scanned = store
             .scan_spill_chunk(&mut scan_state, &mut output)
             .unwrap();

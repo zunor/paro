@@ -25,14 +25,13 @@ use crate::table::storage_descriptor::TableStorageDescriptor;
 use crate::table::table_factory::{stable_data_dir, TableFactory};
 use crate::tablet::tablet_reader::TabletReaderParams;
 use crate::tablet::{KeysType, TabletColumn, TabletSchema};
+use crate::test_utils::*;
 use crate::transaction::txn::Transaction;
 use crate::wal::wal_entry::WalEntry;
 use crate::wal::wal_reader::WalReader;
-use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_journal::segments::SegmentCatalogStore;
 use serde_json::json;
 use std::collections::HashMap;
@@ -430,7 +429,7 @@ impl SearchCursorTestExt for TableHandle {
 fn chunk_with_i32_range(start: i32, end: i32, offset: i32) -> Chunk {
     let ids: Vec<i32> = (start..end).collect();
     let values: Vec<i32> = ids.iter().map(|id| *id + offset).collect();
-    Chunk::from_vectors(vec![Vector::from_i32(&ids), Vector::from_i32(&values)])
+    test_chunk_from_vectors(vec![test_i32_vector(&ids), test_i32_vector(&values)])
 }
 
 fn build_duplicate_key_compaction_output(
@@ -450,7 +449,7 @@ fn build_duplicate_key_compaction_output(
         table.tablet().as_ref(),
         Arc::new(plan.clone()),
         workspace,
-        Arc::new(default_allocator()),
+        test_allocator(),
     )
     .unwrap()
     .expect("compaction output rowset");
@@ -518,9 +517,9 @@ fn create_hnsw_table_with_note(dim: usize) -> TableHandle {
 
 fn chunk_with_embeddings(ids: &[i32], embeddings: &[Vec<f32>], dim: usize) -> Chunk {
     assert_eq!(ids.len(), embeddings.len());
-    Chunk::from_vectors(vec![
-        Vector::from_i32(ids),
-        Vector::from_embeddings(embeddings, dim),
+    test_chunk_from_vectors(vec![
+        test_i32_vector(ids),
+        test_embedding_vector(embeddings, dim),
     ])
 }
 
@@ -533,7 +532,7 @@ fn chunk_with_embeddings_and_notes(
     assert_eq!(ids.len(), embeddings.len());
     assert_eq!(ids.len(), notes.len());
 
-    let mut note_vec = Vector::with_capacity(LogicalType::Varchar, notes.len());
+    let mut note_vec = test_vector_with_capacity(LogicalType::Varchar, notes.len());
     note_vec.set_count(notes.len());
     for (idx, note) in notes.iter().enumerate() {
         match note {
@@ -542,9 +541,9 @@ fn chunk_with_embeddings_and_notes(
         }
     }
 
-    Chunk::from_vectors(vec![
-        Vector::from_i32(ids),
-        Vector::from_embeddings(embeddings, dim),
+    test_chunk_from_vectors(vec![
+        test_i32_vector(ids),
+        test_embedding_vector(embeddings, dim),
         note_vec,
     ])
 }
@@ -554,14 +553,14 @@ fn append_and_scan_roundtrip() {
     let types = vec![LogicalType::Integer];
     let table = create_table(&types);
 
-    let vec = Vector::from_i32(&[1, 2, 3]);
-    let chunk = Chunk::from_vectors(vec![vec]);
+    let vec = test_i32_vector(&[1, 2, 3]);
+    let chunk = test_chunk_from_vectors(vec![vec]);
 
     table.append(&chunk).unwrap();
     assert_eq!(table.total_rows(), 3);
     assert_eq!(table.rowset_count(), 1);
 
-    let mut out = Chunk::new();
+    let mut out = test_empty_data_chunk();
     table.scan_legacy(&mut out).unwrap();
     assert_eq!(out.size(), 3);
 }
@@ -626,9 +625,9 @@ fn primary_key_append_and_delete() {
     let table = create_table_with_keys(&types, KeysType::PrimaryKeys);
 
     // Build chunk: key=id, value=v
-    let keys = Vector::from_i32(&[1, 2, 2]); // duplicate key 2
-    let vals = Vector::from_i32(&[10, 20, 30]);
-    let chunk = Chunk::from_vectors(vec![keys, vals]);
+    let keys = test_i32_vector(&[1, 2, 2]); // duplicate key 2
+    let vals = test_i32_vector(&[10, 20, 30]);
+    let chunk = test_chunk_from_vectors(vec![keys, vals]);
 
     table.append(&chunk).unwrap();
 
@@ -643,7 +642,7 @@ fn primary_key_append_and_delete() {
     );
 
     // Delete key 2
-    let del_keys = Chunk::from_vectors(vec![Vector::from_i32(&[2])]);
+    let del_keys = test_chunk_from_vectors(vec![test_i32_vector(&[2])]);
     let removed = table.delete_by_primary_keys(&del_keys, None).unwrap();
     assert_eq!(removed, 1);
     assert_eq!(
@@ -659,7 +658,7 @@ fn primary_key_append_and_delete() {
 #[test]
 fn row_id_delete_writes_delvec_and_wal() {
     let table = create_table(&[LogicalType::Integer]);
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+    let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]);
     table.append(&chunk).unwrap();
 
     let mut reader = table
@@ -734,7 +733,7 @@ fn primary_key_update_changes_key_and_row_values() {
         &[LogicalType::Integer, LogicalType::Integer],
         KeysType::PrimaryKeys,
     );
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), Vector::from_i32(&[10, 20])]);
+    let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]);
     table.append(&chunk).unwrap();
 
     let mut reader = table
@@ -777,8 +776,8 @@ fn primary_key_update_changes_key_and_row_values() {
 
     let schema = table.tablet().schema().unwrap();
     let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
-    let old_key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1])]);
-    let new_key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[3])]);
+    let old_key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1])]);
+    let new_key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[3])]);
     let old_key = serializer.encode_row(&old_key_chunk, 0).unwrap();
     let new_key = serializer.encode_row(&new_key_chunk, 0).unwrap();
     assert!(table
@@ -796,7 +795,7 @@ fn primary_key_update_changes_key_and_row_values() {
 #[test]
 fn duplicate_key_update_rewrites_row_by_row_id() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), Vector::from_i32(&[10, 20])]);
+    let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]);
     table.append(&chunk).unwrap();
 
     let mut reader = table
@@ -840,18 +839,15 @@ fn insert_on_conflict_do_nothing_keeps_existing_primary_key_rows() {
         KeysType::PrimaryKeys,
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
         ]))
         .unwrap();
 
     let affected = table
         .insert_on_conflict(
-            &Chunk::from_vectors(vec![
-                Vector::from_i32(&[2, 3]),
-                Vector::from_i32(&[200, 30]),
-            ]),
+            &test_chunk_from_vectors(vec![test_i32_vector(&[2, 3]), test_i32_vector(&[200, 30])]),
             &InsertOnConflictAction::DoNothing,
             None,
         )
@@ -875,19 +871,19 @@ fn insert_on_conflict_do_update_writes_partial_rowset_for_non_key_columns() {
         KeysType::PrimaryKeys,
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
-            Vector::from_i32(&[100, 200]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
+            test_i32_vector(&[100, 200]),
         ]))
         .unwrap();
 
     let affected = table
         .insert_on_conflict(
-            &Chunk::from_vectors(vec![
-                Vector::from_i32(&[2, 3]),
-                Vector::from_i32(&[999, 30]),
-                Vector::from_i32(&[222, 300]),
+            &test_chunk_from_vectors(vec![
+                test_i32_vector(&[2, 3]),
+                test_i32_vector(&[999, 30]),
+                test_i32_vector(&[222, 300]),
             ]),
             &InsertOnConflictAction::DoUpdate {
                 target_columns: vec![2],
@@ -933,10 +929,10 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
         KeysType::PrimaryKeys,
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
-            Vector::from_i32(&[100, 200]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
+            test_i32_vector(&[100, 200]),
         ]))
         .unwrap();
 
@@ -971,10 +967,10 @@ fn pk_compaction_materializes_partial_update_chains_into_full_rows() {
         KeysType::PrimaryKeys,
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
-            Vector::from_i32(&[100, 200]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
+            test_i32_vector(&[100, 200]),
         ]))
         .unwrap();
 
@@ -996,8 +992,7 @@ fn pk_compaction_materializes_partial_update_chains_into_full_rows() {
     let plan = CompactionPlanner::plan(table.tablet().as_ref())
         .unwrap()
         .expect("primary-key compaction plan");
-    let mut task =
-        HorizontalCompactionTask::new(table.tablet(), plan, Arc::new(default_allocator()));
+    let mut task = HorizontalCompactionTask::new(table.tablet(), plan, test_allocator());
     task.run().unwrap();
 
     assert_eq!(table.tablet().num_rowsets(), 1);
@@ -1043,10 +1038,10 @@ fn partial_update_restart_rebuilds_primary_key_row_visibility() {
         Some(Arc::clone(&manager)),
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[100, 200]),
-            Vector::from_strings(&["before-restart", "stable"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[100, 200]),
+            test_string_vector(&["before-restart", "stable"]),
         ]))
         .unwrap();
 
@@ -1102,10 +1097,10 @@ fn partial_update_restart_with_meta_manager_rebuilds_primary_key_row_visibility(
     );
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[100, 200]),
-            Vector::from_strings(&["before-restart", "stable"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[100, 200]),
+            test_string_vector(&["before-restart", "stable"]),
         ]))
         .unwrap();
 
@@ -1136,9 +1131,9 @@ fn partial_update_restart_with_meta_manager_rebuilds_primary_key_row_visibility(
 #[test]
 fn append_and_scan_varchar_roundtrip() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
-    let chunk = Chunk::from_vectors(vec![
-        Vector::from_i32(&[1, 2]),
-        Vector::from_strings(&["alice", "bob"]),
+    let chunk = test_chunk_from_vectors(vec![
+        test_i32_vector(&[1, 2]),
+        test_string_vector(&["alice", "bob"]),
     ]);
     table.append(&chunk).unwrap();
 
@@ -1161,9 +1156,9 @@ fn append_and_scan_varchar_roundtrip() {
 fn delete_update_roundtrip_preserves_latest_rows() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2, 3]),
-            Vector::from_i32(&[10, 20, 30]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2, 3]),
+            test_i32_vector(&[10, 20, 30]),
         ]))
         .unwrap();
 
@@ -1205,7 +1200,7 @@ fn vector_search_filters_rows_deleted_by_primary_keys() {
     let delete_ids: Vec<i32> = (0..50).collect();
     let removed = table
         .delete_by_primary_keys(
-            &Chunk::from_vectors(vec![Vector::from_i32(&delete_ids)]),
+            &test_chunk_from_vectors(vec![test_i32_vector(&delete_ids)]),
             None,
         )
         .unwrap();
@@ -1541,7 +1536,7 @@ fn vector_column_from_specs_builds_hnsw_index() {
 #[test]
 fn full_table_delete_non_pk_marks_all_rows() {
     let table = create_table(&[LogicalType::Integer]);
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+    let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]);
     table.append(&chunk).unwrap();
 
     let deleted = table.delete_all(None).unwrap();
@@ -1560,9 +1555,9 @@ fn full_table_delete_primary_key_clears_index() {
         &[LogicalType::Integer, LogicalType::Integer],
         KeysType::PrimaryKeys,
     );
-    let chunk = Chunk::from_vectors(vec![
-        Vector::from_i32(&[1, 2, 3]),
-        Vector::from_i32(&[10, 20, 30]),
+    let chunk = test_chunk_from_vectors(vec![
+        test_i32_vector(&[1, 2, 3]),
+        test_i32_vector(&[10, 20, 30]),
     ]);
     table.append(&chunk).unwrap();
     assert_eq!(
@@ -1595,9 +1590,9 @@ fn full_table_delete_primary_key_clears_index() {
 #[test]
 fn transactional_delete_update_commit_applies_in_single_commit() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    let chunk = Chunk::from_vectors(vec![
-        Vector::from_i32(&[1, 2, 3]),
-        Vector::from_i32(&[10, 20, 30]),
+    let chunk = test_chunk_from_vectors(vec![
+        test_i32_vector(&[1, 2, 3]),
+        test_i32_vector(&[10, 20, 30]),
     ]);
     table.append(&chunk).unwrap();
 
@@ -1641,9 +1636,9 @@ fn transactional_delete_update_commit_applies_in_single_commit() {
 #[test]
 fn transactional_delete_update_rollback_keeps_storage_unchanged() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    let chunk = Chunk::from_vectors(vec![
-        Vector::from_i32(&[1, 2, 3]),
-        Vector::from_i32(&[10, 20, 30]),
+    let chunk = test_chunk_from_vectors(vec![
+        test_i32_vector(&[1, 2, 3]),
+        test_i32_vector(&[10, 20, 30]),
     ]);
     table.append(&chunk).unwrap();
 
@@ -1682,10 +1677,10 @@ fn transactional_concurrent_delete_conflict_on_same_primary_key() {
         &[LogicalType::Integer, LogicalType::Integer],
         KeysType::PrimaryKeys,
     );
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), Vector::from_i32(&[10, 20])]);
+    let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]);
     table.append(&chunk).unwrap();
 
-    let key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1])]);
+    let key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1])]);
     let txn1 = Arc::new(Transaction::new(3001, 3001));
     let txn2 = Arc::new(Transaction::new(3002, 3002));
 
@@ -1712,7 +1707,7 @@ fn transactional_delete_and_update_conflict_on_same_row() {
         &[LogicalType::Integer, LogicalType::Integer],
         KeysType::PrimaryKeys,
     );
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), Vector::from_i32(&[10, 20])]);
+    let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]);
     table.append(&chunk).unwrap();
 
     let row_ids = collect_row_ids_by_id(&table);
@@ -1728,7 +1723,7 @@ fn transactional_delete_and_update_conflict_on_same_row() {
     assert_eq!(updated, 1);
 
     let delete_txn = Arc::new(Transaction::new(3102, 3102));
-    let key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1])]);
+    let key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1])]);
     let err = table
         .delete_by_primary_keys(&key_chunk, Some(delete_txn.clone()))
         .unwrap_err();
@@ -1748,19 +1743,19 @@ fn transactional_delete_survives_pk_compaction_relocation() {
     );
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
         ]))
         .unwrap();
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[3, 4]),
-            Vector::from_i32(&[30, 40]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[3, 4]),
+            test_i32_vector(&[30, 40]),
         ]))
         .unwrap();
 
-    let key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[2])]);
+    let key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[2])]);
     let txn = Arc::new(Transaction::new(3201, 3201));
     let removed = table
         .delete_by_primary_keys(&key_chunk, Some(txn.clone()))
@@ -1777,8 +1772,7 @@ fn transactional_delete_survives_pk_compaction_relocation() {
     let plan = CompactionPlanner::plan(table.tablet().as_ref())
         .unwrap()
         .expect("primary-key compaction plan");
-    let mut task =
-        HorizontalCompactionTask::new(table.tablet(), plan, Arc::new(default_allocator()));
+    let mut task = HorizontalCompactionTask::new(table.tablet(), plan, test_allocator());
     task.run().unwrap();
     let visible_after: std::collections::HashSet<u64> = table
         .tablet()
@@ -1879,7 +1873,7 @@ fn art_index_build_and_remove_tracks_visible_segments() {
     let values = (0..16).collect::<Vec<i32>>();
 
     table
-        .append(&Chunk::from_vectors(vec![Vector::from_i32(&values)]))
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&values)]))
         .unwrap();
 
     let before_build = table.collect_segments(table.max_version()).unwrap();
@@ -1977,10 +1971,10 @@ fn runtime_art_predicate_returns_all_duplicate_matches() {
     ]);
     table.declare_art_index(1);
 
-    let chunk = Chunk::from_vectors(vec![
-        Vector::from_i32(&[1, 2, 3, 4]),
-        Vector::from_i32(&[10, 20, 20, 30]),
-        Vector::from_i32(&[100, 200, 300, 400]),
+    let chunk = test_chunk_from_vectors(vec![
+        test_i32_vector(&[1, 2, 3, 4]),
+        test_i32_vector(&[10, 20, 20, 30]),
+        test_i32_vector(&[100, 200, 300, 400]),
     ]);
     table.append(&chunk).unwrap();
 
@@ -2147,7 +2141,7 @@ fn fulltext_generation_contributes_to_segment_index_statistics() {
     let table = create_table(&[LogicalType::Varchar]);
     register_fulltext_definition(&table, 0, "simple");
     table
-        .append(&Chunk::from_vectors(vec![Vector::from_strings(&[
+        .append(&test_chunk_from_vectors(vec![test_string_vector(&[
             "vector alpha",
             "vector beta",
         ])]))
@@ -2214,9 +2208,9 @@ fn fulltext_capability_exposes_generation_level_provider_stats() {
     register_fulltext_definition(&table, 1, "simple");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2, 3]),
-            Vector::from_strings(&["vector alpha", "vector beta", "noise"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2, 3]),
+            test_string_vector(&["vector alpha", "vector beta", "noise"]),
         ]))
         .unwrap();
 
@@ -2238,9 +2232,9 @@ fn search_maintenance_sweep_reports_tombstone_pressure() {
     register_fulltext_definition(&table, 1, "simple");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["vector alpha", "vector beta"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["vector alpha", "vector beta"]),
         ]))
         .unwrap();
 
@@ -2262,9 +2256,9 @@ fn generation_snapshot_tracks_build_epoch_and_superseded_epochs() {
     let definition_id = register_fulltext_definition(&table, 1, "simple");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1]),
-            Vector::from_strings(&["vector alpha"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1]),
+            test_string_vector(&["vector alpha"]),
         ]))
         .unwrap();
     let first = table
@@ -2273,9 +2267,9 @@ fn generation_snapshot_tracks_build_epoch_and_superseded_epochs() {
         .expect("first generation snapshot");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[2]),
-            Vector::from_strings(&["vector beta"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[2]),
+            test_string_vector(&["vector beta"]),
         ]))
         .unwrap();
     let second = table
@@ -2301,9 +2295,9 @@ fn fulltext_registry_definition_auto_builds_for_inserts() {
     let definition_id = register_fulltext_definition(&table, 1, "simple");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["vector alpha", "noise"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["vector alpha", "noise"]),
         ]))
         .unwrap();
 
@@ -2314,9 +2308,9 @@ fn fulltext_registry_definition_auto_builds_for_inserts() {
     assert!(cov_after_first.is_complete());
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[3, 4]),
-            Vector::from_strings(&["vector beta", "other"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[3, 4]),
+            test_string_vector(&["vector beta", "other"]),
         ]))
         .unwrap();
 
@@ -2346,9 +2340,9 @@ fn fulltext_registry_definition_builds_with_chinese_tokenizer() {
     let definition_id = register_fulltext_definition(&table, 1, "chinese");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["向量数据库", "分布式系统"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["向量数据库", "分布式系统"]),
         ]))
         .unwrap();
 
@@ -2380,9 +2374,9 @@ fn fulltext_registry_definition_auto_builds_on_transaction_commit() {
     let txn = Arc::new(Transaction::new(9001, 9001));
     table
         .append_with_transaction(
-            &Chunk::from_vectors(vec![
-                Vector::from_i32(&[10, 11]),
-                Vector::from_strings(&["vector txn", "noise txn"]),
+            &test_chunk_from_vectors(vec![
+                test_i32_vector(&[10, 11]),
+                test_string_vector(&["vector txn", "noise txn"]),
             ]),
             Some(txn.clone()),
         )
@@ -2423,15 +2417,15 @@ fn sparse_registry_definition_auto_builds_for_inserts() {
     register_sparse_definition(&table, 1);
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["{1:1.0,3:0.5}", "{2:1.0}"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["{1:1.0,3:0.5}", "{2:1.0}"]),
         ]))
         .unwrap();
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[3, 4]),
-            Vector::from_strings(&["{1:0.7,2:0.2}", "{4:1.0}"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[3, 4]),
+            test_string_vector(&["{1:0.7,2:0.2}", "{4:1.0}"]),
         ]))
         .unwrap();
 
@@ -2457,9 +2451,9 @@ fn sparse_registry_definition_auto_builds_on_transaction_commit() {
     let txn = Arc::new(Transaction::new(9101, 9101));
     table
         .append_with_transaction(
-            &Chunk::from_vectors(vec![
-                Vector::from_i32(&[10, 11]),
-                Vector::from_strings(&["{5:1.0}", "{2:0.6,5:0.4}"]),
+            &test_chunk_from_vectors(vec![
+                test_i32_vector(&[10, 11]),
+                test_string_vector(&["{5:1.0}", "{2:0.6,5:0.4}"]),
             ]),
             Some(txn.clone()),
         )
@@ -2486,15 +2480,15 @@ fn sparse_registry_definition_auto_builds_on_transaction_commit() {
 fn fulltext_late_definition_bootstrap_materializes_existing_rowsets() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["vector one", "noise"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["vector one", "noise"]),
         ]))
         .unwrap();
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[3, 4]),
-            Vector::from_strings(&["vector two", "other"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[3, 4]),
+            test_string_vector(&["vector two", "other"]),
         ]))
         .unwrap();
 
@@ -2573,10 +2567,10 @@ fn fulltext_late_definition_exact_tail_merge_resolves_partial_rows() {
         KeysType::PrimaryKeys,
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
-            Vector::from_strings(&["vector alpha", "noise beta"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
+            test_string_vector(&["vector alpha", "noise beta"]),
         ]))
         .unwrap();
 
@@ -2641,10 +2635,10 @@ fn sparse_late_definition_exact_tail_merge_resolves_partial_rows() {
         KeysType::PrimaryKeys,
     );
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_i32(&[10, 20]),
-            Vector::from_strings(&["{1:1.0,3:0.5}", "{2:1.0}"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
+            test_string_vector(&["{1:1.0,3:0.5}", "{2:1.0}"]),
         ]))
         .unwrap();
 
@@ -2704,9 +2698,9 @@ fn fulltext_update_delete_respect_delete_bitmap() {
     register_fulltext_definition(&table, 1, "simple");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["vector alpha", "vector beta"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["vector alpha", "vector beta"]),
         ]))
         .unwrap();
 
@@ -2736,15 +2730,15 @@ fn fulltext_compaction_rebuild_preserves_search_results() {
     register_fulltext_definition(&table, 1, "simple");
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["vector one", "noise"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["vector one", "noise"]),
         ]))
         .unwrap();
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[3, 4]),
-            Vector::from_strings(&["vector two", "other"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[3, 4]),
+            test_string_vector(&["vector two", "other"]),
         ]))
         .unwrap();
 
@@ -2799,15 +2793,15 @@ fn sparse_compaction_rebuild_preserves_search_results() {
     register_sparse_definition(&table, 1);
 
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[1, 2]),
-            Vector::from_strings(&["{1:1.0,3:0.5}", "{2:1.0}"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["{1:1.0,3:0.5}", "{2:1.0}"]),
         ]))
         .unwrap();
     table
-        .append(&Chunk::from_vectors(vec![
-            Vector::from_i32(&[3, 4]),
-            Vector::from_strings(&["{1:0.7,2:0.2}", "{4:1.0}"]),
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[3, 4]),
+            test_string_vector(&["{1:0.7,2:0.2}", "{4:1.0}"]),
         ]))
         .unwrap();
 

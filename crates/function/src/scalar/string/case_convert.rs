@@ -90,9 +90,12 @@ mod tests {
 
     #[test]
     fn test_lower() {
-        let input_vec = Vector::from_strings(&["HELLO", "World", "123ABC"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["HELLO", "World", "123ABC"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         lower_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -103,9 +106,12 @@ mod tests {
 
     #[test]
     fn test_upper() {
-        let input_vec = Vector::from_strings(&["hello", "World", "123abc"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "World", "123abc"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         upper_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -116,9 +122,12 @@ mod tests {
 
     #[test]
     fn test_lower_unicode() {
-        let input_vec = Vector::from_strings(&["MÜNCHEN", "HELLO"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["MÜNCHEN", "HELLO"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         lower_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -128,9 +137,12 @@ mod tests {
 
     #[test]
     fn test_upper_unicode() {
-        let input_vec = Vector::from_strings(&["münchen", "hello"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["münchen", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         upper_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -140,10 +152,13 @@ mod tests {
 
     #[test]
     fn test_case_with_null() {
-        let mut input_vec = Vector::from_strings(&["hello", "world"]);
+        let mut input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         input_vec.validity_mut().set_null(1);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         lower_varchar(&chunk, &MockState, &mut result).unwrap();
 

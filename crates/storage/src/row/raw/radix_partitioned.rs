@@ -404,7 +404,11 @@ impl RadixPartitionedRawRow {
                         let chunk_count = iterator.current_chunk_count();
                         if chunk_count > 0 {
                             let row_locations = iterator.current_row_locations();
-                            let mut output = Chunk::initialize(&types, chunk_count.max(1));
+                            let mut output = Chunk::try_initialize(
+                                &types,
+                                chunk_count.max(1),
+                                new_partitioned_data.data.chunk_allocator(),
+                            )?;
                             gather_chunk(partition, &row_locations, &mut output, chunk_count);
                             new_partitioned_data.append(&mut append_state, &output)?;
                         }
@@ -493,11 +497,11 @@ impl RadixPartitionedRawRow {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use crate::buffer::{BufferPool, MemoryTag};
 
@@ -514,12 +518,12 @@ mod tests {
     }
 
     fn build_chunk_with_hashes(keys: &[i32], hashes: &[u64]) -> Chunk {
-        let mut hash_vector = Vector::with_capacity(LogicalType::UBigInt, hashes.len().max(1));
+        let mut hash_vector = test_vector_with_capacity(LogicalType::UBigInt, hashes.len().max(1));
         hash_vector.set_count(hashes.len());
         for (idx, hash) in hashes.iter().enumerate() {
             hash_vector.set_u64(idx, *hash);
         }
-        Chunk::from_vectors(vec![Vector::from_i32(keys), hash_vector])
+        test_chunk_from_vectors(vec![test_i32_vector(keys), hash_vector])
     }
 
     fn build_spill_aggregate_chunk(
@@ -528,15 +532,15 @@ mod tests {
         values: &[i32],
         hashes: &[u64],
     ) -> Chunk {
-        let mut hash_vector = Vector::with_capacity(LogicalType::UBigInt, hashes.len().max(1));
+        let mut hash_vector = test_vector_with_capacity(LogicalType::UBigInt, hashes.len().max(1));
         hash_vector.set_count(hashes.len());
         for (idx, hash) in hashes.iter().enumerate() {
             hash_vector.set_u64(idx, *hash);
         }
-        Chunk::from_vectors(vec![
-            Vector::from_i32(k1),
-            Vector::from_i32(k2),
-            Vector::from_i32(values),
+        test_chunk_from_vectors(vec![
+            test_i32_vector(k1),
+            test_i32_vector(k2),
+            test_i32_vector(values),
             hash_vector,
         ])
     }
@@ -563,7 +567,7 @@ mod tests {
                 }
             }
 
-            let mut output = Chunk::initialize(types, count.max(1));
+            let mut output = test_chunk_with_capacity(types, count.max(1));
             gather_chunk(collection, &row_locations, &mut output, count);
             for row_idx in 0..count {
                 let key = output.column(0).unwrap().get_i32(row_idx).unwrap();
@@ -765,7 +769,7 @@ mod tests {
         let mut sum_k1 = 0i64;
         for partition in data.get_partitions() {
             let mut scan_state = RawRowScanState::new();
-            partition.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
+            partition.initialize_scan(&mut scan_state, RawRowPinProperties::UnpinAfterDone);
             for chunk_idx in 0..partition.chunk_count() {
                 let count = partition
                     .fetch_chunk(&mut scan_state, chunk_idx, true)
@@ -778,8 +782,9 @@ mod tests {
                     }
                 }
 
-                let mut output = Chunk::initialize(&types, count.max(1));
+                let mut output = test_chunk_with_capacity(&types, count.max(1));
                 gather_chunk(partition, &row_locations, &mut output, count);
+                partition.finalize_pin_state(&mut scan_state.pin_state);
                 for row_idx in 0..count {
                     seen_rows += 1;
                     sum_k1 += output.column(0).unwrap().get_i32(row_idx).unwrap() as i64;
@@ -840,7 +845,7 @@ mod tests {
         let mut sum_k1 = 0i64;
         for partition in data.get_partitions() {
             let mut scan_state = RawRowScanState::new();
-            partition.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
+            partition.initialize_scan(&mut scan_state, RawRowPinProperties::UnpinAfterDone);
             for chunk_idx in 0..partition.chunk_count() {
                 let count = partition
                     .fetch_chunk(&mut scan_state, chunk_idx, true)
@@ -853,8 +858,9 @@ mod tests {
                     }
                 }
 
-                let mut output = Chunk::initialize(&types, count.max(1));
+                let mut output = test_chunk_with_capacity(&types, count.max(1));
                 gather_chunk(partition, &row_locations, &mut output, count);
+                partition.finalize_pin_state(&mut scan_state.pin_state);
                 for row_idx in 0..count {
                     seen_rows += 1;
                     sum_k1 += output.column(0).unwrap().get_i32(row_idx).unwrap() as i64;
@@ -955,7 +961,7 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(partition_chunk_rows, partition.count());
             let mut scan_state = RawRowScanState::new();
-            partition.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
+            partition.initialize_scan(&mut scan_state, RawRowPinProperties::UnpinAfterDone);
             for chunk_idx in 0..partition.chunk_count() {
                 let count = partition
                     .fetch_chunk(&mut scan_state, chunk_idx, true)
@@ -968,8 +974,9 @@ mod tests {
                     }
                 }
 
-                let mut output = Chunk::initialize(&types, count.max(1));
+                let mut output = test_chunk_with_capacity(&types, count.max(1));
                 gather_chunk(partition, &row_locations, &mut output, count);
+                partition.finalize_pin_state(&mut scan_state.pin_state);
                 for row_idx in 0..count {
                     seen_rows += 1;
                     sum_k1 += output.column(0).unwrap().get_i32(row_idx).unwrap() as i64;

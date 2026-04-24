@@ -4,17 +4,22 @@
 //! Physical cross product (CROSS JOIN): Cartesian product of left and right inputs.
 //!
 //! The sink materializes the right (build) side; the operator streams the left and
-//! emits pairs. Uses in-memory `Vec<Chunk>` for the build side (no spill yet).
+//! emits pairs.
 
 use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
 
 use crate::execution_context::ExecutionContext;
+use crate::memory_runtime::{RetainedChunkVec, SharedRetainedObject};
 use crate::operator::state::OperatorSinkFinalizeInput;
 use crate::operator::state::{
     GlobalOperatorState, GlobalSinkState, LocalSinkState, OperatorSinkCombineInput,
@@ -119,14 +124,13 @@ impl fmt::Debug for CrossProduct {
 // ========== States ==========
 
 /// Global sink state for cross product (materialized build side).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CrossProductGlobalSinkState {
+    retained_object: Arc<SharedRetainedObject>,
     /// Materialized chunks from the right (build) side.
-    rhs_chunks: Mutex<Vec<Chunk>>,
+    rhs_chunks: Arc<Mutex<RetainedChunkVec>>,
     /// Total row count from right side.
     rhs_row_count: Mutex<usize>,
-    /// Frozen snapshot shared by probe-side operator states.
-    finalized_rhs_chunks: Mutex<Option<Arc<Vec<Chunk>>>>,
 }
 
 impl GlobalSinkState for CrossProductGlobalSinkState {
@@ -140,41 +144,41 @@ impl GlobalSinkState for CrossProductGlobalSinkState {
 }
 
 impl CrossProductGlobalSinkState {
-    fn snapshot(&self) -> Result<(Arc<Vec<Chunk>>, usize)> {
-        let row_count = *self
-            .rhs_row_count
-            .lock()
-            .map_err(|e| paro_error::internal(e.to_string()))?;
-
-        if let Some(snapshot) = self
-            .finalized_rhs_chunks
-            .lock()
-            .map_err(|e| paro_error::internal(e.to_string()))?
-            .clone()
-        {
-            return Ok((snapshot, row_count));
-        }
-
-        let snapshot = Arc::new(
-            self.rhs_chunks
-                .lock()
-                .map_err(|e| paro_error::internal(e.to_string()))?
-                .clone(),
+    fn new(ctx: &ExecutionContext) -> Self {
+        let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+        let retained_object = Arc::new(SharedRetainedObject::new(
+            "cross_product_rhs",
+            owner,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+        ));
+        let retained_owner: Arc<dyn MemoryOwner> = retained_object.clone();
+        let memory = MemoryAccountingContext::from_owner(
+            retained_owner,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
         );
-        *self
-            .finalized_rhs_chunks
-            .lock()
-            .map_err(|e| paro_error::internal(e.to_string()))? = Some(snapshot.clone());
+        Self {
+            retained_object,
+            rhs_chunks: Arc::new(Mutex::new(RetainedChunkVec::new(memory))),
+            rhs_row_count: Mutex::new(0),
+        }
+    }
 
-        Ok((snapshot, row_count))
+    fn row_count(&self) -> Result<usize> {
+        self.rhs_row_count
+            .lock()
+            .map(|count| *count)
+            .map_err(|e| paro_error::internal(e.to_string()))
     }
 }
 
 /// Local sink state for cross product (build / materialize).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CrossProductLocalSinkState {
     /// Local chunks collected before combining.
-    local_chunks: Vec<Chunk>,
+    local_chunks: RetainedChunkVec,
 }
 
 impl LocalSinkState for CrossProductLocalSinkState {
@@ -191,7 +195,7 @@ impl LocalSinkState for CrossProductLocalSinkState {
 #[derive(Debug)]
 struct CrossProductOperatorState {
     /// Reference to materialized right side chunks.
-    rhs_chunks: Arc<Vec<Chunk>>,
+    rhs_chunks: Arc<Mutex<RetainedChunkVec>>,
     /// Total row count from right side.
     rhs_row_count: usize,
     /// Current row index in probe chunk.
@@ -205,7 +209,10 @@ struct CrossProductOperatorState {
 impl Default for CrossProductOperatorState {
     fn default() -> Self {
         Self {
-            rhs_chunks: Arc::new(Vec::new()),
+            rhs_chunks: Arc::new(Mutex::new(RetainedChunkVec::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ))),
             rhs_row_count: 0,
             current_probe_row: 0,
             current_rhs_chunk_idx: 0,
@@ -215,7 +222,7 @@ impl Default for CrossProductOperatorState {
 }
 
 impl CrossProductOperatorState {
-    fn new(rhs_chunks: Arc<Vec<Chunk>>, rhs_row_count: usize) -> Self {
+    fn new(rhs_chunks: Arc<Mutex<RetainedChunkVec>>, rhs_row_count: usize) -> Self {
         Self {
             rhs_chunks,
             rhs_row_count,
@@ -238,6 +245,16 @@ impl OperatorState for CrossProductOperatorState {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+fn cross_product_local_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    )
 }
 
 // ========== PhysicalOperator Implementation ==========
@@ -305,21 +322,23 @@ impl PhysicalOperator for CrossProduct {
             .as_any()
             .downcast_ref::<CrossProductGlobalSinkState>()
             .ok_or_else(|| paro_error::internal("Invalid cross product sink state".to_string()))?;
-        let (rhs_chunks, rhs_row_count) = gstate.snapshot()?;
+        gstate.retained_object.rebind_reclaimer();
         Ok(Box::new(CrossProductOperatorState::new(
-            rhs_chunks,
-            rhs_row_count,
+            gstate.rhs_chunks.clone(),
+            gstate.row_count()?,
         )))
     }
 
     // --- Sink (build) ---
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        Ok(Box::new(CrossProductGlobalSinkState::default()))
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+        Ok(Box::new(CrossProductGlobalSinkState::new(ctx)))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        Ok(Box::new(CrossProductLocalSinkState::default()))
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        Ok(Box::new(CrossProductLocalSinkState {
+            local_chunks: RetainedChunkVec::new(cross_product_local_memory_context(ctx)),
+        }))
     }
 
     fn sink(
@@ -335,7 +354,9 @@ impl PhysicalOperator for CrossProduct {
             .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
 
         if chunk.size() > 0 {
-            lstate.local_chunks.push(chunk.clone());
+            lstate
+                .local_chunks
+                .push(chunk.try_deep_copy(chunk.allocator().clone())?)?;
         }
 
         Ok(SinkResultType::NeedMoreInput)
@@ -366,27 +387,18 @@ impl PhysicalOperator for CrossProduct {
             .rhs_row_count
             .lock()
             .map_err(|e| paro_error::internal(e.to_string()))?;
-        let mut finalized = gstate
-            .finalized_rhs_chunks
-            .lock()
-            .map_err(|e| paro_error::internal(e.to_string()))?;
-
-        for chunk in lstate.local_chunks.drain(..) {
-            *g_count += chunk.size();
-            g_chunks.push(chunk);
-        }
-        *finalized = None;
+        *g_count += lstate.local_chunks.row_count();
+        g_chunks.append_from(&mut lstate.local_chunks)?;
 
         Ok(SinkCombineResultType::Finished)
     }
 
     fn finalize(&self, input: &OperatorSinkFinalizeInput) -> Result<SinkFinalizeType> {
-        let gstate = input
+        let _gstate = input
             .global_state
             .as_any()
             .downcast_ref::<CrossProductGlobalSinkState>()
             .ok_or_else(|| paro_error::internal("Invalid global sink state".to_string()))?;
-        let _ = gstate.snapshot()?;
         Ok(SinkFinalizeType::Ready)
     }
 
@@ -399,6 +411,7 @@ impl PhysicalOperator for CrossProduct {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         let state = state
             .as_any_mut()
@@ -416,33 +429,41 @@ impl PhysicalOperator for CrossProduct {
         let mut output_row_count = 0;
         let capacity = chunk.capacity();
 
-        while output_row_count < capacity {
-            if state.current_rhs_chunk_idx >= state.rhs_chunks.len() {
-                state.current_probe_row += 1;
-                state.current_rhs_chunk_idx = 0;
-                state.current_rhs_row = 0;
+        {
+            let rhs_chunks = state
+                .rhs_chunks
+                .lock()
+                .map_err(|e| paro_error::internal(e.to_string()))?;
+            let rhs_chunks = rhs_chunks.as_slice();
 
-                if state.current_probe_row >= input.size() {
-                    break;
+            while output_row_count < capacity {
+                if state.current_rhs_chunk_idx >= rhs_chunks.len() {
+                    state.current_probe_row += 1;
+                    state.current_rhs_chunk_idx = 0;
+                    state.current_rhs_row = 0;
+
+                    if state.current_probe_row >= input.size() {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            let rhs_chunk = &state.rhs_chunks[state.current_rhs_chunk_idx];
-            self.emit_row(
-                chunk,
-                output_row_count,
-                input,
-                state.current_probe_row,
-                rhs_chunk,
-                state.current_rhs_row,
-            )?;
-            output_row_count += 1;
+                let rhs_chunk = &rhs_chunks[state.current_rhs_chunk_idx];
+                self.emit_row(
+                    chunk,
+                    output_row_count,
+                    input,
+                    state.current_probe_row,
+                    rhs_chunk,
+                    state.current_rhs_row,
+                )?;
+                output_row_count += 1;
 
-            state.current_rhs_row += 1;
-            if state.current_rhs_row >= rhs_chunk.size() {
-                state.current_rhs_row = 0;
-                state.current_rhs_chunk_idx += 1;
+                state.current_rhs_row += 1;
+                if state.current_rhs_row >= rhs_chunk.size() {
+                    state.current_rhs_row = 0;
+                    state.current_rhs_chunk_idx += 1;
+                }
             }
         }
 
@@ -491,7 +512,7 @@ mod tests {
 
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_context::StatementContext;
     use paro_scheduler::task::InterruptState;
 
@@ -523,22 +544,41 @@ mod tests {
     }
 
     fn create_rhs_chunk(values: &[i32]) -> Chunk {
-        Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(values))])
+        Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    values,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn create_string_chunk(values: &[&str]) -> Chunk {
-        Chunk::from_arc_vectors(vec![Arc::new(Vector::from_strings(values))])
+        Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    values,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     #[test]
     fn execute_emits_cartesian_rows_across_multiple_calls() {
         let cross = create_test_cross_product();
-        let sink_state = Arc::new(CrossProductGlobalSinkState::default());
-        sink_state
-            .rhs_chunks
-            .lock()
-            .unwrap()
-            .extend([create_rhs_chunk(&[10, 11]), create_rhs_chunk(&[12])]);
+        let session = create_test_session();
+        let thread = ThreadContext::new(0, 1);
+        let ctx = ExecutionContext::new(session, &thread, None);
+        let sink_state = Arc::new(CrossProductGlobalSinkState::new(&ctx));
+        {
+            let mut rhs_chunks = sink_state.rhs_chunks.lock().unwrap();
+            rhs_chunks.push(create_rhs_chunk(&[10, 11])).unwrap();
+            rhs_chunks.push(create_rhs_chunk(&[12])).unwrap();
+        }
         *sink_state.rhs_row_count.lock().unwrap() = 3;
 
         let interrupt = InterruptState::new();
@@ -553,18 +593,30 @@ mod tests {
         );
         cross.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
-        let session = create_test_session();
-        let thread = ThreadContext::new(0, 1);
-        let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = cross.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2]))]);
-        let mut output = Chunk::initialize(cross.types(), 2);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = paro_common::test_utils::test_chunk_with_capacity(cross.types(), 2);
         let gstate = EmptyGlobalOperatorState;
 
         let mut rows = Vec::new();
         loop {
             let result = cross
-                .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+                .execute(
+                    &ctx,
+                    &input,
+                    &mut output,
+                    &gstate,
+                    state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .unwrap();
             for row_idx in 0..output.size() {
                 rows.push((
@@ -599,7 +651,10 @@ mod tests {
             as Arc<dyn PhysicalOperator>;
         let cross = CrossProduct::new(left, right);
 
-        let sink_state = Arc::new(CrossProductGlobalSinkState::default());
+        let session = create_test_session();
+        let thread = ThreadContext::new(0, 1);
+        let ctx = ExecutionContext::new(session, &thread, None);
+        let sink_state = Arc::new(CrossProductGlobalSinkState::new(&ctx));
         sink_state
             .rhs_chunks
             .lock()
@@ -608,7 +663,8 @@ mod tests {
                 "grace-hopper",
                 "linus-torvalds",
                 "margaret-hamilton",
-            ]));
+            ]))
+            .unwrap();
         *sink_state.rhs_row_count.lock().unwrap() = 3;
 
         let interrupt = InterruptState::new();
@@ -623,19 +679,25 @@ mod tests {
         );
         cross.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
-        let session = create_test_session();
-        let thread = ThreadContext::new(0, 1);
-        let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = cross.get_operator_state(&ctx).unwrap();
         let input = create_string_chunk(&["ada-lovelace", "eve-analyst"]);
-        let mut output = Chunk::initialize(cross.types(), 2);
+        let mut output = paro_common::test_utils::test_chunk_with_capacity(cross.types(), 2);
         let gstate = EmptyGlobalOperatorState;
 
         let mut rows = Vec::new();
         for _ in 0..8 {
-            output.reset();
+            output
+                .try_reset(output.allocator().clone())
+                .expect("test chunk reset allocation failed");
             let result = cross
-                .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+                .execute(
+                    &ctx,
+                    &input,
+                    &mut output,
+                    &gstate,
+                    state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .unwrap();
             for row_idx in 0..output.size() {
                 rows.push((

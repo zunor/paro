@@ -241,7 +241,7 @@ impl ExpressionExecutor {
             &output_types,
             input.size(),
             runtime.allocator(MemoryTag::BaseTable),
-        );
+        )?;
         for expr_idx in 0..self.program.expressions.len() {
             let column = result.column_mut(expr_idx).ok_or_else(|| {
                 paro_error::internal(format!("Output column {} not found", expr_idx))
@@ -273,11 +273,11 @@ impl ExpressionExecutor {
         count: usize,
         runtime: &dyn FunctionExecContext,
     ) -> Result<Arc<Vector>> {
-        let mut result = Vector::with_capacity_and_allocator(
+        let mut result = Vector::try_new(
             self.program.expressions[expr_idx].return_type(),
             count.max(1),
             runtime.allocator(MemoryTag::BaseTable),
-        );
+        )?;
         self.execute_into(expr_idx, chunk, sel, count, runtime, &mut result)?;
         Ok(Arc::new(result))
     }
@@ -311,8 +311,7 @@ impl ExpressionExecutor {
                 Self::execute_operator_into(expr, state, chunk, sel, count, runtime, result)
             }
             (Expression::Constant(expr), CompiledExpressionState::Constant(_)) => {
-                Self::execute_constant_into(expr, count, result);
-                Ok(())
+                Self::execute_constant_into(expr, count, runtime, result)
             }
             (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
                 Self::execute_column_ref_into(expr, chunk, sel, count, result)
@@ -361,11 +360,12 @@ impl ExpressionExecutor {
                 Self::execute_operator_value(expr, state, chunk, sel, count, runtime)
             }
             (Expression::Constant(expr), CompiledExpressionState::Constant(_)) => {
-                Ok(EvaluatedValue::Borrowed(Vector::constant_from_value(
+                Ok(EvaluatedValue::Borrowed(Vector::try_constant_from_value(
                     expr.return_type.clone(),
                     expr.value.clone(),
                     count,
-                )))
+                    runtime.allocator(MemoryTag::BaseTable),
+                )?))
             }
             (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
                 Self::execute_column_ref_value(expr, chunk, sel, count)
@@ -391,16 +391,17 @@ impl ExpressionExecutor {
         types: &[LogicalType],
         count: usize,
         allocator: Arc<dyn Allocator>,
-    ) {
+    ) -> Result<()> {
         let required_capacity = count.max(1);
         let needs_reinit = result.column_count() != types.len()
             || result.capacity() < required_capacity
             || result.types() != types;
         if needs_reinit {
-            *result = Chunk::initialize_with_allocator(types, required_capacity, allocator);
+            *result = Chunk::try_initialize(types, required_capacity, allocator)?;
         } else {
-            result.reset();
+            result.try_reset(result.allocator().clone())?;
         }
+        Ok(())
     }
 
     fn prepare_result_vector(
@@ -408,18 +409,15 @@ impl ExpressionExecutor {
         logical_type: &LogicalType,
         count: usize,
         allocator: Arc<dyn Allocator>,
-    ) {
+    ) -> Result<()> {
         let required_capacity = count.max(1);
         if result.logical_type() != logical_type || result.capacity() < required_capacity {
-            *result = Vector::with_capacity_and_allocator(
-                logical_type.clone(),
-                required_capacity,
-                allocator,
-            );
+            *result = Vector::try_new(logical_type.clone(), required_capacity, allocator)?;
         } else {
-            result.reset_for_execution(required_capacity, allocator);
+            result.try_reset_for_execution(required_capacity, allocator)?;
         }
         result.set_len(count);
+        Ok(())
     }
 
     fn prepare_slot_result<'a>(
@@ -427,7 +425,7 @@ impl ExpressionExecutor {
         logical_type: &LogicalType,
         count: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> &'a mut Vector {
+    ) -> Result<&'a mut Vector> {
         slot.prepare_scratch(logical_type, count, allocator)
     }
 
@@ -436,7 +434,7 @@ impl ExpressionExecutor {
         intermediate_chunk: &'a mut Option<Chunk>,
         count: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> &'a mut Chunk {
+    ) -> Result<&'a mut Chunk> {
         let required_capacity = count.max(1);
         let needs_reinit = intermediate_chunk
             .as_ref()
@@ -445,19 +443,19 @@ impl ExpressionExecutor {
             })
             .unwrap_or(true);
         if needs_reinit {
-            *intermediate_chunk = Some(Chunk::initialize_with_allocator(
+            *intermediate_chunk = Some(Chunk::try_initialize(
                 intermediate_types,
                 required_capacity,
                 allocator,
-            ));
+            )?);
         } else if let Some(chunk) = intermediate_chunk.as_mut() {
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
         }
         let chunk = intermediate_chunk
             .as_mut()
             .expect("intermediate chunk initialized");
         chunk.set_cardinality(count);
-        chunk
+        Ok(chunk)
     }
 
     fn store_value(slot: &mut ValueSlot, value: &EvaluatedValue) {
@@ -494,7 +492,10 @@ impl ExpressionExecutor {
             argument.set_count(unique_len);
             inputs.push(Arc::new(argument));
         }
-        Ok(Chunk::from_arc_vectors(inputs))
+        Ok(Chunk::from_arc_vectors(
+            inputs,
+            intermediate.allocator().clone(),
+        ))
     }
 
     fn try_dictionary_cached_function(
@@ -573,17 +574,17 @@ impl ExpressionExecutor {
                 dictionary_child,
                 dictionary_info.unique_len,
             )?;
-            let mut unique_result = Vector::with_capacity_and_allocator(
+            let mut unique_result = Vector::try_new(
                 expr.return_type.clone(),
                 dictionary_info.unique_len.max(1),
                 allocator.clone(),
-            );
+            )?;
             Self::prepare_result_vector(
                 &mut unique_result,
                 &expr.return_type,
                 dictionary_info.unique_len,
                 allocator,
-            );
+            )?;
             let function_context =
                 BoundFunctionContext::new(runtime, expr.function.bind_data.as_deref(), local_state);
             expr.function
@@ -594,7 +595,7 @@ impl ExpressionExecutor {
             output
         };
 
-        let mut result = Vector::dictionary(output_child, driving_selection);
+        let mut result = Vector::try_dictionary(output_child, driving_selection)?;
         result.set_len(count);
         Ok(Some(result))
     }
@@ -699,8 +700,9 @@ impl ExpressionExecutor {
                 }
 
                 let allocator = runtime.allocator(MemoryTag::BaseTable);
-                let mut current = SelectionVector::with_allocator(count.max(1), allocator.clone());
-                let mut next = SelectionVector::with_allocator(count.max(1), allocator);
+                let mut current =
+                    SelectionVector::try_with_capacity(count.max(1), allocator.clone())?;
+                let mut next = SelectionVector::try_with_capacity(count.max(1), allocator)?;
 
                 match expr.conjunction_type {
                     paro_planner::expression::ConjunctionType::And => {
@@ -876,7 +878,7 @@ impl ExpressionExecutor {
             intermediate_chunk,
             count,
             allocator.clone(),
-        );
+        )?;
         for (child_idx, child_expr) in expr.children.iter().enumerate() {
             let child_value = Self::execute_value(
                 child_expr,
@@ -902,7 +904,7 @@ impl ExpressionExecutor {
             *result = cached_result;
             return Ok(());
         }
-        Self::prepare_result_vector(result, &expr.return_type, count, allocator);
+        Self::prepare_result_vector(result, &expr.return_type, count, allocator)?;
         let function_context = BoundFunctionContext::new(
             runtime,
             expr.function.bind_data.as_deref(),
@@ -936,7 +938,7 @@ impl ExpressionExecutor {
             intermediate_chunk,
             count,
             allocator.clone(),
-        );
+        )?;
         for (child_idx, child_expr) in expr.children.iter().enumerate() {
             let child_value = Self::execute_value(
                 child_expr,
@@ -961,7 +963,7 @@ impl ExpressionExecutor {
         )? {
             return Ok(EvaluatedValue::Borrowed(cached_result));
         }
-        let result_vector = Self::prepare_slot_result(result, &expr.return_type, count, allocator);
+        let result_vector = Self::prepare_slot_result(result, &expr.return_type, count, allocator)?;
         let function_context = BoundFunctionContext::new(
             runtime,
             expr.function.bind_data.as_deref(),
@@ -986,7 +988,7 @@ impl ExpressionExecutor {
         Self::store_value(&mut state.child_result, &child_value);
 
         if child_value.as_vector().logical_type() == &expr.target_type {
-            child_value.write_into(result);
+            child_value.write_into(result)?;
             result.set_len(count);
             return Ok(());
         }
@@ -996,7 +998,7 @@ impl ExpressionExecutor {
             &expr.target_type,
             count,
             runtime.allocator(MemoryTag::BaseTable),
-        );
+        )?;
         let ctx = CastExecCtx {
             runtime,
             try_cast: expr.try_cast,
@@ -1025,7 +1027,7 @@ impl ExpressionExecutor {
 
         let allocator = runtime.allocator(MemoryTag::BaseTable);
         let result_vector =
-            Self::prepare_slot_result(&mut state.result, &expr.target_type, count, allocator);
+            Self::prepare_slot_result(&mut state.result, &expr.target_type, count, allocator)?;
         let ctx = CastExecCtx {
             runtime,
             try_cast: expr.try_cast,
@@ -1057,7 +1059,7 @@ impl ExpressionExecutor {
             &LogicalType::Boolean,
             count,
             runtime.allocator(MemoryTag::BaseTable),
-        );
+        )?;
         (state.compare)(
             left.as_vector(),
             right.as_vector(),
@@ -1084,7 +1086,7 @@ impl ExpressionExecutor {
             &LogicalType::Boolean,
             count,
             runtime.allocator(MemoryTag::BaseTable),
-        );
+        )?;
         (state.compare)(
             left.as_vector(),
             right.as_vector(),
@@ -1138,7 +1140,7 @@ impl ExpressionExecutor {
             runtime,
         )?;
         if expr.children.len() == 1 {
-            first.write_into(result);
+            first.write_into(result)?;
             result.set_len(count);
             return Ok(());
         }
@@ -1164,7 +1166,7 @@ impl ExpressionExecutor {
                 &LogicalType::Boolean,
                 count,
                 allocator.clone(),
-            );
+            )?;
             Self::apply_conjunction(
                 expr.conjunction_type,
                 &current,
@@ -1175,7 +1177,7 @@ impl ExpressionExecutor {
             current = target.reference();
         }
         *result = current;
-        result.make_exclusive();
+        result.try_make_exclusive()?;
         Ok(())
     }
 
@@ -1224,7 +1226,7 @@ impl ExpressionExecutor {
                 &LogicalType::Boolean,
                 count,
                 allocator.clone(),
-            );
+            )?;
             Self::apply_conjunction(
                 expr.conjunction_type,
                 &current,
@@ -1333,7 +1335,7 @@ impl ExpressionExecutor {
         result: &mut Vector,
     ) -> Result<()> {
         let value = Self::execute_operator_value(expr, state, chunk, sel, count, runtime)?;
-        value.write_into(result);
+        value.write_into(result)?;
         result.set_len(count);
         Ok(())
     }
@@ -1362,10 +1364,14 @@ impl ExpressionExecutor {
                     &LogicalType::Boolean,
                     count,
                     runtime.allocator(MemoryTag::BaseTable),
-                );
+                )?;
                 use paro_function::scalar::executor::unary::UnaryExecutor;
                 use paro_function::scalar::operators::logic::NotOperator;
-                UnaryExecutor::execute::<bool, bool, NotOperator>(child.as_vector(), result, count);
+                UnaryExecutor::execute::<bool, bool, NotOperator>(
+                    child.as_vector(),
+                    result,
+                    count,
+                )?;
                 Ok(state
                     .result
                     .evaluated(true)
@@ -1386,7 +1392,7 @@ impl ExpressionExecutor {
                     &LogicalType::Boolean,
                     count,
                     runtime.allocator(MemoryTag::BaseTable),
-                );
+                )?;
                 let is_not = matches!(expr.operator_type, OperatorType::IsNotNull);
                 for row_idx in 0..count {
                     result.set_bool(row_idx, child.as_vector().is_null(row_idx) != is_not);
@@ -1402,7 +1408,7 @@ impl ExpressionExecutor {
                     &expr.return_type,
                     count,
                     runtime.allocator(MemoryTag::BaseTable),
-                );
+                )?;
 
                 for row_idx in 0..count {
                     result.set_null(row_idx, true);
@@ -1410,12 +1416,13 @@ impl ExpressionExecutor {
 
                 let allocator = runtime.allocator(MemoryTag::BaseTable);
                 let mut unresolved =
-                    SelectionVector::with_allocator(count.max(1), allocator.clone());
-                let mut next_unresolved = SelectionVector::with_allocator(count.max(1), allocator);
-                let mut child_sel = SelectionVector::with_allocator(
+                    SelectionVector::try_with_capacity(count.max(1), allocator.clone())?;
+                let mut next_unresolved =
+                    SelectionVector::try_with_capacity(count.max(1), allocator)?;
+                let mut child_sel = SelectionVector::try_with_capacity(
                     count.max(1),
                     runtime.allocator(MemoryTag::BaseTable),
-                );
+                )?;
                 let mut unresolved_count = select_all_rows(None, count, &mut unresolved);
 
                 for (child_idx, child_expr) in expr.children.iter().enumerate() {
@@ -1480,7 +1487,7 @@ impl ExpressionExecutor {
                     &LogicalType::Boolean,
                     count,
                     runtime.allocator(MemoryTag::BaseTable),
-                );
+                )?;
 
                 match state
                     .in_list
@@ -1517,14 +1524,19 @@ impl ExpressionExecutor {
                             &LogicalType::Boolean,
                             count,
                             runtime.allocator(MemoryTag::BaseTable),
-                        );
+                        )?;
                         let scratch = Self::prepare_slot_result(
                             &mut state.scratch,
                             &LogicalType::Boolean,
                             count,
                             runtime.allocator(MemoryTag::BaseTable),
-                        );
-                        *result = Vector::constant::<bool>(LogicalType::Boolean, false, count);
+                        )?;
+                        *result = Vector::try_constant::<bool>(
+                            LogicalType::Boolean,
+                            false,
+                            count,
+                            runtime.allocator(MemoryTag::BaseTable),
+                        )?;
 
                         for rhs_idx in 1..expr.children.len() {
                             let rhs = Self::execute_value(
@@ -1550,7 +1562,7 @@ impl ExpressionExecutor {
                         if negate {
                             UnaryExecutor::execute::<bool, bool, NotOperator>(
                                 result, scratch, count,
-                            );
+                            )?;
                             std::mem::swap(result, scratch);
                         }
                     }
@@ -1560,7 +1572,11 @@ impl ExpressionExecutor {
             }
             OperatorType::ArrayConstructor => {
                 let array_size = expr.children.len();
-                let mut result = Vector::new_array(expr.return_type.clone(), count);
+                let mut result = Vector::try_new_array(
+                    expr.return_type.clone(),
+                    count,
+                    runtime.allocator(MemoryTag::BaseTable),
+                )?;
                 result.set_count(count);
 
                 let child_vec = result.child_mut().ok_or_else(|| {
@@ -1599,11 +1615,11 @@ impl ExpressionExecutor {
                     .expect("array constructor initialized"))
             }
             OperatorType::StructConstructor => {
-                let mut result = Vector::with_capacity_and_allocator(
+                let mut result = Vector::try_new(
                     expr.return_type.clone(),
                     count.max(1),
                     runtime.allocator(MemoryTag::BaseTable),
-                );
+                )?;
                 result.set_count(count);
 
                 let children = result
@@ -1746,8 +1762,19 @@ impl ExpressionExecutor {
         }
     }
 
-    fn execute_constant_into(expr: &ConstantExpression, count: usize, result: &mut Vector) {
-        *result = Vector::constant_from_value(expr.return_type.clone(), expr.value.clone(), count);
+    fn execute_constant_into(
+        expr: &ConstantExpression,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        result: &mut Vector,
+    ) -> Result<()> {
+        *result = Vector::try_constant_from_value(
+            expr.return_type.clone(),
+            expr.value.clone(),
+            count,
+            runtime.allocator(MemoryTag::BaseTable),
+        )?;
+        Ok(())
     }
 
     fn execute_column_ref_value(
@@ -1758,10 +1785,11 @@ impl ExpressionExecutor {
     ) -> Result<EvaluatedValue> {
         if expr.binding.column_index >= chunk.data.len() {
             if count == 0 {
-                return Ok(EvaluatedValue::Borrowed(Vector::with_capacity(
+                return Ok(EvaluatedValue::Borrowed(Vector::try_new(
                     expr.return_type.clone(),
                     0,
-                )));
+                    chunk.allocator().clone(),
+                )?));
             }
             return Err(paro_error::internal(format!(
                 "Column reference index {} out of bounds (chunk columns={})",
@@ -1771,10 +1799,10 @@ impl ExpressionExecutor {
         }
         let column = chunk.data[expr.binding.column_index].as_ref();
         if let Some(sel) = sel {
-            Ok(EvaluatedValue::Borrowed(Vector::dictionary(
+            Ok(EvaluatedValue::Borrowed(Vector::try_dictionary(
                 chunk.data[expr.binding.column_index].clone(),
                 sel,
-            )))
+            )?))
         } else {
             Ok(EvaluatedValue::Borrowed(column.reference()))
         }
@@ -1788,7 +1816,7 @@ impl ExpressionExecutor {
         result: &mut Vector,
     ) -> Result<()> {
         let value = Self::execute_column_ref_value(expr, chunk, sel, count)?;
-        value.write_into(result);
+        value.write_into(result)?;
         result.set_len(count);
         Ok(())
     }
@@ -1801,10 +1829,11 @@ impl ExpressionExecutor {
     ) -> Result<EvaluatedValue> {
         if expr.index >= chunk.data.len() {
             if count == 0 {
-                return Ok(EvaluatedValue::Borrowed(Vector::with_capacity(
+                return Ok(EvaluatedValue::Borrowed(Vector::try_new(
                     expr.return_type.clone(),
                     0,
-                )));
+                    chunk.allocator().clone(),
+                )?));
             }
             return Err(paro_error::internal(format!(
                 "Reference index {} out of bounds (chunk columns={})",
@@ -1814,10 +1843,10 @@ impl ExpressionExecutor {
         }
         let column = chunk.data[expr.index].as_ref();
         if let Some(sel) = sel {
-            Ok(EvaluatedValue::Borrowed(Vector::dictionary(
+            Ok(EvaluatedValue::Borrowed(Vector::try_dictionary(
                 chunk.data[expr.index].clone(),
                 sel,
-            )))
+            )?))
         } else {
             Ok(EvaluatedValue::Borrowed(column.reference()))
         }
@@ -1831,7 +1860,7 @@ impl ExpressionExecutor {
         result: &mut Vector,
     ) -> Result<()> {
         let value = Self::execute_reference_value(expr, chunk, sel, count)?;
-        value.write_into(result);
+        value.write_into(result)?;
         result.set_len(count);
         Ok(())
     }
@@ -1922,7 +1951,13 @@ mod tests {
     }
 
     fn integer_chunk(values: &[i32]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(values)])
+        Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn nullable_i32_vector(values: &[Option<i32>]) -> Vector {
@@ -1930,7 +1965,10 @@ mod tests {
             .iter()
             .map(|value| value.unwrap_or_default())
             .collect();
-        let mut vector = Vector::from_i32(&dense);
+        let mut vector = paro_common::test_utils::test_i32_vector_with_allocator(
+            &dense,
+            paro_common::test_utils::test_allocator(),
+        );
         for (row_idx, value) in values.iter().enumerate() {
             if value.is_none() {
                 vector.set_null(row_idx, true);
@@ -1940,15 +1978,22 @@ mod tests {
     }
 
     fn nullable_integer_chunk(values: &[Option<i32>]) -> Chunk {
-        Chunk::from_vectors(vec![nullable_i32_vector(values)])
+        Chunk::from_vectors(
+            vec![nullable_i32_vector(values)],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn boolean_chunk(values: &[Option<bool>]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_nullable_bools(values)])
+        Chunk::from_vectors(
+            vec![paro_common::test_utils::test_nullable_bool_vector(values)],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn vector_from_i64_values(logical_type: LogicalType, values: &[i64]) -> Vector {
-        let mut vector = Vector::with_capacity(logical_type, values.len());
+        let mut vector =
+            paro_common::test_utils::test_vector_with_capacity(logical_type, values.len());
         vector.set_count(values.len());
         unsafe {
             ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<i64>(), values.len());
@@ -2283,8 +2328,11 @@ mod tests {
     }
 
     fn storage_dictionary_i32(values: &[i32], selection: Vec<u32>, provenance_id: u64) -> Vector {
-        Vector::with_dictionary(
-            Arc::new(Vector::from_i32(values)),
+        paro_common::test_utils::test_with_dictionary(
+            Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                values,
+                paro_common::test_utils::test_allocator(),
+            )),
             selection,
             DictionaryInfo {
                 unique_len: values.len(),
@@ -2300,7 +2348,8 @@ mod tests {
         let runtime = test_runtime(session.clone());
         let expr = scalar_subquery_check_expr(1);
         let mut executor = ExpressionExecutor::new(&expr);
-        let mut input = Chunk::new();
+        let mut input = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         input.set_cardinality(1);
 
         let result = executor
@@ -2316,7 +2365,8 @@ mod tests {
         let runtime = test_runtime(session.clone());
         let expr = scalar_subquery_check_expr(2);
         let mut executor = ExpressionExecutor::new(&expr);
-        let mut input = Chunk::new();
+        let mut input = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         input.set_cardinality(1);
 
         let err = executor
@@ -2352,7 +2402,7 @@ mod tests {
         let expr = greater_than_i32(0, 1);
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[0, 2, 1, 5]);
-        let mut selection = SelectionVector::with_capacity(input.size());
+        let mut selection = paro_common::test_utils::test_selection_with_capacity(input.size());
         selection.set_len(input.size());
 
         let selected = executor
@@ -2370,7 +2420,7 @@ mod tests {
         let expr = greater_than_i32(0, 1);
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[0, 2, 1, 5]);
-        let mut selection = SelectionVector::with_capacity(input.size());
+        let mut selection = paro_common::test_utils::test_selection_with_capacity(input.size());
 
         let selected = executor
             .select_into(0, &input, input.size(), &runtime, &mut selection)
@@ -2396,7 +2446,7 @@ mod tests {
         ));
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[0, 2, 3, 5]);
-        let mut selection = SelectionVector::with_capacity(input.size());
+        let mut selection = paro_common::test_utils::test_selection_with_capacity(input.size());
 
         let selected = executor
             .select_into(0, &input, input.size(), &runtime, &mut selection)
@@ -2426,11 +2476,15 @@ mod tests {
             reference_i32(1),
         ));
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![
-            nullable_i32_vector(&[Some(1), Some(1), Some(1), None, None]),
-            nullable_i32_vector(&[Some(1), Some(2), None, Some(1), None]),
-        ]);
-        let mut result = Vector::with_capacity(LogicalType::Boolean, input.size());
+        let input = Chunk::from_vectors(
+            vec![
+                nullable_i32_vector(&[Some(1), Some(1), Some(1), None, None]),
+                nullable_i32_vector(&[Some(1), Some(2), None, Some(1), None]),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, input.size());
 
         executor
             .execute_into(0, &input, None, input.size(), &runtime, &mut result)
@@ -2450,8 +2504,11 @@ mod tests {
         let expr = coalesce_i32_expr(vec![reference_i32(0), constant_i32(99)]);
         let mut executor = ExpressionExecutor::new(&expr);
         let input = nullable_integer_chunk(&[None, Some(7), None, Some(5)]);
-        let selection = SelectionVector::from_indices(vec![3, 0, 1]);
-        let mut result = Vector::with_capacity(LogicalType::Integer, selection.len());
+        let selection = paro_common::test_utils::test_selection(vec![3, 0, 1]);
+        let mut result = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::Integer,
+            selection.len(),
+        );
 
         executor
             .execute_into(
@@ -2479,8 +2536,10 @@ mod tests {
         let mut small_executor = ExpressionExecutor::new(&small_expr);
         let mut large_executor = ExpressionExecutor::new(&large_expr);
         let input = nullable_integer_chunk(&[Some(2), Some(3), None, Some(20)]);
-        let mut small_result = Vector::with_capacity(LogicalType::Boolean, input.size());
-        let mut large_result = Vector::with_capacity(LogicalType::Boolean, input.size());
+        let mut small_result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, input.size());
+        let mut large_result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, input.size());
 
         small_executor
             .execute_into(0, &input, None, input.size(), &runtime, &mut small_result)
@@ -2530,8 +2589,11 @@ mod tests {
         ));
         let mut executor = ExpressionExecutor::new(&expr);
         let input = boolean_chunk(&[Some(true), None, Some(false)]);
-        let selection = SelectionVector::from_indices(vec![2, 0, 1]);
-        let mut result = Vector::with_capacity(LogicalType::Boolean, selection.len());
+        let selection = paro_common::test_utils::test_selection(vec![2, 0, 1]);
+        let mut result = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::Boolean,
+            selection.len(),
+        );
 
         executor
             .execute_into(
@@ -2556,16 +2618,14 @@ mod tests {
         let (expr, counter) = cached_identity_expr(0);
         let mut executor = ExpressionExecutor::new(&expr);
 
-        let first_input = Chunk::from_vectors(vec![storage_dictionary_i32(
-            &[10, 20, 30],
-            vec![2, 0, 1, 0],
-            41,
-        )]);
-        let second_input = Chunk::from_vectors(vec![storage_dictionary_i32(
-            &[10, 20, 30],
-            vec![1, 1, 2],
-            41,
-        )]);
+        let first_input = Chunk::from_vectors(
+            vec![storage_dictionary_i32(&[10, 20, 30], vec![2, 0, 1, 0], 41)],
+            paro_common::test_utils::test_allocator(),
+        );
+        let second_input = Chunk::from_vectors(
+            vec![storage_dictionary_i32(&[10, 20, 30], vec![1, 1, 2], 41)],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let first = executor
             .execute_expression(0, &first_input, None, first_input.size(), &runtime)
@@ -2589,10 +2649,16 @@ mod tests {
         let runtime = test_runtime(session);
         let (expr, counter) = cached_identity_expr(0);
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![Vector::dictionary(
-            Arc::new(Vector::from_i32(&[10, 20, 30])),
-            vec![2, 0, 1, 0],
-        )]);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_dictionary(
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20, 30],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                vec![2, 0, 1, 0],
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let _ = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2616,10 +2682,16 @@ mod tests {
         let runtime = test_runtime(session);
         let (expr, counter) = cached_add_pair_expr(0, 1);
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![
-            storage_dictionary_i32(&[10, 20, 30], vec![2, 0, 1, 0], 52),
-            Vector::from_i32(&[1, 1, 1, 1]),
-        ]);
+        let input = Chunk::from_vectors(
+            vec![
+                storage_dictionary_i32(&[10, 20, 30], vec![2, 0, 1, 0], 52),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 1, 1, 1],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let first = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2640,16 +2712,14 @@ mod tests {
         let (expr, counter) = cached_identity_expr(0);
         let mut executor = ExpressionExecutor::new(&expr);
 
-        let first_input = Chunk::from_vectors(vec![storage_dictionary_i32(
-            &[10, 20, 30],
-            vec![2, 0, 1],
-            100,
-        )]);
-        let second_input = Chunk::from_vectors(vec![storage_dictionary_i32(
-            &[10, 20, 30],
-            vec![2, 0, 1],
-            101,
-        )]);
+        let first_input = Chunk::from_vectors(
+            vec![storage_dictionary_i32(&[10, 20, 30], vec![2, 0, 1], 100)],
+            paro_common::test_utils::test_allocator(),
+        );
+        let second_input = Chunk::from_vectors(
+            vec![storage_dictionary_i32(&[10, 20, 30], vec![2, 0, 1], 101)],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let _ = executor
             .execute_expression(0, &first_input, None, first_input.size(), &runtime)
@@ -2671,9 +2741,21 @@ mod tests {
             reference_i32(1),
         ));
         let mut executor = ExpressionExecutor::new(&expr);
-        let left = Vector::dictionary(Arc::new(Vector::from_i32(&[10, 20, 30])), vec![2, 0, 1]);
-        let right = Vector::dictionary(Arc::new(Vector::from_i32(&[30, 10, 10])), vec![0, 1, 1]);
-        let input = Chunk::from_vectors(vec![left, right]);
+        let left = paro_common::test_utils::test_dictionary(
+            Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20, 30],
+                paro_common::test_utils::test_allocator(),
+            )),
+            vec![2, 0, 1],
+        );
+        let right = paro_common::test_utils::test_dictionary(
+            Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                &[30, 10, 10],
+                paro_common::test_utils::test_allocator(),
+            )),
+            vec![0, 1, 1],
+        );
+        let input = paro_common::test_utils::test_chunk_from_vectors(vec![left, right]);
 
         let result = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2695,10 +2777,16 @@ mod tests {
             false,
         );
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![Vector::dictionary(
-            Arc::new(Vector::from_i32(&[10, 20, 30])),
-            vec![2, 0, 1],
-        )]);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_dictionary(
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20, 30],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                vec![2, 0, 1],
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let result = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2720,10 +2808,16 @@ mod tests {
             true,
         );
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![Vector::dictionary(
-            Arc::new(Vector::from_i64(&[127, 128, -129])),
-            vec![2, 0, 1],
-        )]);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_dictionary(
+                Arc::new(paro_common::test_utils::test_i64_vector_with_allocator(
+                    &[127, 128, -129],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                vec![2, 0, 1],
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let result = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2745,7 +2839,15 @@ mod tests {
             false,
         );
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![Vector::sequence(10, 3, 4)]);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_sequence_with_allocator(
+                10,
+                3,
+                4,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let result = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2768,10 +2870,13 @@ mod tests {
             false,
         );
         let mut executor = ExpressionExecutor::new(&expr);
-        let input = Chunk::from_vectors(vec![vector_from_i64_values(
-            LogicalType::Timestamp,
-            &[1_000_000, -42],
-        )]);
+        let input = Chunk::from_vectors(
+            vec![vector_from_i64_values(
+                LogicalType::Timestamp,
+                &[1_000_000, -42],
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let result = executor
             .execute_expression(0, &input, None, input.size(), &runtime)
@@ -2789,7 +2894,7 @@ mod tests {
         let expr = reference_i32(0);
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[10, 20, 30]);
-        let selection = SelectionVector::from_indices(vec![2, 0]);
+        let selection = paro_common::test_utils::test_selection(vec![2, 0]);
         let selection_allocation = selection.allocation_identity();
 
         let selected = executor
@@ -2826,7 +2931,7 @@ mod tests {
         ));
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[10, 20, 30]);
-        let selection = SelectionVector::from_indices(vec![1, 2]);
+        let selection = paro_common::test_utils::test_selection(vec![1, 2]);
         let selection_allocation = selection.allocation_identity();
 
         let selected = executor
@@ -2879,7 +2984,8 @@ mod tests {
         };
         assert!(function_state.intermediate_chunk.is_none());
 
-        let mut result = Vector::with_capacity(LogicalType::Integer, 1);
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, 1);
         let first_input = integer_chunk(&[1, 2]);
         executor
             .execute_into(
@@ -2979,7 +3085,8 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let mut executor = ExpressionExecutor::with_expressions(&[add_one_expr(0)]);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let first_input = integer_chunk(&[1, 2, 3]);
         executor

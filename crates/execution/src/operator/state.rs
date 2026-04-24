@@ -11,6 +11,7 @@
 use std::any::Any;
 use std::fmt;
 
+use crate::memory_runtime::OperatorMemoryScope;
 use crate::result_type::SinkFinalizeType;
 
 // ========== Progress Data ==========
@@ -156,7 +157,7 @@ impl GlobalOperatorState for EmptyGlobalOperatorState {
 /// Thread-local state for source operators.
 ///
 /// Each thread has its own LocalSourceState when scanning.
-pub trait LocalSourceState: Send + Sync + fmt::Debug {
+pub trait LocalSourceState: Send + fmt::Debug {
     /// Downcast to concrete type.
     fn as_any(&self) -> &dyn Any;
 
@@ -224,7 +225,7 @@ impl GlobalSourceState for EmptyGlobalSourceState {
 /// Thread-local state for sink operators.
 ///
 /// Each thread has its own LocalSinkState when writing.
-pub trait LocalSinkState: Send + Sync + fmt::Debug {
+pub trait LocalSinkState: Send + fmt::Debug {
     /// Downcast to concrete type.
     fn as_any(&self) -> &dyn Any;
 
@@ -329,10 +330,13 @@ pub struct OperatorSourceInput<'a> {
     pub local_state: &'a mut dyn LocalSourceState,
     /// Interrupt state for blocking operations
     pub interrupt_state: &'a InterruptState,
+    /// Grant-backed memory scope for this source call.
+    pub memory: OperatorMemoryScope<'a>,
 }
 
 impl<'a> OperatorSourceInput<'a> {
-    /// Create a new source input.
+    /// Create a test-only source input with an owner-backed tracked memory scope.
+    #[cfg(test)]
     pub fn new(
         global_state: &'a dyn GlobalSourceState,
         local_state: &'a mut dyn LocalSourceState,
@@ -342,6 +346,21 @@ impl<'a> OperatorSourceInput<'a> {
             global_state,
             local_state,
             interrupt_state,
+            memory: test_operator_memory_scope(),
+        }
+    }
+
+    pub fn with_memory(
+        global_state: &'a dyn GlobalSourceState,
+        local_state: &'a mut dyn LocalSourceState,
+        interrupt_state: &'a InterruptState,
+        memory: OperatorMemoryScope<'a>,
+    ) -> Self {
+        Self {
+            global_state,
+            local_state,
+            interrupt_state,
+            memory,
         }
     }
 }
@@ -356,10 +375,13 @@ pub struct OperatorSinkInput<'a> {
     pub local_state: &'a mut dyn LocalSinkState,
     /// Interrupt state for blocking operations
     pub interrupt_state: &'a InterruptState,
+    /// Grant-backed memory scope for this sink call.
+    pub memory: OperatorMemoryScope<'a>,
 }
 
 impl<'a> OperatorSinkInput<'a> {
-    /// Create a new sink input.
+    /// Create a test-only sink input with an owner-backed tracked memory scope.
+    #[cfg(test)]
     pub fn new(
         global_state: &'a dyn GlobalSinkState,
         local_state: &'a mut dyn LocalSinkState,
@@ -369,8 +391,50 @@ impl<'a> OperatorSinkInput<'a> {
             global_state,
             local_state,
             interrupt_state,
+            memory: test_operator_memory_scope(),
         }
     }
+
+    pub fn with_memory(
+        global_state: &'a dyn GlobalSinkState,
+        local_state: &'a mut dyn LocalSinkState,
+        interrupt_state: &'a InterruptState,
+        memory: OperatorMemoryScope<'a>,
+    ) -> Self {
+        Self {
+            global_state,
+            local_state,
+            interrupt_state,
+            memory,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_operator_memory_scope() -> OperatorMemoryScope<'static> {
+    use std::sync::Arc;
+
+    use paro_common::allocator::{Allocator, DefaultAllocator, MemoryTag};
+    use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
+
+    use crate::memory_runtime::{LocalMemoryGrant, OperatorMemoryAccount, QueryMemoryPool};
+
+    const TEST_OPERATOR_GRANT_BYTES: usize = 1024 * 1024 * 1024;
+
+    let pool = Arc::new(QueryMemoryPool::unbounded());
+    let account = Arc::new(OperatorMemoryAccount::new(pool));
+    let owner: Arc<dyn MemoryOwner> = account;
+    let allocator: Arc<dyn Allocator> = Arc::new(DefaultAllocator::new());
+    let grant = LocalMemoryGrant::new(
+        owner,
+        TEST_OPERATOR_GRANT_BYTES,
+        MemoryTag::Allocator,
+        MemoryAccountingClass::NonRevocable,
+        allocator,
+    )
+    .expect("test operator memory grant should be available");
+
+    OperatorMemoryScope::new(Box::leak(Box::new(grant)))
 }
 
 /// Input for sink combine operations.
@@ -381,10 +445,13 @@ pub struct OperatorSinkCombineInput<'a> {
     pub local_state: &'a mut dyn LocalSinkState,
     /// Interrupt state for blocking operations
     pub interrupt_state: &'a InterruptState,
+    /// Grant-backed memory scope for this combine call.
+    pub memory: OperatorMemoryScope<'a>,
 }
 
 impl<'a> OperatorSinkCombineInput<'a> {
-    /// Create a new combine input.
+    /// Create a test-only combine input with an owner-backed tracked memory scope.
+    #[cfg(test)]
     pub fn new(
         global_state: &'a dyn GlobalSinkState,
         local_state: &'a mut dyn LocalSinkState,
@@ -394,6 +461,22 @@ impl<'a> OperatorSinkCombineInput<'a> {
             global_state,
             local_state,
             interrupt_state,
+            memory: test_operator_memory_scope(),
+        }
+    }
+
+    /// Create a new combine input.
+    pub fn with_memory(
+        global_state: &'a dyn GlobalSinkState,
+        local_state: &'a mut dyn LocalSinkState,
+        interrupt_state: &'a InterruptState,
+        memory: OperatorMemoryScope<'a>,
+    ) -> Self {
+        Self {
+            global_state,
+            local_state,
+            interrupt_state,
+            memory,
         }
     }
 }

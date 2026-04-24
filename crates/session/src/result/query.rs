@@ -53,23 +53,25 @@ impl QueryResult {
     pub fn rows_changed(
         count: usize,
         allocator: std::sync::Arc<dyn paro_common::allocator::Allocator>,
-    ) -> Self {
-        Self {
+    ) -> paro_common::error::Result<Self> {
+        Ok(Self {
             names: Vec::new(),
             types: Vec::new(),
-            stream: ResultHandler::empty(allocator),
+            stream: ResultHandler::empty(allocator)?,
             rows_affected: count,
-        }
+        })
     }
 
     /// Create an empty result.
-    pub fn empty(allocator: std::sync::Arc<dyn paro_common::allocator::Allocator>) -> Self {
-        Self {
+    pub fn empty(
+        allocator: std::sync::Arc<dyn paro_common::allocator::Allocator>,
+    ) -> paro_common::error::Result<Self> {
+        Ok(Self {
             names: Vec::new(),
             types: Vec::new(),
-            stream: ResultHandler::empty(allocator),
+            stream: ResultHandler::empty(allocator)?,
             rows_affected: 0,
-        }
+        })
     }
 
     /// Get the number of columns.
@@ -94,7 +96,7 @@ impl QueryResult {
     pub fn collect_all(&mut self) -> Result<Vec<Chunk>> {
         let mut chunks = Vec::new();
         while let Some(chunk) = self.stream.fetch()? {
-            chunks.push(chunk.deep_copy_with_allocator(chunk.allocator().clone()));
+            chunks.push(chunk.try_deep_copy(chunk.allocator().clone())?);
         }
         Ok(chunks)
     }
@@ -187,13 +189,49 @@ impl QueryResult {
 mod tests {
     use super::*;
     use paro_common::allocator::default_allocator;
-    use paro_common::vector::Vector;
-    use std::sync::Arc;
+    use paro_context::StatementCancellation;
+    use paro_execution::memory_runtime::{OutputAppendResult, QueryOutputBuffer};
+    use paro_scheduler::coordinator::EventCoordinator;
+    use paro_scheduler::scheduler::TaskScheduler;
+    use std::sync::{Arc, Mutex};
+
+    fn materialized_stream(
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: Vec<Chunk>,
+        allocator: Arc<dyn paro_common::allocator::Allocator>,
+    ) -> ResultHandler {
+        let buffer = Arc::new(Mutex::new(QueryOutputBuffer::detached(
+            64 * 1024 * 1024,
+            allocator.clone(),
+        )));
+        {
+            let mut buffer_guard = buffer.lock().unwrap();
+            for chunk in chunks {
+                assert!(matches!(
+                    buffer_guard.try_append(chunk),
+                    Ok(OutputAppendResult::Success)
+                ));
+            }
+            buffer_guard.close();
+        }
+
+        ResultHandler::new(
+            names,
+            types,
+            buffer,
+            Arc::new(EventCoordinator::new(Arc::new(TaskScheduler::new()))),
+            StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+            allocator,
+            None,
+        )
+        .expect("test result handler allocation failed")
+    }
 
     #[test]
     fn test_empty_result() {
         let allocator = Arc::new(default_allocator().clone());
-        let mut result = QueryResult::empty(allocator);
+        let mut result = QueryResult::empty(allocator).unwrap();
         assert!(result.is_query() == false);
         assert_eq!(result.column_count(), 0);
         assert!(result.collect_all().unwrap().is_empty());
@@ -202,11 +240,17 @@ mod tests {
     #[test]
     fn test_result_with_data() {
         let allocator = Arc::new(default_allocator().clone());
-        let v1 = Vector::from_i32(&[1, 2, 3]);
-        let v2 = Vector::from_strings(&["a", "b", "c"]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
+        let v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "b", "c"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
 
-        let stream = ResultHandler::from_materialized_for_test(
+        let stream = materialized_stream(
             vec!["id".to_string(), "name".to_string()],
             vec![LogicalType::Integer, LogicalType::Varchar],
             vec![chunk],
@@ -230,10 +274,13 @@ mod tests {
     #[test]
     fn test_to_string_rows() {
         let allocator = Arc::new(default_allocator().clone());
-        let v1 = Vector::from_i32(&[10, 20]);
-        let chunk = Chunk::from_vectors(vec![v1]);
+        let v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[10, 20],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1]);
 
-        let stream = ResultHandler::from_materialized_for_test(
+        let stream = materialized_stream(
             vec!["value".to_string()],
             vec![LogicalType::Integer],
             vec![chunk],

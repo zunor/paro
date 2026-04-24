@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_predicate_tree;
+use crate::memory_runtime::PrefetchLease;
 use crate::operator::scan::{column_pruning, late_materialize, memory_budget};
 use crate::operator::state::{
     GlobalSourceState, LocalSourceState, OperatorSourceInput, ProgressData,
@@ -22,8 +23,9 @@ use crate::result_type::SourceResultType;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryReleaseHandle};
 use paro_common::types::LogicalType;
-use paro_storage::buffer::{PageCache, Prefetcher, TemporaryMemoryState};
+use paro_storage::buffer::{PageCache, Prefetcher};
 use paro_storage::compression::ParallelDecompressor;
 use paro_storage::index::PredicateTree;
 use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
@@ -156,6 +158,7 @@ struct RowsetScanLocalState {
     reader: Option<TabletReader>,
     current_segment_total_rows: u64,
     current_segment_output_rows: u64,
+    late_materialize_reservation: Option<MemoryReleaseHandle>,
 }
 
 impl LocalSourceState for RowsetScanLocalState {
@@ -165,6 +168,13 @@ impl LocalSourceState for RowsetScanLocalState {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+impl RowsetScanLocalState {
+    fn clear_reader(&mut self) {
+        self.reader = None;
+        self.late_materialize_reservation = None;
     }
 }
 
@@ -180,8 +190,6 @@ struct RowsetScanGlobalState {
     segment_options: Option<SegmentOptions>,
     prefetcher: Option<Arc<Prefetcher>>,
     late_materialize_plan: Option<late_materialize::LateMaterializePlan>,
-    late_materialize_state: Option<Arc<TemporaryMemoryState>>,
-    scan_memory_state: Arc<TemporaryMemoryState>,
     scan_budget_config: memory_budget::ScanMemoryBudgetConfig,
 }
 
@@ -201,10 +209,6 @@ impl GlobalSourceState for RowsetScanGlobalState {
 
 impl Drop for RowsetScanGlobalState {
     fn drop(&mut self) {
-        self.scan_memory_state.set_zero();
-        if let Some(state) = &self.late_materialize_state {
-            state.set_zero();
-        }
         if let Some(prefetcher) = &self.prefetcher {
             prefetcher.record_waste();
         }
@@ -309,25 +313,25 @@ impl PhysicalOperator for PhysicalRowsetScan {
             };
         let projected_columns = column_projection.read_columns().len().max(1);
 
-        let tmm_cfg = ctx.temporary_memory_manager().current_config();
-        let scan_memory_state = ctx.temporary_memory_manager().register();
         let base_scan_budget_cfg = memory_budget::ScanMemoryBudgetConfig::new(
             projected_columns,
             1,
             batch_size,
             ctx.num_threads(),
-            tmm_cfg.query_max_memory,
-            tmm_cfg.force_external,
+            ctx.query_max_memory(),
+            ctx.force_external(),
         );
-        let initial_scan_budget =
-            memory_budget::plan_scan_memory_budget(&scan_memory_state, &base_scan_budget_cfg);
+        let initial_scan_budget = memory_budget::plan_scan_memory_budget(&base_scan_budget_cfg);
 
         let page_cache = Arc::new(PageCache::new(ctx.buffer_pool().clone()));
-        let prefetch_state = ctx.temporary_memory_manager().register();
+        let prefetch_lease = Arc::new(PrefetchLease::new(
+            ctx.operator_memory_account(),
+            initial_scan_budget.prefetch_target_bytes,
+        ));
         let prefetcher = Arc::new(Prefetcher::new(
             page_cache.clone(),
             ctx.session.scheduler().clone(),
-            prefetch_state,
+            prefetch_lease,
             initial_scan_budget.prefetch_options(),
         ));
         prefetcher.update_target_bytes(initial_scan_budget.prefetch_target_bytes);
@@ -346,8 +350,7 @@ impl PhysicalOperator for PhysicalRowsetScan {
         });
 
         let scan_budget_config = base_scan_budget_cfg.with_segment_count(segments.len().max(1));
-        let scan_budget =
-            memory_budget::plan_scan_memory_budget(&scan_memory_state, &scan_budget_config);
+        let scan_budget = memory_budget::plan_scan_memory_budget(&scan_budget_config);
         prefetcher.update_target_bytes(scan_budget.prefetch_target_bytes);
         let max_scan_threads = if segments.is_empty() {
             1
@@ -355,16 +358,13 @@ impl PhysicalOperator for PhysicalRowsetScan {
             scan_budget.max_scan_threads.min(segments.len()).max(1)
         };
 
-        let late_materialize_state = ctx.temporary_memory_manager().register();
         let mut late_materialize_plan = late_materialize::plan_late_materialization(
             self.bind_data.predicate_tree.as_ref(),
             &column_projection,
             batch_size,
-            &late_materialize_state,
         );
         if scan_budget.externalize && late_materialize_plan.enabled {
             late_materialize_plan.enabled = false;
-            late_materialize_state.set_zero();
         }
 
         Ok(Box::new(RowsetScanGlobalState {
@@ -378,8 +378,6 @@ impl PhysicalOperator for PhysicalRowsetScan {
             segment_options: Some(segment_options),
             prefetcher: Some(prefetcher),
             late_materialize_plan: Some(late_materialize_plan),
-            late_materialize_state: Some(late_materialize_state),
-            scan_memory_state,
             scan_budget_config,
         }))
     }
@@ -424,10 +422,7 @@ impl PhysicalOperator for PhysicalRowsetScan {
                     .scan_budget_config
                     .clone()
                     .with_segment_count(remaining_segments);
-                let runtime_budget = memory_budget::plan_scan_memory_budget(
-                    &gstate.scan_memory_state,
-                    &runtime_budget_cfg,
-                );
+                let runtime_budget = memory_budget::plan_scan_memory_budget(&runtime_budget_cfg);
                 if runtime_budget.backpressure {
                     std::thread::yield_now();
                 }
@@ -455,7 +450,22 @@ impl PhysicalOperator for PhysicalRowsetScan {
                 }
                 if let Some(plan) = &gstate.late_materialize_plan {
                     if plan.enabled && !runtime_budget.externalize {
+                        let reservation = input
+                            .memory
+                            .local_grant()
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "rowset scan late materialization requires tracked memory"
+                                        .to_string(),
+                                )
+                            })?
+                            .retain_external_allocation_handle(
+                                MemoryTag::ColumnData,
+                                MemoryAccountingClass::NonRevocable,
+                                plan.required_bytes,
+                            )?;
                         params = params.with_late_materialize(plan.predicate_columns.clone());
+                        lstate.late_materialize_reservation = Some(reservation);
                     }
                 }
 
@@ -495,7 +505,7 @@ impl PhysicalOperator for PhysicalRowsetScan {
                     lstate.current_segment_output_rows = 0;
 
                     // Segment finished, try next one
-                    lstate.reader = None;
+                    lstate.clear_reader();
                     continue;
                 }
             }

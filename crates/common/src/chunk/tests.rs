@@ -4,17 +4,20 @@
 use super::*;
 use crate::runtime_value::Value;
 use crate::types::LogicalType;
-use crate::vector::{AllocationSet, SelectionVector, Vector, VectorType, VECTOR_SIZE};
+use crate::vector::{AllocationSet, VectorType, VECTOR_SIZE};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 fn make_int_string_chunk(ids: &[i32], labels: &[&str]) -> Chunk {
-    Chunk::from_vectors(vec![Vector::from_i32(ids), Vector::from_strings(labels)])
+    crate::test_utils::test_chunk_from_vectors(vec![
+        crate::test_utils::test_i32_vector(ids),
+        crate::test_utils::test_string_vector(labels),
+    ])
 }
 
 #[test]
 fn test_empty_chunk() {
-    let chunk = Chunk::new();
+    let chunk = crate::test_utils::test_new_chunk();
     assert!(chunk.is_empty());
     assert_eq!(chunk.column_count(), 0);
     assert_eq!(chunk.capacity(), VECTOR_SIZE);
@@ -23,7 +26,7 @@ fn test_empty_chunk() {
 #[test]
 fn test_initialize() {
     let types = vec![LogicalType::Integer, LogicalType::Varchar];
-    let chunk = Chunk::initialize(&types, 1024);
+    let chunk = crate::test_utils::test_chunk_with_capacity(&types, 1024);
     assert_eq!(chunk.column_count(), 2);
     assert!(chunk.is_empty());
     assert_eq!(chunk.capacity(), 1024);
@@ -32,17 +35,17 @@ fn test_initialize() {
 #[test]
 fn test_init_empty() {
     let types = vec![LogicalType::BigInt, LogicalType::Boolean];
-    let chunk = Chunk::init_empty(&types);
+    let chunk = crate::test_utils::test_empty_chunk(&types);
     assert_eq!(chunk.column_count(), 2);
     assert_eq!(chunk.types(), types);
 }
 
 #[test]
 fn test_from_vectors() {
-    let v1 = Vector::from_i32(&[1, 2, 3]);
-    let v2 = Vector::from_strings(&["a", "b", "c"]);
+    let v1 = crate::test_utils::test_i32_vector(&[1, 2, 3]);
+    let v2 = crate::test_utils::test_string_vector(&["a", "b", "c"]);
 
-    let chunk = Chunk::from_vectors(vec![v1, v2]);
+    let chunk = crate::test_utils::test_chunk_from_vectors(vec![v1, v2]);
     assert_eq!(chunk.size(), 3);
     assert_eq!(chunk.column_count(), 2);
 
@@ -53,7 +56,7 @@ fn test_from_vectors() {
 #[test]
 fn test_set_cardinality() {
     let types = vec![LogicalType::Integer];
-    let mut chunk = Chunk::initialize(&types, 100);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 100);
 
     chunk.set_cardinality(50);
     assert_eq!(chunk.size(), 50);
@@ -62,8 +65,8 @@ fn test_set_cardinality() {
 #[test]
 fn test_set_cardinality_preserves_shared_column_already_at_target_count() {
     let types = vec![LogicalType::Integer, LogicalType::Integer];
-    let mut chunk = Chunk::initialize(&types, 8);
-    let shared = Arc::new(Vector::from_i32(&[11, 22]));
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 8);
+    let shared = Arc::new(crate::test_utils::test_i32_vector(&[11, 22]));
 
     chunk.data[0] = shared.clone();
     chunk.set_cardinality(2);
@@ -75,8 +78,8 @@ fn test_set_cardinality_preserves_shared_column_already_at_target_count() {
 
 #[test]
 fn test_set_cardinality_same_count_skips_shared_cow() {
-    let shared = Arc::new(Vector::from_i32(&[7, 8]));
-    let mut chunk = Chunk::from_arc_vectors(vec![shared.clone()]);
+    let shared = Arc::new(crate::test_utils::test_i32_vector(&[7, 8]));
+    let mut chunk = crate::test_utils::test_chunk_from_arc_vectors(vec![shared.clone()]);
 
     chunk.set_cardinality(2);
 
@@ -86,28 +89,30 @@ fn test_set_cardinality_same_count_skips_shared_cow() {
 
 #[test]
 fn test_reset() {
-    let v1 = Vector::from_i64(&[10, 20, 30]);
-    let mut chunk = Chunk::from_vectors(vec![v1]);
+    let v1 = crate::test_utils::test_i64_vector(&[10, 20, 30]);
+    let mut chunk = crate::test_utils::test_chunk_from_vectors(vec![v1]);
 
     assert_eq!(chunk.size(), 3);
-    chunk.reset();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
     assert_eq!(chunk.size(), 0);
     assert_eq!(chunk.column_count(), 1);
 }
 
 #[test]
 fn test_all_constant() {
-    let v1 = Vector::constant::<i32>(LogicalType::Integer, 42, 100);
-    let v2 = Vector::constant::<i64>(LogicalType::BigInt, 99, 100);
+    let v1 = crate::test_utils::test_constant::<i32>(LogicalType::Integer, 42, 100);
+    let v2 = crate::test_utils::test_constant::<i64>(LogicalType::BigInt, 99, 100);
 
-    let chunk = Chunk::from_vectors(vec![v1, v2]);
+    let chunk = crate::test_utils::test_chunk_from_vectors(vec![v1, v2]);
     assert!(chunk.all_constant());
 }
 
 #[test]
 fn test_flatten() {
-    let v1 = Vector::constant::<i32>(LogicalType::Integer, 5, 10);
-    let mut chunk = Chunk::from_vectors(vec![v1]);
+    let v1 = crate::test_utils::test_constant::<i32>(LogicalType::Integer, 5, 10);
+    let mut chunk = crate::test_utils::test_chunk_from_vectors(vec![v1]);
 
     assert_eq!(chunk.data[0].vector_type(), VectorType::Constant);
     chunk.flatten();
@@ -116,12 +121,12 @@ fn test_flatten() {
 
 #[test]
 fn test_split_fuse() {
-    let v1 = Vector::from_i32(&[1, 2]);
-    let v2 = Vector::from_strings(&["a", "b"]);
-    let v3 = Vector::from_bool(&[true, false]);
+    let v1 = crate::test_utils::test_i32_vector(&[1, 2]);
+    let v2 = crate::test_utils::test_string_vector(&["a", "b"]);
+    let v3 = crate::test_utils::test_bool_vector(&[true, false]);
 
-    let mut chunk = Chunk::from_vectors(vec![v1, v2, v3]);
-    let mut other = Chunk::new();
+    let mut chunk = crate::test_utils::test_chunk_from_vectors(vec![v1, v2, v3]);
+    let mut other = crate::test_utils::test_new_chunk();
 
     chunk.split(&mut other, 1);
 
@@ -139,10 +144,16 @@ fn test_fuse_drops_reset_state_when_allocators_differ() {
 
     let left_allocator = Arc::new(DefaultAllocator::new());
     let right_allocator = Arc::new(DefaultAllocator::new());
-    let mut left =
-        Chunk::initialize_with_allocator(&[LogicalType::Integer], 4, left_allocator.clone());
-    let mut right =
-        Chunk::initialize_with_allocator(&[LogicalType::Varchar], 4, right_allocator.clone());
+    let mut left = crate::test_utils::test_chunk_with_capacity_and_allocator(
+        &[LogicalType::Integer],
+        4,
+        left_allocator.clone(),
+    );
+    let mut right = crate::test_utils::test_chunk_with_capacity_and_allocator(
+        &[LogicalType::Varchar],
+        4,
+        right_allocator.clone(),
+    );
 
     left.set_cardinality(1);
     left.set_value(0, 0, &Value::Integer(7)).unwrap();
@@ -167,9 +178,9 @@ fn test_fuse_drops_reset_state_when_allocators_differ() {
 
 #[test]
 fn test_types() {
-    let v1 = Vector::from_i32(&[1, 2]);
-    let v2 = Vector::from_strings(&["x", "y"]);
-    let chunk = Chunk::from_vectors(vec![v1, v2]);
+    let v1 = crate::test_utils::test_i32_vector(&[1, 2]);
+    let v2 = crate::test_utils::test_string_vector(&["x", "y"]);
+    let chunk = crate::test_utils::test_chunk_from_vectors(vec![v1, v2]);
 
     let types = chunk.types();
     assert_eq!(types, vec![LogicalType::Integer, LogicalType::Varchar]);
@@ -181,7 +192,8 @@ fn test_allocator_propagation() {
 
     let allocator = Arc::new(DefaultAllocator::new());
     let types = vec![LogicalType::Integer];
-    let mut chunk = Chunk::initialize_with_allocator(&types, 100, allocator.clone());
+    let mut chunk =
+        crate::test_utils::test_chunk_with_capacity_and_allocator(&types, 100, allocator.clone());
 
     assert_eq!(chunk.allocator.name(), "DefaultAllocator");
     assert_eq!(
@@ -190,7 +202,9 @@ fn test_allocator_propagation() {
     );
 
     // Reset should preserve allocator
-    chunk.reset();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
     assert_eq!(
         chunk.column(0).unwrap().allocator().name(),
         "DefaultAllocator"
@@ -203,7 +217,8 @@ fn test_reset_restores_schema_capacity_and_allocator() {
 
     let allocator = Arc::new(DefaultAllocator::new());
     let types = vec![LogicalType::Integer, LogicalType::Varchar];
-    let mut chunk = Chunk::initialize_with_allocator(&types, 4, allocator.clone());
+    let mut chunk =
+        crate::test_utils::test_chunk_with_capacity_and_allocator(&types, 4, allocator.clone());
 
     chunk.set_cardinality(2);
     chunk.column_mut(0).unwrap().set_i32(0, 10);
@@ -212,7 +227,9 @@ fn test_reset_restores_schema_capacity_and_allocator() {
     chunk.column_mut(1).unwrap().set_string(1, "twenty");
     chunk.set_capacity(9);
 
-    chunk.reset();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
 
     assert_eq!(chunk.size(), 0);
     assert_eq!(chunk.capacity(), 4);
@@ -232,10 +249,12 @@ fn test_reset_restores_schema_capacity_and_allocator() {
 
 #[test]
 fn test_reset_keeps_flat_buffer_writable() {
-    let mut chunk = Chunk::initialize(&[LogicalType::Integer], 8);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 8);
 
     for value in 0..4 {
-        chunk.reset();
+        chunk
+            .try_reset(chunk.allocator().clone())
+            .expect("test chunk reset allocation failed");
         chunk.set_cardinality(1);
 
         let before = chunk.column(0).unwrap().as_slice::<i32>().as_ptr() as usize;
@@ -259,7 +278,7 @@ fn test_reset_preserves_nested_vector_writability() {
         LogicalType::List(Box::new(LogicalType::Integer)),
         LogicalType::Struct(struct_fields.clone()),
     ];
-    let mut chunk = Chunk::initialize(&types, 4);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 4);
 
     chunk.set_cardinality(2);
     chunk.column_mut(0).unwrap().set_string(0, "alpha");
@@ -306,7 +325,9 @@ fn test_reset_preserves_nested_vector_writability() {
         ),
     );
 
-    chunk.reset();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
     chunk.set_cardinality(1);
     chunk.column_mut(0).unwrap().set_string(0, "gamma");
     chunk.column_mut(1).unwrap().set_value(
@@ -360,14 +381,16 @@ fn test_reset_preserves_nested_vector_writability() {
 #[test]
 fn test_reference_reset_returns_to_own_initialized_state() {
     let types = vec![LogicalType::Integer, LogicalType::Varchar];
-    let mut reusable = Chunk::initialize(&types, 3);
+    let mut reusable = crate::test_utils::test_chunk_with_capacity(&types, 3);
     let source = make_int_string_chunk(&[10, 20], &["ten", "twenty"]);
 
     reusable.reference(&source);
     assert_eq!(reusable.size(), 2);
     assert_eq!(reusable.column(0).unwrap().get_i32(1), Some(20));
 
-    reusable.reset();
+    reusable
+        .try_reset(reusable.allocator().clone())
+        .expect("test chunk reset allocation failed");
 
     assert_eq!(reusable.size(), 0);
     assert_eq!(reusable.capacity(), 3);
@@ -382,18 +405,20 @@ fn test_reference_reset_returns_to_own_initialized_state() {
 
 #[test]
 fn test_move_from_preserves_reset_state() {
-    let mut source = Chunk::initialize(&[LogicalType::Integer], 5);
+    let mut source = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 5);
     source.set_cardinality(1);
     source.column_mut(0).unwrap().set_i32(0, 42);
 
-    let mut target = Chunk::new();
+    let mut target = crate::test_utils::test_new_chunk();
     target.move_from(&mut source);
 
     assert_eq!(source.column_count(), 0);
     assert_eq!(target.size(), 1);
     assert_eq!(target.column(0).unwrap().get_i32(0), Some(42));
 
-    target.reset();
+    target
+        .try_reset(target.allocator().clone())
+        .expect("test chunk reset allocation failed");
     assert_eq!(target.capacity(), 5);
     target.set_cardinality(1);
     target.column_mut(0).unwrap().set_i32(0, 99);
@@ -403,16 +428,19 @@ fn test_move_from_preserves_reset_state() {
 #[test]
 fn test_split_transfers_reset_state() {
     let types = vec![LogicalType::Integer, LogicalType::Varchar];
-    let mut chunk = Chunk::initialize(&types, 4);
-    let mut tail = Chunk::new();
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 4);
+    let mut tail = crate::test_utils::test_new_chunk();
 
     chunk.split(&mut tail, 1);
 
     assert_eq!(chunk.column_count(), 1);
     assert_eq!(tail.column_count(), 1);
 
-    chunk.reset();
-    tail.reset();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
+    tail.try_reset(tail.allocator().clone())
+        .expect("test chunk reset allocation failed");
 
     chunk.set_cardinality(1);
     chunk.column_mut(0).unwrap().set_i32(0, 1);
@@ -425,8 +453,8 @@ fn test_split_transfers_reset_state() {
 
 #[test]
 fn test_fuse_combines_reset_state_when_capacities_match() {
-    let mut left = Chunk::initialize(&[LogicalType::Integer], 4);
-    let mut right = Chunk::initialize(&[LogicalType::Varchar], 4);
+    let mut left = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 4);
+    let mut right = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], 4);
 
     left.set_cardinality(1);
     left.column_mut(0).unwrap().set_i32(0, 10);
@@ -438,7 +466,8 @@ fn test_fuse_combines_reset_state_when_capacities_match() {
     assert_eq!(left.column_count(), 2);
     assert_eq!(right.column_count(), 0);
 
-    left.reset();
+    left.try_reset(left.allocator().clone())
+        .expect("test chunk reset allocation failed");
     left.set_cardinality(1);
     left.column_mut(0).unwrap().set_i32(0, 20);
     left.column_mut(1).unwrap().set_string(0, "twenty");
@@ -449,10 +478,12 @@ fn test_fuse_combines_reset_state_when_capacities_match() {
 
 #[test]
 fn test_destroy_clears_reset_state() {
-    let mut chunk = Chunk::initialize(&[LogicalType::Integer], 4);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 4);
 
     chunk.destroy();
-    chunk.reset();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
 
     assert_eq!(chunk.column_count(), 0);
     assert_eq!(chunk.capacity(), 0);
@@ -461,7 +492,10 @@ fn test_destroy_clears_reset_state() {
 
 #[test]
 fn test_chunk_get_set_value_with_bounds_checks() {
-    let mut chunk = Chunk::initialize(&[LogicalType::Integer, LogicalType::Varchar], 2);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Varchar],
+        2,
+    );
     chunk.set_cardinality(2);
 
     assert_eq!(chunk.set_value(0, 0, &Value::Integer(42)), Some(()));
@@ -483,12 +517,15 @@ fn test_chunk_get_set_value_with_bounds_checks() {
 
 #[test]
 fn test_reference_columns_references_selected_columns_and_preserves_reset_state() {
-    let source = Chunk::from_vectors(vec![
-        Vector::from_i32(&[10, 20]),
-        Vector::from_strings(&["ten", "twenty"]),
-        Vector::from_bool(&[true, false]),
+    let source = crate::test_utils::test_chunk_from_vectors(vec![
+        crate::test_utils::test_i32_vector(&[10, 20]),
+        crate::test_utils::test_string_vector(&["ten", "twenty"]),
+        crate::test_utils::test_bool_vector(&[true, false]),
     ]);
-    let mut target = Chunk::initialize(&[LogicalType::Varchar, LogicalType::Integer], 3);
+    let mut target = crate::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Varchar, LogicalType::Integer],
+        3,
+    );
 
     target.reference_columns(&source, &[1, 0]);
 
@@ -499,7 +536,9 @@ fn test_reference_columns_references_selected_columns_and_preserves_reset_state(
     );
     assert_eq!(target.get_value(1, 1), Some(Value::Integer(20)));
 
-    target.reset();
+    target
+        .try_reset(target.allocator().clone())
+        .expect("test chunk reset allocation failed");
     assert_eq!(target.size(), 0);
     assert_eq!(
         target.types(),
@@ -521,7 +560,7 @@ fn test_reference_columns_references_selected_columns_and_preserves_reset_state(
 
 #[test]
 fn test_get_allocation_size_is_non_zero_and_grows_with_string_heap_usage() {
-    let mut chunk = Chunk::initialize(&[LogicalType::Varchar], 2);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], 2);
     let before = chunk.get_allocation_size();
 
     chunk.set_cardinality(2);
@@ -547,10 +586,13 @@ fn test_get_allocation_size_is_non_zero_and_grows_with_string_heap_usage() {
 
 #[test]
 fn test_allocation_size_deduplicates_shared_dictionary_child_within_chunk() {
-    let shared = Arc::new(Vector::from_i32(&[1, 2, 3, 4]));
-    let dict1 = Arc::new(Vector::dictionary(shared.clone(), vec![0, 1, 2]));
-    let dict2 = Arc::new(Vector::dictionary(shared, vec![2, 3, 1]));
-    let chunk = Chunk::from_arc_vectors(vec![dict1.clone(), dict2.clone()]);
+    let shared = Arc::new(crate::test_utils::test_i32_vector(&[1, 2, 3, 4]));
+    let dict1 = Arc::new(crate::test_utils::test_dictionary(
+        shared.clone(),
+        vec![0, 1, 2],
+    ));
+    let dict2 = Arc::new(crate::test_utils::test_dictionary(shared, vec![2, 3, 1]));
+    let chunk = crate::test_utils::test_chunk_from_arc_vectors(vec![dict1.clone(), dict2.clone()]);
 
     let combined = chunk.get_allocation_size();
     let separate = {
@@ -566,12 +608,13 @@ fn test_allocation_size_deduplicates_shared_dictionary_child_within_chunk() {
 
 #[test]
 fn test_allocation_set_deduplicates_shared_allocations_across_chunks() {
-    let shared = Arc::new(Vector::from_i32(&[10, 20, 30, 40]));
-    let chunk1 = Chunk::from_arc_vectors(vec![Arc::new(Vector::dictionary(
-        shared.clone(),
-        vec![0, 1, 2],
-    ))]);
-    let chunk2 = Chunk::from_arc_vectors(vec![Arc::new(Vector::dictionary(shared, vec![2, 3, 1]))]);
+    let shared = Arc::new(crate::test_utils::test_i32_vector(&[10, 20, 30, 40]));
+    let chunk1 = crate::test_utils::test_chunk_from_arc_vectors(vec![Arc::new(
+        crate::test_utils::test_dictionary(shared.clone(), vec![0, 1, 2]),
+    )]);
+    let chunk2 = crate::test_utils::test_chunk_from_arc_vectors(vec![Arc::new(
+        crate::test_utils::test_dictionary(shared, vec![2, 3, 1]),
+    )]);
 
     let separate = chunk1.get_allocation_size() + chunk2.get_allocation_size();
     let mut allocations = AllocationSet::new();
@@ -584,7 +627,7 @@ fn test_allocation_set_deduplicates_shared_allocations_across_chunks() {
 
 #[test]
 fn test_verify_accepts_consistent_chunk() {
-    let mut chunk = Chunk::initialize(
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(
         &[
             LogicalType::Integer,
             LogicalType::List(Box::new(LogicalType::Integer)),
@@ -610,7 +653,7 @@ fn test_verify_accepts_consistent_chunk() {
 #[cfg(debug_assertions)]
 #[test]
 fn test_verify_panics_on_invalid_chunk_state() {
-    let mut chunk = Chunk::initialize(&[LogicalType::Integer], 4);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 4);
     chunk.set_cardinality(1);
     chunk.capacity = 0;
 
@@ -623,7 +666,7 @@ fn test_verify_panics_on_invalid_chunk_state() {
 fn test_verify_panics_on_reset_allocator_mismatch() {
     use crate::allocator::DefaultAllocator;
 
-    let mut chunk = Chunk::initialize_with_allocator(
+    let mut chunk = crate::test_utils::test_chunk_with_capacity_and_allocator(
         &[LogicalType::Integer],
         4,
         Arc::new(DefaultAllocator::new()),
@@ -639,7 +682,9 @@ fn test_append_copies_rows() {
     let mut chunk = make_int_string_chunk(&[1, 2], &["a", "b"]);
     let other = make_int_string_chunk(&[3, 4], &["c", "d"]);
 
-    chunk.append(&other);
+    chunk
+        .try_append(&other)
+        .expect("test chunk append allocation failed");
 
     assert_eq!(chunk.size(), 4);
     assert_eq!(chunk.column(0).unwrap().get_i32(2), Some(3));
@@ -651,13 +696,15 @@ fn test_append_copies_rows() {
 #[test]
 fn test_append_grows_capacity_and_preserves_values() {
     let types = vec![LogicalType::Integer, LogicalType::Varchar];
-    let mut chunk = Chunk::initialize(&types, 1);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 1);
     chunk.set_cardinality(1);
     chunk.column_mut(0).unwrap().set_i32(0, 10);
     chunk.column_mut(1).unwrap().set_string(0, "ten");
 
     let other = make_int_string_chunk(&[20, 30], &["twenty", "thirty"]);
-    chunk.append(&other);
+    chunk
+        .try_append(&other)
+        .expect("test chunk append allocation failed");
 
     assert!(chunk.capacity() >= 3);
     assert_eq!(chunk.size(), 3);
@@ -672,9 +719,11 @@ fn test_append_grows_capacity_and_preserves_values() {
 #[test]
 fn test_slice_filters_rows_with_dictionary_vectors() {
     let mut chunk = make_int_string_chunk(&[10, 20, 30], &["ten", "twenty", "thirty"]);
-    let sel = SelectionVector::from_indices(vec![2, 0]);
+    let sel = crate::test_utils::test_selection(vec![2, 0]);
 
-    chunk.slice(&sel, 2);
+    chunk
+        .try_slice(&sel, 2)
+        .expect("test chunk slice allocation failed");
 
     assert_eq!(chunk.size(), 2);
     assert_eq!(
@@ -690,10 +739,12 @@ fn test_slice_filters_rows_with_dictionary_vectors() {
 #[test]
 fn test_slice_reuses_selection_allocation_across_columns() {
     let mut chunk = make_int_string_chunk(&[10, 20, 30], &["ten", "twenty", "thirty"]);
-    let sel = SelectionVector::from_indices(vec![2, 0]);
+    let sel = crate::test_utils::test_selection(vec![2, 0]);
     let selection_allocation = sel.allocation_identity();
 
-    chunk.slice(&sel, 2);
+    chunk
+        .try_slice(&sel, 2)
+        .expect("test chunk slice allocation failed");
 
     let left_sel = chunk
         .column(0)
@@ -712,12 +763,14 @@ fn test_slice_reuses_selection_allocation_across_columns() {
 
 #[test]
 fn test_slice_collapses_nested_dictionary() {
-    let base = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
-    let dict = Arc::new(Vector::dictionary(base, vec![3, 1, 2]));
-    let mut chunk = Chunk::from_arc_vectors(vec![dict]);
-    let sel = SelectionVector::from_indices(vec![1, 2]);
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
+    let dict = Arc::new(crate::test_utils::test_dictionary(base, vec![3, 1, 2]));
+    let mut chunk = crate::test_utils::test_chunk_from_arc_vectors(vec![dict]);
+    let sel = crate::test_utils::test_selection(vec![1, 2]);
 
-    chunk.slice(&sel, 2);
+    chunk
+        .try_slice(&sel, 2)
+        .expect("test chunk slice allocation failed");
 
     let column = chunk.column(0).unwrap();
     assert_eq!(chunk.size(), 2);
@@ -731,16 +784,43 @@ fn test_slice_collapses_nested_dictionary() {
 }
 
 #[test]
+fn test_slice_range_uses_range_selection() {
+    let mut chunk = make_int_string_chunk(&[10, 20, 30, 40], &["ten", "twenty", "thirty", "forty"]);
+
+    chunk
+        .try_slice_range(1, 2)
+        .expect("test chunk range slice allocation failed");
+
+    assert_eq!(chunk.size(), 2);
+    assert!(matches!(
+        chunk.column(0).unwrap().selection(),
+        crate::vector::VectorSelection::Range {
+            offset: 1,
+            count: 2
+        }
+    ));
+    assert!(chunk.column(0).unwrap().sel_vector().is_none());
+    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(20));
+    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(30));
+    assert_eq!(chunk.column(1).unwrap().get_string(0), Some("twenty"));
+    assert_eq!(chunk.column(1).unwrap().get_string(1), Some("thirty"));
+}
+
+#[test]
 fn test_slice_preserves_array_values() {
     let embeddings = vec![
         vec![1.0f32, 2.0, 3.0],
         vec![4.0f32, 5.0, 6.0],
         vec![7.0f32, 8.0, 9.0],
     ];
-    let mut chunk = Chunk::from_vectors(vec![Vector::from_embeddings(&embeddings, 3)]);
-    let sel = SelectionVector::from_indices(vec![2, 0]);
+    let mut chunk = crate::test_utils::test_chunk_from_vectors(vec![
+        crate::test_utils::test_embeddings_vector(&embeddings, 3),
+    ]);
+    let sel = crate::test_utils::test_selection(vec![2, 0]);
 
-    chunk.slice(&sel, 2);
+    chunk
+        .try_slice(&sel, 2)
+        .expect("test chunk slice allocation failed");
 
     match chunk.column(0).unwrap().get_value(0) {
         Value::Array(values, _, size) => {
@@ -769,7 +849,9 @@ fn test_slice_preserves_array_values() {
 fn test_slice_range_uses_contiguous_selection() {
     let mut chunk = make_int_string_chunk(&[10, 20, 30, 40], &["ten", "twenty", "thirty", "forty"]);
 
-    chunk.slice_range(1, 2);
+    chunk
+        .try_slice_range(1, 2)
+        .expect("test chunk slice_range allocation failed");
 
     assert_eq!(chunk.size(), 2);
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(20));
@@ -781,9 +863,11 @@ fn test_slice_range_uses_contiguous_selection() {
 #[test]
 fn test_copy_to_deep_copies_rows() {
     let mut source = make_int_string_chunk(&[1, 2, 3], &["a", "b", "c"]);
-    let mut target = Chunk::initialize(&source.types(), 3);
+    let mut target = crate::test_utils::test_chunk_with_capacity(&source.types(), 3);
 
-    source.copy_to(&mut target, 0);
+    source
+        .try_copy_to(&mut target, 0)
+        .expect("test chunk copy allocation failed");
     source.column_mut(0).unwrap().set_i32(0, 99);
     source.column_mut(1).unwrap().set_string(1, "changed");
 
@@ -795,9 +879,11 @@ fn test_copy_to_deep_copies_rows() {
 #[test]
 fn test_copy_to_respects_offset() {
     let source = make_int_string_chunk(&[1, 2, 3, 4], &["a", "b", "c", "d"]);
-    let mut target = Chunk::initialize(&source.types(), 1);
+    let mut target = crate::test_utils::test_chunk_with_capacity(&source.types(), 1);
 
-    source.copy_to(&mut target, 2);
+    source
+        .try_copy_to(&mut target, 2)
+        .expect("test chunk copy allocation failed");
 
     assert!(target.capacity() >= 2);
     assert_eq!(target.size(), 2);

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{StringHeap, ValidityMask, Vector, VectorBuffer, VectorType};
+use super::{StringHeap, ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType};
 use crate::allocator::default_allocator;
 use crate::error::{self as paro_error, ParoError};
 use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
@@ -17,8 +17,7 @@ impl Vector {
         false_vec: &Vector,
     ) -> Result<Self, ParoError> {
         let allocator = Arc::new(default_allocator());
-        let mut result =
-            Self::with_capacity_and_allocator(logical_type.clone(), count, allocator.clone());
+        let mut result = Self::try_new(logical_type.clone(), count, allocator.clone())?;
         result.count = count;
         result.validity = ValidityMask::with_allocator(count, result.buffer.allocator().clone());
 
@@ -67,11 +66,11 @@ impl Vector {
             | LogicalType::Json
             | LogicalType::Jsonb => {
                 let mut heap: Option<StringHeap> = None;
-                let buffer = VectorBuffer::with_allocator(
+                let buffer = VectorBuffer::try_with_allocator(
                     std::mem::size_of::<InlineString>(),
                     count,
                     allocator.clone(),
-                );
+                )?;
                 unsafe {
                     let entries = buffer.data() as *mut InlineString;
                     for (i, &m) in mask.iter().enumerate().take(count) {
@@ -132,8 +131,7 @@ impl Vector {
         false_vec: &Vector,
     ) -> Result<Self, ParoError> {
         let allocator = Arc::new(default_allocator());
-        let mut result =
-            Self::with_capacity_and_allocator(logical_type.clone(), count, allocator.clone());
+        let mut result = Self::try_new(logical_type.clone(), count, allocator.clone())?;
         result.count = count;
         result.validity = ValidityMask::with_allocator(count, result.buffer.allocator().clone());
 
@@ -167,11 +165,11 @@ impl Vector {
             | LogicalType::Json
             | LogicalType::Jsonb => {
                 let mut heap: Option<StringHeap> = None;
-                let buffer = VectorBuffer::with_allocator(
+                let buffer = VectorBuffer::try_with_allocator(
                     std::mem::size_of::<InlineString>(),
                     count,
                     allocator.clone(),
-                );
+                )?;
                 unsafe {
                     let entries = buffer.data() as *mut InlineString;
                     for (i, &m) in mask.iter().enumerate().take(count) {
@@ -214,6 +212,12 @@ impl Vector {
     }
 
     pub fn flatten(&mut self) {
+        self.try_flatten()
+            .expect("vector flatten allocation failed")
+    }
+
+    /// Fallible flatten that materializes dictionary/sequence sources and allocates buffers when needed.
+    pub fn try_flatten(&mut self) -> Result<(), ParoError> {
         match self.vector_type {
             VectorType::Flat => {
                 // Already flat, but need to flatten nested types
@@ -230,11 +234,11 @@ impl Vector {
             VectorType::Constant => {
                 // Replicate the single value
                 let element_size = self.logical_type.physical_size();
-                let new_buffer = VectorBuffer::with_allocator(
+                let new_buffer = VectorBuffer::try_with_allocator(
                     element_size,
                     self.count,
                     self.buffer.allocator().clone(),
-                );
+                )?;
 
                 if element_size > 0 && !self.buffer.data().is_null() {
                     // SAFETY: We're copying the constant value to all positions
@@ -273,11 +277,11 @@ impl Vector {
                     (*ptr, *ptr.add(1))
                 };
 
-                let new_buffer = VectorBuffer::with_allocator(
+                let new_buffer = VectorBuffer::try_with_allocator(
                     std::mem::size_of::<i64>(),
                     self.count,
                     self.buffer.allocator().clone(),
-                );
+                )?;
 
                 // SAFETY: We're writing i64 values
                 unsafe {
@@ -294,12 +298,12 @@ impl Vector {
             VectorType::Dictionary => {
                 // Materialize through selection vector
                 let child = self.child.take().unwrap();
-                let sel = self.sel_vector.take().unwrap();
+                let selection = std::mem::replace(&mut self.selection, VectorSelection::None);
                 let element_size = self.logical_type.physical_size();
                 let allocator = self.buffer.allocator().clone();
 
                 let new_buffer =
-                    VectorBuffer::with_allocator(element_size, self.count, allocator.clone());
+                    VectorBuffer::try_with_allocator(element_size, self.count, allocator.clone())?;
                 self.validity =
                     ValidityMask::with_allocator(self.count, self.buffer.allocator().clone());
 
@@ -308,7 +312,7 @@ impl Vector {
                     let dst = new_buffer.data();
                     let src = child.buffer.data();
                     for i in 0..self.count {
-                        let physical_idx = sel.get(i);
+                        let physical_idx = selection.physical_index(i);
                         if !child.validity.is_valid(physical_idx) {
                             self.validity.set_null(i);
                         } else {
@@ -333,11 +337,11 @@ impl Vector {
                 ) {
                     let allocator = self.buffer.allocator().clone();
                     let mut new_heap: Option<StringHeap> = None;
-                    let string_buffer = VectorBuffer::with_allocator(
+                    let string_buffer = VectorBuffer::try_with_allocator(
                         std::mem::size_of::<InlineString>(),
                         self.count,
                         allocator.clone(),
-                    );
+                    )?;
 
                     // SAFETY: We're copying InlineString values and rebuilding heap for long strings
                     unsafe {
@@ -345,7 +349,7 @@ impl Vector {
                         let dst_entries = string_buffer.data() as *mut InlineString;
 
                         for i in 0..self.count {
-                            let physical_idx = sel.get(i);
+                            let physical_idx = selection.physical_index(i);
                             if !child.validity.is_valid(physical_idx) {
                                 self.validity.set_null(i);
                                 *dst_entries.add(i) = InlineString::empty();
@@ -381,6 +385,8 @@ impl Vector {
                 self.dictionary_info = None;
             }
         }
+
+        Ok(())
     }
 
     /// Convert a FLAT vector with one element to a CONSTANT vector.

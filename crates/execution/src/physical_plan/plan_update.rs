@@ -220,7 +220,8 @@ mod tests {
             .expect("local source state");
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut chunk = paro_common::chunk::Chunk::initialize(update_op.child.types(), 8);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(update_op.child.types(), 8);
 
         let result = update_op
             .child

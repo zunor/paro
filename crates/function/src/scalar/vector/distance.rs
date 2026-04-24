@@ -63,7 +63,7 @@ impl<'a> ArrayF32Reader<'a> {
             }
         };
 
-        let array = vector.to_array_view(count);
+        let array = vector.try_to_array_view(count)?;
 
         let read_kind = match child_type {
             LogicalType::Float => ArrayElementReadKind::Float(
@@ -567,7 +567,11 @@ mod tests {
             .iter()
             .map(|row| row.to_vec())
             .collect::<Vec<Vec<f32>>>();
-        Vector::from_embeddings(&embeddings, dims)
+        paro_common::test_utils::test_embeddings_vector_with_allocator(
+            &embeddings,
+            dims,
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     #[test]
@@ -627,12 +631,12 @@ mod tests {
     #[test]
     fn test_l2_distance_dictionary_array_input() {
         let dict_child = embedding_vector(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 9.0]]);
-        let lhs = Vector::dictionary(Arc::new(dict_child), vec![2u32, 0, 1]);
+        let lhs = paro_common::test_utils::test_dictionary(Arc::new(dict_child), vec![2u32, 0, 1]);
         let rhs = embedding_vector(&[&[7.0, 8.0, 9.0], &[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
 
-        let chunk = Chunk::from_vectors(vec![lhs, rhs]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![lhs, rhs]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
         l2_distance_fn(&chunk, &state, &mut result).unwrap();
 
         assert!((result.get_f64(0).unwrap() - 0.0).abs() < 1e-12);
@@ -642,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_l2_distance_constant_array_input() {
-        let lhs = Vector::constant_from_value(
+        let lhs = paro_common::test_utils::test_constant_from_value(
             LogicalType::Array(Box::new(LogicalType::Float), 3),
             Value::Array(
                 vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
@@ -653,9 +657,9 @@ mod tests {
         );
         let rhs = embedding_vector(&[&[1.0, 2.0, 3.0], &[2.0, 2.0, 3.0], &[1.0, 1.0, 1.0]]);
 
-        let chunk = Chunk::from_vectors(vec![lhs, rhs]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![lhs, rhs]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
         l2_distance_fn(&chunk, &state, &mut result).unwrap();
 
         assert!((result.get_f64(0).unwrap() - 0.0).abs() < 1e-12);
@@ -666,11 +670,11 @@ mod tests {
     #[test]
     fn test_vector_norm_dictionary_array_input() {
         let dict_child = embedding_vector(&[&[3.0, 4.0], &[1.0, 0.0]]);
-        let vec = Vector::dictionary(Arc::new(dict_child), vec![1u32, 0, 1]);
+        let vec = paro_common::test_utils::test_dictionary(Arc::new(dict_child), vec![1u32, 0, 1]);
 
-        let chunk = Chunk::from_vectors(vec![vec]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
         vector_norm_fn(&chunk, &state, &mut result).unwrap();
 
         assert!((result.get_f64(0).unwrap() - 1.0).abs() < 1e-12);

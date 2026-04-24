@@ -330,10 +330,10 @@ mod tests {
             simple_update(&[input], &input_data, state_ptr, input.len());
         }
 
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
         result.set_count(1);
 
-        let mut states = Vector::new(LogicalType::BigInt);
+        let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
         states.set_count(1);
         *states.flat_data_mut::<*mut u8>() = state_ptr;
 
@@ -349,7 +349,10 @@ mod tests {
     fn var_pop_basic() {
         let func_set = get_var_pop_function();
         let (func, _) = func_set.bind(&[LogicalType::Integer]).unwrap();
-        let input = Vector::from_i32(&[1, 2, 3]);
+        let input = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let result = unsafe { run_simple_update(&func, &input) };
         assert!(!result.is_null(0));
@@ -363,7 +366,10 @@ mod tests {
         let variance_set = get_variance_function();
         let (var_func, _) = var_set.bind(&[LogicalType::Integer]).unwrap();
         let (variance_func, _) = variance_set.bind(&[LogicalType::Integer]).unwrap();
-        let input = Vector::from_i32(&[1, 2, 3]);
+        let input = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let var_result = unsafe { run_simple_update(&var_func, &input) };
         let variance_result = unsafe { run_simple_update(&variance_func, &input) };
@@ -377,7 +383,10 @@ mod tests {
     fn stddev_samp_single_row_is_null() {
         let stddev_set = get_stddev_samp_function();
         let (func, _) = stddev_set.bind(&[LogicalType::Integer]).unwrap();
-        let input = Vector::from_i32(&[42]);
+        let input = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[42],
+            paro_common::test_utils::test_allocator(),
+        );
         let result = unsafe { run_simple_update(&func, &input) };
         assert!(result.is_null(0));
     }

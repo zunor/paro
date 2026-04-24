@@ -534,7 +534,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_i32(&[10, 20, 30]);
+            let input = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20, 30],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -543,10 +546,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Integer);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -573,7 +576,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let mut input = Vector::from_i32(&[0, 0, 30, 40]);
+            let mut input = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[0, 0, 30, 40],
+                paro_common::test_utils::test_allocator(),
+            );
             input.set_null(0, true);
             input.set_null(1, true); // [NULL, NULL, 30, 40]
 
@@ -584,10 +590,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Integer);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -614,7 +620,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_i32(&[10, 20, 30]);
+            let input = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20, 30],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -623,10 +632,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Integer);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -653,7 +662,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let mut input = Vector::from_i32(&[10, 20, 0, 0]);
+            let mut input = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20, 0, 0],
+                paro_common::test_utils::test_allocator(),
+            );
             input.set_null(2, true);
             input.set_null(3, true); // [10, 20, NULL, NULL]
 
@@ -664,10 +676,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Integer);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -696,10 +708,10 @@ mod tests {
 
             // No updates
 
-            let mut result = Vector::new(LogicalType::Integer);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -725,7 +737,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_f64(&[1.5, 2.5, 3.5]);
+            let input = paro_common::test_utils::test_f64_vector_with_allocator(
+                &[1.5, 2.5, 3.5],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -734,10 +749,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Double);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -770,7 +785,10 @@ mod tests {
             (func.initialize)(state2_ptr);
 
             // State 1: first = 100
-            let input1 = Vector::from_i32(&[100, 200]);
+            let input1 = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[100, 200],
+                paro_common::test_utils::test_allocator(),
+            );
             if let Some(simple_update) = func.simple_update {
                 {
                     let input_data = preserve_input_data(&func, &mut arena);
@@ -779,7 +797,10 @@ mod tests {
             }
 
             // State 2: first = 300
-            let input2 = Vector::from_i32(&[300, 400]);
+            let input2 = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[300, 400],
+                paro_common::test_utils::test_allocator(),
+            );
             if let Some(simple_update) = func.simple_update {
                 {
                     let input_data = preserve_input_data(&func, &mut arena);
@@ -788,12 +809,12 @@ mod tests {
             }
 
             // Combine: target (state2) keeps its value since it's already set
-            let mut source_states = Vector::new(LogicalType::BigInt);
+            let mut source_states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             source_states.set_count(1);
             let source_ptr = source_states.flat_data_mut::<*mut u8>();
             *source_ptr = state1_ptr;
 
-            let mut target_states = Vector::new(LogicalType::BigInt);
+            let mut target_states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             target_states.set_count(1);
             let target_ptr = target_states.flat_data_mut::<*mut u8>();
             *target_ptr = state2_ptr;
@@ -803,7 +824,7 @@ mod tests {
                 (func.combine)(&source_states, &target_states, &input_data, 1);
             }
 
-            let mut result = Vector::new(LogicalType::Integer);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
             result.set_count(1);
 
             {

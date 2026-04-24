@@ -328,6 +328,11 @@ impl PrefixReleasableRowStore {
         self.store.layout()
     }
 
+    #[inline]
+    pub fn size_in_bytes(&self) -> usize {
+        self.store.size_in_bytes()
+    }
+
     pub fn pin_ordinal_range(&self, start: u32, len: u32) -> Result<PinnedRows<'_>> {
         if len == 0 {
             return Ok(PinnedRows::new(

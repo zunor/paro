@@ -33,14 +33,14 @@ fn materialize_key_vector(
     vector: Arc<Vector>,
     logical_type: LogicalType,
     count: usize,
-) -> Arc<Vector> {
+) -> Result<Arc<Vector>> {
     let allocator = ctx.allocator(paro_common::allocator::MemoryTag::BaseTable);
-    let mut flat = Vector::with_capacity_and_allocator(logical_type, count.max(1), allocator);
+    let mut flat = Vector::try_new(logical_type, count.max(1), allocator)?;
     flat.set_len(count);
     for row_idx in 0..count {
         flat.copy_at(row_idx, vector.as_ref(), row_idx);
     }
-    Arc::new(flat)
+    Ok(Arc::new(flat))
 }
 
 pub(super) fn evaluate_probe_keys(
@@ -60,23 +60,28 @@ pub(super) fn evaluate_probe_keys(
             vec,
             cond.left.return_type(),
             input.size(),
-        ));
+        )?);
     }
-    let mut probe_keys = Chunk::from_arc_vectors(key_vectors);
+    let mut probe_keys = Chunk::from_arc_vectors(key_vectors, input.allocator().clone());
     probe_keys.set_cardinality(input.size());
     Ok(probe_keys)
 }
 
-pub(super) fn prepare_output_chunk(chunk: &mut Chunk, types: &[LogicalType], capacity: usize) {
+pub(super) fn prepare_output_chunk(
+    chunk: &mut Chunk,
+    types: &[LogicalType],
+    capacity: usize,
+) -> Result<()> {
     let needs_reinit = chunk.column_count() != types.len()
         || chunk.capacity() < capacity
         || chunk.types() != types;
     if needs_reinit {
         let allocator = chunk.allocator().clone();
-        *chunk = Chunk::initialize_with_allocator(types, capacity, allocator);
+        *chunk = Chunk::try_initialize(types, capacity, allocator)?;
     } else {
-        chunk.reset();
+        chunk.try_reset(chunk.allocator().clone())?;
     }
+    Ok(())
 }
 
 pub(super) fn residual_condition_matches(
@@ -144,7 +149,11 @@ pub(super) fn filter_residual_matches(
         return Ok(match_count);
     }
 
-    let mut build_chunk = Chunk::initialize(build_payload_types, match_count);
+    let mut build_chunk = Chunk::try_initialize(
+        build_payload_types,
+        match_count,
+        left_input.allocator().clone(),
+    )?;
     build_chunk.set_cardinality(match_count);
 
     for (build_col_idx, _build_type) in build_payload_types.iter().enumerate() {
@@ -158,7 +167,8 @@ pub(super) fn filter_residual_matches(
         }
     }
 
-    let mut surviving = SelectionVector::incremental(match_count);
+    let mut surviving =
+        SelectionVector::try_incremental(match_count, output_sel.allocator().clone())?;
     let mut surviving_count = match_count;
 
     for (condition, executors) in residual_conditions_on_build_payload
@@ -363,7 +373,7 @@ pub(super) fn result_for_probe_batch(count: usize, scan_finished: bool) -> Opera
 
 #[cfg(test)]
 mod tests {
-    use paro_common::chunk::Chunk;
+
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::operator::join::JoinComparisonType;
@@ -390,10 +400,11 @@ mod tests {
 
     #[test]
     fn prepare_output_chunk_reuses_compatible_chunks() {
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], 4);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 4);
         chunk.set_cardinality(2);
 
-        prepare_output_chunk(&mut chunk, &[LogicalType::Integer], 4);
+        prepare_output_chunk(&mut chunk, &[LogicalType::Integer], 4).unwrap();
 
         assert_eq!(chunk.column_count(), 1);
         assert_eq!(chunk.capacity(), 4);

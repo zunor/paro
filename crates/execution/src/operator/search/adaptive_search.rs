@@ -220,7 +220,7 @@ impl PhysicalOperator for AdaptiveSearchOperator {
                 Ok(SourceResultType::HaveMoreOutput)
             }
             None => {
-                *chunk = Chunk::init_empty(self.types());
+                *chunk = Chunk::try_init_empty(self.types(), chunk.allocator().clone())?;
                 Ok(SourceResultType::Finished)
             }
         }

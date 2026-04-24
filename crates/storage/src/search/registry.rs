@@ -1682,9 +1682,8 @@ mod tests {
     use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
     use crate::search::{ResourceBudget, SearchBatchConfig, SearchBatchState};
     use crate::table::table_factory::TableFactory;
-    use paro_common::chunk::Chunk;
+    use crate::test_utils::*;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1756,7 +1755,7 @@ mod tests {
             .register_search_definition(definition.clone())
             .expect("register fulltext definition");
         table
-            .append(&Chunk::from_vectors(vec![Vector::from_strings(&[
+            .append(&test_chunk_from_vectors(vec![test_string_vector(&[
                 "graph vector",
             ])]))
             .unwrap();
@@ -1803,13 +1802,13 @@ mod tests {
         };
         table.register_search_definition(definition).unwrap();
         table
-            .append(&Chunk::from_vectors(vec![Vector::from_strings(&[
+            .append(&test_chunk_from_vectors(vec![test_string_vector(&[
                 "graph alpha",
             ])]))
             .unwrap();
 
         table
-            .append(&Chunk::from_vectors(vec![Vector::from_strings(&[
+            .append(&test_chunk_from_vectors(vec![test_string_vector(&[
                 "graph beta",
             ])]))
             .unwrap();

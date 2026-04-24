@@ -842,7 +842,8 @@ mod tests {
 
     fn encode_single(vector: Vector, modifiers: OrderModifiers) -> Vec<Vec<u8>> {
         let count = vector.len();
-        let chunk = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)]);
+        let chunk =
+            crate::test_utils::test_chunk_from_arc_vectors(vec![std::sync::Arc::new(vector)]);
         let encoding = SortKeyEncoding::new(
             vec![chunk.column(0).unwrap().logical_type().clone()],
             vec![modifiers],
@@ -868,7 +869,7 @@ mod tests {
 
     #[test]
     fn encodes_integers_and_strings() {
-        let mut ints = Vector::new(LogicalType::Integer);
+        let mut ints = crate::test_utils::test_vector(LogicalType::Integer);
         ints.set_i32(0, 1);
         ints.set_i32(1, 2);
         ints.set_i32(2, 3);
@@ -877,7 +878,7 @@ mod tests {
         assert!(int_keys[0] < int_keys[1]);
         assert!(int_keys[1] < int_keys[2]);
 
-        let mut strings = Vector::new(LogicalType::Varchar);
+        let mut strings = crate::test_utils::test_vector(LogicalType::Varchar);
         strings.set_string(0, "apple");
         strings.set_string(1, "banana");
         strings.set_string(2, "cherry");
@@ -889,7 +890,7 @@ mod tests {
 
     #[test]
     fn respects_descending_and_null_order() {
-        let mut vec = Vector::new(LogicalType::Integer);
+        let mut vec = crate::test_utils::test_vector(LogicalType::Integer);
         vec.set_i32(0, 1);
         vec.set_null(1, true);
         vec.set_i32(2, 3);
@@ -909,7 +910,7 @@ mod tests {
             precision: 6,
             scale: 2,
         };
-        let mut small = Vector::new(small_ty.clone());
+        let mut small = crate::test_utils::test_vector(small_ty.clone());
         small.set_value(0, &Value::Decimal(-125, 6, 2));
         small.set_value(1, &Value::Decimal(250, 6, 2));
         small.set_count(2);
@@ -918,7 +919,7 @@ mod tests {
             precision: 30,
             scale: 6,
         };
-        let mut large = Vector::new(large_ty.clone());
+        let mut large = crate::test_utils::test_vector(large_ty.clone());
         large.set_value(0, &Value::Decimal(i128::MIN / 8, 30, 6));
         large.set_value(1, &Value::Decimal(i128::MAX / 8, 30, 6));
         large.set_count(2);
@@ -934,7 +935,8 @@ mod tests {
         assert_eq!(encoding.fixed_key_len(), Some(26));
         assert_eq!(encoding.slot_size(), 26);
 
-        let chunk = Chunk::from_arc_vectors(vec![small.into(), large.into()]);
+        let chunk =
+            crate::test_utils::test_chunk_from_arc_vectors(vec![small.into(), large.into()]);
         let left = encoding.encode_row(&chunk, 0, &[0, 1]).unwrap();
         let right = encoding.encode_row(&chunk, 1, &[0, 1]).unwrap();
         assert!(left < right);
@@ -942,7 +944,7 @@ mod tests {
 
     #[test]
     fn computes_variable_lengths_for_blob_escape() {
-        let mut vec = Vector::new(LogicalType::Blob);
+        let mut vec = crate::test_utils::test_vector(LogicalType::Blob);
         vec.set_blob(0, &[0, 1, 2, 3]);
         vec.set_count(1);
 
@@ -981,7 +983,7 @@ mod tests {
 
     #[test]
     fn fixed_width_keys_keep_null_field_padding() {
-        let mut ints = Vector::new(LogicalType::Integer);
+        let mut ints = crate::test_utils::test_vector(LogicalType::Integer);
         ints.set_null(0, true);
         ints.set_i32(1, 7);
         ints.set_count(2);
@@ -991,7 +993,7 @@ mod tests {
             vec![OrderModifiers::new(true, true)],
         )
         .unwrap();
-        let chunk = Chunk::from_arc_vectors(vec![ints.into()]);
+        let chunk = crate::test_utils::test_chunk_from_arc_vectors(vec![ints.into()]);
 
         let null_key = encoding.encode_row(&chunk, 0, &[0]).unwrap();
         let value_key = encoding.encode_row(&chunk, 1, &[0]).unwrap();
@@ -1005,22 +1007,26 @@ mod tests {
 
     #[test]
     fn variable_keys_account_for_fixed_width_null_padding() {
-        let mut groups = Vector::new(LogicalType::Integer);
+        let mut groups = crate::test_utils::test_vector(LogicalType::Integer);
         groups.set_i32(0, 1);
         groups.set_i32(1, 1);
         groups.set_count(2);
 
-        let mut labels = Vector::new(LogicalType::Varchar);
+        let mut labels = crate::test_utils::test_vector(LogicalType::Varchar);
         labels.set_null(0, true);
         labels.set_string(1, "gamma");
         labels.set_count(2);
 
-        let mut ids = Vector::new(LogicalType::Integer);
+        let mut ids = crate::test_utils::test_vector(LogicalType::Integer);
         ids.set_i32(0, 2);
         ids.set_i32(1, 5);
         ids.set_count(2);
 
-        let chunk = Chunk::from_arc_vectors(vec![groups.into(), labels.into(), ids.into()]);
+        let chunk = crate::test_utils::test_chunk_from_arc_vectors(vec![
+            groups.into(),
+            labels.into(),
+            ids.into(),
+        ]);
         let encoding = SortKeyEncoding::new(
             vec![
                 LogicalType::Integer,
@@ -1055,15 +1061,16 @@ mod tests {
 
     #[test]
     fn encode_row_into_parts_matches_row_bytes_for_variable_keys() {
-        let mut ints = Vector::new(LogicalType::Integer);
+        let mut ints = crate::test_utils::test_vector(LogicalType::Integer);
         ints.set_i32(0, 42);
         ints.set_count(1);
 
-        let mut strings = Vector::new(LogicalType::Varchar);
+        let mut strings = crate::test_utils::test_vector(LogicalType::Varchar);
         strings.set_string(0, "split-writer-overflow");
         strings.set_count(1);
 
-        let chunk = Chunk::from_arc_vectors(vec![ints.into(), strings.into()]);
+        let chunk =
+            crate::test_utils::test_chunk_from_arc_vectors(vec![ints.into(), strings.into()]);
         let encoding = SortKeyEncoding::new(
             vec![LogicalType::Integer, LogicalType::Varchar],
             vec![

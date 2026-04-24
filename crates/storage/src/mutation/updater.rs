@@ -9,13 +9,15 @@ use crate::primary_key::RowID;
 use crate::table::table_handle::TableHandle;
 use crate::tablet::{KeysType, TabletReaderParams};
 use crate::transaction::txn::Transaction;
+use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 
 pub(crate) fn collect_rows_by_row_ids(table: &TableHandle, row_ids: &[u64]) -> Result<Chunk> {
+    let allocator = Arc::new(default_allocator());
     if row_ids.is_empty() {
-        return Ok(Chunk::initialize(table.types(), 0));
+        return Chunk::try_initialize(table.types(), 0, allocator);
     }
 
     let mut row_positions = HashMap::with_capacity(row_ids.len());
@@ -28,7 +30,7 @@ pub(crate) fn collect_rows_by_row_ids(table: &TableHandle, row_ids: &[u64]) -> R
         }
     }
 
-    let mut rows = Chunk::initialize(table.types(), row_ids.len());
+    let mut rows = Chunk::try_initialize(table.types(), row_ids.len(), allocator)?;
     rows.set_cardinality(row_ids.len());
 
     let mut found = vec![false; row_ids.len()];
@@ -185,7 +187,7 @@ pub(crate) fn build_partial_updated_rows_chunk(
 ) -> Result<Chunk> {
     let row_count = base_rows.size();
     let mut partial_rows =
-        Chunk::initialize_with_allocator(table.types(), row_count, base_rows.allocator().clone());
+        Chunk::try_initialize(table.types(), row_count, base_rows.allocator().clone())?;
     partial_rows.set_cardinality(row_count);
 
     let schema = table

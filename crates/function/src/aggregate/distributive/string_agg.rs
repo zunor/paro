@@ -424,9 +424,9 @@ mod tests {
             simple_update(inputs, &input_data, state_ptr, row_count);
         }
 
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         result.set_count(1);
-        let mut states = Vector::new(LogicalType::BigInt);
+        let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
         states.set_count(1);
         *states.flat_data_mut::<*mut u8>() = state_ptr;
 
@@ -448,7 +448,10 @@ mod tests {
     fn string_agg_default_separator() {
         let set = get_string_agg_function();
         let (func, _) = set.bind(&[LogicalType::Varchar]).unwrap();
-        let input = Vector::from_strings(&["a", "b", "c"]);
+        let input = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "b", "c"],
+            paro_common::test_utils::test_allocator(),
+        );
         let result = unsafe { finalize_single(&func, &[&input], 3) };
         assert_eq!(result.get_string(0), Some("a,b,c"));
     }
@@ -459,8 +462,14 @@ mod tests {
         let (func, _) = set
             .bind(&[LogicalType::Varchar, LogicalType::Varchar])
             .unwrap();
-        let values = Vector::from_strings(&["a", "b", "c"]);
-        let separators = Vector::from_strings(&["|", "|", "|"]);
+        let values = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "b", "c"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let separators = paro_common::test_utils::test_string_vector_with_allocator(
+            &["|", "|", "|"],
+            paro_common::test_utils::test_allocator(),
+        );
         let result = unsafe { finalize_single(&func, &[&values, &separators], 3) };
         assert_eq!(result.get_string(0), Some("a|b|c"));
     }
@@ -469,7 +478,10 @@ mod tests {
     fn string_agg_skips_null_values() {
         let set = get_string_agg_function();
         let (func, _) = set.bind(&[LogicalType::Varchar]).unwrap();
-        let mut input = Vector::from_strings(&["a", "", "c"]);
+        let mut input = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "", "c"],
+            paro_common::test_utils::test_allocator(),
+        );
         input.set_null(1, true);
         let result = unsafe { finalize_single(&func, &[&input], 3) };
         assert_eq!(result.get_string(0), Some("a,c"));

@@ -6,8 +6,8 @@ use std::thread;
 
 use divan::Bencher;
 use paro_common::chunk::Chunk;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::primary_key::{PrimaryIndex, PrimaryKeySerializer, RowID};
 use paro_storage::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
 
@@ -95,11 +95,22 @@ impl EncodeBenchState {
             .map(|idx| format!("pk-code-{idx:08}"))
             .collect();
         let payloads: Vec<i32> = (0..ENCODE_BATCH_ROWS as i32).map(|v| v + 100).collect();
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_i32(&ids),
-            Vector::from_strings(&codes.iter().map(String::as_str).collect::<Vec<_>>()),
-            Vector::from_i32(&payloads),
-        ]);
+        let allocator = test_allocator();
+        let code_refs = codes.iter().map(String::as_str).collect::<Vec<_>>();
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(&ids, allocator.clone()),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &code_refs,
+                    allocator.clone(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &payloads,
+                    allocator.clone(),
+                ),
+            ],
+            allocator,
+        );
         Self { serializer, chunk }
     }
 }

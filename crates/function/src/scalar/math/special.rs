@@ -291,8 +291,9 @@ mod tests {
 
     #[test]
     fn test_pi() {
-        let chunk = Chunk::new();
-        let mut result = Vector::new(LogicalType::Double);
+        let chunk = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         pi_impl(&chunk, &MockState, &mut result).unwrap();
 
@@ -301,8 +302,9 @@ mod tests {
 
     #[test]
     fn test_random() {
-        let chunk = Chunk::new();
-        let mut result = Vector::new(LogicalType::Double);
+        let chunk = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         random_impl(&chunk, &MockState, &mut result).unwrap();
 
@@ -318,11 +320,20 @@ mod tests {
 
     #[test]
     fn test_greatest_i32() {
-        let v1 = Vector::from_i32(&[1, 5, 3]);
-        let v2 = Vector::from_i32(&[4, 2, 6]);
-        let v3 = Vector::from_i32(&[2, 8, 1]);
-        let chunk = Chunk::from_vectors(vec![v1, v2, v3]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 5, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[4, 2, 6],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v3 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2, 8, 1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2, v3]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         greatest_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -333,10 +344,16 @@ mod tests {
 
     #[test]
     fn test_greatest_f64() {
-        let v1 = Vector::from_f64(&[1.5, 5.5, 3.5]);
-        let v2 = Vector::from_f64(&[4.5, 2.5, 6.5]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::Double);
+        let v1 = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[1.5, 5.5, 3.5],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[4.5, 2.5, 6.5],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         greatest_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -347,11 +364,17 @@ mod tests {
 
     #[test]
     fn test_greatest_with_null() {
-        let mut v1 = Vector::from_i32(&[1, 5, 3]);
+        let mut v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 5, 3],
+            paro_common::test_utils::test_allocator(),
+        );
         v1.validity_mut().set_null(0);
-        let v2 = Vector::from_i32(&[4, 2, 6]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let v2 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[4, 2, 6],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         greatest_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -363,11 +386,20 @@ mod tests {
 
     #[test]
     fn test_least_i32() {
-        let v1 = Vector::from_i32(&[1, 5, 3]);
-        let v2 = Vector::from_i32(&[4, 2, 6]);
-        let v3 = Vector::from_i32(&[2, 8, 1]);
-        let chunk = Chunk::from_vectors(vec![v1, v2, v3]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 5, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[4, 2, 6],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v3 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2, 8, 1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2, v3]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         least_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -378,10 +410,16 @@ mod tests {
 
     #[test]
     fn test_least_f64() {
-        let v1 = Vector::from_f64(&[1.5, 5.5, 3.5]);
-        let v2 = Vector::from_f64(&[4.5, 2.5, 6.5]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::Double);
+        let v1 = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[1.5, 5.5, 3.5],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[4.5, 2.5, 6.5],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         least_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -392,11 +430,17 @@ mod tests {
 
     #[test]
     fn test_least_with_null() {
-        let mut v1 = Vector::from_i32(&[1, 5, 3]);
+        let mut v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 5, 3],
+            paro_common::test_utils::test_allocator(),
+        );
         v1.validity_mut().set_null(0);
-        let v2 = Vector::from_i32(&[4, 2, 6]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let v2 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[4, 2, 6],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         least_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -408,12 +452,18 @@ mod tests {
 
     #[test]
     fn test_greatest_all_null() {
-        let mut v1 = Vector::from_i32(&[1]);
-        let mut v2 = Vector::from_i32(&[2]);
+        let mut v1 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut v2 = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2],
+            paro_common::test_utils::test_allocator(),
+        );
         v1.validity_mut().set_null(0);
         v2.validity_mut().set_null(0);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         greatest_i32(&chunk, &MockState, &mut result).unwrap();
 
@@ -422,10 +472,16 @@ mod tests {
 
     #[test]
     fn test_greatest_i64() {
-        let v1 = Vector::from_i64(&[1_000_000_000_000i64, 5]);
-        let v2 = Vector::from_i64(&[4, 2_000_000_000_000i64]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::BigInt);
+        let v1 = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1_000_000_000_000i64, 5],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[4, 2_000_000_000_000i64],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         greatest_i64(&chunk, &MockState, &mut result).unwrap();
 
@@ -435,10 +491,16 @@ mod tests {
 
     #[test]
     fn test_least_i64() {
-        let v1 = Vector::from_i64(&[1_000_000_000_000i64, 5]);
-        let v2 = Vector::from_i64(&[4, 2_000_000_000_000i64]);
-        let chunk = Chunk::from_vectors(vec![v1, v2]);
-        let mut result = Vector::new(LogicalType::BigInt);
+        let v1 = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1_000_000_000_000i64, 5],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[4, 2_000_000_000_000i64],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         least_i64(&chunk, &MockState, &mut result).unwrap();
 

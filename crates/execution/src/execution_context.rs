@@ -11,6 +11,8 @@ use paro_context::StatementContext;
 use paro_scheduler::task::InterruptState;
 use std::sync::Arc;
 
+use crate::memory_runtime::{OperatorMemoryAccount, QueryMemoryPool};
+
 /// Execution context for operator execution.
 ///
 /// The context holds shared statement state, the current thread-local state, and
@@ -66,10 +68,37 @@ impl<'a> ExecutionContext<'a> {
         self.session.buffer_pool()
     }
 
-    /// Get the temporary memory manager.
+    /// Get the current query memory pool.
     #[inline]
-    pub fn temporary_memory_manager(&self) -> &Arc<paro_storage::buffer::TemporaryMemoryManager> {
-        self.session.temporary_memory_manager()
+    pub fn query_memory_pool(&self) -> Arc<QueryMemoryPool> {
+        self.pipeline
+            .map(Pipeline::query_memory_pool)
+            .unwrap_or_else(|| Arc::new(QueryMemoryPool::unbounded()))
+    }
+
+    /// Create a fresh operator memory account under the current query pool.
+    #[inline]
+    pub fn operator_memory_account(&self) -> Arc<OperatorMemoryAccount> {
+        Arc::new(OperatorMemoryAccount::new(self.query_memory_pool()))
+    }
+
+    #[inline]
+    pub fn query_max_memory(&self) -> usize {
+        self.session
+            .query_governance()
+            .memory_quota
+            .unwrap_or_else(|| self.query_memory_pool().capacity_bytes())
+            .max(1)
+    }
+
+    #[inline]
+    pub fn force_external(&self) -> bool {
+        self.session.limits.force_external
+    }
+
+    #[inline]
+    pub fn has_temporary_directory(&self) -> bool {
+        self.session.limits.use_temporary_directory && self.buffer_pool().has_temporary_directory()
     }
 
     /// Get the number of threads.

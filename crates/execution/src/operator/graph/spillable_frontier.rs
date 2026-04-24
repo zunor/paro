@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::{Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryOwnerAllocator};
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_storage::buffer::{BufferPool, MemoryTag};
@@ -12,12 +14,15 @@ use paro_storage::column::{
     ChunkManagementState, ColumnDataAllocatorType, ColumnDataAppendState, ColumnDataCollection,
 };
 
+use crate::memory_runtime::{AccountedBuffer, ReclaimStats, Reclaimer, SpillCost};
+
 #[derive(Debug)]
 pub struct SpillableFrontier {
     spill_threshold_rows: usize,
     chunk_rows: usize,
-    memory_frontier: Vec<u32>,
-    external_chunk_ends: Vec<usize>,
+    memory: MemoryAccountingContext,
+    memory_frontier: AccountedBuffer<u32>,
+    external_chunk_ends: AccountedBuffer<usize>,
     external_row_count: usize,
     collection: Option<ColumnDataCollection>,
     buffer_pool: Arc<BufferPool>,
@@ -28,7 +33,8 @@ pub struct SpillableFrontier {
 pub struct SpillableFrontierCursor {
     loaded_chunk_idx: Option<usize>,
     chunk_state: ChunkManagementState,
-    chunk: Chunk,
+    chunk_rows: usize,
+    chunk: Option<Chunk>,
 }
 
 impl SpillableFrontierCursor {
@@ -40,7 +46,8 @@ impl SpillableFrontierCursor {
         Self {
             loaded_chunk_idx: None,
             chunk_state: ChunkManagementState::new(),
-            chunk: Chunk::initialize(&frontier_collection_types(), chunk_rows.max(1)),
+            chunk_rows: chunk_rows.max(1),
+            chunk: None,
         }
     }
 
@@ -61,22 +68,48 @@ impl SpillableFrontier {
         Self::with_chunk_rows(buffer_pool, spill_threshold_rows, VECTOR_SIZE)
     }
 
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        spill_threshold_rows: usize,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        Self::with_chunk_rows_and_memory(buffer_pool, spill_threshold_rows, VECTOR_SIZE, memory)
+    }
+
     pub fn with_chunk_rows(
         buffer_pool: Arc<BufferPool>,
         spill_threshold_rows: usize,
         chunk_rows: usize,
     ) -> Self {
+        Self::with_chunk_rows_and_memory(
+            buffer_pool,
+            spill_threshold_rows,
+            chunk_rows,
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+    }
+
+    pub fn with_chunk_rows_and_memory(
+        buffer_pool: Arc<BufferPool>,
+        spill_threshold_rows: usize,
+        chunk_rows: usize,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         let chunk_rows = chunk_rows.max(1);
         let collection = if spill_threshold_rows == 0 {
-            Some(new_frontier_collection(buffer_pool.clone()))
+            Some(new_frontier_collection(buffer_pool.clone(), memory.clone()))
         } else {
             None
         };
         Self {
             spill_threshold_rows,
             chunk_rows,
-            memory_frontier: Vec::new(),
-            external_chunk_ends: Vec::new(),
+            memory: memory.clone(),
+            memory_frontier: AccountedBuffer::new(memory.clone()),
+            external_chunk_ends: AccountedBuffer::new(memory),
             external_row_count: 0,
             collection,
             buffer_pool,
@@ -104,7 +137,7 @@ impl SpillableFrontier {
             self.externalize_in_memory()?;
             self.append_external(vertices)?;
         } else {
-            self.memory_frontier.extend_from_slice(vertices);
+            self.memory_frontier.try_extend_from_slice(vertices)?;
         }
         self.count += vertices.len();
         Ok(())
@@ -139,11 +172,22 @@ impl SpillableFrontier {
                             chunk_idx
                         ))
                     })?;
+                if cursor.chunk.is_none() {
+                    cursor.chunk = Some(Chunk::try_initialize(
+                        &frontier_collection_types(),
+                        cursor.chunk_rows.max(self.chunk_rows).max(1),
+                        graph_memory_allocator(&self.buffer_pool, &self.memory),
+                    )?);
+                }
+                let chunk = cursor
+                    .chunk
+                    .as_mut()
+                    .expect("frontier cursor chunk initialized above");
                 collection.fetch_chunk_by_storage_index(
                     storage_index,
                     &[0],
                     &mut cursor.chunk_state,
-                    &mut cursor.chunk,
+                    chunk,
                 )?;
                 cursor.loaded_chunk_idx = Some(chunk_idx);
             }
@@ -151,6 +195,8 @@ impl SpillableFrontier {
             let row_idx = index - chunk_start;
             cursor
                 .chunk
+                .as_ref()
+                .expect("frontier cursor chunk loaded above")
                 .column(0)
                 .and_then(|col| col.get_u32(row_idx))
                 .ok_or_else(|| {
@@ -176,10 +222,30 @@ impl SpillableFrontier {
 
     pub fn resident_memory_bytes(&self) -> usize {
         if self.collection.is_some() {
-            0
+            self.collection
+                .as_ref()
+                .map(ColumnDataCollection::resident_bytes)
+                .unwrap_or(0)
         } else {
             self.memory_frontier.len() * std::mem::size_of::<u32>()
         }
+    }
+
+    pub fn reclaimable_bytes(&self) -> usize {
+        self.resident_memory_bytes()
+    }
+
+    pub fn reclaim(&mut self, target_bytes: usize) -> Result<usize> {
+        if target_bytes == 0 {
+            return Ok(0);
+        }
+        if self.collection.is_none() && !self.memory_frontier.is_empty() {
+            self.externalize_in_memory()?;
+        }
+        let Some(collection) = self.collection.as_ref() else {
+            return Ok(0);
+        };
+        collection.reclaim(target_bytes)
     }
 
     pub fn ensure_external(&mut self) -> Result<()> {
@@ -203,7 +269,10 @@ impl SpillableFrontier {
         self.external_row_count = 0;
         self.count = 0;
         if self.spill_threshold_rows == 0 && self.collection.is_none() {
-            self.collection = Some(new_frontier_collection(self.buffer_pool.clone()));
+            self.collection = Some(new_frontier_collection(
+                self.buffer_pool.clone(),
+                self.memory.clone(),
+            ));
         }
         Ok(())
     }
@@ -211,40 +280,112 @@ impl SpillableFrontier {
     pub fn take(&mut self) -> Self {
         std::mem::replace(
             self,
-            Self::with_chunk_rows(
+            Self::with_chunk_rows_and_memory(
                 self.buffer_pool.clone(),
                 self.spill_threshold_rows,
                 self.chunk_rows,
+                self.memory.clone(),
             ),
         )
     }
 
     fn externalize_in_memory(&mut self) -> Result<()> {
         if self.collection.is_none() {
-            self.collection = Some(new_frontier_collection(self.buffer_pool.clone()));
+            self.collection = Some(new_frontier_collection(
+                self.buffer_pool.clone(),
+                self.memory.clone(),
+            ));
         }
         if !self.memory_frontier.is_empty() {
-            let existing = std::mem::take(&mut self.memory_frontier);
-            self.append_external(&existing)?;
+            for start in (0..self.memory_frontier.len()).step_by(self.chunk_rows) {
+                let end = (start + self.chunk_rows).min(self.memory_frontier.len());
+                let values = self.memory_frontier[start..end].to_vec();
+                self.append_external_chunk(&values)?;
+            }
+            self.memory_frontier.clear();
         }
         Ok(())
     }
 
     fn append_external(&mut self, vertices: &[u32]) -> Result<()> {
-        let collection = self
-            .collection
-            .get_or_insert_with(|| new_frontier_collection(self.buffer_pool.clone()));
+        let collection = self.collection.get_or_insert_with(|| {
+            new_frontier_collection(self.buffer_pool.clone(), self.memory.clone())
+        });
         let mut append_state = ColumnDataAppendState::new();
         collection.initialize_append(&mut append_state);
 
         for start in (0..vertices.len()).step_by(self.chunk_rows) {
             let end = (start + self.chunk_rows).min(vertices.len());
-            let chunk = build_frontier_chunk(&vertices[start..end]);
+            let chunk = build_frontier_chunk(
+                &vertices[start..end],
+                graph_memory_allocator(&self.buffer_pool, &self.memory),
+            )?;
             collection.append(&mut append_state, &chunk)?;
             self.external_row_count += end - start;
-            self.external_chunk_ends.push(self.external_row_count);
+            self.external_chunk_ends.try_push(self.external_row_count)?;
         }
         Ok(())
+    }
+
+    fn append_external_chunk(&mut self, vertices: &[u32]) -> Result<()> {
+        let collection = self.collection.get_or_insert_with(|| {
+            new_frontier_collection(self.buffer_pool.clone(), self.memory.clone())
+        });
+        let mut append_state = ColumnDataAppendState::new();
+        collection.initialize_append(&mut append_state);
+        let chunk = build_frontier_chunk(
+            vertices,
+            graph_memory_allocator(&self.buffer_pool, &self.memory),
+        )?;
+        collection.append(&mut append_state, &chunk)?;
+        self.external_row_count += vertices.len();
+        self.external_chunk_ends.try_push(self.external_row_count)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct SpillableFrontierReclaimer {
+    name: String,
+    frontier: Arc<std::sync::Mutex<SpillableFrontier>>,
+}
+
+impl SpillableFrontierReclaimer {
+    pub fn new(
+        name: impl Into<String>,
+        frontier: Arc<std::sync::Mutex<SpillableFrontier>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            frontier,
+        }
+    }
+}
+
+impl Reclaimer for SpillableFrontierReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        self.frontier
+            .try_lock()
+            .map(|frontier| frontier.reclaimable_bytes())
+            .unwrap_or(0)
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> paro_common::memory::MemoryResult<ReclaimStats> {
+        let Ok(mut frontier) = self.frontier.try_lock() else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        let reclaimed = frontier
+            .reclaim(target_bytes)
+            .map_err(|err| paro_common::memory::MemoryError::reclaim_failed(err.to_string()))?;
+        Ok(ReclaimStats::new(target_bytes, reclaimed, reclaimed))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
     }
 }
 
@@ -252,23 +393,48 @@ fn frontier_collection_types() -> Vec<LogicalType> {
     vec![LogicalType::UInteger]
 }
 
-fn new_frontier_collection(buffer_pool: Arc<BufferPool>) -> ColumnDataCollection {
-    ColumnDataCollection::with_buffer_pool(
+fn new_frontier_collection(
+    buffer_pool: Arc<BufferPool>,
+    memory: MemoryAccountingContext,
+) -> ColumnDataCollection {
+    ColumnDataCollection::with_buffer_pool_and_memory(
         buffer_pool,
         frontier_collection_types(),
         MemoryTag::ColumnData,
         ColumnDataAllocatorType::BufferManagerAllocator,
+        memory,
     )
 }
 
-fn build_frontier_chunk(vertices: &[u32]) -> Chunk {
+fn graph_memory_allocator(
+    buffer_pool: &Arc<BufferPool>,
+    memory: &MemoryAccountingContext,
+) -> Arc<dyn Allocator> {
+    let inner: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
+        buffer_pool.clone() as Arc<dyn BufferManager>,
+        memory.tag(),
+    ));
+    if let Some(owner) = memory.owner() {
+        Arc::new(MemoryOwnerAllocator::new(
+            inner,
+            owner,
+            memory.domain(),
+            memory.tag(),
+            memory.accounting_class(),
+        ))
+    } else {
+        inner
+    }
+}
+
+fn build_frontier_chunk(vertices: &[u32], allocator: Arc<dyn Allocator>) -> Result<Chunk> {
     let row_count = vertices.len();
-    let mut vector = Vector::with_capacity(LogicalType::UInteger, row_count.max(1));
+    let mut vector = Vector::try_new(LogicalType::UInteger, row_count.max(1), allocator.clone())?;
     vector.set_len(row_count);
     for (idx, vertex_id) in vertices.iter().copied().enumerate() {
         vector.set_u32(idx, vertex_id);
     }
-    Chunk::from_vectors(vec![vector])
+    Ok(Chunk::from_vectors(vec![vector], allocator))
 }
 
 #[cfg(test)]
@@ -378,5 +544,32 @@ mod tests {
             .map(|idx| frontier.get(idx, &mut cursor).unwrap())
             .collect();
         assert_eq!(values, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_frontier_reclaim_spills_resident_chunks() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "paro_frontier_reclaim_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        pool.set_temporary_directory(temp_dir.to_string_lossy().to_string())
+            .unwrap();
+
+        let mut frontier = SpillableFrontier::with_chunk_rows(pool, 0, 256);
+        frontier
+            .append_from_slice(&(0..4096u32).collect::<Vec<_>>())
+            .unwrap();
+        assert!(frontier.reclaimable_bytes() > 0);
+
+        let reclaimed = frontier.reclaim(usize::MAX / 4).unwrap();
+        assert!(reclaimed > 0);
+
+        let mut cursor = SpillableFrontierCursor::with_chunk_rows(256);
+        assert_eq!(frontier.get(17, &mut cursor).unwrap(), 17);
+        assert_eq!(frontier.get(4095, &mut cursor).unwrap(), 4095);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

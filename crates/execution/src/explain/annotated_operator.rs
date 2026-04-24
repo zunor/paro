@@ -193,8 +193,9 @@ impl PhysicalOperator for ExplainAnnotatedOperator {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
-        self.inner.execute(ctx, input, chunk, gstate, state)
+        self.inner.execute(ctx, input, chunk, gstate, state, memory)
     }
 
     fn final_execute(
@@ -203,8 +204,9 @@ impl PhysicalOperator for ExplainAnnotatedOperator {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorFinalizeResultType> {
-        self.inner.final_execute(ctx, chunk, gstate, state)
+        self.inner.final_execute(ctx, chunk, gstate, state, memory)
     }
 
     fn operator_finalize(&self, input: &OperatorFinalizeInput) -> Result<OperatorFinalResultType> {

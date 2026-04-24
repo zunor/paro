@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_scheduler::scheduler::TaskScheduler;
-use paro_storage::buffer::{BufferManager, BufferPool, TemporaryMemoryManager};
 use std::sync::Arc;
+
+use crate::QueryMemoryCoordinator;
+use paro_storage::buffer::{BufferManager, BufferPool};
 
 #[derive(Clone)]
 pub struct ExecutionResources {
     pub scheduler: Arc<TaskScheduler>,
     pub buffer_pool: Arc<BufferPool>,
     pub buffer_manager: Arc<dyn BufferManager>,
-    pub temporary_memory_manager: Arc<TemporaryMemoryManager>,
+    pub query_memory_coordinator: Option<Arc<dyn QueryMemoryCoordinator>>,
 }
 
 impl std::fmt::Debug for ExecutionResources {

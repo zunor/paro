@@ -8,10 +8,12 @@ use parking_lot::Mutex;
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingClass;
 use paro_common::types::LogicalType;
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::types::ExplainRuntimeStats;
+use crate::memory_runtime::OperatorMemoryScope;
 use crate::operator::state::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, OperatorSinkCombineInput,
     OperatorSinkFinalizeInput, OperatorSinkInput, OperatorSourceInput,
@@ -81,6 +83,13 @@ impl ExternalTable {
         self.shared_state().map(|shared| shared.runtime_stats())
     }
 
+    fn runtime_allocator(memory: &OperatorMemoryScope<'_>) -> Arc<dyn Allocator> {
+        memory.accounted_allocator_for(
+            MemoryTag::ExternalRuntimeHost,
+            MemoryAccountingClass::NonRevocable,
+        )
+    }
+
     fn take_prefix_batch(
         &self,
         state: &mut ExternalTableLocalSinkState,
@@ -94,18 +103,18 @@ impl ExternalTable {
         }
 
         let mut batch_view = state.accumulation.clone();
-        batch_view.slice_range(0, rows);
-        let batch = batch_view.deep_copy_with_allocator(allocator.clone());
+        batch_view.try_slice_range(0, rows)?;
+        let batch = batch_view.try_deep_copy(allocator.clone())?;
 
         if rows == state.accumulation.size() {
-            state.accumulation.reset();
+            state.accumulation.try_reset(allocator.clone())?;
             state.accumulation_bytes = 0;
             return Ok(batch);
         }
 
         let mut remaining_view = state.accumulation.clone();
-        remaining_view.slice_range(rows, state.accumulation.size() - rows);
-        state.accumulation = remaining_view.deep_copy_with_allocator(allocator);
+        remaining_view.try_slice_range(rows, state.accumulation.size() - rows)?;
+        state.accumulation = remaining_view.try_deep_copy(allocator)?;
         state.accumulation_bytes = SubmissionBatchPolicy::estimate_chunk_bytes(&state.accumulation);
         Ok(batch)
     }
@@ -115,14 +124,21 @@ impl ExternalTable {
         shared: &Arc<ExternalTableSharedState>,
         state: &mut ExternalTableLocalSinkState,
         input: &Chunk,
-    ) {
+        memory: &OperatorMemoryScope<'_>,
+    ) -> Result<()> {
         if state.current_input_staged || input.is_empty() {
-            return;
+            return Ok(());
         }
-        state.accumulation.append(input);
+        if !state.accumulation_uses_runtime_allocator {
+            state.accumulation =
+                Chunk::try_init_empty(self.child.types(), Self::runtime_allocator(memory))?;
+            state.accumulation_uses_runtime_allocator = true;
+        }
+        state.accumulation.try_append(input)?;
         state.accumulation_bytes = SubmissionBatchPolicy::estimate_chunk_bytes(&state.accumulation);
         state.current_input_staged = true;
         shared.observe_accumulation_bytes(state.accumulation_bytes);
+        Ok(())
     }
 
     fn enqueue_response_batches(
@@ -143,8 +159,7 @@ impl ExternalTable {
                 chunk: batch.clone(),
                 partition_id,
                 partition_end: idx + 1 == response.output_batches.len(),
-            })
-            .collect::<Vec<_>>();
+            });
         shared.enqueue_output_batches(batches);
     }
 
@@ -175,7 +190,7 @@ impl ExternalTable {
             .into_iter()
             .map(|batch| {
                 let mut input_slice = input.clone();
-                input_slice.slice_range(offset, batch.size());
+                input_slice.try_slice_range(offset, batch.size())?;
                 offset += batch.size();
 
                 let mut columns = Vec::with_capacity(batch.column_count() + passthrough_count);
@@ -207,7 +222,10 @@ impl ExternalTable {
                             .clone(),
                     );
                 }
-                Ok(Chunk::from_vectors(columns))
+                Ok(Chunk::from_vectors(
+                    columns,
+                    input.allocator().clone(),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -243,6 +261,7 @@ impl ExternalTable {
         shared: &Arc<ExternalTableSharedState>,
         state: &mut ExternalTableLocalSinkState,
         tail_flush: bool,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<Option<SinkResultType>> {
         if !self.batch_policy.should_flush(
             state.accumulation.size(),
@@ -258,8 +277,7 @@ impl ExternalTable {
             .suggest_batch_rows(self.child.types(), state.accumulation_bytes)
             .min(state.accumulation.size())
             .max(1);
-        let batch =
-            self.take_prefix_batch(state, batch_rows, ctx.allocator(MemoryTag::Extension))?;
+        let batch = self.take_prefix_batch(state, batch_rows, Self::runtime_allocator(memory))?;
         shared.observe_accumulation_bytes(state.accumulation_bytes);
         let worker_input = self.extract_worker_input(&batch)?;
 
@@ -273,7 +291,7 @@ impl ExternalTable {
         };
         state.next_batch_id = state.next_batch_id.saturating_add(1);
 
-        match self.bridge.execute_table(ctx, &submission)? {
+        match self.bridge.execute_table(ctx, &submission, memory)? {
             RuntimeBridgeOutcome::Ready(response) => {
                 let response = self.attach_passthrough_columns(&batch, response)?;
                 shared.record_submission(batch.size(), false, &response);
@@ -315,7 +333,7 @@ impl ExternalTable {
                     .map(|vector| vector.as_ref().clone())
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Chunk::from_vectors(columns))
+        Ok(Chunk::from_vectors(columns, batch.allocator().clone()))
     }
 
     fn run_sink_step(
@@ -325,14 +343,15 @@ impl ExternalTable {
         state: &mut ExternalTableLocalSinkState,
         input: Option<&Chunk>,
         tail_flush: bool,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<SinkResultType> {
         if let Some(input) = input {
-            self.stage_input(shared, state, input);
+            self.stage_input(shared, state, input, memory)?;
         }
 
         self.collect_inflight_if_needed(shared, state);
 
-        if let Some(result) = self.submit_if_ready(ctx, shared, state, tail_flush)? {
+        if let Some(result) = self.submit_if_ready(ctx, shared, state, tail_flush, memory)? {
             return Ok(result);
         }
 
@@ -441,6 +460,10 @@ impl PhysicalOperator for ExternalTable {
                     .saturating_add(stats.peak_visible_output_bytes),
             ),
             temp_storage_bytes: None,
+            data_plane_bytes: (stats.data_plane_bytes > 0).then_some(stats.data_plane_bytes),
+            output_buffer_bytes: (stats.peak_visible_output_bytes > 0)
+                .then_some(stats.peak_visible_output_bytes),
+            ..Default::default()
         }
     }
 
@@ -511,7 +534,7 @@ impl PhysicalOperator for ExternalTable {
         Ok(Box::new(ExternalTableLocalSinkState::new(
             self.child.types(),
             ctx.allocator(MemoryTag::Extension),
-        )))
+        )?))
     }
 
     fn sink(
@@ -530,7 +553,14 @@ impl PhysicalOperator for ExternalTable {
             .as_any_mut()
             .downcast_mut::<ExternalTableLocalSinkState>()
             .ok_or_else(|| paro_error::internal("invalid external table local sink state"))?;
-        self.run_sink_step(ctx, &gstate.shared, lstate, Some(chunk), false)
+        self.run_sink_step(
+            ctx,
+            &gstate.shared,
+            lstate,
+            Some(chunk),
+            false,
+            &input.memory,
+        )
     }
 
     fn combine(
@@ -554,7 +584,7 @@ impl PhysicalOperator for ExternalTable {
         }
 
         Ok(
-            match self.run_sink_step(ctx, &gstate.shared, lstate, None, true)? {
+            match self.run_sink_step(ctx, &gstate.shared, lstate, None, true, &input.memory)? {
                 SinkResultType::NeedMoreInput | SinkResultType::Finished => {
                     SinkCombineResultType::Finished
                 }
@@ -625,7 +655,7 @@ impl PhysicalOperator for ExternalTable {
 
         gstate.shared.promote_backlog();
         let Some(batch) = gstate.shared.pop_visible_batch() else {
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
             return Ok(if gstate.shared.is_finalized() {
                 SourceResultType::Finished
             } else {
@@ -665,7 +695,7 @@ mod tests {
     use crate::pipeline::meta_pipeline::{MetaPipeline, MetaPipelineType};
     use crate::thread_context::ThreadContext;
     use paro_common::runtime_value::Value;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
     use paro_routine::{
@@ -719,11 +749,30 @@ mod tests {
             &self,
             _ctx: &ExecutionContext,
             _submission: &crate::operator::external::runtime_bridge::TableSubmission<'_>,
+            _memory: &crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<RuntimeBridgeOutcome> {
             let batches = vec![
-                Chunk::from_vectors(vec![Vector::from_i32(&[10])]),
-                Chunk::from_vectors(vec![Vector::from_i32(&[20])]),
-                Chunk::from_vectors(vec![Vector::from_i32(&[30])]),
+                Chunk::from_vectors(
+                    vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[10],
+                        paro_common::test_utils::test_allocator(),
+                    )],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                Chunk::from_vectors(
+                    vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[20],
+                        paro_common::test_utils::test_allocator(),
+                    )],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                Chunk::from_vectors(
+                    vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[30],
+                        paro_common::test_utils::test_allocator(),
+                    )],
+                    paro_common::test_utils::test_allocator(),
+                ),
             ];
             Ok(RuntimeBridgeOutcome::Ready(RuntimeBridgeResponse {
                 metrics: RuntimeBridgeMetrics {
@@ -815,7 +864,8 @@ mod tests {
             .expect("local source state");
         let mut source_input =
             OperatorSourceInput::new(g_source.as_ref(), l_source.as_mut(), ctx.interrupt_state());
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let first = operator
             .get_data(&ctx, &mut output, &mut source_input)
@@ -884,7 +934,19 @@ mod tests {
             bridge(Arc::new(ReadyTableKernel)),
         );
 
-        let input = Chunk::from_vectors(vec![Vector::from_i32(&[7]), Vector::from_i32(&[99])]);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[7],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[99],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         let worker_input = operator
             .extract_worker_input(&input)
             .expect("worker input should extract routine arguments");
@@ -895,14 +957,30 @@ mod tests {
             metrics: RuntimeBridgeMetrics {
                 output_rows: 1,
                 output_bytes: SubmissionBatchPolicy::estimate_chunk_bytes(&Chunk::from_vectors(
-                    vec![Vector::from_i32(&[70])],
+                    vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[70],
+                        paro_common::test_utils::test_allocator(),
+                    )],
+                    paro_common::test_utils::test_allocator(),
                 )),
                 data_plane_bytes: SubmissionBatchPolicy::estimate_chunk_bytes(
-                    &Chunk::from_vectors(vec![Vector::from_i32(&[70])]),
+                    &Chunk::from_vectors(
+                        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                            &[70],
+                            paro_common::test_utils::test_allocator(),
+                        )],
+                        paro_common::test_utils::test_allocator(),
+                    ),
                 ),
                 ..Default::default()
             },
-            output_batches: vec![Chunk::from_vectors(vec![Vector::from_i32(&[70])])],
+            output_batches: vec![Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[70],
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            )],
         };
         let attached = operator
             .attach_passthrough_columns(&input, response)
@@ -915,6 +993,12 @@ mod tests {
     }
 
     fn input_chunk(values: &[i32]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(values)])
+        Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 }

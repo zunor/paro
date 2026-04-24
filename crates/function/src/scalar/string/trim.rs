@@ -223,10 +223,13 @@ mod tests {
 
     #[test]
     fn test_trim_whitespace() {
-        let input_vec = Vector::from_strings(&["  hello  ", "\tworld\n", "  "]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["  hello  ", "\tworld\n", "  "],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         trim_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -237,11 +240,20 @@ mod tests {
 
     #[test]
     fn test_trim_chars() {
-        let str_vec = Vector::from_strings(&["xxhelloxx", "abcHIabc"]);
-        let chars_vec = Vector::from_strings(&["x", "abc"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, chars_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["xxhelloxx", "abcHIabc"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chars_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["x", "abc"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, chars_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         trim_chars_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -251,10 +263,13 @@ mod tests {
 
     #[test]
     fn test_ltrim_whitespace() {
-        let input_vec = Vector::from_strings(&["  hello  ", "\tworld"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["  hello  ", "\tworld"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         ltrim_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -264,11 +279,20 @@ mod tests {
 
     #[test]
     fn test_ltrim_chars() {
-        let str_vec = Vector::from_strings(&["xxhelloxx"]);
-        let chars_vec = Vector::from_strings(&["x"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, chars_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["xxhelloxx"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chars_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["x"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, chars_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         ltrim_chars_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -277,10 +301,13 @@ mod tests {
 
     #[test]
     fn test_rtrim_whitespace() {
-        let input_vec = Vector::from_strings(&["  hello  ", "world\t"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["  hello  ", "world\t"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         rtrim_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -290,11 +317,20 @@ mod tests {
 
     #[test]
     fn test_rtrim_chars() {
-        let str_vec = Vector::from_strings(&["xxhelloxx"]);
-        let chars_vec = Vector::from_strings(&["x"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, chars_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["xxhelloxx"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chars_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["x"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, chars_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         rtrim_chars_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -303,11 +339,14 @@ mod tests {
 
     #[test]
     fn test_trim_with_null() {
-        let mut input_vec = Vector::from_strings(&["  hello  ", "world"]);
+        let mut input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["  hello  ", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         input_vec.validity_mut().set_null(1);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         trim_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -317,10 +356,13 @@ mod tests {
 
     #[test]
     fn test_trim_unicode() {
-        let input_vec = Vector::from_strings(&["  你好  ", "　世界　"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["  你好  ", "　世界　"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         trim_varchar(&chunk, &state, &mut result).unwrap();
 

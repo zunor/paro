@@ -6,6 +6,9 @@
 //! This wraps multiple [`GroupedAggregateHashTable`] partitions and routes
 //! rows by hash high bits, so each partition resizes/scans independently.
 
+use std::sync::Arc;
+
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -39,11 +42,13 @@ impl AggregateHashTable {
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         Ok(Self::Flat(GroupedAggregateHashTable::new(
             group_types,
             aggregate_objects,
             aggregate_inputs,
+            allocator,
         )?))
     }
 
@@ -52,12 +57,14 @@ impl AggregateHashTable {
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         partition_bits: usize,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         Ok(Self::Radix(RadixPartitionedAggregateHashTable::new(
             group_types,
             aggregate_objects,
             aggregate_inputs,
             partition_bits,
+            allocator,
         )?))
     }
 
@@ -147,10 +154,24 @@ impl AggregateHashTable {
         }
     }
 
+    pub fn external_accounted_memory_usage(&self) -> usize {
+        match self {
+            Self::Flat(table) => table.external_accounted_memory_usage(),
+            Self::Radix(table) => table.external_accounted_memory_usage(),
+        }
+    }
+
     pub fn count(&self) -> usize {
         match self {
             Self::Flat(table) => table.count(),
             Self::Radix(table) => table.count(),
+        }
+    }
+
+    pub fn allocator(&self) -> Arc<dyn Allocator> {
+        match self {
+            Self::Flat(table) => table.allocator(),
+            Self::Radix(table) => table.allocator(),
         }
     }
 
@@ -176,6 +197,7 @@ impl RadixPartitionedAggregateHashTable {
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         partition_bits: usize,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         if partition_bits == 0 || partition_bits > MAX_RADIX_PARTITION_BITS {
             return Err(paro_error::internal(format!(
@@ -193,6 +215,7 @@ impl RadixPartitionedAggregateHashTable {
                 group_types.clone(),
                 aggregate_objects.clone(),
                 aggregate_inputs.clone(),
+                allocator.clone(),
             )?);
         }
         Ok(Self {
@@ -234,14 +257,15 @@ impl RadixPartitionedAggregateHashTable {
 
         if groups.size() == 0 {
             addresses.set_count(0);
-            *new_groups = SelectionVector::from_indices(Vec::new());
+            *new_groups =
+                SelectionVector::try_from_indices(Vec::new(), groups.allocator().clone())?;
             return Ok(0);
         }
 
         let mut partition_rows = vec![Vec::<usize>::new(); self.partitions.len()];
         let mut partition_hashes = vec![Vec::<u64>::new(); self.partitions.len()];
 
-        let hash_format = hashes.decode(groups.size());
+        let hash_format = hashes.try_decode(groups.size())?;
         let hash_data = hash_format.get_data::<u64>();
         for row_idx in 0..groups.size() {
             let physical_idx = hash_format.sel().get(row_idx);
@@ -282,9 +306,12 @@ impl RadixPartitionedAggregateHashTable {
                         "Missing partition hashes while probing radix table: partition_idx={partition_idx}"
                     ))
                 })?,
-            );
-            let mut partition_addresses = Vector::with_capacity(LogicalType::BigInt, rows.len());
-            let mut partition_new_groups = SelectionVector::with_capacity(rows.len());
+                groups.allocator().clone(),
+            )?;
+            let mut partition_addresses =
+                Vector::try_new(LogicalType::BigInt, rows.len(), groups.allocator().clone())?;
+            let mut partition_new_groups =
+                SelectionVector::try_with_capacity(rows.len(), groups.allocator().clone())?;
             partition.find_or_create_groups(
                 &partition_groups,
                 &partition_hashes_vec,
@@ -292,7 +319,7 @@ impl RadixPartitionedAggregateHashTable {
                 &mut partition_new_groups,
             )?;
 
-            let partition_address_format = partition_addresses.decode(rows.len());
+            let partition_address_format = partition_addresses.try_decode(rows.len())?;
             let partition_address_data = partition_address_format.get_data::<*mut u8>();
             for (local_row, &global_row) in rows.iter().enumerate() {
                 let physical_idx = partition_address_format.sel().get(local_row);
@@ -319,7 +346,8 @@ impl RadixPartitionedAggregateHashTable {
             }
         }
 
-        *new_groups = SelectionVector::from_indices(new_group_rows);
+        *new_groups =
+            SelectionVector::try_from_indices(new_group_rows, groups.allocator().clone())?;
         Ok(new_groups.len())
     }
 
@@ -355,7 +383,7 @@ impl RadixPartitionedAggregateHashTable {
         }
 
         let mut partition_rows = vec![Vec::<usize>::new(); self.partitions.len()];
-        let hash_format = hashes.decode(payload.size());
+        let hash_format = hashes.try_decode(payload.size())?;
         let hash_data = hash_format.get_data::<u64>();
         for row_idx in 0..payload.size() {
             let physical_idx = hash_format.sel().get(row_idx);
@@ -466,11 +494,25 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
             .sum()
     }
 
+    pub fn external_accounted_memory_usage(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(GroupedAggregateHashTable::external_accounted_memory_usage)
+            .sum()
+    }
+
     pub fn count(&self) -> usize {
         self.partitions
             .iter()
             .map(GroupedAggregateHashTable::count)
             .sum()
+    }
+
+    pub fn allocator(&self) -> Arc<dyn Allocator> {
+        self.partitions
+            .first()
+            .map(GroupedAggregateHashTable::allocator)
+            .expect("radix aggregate hash table should have partitions")
     }
 
     fn partition_for_hash(&self, hash: u64) -> usize {
@@ -505,8 +547,8 @@ fn validate_address_capacity(addresses: &Vector, row_count: usize) -> Result<()>
     Ok(())
 }
 
-fn u64_vector_from_slice(values: &[u64]) -> Vector {
-    let mut vector = Vector::with_capacity(LogicalType::UBigInt, values.len());
+fn u64_vector_from_slice(values: &[u64], allocator: Arc<dyn Allocator>) -> Result<Vector> {
+    let mut vector = Vector::try_new(LogicalType::UBigInt, values.len(), allocator)?;
     vector.set_count(values.len());
     unsafe {
         let data = vector.flat_data_mut::<u64>();
@@ -514,7 +556,7 @@ fn u64_vector_from_slice(values: &[u64]) -> Vector {
             *data.add(idx) = *value;
         }
     }
-    vector
+    Ok(vector)
 }
 
 fn gather_chunk_rows(source: &Chunk, rows: &[usize]) -> Result<Chunk> {
@@ -527,7 +569,8 @@ fn gather_chunk_rows(source: &Chunk, rows: &[usize]) -> Result<Chunk> {
         })?;
         column_types.push(column.logical_type().clone());
     }
-    let mut gathered = Chunk::initialize(&column_types, rows.len());
+    let mut gathered =
+        Chunk::try_initialize(&column_types, rows.len(), source.allocator().clone())?;
     gathered.set_cardinality(rows.len());
     for column_idx in 0..source.column_count() {
         let source_col = source.column(column_idx).ok_or_else(|| {
@@ -554,10 +597,14 @@ fn gather_chunk_rows(source: &Chunk, rows: &[usize]) -> Result<Chunk> {
 }
 
 fn gather_address_rows(addresses: &Vector, rows: &[usize]) -> Result<Vector> {
-    let mut gathered = Vector::with_capacity(LogicalType::BigInt, rows.len());
+    let mut gathered = Vector::try_new(
+        LogicalType::BigInt,
+        rows.len(),
+        addresses.allocator().clone(),
+    )?;
     gathered.set_count(rows.len());
 
-    let address_format = addresses.decode(addresses.len());
+    let address_format = addresses.try_decode(addresses.len())?;
     let address_data = address_format.get_data::<*mut u8>();
     unsafe {
         let target_data = gathered.flat_data_mut::<*mut u8>();

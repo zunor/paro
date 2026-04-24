@@ -12,10 +12,16 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryGrant,
+    MemoryOwner, MemoryReleaseHandle,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
@@ -26,6 +32,7 @@ use paro_planner::expression::{Expression, OrderByExpression, WindowExpression};
 use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_window_expression;
 use crate::explain::types::ExplainRuntimeStats;
+use crate::memory_runtime::RetainedChunkVec;
 use crate::operator::state::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, OperatorSinkInput,
     OperatorSourceInput,
@@ -38,10 +45,58 @@ use crate::result_type::{
 use crate::sorting::sort::Sort;
 
 /// Row key for sorting and partitioning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct RowKey {
     chunk_idx: usize,
     row_idx: usize,
+}
+
+#[derive(Debug)]
+struct AccountedRowKeys {
+    keys: AccountedVec<RowKey>,
+}
+
+impl AccountedRowKeys {
+    fn new(memory: &MemoryAccountingContext) -> Self {
+        Self {
+            keys: AccountedVec::new_with_accounting(
+                grant_for_context(memory),
+                memory.tag(),
+                memory.accounting_class(),
+            ),
+        }
+    }
+
+    fn from_slice(memory: &MemoryAccountingContext, keys: &[RowKey]) -> Result<Self> {
+        let mut accounted = Self::new(memory);
+        accounted.keys.try_extend_from_slice(keys)?;
+        Ok(accounted)
+    }
+
+    fn push(&mut self, key: RowKey) -> Result<()> {
+        self.keys.try_push(key)?;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[RowKey] {
+        self.keys.as_slice()
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+impl Deref for AccountedRowKeys {
+    type Target = [RowKey];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
 }
 
 /// Partition information.
@@ -61,6 +116,151 @@ enum WindowValue {
     Double(f64),
     Integer(i32),
     Varchar(String),
+}
+
+impl WindowValue {
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Varchar(value) => value.capacity(),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AccountedWindowValues {
+    memory: MemoryAccountingContext,
+    values: AccountedVec<WindowValue>,
+    payload_handles: AccountedVec<MemoryReleaseHandle>,
+}
+
+impl AccountedWindowValues {
+    fn new(memory: &MemoryAccountingContext) -> Self {
+        let metadata_memory = memory.with_class(MemoryAccountingClass::Metadata);
+        Self {
+            memory: memory.clone(),
+            values: AccountedVec::new_with_accounting(
+                grant_for_context(memory),
+                memory.tag(),
+                memory.accounting_class(),
+            ),
+            payload_handles: AccountedVec::new_with_accounting(
+                grant_for_context(&metadata_memory),
+                MemoryTag::Metadata,
+                MemoryAccountingClass::Metadata,
+            ),
+        }
+    }
+
+    fn with_capacity(memory: &MemoryAccountingContext, capacity: usize) -> Result<Self> {
+        let mut values = Self::new(memory);
+        values.values.try_reserve(capacity)?;
+        Ok(values)
+    }
+
+    fn push(&mut self, value: WindowValue) -> Result<()> {
+        let payload_bytes = value.payload_bytes();
+        if payload_bytes > 0 {
+            self.payload_handles.try_reserve(1)?;
+        }
+        self.values.try_push(value)?;
+        if payload_bytes > 0 {
+            let handle = match self.memory.retain(payload_bytes) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    self.values.pop();
+                    return Err(err.into());
+                }
+            };
+            self.payload_handles.try_push(handle)?;
+        }
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[WindowValue] {
+        self.values.as_slice()
+    }
+}
+
+impl Deref for AccountedWindowValues {
+    type Target = [WindowValue];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl Drop for AccountedWindowValues {
+    fn drop(&mut self) {
+        for handle in self.payload_handles.iter() {
+            handle.release();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AccountedWindowResults {
+    results: AccountedVec<AccountedWindowValues>,
+}
+
+impl AccountedWindowResults {
+    fn new(memory: &MemoryAccountingContext) -> Self {
+        let metadata_memory = memory.with_class(MemoryAccountingClass::Metadata);
+        Self {
+            results: AccountedVec::new_with_accounting(
+                grant_for_context(&metadata_memory),
+                MemoryTag::Metadata,
+                MemoryAccountingClass::Metadata,
+            ),
+        }
+    }
+
+    fn push(&mut self, values: AccountedWindowValues) -> Result<()> {
+        self.results.try_push(values)?;
+        Ok(())
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, AccountedWindowValues> {
+        self.results.iter()
+    }
+}
+
+impl Deref for AccountedWindowResults {
+    type Target = [AccountedWindowValues];
+
+    fn deref(&self) -> &Self::Target {
+        self.results.as_slice()
+    }
+}
+
+fn window_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::OrderBy,
+        MemoryAccountingClass::Revocable,
+    )
+}
+
+fn sort_backed_memory_context(
+    gstate: &SortBackedGlobalSinkState,
+    ctx: &ExecutionContext,
+) -> MemoryAccountingContext {
+    gstate
+        .sort_state
+        .as_any()
+        .downcast_ref::<crate::sorting::sort::SortGlobalSinkState>()
+        .map(crate::sorting::sort::SortGlobalSinkState::memory_context)
+        .unwrap_or_else(|| window_memory_context(ctx))
+}
+
+fn grant_for_context(memory: &MemoryAccountingContext) -> MemoryGrant {
+    if let Some(owner) = memory.owner() {
+        MemoryGrant::new(0, memory.domain(), owner).expect("zero-byte window grant should fit")
+    } else {
+        MemoryGrant::detached(usize::MAX / 4, memory.domain())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,8 +283,8 @@ struct WindowSourceTask {
 #[derive(Debug, Clone)]
 struct SortHashGroup {
     hash_bin: usize,
-    chunks: Arc<Vec<Chunk>>,
-    keys: Vec<RowKey>,
+    chunks: Arc<Mutex<RetainedChunkVec>>,
+    keys: Arc<Mutex<AccountedRowKeys>>,
 }
 
 trait SortStrategy: std::fmt::Debug + Send + Sync {
@@ -161,14 +361,14 @@ impl LocalSinkState for SortBackedLocalSinkState {
 
 #[derive(Debug)]
 struct NaturalGlobalSinkState {
-    chunks: Mutex<Vec<Chunk>>,
+    chunks: Mutex<RetainedChunkVec>,
     hash_groups: Mutex<Option<Vec<SortHashGroup>>>,
 }
 
-impl Default for NaturalGlobalSinkState {
-    fn default() -> Self {
+impl NaturalGlobalSinkState {
+    fn new(memory: MemoryAccountingContext) -> Self {
         Self {
-            chunks: Mutex::new(Vec::new()),
+            chunks: Mutex::new(RetainedChunkVec::new(memory)),
             hash_groups: Mutex::new(None),
         }
     }
@@ -188,9 +388,17 @@ impl GlobalSinkState for NaturalGlobalSinkState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct NaturalLocalSinkState {
-    local_chunks: Vec<Chunk>,
+    local_chunks: RetainedChunkVec,
+}
+
+impl NaturalLocalSinkState {
+    fn new(memory: MemoryAccountingContext) -> Self {
+        Self {
+            local_chunks: RetainedChunkVec::new(memory),
+        }
+    }
 }
 
 impl LocalSinkState for NaturalLocalSinkState {
@@ -298,30 +506,31 @@ fn same_partition(chunks: &[Chunk], a: &RowKey, b: &RowKey, partitions: &[Expres
     true
 }
 
-fn build_row_keys(chunks: &[Chunk]) -> Vec<RowKey> {
-    let mut keys = Vec::new();
+fn build_row_keys(chunks: &[Chunk], memory: &MemoryAccountingContext) -> Result<AccountedRowKeys> {
+    let mut keys = AccountedRowKeys::new(memory);
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         for row_idx in 0..chunk.size() {
-            keys.push(RowKey { chunk_idx, row_idx });
+            keys.push(RowKey { chunk_idx, row_idx })?;
         }
     }
-    keys
+    Ok(keys)
 }
 
 fn collect_sorted_chunks(
     sort: &Sort,
     ctx: &ExecutionContext,
     sink_state: &dyn GlobalSinkState,
-) -> Result<Vec<Chunk>> {
+    memory: &MemoryAccountingContext,
+) -> Result<RetainedChunkVec> {
     let gsource = sort.get_global_source_state(ctx, sink_state)?;
     let mut lsource = sort.get_local_source_state(ctx, gsource.as_ref())?;
 
-    let mut chunks = Vec::new();
+    let mut chunks = RetainedChunkVec::new(memory.clone());
     loop {
-        let mut out = Chunk::new();
+        let mut out = Chunk::try_new(ctx.allocator(paro_common::allocator::MemoryTag::BaseTable))?;
         let result = sort.get_data(ctx, &mut out, gsource.as_ref(), lsource.as_mut())?;
         if out.size() > 0 {
-            chunks.push(out);
+            chunks.push(out)?;
         }
 
         if result == SourceResultType::Finished {
@@ -336,13 +545,13 @@ fn split_keys_by_partitions(
     chunks: &[Chunk],
     keys: &[RowKey],
     partitions: &[Expression],
-) -> Vec<Vec<RowKey>> {
+) -> Result<Vec<Vec<RowKey>>> {
     if keys.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     if partitions.is_empty() {
-        return vec![keys.to_vec()];
+        return Ok(vec![keys.to_vec()]);
     }
 
     let mut groups = Vec::new();
@@ -356,7 +565,7 @@ fn split_keys_by_partitions(
     }
     groups.push(keys[start..].to_vec());
 
-    groups
+    Ok(groups)
 }
 
 fn window_order_to_sort_order(order: &OrderByExpression) -> OrderByNode {
@@ -477,8 +686,9 @@ impl SortStrategy for FullSortStrategy {
             return Ok(groups.clone());
         }
 
-        let chunks = collect_sorted_chunks(&self.sort, ctx, gstate.sort_state.as_ref())?;
-        let keys = build_row_keys(&chunks);
+        let memory = sort_backed_memory_context(gstate, ctx);
+        let chunks = collect_sorted_chunks(&self.sort, ctx, gstate.sort_state.as_ref(), &memory)?;
+        let keys = build_row_keys(chunks.as_slice(), &memory)?;
         if keys.is_empty() {
             *gstate.hash_groups.lock().unwrap() = Some(Vec::new());
             return Ok(Vec::new());
@@ -486,8 +696,8 @@ impl SortStrategy for FullSortStrategy {
 
         let groups = vec![SortHashGroup {
             hash_bin: 0,
-            chunks: Arc::new(chunks),
-            keys,
+            chunks: Arc::new(Mutex::new(chunks)),
+            keys: Arc::new(Mutex::new(keys)),
         }];
 
         *gstate.hash_groups.lock().unwrap() = Some(groups.clone());
@@ -635,25 +845,29 @@ impl SortStrategy for HashedSortStrategy {
             return Ok(groups.clone());
         }
 
-        let chunks = collect_sorted_chunks(&self.sort, ctx, gstate.sort_state.as_ref())?;
-        let keys = build_row_keys(&chunks);
+        let memory = sort_backed_memory_context(gstate, ctx);
+        let chunks = collect_sorted_chunks(&self.sort, ctx, gstate.sort_state.as_ref(), &memory)?;
+        let keys = build_row_keys(chunks.as_slice(), &memory)?;
         if keys.is_empty() {
             *gstate.hash_groups.lock().unwrap() = Some(Vec::new());
             return Ok(Vec::new());
         }
 
-        let partitioned_keys = split_keys_by_partitions(&chunks, &keys, &self.partitions);
-        let chunk_ref = Arc::new(chunks);
+        let partitioned_keys =
+            split_keys_by_partitions(chunks.as_slice(), keys.as_slice(), &self.partitions)?;
+        let chunk_ref = Arc::new(Mutex::new(chunks));
 
         let groups = partitioned_keys
             .into_iter()
             .enumerate()
-            .map(|(idx, keys)| SortHashGroup {
-                hash_bin: idx,
-                chunks: Arc::clone(&chunk_ref),
-                keys,
+            .map(|(idx, keys)| {
+                Ok(SortHashGroup {
+                    hash_bin: idx,
+                    chunks: Arc::clone(&chunk_ref),
+                    keys: Arc::new(Mutex::new(AccountedRowKeys::from_slice(&memory, &keys)?)),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         *gstate.hash_groups.lock().unwrap() = Some(groups.clone());
         Ok(groups)
@@ -679,12 +893,16 @@ impl SortStrategy for HashedSortStrategy {
 struct NaturalSortStrategy;
 
 impl SortStrategy for NaturalSortStrategy {
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        Ok(Box::new(NaturalGlobalSinkState::default()))
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+        Ok(Box::new(NaturalGlobalSinkState::new(
+            window_memory_context(ctx),
+        )))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        Ok(Box::new(NaturalLocalSinkState::default()))
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        Ok(Box::new(NaturalLocalSinkState::new(window_memory_context(
+            ctx,
+        ))))
     }
 
     fn sink(
@@ -702,7 +920,7 @@ impl SortStrategy for NaturalSortStrategy {
             .as_any_mut()
             .downcast_mut::<NaturalLocalSinkState>()
             .expect("Invalid NaturalSort local sink state");
-        lstate.local_chunks.push(chunk.clone());
+        lstate.local_chunks.push(chunk.clone())?;
         Ok(SinkResultType::NeedMoreInput)
     }
 
@@ -722,7 +940,7 @@ impl SortStrategy for NaturalSortStrategy {
             .expect("Invalid NaturalSort local sink state");
 
         let mut chunks = gstate.chunks.lock().unwrap();
-        chunks.append(&mut lstate.local_chunks);
+        chunks.append_from(&mut lstate.local_chunks)?;
         Ok(SinkCombineResultType::Finished)
     }
 
@@ -740,7 +958,7 @@ impl SortStrategy for NaturalSortStrategy {
 
     fn get_hash_groups(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         global_state: &dyn GlobalSinkState,
     ) -> Result<Vec<SortHashGroup>> {
         let gstate = global_state
@@ -752,8 +970,13 @@ impl SortStrategy for NaturalSortStrategy {
             return Ok(groups.clone());
         }
 
-        let chunks = gstate.chunks.lock().unwrap().clone();
-        let keys = build_row_keys(&chunks);
+        let memory = window_memory_context(ctx);
+        let mut source_chunks = RetainedChunkVec::new(memory.clone());
+        {
+            let mut chunks = gstate.chunks.lock().unwrap();
+            source_chunks.append_from(&mut chunks)?;
+        }
+        let keys = build_row_keys(source_chunks.as_slice(), &memory)?;
         if keys.is_empty() {
             *gstate.hash_groups.lock().unwrap() = Some(Vec::new());
             return Ok(Vec::new());
@@ -761,8 +984,8 @@ impl SortStrategy for NaturalSortStrategy {
 
         let groups = vec![SortHashGroup {
             hash_bin: 0,
-            chunks: Arc::new(chunks),
-            keys,
+            chunks: Arc::new(Mutex::new(source_chunks)),
+            keys: Arc::new(Mutex::new(keys)),
         }];
 
         *gstate.hash_groups.lock().unwrap() = Some(groups.clone());
@@ -774,9 +997,9 @@ impl SortStrategy for NaturalSortStrategy {
 struct WindowHashGroup {
     hash_bin: usize,
     stage: WindowGroupStage,
-    chunks: Option<Arc<Vec<Chunk>>>,
-    keys: Vec<RowKey>,
-    window_results: Option<Vec<Vec<WindowValue>>>,
+    chunks: Option<Arc<Mutex<RetainedChunkVec>>>,
+    keys: Arc<Mutex<AccountedRowKeys>>,
+    window_results: Option<AccountedWindowResults>,
     output_idx: usize,
 }
 
@@ -817,7 +1040,6 @@ impl WindowHashGroup {
     fn mark_done(&mut self) {
         self.stage = WindowGroupStage::Done;
         self.output_idx = 0;
-        self.keys.clear();
         self.window_results = None;
         self.chunks = None;
     }
@@ -1145,14 +1367,14 @@ impl Window {
         sorted_keys: &[RowKey],
         partition: &Partition,
         expr: &WindowExpression,
-    ) -> Vec<WindowValue> {
+        results: &mut AccountedWindowValues,
+    ) -> Result<()> {
         let partition_size = partition.end - partition.start;
-        let mut results = Vec::with_capacity(partition_size);
 
         match expr.function.function_type {
             WindowFunctionType::RowNumber => {
                 for i in 0..partition_size {
-                    results.push(WindowValue::BigInt((i + 1) as i64));
+                    results.push(WindowValue::BigInt((i + 1) as i64))?;
                 }
             }
             WindowFunctionType::Rank => {
@@ -1165,7 +1387,7 @@ impl Window {
                             rank = (i + 1) as i64;
                         }
                     }
-                    results.push(WindowValue::BigInt(rank));
+                    results.push(WindowValue::BigInt(rank))?;
                 }
             }
             WindowFunctionType::DenseRank => {
@@ -1178,13 +1400,13 @@ impl Window {
                             rank += 1;
                         }
                     }
-                    results.push(WindowValue::BigInt(rank));
+                    results.push(WindowValue::BigInt(rank))?;
                 }
             }
             WindowFunctionType::PercentRank => {
                 if partition_size <= 1 {
                     for _ in 0..partition_size {
-                        results.push(WindowValue::Double(0.0));
+                        results.push(WindowValue::Double(0.0))?;
                     }
                 } else {
                     let mut rank = 1i64;
@@ -1197,7 +1419,7 @@ impl Window {
                             }
                         }
                         let percent = (rank - 1) as f64 / (partition_size - 1) as f64;
-                        results.push(WindowValue::Double(percent));
+                        results.push(WindowValue::Double(percent))?;
                     }
                 }
             }
@@ -1217,7 +1439,7 @@ impl Window {
                         }
                     }
                     let cume = peer_end as f64 / partition_size as f64;
-                    results.push(WindowValue::Double(cume));
+                    results.push(WindowValue::Double(cume))?;
                 }
             }
             WindowFunctionType::Ntile => {
@@ -1225,37 +1447,37 @@ impl Window {
                 let n = self.get_ntile_buckets(chunks, sorted_keys, partition, expr);
                 if n <= 0 {
                     for _ in 0..partition_size {
-                        results.push(WindowValue::Null);
+                        results.push(WindowValue::Null)?;
                     }
                 } else {
                     let n = n as usize;
                     for i in 0..partition_size {
                         let bucket = (i * n / partition_size) + 1;
-                        results.push(WindowValue::BigInt(bucket as i64));
+                        results.push(WindowValue::BigInt(bucket as i64))?;
                     }
                 }
             }
             WindowFunctionType::Lead | WindowFunctionType::Lag => {
-                self.compute_lead_lag(chunks, sorted_keys, partition, expr, &mut results);
+                self.compute_lead_lag(chunks, sorted_keys, partition, expr, results)?;
             }
             WindowFunctionType::FirstValue => {
-                self.compute_first_value(chunks, sorted_keys, partition, expr, &mut results);
+                self.compute_first_value(chunks, sorted_keys, partition, expr, results)?;
             }
             WindowFunctionType::LastValue => {
-                self.compute_last_value(chunks, sorted_keys, partition, expr, &mut results);
+                self.compute_last_value(chunks, sorted_keys, partition, expr, results)?;
             }
             WindowFunctionType::NthValue => {
-                self.compute_nth_value(chunks, sorted_keys, partition, expr, &mut results);
+                self.compute_nth_value(chunks, sorted_keys, partition, expr, results)?;
             }
             WindowFunctionType::Aggregate => {
                 // Aggregate window functions not yet supported
                 for _ in 0..partition_size {
-                    results.push(WindowValue::Null);
+                    results.push(WindowValue::Null)?;
                 }
             }
         }
 
-        results
+        Ok(())
     }
 
     /// Get NTILE bucket count from expression.
@@ -1300,8 +1522,8 @@ impl Window {
         sorted_keys: &[RowKey],
         partition: &Partition,
         expr: &WindowExpression,
-        results: &mut Vec<WindowValue>,
-    ) {
+        results: &mut AccountedWindowValues,
+    ) -> Result<()> {
         let partition_size = partition.end - partition.start;
         let is_lead = expr.function.function_type == WindowFunctionType::Lead;
 
@@ -1334,13 +1556,14 @@ impl Window {
             };
 
             if target_idx < 0 || target_idx >= partition_size as i64 {
-                results.push(default_value.clone());
+                results.push(default_value.clone())?;
             } else {
                 let key = &sorted_keys[partition.start + target_idx as usize];
                 let value = self.get_value_from_row(chunks, key, expr);
-                results.push(value);
+                results.push(value)?;
             }
         }
+        Ok(())
     }
 
     /// Compute FIRST_VALUE function.
@@ -1350,11 +1573,11 @@ impl Window {
         sorted_keys: &[RowKey],
         partition: &Partition,
         expr: &WindowExpression,
-        results: &mut Vec<WindowValue>,
-    ) {
+        results: &mut AccountedWindowValues,
+    ) -> Result<()> {
         let partition_size = partition.end - partition.start;
         if partition_size == 0 {
-            return;
+            return Ok(());
         }
 
         // Get value from first row
@@ -1362,8 +1585,9 @@ impl Window {
         let first_value = self.get_value_from_row(chunks, first_key, expr);
 
         for _ in 0..partition_size {
-            results.push(first_value.clone());
+            results.push(first_value.clone())?;
         }
+        Ok(())
     }
 
     /// Compute LAST_VALUE function.
@@ -1373,11 +1597,11 @@ impl Window {
         sorted_keys: &[RowKey],
         partition: &Partition,
         expr: &WindowExpression,
-        results: &mut Vec<WindowValue>,
-    ) {
+        results: &mut AccountedWindowValues,
+    ) -> Result<()> {
         let partition_size = partition.end - partition.start;
         if partition_size == 0 {
-            return;
+            return Ok(());
         }
 
         // For default frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
@@ -1387,8 +1611,9 @@ impl Window {
         let last_value = self.get_value_from_row(chunks, last_key, expr);
 
         for _ in 0..partition_size {
-            results.push(last_value.clone());
+            results.push(last_value.clone())?;
         }
+        Ok(())
     }
 
     /// Compute NTH_VALUE function.
@@ -1398,8 +1623,8 @@ impl Window {
         sorted_keys: &[RowKey],
         partition: &Partition,
         expr: &WindowExpression,
-        results: &mut Vec<WindowValue>,
-    ) {
+        results: &mut AccountedWindowValues,
+    ) -> Result<()> {
         let partition_size = partition.end - partition.start;
 
         // Get n from second argument
@@ -1424,8 +1649,9 @@ impl Window {
         };
 
         for _ in 0..partition_size {
-            results.push(value.clone());
+            results.push(value.clone())?;
         }
+        Ok(())
     }
 
     /// Get value from a row for window function.
@@ -1505,27 +1731,28 @@ impl Window {
         &self,
         chunks: &[Chunk],
         sorted_keys: &[RowKey],
-    ) -> Vec<Vec<WindowValue>> {
-        if sorted_keys.is_empty() {
-            return vec![Vec::new(); self.expressions.len()];
-        }
-
-        let mut all_results = Vec::with_capacity(self.expressions.len());
+        memory: &MemoryAccountingContext,
+    ) -> Result<AccountedWindowResults> {
+        let mut all_results = AccountedWindowResults::new(memory);
 
         for expr in &self.expressions {
             let partitions = self.find_partitions(chunks, sorted_keys, expr);
-            let mut expr_results = Vec::with_capacity(sorted_keys.len());
+            let mut expr_results = AccountedWindowValues::with_capacity(memory, sorted_keys.len())?;
 
             for partition in &partitions {
-                let partition_results =
-                    self.compute_window_function(chunks, sorted_keys, partition, expr);
-                expr_results.extend(partition_results);
+                self.compute_window_function(
+                    chunks,
+                    sorted_keys,
+                    partition,
+                    expr,
+                    &mut expr_results,
+                )?;
             }
 
-            all_results.push(expr_results);
+            all_results.push(expr_results)?;
         }
 
-        all_results
+        Ok(all_results)
     }
 
     /// Build output chunk with window results.
@@ -1533,13 +1760,14 @@ impl Window {
         &self,
         chunks: &[Chunk],
         sorted_keys: &[RowKey],
-        window_results: &[Vec<WindowValue>],
+        window_results: &AccountedWindowResults,
         start_idx: usize,
         count: usize,
-    ) -> Chunk {
+        allocator: Arc<dyn paro_common::allocator::Allocator>,
+    ) -> Result<Chunk> {
         let actual_count = count.min(sorted_keys.len().saturating_sub(start_idx));
         if actual_count == 0 {
-            return Chunk::new();
+            return Chunk::try_new(allocator);
         }
 
         let mut output_vectors = Vec::with_capacity(self.types.len());
@@ -1547,7 +1775,8 @@ impl Window {
         // Copy input columns
         for col_idx in 0..self.input_width {
             let col_type = &self.types[col_idx];
-            let mut output_vec = Vector::with_capacity(col_type.clone(), actual_count);
+            let mut output_vec =
+                Vector::try_new(col_type.clone(), actual_count, allocator.clone())?;
 
             for i in 0..actual_count {
                 let key = &sorted_keys[start_idx + i];
@@ -1568,10 +1797,11 @@ impl Window {
         // Add window result columns
         for (expr_idx, results) in window_results.iter().enumerate() {
             let col_type = &self.types[self.input_width + expr_idx];
-            let mut output_vec = Vector::with_capacity(col_type.clone(), actual_count);
+            let mut output_vec =
+                Vector::try_new(col_type.clone(), actual_count, allocator.clone())?;
 
             for i in 0..actual_count {
-                let result = &results[start_idx + i];
+                let result = &results.as_slice()[start_idx + i];
                 match result {
                     WindowValue::Null => output_vec.set_null(i, true),
                     WindowValue::BigInt(v) => output_vec.set_i64(i, *v),
@@ -1585,9 +1815,9 @@ impl Window {
             output_vectors.push(Arc::new(output_vec));
         }
 
-        let mut chunk = Chunk::from_arc_vectors(output_vectors);
+        let mut chunk = Chunk::from_arc_vectors(output_vectors, allocator);
         chunk.set_cardinality(actual_count);
-        chunk
+        Ok(chunk)
     }
 }
 
@@ -1851,7 +2081,7 @@ impl PhysicalOperator for Window {
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
@@ -1890,12 +2120,21 @@ impl PhysicalOperator for Window {
                     group.advance_stage();
                 }
                 WindowGroupStage::Sink => {
-                    let chunks = group
-                        .chunks
-                        .as_ref()
-                        .expect("window group chunks should exist in sink stage")
-                        .as_slice();
-                    let results = self.compute_group_window_results(chunks, &group.keys);
+                    let memory = window_memory_context(ctx);
+                    let results = {
+                        let chunks = group
+                            .chunks
+                            .as_ref()
+                            .expect("window group chunks should exist in sink stage")
+                            .lock()
+                            .unwrap();
+                        let keys = group.keys.lock().unwrap();
+                        self.compute_group_window_results(
+                            chunks.as_slice(),
+                            keys.as_slice(),
+                            &memory,
+                        )?
+                    };
                     group.window_results = Some(results);
                     group.advance_stage();
                 }
@@ -1904,33 +2143,38 @@ impl PhysicalOperator for Window {
                     group.advance_stage();
                 }
                 WindowGroupStage::GetData => {
-                    if group.output_idx >= group.keys.len() {
+                    let keys_len = group.keys.lock().unwrap().len();
+                    if group.output_idx >= keys_len {
                         group.mark_done();
                         runtime.finish_group_if_done(task.group_idx);
                         continue;
                     }
 
-                    let output_count = (group.keys.len() - group.output_idx).min(VECTOR_SIZE);
-                    let chunks = group
-                        .chunks
-                        .as_ref()
-                        .expect("window group chunks should exist in getdata stage")
-                        .as_slice();
-                    let window_results = group
-                        .window_results
-                        .as_ref()
-                        .expect("window group results should be materialized before getdata");
-
-                    *chunk = self.build_output_chunk(
-                        chunks,
-                        &group.keys,
-                        window_results,
-                        group.output_idx,
-                        output_count,
-                    );
+                    let output_count = (keys_len - group.output_idx).min(VECTOR_SIZE);
+                    *chunk = {
+                        let chunks = group
+                            .chunks
+                            .as_ref()
+                            .expect("window group chunks should exist in getdata stage")
+                            .lock()
+                            .unwrap();
+                        let keys = group.keys.lock().unwrap();
+                        let window_results = group
+                            .window_results
+                            .as_ref()
+                            .expect("window group results should be materialized before getdata");
+                        self.build_output_chunk(
+                            chunks.as_slice(),
+                            keys.as_slice(),
+                            window_results,
+                            group.output_idx,
+                            output_count,
+                            chunk.allocator().clone(),
+                        )?
+                    };
 
                     group.output_idx += output_count;
-                    if group.output_idx >= group.keys.len() {
+                    if group.output_idx >= keys_len {
                         group.mark_done();
                         runtime.finish_group_if_done(task.group_idx);
                     }
@@ -1984,6 +2228,7 @@ impl Window {
             spilled: Some(spilled),
             peak_memory_bytes,
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 }

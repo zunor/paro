@@ -50,8 +50,8 @@ fn ensure_list_child_capacity(result: &mut Vector, child_type: &LogicalType, nee
     let allocator = old_child.allocator().clone();
     let new_capacity = needed.max(old_capacity.saturating_mul(2)).max(1);
 
-    let mut new_child =
-        Vector::with_capacity_and_allocator(child_type.clone(), new_capacity, allocator);
+    let mut new_child = Vector::try_new(child_type.clone(), new_capacity, allocator)
+        .expect("array_agg child vector allocation failed");
     new_child.set_count(old_len);
     for i in 0..old_len {
         new_child.copy_at(i, &old_child, i);
@@ -224,9 +224,9 @@ mod tests {
             simple_update(&[input], &input_data, state_ptr, row_count);
         }
 
-        let mut result = Vector::new(func.return_type.clone());
+        let mut result = paro_common::test_utils::test_vector(func.return_type.clone());
         result.set_count(1);
-        let mut states = Vector::new(LogicalType::BigInt);
+        let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
         states.set_count(1);
         *states.flat_data_mut::<*mut u8>() = state_ptr;
 
@@ -248,7 +248,10 @@ mod tests {
     fn array_agg_integers() {
         let set = get_array_agg_function();
         let (func, _) = set.bind(&[LogicalType::Integer]).unwrap();
-        let input = Vector::from_i32(&[1, 2, 3]);
+        let input = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
         let result = unsafe { finalize_single(&func, &input, 3) };
         match result.get_value(0) {
             Value::List(values, _) => {
@@ -265,7 +268,10 @@ mod tests {
     fn array_agg_keeps_nulls() {
         let set = get_array_agg_function();
         let (func, _) = set.bind(&[LogicalType::Integer]).unwrap();
-        let mut input = Vector::from_i32(&[1, 0, 3]);
+        let mut input = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 0, 3],
+            paro_common::test_utils::test_allocator(),
+        );
         input.set_null(1, true);
         let result = unsafe { finalize_single(&func, &input, 3) };
         match result.get_value(0) {

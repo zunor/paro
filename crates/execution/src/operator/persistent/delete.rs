@@ -135,7 +135,7 @@ mod tests {
     use crate::operator::scan::dummy_scan::PhysicalDummyScan;
     use crate::thread_context::ThreadContext;
     use paro_catalog::entry::{ColumnDefinition, TableCatalogEntry};
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_scheduler::task::InterruptState;
     use paro_storage::table::table_factory::TableFactory;
@@ -185,7 +185,8 @@ mod tests {
 
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 1);
 
         let result = op
             .get_data(&ctx, &mut chunk, &mut input)
@@ -216,7 +217,8 @@ mod tests {
 
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 1);
 
         let result = op
             .get_data(&ctx, &mut chunk, &mut input)
@@ -228,7 +230,13 @@ mod tests {
     #[test]
     fn delete_sink_full_table_fast_path_deletes_all_rows() {
         let storage = Arc::new(create_storage(&[LogicalType::Integer]));
-        let input_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let input_chunk = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         storage.append(&input_chunk).expect("append should succeed");
 
         let table = Arc::new(TableCatalogEntry::new(
@@ -258,7 +266,13 @@ mod tests {
         let interrupt = InterruptState::new();
         let mut sink_input = OperatorSinkInput::new(gsink.as_ref(), lsink.as_mut(), &interrupt);
 
-        let sink_probe = Chunk::from_vectors(vec![Vector::from_i32(&[0])]);
+        let sink_probe = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[0],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let sink_result = op
             .sink(&ctx, &sink_probe, &mut sink_input)
             .expect("sink should succeed");
@@ -272,7 +286,7 @@ mod tests {
             .expect("local source state should be created");
         let mut source_input =
             OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut out = Chunk::initialize(&[LogicalType::BigInt], 1);
+        let mut out = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 1);
         let source_result = op
             .get_data(&ctx, &mut out, &mut source_input)
             .expect("get_data should succeed");
@@ -484,7 +498,7 @@ impl PhysicalOperator for PhysicalDelete {
                 })?;
                 key_vectors.push(col.clone());
             }
-            let key_chunk = Chunk::from_arc_vectors(key_vectors);
+            let key_chunk = Chunk::from_arc_vectors(key_vectors, chunk.allocator().clone());
             total_deleted += storage.delete_by_primary_keys(&key_chunk, txn)?;
         } else {
             // Get row_id column

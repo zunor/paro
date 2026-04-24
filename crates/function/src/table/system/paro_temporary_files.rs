@@ -141,6 +141,7 @@ fn paro_temporary_files_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let Some(gstate) = input.global_state.and_then(|state| {
         state
             .as_any()
@@ -169,25 +170,25 @@ fn paro_temporary_files_function(
     let swap_limit_hits: Vec<i64> = rows.iter().map(|row| row.swap_limit_hits).collect();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&paths);
+        *col = Vector::try_from_strings(&paths, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_i64(&sizes);
+        *col = Vector::try_from_i64(&sizes, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_i64(&write_bytes);
+        *col = Vector::try_from_i64(&write_bytes, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
-        *col = Vector::from_i64(&read_bytes);
+        *col = Vector::try_from_i64(&read_bytes, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(4) {
-        *col = Vector::from_i64(&file_count);
+        *col = Vector::try_from_i64(&file_count, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(5) {
-        *col = Vector::from_i64(&swap_usage);
+        *col = Vector::try_from_i64(&swap_usage, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(6) {
-        *col = Vector::from_i64(&swap_limit_hits);
+        *col = Vector::try_from_i64(&swap_limit_hits, output_allocator.clone())?;
     }
     output.set_cardinality(batch_size);
 

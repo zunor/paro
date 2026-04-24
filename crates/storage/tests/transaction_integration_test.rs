@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_common::chunk::Chunk;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::metrics::storage_metrics;
 use paro_storage::primary_key::DeleteVector;
@@ -84,9 +84,16 @@ fn create_managed_pk_tablet() -> (TabletRef, TempDir, Arc<TabletMetaManager>) {
 }
 
 fn chunk_with_pairs(ids: &[i32], vals: &[i32]) -> Chunk {
-    let v0 = Vector::from_i32(ids);
-    let v1 = Vector::from_i32(vals);
-    Chunk::from_vectors(vec![v0, v1])
+    let allocator = test_allocator();
+    let v0 = paro_common::test_utils::test_i32_vector_with_allocator(ids, allocator.clone());
+    let v1 = paro_common::test_utils::test_i32_vector_with_allocator(vals, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![v0, v1])
+}
+
+fn chunk_with_i32(values: &[i32]) -> Chunk {
+    let allocator = test_allocator();
+    let vector = paro_common::test_utils::test_i32_vector_with_allocator(values, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![vector])
 }
 
 fn read_rows_from_tablet(tablet: &TabletRef, visible_version: i64) -> usize {
@@ -131,7 +138,7 @@ fn test_transaction_visibility() {
     let t1 = tm.begin_transaction().unwrap();
     let t2 = tm.begin_transaction().unwrap();
 
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+    let chunk = chunk_with_i32(&[1, 2, 3]);
     table
         .append_with_transaction(&chunk, Some(t1.clone()))
         .unwrap();
@@ -160,7 +167,7 @@ fn test_transaction_rollback_hides_rowset() {
     let tm = TransactionManager::new();
 
     let t1 = tm.begin_transaction().unwrap();
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[10, 20])]);
+    let chunk = chunk_with_i32(&[10, 20]);
     table
         .append_with_transaction(&chunk, Some(t1.clone()))
         .unwrap();
@@ -345,7 +352,7 @@ fn test_concurrent_read_write_rowset_scan() {
     let handle = thread::spawn(move || read_rows(&table_for_read, visible));
 
     let t_write = tm.begin_transaction().unwrap();
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&[7, 8, 9])]);
+    let chunk = chunk_with_i32(&[7, 8, 9]);
     table
         .append_with_transaction(&chunk, Some(t_write.clone()))
         .unwrap();

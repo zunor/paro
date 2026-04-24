@@ -207,11 +207,20 @@ mod tests {
 
     #[test]
     fn test_date_add() {
-        let input_date = Vector::from_i64(&[0, 10, 100]);
-        let input_days = Vector::from_i64(&[1, 5, -10]);
-        let chunk = Chunk::from_vectors(vec![input_date, input_days]);
+        let input_date = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[0, 10, 100],
+            paro_common::test_utils::test_allocator(),
+        );
+        let input_days = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1, 5, -10],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![input_date, input_days],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Date);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Date);
         date_add_days_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_i64(0), Some(1));
         assert_eq!(result.get_i64(1), Some(15));
@@ -220,11 +229,20 @@ mod tests {
 
     #[test]
     fn test_date_sub() {
-        let input_date = Vector::from_i64(&[10, 100, 50]);
-        let input_days = Vector::from_i64(&[5, 10, 100]);
-        let chunk = Chunk::from_vectors(vec![input_date, input_days]);
+        let input_date = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[10, 100, 50],
+            paro_common::test_utils::test_allocator(),
+        );
+        let input_days = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[5, 10, 100],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![input_date, input_days],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Date);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Date);
         date_sub_days_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_i64(0), Some(5));
         assert_eq!(result.get_i64(1), Some(90));
@@ -233,11 +251,17 @@ mod tests {
 
     #[test]
     fn test_datediff() {
-        let start = Vector::from_i64(&[0, 10, 100]);
-        let end = Vector::from_i64(&[10, 20, 50]);
-        let chunk = Chunk::from_vectors(vec![start, end]);
+        let start = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[0, 10, 100],
+            paro_common::test_utils::test_allocator(),
+        );
+        let end = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[10, 20, 50],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![start, end]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
         datediff_date_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_i64(0), Some(10));
         assert_eq!(result.get_i64(1), Some(10));

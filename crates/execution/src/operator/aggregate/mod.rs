@@ -1,6 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+mod accounted_rows;
+
 pub mod aggregate_kernel;
 pub mod aggregate_object;
 pub mod aggregate_state;

@@ -58,7 +58,11 @@ impl BufferPoolReservation {
     pub fn resize(&mut self, new_size: usize) {
         if let Some(pool) = self.pool.upgrade() {
             let delta = new_size as i64 - self.size as i64;
-            pool.update_used_memory(self.tag, delta);
+            if delta >= 0 {
+                pool.update_used_memory(self.tag, delta);
+            } else {
+                pool.release_reserved_memory(self.tag, (-delta) as usize);
+            }
             self.size = new_size;
         }
     }

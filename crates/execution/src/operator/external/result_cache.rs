@@ -152,19 +152,27 @@ mod tests {
     use paro_common::allocator::default_allocator;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_routine::{BuiltinIntrinsicId, RoutineCallIdentity};
     use std::sync::Arc;
 
     #[test]
     fn digest_changes_when_values_change() {
         let allocator = Arc::new(default_allocator());
-        let left = Chunk::from_vectors(vec![Vector::from_i32_with_allocator(
-            &[1, 2, 3],
-            allocator.clone(),
-        )]);
-        let right =
-            Chunk::from_vectors(vec![Vector::from_i32_with_allocator(&[1, 2, 4], allocator)]);
+        let left = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                allocator.clone(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let right = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 4],
+                allocator,
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let left_key = digest_chunk_abi_view(
             &left,
@@ -187,10 +195,13 @@ mod tests {
     #[test]
     fn cache_evicts_when_budget_is_exceeded() {
         let allocator = Arc::new(default_allocator());
-        let chunk = Chunk::from_vectors(vec![Vector::from_i32_with_allocator(
-            &[1, 2, 3],
-            allocator.clone(),
-        )]);
+        let chunk = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                allocator.clone(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let key_a = digest_chunk_abi_view(
             &chunk,
             vec![RoutineCallIdentity::Builtin {
@@ -199,11 +210,14 @@ mod tests {
             }],
         );
         let key_b = digest_chunk_abi_view(
-            &Chunk::from_vectors(vec![Vector::constant_null_with_allocator(
-                LogicalType::Integer,
-                3,
-                allocator,
-            )]),
+            &Chunk::from_vectors(
+                vec![paro_common::test_utils::test_constant_null_with_allocator(
+                    LogicalType::Integer,
+                    3,
+                    allocator,
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
             vec![RoutineCallIdentity::Builtin {
                 intrinsic: BuiltinIntrinsicId::Subtract,
                 semantic_tags: Vec::new(),

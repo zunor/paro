@@ -878,7 +878,6 @@ mod tests {
         LogicalIndex, OnCreateConflict, SequenceCatalogEntry, TableCatalogEntry,
     };
     use paro_catalog::mvcc::CatalogSnapshot;
-    use paro_common::chunk::Chunk;
     use paro_common::ddl::{
         CreateIndexPayload, CreatePropertyGraphPayload, CreateSchemaPayload, CreateSequencePayload,
         CreateTablePayload, CreateViewPayload, DdlChange, DdlChangeRecord, DdlDependencyObjectRef,
@@ -887,7 +886,6 @@ mod tests {
     };
     use paro_common::effect::{CatalogTxnOp, PreparedDataOp, RowsetLocator};
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
     use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
@@ -1187,7 +1185,9 @@ mod tests {
         )];
         install_committed_table(&catalog, "main", "users", columns, Arc::clone(&storage));
 
-        let insert = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let insert = paro_common::test_utils::test_chunk_from_vectors(vec![
+            paro_common::test_utils::test_i32_vector(&[1, 2, 3]),
+        ]);
         storage.append(&insert).unwrap();
 
         let txn = CatalogSnapshot::read_only(u64::MAX);
@@ -1257,7 +1257,9 @@ mod tests {
         )];
         install_committed_table(&catalog, "main", "users", columns, Arc::clone(&storage));
 
-        let insert = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let insert = paro_common::test_utils::test_chunk_from_vectors(vec![
+            paro_common::test_utils::test_i32_vector(&[1, 2, 3]),
+        ]);
         storage.append(&insert).unwrap();
 
         let txn = CatalogSnapshot::read_only(u64::MAX);
@@ -1979,7 +1981,9 @@ mod tests {
         assert_eq!(target_storage.rowset_count(), 0);
 
         let source_storage = create_table(&[LogicalType::Integer]);
-        let source_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let source_chunk = paro_common::test_utils::test_chunk_from_vectors(vec![
+            paro_common::test_utils::test_i32_vector(&[1, 2, 3]),
+        ]);
         source_storage.append(&source_chunk).unwrap();
 
         let source_descriptor = source_storage.to_descriptor().unwrap();
@@ -2035,7 +2039,9 @@ mod tests {
         );
 
         let source_storage = create_table(&[LogicalType::Integer]);
-        let source_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let source_chunk = paro_common::test_utils::test_chunk_from_vectors(vec![
+            paro_common::test_utils::test_i32_vector(&[1, 2, 3]),
+        ]);
         source_storage.append(&source_chunk).unwrap();
         let source_descriptor = source_storage.to_descriptor().unwrap();
         let rowset_dir = find_first_segment_dir(Path::new(&source_descriptor.data_dir))

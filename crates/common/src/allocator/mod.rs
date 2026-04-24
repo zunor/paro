@@ -20,7 +20,8 @@ pub use allocated_data::AllocatedData;
 pub use allocator::Allocator;
 pub use arena_allocator::ArenaAllocator;
 pub use buffer_allocator::{
-    BufferAllocator, BufferManager, MemoryTag, MemoryUsage, MemoryUsageSnapshot, MEMORY_TAG_COUNT,
+    allocator_lock_count, reset_allocator_lock_count, BufferAllocator, BufferManager, MemoryTag,
+    MemoryUsage, MemoryUsageSnapshot, MEMORY_TAG_COUNT,
 };
 pub use default_allocator::DefaultAllocator;
 

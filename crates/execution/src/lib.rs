@@ -10,6 +10,7 @@ pub mod execution_context;
 pub mod explain;
 pub mod expression_executor;
 pub mod join_hashtable;
+pub mod memory_runtime;
 pub mod operator;
 pub mod operator_type;
 pub mod physical_plan;

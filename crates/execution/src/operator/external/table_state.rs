@@ -263,6 +263,7 @@ pub struct InflightTableBatch {
 #[derive(Debug)]
 pub struct ExternalTableLocalSinkState {
     pub accumulation: Chunk,
+    pub accumulation_uses_runtime_allocator: bool,
     pub accumulation_bytes: u64,
     pub inflight: Option<InflightTableBatch>,
     pub current_input_staged: bool,
@@ -272,16 +273,20 @@ pub struct ExternalTableLocalSinkState {
 }
 
 impl ExternalTableLocalSinkState {
-    pub fn new(input_types: &[LogicalType], allocator: Arc<dyn Allocator>) -> Self {
-        Self {
-            accumulation: Chunk::init_empty_with_allocator(input_types, allocator),
+    pub fn new(
+        input_types: &[LogicalType],
+        allocator: Arc<dyn Allocator>,
+    ) -> paro_common::error::Result<Self> {
+        Ok(Self {
+            accumulation: Chunk::try_init_empty(input_types, allocator)?,
+            accumulation_uses_runtime_allocator: false,
             accumulation_bytes: 0,
             inflight: None,
             current_input_staged: false,
             next_batch_id: 1,
             combined: false,
             next_partition_id: 1,
-        }
+        })
     }
 }
 

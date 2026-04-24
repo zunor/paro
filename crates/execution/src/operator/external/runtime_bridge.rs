@@ -15,6 +15,7 @@ use paro_routine::{RoutineCallIdentity, RoutineSemantics};
 
 use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::OperatorMemoryScope;
 
 use super::batching::SubmissionBatchPolicy;
 
@@ -129,6 +130,7 @@ pub trait ProjectBridgeKernel: Send + Sync + fmt::Debug {
         &self,
         ctx: &ExecutionContext,
         submission: &ProjectSubmission<'_>,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome>;
 }
 
@@ -137,6 +139,7 @@ pub trait TableBridgeKernel: Send + Sync + fmt::Debug {
         &self,
         ctx: &ExecutionContext,
         submission: &TableSubmission<'_>,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome>;
 }
 
@@ -148,6 +151,7 @@ impl ProjectBridgeKernel for EvaluatingProjectKernel {
         &self,
         ctx: &ExecutionContext,
         submission: &ProjectSubmission<'_>,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
         ctx.session.ensure_python_runtime_ready_for_execution()?;
         let started_at = Instant::now();
@@ -157,7 +161,10 @@ impl ProjectBridgeKernel for EvaluatingProjectKernel {
             .map(|expression| expression.expression.clone())
             .collect::<Vec<_>>();
         let mut executor = ExpressionExecutor::with_expressions(&expressions);
-        let mut generated = Chunk::with_allocator(ctx.allocator(MemoryTag::Extension));
+        let mut generated = Chunk::try_new(memory.accounted_allocator_for(
+            MemoryTag::ExternalRuntimeHost,
+            paro_common::memory::MemoryAccountingClass::NonRevocable,
+        ))?;
         executor.execute_all_into(submission.input, ctx, &mut generated)?;
 
         let elapsed_us = started_at.elapsed().as_micros() as u64;
@@ -189,6 +196,7 @@ impl TableBridgeKernel for UnboundTableKernel {
         &self,
         ctx: &ExecutionContext,
         submission: &TableSubmission<'_>,
+        _memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
         ctx.session.ensure_python_runtime_ready_for_execution()?;
         Err(paro_error::not_implemented(format!(
@@ -242,16 +250,18 @@ impl ExternalRuntimeBridge {
         &self,
         ctx: &ExecutionContext,
         submission: &ProjectSubmission<'_>,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
-        self.project_kernel.execute(ctx, submission)
+        self.project_kernel.execute(ctx, submission, memory)
     }
 
     pub fn execute_table(
         &self,
         ctx: &ExecutionContext,
         submission: &TableSubmission<'_>,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
-        self.table_kernel.execute(ctx, submission)
+        self.table_kernel.execute(ctx, submission, memory)
     }
 }
 
@@ -275,7 +285,7 @@ mod tests {
     use crate::thread_context::ThreadContext;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_external_runtime::host::{
         ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult,
@@ -385,7 +395,13 @@ mod tests {
     #[test]
     fn evaluating_project_kernel_executes_generated_columns() {
         let ctx = test_ctx();
-        let input = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let expression = add_one_expr();
         let routines = vec![ExternalRoutineDescriptor {
             label: "py_add_one".to_string(),
@@ -408,7 +424,11 @@ mod tests {
         };
 
         let response = match EvaluatingProjectKernel
-            .execute(&ctx, &submission)
+            .execute(
+                &ctx,
+                &submission,
+                &crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("project bridge should succeed")
         {
             super::RuntimeBridgeOutcome::Ready(response) => response,
@@ -429,7 +449,13 @@ mod tests {
     #[test]
     fn evaluating_project_kernel_reports_runtime_unavailable_before_execution() {
         let ctx = disabled_runtime_ctx();
-        let input = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let expression = add_one_expr();
         let routines = vec![ExternalRoutineDescriptor {
             label: "py_add_one".to_string(),
@@ -452,7 +478,11 @@ mod tests {
         };
 
         let err = EvaluatingProjectKernel
-            .execute(&ctx, &submission)
+            .execute(
+                &ctx,
+                &submission,
+                &crate::operator::state::test_operator_memory_scope(),
+            )
             .expect_err("runtime availability must fail before execution");
         assert!(err.to_string().contains("Python runtime"));
     }

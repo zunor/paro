@@ -273,11 +273,11 @@ impl RadixPartitionedColumnData {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use crate::buffer::{BufferPool, MemoryTag};
     use crate::column::ColumnDataScanState;
@@ -285,19 +285,19 @@ mod tests {
     use super::{PartitionedColumnDataAppendState, RadixPartitionedColumnData, RadixPartitioning};
 
     fn build_chunk_with_hashes(keys: &[i32], hashes: &[u64]) -> Chunk {
-        let mut hash_vector = Vector::with_capacity(LogicalType::UBigInt, hashes.len().max(1));
+        let mut hash_vector = test_vector_with_capacity(LogicalType::UBigInt, hashes.len().max(1));
         hash_vector.set_count(hashes.len());
         for (idx, hash) in hashes.iter().enumerate() {
             hash_vector.set_u64(idx, *hash);
         }
-        Chunk::from_vectors(vec![Vector::from_i32(keys), hash_vector])
+        test_chunk_from_vectors(vec![test_i32_vector(keys), hash_vector])
     }
 
     fn collect_rows(collection: &crate::column::ColumnDataCollection) -> Vec<(i32, u64)> {
         let mut rows = Vec::new();
         let mut scan_state = ColumnDataScanState::new();
         collection.initialize_scan(&mut scan_state, None);
-        let mut out = Chunk::initialize(&[LogicalType::Integer, LogicalType::UBigInt], 1);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer, LogicalType::UBigInt], 1);
         while collection
             .scan(&mut scan_state, &mut out)
             .expect("scan should succeed")

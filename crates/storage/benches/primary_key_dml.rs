@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 use divan::black_box;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::{InsertOnConflictAction, TableHandle};
 use paro_storage::tablet::{KeysType, TabletReaderParams};
@@ -20,11 +20,15 @@ fn main() {
 }
 
 fn build_chunk(ids: &[i32], prices: &[i32], stocks: &[i32]) -> Chunk {
-    Chunk::from_vectors(vec![
-        Vector::from_i32(ids),
-        Vector::from_i32(prices),
-        Vector::from_i32(stocks),
-    ])
+    let allocator = test_allocator();
+    Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_i32_vector_with_allocator(ids, allocator.clone()),
+            paro_common::test_utils::test_i32_vector_with_allocator(prices, allocator.clone()),
+            paro_common::test_utils::test_i32_vector_with_allocator(stocks, allocator.clone()),
+        ],
+        allocator,
+    )
 }
 
 fn build_seed_table() -> TableHandle {

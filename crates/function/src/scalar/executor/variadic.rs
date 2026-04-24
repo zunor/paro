@@ -12,8 +12,8 @@ pub fn execute_concat(input: &Chunk, result: &mut Vector) -> Result<()> {
     let views = input
         .data
         .iter()
-        .map(|vector| vector.to_varlen_view(count))
-        .collect::<Vec<_>>();
+        .map(|vector| vector.try_to_varlen_view(count))
+        .collect::<Result<Vec<_>>>()?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for row in 0..count {
@@ -39,13 +39,13 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
     let separator = input
         .column(0)
         .ok_or_else(|| paro_error::internal("Missing separator column".to_string()))?
-        .to_varlen_view(count);
+        .try_to_varlen_view(count)?;
     let arguments = input
         .data
         .iter()
         .skip(1)
-        .map(|vector| vector.to_varlen_view(count))
-        .collect::<Vec<_>>();
+        .map(|vector| vector.try_to_varlen_view(count))
+        .collect::<Result<Vec<_>>>()?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for row in 0..count {
@@ -115,18 +115,29 @@ pub fn apply_coalesce_child(
 mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::{SelectionVector, Vector};
 
     use super::{apply_coalesce_child, execute_concat, execute_concat_ws};
 
     #[test]
     fn concat_skips_null_inputs() {
-        let first = Vector::from_strings(&["hello", "foo"]);
-        let mut second = Vector::from_strings(&[" ", "-"]);
+        let first = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "foo"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut second = paro_common::test_utils::test_string_vector_with_allocator(
+            &[" ", "-"],
+            paro_common::test_utils::test_allocator(),
+        );
         second.set_null(0, true);
-        let third = Vector::from_strings(&["world", "bar"]);
-        let input = Chunk::from_vectors(vec![first, second, third]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let third = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "bar"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let input = Chunk::from_vectors(
+            vec![first, second, third],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         execute_concat(&input, &mut result).expect("concat helper should succeed");
 
@@ -136,12 +147,24 @@ mod tests {
 
     #[test]
     fn concat_ws_null_separator_returns_null() {
-        let mut separator = Vector::from_strings(&[", "]);
+        let mut separator = paro_common::test_utils::test_string_vector_with_allocator(
+            &[", "],
+            paro_common::test_utils::test_allocator(),
+        );
         separator.set_null(0, true);
-        let first = Vector::from_strings(&["a"]);
-        let second = Vector::from_strings(&["b"]);
-        let input = Chunk::from_vectors(vec![separator, first, second]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let first = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let second = paro_common::test_utils::test_string_vector_with_allocator(
+            &["b"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let input = Chunk::from_vectors(
+            vec![separator, first, second],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         execute_concat_ws(&input, &mut result).expect("concat_ws helper should succeed");
 
@@ -151,12 +174,24 @@ mod tests {
     #[test]
     fn concat_handles_long_unicode_inputs() {
         let long = "数".repeat(256);
-        let first = Vector::from_strings(&[long.as_str()]);
-        let second = Vector::from_strings(&["-paro-"]);
+        let first = paro_common::test_utils::test_string_vector_with_allocator(
+            &[long.as_str()],
+            paro_common::test_utils::test_allocator(),
+        );
+        let second = paro_common::test_utils::test_string_vector_with_allocator(
+            &["-paro-"],
+            paro_common::test_utils::test_allocator(),
+        );
         let third_value = format!("{}终", "据".repeat(256));
-        let third = Vector::from_strings(&[third_value.as_str()]);
-        let input = Chunk::from_vectors(vec![first, second, third]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let third = paro_common::test_utils::test_string_vector_with_allocator(
+            &[third_value.as_str()],
+            paro_common::test_utils::test_allocator(),
+        );
+        let input = Chunk::from_vectors(
+            vec![first, second, third],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         execute_concat(&input, &mut result).expect("concat helper should succeed");
 
@@ -166,16 +201,22 @@ mod tests {
 
     #[test]
     fn apply_coalesce_child_tracks_unresolved_rows() {
-        let mut result = Vector::from_strings(&["", "", ""]);
+        let mut result = paro_common::test_utils::test_string_vector_with_allocator(
+            &["", "", ""],
+            paro_common::test_utils::test_allocator(),
+        );
         for row in 0..3 {
             result.set_null(row, true);
         }
 
-        let mut child = Vector::from_strings(&["alpha", "beta", "gamma"]);
+        let mut child = paro_common::test_utils::test_string_vector_with_allocator(
+            &["alpha", "beta", "gamma"],
+            paro_common::test_utils::test_allocator(),
+        );
         child.set_null(1, true);
 
-        let unresolved = SelectionVector::from(vec![2_u32, 0, 1]);
-        let mut next_unresolved = SelectionVector::with_capacity(3);
+        let unresolved = paro_common::test_utils::test_selection(vec![2_u32, 0, 1]);
+        let mut next_unresolved = paro_common::test_utils::test_selection_with_capacity(3);
 
         let next_count =
             apply_coalesce_child(&mut result, &child, &unresolved, 3, &mut next_unresolved);

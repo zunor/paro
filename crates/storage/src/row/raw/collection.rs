@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use crate::buffer::{BufferPool, MemoryTag};
 use paro_common::chunk::Chunk;
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
 
@@ -34,6 +35,8 @@ pub struct RawRowCollection {
     layout: Arc<RawRowLayout>,
     /// Memory tag for tracking
     tag: MemoryTag,
+    /// Logical memory owner for newly allocated row blocks.
+    memory: MemoryAccountingContext,
     /// Data segments
     segments: Vec<RawRowSegment>,
     /// Total row count
@@ -59,10 +62,22 @@ impl RawRowCollection {
     /// * `layout` - Layout of the rows to store
     /// * `tag` - Memory tag for tracking
     pub fn new(buffer_pool: Arc<BufferPool>, layout: Arc<RawRowLayout>, tag: MemoryTag) -> Self {
+        let memory =
+            MemoryAccountingContext::detached(tag, MemoryAccountingClass::default_for_tag(tag));
+        Self::new_with_memory(buffer_pool, layout, tag, memory)
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        layout: Arc<RawRowLayout>,
+        tag: MemoryTag,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         Self {
             buffer_pool,
             layout,
             tag,
+            memory,
             segments: Vec::new(),
             count: 0,
             data_size: 0,
@@ -88,11 +103,21 @@ impl RawRowCollection {
 
     /// Create a new RawRowCollection with the same layout.
     pub fn create_empty(&self) -> Self {
-        Self::new(
+        Self::new_with_memory(
             Arc::clone(&self.buffer_pool),
             Arc::clone(&self.layout),
             self.tag,
+            self.memory.clone(),
         )
+    }
+
+    fn new_allocator(&self) -> Arc<RawRowAllocator> {
+        Arc::new(RawRowAllocator::new_with_memory(
+            Arc::clone(&self.buffer_pool),
+            Arc::clone(&self.layout),
+            self.tag,
+            self.memory.clone(),
+        ))
     }
 
     // === Accessor Methods ===
@@ -300,12 +325,7 @@ impl RawRowCollection {
 
         // Ensure we have at least one segment
         if self.segments.is_empty() {
-            let allocator = Arc::new(RawRowAllocator::new(
-                Arc::clone(&self.buffer_pool),
-                Arc::clone(&self.layout),
-                self.tag,
-            ));
-            self.segments.push(RawRowSegment::new(allocator));
+            self.segments.push(RawRowSegment::new(self.new_allocator()));
         }
     }
 
@@ -357,12 +377,7 @@ impl RawRowCollection {
 
         // Get or create the target segment.
         if self.segments.is_empty() {
-            let allocator = Arc::new(RawRowAllocator::new(
-                Arc::clone(&self.buffer_pool),
-                Arc::clone(&self.layout),
-                self.tag,
-            ));
-            self.segments.push(RawRowSegment::new(allocator));
+            self.segments.push(RawRowSegment::new(self.new_allocator()));
         }
 
         let (row_locations, mut heap_locations) = {
@@ -423,12 +438,7 @@ impl RawRowCollection {
         );
 
         if self.segments.is_empty() {
-            let allocator = Arc::new(RawRowAllocator::new(
-                Arc::clone(&self.buffer_pool),
-                Arc::clone(&self.layout),
-                self.tag,
-            ));
-            self.segments.push(RawRowSegment::new(allocator));
+            self.segments.push(RawRowSegment::new(self.new_allocator()));
         }
 
         let (row_locations, mut heap_locations) = {
@@ -852,8 +862,8 @@ impl Drop for RawRowCollection {
 mod tests {
     use super::*;
     use crate::row::raw::scan_chunk;
-    use paro_common::chunk::Chunk;
-    use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
+    use crate::test_utils::*;
+    use paro_common::vector::VECTOR_SIZE;
 
     fn create_test_collection(types: Vec<LogicalType>) -> RawRowCollection {
         let pool = Arc::new(BufferPool::new(10 * 1024 * 1024));
@@ -989,8 +999,9 @@ mod tests {
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
 
-        let chunk1 = Chunk::from_vectors(vec![Vector::from_i32(&(0..2048).collect::<Vec<_>>())]);
-        let chunk2 = Chunk::from_vectors(vec![Vector::from_i32(&(2048..3072).collect::<Vec<_>>())]);
+        let chunk1 = test_chunk_from_vectors(vec![test_i32_vector(&(0..2048).collect::<Vec<_>>())]);
+        let chunk2 =
+            test_chunk_from_vectors(vec![test_i32_vector(&(2048..3072).collect::<Vec<_>>())]);
         collection.append(&mut append_state, &chunk1).unwrap();
         collection.append(&mut append_state, &chunk2).unwrap();
         collection.finalize_append(&mut append_state);
@@ -1000,8 +1011,8 @@ mod tests {
 
         let mut lstate1 = RawRowScanState::new();
         let mut lstate2 = RawRowScanState::new();
-        let mut out1 = Chunk::initialize(&[LogicalType::Integer], 2048);
-        let mut out2 = Chunk::initialize(&[LogicalType::Integer], 2048);
+        let mut out1 = test_chunk_with_capacity(&[LogicalType::Integer], 2048);
+        let mut out2 = test_chunk_with_capacity(&[LogicalType::Integer], 2048);
 
         let mut seen = Vec::new();
         loop {
@@ -1043,15 +1054,15 @@ mod tests {
             .collect::<Vec<_>>();
         let v = vec![1i32; row_count];
         let hashes = (1..=row_count).map(|v| v as u64).collect::<Vec<_>>();
-        let mut hash_vector = Vector::with_capacity(LogicalType::UBigInt, row_count);
+        let mut hash_vector = test_vector_with_capacity(LogicalType::UBigInt, row_count);
         hash_vector.set_count(row_count);
         for (idx, hash) in hashes.iter().enumerate() {
             hash_vector.set_u64(idx, *hash);
         }
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_i32(&k1),
-            Vector::from_i32(&k2),
-            Vector::from_i32(&v),
+        let chunk = test_chunk_from_vectors(vec![
+            test_i32_vector(&k1),
+            test_i32_vector(&k2),
+            test_i32_vector(&v),
             hash_vector,
         ]);
 
@@ -1073,7 +1084,7 @@ mod tests {
 
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output = Chunk::initialize(
+        let mut output = test_chunk_with_capacity(
             &[
                 LogicalType::Integer,
                 LogicalType::Integer,
@@ -1128,7 +1139,7 @@ mod tests {
         let values: Vec<String> = (0..256)
             .map(|i| format!("long_value_{:04}_{}", i, "x".repeat(64)))
             .collect();
-        let mut append_chunk = Chunk::initialize(&[LogicalType::Varchar], values.len());
+        let mut append_chunk = test_chunk_with_capacity(&[LogicalType::Varchar], values.len());
         append_chunk.set_cardinality(values.len());
         if let Some(col) = append_chunk.column_mut(0) {
             for (idx, value) in values.iter().enumerate() {
@@ -1159,7 +1170,7 @@ mod tests {
             }
         }
 
-        let mut out = Chunk::initialize(&[LogicalType::Varchar], count);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Varchar], count);
         crate::row::raw::gather_chunk(&collection, &row_locations, &mut out, count);
         for (idx, expected) in values.iter().enumerate() {
             assert_eq!(
@@ -1182,7 +1193,8 @@ mod tests {
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
 
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer, LogicalType::Varchar], 256);
+        let mut chunk =
+            test_chunk_with_capacity(&[LogicalType::Integer, LogicalType::Varchar], 256);
         chunk.set_cardinality(256);
         for row in 0..256 {
             chunk.column_mut(0).unwrap().set_i32(row, row as i32);
@@ -1219,7 +1231,7 @@ mod tests {
             let values: Vec<String> = (0..256)
                 .map(|i| format!("spill_value_{:04}_{}", i, "z".repeat(64)))
                 .collect();
-            let mut append_chunk = Chunk::initialize(&[LogicalType::Varchar], values.len());
+            let mut append_chunk = test_chunk_with_capacity(&[LogicalType::Varchar], values.len());
             append_chunk.set_cardinality(values.len());
             if let Some(col) = append_chunk.column_mut(0) {
                 for (idx, value) in values.iter().enumerate() {
@@ -1253,7 +1265,7 @@ mod tests {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 3);
         let mut collection = create_test_collection(vec![array_type.clone()]);
 
-        let mut array_vec = Vector::with_capacity(array_type.clone(), 2);
+        let mut array_vec = test_vector_with_capacity(array_type.clone(), 2);
         array_vec.set_len(2);
         {
             let child = array_vec.child_mut().unwrap();
@@ -1267,7 +1279,7 @@ mod tests {
             }
         }
 
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(array_vec)]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(array_vec)]);
 
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
@@ -1282,7 +1294,7 @@ mod tests {
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
 
         let mut output_chunk =
-            Chunk::initialize(&[array_type], crate::buffer::DEFAULT_BLOCK_SIZE / 8);
+            test_chunk_with_capacity(&[array_type], crate::buffer::DEFAULT_BLOCK_SIZE / 8);
         let scanned = scan_chunk(&collection, &mut scan_state, &mut output_chunk);
 
         assert_eq!(scanned, 2);
@@ -1302,7 +1314,7 @@ mod tests {
         let mut collection = create_test_collection(vec![array_type.clone()]);
 
         // Row 0: [1, NULL], Row 1: NULL, Row 2: [NULL, 4]
-        let mut array_vec = Vector::with_capacity(array_type.clone(), 3);
+        let mut array_vec = test_vector_with_capacity(array_type.clone(), 3);
         array_vec.set_len(3);
         array_vec.set_null(1, true); // Row 1 is NULL
 
@@ -1320,7 +1332,7 @@ mod tests {
             }
         }
 
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(array_vec)]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(array_vec)]);
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
         collection.append(&mut append_state, &chunk).unwrap();
@@ -1329,7 +1341,7 @@ mod tests {
         // Scan back
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output_chunk = Chunk::initialize(&[array_type], 1024);
+        let mut output_chunk = test_chunk_with_capacity(&[array_type], 1024);
         scan_chunk(&collection, &mut scan_state, &mut output_chunk);
 
         let output_vec = output_chunk.column(0).unwrap();
@@ -1353,7 +1365,7 @@ mod tests {
         let mut collection = create_test_collection(vec![array_type.clone()]);
 
         // Logical rows in child: [1, 2], [3, 4]
-        let mut child_vec = Vector::with_capacity(LogicalType::Integer, 4);
+        let mut child_vec = test_vector_with_capacity(LogicalType::Integer, 4);
         child_vec.set_len(4);
         unsafe {
             let data = child_vec.flat_data_mut::<i32>();
@@ -1363,19 +1375,19 @@ mod tests {
             *data.add(3) = 4; // Array index 1
         }
 
-        let mut array_vec = Vector::new(array_type.clone());
+        let mut array_vec = test_vector(array_type.clone());
         array_vec.set_len(2);
         array_vec.set_child(Arc::new(child_vec));
 
         // Create dictionary vector [1, 0]
-        let mut sel = SelectionVector::with_capacity(2);
+        let mut sel = test_selection_with_capacity(2);
         sel.set_len(2);
         sel.set(0, 1);
         sel.set(1, 0);
 
-        let dict_vec = Vector::dictionary(Arc::new(array_vec), sel);
+        let dict_vec = paro_common::test_utils::test_dictionary(Arc::new(array_vec), sel);
 
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(dict_vec)]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(dict_vec)]);
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
         collection.append(&mut append_state, &chunk).unwrap();
@@ -1384,7 +1396,7 @@ mod tests {
         // Scan back
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output_chunk = Chunk::initialize(&[array_type], 1024);
+        let mut output_chunk = test_chunk_with_capacity(&[array_type], 1024);
         scan_chunk(&collection, &mut scan_state, &mut output_chunk);
 
         assert_eq!(output_chunk.size(), 2);
@@ -1403,10 +1415,13 @@ mod tests {
     fn test_collection_nested_dictionary_roundtrip() {
         let mut collection = create_test_collection(vec![LogicalType::Integer]);
 
-        let base = Arc::new(Vector::from_i32(&[10, 20, 30]));
-        let first = Arc::new(Vector::dictionary(base, vec![2, 0, 1]));
-        let nested = Arc::new(Vector::dictionary(first, vec![1, 2]));
-        let chunk = Chunk::from_arc_vectors(vec![nested]);
+        let base = Arc::new(test_i32_vector(&[10, 20, 30]));
+        let first = Arc::new(paro_common::test_utils::test_dictionary(
+            base,
+            vec![2, 0, 1],
+        ));
+        let nested = Arc::new(paro_common::test_utils::test_dictionary(first, vec![1, 2]));
+        let chunk = test_chunk_from_arc_vectors(vec![nested]);
 
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
@@ -1415,7 +1430,7 @@ mod tests {
 
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output_chunk = Chunk::initialize(&[LogicalType::Integer], 1024);
+        let mut output_chunk = test_chunk_with_capacity(&[LogicalType::Integer], 1024);
         scan_chunk(&collection, &mut scan_state, &mut output_chunk);
 
         assert_eq!(output_chunk.size(), 2);
@@ -1430,10 +1445,16 @@ mod tests {
         let outer_array_type = LogicalType::Array(Box::new(inner_array_type.clone()), 2);
         let mut collection = create_test_collection(vec![outer_array_type.clone()]);
 
-        let inner_child = Arc::new(Vector::from_i32(&[1, 2, 3, 4, 5, 6, 7, 8]));
-        let inner_array_vec = Arc::new(Vector::from_array(LogicalType::Integer, inner_child, 4, 2));
-        let outer_vec = Vector::from_array(inner_array_type, inner_array_vec, 2, 2);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(outer_vec)]);
+        let inner_child = Arc::new(test_i32_vector(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        let inner_array_vec = Arc::new(paro_common::test_utils::test_array_vector(
+            LogicalType::Integer,
+            inner_child,
+            4,
+            2,
+        ));
+        let outer_vec =
+            paro_common::test_utils::test_array_vector(inner_array_type, inner_array_vec, 2, 2);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(outer_vec)]);
 
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
@@ -1442,7 +1463,7 @@ mod tests {
 
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output_chunk = Chunk::initialize(&[outer_array_type], 1024);
+        let mut output_chunk = test_chunk_with_capacity(&[outer_array_type], 1024);
         let scanned = scan_chunk(&collection, &mut scan_state, &mut output_chunk);
         assert_eq!(scanned, 2);
 
@@ -1462,11 +1483,21 @@ mod tests {
         let outer_array_type = LogicalType::Array(Box::new(inner_array_type.clone()), 2);
         let mut collection = create_test_collection(vec![outer_array_type.clone()]);
 
-        let inner_child = Arc::new(Vector::from_i32(&[1, 2, 3, 4, 5, 6, 7, 8]));
-        let inner_array_vec = Arc::new(Vector::from_array(LogicalType::Integer, inner_child, 4, 2));
-        let outer_vec = Arc::new(Vector::from_array(inner_array_type, inner_array_vec, 2, 2));
-        let dict_outer = Vector::dictionary(outer_vec, vec![1, 0]);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(dict_outer)]);
+        let inner_child = Arc::new(test_i32_vector(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        let inner_array_vec = Arc::new(paro_common::test_utils::test_array_vector(
+            LogicalType::Integer,
+            inner_child,
+            4,
+            2,
+        ));
+        let outer_vec = Arc::new(paro_common::test_utils::test_array_vector(
+            inner_array_type,
+            inner_array_vec,
+            2,
+            2,
+        ));
+        let dict_outer = paro_common::test_utils::test_dictionary(outer_vec, vec![1, 0]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(dict_outer)]);
 
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
@@ -1475,7 +1506,7 @@ mod tests {
 
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output_chunk = Chunk::initialize(&[outer_array_type], 1024);
+        let mut output_chunk = test_chunk_with_capacity(&[outer_array_type], 1024);
         scan_chunk(&collection, &mut scan_state, &mut output_chunk);
 
         let output_vec = output_chunk.column(0).unwrap();
@@ -1516,8 +1547,8 @@ mod tests {
             inner_array_type,
             2,
         );
-        let constant_vec = Vector::constant_from_value(outer_array_type.clone(), constant_value, 2);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(constant_vec)]);
+        let constant_vec = test_constant_from_value(outer_array_type.clone(), &constant_value, 2);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(constant_vec)]);
 
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
@@ -1526,7 +1557,7 @@ mod tests {
 
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
-        let mut output_chunk = Chunk::initialize(&[outer_array_type], 1024);
+        let mut output_chunk = test_chunk_with_capacity(&[outer_array_type], 1024);
         scan_chunk(&collection, &mut scan_state, &mut output_chunk);
 
         let output_vec = output_chunk.column(0).unwrap();

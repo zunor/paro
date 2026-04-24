@@ -5,19 +5,21 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-use paro_common::allocator::{default_allocator, ArenaAllocator};
+use paro_common::allocator::{Allocator, ArenaAllocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
-use paro_storage::buffer::{MemoryTag, TemporaryMemoryState};
+use paro_storage::buffer::MemoryTag;
 use paro_storage::row::{
     RadixPartitionedRows, RadixPartitionedRowsBuilder, RowLayout, RowStore, RowValidityType,
 };
@@ -25,6 +27,13 @@ use paro_storage::row::{
 use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_bound_expression;
 use crate::explain::types::ExplainRuntimeStats;
+use crate::memory_runtime::{
+    LocalExternalMemoryTracker, LocalMemoryGrant, OperatorExternalMemoryTracker,
+    OperatorMemoryAccount, QueryMemoryPool, ReclaimStats, Reclaimer, SpillCost,
+};
+use crate::operator::aggregate::accounted_rows::{
+    aggregate_modifier_memory_context, AccountedValueRow, AccountedValueRowSet, AccountedValueRows,
+};
 use crate::operator::aggregate::aggregate_kernel::{
     update_filtered_states, update_states, AggregatePayload,
 };
@@ -45,12 +54,14 @@ use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
 use crate::result_type::{SinkCombineResultType, SinkResultType, SourceResultType};
 
-type DistinctRows = Option<HashSet<Vec<Value>>>;
-type OrderedRows = Vec<Vec<Value>>;
+type DistinctRows = Option<AccountedValueRowSet>;
+type OrderedRows = AccountedValueRows;
 const AGGREGATE_EXTERNAL_RADIX_BITS: usize = 8;
 const AGGREGATE_REPARTITION_GROWTH_FACTOR: usize = 2;
 const FORCE_EXTERNAL_AGGREGATE_RADIX_BITS_FALLBACK: usize = 2;
 const USE_NEW_AGG_SPILL_SETTING: &str = "use_new_agg_spill";
+const HASH_AGGREGATE_MEMORY_TAG: MemoryTag = MemoryTag::HashTable;
+const HASH_AGGREGATE_MEMORY_CLASS: MemoryAccountingClass = MemoryAccountingClass::Revocable;
 
 pub struct HashAggregate {
     pub aggregate_data: GroupedAggregateData,
@@ -153,25 +164,10 @@ impl HashAggregate {
                 None
             };
         let layout = AggregateStateLayout::new(&aggregate_objects)?;
-        let mut global_hash_tables = Vec::with_capacity(grouping_sets.len());
-        for _ in 0..grouping_sets.len() {
-            global_hash_tables.push(match radix_partition_bits {
-                Some(bits) => AggregateHashTable::new_radix(
-                    group_types.clone(),
-                    aggregate_objects.clone(),
-                    aggregate_data.aggregate_inputs.clone(),
-                    bits,
-                )?,
-                None => AggregateHashTable::new_flat(
-                    group_types.clone(),
-                    aggregate_objects.clone(),
-                    aggregate_data.aggregate_inputs.clone(),
-                )?,
-            });
-        }
         let spill_hash_col_idx = aggregate_data.payload_types.len();
         let mut spill_payload_types_with_hash = aggregate_data.payload_types.clone();
         spill_payload_types_with_hash.push(LogicalType::UBigInt);
+        let grouping_count = grouping_sets.len();
 
         Ok(Self {
             aggregate_data,
@@ -190,7 +186,7 @@ impl HashAggregate {
             radix_partition_bits,
             spill_payload_types_with_hash,
             spill_hash_col_idx,
-            shared: Arc::new(HashAggregateShared::new(global_hash_tables)),
+            shared: Arc::new(HashAggregateShared::new(grouping_count)),
             sink_state: Mutex::new(None),
         })
     }
@@ -205,14 +201,14 @@ impl HashAggregate {
                 .as_any()
                 .downcast_ref::<HashAggregateGlobalState>()
             {
-                peak_memory_bytes =
-                    state.source_temporary_memory_state.get_peak_reservation() as u64;
+                peak_memory_bytes = state.source_memory.peak_bytes().unwrap_or(0) as u64;
             }
         }
         ExplainRuntimeStats {
             spilled: Some(self.shared.externalized()),
             peak_memory_bytes: Some(peak_memory_bytes),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -226,7 +222,7 @@ impl HashAggregate {
 
     fn build_groups_chunk(&self, payload: &Chunk) -> Result<Chunk> {
         if self.group_payload_refs.is_empty() {
-            let mut groups = Chunk::init_empty_with_allocator(&[], payload.allocator().clone());
+            let mut groups = Chunk::try_init_empty(&[], payload.allocator().clone())?;
             groups.set_cardinality(payload.size());
             return Ok(groups);
         }
@@ -240,7 +236,7 @@ impl HashAggregate {
             })?);
             group_vectors.push(group_vector);
         }
-        let mut groups = Chunk::from_arc_vectors(group_vectors);
+        let mut groups = Chunk::from_arc_vectors(group_vectors, payload.allocator().clone());
         groups.set_cardinality(payload.size());
         Ok(groups)
     }
@@ -324,8 +320,8 @@ impl HashAggregate {
         Ok(())
     }
 
-    fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> SelectionVector {
-        let filter_format = filter_vec.decode(row_count);
+    fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> Result<SelectionVector> {
+        let filter_format = filter_vec.try_decode(row_count)?;
         let filter_data = filter_format.get_data::<bool>();
         let mut selected_rows = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
@@ -338,7 +334,7 @@ impl HashAggregate {
                 selected_rows.push(row_idx as u32);
             }
         }
-        SelectionVector::from_indices(selected_rows)
+        SelectionVector::try_from_indices(selected_rows, filter_vec.allocator().clone())
     }
 
     fn compare_order_values(
@@ -416,7 +412,7 @@ impl HashAggregate {
         Ok(Some(Self::build_filter_selection(
             filter_vec,
             payload.size(),
-        )))
+        )?))
     }
 
     fn collect_distinct_rows_for_aggregate(
@@ -425,6 +421,7 @@ impl HashAggregate {
         groups: &Chunk,
         payload: &Chunk,
         distinct_rows: &mut DistinctRows,
+        modifier_memory: &MemoryAccountingContext,
     ) -> Result<()> {
         let aggregate = self.aggregate_objects.get(agg_idx).ok_or_else(|| {
             paro_error::internal(format!("Aggregate index out of bounds: {agg_idx}"))
@@ -462,7 +459,8 @@ impl HashAggregate {
             })
             .collect::<Result<Vec<_>>>()?;
         let filter_selection = self.filter_selection_for_aggregate(agg_idx, payload)?;
-        let seen = distinct_rows.get_or_insert_with(HashSet::new);
+        let seen =
+            distinct_rows.get_or_insert_with(|| AccountedValueRowSet::new(modifier_memory.clone()));
 
         let mut append_row = |row_idx: usize| {
             let mut distinct_key =
@@ -473,16 +471,17 @@ impl HashAggregate {
             for input_vec in &input_columns {
                 distinct_key.push(input_vec.get_value(row_idx));
             }
-            seen.insert(distinct_key);
+            seen.insert(distinct_key)?;
+            Ok::<(), paro_common::memory::MemoryError>(())
         };
 
         if let Some(selection) = filter_selection {
             for idx in 0..selection.len() {
-                append_row(selection.get(idx));
+                append_row(selection.get(idx))?;
             }
         } else {
             for row_idx in 0..payload.size() {
-                append_row(row_idx);
+                append_row(row_idx)?;
             }
         }
 
@@ -572,16 +571,17 @@ impl HashAggregate {
             for order in &order_columns {
                 row_values.push(order.get_value(row_idx));
             }
-            ordered_rows.push(row_values);
+            ordered_rows.push(row_values)?;
+            Ok::<(), paro_common::memory::MemoryError>(())
         };
 
         if let Some(selection) = filter_selection {
             for idx in 0..selection.len() {
-                append_row(selection.get(idx));
+                append_row(selection.get(idx))?;
             }
         } else {
             for row_idx in 0..payload.size() {
-                append_row(row_idx);
+                append_row(row_idx)?;
             }
         }
         Ok(())
@@ -647,9 +647,11 @@ impl HashAggregate {
         addresses: &Vector,
         distinct_rows: &mut [DistinctRows],
         ordered_rows: &mut [OrderedRows],
+        modifier_memory: &MemoryAccountingContext,
         arena: &mut ArenaAllocator,
     ) -> Result<()> {
-        let all_rows = SelectionVector::incremental(payload.size());
+        let all_rows =
+            SelectionVector::try_incremental(payload.size(), payload.allocator().clone())?;
         for agg_idx in 0..self.aggregate_objects.len() {
             let aggregate = self.aggregate_objects.get(agg_idx).ok_or_else(|| {
                 paro_error::internal(format!("Aggregate index out of bounds: {agg_idx}"))
@@ -669,6 +671,7 @@ impl HashAggregate {
                     groups,
                     payload,
                     &mut distinct_rows[agg_idx],
+                    modifier_memory,
                 )?;
                 continue;
             }
@@ -694,7 +697,7 @@ impl HashAggregate {
             return Ok(());
         }
 
-        let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
+        let mut arena = ArenaAllocator::new(lstate.hash_table.allocator());
         let group_count = self.group_types.len();
 
         for agg_idx in 0..self.aggregate_objects.len() {
@@ -703,7 +706,7 @@ impl HashAggregate {
                 continue;
             }
 
-            let mut rows = std::mem::take(&mut lstate.ordered_rows[agg_idx]);
+            let mut rows = lstate.ordered_rows[agg_idx].take();
             if rows.is_empty() {
                 continue;
             }
@@ -748,7 +751,11 @@ impl HashAggregate {
                 Ordering::Equal
             });
 
-            let mut groups = Chunk::initialize(&self.group_types, rows.len());
+            let mut groups = Chunk::try_initialize(
+                &self.group_types,
+                rows.len(),
+                lstate.hash_table.allocator(),
+            )?;
             groups.set_cardinality(rows.len());
             for group_idx in 0..group_count {
                 let group_col = groups.column_mut(group_idx).ok_or_else(|| {
@@ -768,7 +775,8 @@ impl HashAggregate {
                 .iter()
                 .map(|child| child.return_type())
                 .collect::<Vec<_>>();
-            let mut input_chunk = Chunk::initialize(&input_types, rows.len());
+            let mut input_chunk =
+                Chunk::try_initialize(&input_types, rows.len(), lstate.hash_table.allocator())?;
             input_chunk.set_cardinality(rows.len());
             for input_idx in 0..input_count {
                 let input_col = input_chunk.column_mut(input_idx).ok_or_else(|| {
@@ -782,8 +790,13 @@ impl HashAggregate {
             }
 
             let hashes = lstate.hash_table.hash_groups(&groups)?;
-            let mut addresses = Vector::with_capacity(LogicalType::BigInt, rows.len());
-            let mut new_groups = SelectionVector::with_capacity(rows.len());
+            let mut addresses = Vector::try_new(
+                LogicalType::BigInt,
+                rows.len(),
+                lstate.hash_table.allocator(),
+            )?;
+            let mut new_groups =
+                SelectionVector::try_with_capacity(rows.len(), lstate.hash_table.allocator())?;
             lstate.hash_table.find_or_create_groups(
                 &groups,
                 &hashes,
@@ -791,7 +804,8 @@ impl HashAggregate {
                 &mut new_groups,
             )?;
 
-            let selection = SelectionVector::incremental(rows.len());
+            let selection =
+                SelectionVector::try_incremental(rows.len(), lstate.hash_table.allocator())?;
             let selected_states = self.selected_state_addresses(&addresses, &selection, agg_idx)?;
             let input_refs = (0..input_count)
                 .map(|input_idx| {
@@ -827,7 +841,7 @@ impl HashAggregate {
             return Ok(());
         }
 
-        let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
+        let mut arena = ArenaAllocator::new(lstate.hash_table.allocator());
         let group_count = self.group_types.len();
 
         for agg_idx in 0..self.aggregate_objects.len() {
@@ -843,7 +857,11 @@ impl HashAggregate {
                 continue;
             }
 
-            let row_values = rows.into_iter().collect::<Vec<_>>();
+            let row_values = rows
+                .into_rows()
+                .into_iter()
+                .map(AccountedValueRow::into_values)
+                .collect::<Vec<_>>();
             let input_count = self.aggregate_data.aggregate_inputs[agg_idx].len();
             let expected_len = group_count + input_count;
             for row in &row_values {
@@ -855,7 +873,11 @@ impl HashAggregate {
                 }
             }
 
-            let mut groups = Chunk::initialize(&self.group_types, row_values.len());
+            let mut groups = Chunk::try_initialize(
+                &self.group_types,
+                row_values.len(),
+                lstate.hash_table.allocator(),
+            )?;
             groups.set_cardinality(row_values.len());
             for group_idx in 0..group_count {
                 let group_col = groups.column_mut(group_idx).ok_or_else(|| {
@@ -875,7 +897,11 @@ impl HashAggregate {
                 .iter()
                 .map(|child| child.return_type())
                 .collect::<Vec<_>>();
-            let mut input_chunk = Chunk::initialize(&input_types, row_values.len());
+            let mut input_chunk = Chunk::try_initialize(
+                &input_types,
+                row_values.len(),
+                lstate.hash_table.allocator(),
+            )?;
             input_chunk.set_cardinality(row_values.len());
             for input_idx in 0..input_count {
                 let input_col = input_chunk.column_mut(input_idx).ok_or_else(|| {
@@ -889,8 +915,15 @@ impl HashAggregate {
             }
 
             let hashes = lstate.hash_table.hash_groups(&groups)?;
-            let mut addresses = Vector::with_capacity(LogicalType::BigInt, row_values.len());
-            let mut new_groups = SelectionVector::with_capacity(row_values.len());
+            let mut addresses = Vector::try_new(
+                LogicalType::BigInt,
+                row_values.len(),
+                lstate.hash_table.allocator(),
+            )?;
+            let mut new_groups = SelectionVector::try_with_capacity(
+                row_values.len(),
+                lstate.hash_table.allocator(),
+            )?;
             lstate.hash_table.find_or_create_groups(
                 &groups,
                 &hashes,
@@ -898,7 +931,8 @@ impl HashAggregate {
                 &mut new_groups,
             )?;
 
-            let selection = SelectionVector::incremental(row_values.len());
+            let selection =
+                SelectionVector::try_incremental(row_values.len(), lstate.hash_table.allocator())?;
             let selected_states = self.selected_state_addresses(&addresses, &selection, agg_idx)?;
             let input_refs = (0..input_count)
                 .map(|input_idx| {
@@ -945,11 +979,15 @@ impl HashAggregate {
         }
         let state_offset = self.layout.state_offset(agg_idx);
 
-        let mut selected = Vector::with_capacity(LogicalType::BigInt, selection.len());
+        let mut selected = Vector::try_new(
+            LogicalType::BigInt,
+            selection.len(),
+            addresses.allocator().clone(),
+        )?;
         selected.set_count(selection.len());
         let selected_data = unsafe { selected.flat_data_mut::<*mut u8>() };
 
-        let address_format = addresses.decode(addresses.len());
+        let address_format = addresses.try_decode(addresses.len())?;
         let address_data = address_format.get_data::<*mut u8>();
         for idx in 0..selection.len() {
             let row_idx = selection.get(idx);
@@ -1058,7 +1096,7 @@ impl HashAggregate {
         }
         vectors.push(Arc::new(hashes.clone()));
 
-        let mut spill_chunk = Chunk::from_arc_vectors(vectors);
+        let mut spill_chunk = Chunk::from_arc_vectors(vectors, payload.allocator().clone());
         spill_chunk.set_cardinality(payload.size());
         Ok(spill_chunk)
     }
@@ -1070,13 +1108,16 @@ impl HashAggregate {
         grouping_states
             .iter()
             .map(|state| {
-                state.hash_table.memory_usage().saturating_add(
-                    state
-                        .external_state
-                        .as_ref()
-                        .map(|external| external.data.size_in_bytes())
-                        .unwrap_or(0),
-                )
+                state
+                    .hash_table
+                    .external_accounted_memory_usage()
+                    .saturating_add(
+                        state
+                            .external_state
+                            .as_ref()
+                            .map(|external| external.data.size_in_bytes())
+                            .unwrap_or(0),
+                    )
             })
             .sum()
     }
@@ -1084,20 +1125,16 @@ impl HashAggregate {
     fn update_memory_tracker(
         &self,
         grouping_states: &[HashAggregateGroupingLocalState],
-        temporary_memory_state: &Arc<TemporaryMemoryState>,
-    ) {
+        memory: &mut LocalExternalMemoryTracker,
+    ) -> Result<()> {
         let usage = self.total_local_hash_table_memory_usage(grouping_states);
-        if usage == 0 {
-            temporary_memory_state.set_zero();
-        } else {
-            temporary_memory_state.set_remaining_size_and_update_reservation(usage);
-        }
+        Ok(memory.set_accounted_bytes(usage)?)
     }
 
     fn maybe_externalize_grouping_state(
         &self,
         ctx: &ExecutionContext,
-        temporary_memory_state: &Arc<TemporaryMemoryState>,
+        memory: &mut LocalExternalMemoryTracker,
         grouping_state: &mut HashAggregateGroupingLocalState,
         use_new_agg_spill: bool,
     ) -> Result<bool> {
@@ -1108,9 +1145,10 @@ impl HashAggregate {
             return Ok(true);
         }
 
-        let tmm_cfg = ctx.temporary_memory_manager().current_config();
-        if tmm_cfg.force_external {
-            if !tmm_cfg.has_temporary_directory {
+        let force_external = ctx.force_external();
+        let has_temporary_directory = ctx.has_temporary_directory();
+        if force_external {
+            if !has_temporary_directory {
                 return Err(paro_error::invalid_input(
                     "force_external requires a temporary directory (SET temp_directory)"
                         .to_string(),
@@ -1126,17 +1164,17 @@ impl HashAggregate {
             return Ok(true);
         }
 
-        if !tmm_cfg.has_temporary_directory {
+        if !has_temporary_directory {
             return Ok(false);
         }
 
-        let total_size = grouping_state.hash_table.memory_usage();
+        let total_size = grouping_state.hash_table.external_accounted_memory_usage();
         if total_size == 0 {
             return Ok(false);
         }
 
         let num_threads = ctx.num_threads().max(1);
-        let reservation = temporary_memory_state.get_reservation();
+        let reservation = memory.reservation_bytes();
         let mut thread_limit = reservation / num_threads;
         if thread_limit == 0 {
             thread_limit = reservation;
@@ -1148,19 +1186,17 @@ impl HashAggregate {
         if !grouping_state.reservation_boosted {
             grouping_state.reservation_boosted = true;
             let min_boost = total_size.saturating_mul(num_threads);
-            let new_minimum = temporary_memory_state
-                .get_minimum_reservation()
-                .saturating_add(min_boost);
-            temporary_memory_state.set_minimum_reservation(new_minimum);
+            let new_minimum = memory.minimum_reservation_bytes().saturating_add(min_boost);
+            memory.set_minimum_reservation_bytes(new_minimum);
 
-            let remaining_size = temporary_memory_state
-                .get_remaining_size()
+            let remaining_size = memory
+                .accounted_bytes()
                 .max(total_size.saturating_mul(num_threads));
             let enlarged = remaining_size
                 .saturating_mul(AGGREGATE_REPARTITION_GROWTH_FACTOR)
                 .max(1);
-            temporary_memory_state.set_remaining_size_and_update_reservation(enlarged);
-            let new_reservation = temporary_memory_state.get_reservation();
+            memory.set_accounted_bytes(enlarged)?;
+            let new_reservation = memory.reservation_bytes();
             let per_thread = new_reservation / num_threads;
             thread_limit = if per_thread == 0 {
                 new_reservation
@@ -1240,10 +1276,11 @@ impl HashAggregate {
         }
 
         let mut scanner = partition.scanner();
-        let mut spill_chunk = Chunk::initialize(
+        let mut spill_chunk = Chunk::try_initialize(
             &self.spill_payload_types_with_hash,
             paro_common::vector::VECTOR_SIZE,
-        );
+            hash_table.allocator(),
+        )?;
         loop {
             let fetched = scanner.next_chunk(&mut spill_chunk)?;
             if fetched == 0 {
@@ -1259,14 +1296,17 @@ impl HashAggregate {
                 })?;
                 payload_vectors.push(Arc::clone(column));
             }
-            let mut payload = Chunk::from_arc_vectors(payload_vectors);
+            let mut payload =
+                Chunk::from_arc_vectors(payload_vectors, spill_chunk.allocator().clone());
             payload.set_cardinality(fetched);
 
             let all_groups = self.build_groups_chunk(&payload)?;
             let groups = self.build_groups_chunk_for_set(&all_groups, grouping_set)?;
             let hashes = hash_table.hash_groups(&groups)?;
-            let mut addresses = Vector::with_capacity(LogicalType::BigInt, payload.size());
-            let mut new_groups = SelectionVector::with_capacity(payload.size());
+            let mut addresses =
+                Vector::try_new(LogicalType::BigInt, payload.size(), hash_table.allocator())?;
+            let mut new_groups =
+                SelectionVector::try_with_capacity(payload.size(), hash_table.allocator())?;
             hash_table.find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)?;
             hash_table.update_aggregates(&payload, Some(&hashes), &addresses, None)?;
         }
@@ -1291,20 +1331,18 @@ impl HashAggregate {
         }
 
         if max_partition_size == 0 {
-            sink_state.source_temporary_memory_state.set_zero();
+            sink_state.source_memory.clear();
             return Ok(());
         }
 
         sink_state
-            .source_temporary_memory_state
-            .set_minimum_reservation(max_partition_size);
-        sink_state.source_temporary_memory_state.set_zero();
+            .source_memory
+            .set_minimum_reservation_bytes(max_partition_size)?;
+        sink_state.source_memory.set_accounted_bytes(0)?;
         let max_threads = ctx.num_threads().max(1);
         sink_state
-            .source_temporary_memory_state
-            .set_remaining_size_and_update_reservation(
-                max_partition_size.saturating_mul(max_threads),
-            );
+            .source_memory
+            .set_accounted_bytes(max_partition_size.saturating_mul(max_threads))?;
 
         for (grouping_idx, spill_data) in spill_data.into_iter().enumerate() {
             let Some(spill_data) = spill_data else {
@@ -1329,6 +1367,11 @@ impl HashAggregate {
             let mut ght = ght_mutex
                 .lock()
                 .map_err(|e| paro_error::internal(e.to_string()))?;
+            let ght = ght.as_mut().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Global hash table was not initialized during spill replay: grouping_idx={grouping_idx}"
+                ))
+            })?;
 
             for partition in spill_data.partitions() {
                 if partition.count() == 0 {
@@ -1336,13 +1379,13 @@ impl HashAggregate {
                 }
                 let partition_size = partition.size_in_bytes().max(max_partition_size);
                 sink_state
-                    .source_temporary_memory_state
-                    .set_remaining_size_and_update_reservation(partition_size);
-                self.replay_spilled_partition_into_hash_table(grouping_set, partition, &mut ght)?;
+                    .source_memory
+                    .set_accounted_bytes(partition_size)?;
+                self.replay_spilled_partition_into_hash_table(grouping_set, partition, ght)?;
             }
         }
 
-        sink_state.source_temporary_memory_state.set_zero();
+        sink_state.source_memory.clear();
         Ok(())
     }
 
@@ -1376,6 +1419,11 @@ impl HashAggregate {
                 })?
                 .lock()
                 .map_err(|e| paro_error::internal(e.to_string()))?;
+            let ght = ght.as_ref().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Global hash table was not initialized while checking source mode: grouping_idx={grouping_idx}"
+                ))
+            })?;
             if ght.count() != 0 {
                 return Ok(false);
             }
@@ -1406,6 +1454,7 @@ impl HashAggregate {
 
     fn get_data_from_external_spill(
         &self,
+        ctx: &ExecutionContext,
         chunk: &mut Chunk,
         gstate: &HashAggregateGlobalSourceState,
         lstate: &mut HashAggregateLocalSourceState,
@@ -1441,10 +1490,11 @@ impl HashAggregate {
 
                 if lstate.external_hash_table.is_none() {
                     let partition_size = partition.size_in_bytes().max(1);
-                    gstate
-                        .source_temporary_memory_state
-                        .set_remaining_size_and_update_reservation(partition_size);
-                    let mut hash_table = self.new_hash_table()?;
+                    gstate.source_memory.set_accounted_bytes(partition_size)?;
+                    let hash_table_allocator = gstate
+                        .source_memory
+                        .accounted_allocator(ctx.allocator(HASH_AGGREGATE_MEMORY_TAG));
+                    let mut hash_table = self.new_hash_table(hash_table_allocator)?;
                     self.replay_spilled_partition_into_hash_table(
                         grouping_set,
                         partition,
@@ -1475,25 +1525,36 @@ impl HashAggregate {
             lstate.external_partition_idx = 0;
         }
 
-        gstate.source_temporary_memory_state.set_zero();
+        gstate.source_memory.clear();
         chunk.set_cardinality(0);
         Ok(SourceResultType::Finished)
     }
 
-    fn new_hash_table(&self) -> Result<AggregateHashTable> {
+    fn new_hash_table(&self, allocator: Arc<dyn Allocator>) -> Result<AggregateHashTable> {
         match self.radix_partition_bits {
             Some(bits) => AggregateHashTable::new_radix(
                 self.group_types.clone(),
                 self.aggregate_objects.clone(),
                 self.aggregate_data.aggregate_inputs.clone(),
                 bits,
+                allocator,
             ),
             None => AggregateHashTable::new_flat(
                 self.group_types.clone(),
                 self.aggregate_objects.clone(),
                 self.aggregate_data.aggregate_inputs.clone(),
+                allocator,
             ),
         }
+    }
+
+    fn new_global_hash_tables(
+        &self,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Vec<AggregateHashTable>> {
+        (0..self.grouping_sets.len())
+            .map(|_| self.new_hash_table(allocator.clone()))
+            .collect()
     }
 }
 
@@ -1522,16 +1583,16 @@ impl fmt::Debug for HashAggregate {
 
 #[derive(Debug)]
 struct HashAggregateShared {
-    hash_tables: Vec<Mutex<AggregateHashTable>>,
+    hash_tables: Vec<Mutex<Option<AggregateHashTable>>>,
     externalized: AtomicBool,
     execution_seen: AtomicBool,
     destroyed: AtomicBool,
 }
 
 impl HashAggregateShared {
-    fn new(hash_tables: Vec<AggregateHashTable>) -> Self {
+    fn new(grouping_count: usize) -> Self {
         Self {
-            hash_tables: hash_tables.into_iter().map(Mutex::new).collect(),
+            hash_tables: (0..grouping_count).map(|_| Mutex::new(None)).collect(),
             externalized: AtomicBool::new(false),
             execution_seen: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
@@ -1560,17 +1621,99 @@ impl HashAggregateShared {
         }
         for hash_table in &self.hash_tables {
             if let Ok(mut guard) = hash_table.lock() {
-                let _ = guard.destroy();
+                if let Some(hash_table) = guard.as_mut() {
+                    let _ = hash_table.destroy();
+                }
             }
         }
     }
 }
 
 #[derive(Debug)]
+struct HashAggregateReclaimer {
+    source_memory: Arc<OperatorExternalMemoryTracker>,
+    shared: Arc<HashAggregateShared>,
+}
+
+impl Reclaimer for HashAggregateReclaimer {
+    fn name(&self) -> &str {
+        "hash_aggregate_spill"
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        if self.shared.externalized() {
+            self.source_memory.accounted_bytes().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> paro_common::memory::MemoryResult<ReclaimStats> {
+        if !self.shared.externalized() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let reclaimed = self.source_memory.reclaim_accounted_bytes(target_bytes)?;
+        Ok(ReclaimStats::new(target_bytes, reclaimed, reclaimed))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::AccountingRelease
+    }
+}
+
+fn query_memory_pool_for_context(ctx: &ExecutionContext) -> Arc<QueryMemoryPool> {
+    ctx.pipeline
+        .map(|pipeline| pipeline.query_memory_pool())
+        .unwrap_or_else(|| Arc::new(QueryMemoryPool::unbounded()))
+}
+
+fn new_hash_aggregate_account(ctx: &ExecutionContext) -> Arc<OperatorMemoryAccount> {
+    Arc::new(OperatorMemoryAccount::new(query_memory_pool_for_context(
+        ctx,
+    )))
+}
+
+fn new_hash_aggregate_local_memory_tracker(
+    ctx: &ExecutionContext,
+) -> Result<LocalExternalMemoryTracker> {
+    let account = new_hash_aggregate_account(ctx);
+    let owner: Arc<dyn MemoryOwner> = account;
+    let grant = LocalMemoryGrant::new(
+        owner,
+        0,
+        HASH_AGGREGATE_MEMORY_TAG,
+        HASH_AGGREGATE_MEMORY_CLASS,
+        ctx.allocator(HASH_AGGREGATE_MEMORY_TAG),
+    )?;
+    Ok(LocalExternalMemoryTracker::new(
+        grant,
+        HASH_AGGREGATE_MEMORY_TAG,
+        HASH_AGGREGATE_MEMORY_CLASS,
+    ))
+}
+
+fn new_hash_aggregate_source_memory_tracker(
+    ctx: &ExecutionContext,
+) -> Arc<OperatorExternalMemoryTracker> {
+    Arc::new(OperatorExternalMemoryTracker::new(
+        new_hash_aggregate_account(ctx),
+        MemoryDomain::Host,
+        HASH_AGGREGATE_MEMORY_TAG,
+        HASH_AGGREGATE_MEMORY_CLASS,
+    ))
+}
+
+fn new_hash_aggregate_modifier_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    aggregate_modifier_memory_context(owner)
+}
+
+#[derive(Debug)]
 struct HashAggregateGlobalState {
     shared: Arc<HashAggregateShared>,
     use_new_agg_spill: bool,
-    source_temporary_memory_state: Arc<TemporaryMemoryState>,
+    source_memory: Arc<OperatorExternalMemoryTracker>,
+    source_memory_transferred: AtomicBool,
     spill_data: Vec<Mutex<Option<RadixPartitionedRowsBuilder>>>,
 }
 
@@ -1591,7 +1734,7 @@ impl GlobalSinkState for HashAggregateGlobalState {
 #[derive(Debug)]
 struct HashAggregateGlobalSourceState {
     shared: Arc<HashAggregateShared>,
-    source_temporary_memory_state: Arc<TemporaryMemoryState>,
+    source_memory: Arc<OperatorExternalMemoryTracker>,
     external_spill_data: Vec<Option<RadixPartitionedRows>>,
 }
 
@@ -1607,7 +1750,7 @@ impl GlobalSourceState for HashAggregateGlobalSourceState {
 
 impl Drop for HashAggregateGlobalSourceState {
     fn drop(&mut self) {
-        self.source_temporary_memory_state.set_zero();
+        self.source_memory.clear();
         self.shared.destroy_once();
     }
 }
@@ -1622,6 +1765,7 @@ struct HashAggregateGroupingLocalState {
     hash_table: AggregateHashTable,
     external_state: Option<HashAggregateExternalSinkState>,
     reservation_boosted: bool,
+    modifier_memory: MemoryAccountingContext,
     distinct_rows: Vec<DistinctRows>,
     ordered_rows: Vec<OrderedRows>,
     ordered_finalized: bool,
@@ -1630,7 +1774,7 @@ struct HashAggregateGroupingLocalState {
 
 #[derive(Debug)]
 struct HashAggregateLocalSinkState {
-    temporary_memory_state: Arc<TemporaryMemoryState>,
+    memory: LocalExternalMemoryTracker,
     grouping_states: Vec<HashAggregateGroupingLocalState>,
 }
 
@@ -1650,7 +1794,7 @@ impl Drop for HashAggregateLocalSinkState {
             let _ = grouping_state.hash_table.destroy();
             grouping_state.external_state = None;
         }
-        self.temporary_memory_state.set_zero();
+        self.memory.clear();
     }
 }
 
@@ -1661,7 +1805,9 @@ impl Drop for HashAggregateGlobalState {
                 *guard = None;
             }
         }
-        self.source_temporary_memory_state.set_zero();
+        if !self.source_memory_transferred.load(AtomicOrdering::Acquire) {
+            self.source_memory.clear();
+        }
     }
 }
 
@@ -1789,10 +1935,29 @@ impl PhysicalOperator for HashAggregate {
 
     fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
         let use_new_agg_spill = self.use_new_agg_spill_enabled(ctx);
+        let source_memory = new_hash_aggregate_source_memory_tracker(ctx);
+        let global_allocator =
+            source_memory.accounted_allocator(ctx.allocator(HASH_AGGREGATE_MEMORY_TAG));
+        let global_hash_tables = self.new_global_hash_tables(global_allocator)?;
+        self.shared.destroyed.store(false, AtomicOrdering::Release);
+        self.shared
+            .externalized
+            .store(false, AtomicOrdering::Release);
+        for (slot, hash_table) in self.shared.hash_tables.iter().zip(global_hash_tables) {
+            *slot
+                .lock()
+                .map_err(|err| paro_error::internal(err.to_string()))? = Some(hash_table);
+        }
+        let reclaimer: Arc<dyn Reclaimer> = Arc::new(HashAggregateReclaimer {
+            source_memory: source_memory.clone(),
+            shared: self.shared.clone(),
+        });
+        ctx.query_memory_pool().register_reclaimer(reclaimer);
         Ok(Box::new(HashAggregateGlobalState {
             shared: self.shared.clone(),
             use_new_agg_spill,
-            source_temporary_memory_state: ctx.temporary_memory_manager().register(),
+            source_memory,
+            source_memory_transferred: AtomicBool::new(false),
             spill_data: (0..self.grouping_sets.len())
                 .map(|_| Mutex::new(None))
                 .collect(),
@@ -1800,21 +1965,26 @@ impl PhysicalOperator for HashAggregate {
     }
 
     fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        let temporary_memory_state = ctx.temporary_memory_manager().register();
+        let memory = new_hash_aggregate_local_memory_tracker(ctx)?;
+        let modifier_memory = new_hash_aggregate_modifier_memory_context(ctx);
+        let hash_table_allocator = memory.accounted_allocator();
         let mut grouping_states = Vec::with_capacity(self.grouping_sets.len());
         for _ in 0..self.grouping_sets.len() {
             grouping_states.push(HashAggregateGroupingLocalState {
-                hash_table: self.new_hash_table()?,
+                hash_table: self.new_hash_table(hash_table_allocator.clone())?,
                 external_state: None,
                 reservation_boosted: false,
-                distinct_rows: vec![None; self.aggregate_objects.len()],
-                ordered_rows: vec![Vec::new(); self.aggregate_objects.len()],
+                modifier_memory: modifier_memory.clone(),
+                distinct_rows: (0..self.aggregate_objects.len()).map(|_| None).collect(),
+                ordered_rows: (0..self.aggregate_objects.len())
+                    .map(|_| AccountedValueRows::new(modifier_memory.clone()))
+                    .collect(),
                 ordered_finalized: false,
                 distinct_finalized: false,
             });
         }
         Ok(Box::new(HashAggregateLocalSinkState {
-            temporary_memory_state,
+            memory,
             grouping_states,
         }))
     }
@@ -1841,27 +2011,23 @@ impl PhysicalOperator for HashAggregate {
             .downcast_ref::<HashAggregateGlobalState>()
             .ok_or_else(|| paro_error::internal("Invalid global sink state".to_string()))?;
 
-        self.update_memory_tracker(
-            lstate.grouping_states.as_slice(),
-            &lstate.temporary_memory_state,
-        );
+        let memory = &mut lstate.memory;
+        let grouping_states = &mut lstate.grouping_states;
+        self.update_memory_tracker(grouping_states.as_slice(), memory)?;
 
         let all_groups = self.build_groups_chunk(chunk)?;
         for (grouping_idx, grouping_set) in self.grouping_sets.iter().enumerate() {
             let groups = self.build_groups_chunk_for_set(&all_groups, grouping_set)?;
-            let grouping_state = lstate
-                .grouping_states
-                .get_mut(grouping_idx)
-                .ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "Grouping local state index out of bounds: grouping_idx={grouping_idx}"
-                    ))
-                })?;
+            let grouping_state = grouping_states.get_mut(grouping_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Grouping local state index out of bounds: grouping_idx={grouping_idx}"
+                ))
+            })?;
             let hashes = grouping_state.hash_table.hash_groups(&groups)?;
 
             let external_mode = self.maybe_externalize_grouping_state(
                 ctx,
-                &lstate.temporary_memory_state,
+                memory,
                 grouping_state,
                 gstate.use_new_agg_spill,
             )?;
@@ -1870,8 +2036,10 @@ impl PhysicalOperator for HashAggregate {
                 continue;
             }
 
-            let mut addresses = Vector::with_capacity(LogicalType::BigInt, chunk.size());
-            let mut new_groups = SelectionVector::with_capacity(chunk.size());
+            let mut addresses =
+                Vector::try_new(LogicalType::BigInt, chunk.size(), chunk.allocator().clone())?;
+            let mut new_groups =
+                SelectionVector::try_with_capacity(chunk.size(), chunk.allocator().clone())?;
             grouping_state.hash_table.find_or_create_groups(
                 &groups,
                 &hashes,
@@ -1896,14 +2064,12 @@ impl PhysicalOperator for HashAggregate {
                 &addresses,
                 grouping_state.distinct_rows.as_mut_slice(),
                 grouping_state.ordered_rows.as_mut_slice(),
+                &grouping_state.modifier_memory,
                 &mut arena,
             )?;
         }
 
-        self.update_memory_tracker(
-            lstate.grouping_states.as_slice(),
-            &lstate.temporary_memory_state,
-        );
+        self.update_memory_tracker(grouping_states.as_slice(), memory)?;
 
         Ok(SinkResultType::NeedMoreInput)
     }
@@ -1944,10 +2110,15 @@ impl PhysicalOperator for HashAggregate {
             let mut ght = ght_mutex
                 .lock()
                 .map_err(|e| paro_error::internal(e.to_string()))?;
+            let ght = ght.as_mut().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Global hash table was not initialized during combine: grouping_idx={grouping_idx}"
+                ))
+            })?;
             ght.combine(&mut grouping_state.hash_table)?;
             self.merge_local_external_state_into_global(grouping_idx, grouping_state, gstate)?;
         }
-        lstate.temporary_memory_state.set_zero();
+        lstate.memory.clear();
         Ok(SinkCombineResultType::Finished)
     }
 
@@ -1956,8 +2127,7 @@ impl PhysicalOperator for HashAggregate {
         ctx: &ExecutionContext,
         sink_state: Option<&dyn GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
-        let mut source_temporary_memory_state = ctx.temporary_memory_manager().register();
-        source_temporary_memory_state.set_zero();
+        let mut source_memory = new_hash_aggregate_source_memory_tracker(ctx);
         let mut external_spill_data = Vec::with_capacity(self.grouping_sets.len());
         external_spill_data.resize_with(self.grouping_sets.len(), || None);
 
@@ -1971,7 +2141,7 @@ impl PhysicalOperator for HashAggregate {
                 .ok_or_else(|| {
                     paro_error::internal("Invalid sink state for hash aggregate source".to_string())
                 })?;
-            source_temporary_memory_state = Arc::clone(&sink_state.source_temporary_memory_state);
+            source_memory = Arc::clone(&sink_state.source_memory);
             if sink_state.use_new_agg_spill {
                 let sealed_spill_data = self.take_global_spill_data_for_source(sink_state)?;
                 let (has_spill_data, max_partition_size) =
@@ -1979,27 +2149,29 @@ impl PhysicalOperator for HashAggregate {
                 if has_spill_data && self.global_hash_tables_are_empty(sink_state)? {
                     if max_partition_size > 0 {
                         sink_state
-                            .source_temporary_memory_state
-                            .set_minimum_reservation(max_partition_size);
-                        sink_state.source_temporary_memory_state.set_zero();
+                            .source_memory
+                            .set_minimum_reservation_bytes(max_partition_size)?;
                         sink_state
-                            .source_temporary_memory_state
-                            .set_remaining_size_and_update_reservation(max_partition_size);
+                            .source_memory
+                            .set_accounted_bytes(max_partition_size)?;
                     } else {
-                        sink_state.source_temporary_memory_state.set_zero();
+                        sink_state.source_memory.clear();
                     }
                     external_spill_data = sealed_spill_data;
                 } else {
                     self.replay_global_spill_data(ctx, sink_state, sealed_spill_data)?;
                 }
             } else {
-                sink_state.source_temporary_memory_state.set_zero();
+                sink_state.source_memory.clear();
             }
+            sink_state
+                .source_memory_transferred
+                .store(true, AtomicOrdering::Release);
         }
 
         Ok(Box::new(HashAggregateGlobalSourceState {
             shared: self.shared.clone(),
-            source_temporary_memory_state,
+            source_memory,
             external_spill_data,
         }))
     }
@@ -2020,7 +2192,7 @@ impl PhysicalOperator for HashAggregate {
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         chunk: &mut Chunk,
         input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
@@ -2036,7 +2208,7 @@ impl PhysicalOperator for HashAggregate {
             .ok_or_else(|| paro_error::internal("Invalid local source state".to_string()))?;
 
         if gstate.external_spill_data.iter().any(|slot| slot.is_some()) {
-            return self.get_data_from_external_spill(chunk, gstate, lstate);
+            return self.get_data_from_external_spill(ctx, chunk, gstate, lstate);
         }
 
         while lstate.grouping_idx < self.grouping_sets.len() {
@@ -2053,6 +2225,11 @@ impl PhysicalOperator for HashAggregate {
             let mut ght = ght_mutex
                 .lock()
                 .map_err(|e| paro_error::internal(e.to_string()))?;
+            let ght = ght.as_mut().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Global hash table was not initialized during source: grouping_idx={grouping_idx}"
+                ))
+            })?;
             let position = lstate.positions.get_mut(grouping_idx).ok_or_else(|| {
                 paro_error::internal(format!(
                     "Local source position index out of bounds: grouping_idx={grouping_idx}"
@@ -2093,13 +2270,13 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_common::vector::{Vector, VECTOR_SIZE};
-    use paro_context::{StatementContext, TestStatementContextBuilder};
+    use paro_context::{RuntimeLimits, StatementContext, TestStatementContextBuilder};
     use paro_function::aggregate::{AggregateFunction, AggregateInputData};
     use paro_planner::expression::{
         AggregateExpression, AggregateType, Expression, ReferenceExpression,
     };
     use paro_scheduler::task::InterruptState;
-    use paro_storage::buffer::{BufferPool, MemoryTag, TemporaryMemoryConfig};
+    use paro_storage::buffer::{BufferPool, MemoryTag};
     use paro_storage::row::{RadixPartitionedRowsBuilder, RowLayout, RowValidityType};
 
     use crate::execution_context::ExecutionContext;
@@ -2230,26 +2407,25 @@ mod tests {
     }
 
     fn make_session(memory_limit: usize, force_external: bool) -> (Arc<StatementContext>, String) {
-        let session = TestStatementContextBuilder::minimal().build();
+        let temp_dir = create_test_temp_dir("paro_hash_agg_external");
+        let session = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits {
+                max_threads: 1,
+                max_memory: memory_limit,
+                use_temporary_directory: true,
+                temporary_directory: temp_dir.clone(),
+                max_temp_directory_size: None,
+                force_external,
+            })
+            .build();
         session
             .buffer_pool()
             .set_memory_limit(memory_limit)
             .unwrap();
-        let temp_dir = create_test_temp_dir("paro_hash_agg_external");
         session
             .buffer_pool()
             .set_temporary_directory(temp_dir.clone())
             .expect("temp directory should be configured");
-        session
-            .temporary_memory_manager()
-            .update_configuration(TemporaryMemoryConfig {
-                memory_limit,
-                has_temporary_directory: true,
-                num_threads: 1,
-                num_connections: 1,
-                query_max_memory: usize::MAX,
-                force_external,
-            });
         (session, temp_dir)
     }
 
@@ -2287,12 +2463,24 @@ mod tests {
         )
         .expect("create external spill data");
 
+        let modifier_memory = MemoryAccountingContext::detached(
+            HASH_AGGREGATE_MEMORY_TAG,
+            HASH_AGGREGATE_MEMORY_CLASS,
+        );
+
         HashAggregateGroupingLocalState {
-            hash_table: operator.new_hash_table().expect("create local hash table"),
+            hash_table: operator
+                .new_hash_table(paro_common::test_utils::test_allocator())
+                .expect("create local hash table"),
             external_state: Some(HashAggregateExternalSinkState { data }),
             reservation_boosted: false,
-            distinct_rows: vec![None; operator.aggregate_objects.len()],
-            ordered_rows: vec![Vec::new(); operator.aggregate_objects.len()],
+            modifier_memory: modifier_memory.clone(),
+            distinct_rows: (0..operator.aggregate_objects.len())
+                .map(|_| None)
+                .collect(),
+            ordered_rows: (0..operator.aggregate_objects.len())
+                .map(|_| AccountedValueRows::new(modifier_memory.clone()))
+                .collect(),
             ordered_finalized: false,
             distinct_finalized: false,
         }
@@ -2302,11 +2490,23 @@ mod tests {
         let k1 = (start..end).map(|v| v as i32).collect::<Vec<_>>();
         let k2 = (start..end).map(|v| (v % 257) as i32).collect::<Vec<_>>();
         let values = vec![1i64; end - start];
-        Chunk::from_vectors(vec![
-            Vector::from_i32(&k1),
-            Vector::from_i32(&k2),
-            Vector::from_i64(&values),
-        ])
+        Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &k1,
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &k2,
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i64_vector_with_allocator(
+                    &values,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     #[test]
@@ -2344,7 +2544,10 @@ mod tests {
         let mut seen_k1 = vec![false; row_count + 1];
         for partition in external_data.partitions() {
             let mut scanner = partition.scanner();
-            let mut chunk = Chunk::initialize(&operator.spill_payload_types_with_hash, VECTOR_SIZE);
+            let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+                &operator.spill_payload_types_with_hash,
+                VECTOR_SIZE,
+            );
             loop {
                 let fetched = scanner
                     .next_chunk(&mut chunk)
@@ -2367,11 +2570,15 @@ mod tests {
         assert_eq!(spilled_sum_k1, expected_sum);
         assert!(seen_k1.iter().skip(1).all(|seen| *seen));
 
-        let mut manual_hash_table = operator.new_hash_table().expect("create manual hash table");
+        let mut manual_hash_table = operator
+            .new_hash_table(paro_common::test_utils::test_allocator())
+            .expect("create manual hash table");
         for partition in external_data.partitions() {
             let mut scanner = partition.scanner();
-            let mut spill_chunk =
-                Chunk::initialize(&operator.spill_payload_types_with_hash, VECTOR_SIZE);
+            let mut spill_chunk = paro_common::test_utils::test_chunk_with_capacity(
+                &operator.spill_payload_types_with_hash,
+                VECTOR_SIZE,
+            );
             loop {
                 let fetched = scanner
                     .next_chunk(&mut spill_chunk)
@@ -2387,15 +2594,22 @@ mod tests {
                         spill_chunk.column(col_idx).expect("payload column"),
                     ));
                 }
-                let mut payload = Chunk::from_arc_vectors(payload_vectors);
+                let mut payload = Chunk::from_arc_vectors(
+                    payload_vectors,
+                    paro_common::test_utils::test_allocator(),
+                );
                 payload.set_cardinality(fetched);
                 let all_groups = operator.build_groups_chunk(&payload).expect("build groups");
                 let groups = operator
                     .build_groups_chunk_for_set(&all_groups, &operator.grouping_sets[0])
                     .expect("build grouping set");
                 let hashes = manual_hash_table.hash_groups(&groups).expect("hash groups");
-                let mut addresses = Vector::with_capacity(LogicalType::BigInt, payload.size());
-                let mut new_groups = SelectionVector::with_capacity(payload.size());
+                let mut addresses = paro_common::test_utils::test_vector_with_capacity(
+                    LogicalType::BigInt,
+                    payload.size(),
+                );
+                let mut new_groups =
+                    paro_common::test_utils::test_selection_with_capacity(payload.size());
                 let created = manual_hash_table
                     .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
                     .expect("find or create groups");
@@ -2406,7 +2620,8 @@ mod tests {
             }
         }
         let mut manual_position = AggregateHTScanPosition::default();
-        let mut manual_chunk = Chunk::initialize(&operator.types, VECTOR_SIZE);
+        let mut manual_chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&operator.types, VECTOR_SIZE);
         let mut manual_seen_rows = 0usize;
         while manual_hash_table
             .scan(&mut manual_position, &mut manual_chunk)
@@ -2463,7 +2678,7 @@ mod tests {
         let ght = global_hash_state.shared.hash_tables[0]
             .lock()
             .expect("lock global hash table");
-        assert_eq!(ght.count(), 0);
+        assert_eq!(ght.as_ref().expect("global hash table").count(), 0);
         drop(ght);
 
         let spill_count = global_hash_state.spill_data[0]
@@ -2584,7 +2799,7 @@ mod tests {
         let ght = global_hash_state.shared.hash_tables[0]
             .lock()
             .expect("lock global hash table");
-        assert_eq!(ght.count(), 0);
+        assert_eq!(ght.as_ref().expect("global hash table").count(), 0);
         drop(ght);
         let spill_count = global_hash_state.spill_data[0]
             .lock()
@@ -2618,7 +2833,8 @@ mod tests {
             .get_local_source_state(&ctx, global_source_state.as_ref())
             .expect("create local source state");
 
-        let mut chunk = Chunk::initialize(&operator.types, VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&operator.types, VECTOR_SIZE);
         let mut seen_rows = 0usize;
         let mut sum_k1 = 0i64;
         loop {
@@ -2722,7 +2938,8 @@ mod tests {
             .get_local_source_state(&ctx, global_source_state.as_ref())
             .expect("create local source state");
 
-        let mut chunk = Chunk::initialize(&operator.types, VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&operator.types, VECTOR_SIZE);
         let mut seen_rows = 0usize;
         loop {
             let mut source_input = OperatorSourceInput::new(
@@ -2796,7 +3013,8 @@ mod tests {
             .get_local_source_state(&ctx, global_source_state.as_ref())
             .expect("create local source state");
 
-        let mut chunk = Chunk::initialize(&operator.types, VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&operator.types, VECTOR_SIZE);
         let mut seen_rows = 0usize;
         loop {
             let mut source_input = OperatorSourceInput::new(

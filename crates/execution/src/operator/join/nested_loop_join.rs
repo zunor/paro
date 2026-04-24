@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
@@ -21,6 +24,7 @@ use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_join_condition;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::RetainedChunkVec;
 use crate::operator::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
     construct_right_outer_scan_result, construct_semi_join_result,
@@ -49,18 +53,18 @@ struct RightRowLocation {
 
 #[derive(Debug)]
 struct NestedLoopJoinGlobalSinkState {
-    rhs_payload_chunks: Mutex<Vec<Chunk>>,
-    rhs_condition_chunks: Mutex<Vec<Chunk>>,
+    rhs_payload_chunks: Arc<Mutex<RetainedChunkVec>>,
+    rhs_condition_chunks: Arc<Mutex<RetainedChunkVec>>,
     rhs_row_count: Mutex<usize>,
     right_outer: Arc<OuterJoinMarker>,
     peak_memory_bytes: AtomicUsize,
 }
 
 impl NestedLoopJoinGlobalSinkState {
-    fn new(enable_right_outer: bool) -> Self {
+    fn new(enable_right_outer: bool, memory: MemoryAccountingContext) -> Self {
         Self {
-            rhs_payload_chunks: Mutex::new(Vec::new()),
-            rhs_condition_chunks: Mutex::new(Vec::new()),
+            rhs_payload_chunks: Arc::new(Mutex::new(RetainedChunkVec::new(memory.clone()))),
+            rhs_condition_chunks: Arc::new(Mutex::new(RetainedChunkVec::new(memory))),
             rhs_row_count: Mutex::new(0),
             right_outer: Arc::new(OuterJoinMarker::new(enable_right_outer)),
             peak_memory_bytes: AtomicUsize::new(0),
@@ -80,8 +84,8 @@ impl NestedLoopJoinGlobalSinkState {
     }
 
     fn current_memory_bytes(&self) -> usize {
-        chunks_memory_usage(&self.rhs_payload_chunks.lock().unwrap())
-            + chunks_memory_usage(&self.rhs_condition_chunks.lock().unwrap())
+        self.rhs_payload_chunks.lock().unwrap().retained_bytes()
+            + self.rhs_condition_chunks.lock().unwrap().retained_bytes()
     }
 }
 
@@ -101,8 +105,8 @@ impl GlobalSinkState for NestedLoopJoinGlobalSinkState {
 
 #[derive(Debug)]
 struct NestedLoopJoinLocalSinkState {
-    local_payload_chunks: Vec<Chunk>,
-    local_condition_chunks: Vec<Chunk>,
+    local_payload_chunks: RetainedChunkVec,
+    local_condition_chunks: RetainedChunkVec,
     local_row_count: usize,
     right_condition_executors: Vec<ExpressionExecutor>,
 }
@@ -119,14 +123,13 @@ impl LocalSinkState for NestedLoopJoinLocalSinkState {
 
 impl NestedLoopJoinLocalSinkState {
     fn memory_usage_bytes(&self) -> usize {
-        chunks_memory_usage(&self.local_payload_chunks)
-            + chunks_memory_usage(&self.local_condition_chunks)
+        self.local_payload_chunks.retained_bytes() + self.local_condition_chunks.retained_bytes()
     }
 }
 
 #[derive(Debug)]
 struct NestedLoopJoinGlobalSourceState {
-    rhs_payload_chunks: Arc<Vec<Chunk>>,
+    rhs_payload_chunks: Arc<Mutex<RetainedChunkVec>>,
     right_outer: Arc<OuterJoinMarker>,
     join_type: JoinType,
 }
@@ -201,8 +204,14 @@ pub struct NestedLoopJoin {
     sink_state: Mutex<Option<Arc<dyn GlobalSinkState>>>,
 }
 
-fn chunks_memory_usage(chunks: &[Chunk]) -> usize {
-    chunks.iter().map(Chunk::get_allocation_size).sum()
+fn nested_loop_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        paro_common::allocator::MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    )
 }
 
 impl NestedLoopJoin {
@@ -311,17 +320,22 @@ impl NestedLoopJoin {
         self.arbitrary_condition.is_some()
     }
 
-    fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk) {
+    fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk) -> Result<()> {
         match self.join_type {
             JoinType::Anti => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_anti_join_result(
                     input,
                     &sel,
                     input.size(),
                     &self.join.left_projection_map,
                     result,
-                );
+                )?;
             }
             JoinType::Mark => {
                 construct_mark_join_result(
@@ -329,10 +343,15 @@ impl NestedLoopJoin {
                     &self.join.left_projection_map,
                     &vec![Some(false); input.size()],
                     result,
-                );
+                )?;
             }
             JoinType::Left | JoinType::Outer | JoinType::Single => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_left_outer_result(
                     input,
                     &sel,
@@ -340,18 +359,24 @@ impl NestedLoopJoin {
                     &self.join.left_projection_map,
                     &self.join.right_output_types,
                     result,
-                );
+                )?;
             }
             _ => {
                 result.set_cardinality(0);
             }
         }
+        Ok(())
     }
 
-    fn ensure_output_chunk(&self, chunk: &mut Chunk) {
+    fn ensure_output_chunk(&self, chunk: &mut Chunk) -> Result<()> {
         if chunk.column_count() == 0 {
-            *chunk = Chunk::initialize(&self.types, paro_common::vector::VECTOR_SIZE);
+            *chunk = Chunk::try_initialize(
+                &self.types,
+                paro_common::vector::VECTOR_SIZE,
+                chunk.allocator().clone(),
+            )?;
         }
+        Ok(())
     }
 
     fn ensure_input_state(
@@ -383,7 +408,8 @@ impl NestedLoopJoin {
                     ctx,
                 )?);
             }
-            let mut left_condition_chunk = Chunk::from_arc_vectors(left_columns);
+            let mut left_condition_chunk =
+                Chunk::from_arc_vectors(left_columns, input.allocator().clone());
             left_condition_chunk.set_cardinality(input.size());
             state.left_condition_chunk = Self::materialize_chunk(
                 &left_condition_chunk,
@@ -392,7 +418,7 @@ impl NestedLoopJoin {
                     .iter()
                     .map(|condition| condition.left.return_type())
                     .collect::<Vec<_>>(),
-            );
+            )?;
         }
 
         state.input_initialized = true;
@@ -767,8 +793,9 @@ impl NestedLoopJoin {
         }
     }
 
-    fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Chunk {
-        let mut materialized = Chunk::initialize(types, chunk.size().max(1));
+    fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Result<Chunk> {
+        let mut materialized =
+            Chunk::try_initialize(types, chunk.size().max(1), chunk.allocator().clone())?;
         materialized.set_cardinality(chunk.size());
         for col_idx in 0..chunk.column_count() {
             let source = chunk
@@ -781,7 +808,7 @@ impl NestedLoopJoin {
                 target.copy_at(row_idx, source, row_idx);
             }
         }
-        materialized
+        Ok(materialized)
     }
 }
 
@@ -814,6 +841,7 @@ impl PhysicalOperator for NestedLoopJoin {
             spilled: None,
             peak_memory_bytes: Some(sink_state.peak_memory_bytes() as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -877,7 +905,7 @@ impl PhysicalOperator for NestedLoopJoin {
         self.sink_state.lock().unwrap().clone()
     }
 
-    fn get_operator_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
+    fn get_operator_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
         let left_condition_types = self
             .comparison_conditions
             .iter()
@@ -888,8 +916,15 @@ impl PhysicalOperator for NestedLoopJoin {
 
         Ok(Box::new(NestedLoopJoinOperatorState {
             input_initialized: false,
-            left_condition_chunk: Chunk::init_empty(&left_condition_types),
-            combined_row_chunk: Chunk::initialize(&combined_types, 1),
+            left_condition_chunk: Chunk::try_init_empty(
+                &left_condition_types,
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
+            combined_row_chunk: Chunk::try_initialize(
+                &combined_types,
+                1,
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
             left_condition_executors: self
                 .comparison_conditions
                 .iter()
@@ -909,17 +944,19 @@ impl PhysicalOperator for NestedLoopJoin {
         }))
     }
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
         Self::validate_join_type(self.join_type)?;
         Ok(Box::new(NestedLoopJoinGlobalSinkState::new(
             self.uses_right_outer_marker(),
+            nested_loop_memory_context(ctx),
         )))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        let memory = nested_loop_memory_context(ctx);
         Ok(Box::new(NestedLoopJoinLocalSinkState {
-            local_payload_chunks: Vec::new(),
-            local_condition_chunks: Vec::new(),
+            local_payload_chunks: RetainedChunkVec::new(memory.clone()),
+            local_condition_chunks: RetainedChunkVec::new(memory),
             local_row_count: 0,
             right_condition_executors: self
                 .comparison_conditions
@@ -949,7 +986,7 @@ impl PhysicalOperator for NestedLoopJoin {
 
         lstate
             .local_payload_chunks
-            .push(Self::materialize_chunk(chunk, self.right.types()));
+            .push(Self::materialize_chunk(chunk, self.right.types())?)?;
         lstate.local_row_count += chunk.size();
 
         if !self.comparison_conditions.is_empty() {
@@ -963,7 +1000,8 @@ impl PhysicalOperator for NestedLoopJoin {
                     ctx,
                 )?);
             }
-            let mut condition_chunk = Chunk::from_arc_vectors(condition_columns);
+            let mut condition_chunk =
+                Chunk::from_arc_vectors(condition_columns, chunk.allocator().clone());
             condition_chunk.set_cardinality(chunk.size());
             lstate.local_condition_chunks.push(Self::materialize_chunk(
                 &condition_chunk,
@@ -972,7 +1010,7 @@ impl PhysicalOperator for NestedLoopJoin {
                     .iter()
                     .map(|condition| condition.right.return_type())
                     .collect::<Vec<_>>(),
-            ));
+            )?)?;
         }
 
         if let Some(gstate) = input
@@ -1009,11 +1047,11 @@ impl PhysicalOperator for NestedLoopJoin {
         if lstate.local_row_count > 0 {
             {
                 let mut payload_chunks = gstate.rhs_payload_chunks.lock().unwrap();
-                payload_chunks.append(&mut lstate.local_payload_chunks);
+                payload_chunks.append_from(&mut lstate.local_payload_chunks)?;
             }
             {
                 let mut condition_chunks = gstate.rhs_condition_chunks.lock().unwrap();
-                condition_chunks.append(&mut lstate.local_condition_chunks);
+                condition_chunks.append_from(&mut lstate.local_condition_chunks)?;
             }
             *gstate.rhs_row_count.lock().unwrap() += lstate.local_row_count;
             gstate.right_outer.add_rows(lstate.local_row_count);
@@ -1033,9 +1071,8 @@ impl PhysicalOperator for NestedLoopJoin {
 
         let create_source_state =
             |sink: &NestedLoopJoinGlobalSinkState| -> Result<Box<dyn GlobalSourceState>> {
-                let payload_chunks = Arc::new(sink.rhs_payload_chunks.lock().unwrap().clone());
                 Ok(Box::new(NestedLoopJoinGlobalSourceState {
-                    rhs_payload_chunks: payload_chunks,
+                    rhs_payload_chunks: Arc::clone(&sink.rhs_payload_chunks),
                     right_outer: sink.right_outer.clone(),
                     join_type: self.join_type,
                 }))
@@ -1080,6 +1117,7 @@ impl PhysicalOperator for NestedLoopJoin {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         Self::validate_join_type(self.join_type)?;
 
@@ -1090,7 +1128,7 @@ impl PhysicalOperator for NestedLoopJoin {
                 paro_error::internal("Invalid nested loop join operator state".to_string())
             })?;
 
-        self.ensure_output_chunk(chunk);
+        self.ensure_output_chunk(chunk)?;
         if input.size() == 0 {
             chunk.set_cardinality(0);
             self.reset_input_state(state);
@@ -1112,7 +1150,7 @@ impl PhysicalOperator for NestedLoopJoin {
             if self.join.empty_result_if_rhs_is_empty() {
                 chunk.set_cardinality(0);
             } else {
-                self.construct_empty_join_result(input, chunk);
+                self.construct_empty_join_result(input, chunk)?;
             }
             self.reset_input_state(state);
             return Ok(OperatorResultType::NeedMoreInput);
@@ -1121,7 +1159,9 @@ impl PhysicalOperator for NestedLoopJoin {
         self.ensure_input_state(ctx, input, state)?;
 
         let rhs_payload_chunks = gsink.rhs_payload_chunks.lock().unwrap();
+        let rhs_payload_chunks = rhs_payload_chunks.as_slice();
         let rhs_condition_chunks = gsink.rhs_condition_chunks.lock().unwrap();
+        let rhs_condition_chunks = rhs_condition_chunks.as_slice();
         let mut output_count = 0;
         let output_capacity = chunk.capacity();
 
@@ -1153,8 +1193,8 @@ impl PhysicalOperator for NestedLoopJoin {
                         ctx,
                         input,
                         state,
-                        &rhs_condition_chunks,
-                        &rhs_payload_chunks,
+                        rhs_condition_chunks,
+                        rhs_payload_chunks,
                         right,
                     )?;
                     if outcome == RowMatchState::Match {
@@ -1165,12 +1205,12 @@ impl PhysicalOperator for NestedLoopJoin {
                             output_count,
                             input,
                             state.left_row_idx,
-                            &rhs_payload_chunks,
+                            rhs_payload_chunks,
                             right,
                         )?;
                         output_count += 1;
                     }
-                    self.advance_right_position(&rhs_payload_chunks, state);
+                    self.advance_right_position(rhs_payload_chunks, state);
                 }
                 JoinType::Semi => {
                     if state.rhs_chunk_idx >= rhs_payload_chunks.len() {
@@ -1196,8 +1236,8 @@ impl PhysicalOperator for NestedLoopJoin {
                         ctx,
                         input,
                         state,
-                        &rhs_condition_chunks,
-                        &rhs_payload_chunks,
+                        rhs_condition_chunks,
+                        rhs_payload_chunks,
                         right,
                     )?;
                     if outcome == RowMatchState::Match {
@@ -1207,7 +1247,7 @@ impl PhysicalOperator for NestedLoopJoin {
                         self.reset_for_next_left_row(state);
                         continue;
                     }
-                    self.advance_right_position(&rhs_payload_chunks, state);
+                    self.advance_right_position(rhs_payload_chunks, state);
                 }
                 JoinType::Anti => {
                     if state.rhs_chunk_idx >= rhs_payload_chunks.len() {
@@ -1233,8 +1273,8 @@ impl PhysicalOperator for NestedLoopJoin {
                         ctx,
                         input,
                         state,
-                        &rhs_condition_chunks,
-                        &rhs_payload_chunks,
+                        rhs_condition_chunks,
+                        rhs_payload_chunks,
                         right,
                     )?;
                     if outcome == RowMatchState::Match {
@@ -1242,7 +1282,7 @@ impl PhysicalOperator for NestedLoopJoin {
                         self.reset_for_next_left_row(state);
                         continue;
                     }
-                    self.advance_right_position(&rhs_payload_chunks, state);
+                    self.advance_right_position(rhs_payload_chunks, state);
                 }
                 JoinType::Mark => {
                     if state.found_match {
@@ -1281,8 +1321,8 @@ impl PhysicalOperator for NestedLoopJoin {
                         ctx,
                         input,
                         state,
-                        &rhs_condition_chunks,
-                        &rhs_payload_chunks,
+                        rhs_condition_chunks,
+                        rhs_payload_chunks,
                         right,
                     )?;
                     match outcome {
@@ -1290,7 +1330,7 @@ impl PhysicalOperator for NestedLoopJoin {
                         RowMatchState::Unknown => state.saw_null = true,
                         RowMatchState::NoMatch => {}
                     }
-                    self.advance_right_position(&rhs_payload_chunks, state);
+                    self.advance_right_position(rhs_payload_chunks, state);
                 }
                 JoinType::Single => {
                     if state.rhs_chunk_idx >= rhs_payload_chunks.len() {
@@ -1301,7 +1341,7 @@ impl PhysicalOperator for NestedLoopJoin {
                                     output_count,
                                     input,
                                     state.left_row_idx,
-                                    &rhs_payload_chunks,
+                                    rhs_payload_chunks,
                                     right,
                                 )?;
                             }
@@ -1328,8 +1368,8 @@ impl PhysicalOperator for NestedLoopJoin {
                         ctx,
                         input,
                         state,
-                        &rhs_condition_chunks,
-                        &rhs_payload_chunks,
+                        rhs_condition_chunks,
+                        rhs_payload_chunks,
                         right,
                     )?;
                     if outcome == RowMatchState::Match {
@@ -1340,7 +1380,7 @@ impl PhysicalOperator for NestedLoopJoin {
                         }
                         state.single_match = Some(right);
                     }
-                    self.advance_right_position(&rhs_payload_chunks, state);
+                    self.advance_right_position(rhs_payload_chunks, state);
                 }
                 JoinType::RightSemi | JoinType::RightAnti => {
                     if state.rhs_chunk_idx >= rhs_payload_chunks.len() {
@@ -1357,14 +1397,14 @@ impl PhysicalOperator for NestedLoopJoin {
                         ctx,
                         input,
                         state,
-                        &rhs_condition_chunks,
-                        &rhs_payload_chunks,
+                        rhs_condition_chunks,
+                        rhs_payload_chunks,
                         right,
                     )?;
                     if outcome == RowMatchState::Match {
                         self.mark_right_match(gsink, right);
                     }
-                    self.advance_right_position(&rhs_payload_chunks, state);
+                    self.advance_right_position(rhs_payload_chunks, state);
                 }
                 JoinType::Invalid => unreachable!("join type validated above"),
             }
@@ -1414,13 +1454,21 @@ impl PhysicalOperator for NestedLoopJoin {
         };
 
         if chunk.column_count() == 0 {
-            *chunk = Chunk::initialize(&self.types, paro_common::vector::VECTOR_SIZE);
+            *chunk = Chunk::try_initialize(
+                &self.types,
+                paro_common::vector::VECTOR_SIZE,
+                chunk.allocator().clone(),
+            )?;
         }
 
-        let mut build_chunk =
-            Chunk::initialize(self.right.types(), paro_common::vector::VECTOR_SIZE);
+        let mut build_chunk = Chunk::try_initialize(
+            self.right.types(),
+            paro_common::vector::VECTOR_SIZE,
+            chunk.allocator().clone(),
+        )?;
+        let rhs_payload_chunks = gstate.rhs_payload_chunks.lock().unwrap();
         let count = gstate.right_outer.scan(
-            gstate.rhs_payload_chunks.as_ref(),
+            rhs_payload_chunks.as_slice(),
             &mut lstate.scan_state,
             emit_found,
             &mut build_chunk,
@@ -1430,7 +1478,7 @@ impl PhysicalOperator for NestedLoopJoin {
             return Ok(SourceResultType::Finished);
         }
 
-        let build_sel = SelectionVector::incremental(count);
+        let build_sel = SelectionVector::try_incremental(count, chunk.allocator().clone())?;
         match gstate.join_type {
             JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
                 &build_chunk,
@@ -1448,7 +1496,7 @@ impl PhysicalOperator for NestedLoopJoin {
                 chunk,
             ),
             _ => unreachable!("source phase only runs for right/full/right-semi/right-anti"),
-        }
+        }?;
 
         Ok(SourceResultType::HaveMoreOutput)
     }
@@ -1478,10 +1526,12 @@ mod tests {
     use super::{NestedLoopJoin, NestedLoopJoinGlobalSinkState, NestedLoopJoinGlobalSourceState};
     use std::sync::Arc;
 
+    use paro_common::allocator::MemoryTag;
     use paro_common::chunk::Chunk;
+    use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
@@ -1549,15 +1599,23 @@ mod tests {
     ) {
         let sink_state = Arc::new(NestedLoopJoinGlobalSinkState::new(
             join.uses_right_outer_marker(),
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
         ));
         let row_count = payload_chunks.iter().map(Chunk::size).sum::<usize>();
         {
             let mut payload = sink_state.rhs_payload_chunks.lock().unwrap();
-            *payload = payload_chunks;
+            for chunk in payload_chunks {
+                payload.push(chunk).unwrap();
+            }
         }
         {
             let mut conditions = sink_state.rhs_condition_chunks.lock().unwrap();
-            *conditions = condition_chunks;
+            for chunk in condition_chunks {
+                conditions.push(chunk).unwrap();
+            }
         }
         *sink_state.rhs_row_count.lock().unwrap() = row_count;
         sink_state.right_outer.add_rows(row_count);
@@ -1569,24 +1627,52 @@ mod tests {
         let join = comparison_join(JoinType::Left, JoinComparisonType::GreaterThan);
         set_sink_state(
             &join,
-            vec![Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(
-                &[2, 7],
-            ))])],
-            vec![Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(
-                &[2, 7],
-            ))])],
+            vec![Chunk::from_arc_vectors(
+                vec![Arc::new(
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[2, 7],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                )],
+                paro_common::test_utils::test_allocator(),
+            )],
+            vec![Chunk::from_arc_vectors(
+                vec![Arc::new(
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[2, 7],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                )],
+                paro_common::test_utils::test_allocator(),
+            )],
         );
 
         let session = create_test_session();
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5, 1]))]);
-        let mut output = Chunk::new();
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5, 1],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -1600,8 +1686,17 @@ mod tests {
     #[test]
     fn mark_nested_loop_join_returns_null_for_unknown_only_matches() {
         let join = comparison_join(JoinType::Mark, JoinComparisonType::GreaterThan);
-        let payload = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1]))]);
-        let mut condition = Chunk::initialize(&[LogicalType::Integer], 1);
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut condition =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 1);
         condition
             .column_mut(0)
             .expect("condition column")
@@ -1613,12 +1708,28 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
-        let mut output = Chunk::new();
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -1631,9 +1742,15 @@ mod tests {
         let join = any_join(JoinType::Inner);
         set_sink_state(
             &join,
-            vec![Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(
-                &[2, 4],
-            ))])],
+            vec![Chunk::from_arc_vectors(
+                vec![Arc::new(
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[2, 4],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                )],
+                paro_common::test_utils::test_allocator(),
+            )],
             vec![],
         );
 
@@ -1641,12 +1758,28 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[3]))]);
-        let mut output = Chunk::new();
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[3],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -1690,19 +1823,33 @@ mod tests {
     #[test]
     fn nested_loop_right_join_source_emits_unmatched_build_rows() {
         let join = comparison_join(JoinType::Right, JoinComparisonType::GreaterThan);
-        let sink_state = Arc::new(NestedLoopJoinGlobalSinkState::new(true));
+        let sink_state = Arc::new(NestedLoopJoinGlobalSinkState::new(
+            true,
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        ));
         {
             let mut payload = sink_state.rhs_payload_chunks.lock().unwrap();
-            *payload = vec![Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(
-                &[10, 20],
-            ))])];
+            payload
+                .push(Chunk::from_arc_vectors(
+                    vec![Arc::new(
+                        paro_common::test_utils::test_i32_vector_with_allocator(
+                            &[10, 20],
+                            paro_common::test_utils::test_allocator(),
+                        ),
+                    )],
+                    paro_common::test_utils::test_allocator(),
+                ))
+                .unwrap();
         }
         *sink_state.rhs_row_count.lock().unwrap() = 2;
         sink_state.right_outer.add_rows(2);
         sink_state.right_outer.set_match(0);
 
         let gstate = NestedLoopJoinGlobalSourceState {
-            rhs_payload_chunks: Arc::new(sink_state.rhs_payload_chunks.lock().unwrap().clone()),
+            rhs_payload_chunks: Arc::clone(&sink_state.rhs_payload_chunks),
             right_outer: sink_state.right_outer.clone(),
             join_type: JoinType::Right,
         };
@@ -1713,7 +1860,8 @@ mod tests {
         let mut lstate = join.get_local_source_state(&ctx, &gstate).unwrap();
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(&gstate, lstate.as_mut(), &interrupt);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let result = join.get_data(&ctx, &mut output, &mut input).unwrap();
 

@@ -30,7 +30,7 @@ impl UnaryOperator<f64, f64> for SinOpF64 {
 }
 
 fn sin_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, SinOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, SinOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -60,7 +60,7 @@ impl UnaryOperator<f64, f64> for CosOpF64 {
 }
 
 fn cos_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, CosOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, CosOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -90,7 +90,7 @@ impl UnaryOperator<f64, f64> for TanOpF64 {
 }
 
 fn tan_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, TanOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, TanOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -120,7 +120,7 @@ impl UnaryOperator<f64, f64> for AsinOpF64 {
 }
 
 fn asin_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, AsinOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, AsinOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -150,7 +150,7 @@ impl UnaryOperator<f64, f64> for AcosOpF64 {
 }
 
 fn acos_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, AcosOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, AcosOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -180,7 +180,7 @@ impl UnaryOperator<f64, f64> for AtanOpF64 {
 }
 
 fn atan_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, AtanOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, AtanOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -218,7 +218,7 @@ fn atan2_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -
         &input.data[1],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -259,14 +259,17 @@ mod tests {
     }
 
     fn create_f64_chunk(values: &[f64]) -> Chunk {
-        let vec = Vector::from_f64(values);
-        Chunk::from_vectors(vec![vec])
+        let vec = paro_common::test_utils::test_f64_vector_with_allocator(
+            values,
+            paro_common::test_utils::test_allocator(),
+        );
+        paro_common::test_utils::test_chunk_from_vectors(vec![vec])
     }
 
     #[test]
     fn test_sin() {
         let chunk = create_f64_chunk(&[0.0, FRAC_PI_2, PI]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         sin_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -278,7 +281,7 @@ mod tests {
     #[test]
     fn test_cos() {
         let chunk = create_f64_chunk(&[0.0, FRAC_PI_2, PI]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         cos_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -290,7 +293,7 @@ mod tests {
     #[test]
     fn test_tan() {
         let chunk = create_f64_chunk(&[0.0, FRAC_PI_4]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         tan_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -301,7 +304,7 @@ mod tests {
     #[test]
     fn test_asin() {
         let chunk = create_f64_chunk(&[0.0, 1.0, -1.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         asin_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -313,7 +316,7 @@ mod tests {
     #[test]
     fn test_acos() {
         let chunk = create_f64_chunk(&[1.0, 0.0, -1.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         acos_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -325,7 +328,7 @@ mod tests {
     #[test]
     fn test_atan() {
         let chunk = create_f64_chunk(&[0.0, 1.0, -1.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         atan_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -336,10 +339,16 @@ mod tests {
 
     #[test]
     fn test_atan2() {
-        let y = Vector::from_f64(&[0.0, 1.0, 1.0, -1.0]);
-        let x = Vector::from_f64(&[1.0, 0.0, 1.0, -1.0]);
-        let chunk = Chunk::from_vectors(vec![y, x]);
-        let mut result = Vector::new(LogicalType::Double);
+        let y = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[0.0, 1.0, 1.0, -1.0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let x = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[1.0, 0.0, 1.0, -1.0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![y, x]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         atan2_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -356,7 +365,7 @@ mod tests {
     #[test]
     fn test_asin_out_of_range() {
         let chunk = create_f64_chunk(&[2.0, -2.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         asin_f64(&chunk, &MockState, &mut result).unwrap();
 

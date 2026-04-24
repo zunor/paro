@@ -135,10 +135,13 @@ mod tests {
 
     #[test]
     fn test_length_function() {
-        let input_vec = Vector::from_strings(&["hello", "世界", ""]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "世界", ""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         length_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -149,11 +152,14 @@ mod tests {
 
     #[test]
     fn test_length_with_null() {
-        let mut input_vec = Vector::from_strings(&["hello", "world"]);
+        let mut input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         input_vec.validity_mut().set_null(1);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         length_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -163,10 +169,13 @@ mod tests {
 
     #[test]
     fn test_octet_length_function() {
-        let input_vec = Vector::from_strings(&["hello", "世界", "🎉"]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "世界", "🎉"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         octet_length_varchar(&chunk, &state, &mut result).unwrap();
 

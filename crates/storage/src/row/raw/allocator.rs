@@ -9,6 +9,7 @@ use crate::buffer::{
     BlockHandle, BufferHandle, BufferPool, FileBufferType, MemoryTag, DEFAULT_BLOCK_SIZE,
 };
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle};
 
 use super::segment::RawRowChunkPart;
 use super::{RawRowChunkState, RawRowLayout, RawRowPinProperties, RawRowPinState};
@@ -27,17 +28,20 @@ pub struct RawRowBlock {
     pub capacity: usize,
     /// Currently used size in bytes
     pub size: usize,
+    /// Logical memory ownership for this physical block.
+    release: MemoryReleaseHandle,
 }
 
 impl RawRowBlock {
     /// Create a new row-data block from a buffer handle.
-    fn new(buffer_handle: BufferHandle, capacity: usize) -> Self {
+    fn new(buffer_handle: BufferHandle, capacity: usize, release: MemoryReleaseHandle) -> Self {
         // Extract the BlockHandle from the BufferHandle
         let handle = buffer_handle.block_handle().map(Arc::clone);
         Self {
             handle,
             capacity,
             size: 0,
+            release,
         }
     }
 
@@ -74,6 +78,11 @@ impl RawRowBlock {
         self.size += bytes;
         debug_assert!(self.size <= self.capacity);
     }
+
+    #[inline]
+    fn release_memory(&self) {
+        self.release.release();
+    }
 }
 
 /// Allocator for raw row blocks.
@@ -88,6 +97,8 @@ pub struct RawRowAllocator {
     layout: Arc<RawRowLayout>,
     /// Memory tag for tracking
     tag: MemoryTag,
+    /// Logical memory owner for block allocations.
+    memory: MemoryAccountingContext,
     /// Row blocks (fixed-size row data)
     row_blocks: Vec<RawRowBlock>,
     /// Heap blocks (variable-length data)
@@ -102,10 +113,22 @@ impl RawRowAllocator {
     /// * `layout` - Layout of the rows to store
     /// * `tag` - Memory tag for tracking
     pub fn new(buffer_pool: Arc<BufferPool>, layout: Arc<RawRowLayout>, tag: MemoryTag) -> Self {
+        let memory =
+            MemoryAccountingContext::detached(tag, MemoryAccountingClass::default_for_tag(tag));
+        Self::new_with_memory(buffer_pool, layout, tag, memory)
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        layout: Arc<RawRowLayout>,
+        tag: MemoryTag,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         Self {
             buffer_pool,
             layout,
             tag,
+            memory,
             row_blocks: Vec::new(),
             heap_blocks: Vec::new(),
         }
@@ -157,13 +180,21 @@ impl RawRowAllocator {
     ///
     /// Allocates a new block from the buffer pool for storing rows.
     pub fn create_row_block(&mut self) -> Result<usize> {
-        let handle = self.buffer_pool.allocate(
+        let release = self.memory.retain(DEFAULT_BLOCK_SIZE)?;
+        let handle = match self.buffer_pool.allocate(
             self.tag,
             FileBufferType::ManagedBuffer,
             DEFAULT_BLOCK_SIZE,
-        )?;
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                release.release();
+                return Err(err);
+            }
+        };
         let capacity = handle.size();
-        self.row_blocks.push(RawRowBlock::new(handle, capacity));
+        self.row_blocks
+            .push(RawRowBlock::new(handle, capacity, release));
         Ok(self.row_blocks.len() - 1)
     }
 
@@ -173,11 +204,20 @@ impl RawRowAllocator {
     /// * `min_size` - Minimum size needed (may allocate larger)
     pub fn create_heap_block(&mut self, min_size: usize) -> Result<usize> {
         let size = min_size.max(DEFAULT_BLOCK_SIZE);
-        let handle = self
+        let release = self.memory.retain(size)?;
+        let handle = match self
             .buffer_pool
-            .allocate(self.tag, FileBufferType::ManagedBuffer, size)?;
+            .allocate(self.tag, FileBufferType::ManagedBuffer, size)
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                release.release();
+                return Err(err);
+            }
+        };
         let capacity = handle.size();
-        self.heap_blocks.push(RawRowBlock::new(handle, capacity));
+        self.heap_blocks
+            .push(RawRowBlock::new(handle, capacity, release));
         Ok(self.heap_blocks.len() - 1)
     }
 
@@ -498,7 +538,9 @@ impl RawRowAllocator {
                 }
 
                 for block_id in blocks_to_free {
-                    let _ = self.buffer_pool.free(block_id);
+                    if self.buffer_pool.free(block_id).is_ok() {
+                        self.release_block_accounting(block_id);
+                    }
                 }
             }
             RawRowPinProperties::UnpinAfterDone
@@ -587,7 +629,9 @@ impl RawRowAllocator {
 
             let block_id = handle.block_id();
             drop(handle);
-            let _ = buffer_pool.free(block_id);
+            if buffer_pool.free(block_id).is_ok() {
+                block.release_memory();
+            }
         }
         blocks.clear();
     }
@@ -605,7 +649,21 @@ impl RawRowAllocator {
 
             let block_id = handle.block_id();
             drop(handle);
-            let _ = buffer_pool.free(block_id);
+            if buffer_pool.free(block_id).is_ok() {
+                block.release_memory();
+            }
+        }
+    }
+
+    fn release_block_accounting(&self, block_id: crate::buffer::BlockId) {
+        for block in self.row_blocks.iter().chain(self.heap_blocks.iter()) {
+            let Some(handle) = &block.handle else {
+                continue;
+            };
+            if handle.block_id() == block_id {
+                block.release_memory();
+                return;
+            }
         }
     }
     /// Initialize chunk state for reading/writing.

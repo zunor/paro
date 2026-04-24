@@ -167,15 +167,15 @@ pub(crate) fn build_primary_key_chunk(table: &TableHandle, rows: &Chunk) -> Resu
         })?;
         key_vectors.push(column.clone());
     }
-    Ok(Chunk::from_arc_vectors(key_vectors))
+    Ok(Chunk::from_arc_vectors(
+        key_vectors,
+        rows.allocator().clone(),
+    ))
 }
 
 pub(crate) fn materialize_rows_as_flat_chunk(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk> {
-    let mut materialized = Chunk::initialize_with_allocator(
-        &chunk.types(),
-        row_indices.len(),
-        chunk.allocator().clone(),
-    );
+    let mut materialized =
+        Chunk::try_initialize(&chunk.types(), row_indices.len(), chunk.allocator().clone())?;
     materialized.set_cardinality(row_indices.len());
 
     for col_idx in 0..chunk.column_count() {
@@ -199,7 +199,7 @@ pub(crate) fn concatenate_flat_chunks(chunks: &[Chunk]) -> Result<Chunk> {
         .ok_or_else(|| paro_error::internal("cannot concatenate empty chunk list"))?;
     let total_rows: usize = chunks.iter().map(Chunk::size).sum();
     let mut combined =
-        Chunk::initialize_with_allocator(&first.types(), total_rows, first.allocator().clone());
+        Chunk::try_initialize(&first.types(), total_rows, first.allocator().clone())?;
     combined.set_cardinality(total_rows);
 
     let mut dst_row = 0;

@@ -110,10 +110,15 @@ impl PhysicalOperator for PhysicalExpressionScan {
 
         // Evaluate expressions row by row and fill chunk
         // We need a dummy chunk for executor
-        let dummy_chunk = Chunk::new();
+        let dummy_chunk =
+            Chunk::try_new(ctx.allocator(paro_common::allocator::MemoryTag::BaseTable))?;
 
         for col_idx in 0..self.types.len() {
-            let mut col_vector = Vector::new(self.types[col_idx].clone());
+            let mut col_vector = Vector::try_new(
+                self.types[col_idx].clone(),
+                count,
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?;
             col_vector.set_count(count);
             for row_idx in 0..count {
                 let expr = &self.expressions[start_row + row_idx][col_idx];

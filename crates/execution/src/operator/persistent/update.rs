@@ -71,7 +71,7 @@ mod tests {
     use paro_catalog::entry::{ColumnDefinition, TableCatalogEntry};
     use paro_common::chunk::Chunk;
     use paro_common::runtime_value::Value;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_scheduler::task::InterruptState;
     use paro_storage::table::table_factory::TableFactory;
@@ -114,12 +114,27 @@ mod tests {
 
     #[test]
     fn collect_updated_column_values_uses_table_column_indexes() {
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_i32(&[10, 20]),
-            Vector::from_i32(&[30, 40]),
-            Vector::from_i32(&[50, 60]),
-            Vector::from_i64(&[100, 200]),
-        ]);
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[30, 40],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[50, 60],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i64_vector_with_allocator(
+                    &[100, 200],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let values = collect_updated_column_values(&chunk, &[2, 0])
             .expect("collecting updated column values should succeed");
@@ -147,7 +162,8 @@ mod tests {
 
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 1);
 
         let result = op
             .get_data(&ctx, &mut chunk, &mut input)
@@ -178,7 +194,8 @@ mod tests {
 
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 1);
 
         let result = op
             .get_data(&ctx, &mut chunk, &mut input)
@@ -194,10 +211,19 @@ mod tests {
             KeysType::PrimaryKeys,
         ));
         storage
-            .append(&Chunk::from_vectors(vec![
-                Vector::from_i32(&[1, 2]),
-                Vector::from_i32(&[10, 20]),
-            ]))
+            .append(&Chunk::from_vectors(
+                vec![
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[1, 2],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[10, 20],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ))
             .expect("append rows");
         let table = Arc::new(TableCatalogEntry::new(
             "paro".to_string(),
@@ -244,11 +270,23 @@ mod tests {
         }
         let target_row_id = target_row_id.expect("row id for primary key update");
 
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_i32(&[3]),
-            Vector::from_i32(&[15]),
-            Vector::from_i64(&[target_row_id as i64]),
-        ]);
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[3],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[15],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i64_vector_with_allocator(
+                    &[target_row_id as i64],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         let result = op
             .sink(&ctx, &chunk, &mut input)
             .expect("PRIMARY_KEYS UPDATE should succeed");

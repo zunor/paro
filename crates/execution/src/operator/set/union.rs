@@ -275,10 +275,11 @@ impl PhysicalOperator for Union {
             }
 
             // Create input for child
-            let mut child_input = OperatorSourceInput::new(
+            let mut child_input = OperatorSourceInput::with_memory(
                 child_gstates[current_child].as_ref(),
                 lstate.child_local_states[current_child].as_mut(),
                 input.interrupt_state,
+                input.memory.child_scope(),
             );
 
             // Get data from child

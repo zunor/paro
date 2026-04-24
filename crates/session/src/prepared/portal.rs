@@ -6,6 +6,8 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::FetchDirection;
 
+use crate::result::retained_store::SessionRetainedResultStore;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorHoldability {
     WithoutHold,
@@ -26,54 +28,31 @@ pub enum FormatCode {
 
 #[derive(Clone)]
 pub struct MaterializedPortalData {
-    chunks: Vec<Chunk>,
+    store: SessionRetainedResultStore,
     row_count: usize,
 }
 
 impl std::fmt::Debug for MaterializedPortalData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MaterializedPortalData")
-            .field("chunks", &self.chunks.len())
+            .field("store", &self.store)
             .field("row_count", &self.row_count)
             .finish()
     }
 }
 
 impl MaterializedPortalData {
-    pub fn new(chunks: Vec<Chunk>) -> Self {
-        let row_count = chunks.iter().map(Chunk::len).sum();
-        Self { chunks, row_count }
+    pub fn new(store: SessionRetainedResultStore) -> Self {
+        let row_count = store.row_count();
+        Self { store, row_count }
     }
 
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 
-    fn chunk_range(&self, start: usize, end: usize) -> Vec<Chunk> {
-        if start >= end {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        let mut offset = 0usize;
-        for chunk in &self.chunks {
-            if offset >= end {
-                break;
-            }
-            let chunk_end = offset + chunk.len();
-            if chunk_end <= start {
-                offset = chunk_end;
-                continue;
-            }
-
-            let slice_start = start.saturating_sub(offset);
-            let slice_end = (end - offset).min(chunk.len());
-            let mut sliced = chunk.clone();
-            sliced.slice_range(slice_start, slice_end - slice_start);
-            out.push(sliced);
-            offset = chunk_end;
-        }
-        out
+    fn chunk_range(&self, start: usize, end: usize) -> Result<Vec<Chunk>, String> {
+        self.store.chunk_range(start, end)
     }
 
     pub fn fetch(
@@ -141,7 +120,7 @@ impl MaterializedPortalData {
         let rows = if move_only {
             Vec::new()
         } else {
-            self.chunk_range(start.max(0) as usize, end.max(0) as usize)
+            self.chunk_range(start.max(0) as usize, end.max(0) as usize)?
         };
 
         Ok(FetchOutcome {

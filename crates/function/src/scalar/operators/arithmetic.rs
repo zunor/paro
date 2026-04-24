@@ -104,8 +104,7 @@ where
     T: Copy + 'static,
     OP: BinaryOperator<T, T, T>,
 {
-    BinaryExecutor::execute::<T, T, T, OP>(&chunk.data[0], &chunk.data[1], result, chunk.size());
-    Ok(())
+    BinaryExecutor::execute::<T, T, T, OP>(&chunk.data[0], &chunk.data[1], result, chunk.size())
 }
 
 fn add_numeric_signatures<OP: 'static>(set: &mut ScalarFunctionSet, name: &str)

@@ -3,14 +3,18 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::{Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryOwnerAllocator};
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::column::{
     ChunkManagementState, ColumnDataAllocatorType, ColumnDataAppendState, ColumnDataCollection,
 };
+
+use crate::memory_runtime::AccountedBuffer;
 
 #[derive(Debug)]
 pub struct SpilledParentHop {
@@ -32,9 +36,10 @@ impl SpilledParentHop {
 pub struct SpillableParentArrays {
     num_vertices: usize,
     chunk_rows: usize,
-    hops: Vec<SpilledParentHop>,
-    current_parent_vertex: Vec<u32>,
-    current_parent_edge: Vec<u64>,
+    memory: MemoryAccountingContext,
+    hops: AccountedBuffer<SpilledParentHop>,
+    current_parent_vertex: AccountedBuffer<u32>,
+    current_parent_edge: AccountedBuffer<u64>,
     buffer_pool: Arc<BufferPool>,
 }
 
@@ -43,7 +48,8 @@ pub struct ParentLookupState {
     loaded_hop: Option<usize>,
     loaded_chunk_idx: Option<usize>,
     chunk_state: ChunkManagementState,
-    chunk: Chunk,
+    chunk_rows: usize,
+    chunk: Option<Chunk>,
 }
 
 impl ParentLookupState {
@@ -56,7 +62,8 @@ impl ParentLookupState {
             loaded_hop: None,
             loaded_chunk_idx: None,
             chunk_state: ChunkManagementState::new(),
-            chunk: Chunk::initialize(&parent_collection_types(), chunk_rows.max(1)),
+            chunk_rows: chunk_rows.max(1),
+            chunk: None,
         }
     }
 
@@ -74,24 +81,54 @@ impl Default for ParentLookupState {
 }
 
 impl SpillableParentArrays {
-    pub fn new(num_vertices: usize, buffer_pool: Arc<BufferPool>) -> Self {
+    pub fn new(num_vertices: usize, buffer_pool: Arc<BufferPool>) -> Result<Self> {
         Self::with_chunk_rows(num_vertices, buffer_pool, VECTOR_SIZE)
+    }
+
+    pub fn new_with_memory(
+        num_vertices: usize,
+        buffer_pool: Arc<BufferPool>,
+        memory: MemoryAccountingContext,
+    ) -> Result<Self> {
+        Self::with_chunk_rows_and_memory(num_vertices, buffer_pool, VECTOR_SIZE, memory)
     }
 
     pub fn with_chunk_rows(
         num_vertices: usize,
         buffer_pool: Arc<BufferPool>,
         chunk_rows: usize,
-    ) -> Self {
+    ) -> Result<Self> {
+        Self::with_chunk_rows_and_memory(
+            num_vertices,
+            buffer_pool,
+            chunk_rows,
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+    }
+
+    pub fn with_chunk_rows_and_memory(
+        num_vertices: usize,
+        buffer_pool: Arc<BufferPool>,
+        chunk_rows: usize,
+        memory: MemoryAccountingContext,
+    ) -> Result<Self> {
         let chunk_rows = chunk_rows.max(1);
-        Self {
+        let mut current_parent_vertex = AccountedBuffer::new(memory.clone());
+        current_parent_vertex.try_resize(num_vertices, u32::MAX)?;
+        let mut current_parent_edge = AccountedBuffer::new(memory.clone());
+        current_parent_edge.try_resize(num_vertices, 0u64)?;
+        Ok(Self {
             num_vertices,
             chunk_rows,
-            hops: Vec::new(),
-            current_parent_vertex: vec![u32::MAX; num_vertices],
-            current_parent_edge: vec![0u64; num_vertices],
+            memory: memory.clone(),
+            hops: AccountedBuffer::new(memory),
+            current_parent_vertex,
+            current_parent_edge,
             buffer_pool,
-        }
+        })
     }
 
     pub fn set_parent(&mut self, dst: u32, src_vertex: u32, edge_rowid: u64) {
@@ -104,11 +141,12 @@ impl SpillableParentArrays {
     }
 
     pub fn commit_hop(&mut self) -> Result<()> {
-        let mut collection = ColumnDataCollection::with_buffer_pool(
+        let mut collection = ColumnDataCollection::with_buffer_pool_and_memory(
             self.buffer_pool.clone(),
             parent_collection_types(),
             MemoryTag::ColumnData,
             ColumnDataAllocatorType::BufferManagerAllocator,
+            self.memory.clone(),
         );
         let mut append_state = ColumnDataAppendState::new();
         collection.initialize_append(&mut append_state);
@@ -118,14 +156,15 @@ impl SpillableParentArrays {
             let chunk = build_parent_chunk(
                 &self.current_parent_vertex[start..end],
                 &self.current_parent_edge[start..end],
-            );
+                graph_memory_allocator(&self.buffer_pool, &self.memory),
+            )?;
             collection.append(&mut append_state, &chunk)?;
         }
 
-        self.hops.push(SpilledParentHop {
+        self.hops.try_push(SpilledParentHop {
             collection,
             row_count: self.num_vertices,
-        });
+        })?;
         self.current_parent_vertex.fill(u32::MAX);
         self.current_parent_edge.fill(0);
         Ok(())
@@ -181,11 +220,22 @@ impl SpillableParentArrays {
                         chunk_idx, hop_idx
                     ))
                 })?;
+            if lookup_state.chunk.is_none() {
+                lookup_state.chunk = Some(Chunk::try_initialize(
+                    &parent_collection_types(),
+                    lookup_state.chunk_rows.max(self.chunk_rows).max(1),
+                    graph_memory_allocator(&self.buffer_pool, &self.memory),
+                )?);
+            }
+            let chunk = lookup_state
+                .chunk
+                .as_mut()
+                .expect("parent lookup chunk initialized above");
             hop.collection.fetch_chunk_by_storage_index(
                 storage_index,
                 &[0, 1],
                 &mut lookup_state.chunk_state,
-                &mut lookup_state.chunk,
+                chunk,
             )?;
             lookup_state.loaded_hop = Some(hop_idx);
             lookup_state.loaded_chunk_idx = Some(chunk_idx);
@@ -194,6 +244,8 @@ impl SpillableParentArrays {
         let row_idx = local_id % self.chunk_rows;
         let parent_vertex = lookup_state
             .chunk
+            .as_ref()
+            .expect("parent lookup chunk loaded above")
             .column(0)
             .and_then(|col| col.get_u32(row_idx))
             .ok_or_else(|| {
@@ -204,6 +256,8 @@ impl SpillableParentArrays {
             })?;
         let parent_edge = lookup_state
             .chunk
+            .as_ref()
+            .expect("parent lookup chunk loaded above")
             .column(1)
             .and_then(|col| col.get_u64(row_idx))
             .ok_or_else(|| {
@@ -229,11 +283,38 @@ fn parent_collection_types() -> Vec<LogicalType> {
     vec![LogicalType::UInteger, LogicalType::UBigInt]
 }
 
-fn build_parent_chunk(parent_vertices: &[u32], parent_edges: &[u64]) -> Chunk {
+fn graph_memory_allocator(
+    buffer_pool: &Arc<BufferPool>,
+    memory: &MemoryAccountingContext,
+) -> Arc<dyn Allocator> {
+    let inner: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
+        buffer_pool.clone() as Arc<dyn BufferManager>,
+        memory.tag(),
+    ));
+    if let Some(owner) = memory.owner() {
+        Arc::new(MemoryOwnerAllocator::new(
+            inner,
+            owner,
+            memory.domain(),
+            memory.tag(),
+            memory.accounting_class(),
+        ))
+    } else {
+        inner
+    }
+}
+
+fn build_parent_chunk(
+    parent_vertices: &[u32],
+    parent_edges: &[u64],
+    allocator: Arc<dyn Allocator>,
+) -> Result<Chunk> {
     debug_assert_eq!(parent_vertices.len(), parent_edges.len());
     let row_count = parent_vertices.len();
-    let mut vertex_vector = Vector::with_capacity(LogicalType::UInteger, row_count.max(1));
-    let mut edge_vector = Vector::with_capacity(LogicalType::UBigInt, row_count.max(1));
+    let mut vertex_vector =
+        Vector::try_new(LogicalType::UInteger, row_count.max(1), allocator.clone())?;
+    let mut edge_vector =
+        Vector::try_new(LogicalType::UBigInt, row_count.max(1), allocator.clone())?;
     vertex_vector.set_len(row_count);
     edge_vector.set_len(row_count);
 
@@ -244,7 +325,10 @@ fn build_parent_chunk(parent_vertices: &[u32], parent_edges: &[u64]) -> Chunk {
         edge_vector.set_u64(idx, parent_edge);
     }
 
-    Chunk::from_vectors(vec![vertex_vector, edge_vector])
+    Ok(Chunk::from_vectors(
+        vec![vertex_vector, edge_vector],
+        allocator,
+    ))
 }
 
 #[cfg(test)]
@@ -256,7 +340,7 @@ mod tests {
     #[test]
     fn test_lookup_parent_across_chunk_boundaries() {
         let pool = BufferPool::new_arc(16 * 1024 * 1024);
-        let mut parents = SpillableParentArrays::with_chunk_rows(10, pool, 4);
+        let mut parents = SpillableParentArrays::with_chunk_rows(10, pool, 4).unwrap();
 
         for idx in 0..10u32 {
             parents.set_parent(idx, idx + 10, idx as u64 + 100);
@@ -315,7 +399,7 @@ mod tests {
     #[test]
     fn test_lookup_parent_reads_current_uncommitted_hop() {
         let pool = BufferPool::new_arc(16 * 1024 * 1024);
-        let mut parents = SpillableParentArrays::with_chunk_rows(8, pool, 4);
+        let mut parents = SpillableParentArrays::with_chunk_rows(8, pool, 4).unwrap();
 
         for idx in 0..8u32 {
             parents.set_parent(idx, idx + 10, idx as u64 + 100);
@@ -351,7 +435,7 @@ mod tests {
         pool.set_temporary_directory(temp_dir.to_string_lossy().to_string())
             .unwrap();
 
-        let mut parents = SpillableParentArrays::with_chunk_rows(4096, pool.clone(), 1024);
+        let mut parents = SpillableParentArrays::with_chunk_rows(4096, pool.clone(), 1024).unwrap();
         for idx in 0..4096u32 {
             parents.set_parent(idx, idx + 1, idx as u64 + 10);
         }
@@ -362,7 +446,7 @@ mod tests {
         }
         parents.commit_hop().unwrap();
 
-        for hop in &parents.hops {
+        for hop in parents.hops.iter() {
             for storage_index in hop.collection.chunk_storage_indexes() {
                 if let Some(block_id) = hop.collection.chunk_block_id(storage_index) {
                     pool.add_to_eviction_queue(block_id);

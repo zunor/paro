@@ -222,32 +222,65 @@ mod tests {
     fn test_to_tsquery_family_validation_and_output() {
         let state = MockState;
 
-        let to_tsquery_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["vector & !spam"]),
-        ]);
-        let mut to_tsquery_out = Vector::new(LogicalType::TsQuery);
+        let to_tsquery_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector & !spam"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut to_tsquery_out = paro_common::test_utils::test_vector(LogicalType::TsQuery);
         to_tsquery_with_config_fn(&to_tsquery_input, &state, &mut to_tsquery_out).unwrap();
         assert_eq!(to_tsquery_out.get_string(0), Some("vector & !spam"));
 
-        let plainto_input = Chunk::from_vectors(vec![Vector::from_strings(&["vector database"])]);
-        let mut plainto_out = Vector::new(LogicalType::TsQuery);
+        let plainto_input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_string_vector_with_allocator(
+                &["vector database"],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut plainto_out = paro_common::test_utils::test_vector(LogicalType::TsQuery);
         plainto_tsquery_default_fn(&plainto_input, &state, &mut plainto_out).unwrap();
         assert_eq!(plainto_out.get_string(0), Some("vector & database"));
 
-        let phrase_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["exact match"]),
-        ]);
-        let mut phrase_out = Vector::new(LogicalType::TsQuery);
+        let phrase_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["exact match"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut phrase_out = paro_common::test_utils::test_vector(LogicalType::TsQuery);
         phraseto_tsquery_with_config_fn(&phrase_input, &state, &mut phrase_out).unwrap();
         assert_eq!(phrase_out.get_string(0), Some("exact <-> match"));
 
-        let web_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["vector database -spam \"exact match\" OR graph"]),
-        ]);
-        let mut web_out = Vector::new(LogicalType::TsQuery);
+        let web_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector database -spam \"exact match\" OR graph"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut web_out = paro_common::test_utils::test_vector(LogicalType::TsQuery);
         websearch_to_tsquery_with_config_fn(&web_input, &state, &mut web_out).unwrap();
         let normalized = web_out.get_string(0).unwrap_or_default();
         assert!(normalized.contains("vector"));
@@ -260,11 +293,20 @@ mod tests {
     #[test]
     fn test_to_tsquery_rejects_invalid_syntax() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["vector &"]),
-        ]);
-        let mut result = Vector::new(LogicalType::TsQuery);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector &"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::TsQuery);
         assert!(to_tsquery_with_config_fn(&input, &state, &mut result).is_err());
     }
 }

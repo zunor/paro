@@ -95,11 +95,20 @@ mod tests {
 
     #[test]
     fn test_concat_basic() {
-        let v1 = Vector::from_strings(&["hello", "foo"]);
-        let v2 = Vector::from_strings(&[" ", "-"]);
-        let v3 = Vector::from_strings(&["world", "bar"]);
-        let chunk = Chunk::from_vectors(vec![v1, v2, v3]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let v1 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "foo"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &[" ", "-"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v3 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "bar"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2, v3]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         concat_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -109,12 +118,21 @@ mod tests {
 
     #[test]
     fn test_concat_with_null() {
-        let v1 = Vector::from_strings(&["hello", "foo"]);
-        let mut v2 = Vector::from_strings(&[" ", "-"]);
+        let v1 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "foo"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &[" ", "-"],
+            paro_common::test_utils::test_allocator(),
+        );
         v2.validity_mut().set_null(0); // NULL in middle
-        let v3 = Vector::from_strings(&["world", "bar"]);
-        let chunk = Chunk::from_vectors(vec![v1, v2, v3]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let v3 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "bar"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![v1, v2, v3]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         concat_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -125,12 +143,27 @@ mod tests {
 
     #[test]
     fn test_concat_ws_basic() {
-        let sep = Vector::from_strings(&[", ", "-"]);
-        let v1 = Vector::from_strings(&["a", "x"]);
-        let v2 = Vector::from_strings(&["b", "y"]);
-        let v3 = Vector::from_strings(&["c", "z"]);
-        let chunk = Chunk::from_vectors(vec![sep, v1, v2, v3]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let sep = paro_common::test_utils::test_string_vector_with_allocator(
+            &[", ", "-"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v1 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "x"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["b", "y"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v3 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["c", "z"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![sep, v1, v2, v3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         concat_ws_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -140,13 +173,28 @@ mod tests {
 
     #[test]
     fn test_concat_ws_with_null_values() {
-        let sep = Vector::from_strings(&[", "]);
-        let v1 = Vector::from_strings(&["a"]);
-        let mut v2 = Vector::from_strings(&["b"]);
+        let sep = paro_common::test_utils::test_string_vector_with_allocator(
+            &[", "],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v1 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["b"],
+            paro_common::test_utils::test_allocator(),
+        );
         v2.validity_mut().set_null(0); // NULL value
-        let v3 = Vector::from_strings(&["c"]);
-        let chunk = Chunk::from_vectors(vec![sep, v1, v2, v3]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let v3 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["c"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![sep, v1, v2, v3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         concat_ws_varchar(&chunk, &MockState, &mut result).unwrap();
 
@@ -156,12 +204,21 @@ mod tests {
 
     #[test]
     fn test_concat_ws_null_separator() {
-        let mut sep = Vector::from_strings(&[", "]);
+        let mut sep = paro_common::test_utils::test_string_vector_with_allocator(
+            &[", "],
+            paro_common::test_utils::test_allocator(),
+        );
         sep.validity_mut().set_null(0);
-        let v1 = Vector::from_strings(&["a"]);
-        let v2 = Vector::from_strings(&["b"]);
-        let chunk = Chunk::from_vectors(vec![sep, v1, v2]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let v1 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["b"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![sep, v1, v2]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         concat_ws_varchar(&chunk, &MockState, &mut result).unwrap();
 

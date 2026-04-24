@@ -83,12 +83,24 @@ mod tests {
 
     #[test]
     fn test_replace_basic() {
-        let str_vec = Vector::from_strings(&["hello world", "foo bar foo"]);
-        let from_vec = Vector::from_strings(&["world", "foo"]);
-        let to_vec = Vector::from_strings(&["rust", "baz"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, from_vec, to_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar foo"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let from_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "foo"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let to_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["rust", "baz"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, from_vec, to_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         replace_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -98,12 +110,24 @@ mod tests {
 
     #[test]
     fn test_replace_not_found() {
-        let str_vec = Vector::from_strings(&["hello"]);
-        let from_vec = Vector::from_strings(&["xyz"]);
-        let to_vec = Vector::from_strings(&["abc"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, from_vec, to_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let from_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["xyz"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let to_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["abc"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, from_vec, to_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         replace_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -112,12 +136,24 @@ mod tests {
 
     #[test]
     fn test_replace_empty_from() {
-        let str_vec = Vector::from_strings(&["hello"]);
-        let from_vec = Vector::from_strings(&[""]);
-        let to_vec = Vector::from_strings(&["x"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, from_vec, to_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let from_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let to_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["x"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, from_vec, to_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         replace_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -126,12 +162,24 @@ mod tests {
 
     #[test]
     fn test_replace_empty_to() {
-        let str_vec = Vector::from_strings(&["hello world"]);
-        let from_vec = Vector::from_strings(&[" world"]);
-        let to_vec = Vector::from_strings(&[""]);
-        let chunk = Chunk::from_vectors(vec![str_vec, from_vec, to_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let from_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[" world"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let to_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, from_vec, to_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         replace_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -140,12 +188,24 @@ mod tests {
 
     #[test]
     fn test_replace_unicode() {
-        let str_vec = Vector::from_strings(&["你好世界"]);
-        let from_vec = Vector::from_strings(&["世界"]);
-        let to_vec = Vector::from_strings(&["Rust"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, from_vec, to_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["你好世界"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let from_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["世界"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let to_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["Rust"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, from_vec, to_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         replace_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -154,13 +214,25 @@ mod tests {
 
     #[test]
     fn test_replace_with_null() {
-        let mut str_vec = Vector::from_strings(&["hello", "world"]);
+        let mut str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         str_vec.validity_mut().set_null(1);
-        let from_vec = Vector::from_strings(&["ell", "orl"]);
-        let to_vec = Vector::from_strings(&["ELL", "ORL"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, from_vec, to_vec]);
+        let from_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["ell", "orl"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let to_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["ELL", "ORL"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, from_vec, to_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         replace_varchar(&chunk, &state, &mut result).unwrap();
 

@@ -103,8 +103,7 @@ pub fn register_logic_functions(set: &mut ScalarFunctionSet) {
                         &chunk.data[0],
                         result,
                         chunk.size(),
-                    );
-                    Ok(())
+                    )
                 },
             ));
         }
@@ -143,11 +142,10 @@ pub fn register_logic_functions(set: &mut ScalarFunctionSet) {
 mod tests {
     use super::*;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     #[test]
     fn test_logic_and_3vl() {
-        let left = Vector::from_nullable_bools(&[
+        let left = paro_common::test_utils::test_nullable_bool_vector(&[
             Some(true),
             Some(true),
             Some(true),
@@ -158,7 +156,7 @@ mod tests {
             None,
             None,
         ]);
-        let right = Vector::from_nullable_bools(&[
+        let right = paro_common::test_utils::test_nullable_bool_vector(&[
             Some(true),
             Some(false),
             None,
@@ -169,7 +167,7 @@ mod tests {
             Some(false),
             None,
         ]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         LogicExecutor::execute_and(&left, &right, &mut result, 9);
 
@@ -191,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_logic_or_3vl() {
-        let left = Vector::from_nullable_bools(&[
+        let left = paro_common::test_utils::test_nullable_bool_vector(&[
             Some(true),
             Some(true),
             Some(true),
@@ -202,7 +200,7 @@ mod tests {
             None,
             None,
         ]);
-        let right = Vector::from_nullable_bools(&[
+        let right = paro_common::test_utils::test_nullable_bool_vector(&[
             Some(true),
             Some(false),
             None,
@@ -213,7 +211,7 @@ mod tests {
             Some(false),
             None,
         ]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         LogicExecutor::execute_or(&left, &right, &mut result, 9);
 

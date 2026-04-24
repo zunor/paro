@@ -4,10 +4,9 @@
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::wal::wal_entry::WalEntry;
 use paro_storage::wal::write_ahead_log::WriteAheadLog;
@@ -81,26 +80,37 @@ fn create_vector_test_tablet() -> (TabletRef, TempDir) {
 fn chunk_with_vectors(ids: &[i32], vectors: &[[f32; 2]]) -> Chunk {
     assert_eq!(ids.len(), vectors.len());
     let embeddings: Vec<Vec<f32>> = vectors.iter().map(|v| v.to_vec()).collect();
-    let id_vec = Vector::from_i32(ids);
-    let vec_vec = Vector::from_embeddings(&embeddings, 2);
-    Chunk::from_vectors(vec![id_vec, vec_vec])
+    let allocator = test_allocator();
+    let id_vec = paro_common::test_utils::test_i32_vector_with_allocator(ids, allocator.clone());
+    let vec_vec = paro_common::test_utils::test_embeddings_vector_with_allocator(
+        &embeddings,
+        2,
+        allocator.clone(),
+    );
+    paro_common::test_utils::test_chunk_from_vectors(vec![id_vec, vec_vec])
 }
 
 fn chunk_with_range(start: i32, end: i32) -> Chunk {
     let ids: Vec<i32> = (start..end).collect();
     // vals should have the same length as ids - map each id to id * 10
     let vals: Vec<i32> = ids.iter().map(|id| id * 10).collect();
-    let v0 = Vector::from_i32(&ids);
-    let v1 = Vector::from_i32(&vals);
-    Chunk::from_vectors(vec![v0, v1])
+    let allocator = test_allocator();
+    let v0 = paro_common::test_utils::test_i32_vector_with_allocator(&ids, allocator.clone());
+    let v1 = paro_common::test_utils::test_i32_vector_with_allocator(&vals, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![v0, v1])
+}
+
+fn key_chunk_i32(values: &[i32]) -> Chunk {
+    let allocator = test_allocator();
+    let vector = paro_common::test_utils::test_i32_vector_with_allocator(values, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![vector])
 }
 
 fn run_compaction(tablet: &TabletRef) {
     let plan = CompactionPlanner::plan(tablet.as_ref())
         .unwrap()
         .expect("compaction plan should exist");
-    let mut task =
-        HorizontalCompactionTask::new(tablet.clone(), plan, Arc::new(default_allocator()));
+    let mut task = HorizontalCompactionTask::new(tablet.clone(), plan, test_allocator());
     task.run().unwrap();
 }
 
@@ -345,7 +355,7 @@ fn compaction_persists_rowid_mapping_across_restart() {
 
     let serializer =
         PrimaryKeySerializer::from_schema_ref(&tablet.schema().expect("tablet schema")).unwrap();
-    let key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[7])]);
+    let key_chunk = key_chunk_i32(&[7]);
     let key = serializer.encode_row(&key_chunk, 0).unwrap();
     let before_restart = tablet
         .lookup_primary_key(&key)
@@ -395,7 +405,7 @@ fn compaction_validation_repairs_primary_index_and_persistent_index() {
         .expect("compaction output rowset");
     let serializer =
         PrimaryKeySerializer::from_schema_ref(&tablet.schema().expect("tablet schema")).unwrap();
-    let key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[7])]);
+    let key_chunk = key_chunk_i32(&[7]);
     let key = serializer.encode_row(&key_chunk, 0).unwrap();
 
     tablet.remove_primary_index_entry_for_test(&key);

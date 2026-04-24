@@ -25,13 +25,18 @@ use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
-use paro_storage::buffer::{BufferPool, MemoryTag};
+use paro_storage::buffer::BufferPool;
 use paro_storage::column::{ChunkManagementState, ColumnDataAllocatorType, ColumnDataCollection};
 
 use crate::execution_context::ExecutionContext;
+use crate::memory_runtime::RetainedChunkVec;
 use crate::operator::state::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, OperatorSinkCombineInput,
     OperatorSinkInput, OperatorSourceInput,
@@ -43,6 +48,16 @@ use crate::pipeline::meta_pipeline::{MetaPipeline, MetaPipelineType};
 use crate::pipeline::pipeline::Pipeline;
 use crate::result_type::{SinkCombineResultType, SinkResultType, SourceResultType};
 use paro_planner::binder::ir::CTEMaterialize;
+
+pub(crate) fn cte_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::ColumnData,
+        MemoryAccountingClass::Revocable,
+    )
+}
 
 /// Shared storage for CTE materialized results.
 ///
@@ -65,18 +80,58 @@ impl CteWorkingTable {
     }
 
     /// Prepare the working table for execution with the active buffer pool.
-    pub fn prepare_for_execution(&self, buffer_pool: Arc<BufferPool>) -> Result<()> {
+    pub fn prepare_for_execution(
+        &self,
+        buffer_pool: Arc<BufferPool>,
+        memory: MemoryAccountingContext,
+    ) -> Result<()> {
         let mut guard = self.collection.lock().map_err(|e| {
             paro_error::internal(format!("Failed to lock CTE working table: {}", e))
         })?;
         if guard.is_none() {
-            *guard = Some(ColumnDataCollection::with_buffer_pool(
+            *guard = Some(ColumnDataCollection::with_buffer_pool_and_memory(
                 buffer_pool,
                 self.types.clone(),
                 MemoryTag::ColumnData,
                 ColumnDataAllocatorType::BufferManagerAllocator,
+                memory,
             ));
+        } else if guard
+            .as_ref()
+            .map(|collection| collection.count() == 0)
+            .unwrap_or(false)
+        {
+            guard
+                .as_mut()
+                .expect("collection should exist")
+                .set_memory_context(memory)?;
         }
+        Ok(())
+    }
+
+    /// Reset the table and bind future appends to a fresh execution memory owner.
+    pub fn reset_with_memory(
+        &self,
+        buffer_pool: Arc<BufferPool>,
+        memory: MemoryAccountingContext,
+    ) -> Result<()> {
+        let mut guard = self.collection.lock().map_err(|e| {
+            paro_error::internal(format!("Failed to lock CTE working table: {}", e))
+        })?;
+        if guard.is_none() {
+            *guard = Some(ColumnDataCollection::with_buffer_pool_and_memory(
+                buffer_pool,
+                self.types.clone(),
+                MemoryTag::ColumnData,
+                ColumnDataAllocatorType::BufferManagerAllocator,
+                memory,
+            ));
+            return Ok(());
+        }
+
+        let collection = guard.as_mut().expect("collection should exist");
+        collection.reset()?;
+        collection.set_memory_context(memory)?;
         Ok(())
     }
 
@@ -112,6 +167,26 @@ impl CteWorkingTable {
             collection.reset()?;
         }
         Ok(())
+    }
+
+    pub fn reclaim(&self, target_bytes: usize) -> Result<usize> {
+        let Ok(guard) = self.collection.try_lock() else {
+            return Ok(0);
+        };
+        let Some(collection) = guard.as_ref() else {
+            return Ok(0);
+        };
+        collection.reclaim(target_bytes)
+    }
+
+    pub fn reclaimable_bytes(&self) -> usize {
+        let Ok(guard) = self.collection.try_lock() else {
+            return 0;
+        };
+        guard
+            .as_ref()
+            .map(ColumnDataCollection::resident_bytes)
+            .unwrap_or(0)
     }
 
     /// Append a chunk to the working table.
@@ -264,10 +339,18 @@ impl GlobalSinkState for CteGlobalSinkState {
 }
 
 /// Local sink state for CTE.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CteLocalSinkState {
     /// Local buffer for chunks before merging.
-    pub local_chunks: Vec<Chunk>,
+    pub local_chunks: RetainedChunkVec,
+}
+
+impl CteLocalSinkState {
+    fn new(memory: MemoryAccountingContext) -> Self {
+        Self {
+            local_chunks: RetainedChunkVec::new(memory),
+        }
+    }
 }
 
 impl LocalSinkState for CteLocalSinkState {
@@ -337,15 +420,13 @@ impl PhysicalOperator for CTE {
     // ========== Sink Interface ==========
 
     fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        // Reset the working table before starting
         self.working_table
-            .prepare_for_execution(ctx.buffer_pool().clone())?;
-        self.working_table.reset()?;
+            .reset_with_memory(ctx.buffer_pool().clone(), cte_memory_context(ctx))?;
         Ok(Box::new(CteGlobalSinkState::default()))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        Ok(Box::new(CteLocalSinkState::default()))
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        Ok(Box::new(CteLocalSinkState::new(cte_memory_context(ctx))))
     }
 
     fn sink(
@@ -365,7 +446,7 @@ impl PhysicalOperator for CTE {
             .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
 
         // Clone the chunk and store locally
-        lstate.local_chunks.push(chunk.clone());
+        lstate.local_chunks.push(chunk.clone())?;
 
         Ok(SinkResultType::NeedMoreInput)
     }
@@ -389,7 +470,7 @@ impl PhysicalOperator for CTE {
 
         // Merge local chunks into the working table
         let mut total_rows = 0;
-        for chunk in lstate.local_chunks.drain(..) {
+        for chunk in lstate.local_chunks.drain_chunks() {
             total_rows += chunk.size();
             self.working_table.append(&chunk)?;
         }
@@ -546,7 +627,7 @@ impl PhysicalOperator for CteScan {
         _sink_state: Option<&dyn GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
         self.working_table
-            .prepare_for_execution(ctx.buffer_pool().clone())?;
+            .prepare_for_execution(ctx.buffer_pool().clone(), cte_memory_context(ctx))?;
         let storage_indexes = self.working_table.storage_indexes()?;
         Ok(Box::new(CteScanGlobalSourceState {
             storage_indexes,
@@ -650,14 +731,15 @@ mod tests {
     use crate::operator::PhysicalOperator;
     use crate::thread_context::ThreadContext;
 
-    use super::{CteScan, CteWorkingTable};
+    use super::{cte_memory_context, CteScan, CteWorkingTable};
 
     fn test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
     }
 
     fn make_chunk(value: i32) -> Chunk {
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 1);
         chunk.set_cardinality(1);
         chunk
             .column_mut(0)
@@ -667,7 +749,8 @@ mod tests {
     }
 
     fn make_large_string_chunk(value: &str, rows: usize) -> Chunk {
-        let mut chunk = Chunk::initialize(&[LogicalType::Varchar], rows);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], rows);
         chunk.set_cardinality(rows);
         for row in 0..rows {
             chunk
@@ -682,8 +765,10 @@ mod tests {
     fn cte_scan_reports_parallelism_from_materialized_chunks() {
         let session = test_session();
         let table = Arc::new(CteWorkingTable::new(vec![LogicalType::Integer]));
+        let thread_ctx = ThreadContext::single_threaded();
+        let ctx = ExecutionContext::new(session.clone(), &thread_ctx, None);
         table
-            .prepare_for_execution(session.buffer_pool().clone())
+            .prepare_for_execution(session.buffer_pool().clone(), cte_memory_context(&ctx))
             .expect("prepare CTE table");
         table.append(&make_chunk(1)).expect("append first chunk");
         table.append(&make_chunk(2)).expect("append second chunk");
@@ -697,8 +782,6 @@ mod tests {
             false,
         );
 
-        let thread_ctx = ThreadContext::single_threaded();
-        let ctx = ExecutionContext::new(session, &thread_ctx, None);
         let gstate = op
             .get_global_source_state(&ctx, None)
             .expect("build global source state");
@@ -711,8 +794,10 @@ mod tests {
     fn cte_scan_distributes_chunks_without_reuse() {
         let session = test_session();
         let table = Arc::new(CteWorkingTable::new(vec![LogicalType::Integer]));
+        let thread_ctx = ThreadContext::single_threaded();
+        let ctx = ExecutionContext::new(session.clone(), &thread_ctx, None);
         table
-            .prepare_for_execution(session.buffer_pool().clone())
+            .prepare_for_execution(session.buffer_pool().clone(), cte_memory_context(&ctx))
             .expect("prepare CTE table");
         table.append(&make_chunk(11)).expect("append first chunk");
         table.append(&make_chunk(22)).expect("append second chunk");
@@ -725,8 +810,6 @@ mod tests {
             false,
         );
 
-        let thread_ctx = ThreadContext::single_threaded();
-        let ctx = ExecutionContext::new(session, &thread_ctx, None);
         let gstate = op
             .get_global_source_state(&ctx, None)
             .expect("build global source state");
@@ -741,19 +824,19 @@ mod tests {
             .expect("build third local state");
         let interrupt = InterruptState::default();
 
-        let mut chunk_1 = Chunk::init_empty(op.types());
+        let mut chunk_1 = paro_common::test_utils::test_empty_chunk(op.types());
         let mut input_1 = OperatorSourceInput::new(gstate.as_ref(), lstate_1.as_mut(), &interrupt);
         let result_1 = op
             .get_data(&ctx, &mut chunk_1, &mut input_1)
             .expect("fetch first chunk");
 
-        let mut chunk_2 = Chunk::init_empty(op.types());
+        let mut chunk_2 = paro_common::test_utils::test_empty_chunk(op.types());
         let mut input_2 = OperatorSourceInput::new(gstate.as_ref(), lstate_2.as_mut(), &interrupt);
         let result_2 = op
             .get_data(&ctx, &mut chunk_2, &mut input_2)
             .expect("fetch second chunk");
 
-        let mut chunk_3 = Chunk::init_empty(op.types());
+        let mut chunk_3 = paro_common::test_utils::test_empty_chunk(op.types());
         let mut input_3 = OperatorSourceInput::new(gstate.as_ref(), lstate_3.as_mut(), &interrupt);
         let result_3 = op
             .get_data(&ctx, &mut chunk_3, &mut input_3)
@@ -780,6 +863,8 @@ mod tests {
         let session = test_session();
         let table = Arc::new(CteWorkingTable::new(vec![LogicalType::Varchar]));
         let pool = session.buffer_pool().clone();
+        let thread_ctx = ThreadContext::single_threaded();
+        let ctx = ExecutionContext::new(session.clone(), &thread_ctx, None);
         pool.set_memory_limit(256 * 1024)
             .expect("set small memory limit");
 
@@ -793,7 +878,7 @@ mod tests {
             .expect("set temp directory");
 
         table
-            .prepare_for_execution(pool.clone())
+            .prepare_for_execution(pool.clone(), cte_memory_context(&ctx))
             .expect("prepare working table");
 
         let payload = "spill_payload_".repeat(256);
@@ -818,6 +903,8 @@ mod tests {
         let session = test_session();
         let table = Arc::new(CteWorkingTable::new(vec![LogicalType::Varchar]));
         let pool = session.buffer_pool().clone();
+        let thread_ctx = ThreadContext::single_threaded();
+        let ctx = ExecutionContext::new(session.clone(), &thread_ctx, None);
         pool.set_memory_limit(256 * 1024)
             .expect("set small memory limit");
 
@@ -831,7 +918,7 @@ mod tests {
             .expect("set temp directory");
 
         table
-            .prepare_for_execution(pool.clone())
+            .prepare_for_execution(pool.clone(), cte_memory_context(&ctx))
             .expect("prepare CTE table");
 
         let payload = "spill_payload_".repeat(256);
@@ -853,8 +940,6 @@ mod tests {
             false,
         );
 
-        let thread_ctx = ThreadContext::single_threaded();
-        let ctx = ExecutionContext::new(session, &thread_ctx, None);
         let gstate = op
             .get_global_source_state(&ctx, None)
             .expect("build global source state");
@@ -864,7 +949,7 @@ mod tests {
         let interrupt = InterruptState::default();
 
         loop {
-            let mut chunk = Chunk::init_empty(op.types());
+            let mut chunk = paro_common::test_utils::test_empty_chunk(op.types());
             let mut input = OperatorSourceInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
             let result = op
                 .get_data(&ctx, &mut chunk, &mut input)

@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::memory_runtime::QueryMemoryPool;
 use crate::operator::PhysicalOperator;
 use parking_lot::RwLock;
 
@@ -77,6 +78,9 @@ pub struct MetaPipeline {
 
     /// Mapping from pipeline index to finish group root index.
     finish_map: RwLock<HashMap<usize, usize>>,
+
+    /// Shared query hard-accounting pool for all pipelines in this tree.
+    memory_pool: Arc<QueryMemoryPool>,
 }
 
 impl MetaPipeline {
@@ -86,6 +90,14 @@ impl MetaPipeline {
     /// * `sink` - The shared sink operator (None for root MetaPipeline)
     /// * `meta_type` - Type of MetaPipeline (Regular or JoinBuild)
     pub fn new(sink: Option<Arc<dyn PhysicalOperator>>, meta_type: MetaPipelineType) -> Arc<Self> {
+        Self::new_with_memory_pool(sink, meta_type, Arc::new(QueryMemoryPool::unbounded()))
+    }
+
+    pub fn new_with_memory_pool(
+        sink: Option<Arc<dyn PhysicalOperator>>,
+        meta_type: MetaPipelineType,
+        memory_pool: Arc<QueryMemoryPool>,
+    ) -> Arc<Self> {
         let meta = Arc::new(Self {
             sink,
             meta_type,
@@ -97,6 +109,7 @@ impl MetaPipeline {
             next_batch_index: RwLock::new(0),
             finish_pipelines: RwLock::new(HashSet::new()),
             finish_map: RwLock::new(HashMap::new()),
+            memory_pool,
         });
 
         // Create the base pipeline
@@ -274,7 +287,11 @@ impl MetaPipeline {
     /// The new pipeline shares the same sink as other pipelines in this MetaPipeline.
     pub fn create_pipeline(&self) -> Arc<Pipeline> {
         let mut batch_idx = self.next_batch_index.write();
-        let pipeline = Arc::new(Pipeline::new_with_sink(self.sink.clone(), *batch_idx));
+        let pipeline = Arc::new(Pipeline::new_with_sink_and_memory_pool(
+            self.sink.clone(),
+            *batch_idx,
+            self.memory_pool.clone(),
+        ));
         *batch_idx += 1;
         self.pipelines.write().push(pipeline.clone());
         pipeline
@@ -355,9 +372,10 @@ impl MetaPipeline {
         );
 
         // Create child pipeline with same batch index as current
-        let child = Arc::new(Pipeline::new_with_sink(
+        let child = Arc::new(Pipeline::new_with_sink_and_memory_pool(
             self.sink.clone(),
             current.batch_index(),
+            self.memory_pool.clone(),
         ));
         self.pipelines.write().push(child.clone());
 
@@ -415,6 +433,7 @@ impl MetaPipeline {
             next_batch_index: RwLock::new(0),
             finish_pipelines: RwLock::new(HashSet::new()),
             finish_map: RwLock::new(HashMap::new()),
+            memory_pool: self.memory_pool.clone(),
         });
 
         // Create base pipeline for child

@@ -12,7 +12,7 @@ use paro_common::identity::DatabaseType;
 use paro_external_runtime::host::PythonRuntimeProvider;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
-use paro_storage::buffer::{BufferPool, StandardBufferManager, TemporaryMemoryManager};
+use paro_storage::buffer::{BufferPool, StandardBufferManager};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -166,14 +166,11 @@ impl TestStatementContextBuilder {
         ));
         let scheduler = Arc::new(TaskScheduler::new());
         let _ = scheduler.set_threads(1);
-        let temporary_memory_manager = Arc::new(TemporaryMemoryManager::with_buffer_pool(
-            Arc::downgrade(&buffer_pool),
-        ));
         let execution_resources = Arc::new(ExecutionResources {
             scheduler,
             buffer_pool,
             buffer_manager,
-            temporary_memory_manager,
+            query_memory_coordinator: None,
         });
         let graph_manager = Arc::new(EmptyGraphManager);
         let settings = Arc::new(EffectiveSettings::new(self.settings));

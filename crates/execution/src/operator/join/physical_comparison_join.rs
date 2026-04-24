@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
+use paro_common::error::Result;
 use paro_common::vector::SelectionVector;
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
@@ -102,17 +103,27 @@ impl PhysicalComparisonJoin {
             .join(" AND ")
     }
 
-    pub fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk, has_null: bool) {
+    pub fn construct_empty_join_result(
+        &self,
+        input: &Chunk,
+        result: &mut Chunk,
+        has_null: bool,
+    ) -> Result<()> {
         match self.join.join_type {
             JoinType::Anti => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_anti_join_result(
                     input,
                     &sel,
                     input.size(),
                     &self.join.left_projection_map,
                     result,
-                );
+                )?;
             }
             JoinType::Mark => {
                 let markers = if has_null {
@@ -120,10 +131,20 @@ impl PhysicalComparisonJoin {
                 } else {
                     vec![Some(false); input.size()]
                 };
-                construct_mark_join_result(input, &self.join.left_projection_map, &markers, result);
+                construct_mark_join_result(
+                    input,
+                    &self.join.left_projection_map,
+                    &markers,
+                    result,
+                )?;
             }
             JoinType::Left | JoinType::Outer | JoinType::Single => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_left_outer_result(
                     input,
                     &sel,
@@ -131,12 +152,13 @@ impl PhysicalComparisonJoin {
                     &self.join.left_projection_map,
                     &self.join.right_output_types,
                     result,
-                );
+                )?;
             }
             _ => {
                 result.set_cardinality(0);
             }
         }
+        Ok(())
     }
 }
 

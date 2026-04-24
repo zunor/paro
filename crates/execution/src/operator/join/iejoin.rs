@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
@@ -21,6 +24,7 @@ use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_join_condition;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::RetainedChunkVec;
 use crate::operator::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
     construct_right_outer_scan_result, construct_semi_join_result,
@@ -65,8 +69,8 @@ struct IEJoinMaterializedRhs {
 }
 
 struct IEJoinGlobalSinkState {
-    rhs_payload_chunks: Mutex<Vec<Chunk>>,
-    rhs_condition_chunks: Mutex<Vec<Chunk>>,
+    rhs_payload_chunks: Arc<Mutex<RetainedChunkVec>>,
+    rhs_condition_chunks: Arc<Mutex<RetainedChunkVec>>,
     rhs_row_count: Mutex<usize>,
     materialized: Mutex<Option<Arc<IEJoinMaterializedRhs>>>,
     right_outer: Arc<OuterJoinMarker>,
@@ -74,10 +78,10 @@ struct IEJoinGlobalSinkState {
 }
 
 impl IEJoinGlobalSinkState {
-    fn new(enable_right_outer: bool) -> Self {
+    fn new(enable_right_outer: bool, memory: MemoryAccountingContext) -> Self {
         Self {
-            rhs_payload_chunks: Mutex::new(Vec::new()),
-            rhs_condition_chunks: Mutex::new(Vec::new()),
+            rhs_payload_chunks: Arc::new(Mutex::new(RetainedChunkVec::new(memory.clone()))),
+            rhs_condition_chunks: Arc::new(Mutex::new(RetainedChunkVec::new(memory))),
             rhs_row_count: Mutex::new(0),
             materialized: Mutex::new(None),
             right_outer: Arc::new(OuterJoinMarker::new(enable_right_outer)),
@@ -98,8 +102,8 @@ impl IEJoinGlobalSinkState {
     }
 
     fn current_memory_bytes(&self) -> usize {
-        chunks_memory_usage(&self.rhs_payload_chunks.lock().unwrap())
-            + chunks_memory_usage(&self.rhs_condition_chunks.lock().unwrap())
+        self.rhs_payload_chunks.lock().unwrap().retained_bytes()
+            + self.rhs_condition_chunks.lock().unwrap().retained_bytes()
             + self
                 .materialized
                 .lock()
@@ -136,8 +140,8 @@ impl GlobalSinkState for IEJoinGlobalSinkState {
 
 #[derive(Debug)]
 struct IEJoinLocalSinkState {
-    local_payload_chunks: Vec<Chunk>,
-    local_condition_chunks: Vec<Chunk>,
+    local_payload_chunks: RetainedChunkVec,
+    local_condition_chunks: RetainedChunkVec,
     local_row_count: usize,
     right_condition_executors: Vec<ExpressionExecutor>,
 }
@@ -154,14 +158,13 @@ impl LocalSinkState for IEJoinLocalSinkState {
 
 impl IEJoinLocalSinkState {
     fn memory_usage_bytes(&self) -> usize {
-        chunks_memory_usage(&self.local_payload_chunks)
-            + chunks_memory_usage(&self.local_condition_chunks)
+        self.local_payload_chunks.retained_bytes() + self.local_condition_chunks.retained_bytes()
     }
 }
 
 #[derive(Debug)]
 struct IEJoinGlobalSourceState {
-    payload_chunks: Arc<Vec<Chunk>>,
+    payload_chunks: Arc<Mutex<RetainedChunkVec>>,
     right_outer: Arc<OuterJoinMarker>,
     join_type: JoinType,
 }
@@ -230,13 +233,19 @@ pub struct IEJoin {
     sink_state: Mutex<Option<Arc<dyn GlobalSinkState>>>,
 }
 
-fn chunks_memory_usage(chunks: &[Chunk]) -> usize {
-    chunks.iter().map(Chunk::get_allocation_size).sum()
-}
-
 fn values_memory_usage(values: &Vec<Value>) -> usize {
     values.capacity() * size_of::<Value>()
         + values.iter().map(Value::allocation_size).sum::<usize>()
+}
+
+fn iejoin_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        paro_common::allocator::MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    )
 }
 
 impl IEJoinMaterializedRhs {
@@ -347,23 +356,33 @@ impl IEJoin {
         )
     }
 
-    fn ensure_output_chunk(&self, chunk: &mut Chunk) {
+    fn ensure_output_chunk(&self, chunk: &mut Chunk) -> Result<()> {
         if chunk.column_count() == 0 {
-            *chunk = Chunk::initialize(&self.types, paro_common::vector::VECTOR_SIZE);
+            *chunk = Chunk::try_initialize(
+                &self.types,
+                paro_common::vector::VECTOR_SIZE,
+                chunk.allocator().clone(),
+            )?;
         }
+        Ok(())
     }
 
-    fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk) {
+    fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk) -> Result<()> {
         match self.join_type {
             JoinType::Anti => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_anti_join_result(
                     input,
                     &sel,
                     input.size(),
                     &self.join.left_projection_map,
                     result,
-                );
+                )?;
             }
             JoinType::Mark => {
                 construct_mark_join_result(
@@ -371,10 +390,15 @@ impl IEJoin {
                     &self.join.left_projection_map,
                     &vec![Some(false); input.size()],
                     result,
-                );
+                )?;
             }
             JoinType::Left | JoinType::Outer | JoinType::Single => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_left_outer_result(
                     input,
                     &sel,
@@ -382,14 +406,16 @@ impl IEJoin {
                     &self.join.left_projection_map,
                     &self.join.right_output_types,
                     result,
-                );
+                )?;
             }
             _ => result.set_cardinality(0),
         }
+        Ok(())
     }
 
-    fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Chunk {
-        let mut materialized = Chunk::initialize(types, chunk.size().max(1));
+    fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Result<Chunk> {
+        let mut materialized =
+            Chunk::try_initialize(types, chunk.size().max(1), chunk.allocator().clone())?;
         materialized.set_cardinality(chunk.size());
         for col_idx in 0..chunk.column_count() {
             let source = chunk
@@ -402,7 +428,7 @@ impl IEJoin {
                 target.copy_at(row_idx, source, row_idx);
             }
         }
-        materialized
+        Ok(materialized)
     }
 
     fn condition_types(&self, use_left: bool) -> Vec<LogicalType> {
@@ -432,10 +458,11 @@ impl IEJoin {
         for executor in &mut state.left_condition_executors {
             left_columns.push(executor.execute_expression(0, input, None, input.size(), ctx)?);
         }
-        let mut left_condition_chunk = Chunk::from_arc_vectors(left_columns);
+        let mut left_condition_chunk =
+            Chunk::from_arc_vectors(left_columns, input.allocator().clone());
         left_condition_chunk.set_cardinality(input.size());
         state.left_condition_chunk =
-            Self::materialize_chunk(&left_condition_chunk, &self.condition_types(true));
+            Self::materialize_chunk(&left_condition_chunk, &self.condition_types(true))?;
         state.input_initialized = true;
         state.row_prepared = false;
         state.left_row_idx = 0;
@@ -849,8 +876,8 @@ impl IEJoin {
             return Ok(materialized.clone());
         }
 
-        let payload_chunks = sink.rhs_payload_chunks.lock().unwrap().clone();
-        let condition_chunks = sink.rhs_condition_chunks.lock().unwrap().clone();
+        let payload_chunks = sink.rhs_payload_chunks.lock().unwrap().clone_chunks();
+        let condition_chunks = sink.rhs_condition_chunks.lock().unwrap().clone_chunks();
         if payload_chunks.len() != condition_chunks.len() {
             return Err(paro_error::internal(
                 "IEJoin payload/condition chunk count mismatch".to_string(),
@@ -926,6 +953,7 @@ impl PhysicalOperator for IEJoin {
             spilled: None,
             peak_memory_bytes: Some(sink_state.peak_memory_bytes() as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -993,11 +1021,14 @@ impl PhysicalOperator for IEJoin {
         self.sink_state.lock().unwrap().clone()
     }
 
-    fn get_operator_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
+    fn get_operator_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
         Ok(Box::new(IEJoinOperatorState {
             input_initialized: false,
             row_prepared: false,
-            left_condition_chunk: Chunk::init_empty(&self.condition_types(true)),
+            left_condition_chunk: Chunk::try_init_empty(
+                &self.condition_types(true),
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
             left_condition_executors: self
                 .conditions
                 .iter()
@@ -1010,18 +1041,20 @@ impl PhysicalOperator for IEJoin {
         }))
     }
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
         Self::validate_join_type(self.join_type)?;
         Self::validate_conditions(&self.conditions)?;
         Ok(Box::new(IEJoinGlobalSinkState::new(
             self.uses_right_outer_marker(),
+            iejoin_memory_context(ctx),
         )))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        let memory = iejoin_memory_context(ctx);
         Ok(Box::new(IEJoinLocalSinkState {
-            local_payload_chunks: Vec::new(),
-            local_condition_chunks: Vec::new(),
+            local_payload_chunks: RetainedChunkVec::new(memory.clone()),
+            local_condition_chunks: RetainedChunkVec::new(memory),
             local_row_count: 0,
             right_condition_executors: self
                 .conditions
@@ -1049,7 +1082,7 @@ impl PhysicalOperator for IEJoin {
 
         lstate
             .local_payload_chunks
-            .push(Self::materialize_chunk(chunk, self.right.types()));
+            .push(Self::materialize_chunk(chunk, self.right.types())?)?;
         lstate.local_row_count += chunk.size();
 
         let mut condition_columns = Vec::with_capacity(self.conditions.len());
@@ -1062,12 +1095,13 @@ impl PhysicalOperator for IEJoin {
                 ctx,
             )?);
         }
-        let mut condition_chunk = Chunk::from_arc_vectors(condition_columns);
+        let mut condition_chunk =
+            Chunk::from_arc_vectors(condition_columns, chunk.allocator().clone());
         condition_chunk.set_cardinality(chunk.size());
         lstate.local_condition_chunks.push(Self::materialize_chunk(
             &condition_chunk,
             &self.condition_types(false),
-        ));
+        )?)?;
         if let Some(gstate) = input
             .global_state
             .as_any()
@@ -1098,11 +1132,11 @@ impl PhysicalOperator for IEJoin {
         if lstate.local_row_count > 0 {
             {
                 let mut payload_chunks = gstate.rhs_payload_chunks.lock().unwrap();
-                payload_chunks.append(&mut lstate.local_payload_chunks);
+                payload_chunks.append_from(&mut lstate.local_payload_chunks)?;
             }
             {
                 let mut condition_chunks = gstate.rhs_condition_chunks.lock().unwrap();
-                condition_chunks.append(&mut lstate.local_condition_chunks);
+                condition_chunks.append_from(&mut lstate.local_condition_chunks)?;
             }
             *gstate.rhs_row_count.lock().unwrap() += lstate.local_row_count;
             gstate.right_outer.add_rows(lstate.local_row_count);
@@ -1128,9 +1162,9 @@ impl PhysicalOperator for IEJoin {
 
         let create_source_state =
             |sink: &IEJoinGlobalSinkState| -> Result<Box<dyn GlobalSourceState>> {
-                let materialized = self.materialize_rhs(sink)?;
+                let _materialized = self.materialize_rhs(sink)?;
                 Ok(Box::new(IEJoinGlobalSourceState {
-                    payload_chunks: Arc::new(materialized.payload_chunks.clone()),
+                    payload_chunks: Arc::clone(&sink.rhs_payload_chunks),
                     right_outer: sink.right_outer.clone(),
                     join_type: self.join_type,
                 }))
@@ -1173,6 +1207,7 @@ impl PhysicalOperator for IEJoin {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         Self::validate_join_type(self.join_type)?;
         Self::validate_conditions(&self.conditions)?;
@@ -1182,7 +1217,7 @@ impl PhysicalOperator for IEJoin {
             .downcast_mut::<IEJoinOperatorState>()
             .ok_or_else(|| paro_error::internal("Invalid IEJoin operator state".to_string()))?;
 
-        self.ensure_output_chunk(chunk);
+        self.ensure_output_chunk(chunk)?;
         if input.size() == 0 {
             chunk.set_cardinality(0);
             self.reset_input_state(state);
@@ -1202,7 +1237,7 @@ impl PhysicalOperator for IEJoin {
             if self.join.empty_result_if_rhs_is_empty() {
                 chunk.set_cardinality(0);
             } else {
-                self.construct_empty_join_result(input, chunk);
+                self.construct_empty_join_result(input, chunk)?;
             }
             self.reset_input_state(state);
             return Ok(OperatorResultType::NeedMoreInput);
@@ -1355,13 +1390,21 @@ impl PhysicalOperator for IEJoin {
         };
 
         if chunk.column_count() == 0 {
-            *chunk = Chunk::initialize(&self.types, paro_common::vector::VECTOR_SIZE);
+            *chunk = Chunk::try_initialize(
+                &self.types,
+                paro_common::vector::VECTOR_SIZE,
+                chunk.allocator().clone(),
+            )?;
         }
 
-        let mut build_chunk =
-            Chunk::initialize(self.right.types(), paro_common::vector::VECTOR_SIZE);
+        let mut build_chunk = Chunk::try_initialize(
+            self.right.types(),
+            paro_common::vector::VECTOR_SIZE,
+            chunk.allocator().clone(),
+        )?;
+        let payload_chunks = gstate.payload_chunks.lock().unwrap();
         let count = gstate.right_outer.scan(
-            gstate.payload_chunks.as_ref(),
+            payload_chunks.as_slice(),
             &mut lstate.scan_state,
             emit_found,
             &mut build_chunk,
@@ -1371,7 +1414,7 @@ impl PhysicalOperator for IEJoin {
             return Ok(SourceResultType::Finished);
         }
 
-        let build_sel = SelectionVector::incremental(count);
+        let build_sel = SelectionVector::try_incremental(count, chunk.allocator().clone())?;
         match gstate.join_type {
             JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
                 &build_chunk,
@@ -1389,7 +1432,7 @@ impl PhysicalOperator for IEJoin {
                 chunk,
             ),
             _ => unreachable!("source phase only runs for right/full/right-semi/right-anti"),
-        }
+        }?;
 
         Ok(SourceResultType::HaveMoreOutput)
     }
@@ -1425,15 +1468,18 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
 
+    use paro_common::allocator::MemoryTag;
     use paro_common::chunk::Chunk;
+    use paro_common::memory::MemoryAccountingClass;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_context::StatementContext;
     use paro_planner::expression::{Expression, ReferenceExpression};
     use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
     use crate::execution_context::ExecutionContext;
+    use crate::memory_runtime::RetainedChunkVec;
     use crate::operator::scan::dummy_scan::PhysicalDummyScan;
     use crate::operator::state::{EmptyGlobalOperatorState, GlobalSinkState};
     use crate::operator::PhysicalOperator;
@@ -1531,9 +1577,20 @@ mod tests {
             }
         }
 
+        let mut retained_payload =
+            RetainedChunkVec::detached(MemoryTag::HashTable, MemoryAccountingClass::Revocable);
+        for chunk in payload_chunks.iter().cloned() {
+            retained_payload.push(chunk).unwrap();
+        }
+        let mut retained_conditions =
+            RetainedChunkVec::detached(MemoryTag::HashTable, MemoryAccountingClass::Revocable);
+        for chunk in condition_chunks.iter().cloned() {
+            retained_conditions.push(chunk).unwrap();
+        }
+
         let sink_state = Arc::new(IEJoinGlobalSinkState {
-            rhs_payload_chunks: Mutex::new(payload_chunks.clone()),
-            rhs_condition_chunks: Mutex::new(condition_chunks.clone()),
+            rhs_payload_chunks: Arc::new(Mutex::new(retained_payload)),
+            rhs_condition_chunks: Arc::new(Mutex::new(retained_conditions)),
             rhs_row_count: Mutex::new(row_count),
             materialized: Mutex::new(Some(Arc::new(IEJoinMaterializedRhs {
                 payload_chunks,
@@ -1556,20 +1613,37 @@ mod tests {
     #[test]
     fn inner_ie_join_intersects_two_ranges() {
         let join = interval_join(JoinType::Inner);
-        let payload = Chunk::from_arc_vectors(vec![
-            Arc::new(Vector::from_i32(&[1, 4, 7])),
-            Arc::new(Vector::from_i32(&[3, 6, 10])),
-        ]);
+        let payload = Chunk::from_arc_vectors(
+            vec![
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 4, 7],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[3, 6, 10],
+                    paro_common::test_utils::test_allocator(),
+                )),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         set_materialized_sink_state(&join, vec![payload.clone()], vec![payload], false);
 
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[2, 5, 9]))]);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[2, 5, 9],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let session = create_test_session();
         let thread = ThreadContext::new(0, 0);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join
             .get_operator_state(&ctx)
             .expect("operator state should construct");
-        let mut output = Chunk::initialize(join.types(), 8);
+        let mut output = paro_common::test_utils::test_chunk_with_capacity(join.types(), 8);
 
         let result = join
             .execute(
@@ -1578,6 +1652,7 @@ mod tests {
                 &mut output,
                 &EmptyGlobalOperatorState::default(),
                 state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .expect("IEJoin execution should succeed");
 
@@ -1600,20 +1675,37 @@ mod tests {
     #[test]
     fn single_ie_join_errors_on_multiple_matches() {
         let join = interval_join(JoinType::Single);
-        let payload = Chunk::from_arc_vectors(vec![
-            Arc::new(Vector::from_i32(&[1, 4])),
-            Arc::new(Vector::from_i32(&[7, 6])),
-        ]);
+        let payload = Chunk::from_arc_vectors(
+            vec![
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 4],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[7, 6],
+                    paro_common::test_utils::test_allocator(),
+                )),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         set_materialized_sink_state(&join, vec![payload.clone()], vec![payload], false);
 
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let session = create_test_session();
         let thread = ThreadContext::new(0, 0);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join
             .get_operator_state(&ctx)
             .expect("operator state should construct");
-        let mut output = Chunk::initialize(join.types(), 4);
+        let mut output = paro_common::test_utils::test_chunk_with_capacity(join.types(), 4);
 
         let err = join
             .execute(
@@ -1622,6 +1714,7 @@ mod tests {
                 &mut output,
                 &EmptyGlobalOperatorState::default(),
                 state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .expect_err("SINGLE IEJoin should reject multiple matches");
         assert!(err
@@ -1632,22 +1725,37 @@ mod tests {
     #[test]
     fn mark_ie_join_reports_unknown_when_only_null_comparisons_exist() {
         let join = interval_join(JoinType::Mark);
-        let payload = Chunk::from_arc_vectors(vec![
-            Arc::new(Vector::from_i32(&[1, 5])),
-            Arc::new(Vector::from_i32(&[3, 7])),
-        ]);
+        let payload = Chunk::from_arc_vectors(
+            vec![
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 5],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[3, 7],
+                    paro_common::test_utils::test_allocator(),
+                )),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
         set_materialized_sink_state(&join, vec![payload.clone()], vec![payload], false);
 
-        let mut input_vec = Vector::from_i32(&[0]);
+        let mut input_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[0],
+            paro_common::test_utils::test_allocator(),
+        );
         input_vec.set_null(0, true);
-        let input = Chunk::from_arc_vectors(vec![Arc::new(input_vec)]);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(input_vec)],
+            paro_common::test_utils::test_allocator(),
+        );
         let session = create_test_session();
         let thread = ThreadContext::new(0, 0);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join
             .get_operator_state(&ctx)
             .expect("operator state should construct");
-        let mut output = Chunk::initialize(join.types(), 2);
+        let mut output = paro_common::test_utils::test_chunk_with_capacity(join.types(), 2);
 
         join.execute(
             &ctx,
@@ -1655,6 +1763,7 @@ mod tests {
             &mut output,
             &EmptyGlobalOperatorState::default(),
             state.as_mut(),
+            crate::operator::state::test_operator_memory_scope(),
         )
         .expect("MARK IEJoin execution should succeed");
 

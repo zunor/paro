@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
@@ -283,7 +284,9 @@ pub unsafe fn read_value(
 
         LogicalType::Array(_, _) | LogicalType::List(_) => {
             let heap_ptr = std::ptr::read(data_ptr as *const *const u8);
-            let mut vector = Vector::with_capacity(logical_type.clone(), 1);
+            let mut vector =
+                Vector::try_new(logical_type.clone(), 1, Arc::new(default_allocator()))
+                    .expect("collection value vector allocation failed");
             let _ = gather_collection_entry(logical_type, &mut vector, 0, heap_ptr);
             vector.set_count(1);
             vector.get_value(0)
@@ -1028,11 +1031,12 @@ unsafe fn gather_collection_entry(
                 let required = child_base.saturating_add(length);
                 if required > child_mut.capacity() {
                     let new_capacity = required.max(child_mut.capacity().saturating_mul(2)).max(1);
-                    let mut new_child = Vector::with_capacity_and_allocator(
+                    let mut new_child = Vector::try_new(
                         child_mut.logical_type().clone(),
                         new_capacity,
                         child_mut.allocator().clone(),
-                    );
+                    )
+                    .expect("vector allocation failed");
                     new_child.set_count(child_base);
                     for i in 0..child_base {
                         new_child.copy_at(i, child_mut, i);
@@ -1433,6 +1437,7 @@ mod tests {
         append_chunk, RawRowAllocator, RawRowAppendState, RawRowChunkState, RawRowPinProperties,
         RawRowValidityType,
     };
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     fn create_test_layout(types: Vec<LogicalType>) -> RawRowLayout {
@@ -1442,7 +1447,7 @@ mod tests {
     }
 
     fn create_test_chunk(types: &[LogicalType], count: usize) -> Chunk {
-        let mut chunk = Chunk::initialize(types, count);
+        let mut chunk = test_chunk_with_capacity(types, count);
         chunk.set_cardinality(count);
         for i in 0..chunk.column_count() {
             if let Some(v) = chunk.column_mut(i) {
@@ -1731,7 +1736,7 @@ mod tests {
         let row_locations: Vec<*const u8> = storage.iter().map(|b| b.as_ptr()).collect();
 
         // Selection: write to positions [2, 0, 1] instead of [0, 1, 2]
-        let sel = SelectionVector::from_indices(vec![2, 0, 1]);
+        let sel = test_selection(vec![2, 0, 1]);
 
         let collection = create_test_collection(vec![LogicalType::Integer]);
         let mut chunk = create_test_chunk(&[LogicalType::Integer], 3);

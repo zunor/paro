@@ -184,9 +184,9 @@ impl ColumnDataConsumer {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use crate::buffer::{BufferPool, MemoryTag};
 
@@ -194,7 +194,7 @@ mod tests {
     use super::{ColumnDataConsumer, ColumnDataConsumerScanState};
 
     fn build_test_chunk(start: i32, count: usize) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(
+        test_chunk_from_vectors(vec![test_i32_vector(
             &(start..start + count as i32).collect::<Vec<_>>(),
         )])
     }
@@ -223,8 +223,8 @@ mod tests {
         assert!(consumer.assign_chunk(&mut s1));
         assert!(consumer.assign_chunk(&mut s2));
 
-        let mut out1 = Chunk::initialize(&[LogicalType::Integer], 64);
-        let mut out2 = Chunk::initialize(&[LogicalType::Integer], 64);
+        let mut out1 = test_chunk_with_capacity(&[LogicalType::Integer], 64);
+        let mut out2 = test_chunk_with_capacity(&[LogicalType::Integer], 64);
 
         let n1 = consumer.scan_chunk(&mut s1, &mut out1).unwrap();
         let n2 = consumer.scan_chunk(&mut s2, &mut out2).unwrap();
@@ -286,7 +286,7 @@ mod tests {
         let mut state = ColumnDataConsumerScanState::new();
         assert!(consumer.assign_chunk(&mut state));
 
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 4096);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], 4096);
         let scanned = consumer.scan_chunk(&mut state, &mut out).unwrap();
         assert_eq!(scanned, 4096);
         assert_eq!(out.column(0).unwrap().get_i32(0), Some(0));

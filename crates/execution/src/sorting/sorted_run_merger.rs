@@ -163,7 +163,7 @@ impl SortedRunMerger {
             return self.get_data(chunk, gstate, lstate);
         }
 
-        chunk.reset();
+        chunk.try_reset(chunk.allocator().clone())?;
         let mut key_row_cursors = self
             .sorted_runs
             .iter()

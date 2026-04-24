@@ -68,6 +68,7 @@ smallvec = "1.13"
 paro-scheduler = { workspace = true }
 
 [dev-dependencies]
+paro-common = { workspace = true, features = ["test-support"] }
 tempfile = "3.8"
 divan = { workspace = true }
 serial_test = { workspace = true }

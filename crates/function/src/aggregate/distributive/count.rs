@@ -164,7 +164,6 @@ mod tests {
     use super::*;
     use paro_common::allocator::{default_allocator, ArenaAllocator};
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
     use std::sync::Arc;
 
     fn test_arena() -> ArenaAllocator {
@@ -204,7 +203,7 @@ mod tests {
             }
 
             // Finalize
-            let mut result = Vector::new(LogicalType::BigInt);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
             result.set_count(1);
 
             // Construct states vector containing the pointer
@@ -212,7 +211,7 @@ mod tests {
             // In finalize, it reads *mut u8, so we need to ensure the data in vector is treated as pointers.
             // Our implementation uses `flat_data::<*mut u8>()`.
             // So the vector buffer should contain the pointer value (8 bytes on 64station).
-            let mut states = Vector::new(LogicalType::BigInt); // Type doesn't really matter for data access
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt); // Type doesn't really matter for data access
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -239,7 +238,10 @@ mod tests {
             (func.initialize)(state_ptr);
 
             // Input: [1, null, 2]
-            let mut input = Vector::from_i32(&[1, 0, 2]);
+            let mut input = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 0, 2],
+                paro_common::test_utils::test_allocator(),
+            );
             input.set_null(1, true); // Set 2nd element to null
 
             if let Some(simple_update) = func.simple_update {
@@ -249,10 +251,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::BigInt);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;

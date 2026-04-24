@@ -93,7 +93,7 @@ impl PhysicalOperator for PhysicalDummyScan {
         } else {
             // Initialize vectors with proper types
             let allocator = ctx.allocator(paro_common::allocator::MemoryTag::BaseTable);
-            let new_chunk = Chunk::initialize_with_allocator(&self.output_types, 1, allocator);
+            let new_chunk = Chunk::try_initialize(&self.output_types, 1, allocator)?;
             *chunk = new_chunk;
             chunk.set_cardinality(1);
         }

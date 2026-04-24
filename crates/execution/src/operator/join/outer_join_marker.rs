@@ -120,21 +120,28 @@ mod tests {
     use super::{OuterJoinMarker, OuterJoinScanState};
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use std::sync::Arc;
 
     #[test]
     fn scan_returns_only_unmatched_rows() {
-        let chunks = vec![Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(
-            &[10, 20, 30],
-        ))])];
+        let chunks = vec![Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20, 30],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )];
         let marker = OuterJoinMarker::new(true);
         marker.add_rows(3);
         marker.set_match(0);
         marker.set_match(2);
 
         let mut state = OuterJoinScanState::default();
-        let mut result = Chunk::initialize(&[LogicalType::Integer], 3);
+        let mut result =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
 
         let count = marker
             .scan(&chunks, &mut state, false, &mut result)

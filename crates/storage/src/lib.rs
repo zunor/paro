@@ -40,3 +40,6 @@ pub mod tablet;
 pub mod transaction;
 pub mod wal;
 pub mod write;
+
+#[cfg(test)]
+pub(crate) mod test_utils;

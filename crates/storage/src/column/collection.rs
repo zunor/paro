@@ -12,6 +12,9 @@ use crate::column::allocator::{
 use crate::wal::wal_entry::SerializedDataChunk;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle, MemoryResult,
+};
 use paro_common::types::LogicalType;
 
 #[derive(Debug, Default)]
@@ -75,15 +78,72 @@ impl ColumnDataLocalScanState {
 }
 
 #[derive(Debug)]
+struct StoredChunkOwnership {
+    resident: Option<MemoryReleaseHandle>,
+    spilled_bytes: usize,
+}
+
+impl StoredChunkOwnership {
+    fn new(resident: MemoryReleaseHandle) -> Self {
+        Self {
+            resident: Some(resident),
+            spilled_bytes: 0,
+        }
+    }
+
+    fn is_resident_accounted(&self) -> bool {
+        self.resident.is_some()
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.resident
+            .as_ref()
+            .map(MemoryReleaseHandle::bytes)
+            .unwrap_or(0)
+    }
+
+    fn release_resident(&mut self) -> usize {
+        let Some(handle) = self.resident.take() else {
+            return 0;
+        };
+        let bytes = handle.bytes();
+        handle.release();
+        self.spilled_bytes = self.spilled_bytes.saturating_add(bytes);
+        bytes
+    }
+
+    fn ensure_resident(
+        &mut self,
+        memory: &MemoryAccountingContext,
+        bytes: usize,
+    ) -> MemoryResult<()> {
+        if self.resident.is_some() {
+            return Ok(());
+        }
+        let handle = memory.retain(bytes)?;
+        self.spilled_bytes = self.spilled_bytes.saturating_sub(bytes);
+        self.resident = Some(handle);
+        Ok(())
+    }
+
+    fn release_all(&mut self) {
+        self.release_resident();
+        self.spilled_bytes = 0;
+    }
+}
+
+#[derive(Debug)]
 enum StoredChunk {
     InMemory {
         chunk: Chunk,
         serialized_size: usize,
+        ownership: Mutex<StoredChunkOwnership>,
     },
     BufferManaged {
         block_id: i64,
         byte_len: usize,
         row_count: usize,
+        ownership: Mutex<StoredChunkOwnership>,
     },
 }
 
@@ -103,12 +163,20 @@ impl StoredChunk {
             StoredChunk::BufferManaged { byte_len, .. } => *byte_len,
         }
     }
+
+    fn ownership(&self) -> &Mutex<StoredChunkOwnership> {
+        match self {
+            StoredChunk::InMemory { ownership, .. }
+            | StoredChunk::BufferManaged { ownership, .. } => ownership,
+        }
+    }
 }
 
 /// Columnar data collection with row-batch append and scan interfaces.
 #[derive(Debug)]
 pub struct ColumnDataCollection {
     allocator: Arc<ColumnDataAllocator>,
+    memory: MemoryAccountingContext,
     types: Vec<LogicalType>,
     chunks: Vec<Option<StoredChunk>>,
     count: usize,
@@ -117,8 +185,22 @@ pub struct ColumnDataCollection {
 
 impl ColumnDataCollection {
     pub fn new(allocator: Arc<ColumnDataAllocator>, types: Vec<LogicalType>) -> Self {
+        let memory_tag = allocator.memory_tag();
+        let memory = MemoryAccountingContext::detached(
+            memory_tag,
+            MemoryAccountingClass::default_for_tag(memory_tag),
+        );
+        Self::new_with_memory(allocator, types, memory)
+    }
+
+    pub fn new_with_memory(
+        allocator: Arc<ColumnDataAllocator>,
+        types: Vec<LogicalType>,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         Self {
             allocator,
+            memory,
             types,
             chunks: Vec::new(),
             count: 0,
@@ -132,6 +214,20 @@ impl ColumnDataCollection {
         memory_tag: MemoryTag,
         allocator_type: ColumnDataAllocatorType,
     ) -> Self {
+        let memory = MemoryAccountingContext::detached(
+            memory_tag,
+            MemoryAccountingClass::default_for_tag(memory_tag),
+        );
+        Self::with_buffer_pool_and_memory(buffer_pool, types, memory_tag, allocator_type, memory)
+    }
+
+    pub fn with_buffer_pool_and_memory(
+        buffer_pool: Arc<BufferPool>,
+        types: Vec<LogicalType>,
+        memory_tag: MemoryTag,
+        allocator_type: ColumnDataAllocatorType,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         let allocator = match allocator_type {
             ColumnDataAllocatorType::InMemoryAllocator => {
                 Arc::new(ColumnDataAllocator::in_memory())
@@ -143,7 +239,7 @@ impl ColumnDataCollection {
                 Arc::new(ColumnDataAllocator::hybrid(buffer_pool, memory_tag))
             }
         };
-        Self::new(allocator, types)
+        Self::new_with_memory(allocator, types, memory)
     }
 
     pub fn allocator(&self) -> &Arc<ColumnDataAllocator> {
@@ -158,6 +254,16 @@ impl ColumnDataCollection {
         &self.types
     }
 
+    pub fn set_memory_context(&mut self, memory: MemoryAccountingContext) -> Result<()> {
+        if self.count != 0 || self.chunk_count() != 0 {
+            return Err(paro_error::invalid_input(
+                "Cannot replace ColumnDataCollection memory context while chunks are retained",
+            ));
+        }
+        self.memory = memory;
+        Ok(())
+    }
+
     pub fn count(&self) -> usize {
         self.count
     }
@@ -168,6 +274,20 @@ impl ColumnDataCollection {
 
     pub fn size_in_bytes(&self) -> usize {
         self.size_in_bytes
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|stored| {
+                stored
+                    .ownership()
+                    .lock()
+                    .map(|ownership| ownership.resident_bytes())
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     pub fn initialize_append(&self, state: &mut ColumnDataAppendState) {
@@ -182,17 +302,29 @@ impl ColumnDataCollection {
 
         let serialized = SerializedDataChunk::from_chunk(input)?;
         let bytes = serialized.serialize();
+        let release = self
+            .memory
+            .retain(bytes.len())
+            .map_err(paro_error::ParoError::from)?;
         let stored = if self.allocator.is_buffer_managed() {
-            let block_id = self.allocator.allocate_serialized_chunk(&bytes)?;
+            let block_id = match self.allocator.allocate_serialized_chunk(&bytes) {
+                Ok(block_id) => block_id,
+                Err(err) => {
+                    release.release();
+                    return Err(err);
+                }
+            };
             StoredChunk::BufferManaged {
                 block_id,
                 byte_len: bytes.len(),
                 row_count: input.size(),
+                ownership: Mutex::new(StoredChunkOwnership::new(release)),
             }
         } else {
             StoredChunk::InMemory {
                 chunk: input.clone(),
                 serialized_size: bytes.len(),
+                ownership: Mutex::new(StoredChunkOwnership::new(release)),
             }
         };
 
@@ -382,18 +514,68 @@ impl ColumnDataCollection {
             StoredChunk::BufferManaged {
                 block_id, byte_len, ..
             } => {
+                self.ensure_resident_accounted(entry)?;
                 let bytes = self
                     .allocator
                     .read_block_bytes(*block_id, *byte_len, state)?;
                 let mut offset = 0;
                 let serialized = SerializedDataChunk::deserialize(&bytes, &mut offset)?;
-                serialized.to_chunk()?
+                serialized.to_chunk_with_allocator(output.allocator().clone())?
             }
         };
 
         let projected = self.project_chunk(&full_chunk, column_ids)?;
         output.reference(&projected);
         Ok(projected.size())
+    }
+
+    pub fn reclaim(&self, target_bytes: usize) -> Result<usize> {
+        if target_bytes == 0 || !self.allocator.is_buffer_managed() {
+            return Ok(0);
+        }
+
+        let Some(pool) = self.allocator.buffer_pool() else {
+            return Ok(0);
+        };
+
+        for stored in self.chunks.iter().filter_map(Option::as_ref) {
+            if let StoredChunk::BufferManaged { block_id, .. } = stored {
+                if stored
+                    .ownership()
+                    .lock()
+                    .map(|ownership| ownership.is_resident_accounted())
+                    .unwrap_or(false)
+                {
+                    pool.add_to_eviction_queue(*block_id);
+                }
+            }
+        }
+
+        let before_used = pool.used_memory();
+        let memory_limit = before_used.saturating_sub(target_bytes);
+        let _ = pool.evict_blocks(self.allocator.memory_tag(), 0, memory_limit, None);
+
+        let mut released = 0usize;
+        for stored in self.chunks.iter().filter_map(Option::as_ref) {
+            let StoredChunk::BufferManaged { block_id, .. } = stored else {
+                continue;
+            };
+            let unloaded = pool
+                .get_block(*block_id)
+                .map(|block| !block.is_loaded())
+                .unwrap_or(false);
+            if unloaded {
+                let mut ownership = stored.ownership().lock().map_err(|err| {
+                    paro_error::internal(format!(
+                        "ColumnDataCollection ownership lock poisoned: {}",
+                        err
+                    ))
+                })?;
+                released = released.saturating_add(ownership.release_resident());
+            }
+        }
+
+        Ok(released)
     }
 
     fn next_live_chunk_index(&self, start: usize) -> Option<usize> {
@@ -415,7 +597,7 @@ impl ColumnDataCollection {
             columns.push(Arc::clone(column));
         }
 
-        Ok(Chunk::from_arc_vectors(columns))
+        Ok(Chunk::from_arc_vectors(columns, chunk.allocator().clone()))
     }
 
     fn assert_chunk_types(&self, chunk: &Chunk) -> Result<()> {
@@ -443,10 +625,27 @@ impl ColumnDataCollection {
         self.count = self.count.saturating_sub(stored.row_count());
         self.size_in_bytes = self.size_in_bytes.saturating_sub(stored.size_in_bytes());
 
+        match stored.ownership().lock() {
+            Ok(mut ownership) => ownership.release_all(),
+            Err(err) => err.into_inner().release_all(),
+        }
+
         if let StoredChunk::BufferManaged { block_id, .. } = stored {
             self.allocator.free_block(block_id)?;
         }
         Ok(())
+    }
+
+    fn ensure_resident_accounted(&self, stored: &StoredChunk) -> Result<()> {
+        let mut ownership = stored.ownership().lock().map_err(|err| {
+            paro_error::internal(format!(
+                "ColumnDataCollection ownership lock poisoned: {}",
+                err
+            ))
+        })?;
+        ownership
+            .ensure_resident(&self.memory, stored.size_in_bytes())
+            .map_err(paro_error::ParoError::from)
     }
 }
 
@@ -460,10 +659,73 @@ impl Drop for ColumnDataCollection {
 mod tests {
     use super::*;
     use crate::buffer::MemoryTag;
-    use paro_common::vector::Vector;
+    use crate::test_utils::*;
+    use paro_common::memory::{
+        MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner, MemoryResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct TestMemoryOwner {
+        issued: AtomicUsize,
+        revocable: AtomicUsize,
+    }
+
+    impl TestMemoryOwner {
+        fn issued_bytes(&self) -> usize {
+            self.issued.load(Ordering::Acquire)
+        }
+
+        fn revocable_bytes(&self) -> usize {
+            self.revocable.load(Ordering::Acquire)
+        }
+    }
+
+    impl MemoryOwner for TestMemoryOwner {
+        fn acquire_capacity(&self, _domain: MemoryDomain, bytes: usize) -> MemoryResult<()> {
+            self.issued.fetch_add(bytes, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn release_capacity(&self, _domain: MemoryDomain, bytes: usize) {
+            let _ = self
+                .issued
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
+        }
+
+        fn record_allocation(
+            &self,
+            _domain: MemoryDomain,
+            _tag: MemoryTag,
+            class: MemoryAccountingClass,
+            bytes: usize,
+        ) {
+            if class == MemoryAccountingClass::Revocable {
+                self.revocable.fetch_add(bytes, Ordering::AcqRel);
+            }
+        }
+
+        fn release_allocation(
+            &self,
+            _domain: MemoryDomain,
+            _tag: MemoryTag,
+            class: MemoryAccountingClass,
+            bytes: usize,
+        ) {
+            if class == MemoryAccountingClass::Revocable {
+                let _ =
+                    self.revocable
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                            Some(current.saturating_sub(bytes))
+                        });
+            }
+        }
+    }
 
     fn build_test_chunk(start: i32, count: usize) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(
+        test_chunk_from_vectors(vec![test_i32_vector(
             &(start..start + count as i32).collect::<Vec<_>>(),
         )])
     }
@@ -480,7 +742,7 @@ mod tests {
 
         let mut state = ColumnDataScanState::new();
         collection.initialize_scan(&mut state, None);
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 64);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], 64);
         assert!(collection.scan(&mut state, &mut out).unwrap());
         assert_eq!(out.size(), 64);
         assert_eq!(out.column(0).unwrap().get_i32(0), Some(0));
@@ -506,8 +768,8 @@ mod tests {
 
         let mut lstate1 = ColumnDataLocalScanState::new();
         let mut lstate2 = ColumnDataLocalScanState::new();
-        let mut out1 = Chunk::initialize(&[LogicalType::Integer], 64);
-        let mut out2 = Chunk::initialize(&[LogicalType::Integer], 64);
+        let mut out1 = test_chunk_with_capacity(&[LogicalType::Integer], 64);
+        let mut out2 = test_chunk_with_capacity(&[LogicalType::Integer], 64);
 
         let mut values = Vec::new();
         loop {
@@ -573,11 +835,68 @@ mod tests {
         assert!(evicted.success);
         assert!(pool.get_temporary_spill_metrics().write_bytes > 0);
 
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 4096);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], 4096);
         let scanned = collection.fetch_chunk(0, &mut out).unwrap();
         assert_eq!(scanned, 2048);
         assert_eq!(out.column(0).unwrap().get_i32(0), Some(0));
         assert_eq!(out.column(0).unwrap().get_i32(2047), Some(2047));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_owner_backed_collection_reclaims_and_reacquires_spilled_chunks() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "paro_column_owner_reclaim_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        pool.set_temporary_directory(temp_dir.to_string_lossy().to_string())
+            .unwrap();
+
+        let owner = Arc::new(TestMemoryOwner::default());
+        let memory = MemoryAccountingContext::from_owner(
+            owner.clone(),
+            MemoryDomain::Host,
+            MemoryTag::ColumnData,
+            MemoryAccountingClass::Revocable,
+        );
+        let mut collection = ColumnDataCollection::with_buffer_pool_and_memory(
+            pool,
+            vec![LogicalType::Integer],
+            MemoryTag::ColumnData,
+            ColumnDataAllocatorType::BufferManagerAllocator,
+            memory,
+        );
+
+        for offset in (0..8192).step_by(1024) {
+            collection
+                .append_chunk(&build_test_chunk(offset, 1024))
+                .unwrap();
+        }
+
+        let retained = owner.issued_bytes();
+        assert!(retained > 0);
+        assert_eq!(owner.revocable_bytes(), retained);
+
+        let reclaimed = collection.reclaim(retained).unwrap();
+        assert!(reclaimed > 0);
+        assert!(owner.issued_bytes() < retained);
+
+        for storage_index in collection.chunk_storage_indexes() {
+            let mut state = ChunkManagementState::new();
+            let mut out = test_chunk_with_capacity(&[LogicalType::Integer], 1024);
+            collection
+                .fetch_chunk_by_storage_index(storage_index, &[0], &mut state, &mut out)
+                .unwrap();
+            assert_eq!(out.size(), 1024);
+        }
+        assert_eq!(owner.issued_bytes(), retained);
+
+        collection.reset().unwrap();
+        assert_eq!(owner.issued_bytes(), 0);
+        assert_eq!(owner.revocable_bytes(), 0);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

@@ -21,15 +21,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_catalog::entry::{CatalogEntryEnum, EdgeTableInfo};
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_parser::ast::PathMode;
 use paro_planner::expression::Expression;
 use paro_planner::operator::ExpandDirection;
-use paro_storage::buffer::TemporaryMemoryState;
 use paro_storage::index::graph::vertex_id_map::VertexIdMap;
 use paro_storage::index::graph::{GraphProjectionIndex, GraphReadSnapshot};
 use paro_storage::metrics::storage_metrics;
@@ -38,6 +41,7 @@ use paro_storage::tablet::TabletReaderParams;
 use crate::execution_context::ExecutionContext;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::AccountedBuffer;
 use crate::operator::state::{GlobalOperatorState, OperatorState};
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
@@ -94,19 +98,19 @@ struct GraphShortestPathState {
     /// Cached graph projection index handle (acquired once, avoids RwLock on hot path).
     cached_snapshot: Option<GraphReadSnapshot>,
     /// Scratch space for forward delta-aware neighbor merges.
-    forward_neighbor_scratch: Vec<(u32, u64)>,
+    forward_neighbor_scratch: AccountedBuffer<(u32, u64)>,
     /// Scratch space for backward delta-aware neighbor merges.
-    backward_neighbor_scratch: Vec<(u32, u64)>,
+    backward_neighbor_scratch: AccountedBuffer<(u32, u64)>,
     /// Optional singleton target bitset used for bound-target shortest path.
-    valid_targets: Option<Vec<u64>>,
+    valid_targets: Option<AccountedBuffer<u64>>,
     valid_targets_computed: bool,
     output_buffer: GraphPathOutputBuffer,
     resume_state: Option<GraphShortestPathResumeState>,
     input_row_cursor: usize,
-    lane_seen_scratch: Vec<u64>,
-    lane_visit_scratch: Vec<u64>,
-    lane_visit_next_scratch: Vec<u64>,
-    temporary_memory_state: Option<Arc<TemporaryMemoryState>>,
+    lane_seen_scratch: AccountedBuffer<u64>,
+    lane_visit_scratch: AccountedBuffer<u64>,
+    lane_visit_next_scratch: AccountedBuffer<u64>,
+    graph_memory: MemoryAccountingContext,
 }
 
 #[derive(Debug)]
@@ -121,9 +125,9 @@ struct BidirectionalDirectionState {
     frontier: SpillableFrontier,
     next_frontier: SpillableFrontier,
     frontier_cursor: SpillableFrontierCursor,
-    seen: Vec<u64>,
-    visited_depth: Vec<u32>,
-    terminal_edge_to_root: Vec<u64>,
+    seen: AccountedBuffer<u64>,
+    visited_depth: AccountedBuffer<u32>,
+    terminal_edge_to_root: AccountedBuffer<u64>,
     parents: Option<SpillableParentArrays>,
 }
 
@@ -145,20 +149,21 @@ struct PendingLaneEmission {
 enum LaneAdvanceResult {
     Suspended(LaneBfsState),
     Finished {
-        seen: Vec<u64>,
-        visit: Vec<u64>,
-        visit_next: Vec<u64>,
+        seen: AccountedBuffer<u64>,
+        visit: AccountedBuffer<u64>,
+        visit_next: AccountedBuffer<u64>,
     },
 }
 
 #[derive(Debug)]
 struct LaneBfsState {
-    sources: Vec<(Vec<u64>, u32)>,
-    seen: Vec<u64>,
-    visit: Vec<u64>,
-    visit_next: Vec<u64>,
-    frontier: Vec<u32>,
-    next_frontier: Vec<u32>,
+    memory: MemoryAccountingContext,
+    sources: AccountedBuffer<(Vec<u64>, u32)>,
+    seen: AccountedBuffer<u64>,
+    visit: AccountedBuffer<u64>,
+    visit_next: AccountedBuffer<u64>,
+    frontier: AccountedBuffer<u32>,
+    next_frontier: AccountedBuffer<u32>,
     frontier_idx: usize,
     neighbor_direction: u8,
     neighbor_idx: usize,
@@ -169,9 +174,9 @@ struct LaneBfsState {
 #[derive(Debug)]
 struct SingleSourceBfsState {
     row: usize,
-    input_vals: Vec<u64>,
-    seen: Vec<bool>,
-    next_seen: Vec<bool>,
+    input_vals: AccountedBuffer<u64>,
+    seen: AccountedBuffer<bool>,
+    next_seen: AccountedBuffer<bool>,
     frontier: SpillableFrontier,
     frontier_cursor: SpillableFrontierCursor,
     next_frontier: SpillableFrontier,
@@ -193,32 +198,30 @@ impl OperatorState for GraphShortestPathState {
 }
 
 impl PhysicalGraphShortestPath {
-    fn ensure_temporary_memory_state(
-        &self,
-        ctx: &ExecutionContext,
-        op_state: &mut GraphShortestPathState,
-    ) -> Arc<TemporaryMemoryState> {
-        if let Some(temp_state) = &op_state.temporary_memory_state {
-            return temp_state.clone();
-        }
-        let temp_state = ctx.temporary_memory_manager().register();
-        temp_state.set_zero();
-        op_state.temporary_memory_state = Some(temp_state.clone());
-        temp_state
+    fn graph_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+        let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+        MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        )
     }
 
     fn lane_workset_bytes(state: &LaneBfsState) -> usize {
-        state.seen.len() * std::mem::size_of::<u64>()
-            + state.visit.len() * std::mem::size_of::<u64>()
-            + state.visit_next.len() * std::mem::size_of::<u64>()
-            + state.frontier.len() * std::mem::size_of::<u32>()
-            + state.next_frontier.len() * std::mem::size_of::<u32>()
+        state.seen.capacity() * std::mem::size_of::<u64>()
+            + state.visit.capacity() * std::mem::size_of::<u64>()
+            + state.visit_next.capacity() * std::mem::size_of::<u64>()
+            + state.frontier.capacity() * std::mem::size_of::<u32>()
+            + state.next_frontier.capacity() * std::mem::size_of::<u32>()
     }
 
     fn single_source_workset_bytes(state: &SingleSourceBfsState) -> usize {
         state.frontier.resident_memory_bytes()
             + state.next_frontier.resident_memory_bytes()
             + state.parents.current_in_memory_bytes()
+            + state.seen.capacity() * std::mem::size_of::<bool>()
+            + state.next_seen.capacity() * std::mem::size_of::<bool>()
     }
 
     fn bidirectional_workset_bytes(
@@ -239,95 +242,42 @@ impl PhysicalGraphShortestPath {
             + from_src.next_frontier.resident_memory_bytes()
             + from_dst.frontier.resident_memory_bytes()
             + from_dst.next_frontier.resident_memory_bytes()
+            + from_src.seen.capacity() * std::mem::size_of::<u64>()
+            + from_dst.seen.capacity() * std::mem::size_of::<u64>()
+            + from_src.visited_depth.capacity() * std::mem::size_of::<u32>()
+            + from_dst.visited_depth.capacity() * std::mem::size_of::<u32>()
+            + from_src.terminal_edge_to_root.capacity() * std::mem::size_of::<u64>()
+            + from_dst.terminal_edge_to_root.capacity() * std::mem::size_of::<u64>()
             + src_parent_bytes
             + dst_parent_bytes
     }
 
-    fn update_lane_temporary_memory(
-        &self,
-        temp_state: &Arc<TemporaryMemoryState>,
-        state: &LaneBfsState,
-    ) {
+    fn update_lane_memory_stats(&self, state: &LaneBfsState) {
         let bytes = Self::lane_workset_bytes(state);
-        if bytes == 0 {
-            temp_state.set_zero();
-        } else {
-            temp_state.set_remaining_size_and_update_reservation(bytes);
-        }
-        self.record_runtime_memory(temp_state, false);
+        self.record_runtime_memory(bytes, false);
     }
 
-    fn update_single_source_temporary_memory(
-        &self,
-        temp_state: &Arc<TemporaryMemoryState>,
-        state: &mut SingleSourceBfsState,
-    ) -> Result<()> {
-        let mut bytes = Self::single_source_workset_bytes(state);
-        if bytes == 0 {
-            temp_state.set_zero();
-            return Ok(());
-        }
-        temp_state.set_remaining_size_and_update_reservation(bytes);
+    fn update_single_source_memory_stats(&self, state: &SingleSourceBfsState) {
+        let bytes = Self::single_source_workset_bytes(state);
         self.record_runtime_memory(
-            temp_state,
+            bytes,
             state.frontier.is_external() || state.next_frontier.is_external(),
         );
-        if temp_state.get_reservation() < bytes {
-            state.frontier.ensure_external()?;
-            state.next_frontier.ensure_external()?;
-            bytes = Self::single_source_workset_bytes(state);
-            if bytes == 0 {
-                temp_state.set_zero();
-            } else {
-                temp_state.set_remaining_size_and_update_reservation(bytes);
-                self.record_runtime_memory(
-                    temp_state,
-                    state.frontier.is_external() || state.next_frontier.is_external(),
-                );
-            }
-        }
-        Ok(())
     }
 
-    fn update_bound_target_temporary_memory(
+    fn update_bound_target_memory_stats(
         &self,
-        temp_state: &Arc<TemporaryMemoryState>,
         from_src: &mut BidirectionalDirectionState,
         from_dst: &mut BidirectionalDirectionState,
-    ) -> Result<()> {
-        let mut bytes = Self::bidirectional_workset_bytes(from_src, from_dst);
-        if bytes == 0 {
-            temp_state.set_zero();
-            return Ok(());
-        }
-        temp_state.set_remaining_size_and_update_reservation(bytes);
+    ) {
+        let bytes = Self::bidirectional_workset_bytes(from_src, from_dst);
         self.record_runtime_memory(
-            temp_state,
+            bytes,
             from_src.frontier.is_external()
                 || from_src.next_frontier.is_external()
                 || from_dst.frontier.is_external()
                 || from_dst.next_frontier.is_external(),
         );
-        if temp_state.get_reservation() < bytes {
-            from_src.frontier.ensure_external()?;
-            from_src.next_frontier.ensure_external()?;
-            from_dst.frontier.ensure_external()?;
-            from_dst.next_frontier.ensure_external()?;
-            bytes = Self::bidirectional_workset_bytes(from_src, from_dst);
-            if bytes == 0 {
-                temp_state.set_zero();
-            } else {
-                temp_state.set_remaining_size_and_update_reservation(bytes);
-                self.record_runtime_memory(
-                    temp_state,
-                    from_src.frontier.is_external()
-                        || from_src.next_frontier.is_external()
-                        || from_dst.frontier.is_external()
-                        || from_dst.next_frontier.is_external(),
-                );
-            }
-        }
-        Ok(())
     }
 
     fn graph_frontier_threshold(
@@ -335,23 +285,22 @@ impl PhysicalGraphShortestPath {
         ctx: &ExecutionContext,
         requires_spillable_frontier: bool,
     ) -> Result<usize> {
-        let tmm_cfg = ctx.temporary_memory_manager().current_config();
-        if requires_spillable_frontier && tmm_cfg.force_external && !tmm_cfg.has_temporary_directory
-        {
+        let force_external = ctx.session.limits.force_external;
+        let has_temporary_directory = ctx.session.limits.use_temporary_directory;
+        if requires_spillable_frontier && force_external && !has_temporary_directory {
             return Err(paro_error::out_of_memory(
                 "force_external requires a temporary directory (SET temp_directory)",
             ));
         }
-        Ok(if requires_spillable_frontier && tmm_cfg.force_external {
+        Ok(if requires_spillable_frontier && force_external {
             0
         } else {
             GRAPH_FRONTIER_SPILL_THRESHOLD_ROWS
         })
     }
 
-    fn record_runtime_memory(&self, temp_state: &Arc<TemporaryMemoryState>, externalized: bool) {
-        self.peak_memory_bytes
-            .fetch_max(temp_state.get_peak_reservation(), Ordering::AcqRel);
+    fn record_runtime_memory(&self, bytes: usize, externalized: bool) {
+        self.peak_memory_bytes.fetch_max(bytes, Ordering::AcqRel);
         if externalized {
             self.externalized.store(true, Ordering::Release);
         }
@@ -485,29 +434,45 @@ impl PhysicalGraphShortestPath {
         vals
     }
 
+    fn collect_input_row_values_accounted(
+        input: &Chunk,
+        row: usize,
+        memory: MemoryAccountingContext,
+    ) -> Result<AccountedBuffer<u64>> {
+        let mut vals = AccountedBuffer::with_capacity(memory, input.column_count())?;
+        for c in 0..input.column_count() {
+            vals.try_push(input.column(c).and_then(|v| v.get_u64(row)).unwrap_or(0))?;
+        }
+        Ok(vals)
+    }
+
     fn init_lane_state(
         &self,
-        sources: Vec<(Vec<u64>, u32)>,
+        sources: AccountedBuffer<(Vec<u64>, u32)>,
         num_vertices: u32,
-        lane_seen_scratch: &mut Vec<u64>,
-        lane_visit_scratch: &mut Vec<u64>,
-        lane_visit_next_scratch: &mut Vec<u64>,
-    ) -> Option<LaneBfsState> {
+        lane_seen_scratch: &mut AccountedBuffer<u64>,
+        lane_visit_scratch: &mut AccountedBuffer<u64>,
+        lane_visit_next_scratch: &mut AccountedBuffer<u64>,
+        memory: MemoryAccountingContext,
+    ) -> Result<Option<LaneBfsState>> {
         if sources.is_empty() || num_vertices == 0 {
-            return None;
+            return Ok(None);
         }
 
         let nv = num_vertices as usize;
-        let mut seen = std::mem::take(lane_seen_scratch);
-        seen.resize(nv, 0);
+        let mut seen = std::mem::replace(lane_seen_scratch, AccountedBuffer::new(memory.clone()));
+        seen.try_resize(nv, 0)?;
         seen.fill(0);
-        let mut visit = std::mem::take(lane_visit_scratch);
-        visit.resize(nv, 0);
+        let mut visit = std::mem::replace(lane_visit_scratch, AccountedBuffer::new(memory.clone()));
+        visit.try_resize(nv, 0)?;
         visit.fill(0);
-        let mut visit_next = std::mem::take(lane_visit_next_scratch);
-        visit_next.resize(nv, 0);
+        let mut visit_next = std::mem::replace(
+            lane_visit_next_scratch,
+            AccountedBuffer::new(memory.clone()),
+        );
+        visit_next.try_resize(nv, 0)?;
         visit_next.fill(0);
-        let mut frontier = Vec::new();
+        let mut frontier = AccountedBuffer::new(memory.clone());
 
         for (lane, (_, src_local)) in sources.iter().enumerate() {
             let bit = 1u64 << lane;
@@ -516,46 +481,50 @@ impl PhysicalGraphShortestPath {
                 continue;
             }
             if visit[idx] == 0 {
-                frontier.push(*src_local);
+                frontier.try_push(*src_local)?;
             }
             seen[idx] |= bit;
             visit[idx] |= bit;
         }
 
         if frontier.is_empty() {
-            return None;
+            *lane_seen_scratch = seen;
+            *lane_visit_scratch = visit;
+            *lane_visit_next_scratch = visit_next;
+            return Ok(None);
         }
 
-        Some(LaneBfsState {
+        Ok(Some(LaneBfsState {
+            memory: memory.clone(),
             sources,
             seen,
             visit,
             visit_next,
             frontier,
-            next_frontier: Vec::new(),
+            next_frontier: AccountedBuffer::new(memory),
             frontier_idx: 0,
             neighbor_direction: 0,
             neighbor_idx: 0,
             current_hop: 1,
             pending_emit: None,
-        })
+        }))
     }
 
     fn emit_lane_rows(
         &self,
-        sources: &[(Vec<u64>, u32)],
+        sources: &AccountedBuffer<(Vec<u64>, u32)>,
         vmap: &VertexIdMap,
         bits: u64,
         edge_rowid: u64,
         dst: u32,
         buffer: &mut GraphPathOutputBuffer,
-    ) -> u64 {
+    ) -> Result<u64> {
         let nsrc = sources.len();
         let dst_rowid = vmap.local_to_rowid(dst);
         let mut remaining_bits = bits;
         while remaining_bits != 0 {
             if buffer.is_full() {
-                return remaining_bits;
+                return Ok(remaining_bits);
             }
             let lane = remaining_bits.trailing_zeros() as usize;
             if lane >= nsrc {
@@ -567,9 +536,9 @@ impl PhysicalGraphShortestPath {
             row.push(dst as u64);
             row.push(dst_rowid);
             remaining_bits &= remaining_bits - 1;
-            let _ = buffer.push_row(row, None);
+            let _ = buffer.push_row(row, None)?;
         }
-        0
+        Ok(0)
     }
 
     fn advance_lane_state(
@@ -581,11 +550,8 @@ impl PhysicalGraphShortestPath {
         buffer: &mut GraphPathOutputBuffer,
         forward_neighbor_scratch: &mut Vec<(u32, u64)>,
         backward_neighbor_scratch: &mut Vec<(u32, u64)>,
-        temporary_memory_state: Option<&Arc<TemporaryMemoryState>>,
-    ) -> LaneAdvanceResult {
-        if let Some(temp_state) = temporary_memory_state {
-            self.update_lane_temporary_memory(temp_state, &state);
-        }
+    ) -> Result<LaneAdvanceResult> {
+        self.update_lane_memory_stats(&state);
         while !buffer.is_full() {
             if let Some(pending) = state.pending_emit.take() {
                 let remaining_bits = self.emit_lane_rows(
@@ -595,52 +561,53 @@ impl PhysicalGraphShortestPath {
                     pending.edge_rowid,
                     pending.dst,
                     buffer,
-                );
+                )?;
                 if remaining_bits != 0 {
                     state.pending_emit = Some(PendingLaneEmission {
                         remaining_bits,
                         edge_rowid: pending.edge_rowid,
                         dst: pending.dst,
                     });
-                    return LaneAdvanceResult::Suspended(state);
+                    return Ok(LaneAdvanceResult::Suspended(state));
                 }
             }
 
             if state.current_hop > self.max_hops || state.frontier.is_empty() {
-                return LaneAdvanceResult::Finished {
+                return Ok(LaneAdvanceResult::Finished {
                     seen: state.seen,
                     visit: state.visit,
                     visit_next: state.visit_next,
-                };
+                });
             }
 
             if state.frontier_idx >= state.frontier.len() {
-                for &v_local in &state.frontier {
+                for &v_local in state.frontier.iter() {
                     state.visit[v_local as usize] = 0;
                 }
                 if state.next_frontier.is_empty() {
-                    return LaneAdvanceResult::Finished {
+                    return Ok(LaneAdvanceResult::Finished {
                         seen: state.seen,
                         visit: state.visit,
                         visit_next: state.visit_next,
-                    };
+                    });
                 }
                 storage_metrics().set_graph_frontier_size(state.next_frontier.len());
-                for &v_local in &state.next_frontier {
+                for &v_local in state.next_frontier.iter() {
                     let idx = v_local as usize;
                     let next_bits = state.visit_next[idx];
                     state.seen[idx] |= next_bits;
                     state.visit[idx] = next_bits;
                     state.visit_next[idx] = 0;
                 }
-                state.frontier = std::mem::take(&mut state.next_frontier);
+                state.frontier = std::mem::replace(
+                    &mut state.next_frontier,
+                    AccountedBuffer::new(state.memory.clone()),
+                );
                 state.frontier_idx = 0;
                 state.neighbor_direction = 0;
                 state.neighbor_idx = 0;
                 state.current_hop += 1;
-                if let Some(temp_state) = temporary_memory_state {
-                    self.update_lane_temporary_memory(temp_state, &state);
-                }
+                self.update_lane_memory_stats(&state);
                 continue;
             }
 
@@ -709,7 +676,7 @@ impl PhysicalGraphShortestPath {
             let prev_next = state.visit_next[dst_idx];
             state.visit_next[dst_idx] = prev_next | new_bits;
             if prev_next == 0 {
-                state.next_frontier.push(dst);
+                state.next_frontier.try_push(dst)?;
             }
 
             if state.current_hop < self.min_hops {
@@ -725,17 +692,17 @@ impl PhysicalGraphShortestPath {
             }
 
             let remaining_bits =
-                self.emit_lane_rows(&state.sources, vmap, emit_bits, edge_rowid, dst, buffer);
+                self.emit_lane_rows(&state.sources, vmap, emit_bits, edge_rowid, dst, buffer)?;
             if remaining_bits != 0 {
                 state.pending_emit = Some(PendingLaneEmission {
                     remaining_bits,
                     edge_rowid,
                     dst,
                 });
-                return LaneAdvanceResult::Suspended(state);
+                return Ok(LaneAdvanceResult::Suspended(state));
             }
         }
-        LaneAdvanceResult::Suspended(state)
+        Ok(LaneAdvanceResult::Suspended(state))
     }
 
     fn materialize_path_from_parent_chain(
@@ -1041,7 +1008,7 @@ impl PhysicalGraphShortestPath {
         &self,
         ctx: &ExecutionContext,
         index: &GraphProjectionIndex,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<AccountedBuffer<u64>> {
         let filter = self.target_filter.as_ref().unwrap();
 
         let vertex_map = index.vertex_map(&self.target_label).ok_or_else(|| {
@@ -1052,7 +1019,8 @@ impl PhysicalGraphShortestPath {
         })?;
 
         let num_vertices = vertex_map.num_vertices() as usize;
-        let mut bitset = vec![0u64; num_vertices.div_ceil(64)];
+        let mut bitset = AccountedBuffer::new(Self::graph_memory_context(ctx));
+        bitset.try_resize(num_vertices.div_ceil(64), 0u64)?;
 
         let target_table = if self.direction == ExpandDirection::Backward {
             &self.edge_info.source_vertex_table
@@ -1105,7 +1073,11 @@ impl PhysicalGraphShortestPath {
 
             let rowid_col_idx = scan_chunk.column_count() - 1;
             let mut filter_executor = ExpressionExecutor::with_expressions(&filter_exprs);
-            let mut filter_result = Chunk::initialize(&[LogicalType::Boolean], scan_size);
+            let mut filter_result = Chunk::try_initialize(
+                &[LogicalType::Boolean],
+                scan_size,
+                scan_chunk.allocator().clone(),
+            )?;
             filter_executor.execute_all_into(&scan_chunk, ctx, &mut filter_result)?;
 
             let bool_col = filter_result.column(0).ok_or_else(|| {
@@ -1226,7 +1198,7 @@ impl PhysicalGraphShortestPath {
         backward_neighbor_scratch: &mut Vec<(u32, u64)>,
         buffer_pool: Arc<paro_storage::buffer::BufferPool>,
         frontier_threshold: usize,
-        temporary_memory_state: Option<&Arc<TemporaryMemoryState>>,
+        memory: MemoryAccountingContext,
     ) -> Result<()> {
         if src_local == dst_local {
             return Ok(());
@@ -1239,21 +1211,53 @@ impl PhysicalGraphShortestPath {
 
         let vals = Self::collect_input_row_values(input, row);
         let word_count = nv.div_ceil(64);
-        let mut src_frontier = SpillableFrontier::new(buffer_pool.clone(), frontier_threshold);
+        let mut src_seen = AccountedBuffer::new(memory.clone());
+        src_seen.try_resize(word_count, 0u64)?;
+        let mut src_visited_depth = AccountedBuffer::new(memory.clone());
+        src_visited_depth.try_resize(nv, u32::MAX)?;
+        let mut src_terminal_edge_to_root = AccountedBuffer::new(memory.clone());
+        src_terminal_edge_to_root.try_resize(nv, 0u64)?;
+        let mut dst_seen = AccountedBuffer::new(memory.clone());
+        dst_seen.try_resize(word_count, 0u64)?;
+        let mut dst_visited_depth = AccountedBuffer::new(memory.clone());
+        dst_visited_depth.try_resize(nv, u32::MAX)?;
+        let mut dst_terminal_edge_to_root = AccountedBuffer::new(memory.clone());
+        dst_terminal_edge_to_root.try_resize(nv, 0u64)?;
+        let mut src_frontier = SpillableFrontier::new_with_memory(
+            buffer_pool.clone(),
+            frontier_threshold,
+            memory.clone(),
+        );
         src_frontier.push(src_local)?;
-        let mut dst_frontier = SpillableFrontier::new(buffer_pool.clone(), frontier_threshold);
+        let mut dst_frontier = SpillableFrontier::new_with_memory(
+            buffer_pool.clone(),
+            frontier_threshold,
+            memory.clone(),
+        );
         dst_frontier.push(dst_local)?;
 
         let create_parents = self.emit_path_info;
         let mut from_src = BidirectionalDirectionState {
             current_hop: 1,
             frontier: src_frontier,
-            next_frontier: SpillableFrontier::new(buffer_pool.clone(), frontier_threshold),
+            next_frontier: SpillableFrontier::new_with_memory(
+                buffer_pool.clone(),
+                frontier_threshold,
+                memory.clone(),
+            ),
             frontier_cursor: SpillableFrontierCursor::default(),
-            seen: vec![0u64; word_count],
-            visited_depth: vec![u32::MAX; nv],
-            terminal_edge_to_root: vec![0u64; nv],
-            parents: create_parents.then(|| SpillableParentArrays::new(nv, buffer_pool.clone())),
+            seen: src_seen,
+            visited_depth: src_visited_depth,
+            terminal_edge_to_root: src_terminal_edge_to_root,
+            parents: if create_parents {
+                Some(SpillableParentArrays::new_with_memory(
+                    nv,
+                    buffer_pool.clone(),
+                    memory.clone(),
+                )?)
+            } else {
+                None
+            },
         };
         graph_bitset_set(&mut from_src.seen, src_local);
         from_src.visited_depth[src_local as usize] = 0;
@@ -1261,20 +1265,30 @@ impl PhysicalGraphShortestPath {
         let mut from_dst = BidirectionalDirectionState {
             current_hop: 1,
             frontier: dst_frontier,
-            next_frontier: SpillableFrontier::new(buffer_pool.clone(), frontier_threshold),
+            next_frontier: SpillableFrontier::new_with_memory(
+                buffer_pool.clone(),
+                frontier_threshold,
+                memory.clone(),
+            ),
             frontier_cursor: SpillableFrontierCursor::default(),
-            seen: vec![0u64; word_count],
-            visited_depth: vec![u32::MAX; nv],
-            terminal_edge_to_root: vec![0u64; nv],
-            parents: create_parents.then(|| SpillableParentArrays::new(nv, buffer_pool)),
+            seen: dst_seen,
+            visited_depth: dst_visited_depth,
+            terminal_edge_to_root: dst_terminal_edge_to_root,
+            parents: if create_parents {
+                Some(SpillableParentArrays::new_with_memory(
+                    nv,
+                    buffer_pool,
+                    memory,
+                )?)
+            } else {
+                None
+            },
         };
         graph_bitset_set(&mut from_dst.seen, dst_local);
         from_dst.visited_depth[dst_local as usize] = 0;
 
         let mut best_result: Option<BoundTargetSearchResult> = None;
-        if let Some(temp_state) = temporary_memory_state {
-            self.update_bound_target_temporary_memory(temp_state, &mut from_src, &mut from_dst)?;
-        }
+        self.update_bound_target_memory_stats(&mut from_src, &mut from_dst);
 
         while !from_src.frontier.is_empty() && !from_dst.frontier.is_empty() {
             storage_metrics()
@@ -1336,19 +1350,10 @@ impl PhysicalGraphShortestPath {
                     best_result = Some(candidate);
                 }
             }
-            if let Some(temp_state) = temporary_memory_state {
-                self.update_bound_target_temporary_memory(
-                    temp_state,
-                    &mut from_src,
-                    &mut from_dst,
-                )?;
-            }
+            self.update_bound_target_memory_stats(&mut from_src, &mut from_dst);
         }
 
         let Some(best_result) = best_result else {
-            if let Some(temp_state) = temporary_memory_state {
-                temp_state.set_zero();
-            }
             return Ok(());
         };
 
@@ -1369,25 +1374,16 @@ impl PhysicalGraphShortestPath {
                 &mut dst_lookup_state,
             )?
             else {
-                if let Some(temp_state) = temporary_memory_state {
-                    temp_state.set_zero();
-                }
                 return Ok(());
             };
             if edges.is_empty() {
-                if let Some(temp_state) = temporary_memory_state {
-                    temp_state.set_zero();
-                }
                 return Ok(());
             }
             Some(self.materialize_bound_target_path(input, row, &vertices, &edges, vmap))
         } else {
             None
         };
-        let _ = output_buffer.push_row(out_row, path);
-        if let Some(temp_state) = temporary_memory_state {
-            temp_state.set_zero();
-        }
+        let _ = output_buffer.push_row(out_row, path)?;
         Ok(())
     }
 
@@ -1399,26 +1395,38 @@ impl PhysicalGraphShortestPath {
         vmap: &VertexIdMap,
         buffer_pool: Arc<paro_storage::buffer::BufferPool>,
         frontier_threshold: usize,
+        memory: MemoryAccountingContext,
     ) -> Result<Option<SingleSourceBfsState>> {
         let nv = vmap.num_vertices() as usize;
         if nv == 0 {
             return Ok(None);
         }
 
-        let mut seen = vec![false; nv];
-        let mut frontier = SpillableFrontier::new(buffer_pool.clone(), frontier_threshold);
+        let mut seen = AccountedBuffer::new(memory.clone());
+        seen.try_resize(nv, false)?;
+        let mut next_seen = AccountedBuffer::new(memory.clone());
+        next_seen.try_resize(nv, false)?;
+        let mut frontier = SpillableFrontier::new_with_memory(
+            buffer_pool.clone(),
+            frontier_threshold,
+            memory.clone(),
+        );
         frontier.push(src_local)?;
         seen[src_local as usize] = true;
 
         Ok(Some(SingleSourceBfsState {
             row,
-            input_vals: Self::collect_input_row_values(input, row),
+            input_vals: Self::collect_input_row_values_accounted(input, row, memory.clone())?,
             seen,
-            next_seen: vec![false; nv],
+            next_seen,
             frontier,
             frontier_cursor: SpillableFrontierCursor::default(),
-            next_frontier: SpillableFrontier::new(buffer_pool.clone(), frontier_threshold),
-            parents: SpillableParentArrays::new(nv, buffer_pool),
+            next_frontier: SpillableFrontier::new_with_memory(
+                buffer_pool.clone(),
+                frontier_threshold,
+                memory.clone(),
+            ),
+            parents: SpillableParentArrays::new_with_memory(nv, buffer_pool, memory)?,
             parent_lookup_state: ParentLookupState::new(),
             frontier_idx: 0,
             neighbor_direction: 0,
@@ -1437,11 +1445,8 @@ impl PhysicalGraphShortestPath {
         output_buffer: &mut GraphPathOutputBuffer,
         forward_neighbor_scratch: &mut Vec<(u32, u64)>,
         backward_neighbor_scratch: &mut Vec<(u32, u64)>,
-        temporary_memory_state: Option<&Arc<TemporaryMemoryState>>,
     ) -> Result<Option<SingleSourceBfsState>> {
-        if let Some(temp_state) = temporary_memory_state {
-            self.update_single_source_temporary_memory(temp_state, &mut state)?;
-        }
+        self.update_single_source_memory_stats(&state);
         while !output_buffer.is_full() {
             if state.current_hop > self.max_hops || state.frontier.is_empty() {
                 return Ok(None);
@@ -1469,9 +1474,7 @@ impl PhysicalGraphShortestPath {
                 if state.current_hop > self.max_hops {
                     return Ok(None);
                 }
-                if let Some(temp_state) = temporary_memory_state {
-                    self.update_single_source_temporary_memory(temp_state, &mut state)?;
-                }
+                self.update_single_source_memory_stats(&state);
                 continue;
             }
 
@@ -1547,7 +1550,7 @@ impl PhysicalGraphShortestPath {
                 continue;
             }
 
-            let mut out_row = state.input_vals.clone();
+            let mut out_row = state.input_vals.as_slice().to_vec();
             out_row.push(edge_rowid);
             out_row.push(dst as u64);
             out_row.push(vmap.local_to_rowid(dst));
@@ -1562,17 +1565,13 @@ impl PhysicalGraphShortestPath {
                 state.current_hop,
                 vmap,
             )?;
-            let action = output_buffer.push_row(out_row, Some(path));
+            let action = output_buffer.push_row(out_row, Some(path))?;
             if action == EmitAction::Yield {
-                if let Some(temp_state) = temporary_memory_state {
-                    self.update_single_source_temporary_memory(temp_state, &mut state)?;
-                }
+                self.update_single_source_memory_stats(&state);
                 return Ok(Some(state));
             }
         }
-        if let Some(temp_state) = temporary_memory_state {
-            self.update_single_source_temporary_memory(temp_state, &mut state)?;
-        }
+        self.update_single_source_memory_stats(&state);
         Ok(Some(state))
     }
 
@@ -1582,18 +1581,19 @@ impl PhysicalGraphShortestPath {
         ncols: usize,
         output_rows: &[Vec<u64>],
         path_rows: &[MaterializedPath],
-    ) {
+    ) -> Result<()> {
         let count = output_rows.len();
         let ocols = self.output_types.len();
         let mut vectors: Vec<Vector> = self
             .output_types
             .iter()
             .map(|t| {
-                let mut v = Vector::with_capacity(t.clone(), count.max(VECTOR_SIZE));
+                let mut v =
+                    Vector::try_new(t.clone(), count.max(VECTOR_SIZE), chunk.allocator().clone())?;
                 v.set_len(count);
-                v
+                Ok(v)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let path_base = ncols + 3;
         for (ri, row) in output_rows.iter().enumerate() {
             for (ci, &val) in row.iter().enumerate() {
@@ -1606,7 +1606,10 @@ impl PhysicalGraphShortestPath {
             }
         }
         let path_vectors = if self.emit_path_info {
-            Some(materialize_path_vectors(path_rows))
+            Some(materialize_path_vectors(
+                path_rows,
+                chunk.allocator().clone(),
+            )?)
         } else {
             None
         };
@@ -1628,8 +1631,9 @@ impl PhysicalGraphShortestPath {
             }
             arcs.push(Arc::new(v));
         }
-        *chunk = Chunk::from_arc_vectors(arcs);
+        *chunk = Chunk::from_arc_vectors(arcs, chunk.allocator().clone());
         chunk.set_cardinality(count);
+        Ok(())
     }
 }
 
@@ -1844,19 +1848,20 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                 ))
             })?;
 
+        let graph_memory = Self::graph_memory_context(ctx);
         Ok(Box::new(GraphShortestPathState {
             cached_snapshot: Some(snapshot),
-            forward_neighbor_scratch: Vec::new(),
-            backward_neighbor_scratch: Vec::new(),
+            forward_neighbor_scratch: AccountedBuffer::new(graph_memory.clone()),
+            backward_neighbor_scratch: AccountedBuffer::new(graph_memory.clone()),
             valid_targets: None,
             valid_targets_computed: false,
-            output_buffer: GraphPathOutputBuffer::new(self.emit_path_info),
+            output_buffer: GraphPathOutputBuffer::new(self.emit_path_info, graph_memory.clone())?,
             resume_state: None,
             input_row_cursor: 0,
-            lane_seen_scratch: Vec::new(),
-            lane_visit_scratch: Vec::new(),
-            lane_visit_next_scratch: Vec::new(),
-            temporary_memory_state: None,
+            lane_seen_scratch: AccountedBuffer::new(graph_memory.clone()),
+            lane_visit_scratch: AccountedBuffer::new(graph_memory.clone()),
+            lane_visit_next_scratch: AccountedBuffer::new(graph_memory.clone()),
+            graph_memory,
         }))
     }
 
@@ -1872,6 +1877,7 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
             spilled: Some(self.externalized.load(Ordering::Acquire)),
             peak_memory_bytes: Some(self.peak_memory_bytes.load(Ordering::Acquire) as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -1882,6 +1888,7 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         if input.is_empty() {
             let op_state = state
@@ -1891,9 +1898,6 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
             op_state.resume_state = None;
             op_state.input_row_cursor = 0;
             op_state.output_buffer.clear();
-            if let Some(temp_state) = &op_state.temporary_memory_state {
-                temp_state.set_zero();
-            }
             return Ok(OperatorResultType::NeedMoreInput);
         }
 
@@ -1954,17 +1958,18 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
             if let Some(resume_state) = op_state.resume_state.take() {
                 match resume_state {
                     GraphShortestPathResumeState::Lane(lane_state) => {
-                        let temp_state = self.ensure_temporary_memory_state(ctx, op_state);
-                        match self.advance_lane_state(
+                        let advance = self.advance_lane_state(
                             lane_state,
                             snapshot,
                             edge_label,
                             vmap,
                             &mut op_state.output_buffer,
-                            &mut op_state.forward_neighbor_scratch,
-                            &mut op_state.backward_neighbor_scratch,
-                            Some(&temp_state),
-                        ) {
+                            op_state.forward_neighbor_scratch.as_mut_vec(),
+                            op_state.backward_neighbor_scratch.as_mut_vec(),
+                        )?;
+                        op_state.forward_neighbor_scratch.sync_capacity()?;
+                        op_state.backward_neighbor_scratch.sync_capacity()?;
+                        match advance {
                             LaneAdvanceResult::Suspended(next_state) => {
                                 op_state.resume_state =
                                     Some(GraphShortestPathResumeState::Lane(next_state));
@@ -1978,28 +1983,26 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                                 op_state.lane_seen_scratch = seen;
                                 op_state.lane_visit_scratch = visit;
                                 op_state.lane_visit_next_scratch = visit_next;
-                                temp_state.set_zero();
                             }
                         }
                     }
                     GraphShortestPathResumeState::SingleSource(single_source_state) => {
-                        let temp_state = self.ensure_temporary_memory_state(ctx, op_state);
-                        if let Some(next_state) = self.advance_single_source_state(
+                        let next_state = self.advance_single_source_state(
                             input,
                             single_source_state,
                             snapshot,
                             edge_label,
                             vmap,
                             &mut op_state.output_buffer,
-                            &mut op_state.forward_neighbor_scratch,
-                            &mut op_state.backward_neighbor_scratch,
-                            Some(&temp_state),
-                        )? {
+                            op_state.forward_neighbor_scratch.as_mut_vec(),
+                            op_state.backward_neighbor_scratch.as_mut_vec(),
+                        )?;
+                        op_state.forward_neighbor_scratch.sync_capacity()?;
+                        op_state.backward_neighbor_scratch.sync_capacity()?;
+                        if let Some(next_state) = next_state {
                             op_state.resume_state =
                                 Some(GraphShortestPathResumeState::SingleSource(next_state));
                             break;
-                        } else {
-                            temp_state.set_zero();
                         }
                     }
                 }
@@ -2011,7 +2014,6 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
             }
 
             if bound_target_mode {
-                let temp_state = self.ensure_temporary_memory_state(ctx, op_state);
                 let frontier_threshold = self.graph_frontier_threshold(ctx, true)?;
                 let row = op_state.input_row_cursor;
                 op_state.input_row_cursor += 1;
@@ -2030,17 +2032,18 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                     edge_label,
                     vmap,
                     &mut op_state.output_buffer,
-                    &mut op_state.forward_neighbor_scratch,
-                    &mut op_state.backward_neighbor_scratch,
+                    op_state.forward_neighbor_scratch.as_mut_vec(),
+                    op_state.backward_neighbor_scratch.as_mut_vec(),
                     ctx.buffer_pool().clone(),
                     frontier_threshold,
-                    Some(&temp_state),
+                    op_state.graph_memory.clone(),
                 )?;
+                op_state.forward_neighbor_scratch.sync_capacity()?;
+                op_state.backward_neighbor_scratch.sync_capacity()?;
                 continue;
             }
 
             if single_source_mode {
-                let temp_state = self.ensure_temporary_memory_state(ctx, op_state);
                 let frontier_threshold = self.graph_frontier_threshold(ctx, true)?;
                 let row = op_state.input_row_cursor;
                 op_state.input_row_cursor += 1;
@@ -2052,38 +2055,39 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                     vmap,
                     ctx.buffer_pool().clone(),
                     frontier_threshold,
+                    op_state.graph_memory.clone(),
                 )? {
-                    if let Some(next_state) = self.advance_single_source_state(
+                    let next_state = self.advance_single_source_state(
                         input,
                         state,
                         snapshot,
                         edge_label,
                         vmap,
                         &mut op_state.output_buffer,
-                        &mut op_state.forward_neighbor_scratch,
-                        &mut op_state.backward_neighbor_scratch,
-                        Some(&temp_state),
-                    )? {
+                        op_state.forward_neighbor_scratch.as_mut_vec(),
+                        op_state.backward_neighbor_scratch.as_mut_vec(),
+                    )?;
+                    op_state.forward_neighbor_scratch.sync_capacity()?;
+                    op_state.backward_neighbor_scratch.sync_capacity()?;
+                    if let Some(next_state) = next_state {
                         op_state.resume_state =
                             Some(GraphShortestPathResumeState::SingleSource(next_state));
                         break;
-                    } else {
-                        temp_state.set_zero();
                     }
-                } else {
-                    temp_state.set_zero();
                 }
                 continue;
             }
 
-            let temp_state = self.ensure_temporary_memory_state(ctx, op_state);
             let batch_start = op_state.input_row_cursor;
             let batch_end = (batch_start + LANE_LIMIT).min(input.size());
             op_state.input_row_cursor = batch_end;
-            let mut sources: Vec<(Vec<u64>, u32)> = Vec::with_capacity(batch_end - batch_start);
+            let mut sources = AccountedBuffer::with_capacity(
+                op_state.graph_memory.clone(),
+                batch_end - batch_start,
+            )?;
             for row in batch_start..batch_end {
                 let src_local = src_col.get_u64(row).unwrap_or(0) as u32;
-                sources.push((Self::collect_input_row_values(input, row), src_local));
+                sources.try_push((Self::collect_input_row_values(input, row), src_local))?;
             }
             if let Some(state) = self.init_lane_state(
                 sources,
@@ -2091,17 +2095,20 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                 &mut op_state.lane_seen_scratch,
                 &mut op_state.lane_visit_scratch,
                 &mut op_state.lane_visit_next_scratch,
-            ) {
-                match self.advance_lane_state(
+                op_state.graph_memory.clone(),
+            )? {
+                let advance = self.advance_lane_state(
                     state,
                     snapshot,
                     edge_label,
                     vmap,
                     &mut op_state.output_buffer,
-                    &mut op_state.forward_neighbor_scratch,
-                    &mut op_state.backward_neighbor_scratch,
-                    Some(&temp_state),
-                ) {
+                    op_state.forward_neighbor_scratch.as_mut_vec(),
+                    op_state.backward_neighbor_scratch.as_mut_vec(),
+                )?;
+                op_state.forward_neighbor_scratch.sync_capacity()?;
+                op_state.backward_neighbor_scratch.sync_capacity()?;
+                match advance {
                     LaneAdvanceResult::Suspended(next_state) => {
                         op_state.resume_state =
                             Some(GraphShortestPathResumeState::Lane(next_state));
@@ -2115,21 +2122,15 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                         op_state.lane_seen_scratch = seen;
                         op_state.lane_visit_scratch = visit;
                         op_state.lane_visit_next_scratch = visit_next;
-                        temp_state.set_zero();
                     }
                 }
-            } else {
-                temp_state.set_zero();
             }
         }
 
         if op_state.output_buffer.is_empty() {
-            *chunk = Chunk::init_empty(&self.output_types);
+            *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
             if op_state.resume_state.is_none() && op_state.input_row_cursor >= input.size() {
                 op_state.input_row_cursor = 0;
-                if let Some(temp_state) = &op_state.temporary_memory_state {
-                    temp_state.set_zero();
-                }
                 return Ok(OperatorResultType::NeedMoreInput);
             }
             return Ok(OperatorResultType::HaveMoreOutput);
@@ -2139,16 +2140,13 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
             op_state.resume_state.is_some() || op_state.input_row_cursor < input.size();
         let (output_rows, path_rows) = op_state.output_buffer.take();
         let count = output_rows.len();
-        self.materialize_output_chunk(chunk, ncols, &output_rows, &path_rows);
+        self.materialize_output_chunk(chunk, ncols, &output_rows, &path_rows)?;
         storage_metrics().add_graph_expand_rows(count);
 
         if has_more_output {
             Ok(OperatorResultType::HaveMoreOutput)
         } else {
             op_state.input_row_cursor = 0;
-            if let Some(temp_state) = &op_state.temporary_memory_state {
-                temp_state.set_zero();
-            }
             Ok(OperatorResultType::NeedMoreInput)
         }
     }

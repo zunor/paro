@@ -85,6 +85,7 @@ jobs:
               - 'clippy.toml'
               - '.clippy.toml'
               - '.cargo/**'
+              - 'tools/ci/check_memory_runtime_api.py'
 
   header:
     name: header
@@ -130,6 +131,16 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all --check
+
+  memory_api:
+    name: memory api guard
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/ci/check_memory_runtime_api.py
 
   clippy:
     name: clippy

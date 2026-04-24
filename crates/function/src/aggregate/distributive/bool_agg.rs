@@ -284,7 +284,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_bool(&[true, true, true]);
+            let input = paro_common::test_utils::test_bool_vector_with_allocator(
+                &[true, true, true],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -293,10 +296,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -322,7 +325,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_bool(&[true, false, true]);
+            let input = paro_common::test_utils::test_bool_vector_with_allocator(
+                &[true, false, true],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -331,10 +337,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -362,10 +368,10 @@ mod tests {
 
             // No updates
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -390,7 +396,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_bool(&[false, false, false]);
+            let input = paro_common::test_utils::test_bool_vector_with_allocator(
+                &[false, false, false],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -399,10 +408,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -428,7 +437,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let input = Vector::from_bool(&[false, true, false]);
+            let input = paro_common::test_utils::test_bool_vector_with_allocator(
+                &[false, true, false],
+                paro_common::test_utils::test_allocator(),
+            );
 
             if let Some(simple_update) = func.simple_update {
                 {
@@ -437,10 +449,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -468,10 +480,10 @@ mod tests {
 
             // No updates
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;
@@ -496,7 +508,10 @@ mod tests {
         unsafe {
             (func.initialize)(state_ptr);
 
-            let mut input = Vector::from_bool(&[true, false, true]);
+            let mut input = paro_common::test_utils::test_bool_vector_with_allocator(
+                &[true, false, true],
+                paro_common::test_utils::test_allocator(),
+            );
             input.set_null(1, true); // [true, NULL, true]
 
             if let Some(simple_update) = func.simple_update {
@@ -506,10 +521,10 @@ mod tests {
                 }
             }
 
-            let mut result = Vector::new(LogicalType::Boolean);
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
             result.set_count(1);
 
-            let mut states = Vector::new(LogicalType::BigInt);
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
             states.set_count(1);
             let states_ptr = states.flat_data_mut::<*mut u8>();
             *states_ptr = state_ptr;

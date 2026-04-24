@@ -154,9 +154,10 @@ impl PhysicalOperator for PhysicalGraphProject {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         _state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         if input.is_empty() {
-            *chunk = Chunk::init_empty(&self.output_types);
+            *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
             return Ok(OperatorResultType::NeedMoreInput);
         }
 
@@ -248,7 +249,11 @@ impl PhysicalOperator for PhysicalGraphProject {
                 if let Some(v) = full_cols[col_idx].take() {
                     arc_vectors.push(v);
                 } else {
-                    arc_vectors.push(null_vector(&table.columns[col_idx].logical_type, count));
+                    arc_vectors.push(null_vector(
+                        &table.columns[col_idx].logical_type,
+                        count,
+                        input.allocator().clone(),
+                    )?);
                 }
             }
 
@@ -299,11 +304,11 @@ impl PhysicalOperator for PhysicalGraphProject {
         }
 
         let combined_chunk = if combined_columns.is_empty() {
-            let mut empty = Chunk::initialize(&[], count.max(1));
+            let mut empty = Chunk::try_initialize(&[], count.max(1), input.allocator().clone())?;
             empty.set_cardinality(count);
             empty
         } else {
-            let mut cc = Chunk::from_arc_vectors(combined_columns);
+            let mut cc = Chunk::from_arc_vectors(combined_columns, input.allocator().clone());
             cc.set_cardinality(count);
             cc
         };
@@ -330,7 +335,11 @@ impl PhysicalOperator for PhysicalGraphProject {
             for filter_expr in &remapped_filters {
                 let filter_exprs = vec![filter_expr.clone()];
                 let mut filter_executor = ExpressionExecutor::with_expressions(&filter_exprs);
-                let mut filter_result = Chunk::initialize(&[LogicalType::Boolean], count);
+                let mut filter_result = Chunk::try_initialize(
+                    &[LogicalType::Boolean],
+                    count,
+                    combined_chunk.allocator().clone(),
+                )?;
                 filter_executor.execute_all_into(&combined_chunk, ctx, &mut filter_result)?;
 
                 if let Some(bool_col) = filter_result.column(0) {
@@ -348,7 +357,7 @@ impl PhysicalOperator for PhysicalGraphProject {
             // Build filtered combined chunk
             let selected_count = mask.iter().filter(|&&b| b).count();
             if selected_count == 0 {
-                *chunk = Chunk::init_empty(&self.output_types);
+                *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
                 return Ok(OperatorResultType::NeedMoreInput);
             }
 
@@ -360,7 +369,11 @@ impl PhysicalOperator for PhysicalGraphProject {
                 for col_idx in 0..combined_chunk.column_count() {
                     if let Some(src_col) = combined_chunk.column(col_idx) {
                         let logical_type = src_col.logical_type().clone();
-                        let mut new_vec = Vector::with_capacity(logical_type, selected_count);
+                        let mut new_vec = Vector::try_new(
+                            logical_type,
+                            selected_count,
+                            combined_chunk.allocator().clone(),
+                        )?;
                         new_vec.set_len(selected_count);
                         let mut dst_idx = 0;
                         for (src_idx, &keep) in mask.iter().enumerate() {
@@ -372,7 +385,8 @@ impl PhysicalOperator for PhysicalGraphProject {
                         new_vectors.push(Arc::new(new_vec));
                     }
                 }
-                let mut filtered = Chunk::from_arc_vectors(new_vectors);
+                let mut filtered =
+                    Chunk::from_arc_vectors(new_vectors, combined_chunk.allocator().clone());
                 filtered.set_cardinality(selected_count);
                 filtered
             }
@@ -382,7 +396,11 @@ impl PhysicalOperator for PhysicalGraphProject {
 
         // Step 4: Evaluate expressions.
         let mut executor = ExpressionExecutor::with_expressions(&remapped_expressions);
-        let mut output_chunk = Chunk::initialize(&self.output_types, filtered_count);
+        let mut output_chunk = Chunk::try_initialize(
+            &self.output_types,
+            filtered_count,
+            chunk.allocator().clone(),
+        )?;
         executor.execute_all_into(&filtered_chunk, ctx, &mut output_chunk)?;
 
         *chunk = output_chunk;
@@ -562,11 +580,15 @@ fn collect_path_column_indices(expr: &Expression, out: &mut Vec<usize>) {
     }
 }
 
-fn null_vector(logical_type: &LogicalType, count: usize) -> Arc<Vector> {
-    let mut v = Vector::with_capacity(logical_type.clone(), count);
+fn null_vector(
+    logical_type: &LogicalType,
+    count: usize,
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
+) -> Result<Arc<Vector>> {
+    let mut v = Vector::try_new(logical_type.clone(), count, allocator)?;
     v.set_count(count);
     for j in 0..count {
         v.set_null(j, true);
     }
-    Arc::new(v)
+    Ok(Arc::new(v))
 }

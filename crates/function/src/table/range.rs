@@ -399,6 +399,7 @@ fn range_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<RangeGlobalState>());
@@ -442,7 +443,8 @@ fn range_function(
                 .saturating_add(gstate.step.saturating_mul(start_idx as i64));
 
             // Use Sequence Vector for efficient representation
-            let vec = Vector::sequence(start_value, gstate.step, count);
+            let vec =
+                Vector::try_sequence(start_value, gstate.step, count, output_allocator.clone())?;
 
             // Replace the output column
             if let Some(col) = output.column_mut(0) {
@@ -867,7 +869,8 @@ mod tests {
         let gstate = RangeGlobalState::new(bind_data.start, bind_data.step, bind_data.cardinality);
         let mut lstate = RangeLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -897,7 +900,8 @@ mod tests {
         let gstate = RangeGlobalState::new(bind_data.start, bind_data.step, bind_data.cardinality);
         let mut lstate = RangeLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -924,7 +928,8 @@ mod tests {
         let gstate = RangeGlobalState::new(bind_data.start, bind_data.step, bind_data.cardinality);
         let mut lstate = RangeLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -951,7 +956,8 @@ mod tests {
         let gstate = RangeGlobalState::new(bind_data.start, bind_data.step, bind_data.cardinality);
         let mut lstate = RangeLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -978,7 +984,8 @@ mod tests {
         let gstate = RangeGlobalState::new(bind_data.start, bind_data.step, bind_data.cardinality);
         let mut lstate = RangeLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -1003,7 +1010,10 @@ mod tests {
         let mut batch_count = 0;
 
         loop {
-            let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+            let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+                &[LogicalType::BigInt],
+                VECTOR_SIZE,
+            );
 
             let mut input = TableFunctionInput {
                 bind_data: Some(&bind_data as &dyn TableFunctionBindData),

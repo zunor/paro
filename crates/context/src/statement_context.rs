@@ -156,8 +156,8 @@ impl StatementContext {
         self.services.infra.buffer_manager.get_buffer_allocator()
     }
 
-    pub fn temporary_memory_manager(&self) -> &Arc<paro_storage::buffer::TemporaryMemoryManager> {
-        &self.services.infra.temporary_memory_manager
+    pub fn query_memory_coordinator(&self) -> Option<&Arc<dyn crate::QueryMemoryCoordinator>> {
+        self.services.infra.query_memory_coordinator.as_ref()
     }
 
     pub fn scheduler(&self) -> &Arc<paro_scheduler::scheduler::TaskScheduler> {

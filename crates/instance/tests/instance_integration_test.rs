@@ -5,12 +5,10 @@ use paro_catalog::catalog::Catalog;
 use paro_catalog::entry::{CatalogEntryEnum, ColumnDefinition};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::BundleKind;
-use paro_common::chunk::Chunk;
 use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
 use paro_common::effect::{ApplyDescriptor, StagedArtifactDescriptor, StagingArtifactId};
 use paro_common::journal::{CommitRecord, JournalRecord};
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_instance::checkpoint::manifest_store::testing::arm_manifest_rename_failure_for_path_on_nth_call;
 use paro_instance::checkpoint::{manifest_store::ManifestStore, CheckpointRecovery};
 use paro_instance::storage_manager::{wal_path_with_suffix, StorageManager};
@@ -492,7 +490,9 @@ fn create_single_int_table(
     db.sync_compaction_tablets()
         .expect("compaction registry should reflect test catalog create");
 
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(values)]);
+    let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![
+        paro_common::test_utils::test_i32_vector(values),
+    ]);
     storage.append(&chunk).expect("append table data");
     storage
 }
@@ -791,7 +791,9 @@ fn checkpoint_base_restore_preflight_does_not_mutate_live_tablets_on_invalid_cat
     db.sync_compaction_tablets()
         .expect("sync compaction registry for durable table");
     durable_storage
-        .append(&Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]))
+        .append(&paro_common::test_utils::test_chunk_from_vectors(vec![
+            paro_common::test_utils::test_i32_vector(&[1, 2, 3]),
+        ]))
         .expect("append durable test data");
     db.force_checkpoint().expect("checkpoint should succeed");
 

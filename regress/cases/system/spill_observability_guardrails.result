@@ -27,18 +27,18 @@ SET
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
-PROJECTION  (rows=10000) (actual time=29.428..32.298 rows=10000 loops=5)
+PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=5)
   Output: id
-  ->  ORDER_BY  (rows=10000) (actual time=9.419..32.306 rows=20000 loops=9)
+  ->  ORDER_BY  (rows=10000) (actual time=<time-range> rows=20000 loops=9)
         Sort Key: id DESC NULLS FIRST
         Sort Method: external merge
         Spilled: true
-        Peak Memory: 0 B
-        ->  PROJECTION  (rows=10000) (actual time=9.401..15.059 rows=10000 loops=3)
+        Peak Memory: <bytes>
+        ->  PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=3)
               Output: id, id
-              ->  ROWSET_SCAN on public.spill_h_sort (actual time=0.189..16.218 rows=10000 loops=4)
+              ->  ROWSET_SCAN on public.spill_h_sort (actual time=<time-range> rows=10000 loops=4)
                     Columns: id
-Execution Time: 5.223 ms
+Execution Time: <time-ms>
 Rows Returned: 10000
 
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
@@ -47,20 +47,20 @@ SELECT k1, k2, SUM(v)
 FROM spill_h_agg
 GROUP BY k1, k2;
 QUERY PLAN
-PROJECTION  (rows=200000) (actual time=641.063..941.480 rows=200000 loops=100)
+PROJECTION  (rows=200000) (actual time=<time-range> rows=200000 loops=100)
   Output: ref_1, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=200000) (actual time=127.339..942.463 rows=400000 loops=150)
+  ->  HASH_GROUP_BY  (rows=200000) (actual time=<time-range> rows=400000 loops=150)
         Group Key: k1, k2
         Aggregates: SUM(v)
         Key Mode: INLINE_KEY_8B
         Partitioning: RADIX_PARTITIONS=4
         Spilled: true
-        Peak Memory: 57.6 MB
-        ->  PROJECTION (actual time=127.312..556.367 rows=200000 loops=49)
+        Peak Memory: <bytes>
+        ->  PROJECTION (actual time=<time-range> rows=200000 loops=49)
               Output: k1, k2, v
-              ->  ROWSET_SCAN on public.spill_h_agg (actual time=0.212..558.928 rows=200000 loops=50)
+              ->  ROWSET_SCAN on public.spill_h_agg (actual time=<time-range> rows=200000 loops=50)
                     Columns: k1, k2, v
-Execution Time: 383.483 ms
+Execution Time: <time-ms>
 Rows Returned: 200000
 
 SET force_external = DEFAULT;
@@ -84,18 +84,18 @@ SET
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
-PROJECTION  (rows=10000) (actual time=16.091..23.424 rows=10000 loops=5)
+PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=5)
   Output: id
-  ->  ORDER_BY  (rows=10000) (actual time=6.613..23.432 rows=20000 loops=9)
+  ->  ORDER_BY  (rows=10000) (actual time=<time-range> rows=20000 loops=9)
         Sort Key: id DESC NULLS FIRST
         Sort Method: quicksort
         Spilled: false
-        Peak Memory: 0 B
-        ->  PROJECTION  (rows=10000) (actual time=6.601..11.715 rows=10000 loops=3)
+        Peak Memory: <bytes>
+        ->  PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=3)
               Output: id, id
-              ->  ROWSET_SCAN on public.spill_h_sort (actual time=0.138..12.783 rows=10000 loops=4)
+              ->  ROWSET_SCAN on public.spill_h_sort (actual time=<time-range> rows=10000 loops=4)
                     Columns: id
-Execution Time: 9.298 ms
+Execution Time: <time-ms>
 Rows Returned: 10000
 
 SET force_external = true;

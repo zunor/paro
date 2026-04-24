@@ -9,10 +9,12 @@ use crate::codec::{cell_decoder::decode_cell_into_vector, physical_layout};
 use crate::rowset::RowsetId;
 use crate::search::{CandidateBatch, PhysicalRowRef, SearchReadSnapshot};
 use crate::tablet::TabletRef;
+use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ProjectedCell {
@@ -49,9 +51,10 @@ pub(crate) fn materialize_column(
     result_col_idx: usize,
     rows: &[PhysicalRowRef],
     data_cache: &HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>>,
+    allocator: Arc<dyn Allocator>,
 ) -> Result<Vector> {
     let row_count = rows.len();
-    let mut vector = Vector::with_capacity(logical_type.clone(), row_count);
+    let mut vector = Vector::try_new(logical_type.clone(), row_count, allocator)?;
     let is_nullable = tablet
         .schema()
         .and_then(|schema| schema.column(column_idx).map(|col| col.is_nullable))
@@ -180,6 +183,7 @@ pub(crate) fn materialize_candidate_batch(
     emit_score: bool,
 ) -> Result<Chunk> {
     let row_count = batch.rows.len();
+    let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
     let mut output_vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
     let data_cache =
         fetch_projected_columns(snapshot, &batch.rows, projected_columns, column_types)?;
@@ -195,6 +199,7 @@ pub(crate) fn materialize_candidate_batch(
             result_col_idx,
             &batch.rows,
             &data_cache,
+            allocator.clone(),
         )?);
     }
 
@@ -209,8 +214,8 @@ pub(crate) fn materialize_candidate_batch(
         } else {
             batch.scores
         };
-        output_vectors.push(Vector::from_f32(&scores));
+        output_vectors.push(Vector::try_from_f32(&scores, allocator.clone())?);
     }
 
-    Ok(Chunk::from_vectors(output_vectors))
+    Ok(Chunk::from_vectors(output_vectors, allocator))
 }

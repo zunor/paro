@@ -164,15 +164,30 @@ mod tests {
 
     #[test]
     fn test_internal_fallback_behavior_matches_legacy() {
-        let text_vec = Vector::from_strings(&["vector database systems", "hello world"]);
-        let legacy_query_vec = Vector::from_strings(&["vector database", "database"]);
-        let internal_query_vec = Vector::from_strings(&["vector & database", "database"]);
-        let legacy_input = Chunk::from_vectors(vec![text_vec.clone(), legacy_query_vec]);
-        let internal_input = Chunk::from_vectors(vec![text_vec, internal_query_vec]);
+        let text_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["vector database systems", "hello world"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let legacy_query_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["vector database", "database"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let internal_query_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["vector & database", "database"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let legacy_input = Chunk::from_vectors(
+            vec![text_vec.clone(), legacy_query_vec],
+            paro_common::test_utils::test_allocator(),
+        );
+        let internal_input = Chunk::from_vectors(
+            vec![text_vec, internal_query_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
 
-        let mut legacy_match = Vector::new(LogicalType::Boolean);
-        let mut internal_match = Vector::new(LogicalType::Boolean);
+        let mut legacy_match = paro_common::test_utils::test_vector(LogicalType::Boolean);
+        let mut internal_match = paro_common::test_utils::test_vector(LogicalType::Boolean);
         fulltext_match_fn(&legacy_input, &state, &mut legacy_match).unwrap();
         fulltext_match_internal_fn(&internal_input, &state, &mut internal_match).unwrap();
         assert_eq!(legacy_match.get_bool(0), internal_match.get_bool(0));
@@ -182,11 +197,20 @@ mod tests {
     #[test]
     fn test_legacy_fulltext_match_uses_tokenizer_not_whitespace_split() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["Vector-database systems"]),
-            Vector::from_strings(&["DATABASE"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["Vector-database systems"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["DATABASE"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
         fulltext_match_fn(&input, &state, &mut result).unwrap();
         assert_eq!(result.get_bool(0), Some(true));
     }
@@ -194,11 +218,20 @@ mod tests {
     #[test]
     fn test_non_constant_query_rows_do_not_reuse_previous_parse() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["vector database", "graph storage"]),
-            Vector::from_strings(&["vector", "graph"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector database", "graph storage"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector", "graph"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
         fulltext_match_fn(&input, &state, &mut result).unwrap();
         assert_eq!(result.get_bool(0), Some(true));
         assert_eq!(result.get_bool(1), Some(true));

@@ -1166,9 +1166,8 @@ mod tests {
     use crate::table::table_handle::TableHandle;
     use crate::tablet::tablet_reader::TabletReaderParams;
     use crate::tablet::KeysType;
-    use paro_common::chunk::Chunk;
+    use crate::test_utils::*;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     fn create_table(types: &[LogicalType]) -> TableHandle {
         TableFactory::default().create_table(types).unwrap()
@@ -1212,7 +1211,7 @@ mod tests {
         let tablet = table.tablet();
         let schema = tablet.schema().expect("tablet schema");
         let serializer = PrimaryKeySerializer::from_schema_ref(&schema).expect("pk serializer");
-        let key_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[key])]);
+        let key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[key])]);
         serializer
             .encode_row(&key_chunk, 0)
             .expect("encode primary key")
@@ -1358,14 +1357,14 @@ mod tests {
 
         txn.append_to_tablet(
             tablet.clone(),
-            &Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), Vector::from_i32(&[10, 20])]),
+            &test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]),
             SearchWritePlan::default(),
         )
         .expect("append first batch");
         let mark = txn.mark_savepoint().expect("mark savepoint");
         txn.append_to_tablet(
             tablet,
-            &Chunk::from_vectors(vec![Vector::from_i32(&[3, 4]), Vector::from_i32(&[30, 40])]),
+            &test_chunk_from_vectors(vec![test_i32_vector(&[3, 4]), test_i32_vector(&[30, 40])]),
             SearchWritePlan::default(),
         )
         .expect("append second batch");
@@ -1384,9 +1383,9 @@ mod tests {
             KeysType::PrimaryKeys,
         );
         table
-            .append(&Chunk::from_vectors(vec![
-                Vector::from_i32(&[1, 2]),
-                Vector::from_i32(&[10, 20]),
+            .append(&test_chunk_from_vectors(vec![
+                test_i32_vector(&[1, 2]),
+                test_i32_vector(&[10, 20]),
             ]))
             .expect("append rows");
         let tablet = table.tablet();
@@ -1422,7 +1421,7 @@ mod tests {
     fn test_pending_row_id_delete_commit_and_rollback_release_intents() {
         let table = create_table(&[LogicalType::Integer]);
         table
-            .append(&Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]))
+            .append(&test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]))
             .expect("append rows");
         let tablet = table.tablet();
         let location = row_id_location_by_value(&table, 2);
@@ -1460,9 +1459,9 @@ mod tests {
             KeysType::PrimaryKeys,
         );
         table
-            .append(&Chunk::from_vectors(vec![
-                Vector::from_i32(&[1, 2]),
-                Vector::from_i32(&[10, 20]),
+            .append(&test_chunk_from_vectors(vec![
+                test_i32_vector(&[1, 2]),
+                test_i32_vector(&[10, 20]),
             ]))
             .expect("append rows");
         let tablet = table.tablet();

@@ -358,7 +358,6 @@ mod tests {
     use std::sync::Arc;
 
     use paro_catalog::entry::{ColumnDefinition, TableCatalogEntry};
-    use paro_common::chunk::Chunk;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
@@ -380,7 +379,10 @@ mod tests {
 
     fn create_table(name: &str, values: &[i32]) -> Arc<TableCatalogEntry> {
         let storage = Arc::new(create_storage(&[LogicalType::Integer]));
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], values.len());
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::Integer],
+            values.len(),
+        );
         for (idx, value) in values.iter().enumerate() {
             chunk
                 .column_mut(0)

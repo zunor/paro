@@ -156,16 +156,31 @@ mod tests {
     #[test]
     fn test_to_tsvector_normalizes_text() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["Hello, Vector DB!"]),
-        ]);
-        let mut result = Vector::new(LogicalType::TsVector);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["Hello, Vector DB!"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::TsVector);
         to_tsvector_with_config_fn(&input, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some("hello vector db"));
 
-        let input_default = Chunk::from_vectors(vec![Vector::from_strings(&["Hello, Vector DB!"])]);
-        let mut result_default = Vector::new(LogicalType::TsVector);
+        let input_default = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_string_vector_with_allocator(
+                &["Hello, Vector DB!"],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result_default = paro_common::test_utils::test_vector(LogicalType::TsVector);
         to_tsvector_default_fn(&input_default, &state, &mut result_default).unwrap();
         assert_eq!(result_default.get_string(0), Some("hello vector db"));
     }
@@ -173,11 +188,20 @@ mod tests {
     #[test]
     fn test_to_tsvector_rejects_unsupported_config() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["unsupported_lang"]),
-            Vector::from_strings(&["hello world"]),
-        ]);
-        let mut result = Vector::new(LogicalType::TsVector);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["unsupported_lang"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["hello world"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::TsVector);
         let err = to_tsvector_with_config_fn(&input, &state, &mut result).unwrap_err();
         assert!(err.to_string().contains("not supported"));
     }
@@ -186,27 +210,54 @@ mod tests {
     fn test_to_tsvector_supports_chinese_and_japanese_config() {
         let state = MockState;
 
-        let chinese_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["chinese"]),
-            Vector::from_strings(&["向量数据库"]),
-        ]);
-        let mut chinese_result = Vector::new(LogicalType::TsVector);
+        let chinese_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["chinese"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["向量数据库"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut chinese_result = paro_common::test_utils::test_vector(LogicalType::TsVector);
         to_tsvector_with_config_fn(&chinese_input, &state, &mut chinese_result).unwrap();
         assert_eq!(chinese_result.get_string(0), Some("向 量 数 据 库"));
 
-        let japanese_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["japanese"]),
-            Vector::from_strings(&["東京ベクトルDB"]),
-        ]);
-        let mut japanese_result = Vector::new(LogicalType::TsVector);
+        let japanese_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["japanese"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["東京ベクトルDB"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut japanese_result = paro_common::test_utils::test_vector(LogicalType::TsVector);
         to_tsvector_with_config_fn(&japanese_input, &state, &mut japanese_result).unwrap();
         assert_eq!(japanese_result.get_string(0), Some("東 京 ベ ク ト ル db"));
 
-        let english_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["english"]),
-            Vector::from_strings(&["The databases are running quickly"]),
-        ]);
-        let mut english_result = Vector::new(LogicalType::TsVector);
+        let english_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["english"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["The databases are running quickly"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut english_result = paro_common::test_utils::test_vector(LogicalType::TsVector);
         to_tsvector_with_config_fn(&english_input, &state, &mut english_result).unwrap();
         assert_eq!(english_result.get_string(0), Some("databas run quick"));
     }

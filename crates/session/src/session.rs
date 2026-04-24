@@ -10,6 +10,7 @@ use crate::ddl::SessionDdlBridge;
 use crate::execution_control::{ConnectionShutdownReason, SessionExecutionControl};
 use crate::prepared::store::{parameter_types_to_pg_array, PortalStoreMark};
 use crate::registered_state::{RegisteredStateManager, SessionContextState};
+use crate::result::retained_store::SessionMemoryBudget;
 use crate::state::session_metadata::SharedSessionMetadataState;
 use crate::state::session_state::SessionState;
 use crate::transaction::block_kind::BlockKind;
@@ -82,6 +83,8 @@ pub struct Session {
     registered_state: RegisteredStateManager,
     /// Buffered COPY FROM STDIN payload limit used by the transitional bridge.
     copy_stdin_memory_limit: usize,
+    /// Session-owned retained result budget for holdable portals/cursors.
+    session_memory_budget: Arc<SessionMemoryBudget>,
 }
 
 impl Session {
@@ -247,7 +250,7 @@ impl Session {
                     scheduler: self.instance.get_scheduler().clone(),
                     buffer_pool: self.instance.get_buffer_pool().clone(),
                     buffer_manager: self.instance.get_buffer_manager().clone(),
-                    temporary_memory_manager: self.instance.get_temporary_memory_manager().clone(),
+                    query_memory_coordinator: Some(self.instance.get_memory_arbitrator().clone()),
                 }),
                 cast_functions: self.instance.cast_functions().clone(),
                 graph_index: self.instance.graph_manager().clone(),
@@ -312,7 +315,7 @@ impl Session {
         let user_name = user_name.into();
         let mut session = Self {
             id,
-            instance,
+            instance: instance.clone(),
             config: SessionConfig::default(),
             effective_settings: HashMap::new(),
             state: SessionState::new(&default_db_name, &user_name),
@@ -325,6 +328,10 @@ impl Session {
             query_progress: QueryProgress::default(),
             registered_state: RegisteredStateManager::new(),
             copy_stdin_memory_limit: default_copy_stdin_memory_limit,
+            session_memory_budget: Arc::new(SessionMemoryBudget::new(
+                instance.runtime_tuning().snapshot().maximum_memory,
+                instance.get_memory_arbitrator().clone(),
+            )),
         };
 
         tracing::info!(
@@ -444,6 +451,14 @@ impl Session {
         self.copy_stdin_memory_limit = limit;
     }
 
+    pub fn session_memory_budget(&self) -> Arc<SessionMemoryBudget> {
+        self.session_memory_budget.clone()
+    }
+
+    pub fn session_retained_bytes(&self) -> usize {
+        self.session_memory_budget.retained_bytes()
+    }
+
     pub fn refresh_session_metadata(&mut self) {
         let settings = collect_setting_rows(self);
 
@@ -549,7 +564,6 @@ impl Session {
     /// The Executor is created later when actually executing (in execute_statement).
     pub fn begin_statement_scope(&mut self, query: &str) {
         let buffer_pool = self.instance.get_buffer_pool();
-        self.refresh_temporary_memory_configuration();
         storage_metrics().set_memory_usage_snapshot(&buffer_pool.get_memory_usage_info());
 
         let control = self
@@ -564,14 +578,6 @@ impl Session {
             session_id = self.id,
             query,
             "statement scope started"
-        );
-    }
-
-    /// Refresh temporary memory manager configuration using current session + instance runtime settings.
-    pub fn refresh_temporary_memory_configuration(&self) {
-        self.instance.refresh_temporary_memory_configuration(
-            self.config.threads,
-            self.config.force_external,
         );
     }
 

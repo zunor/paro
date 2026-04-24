@@ -71,7 +71,7 @@ impl TabletReader {
         segment_id: u32,
     ) -> Result<Chunk> {
         if rows == 0 {
-            return Ok(Chunk::with_allocator(self.allocator.clone()));
+            return Chunk::try_new(self.allocator.clone());
         }
 
         let mut data_map: HashMap<ColumnId, &crate::rowset::column::ColumnBatch> = HashMap::new();
@@ -105,11 +105,11 @@ impl TabletReader {
                 })?;
                 read_vectors.push(resolved_vector.clone());
             } else {
-                read_vectors.push(Arc::new(Vector::constant_null_with_allocator(
+                read_vectors.push(Arc::new(Vector::try_constant_null(
                     ty.clone(),
                     rows,
                     allocator.clone(),
-                )));
+                )?));
             }
         }
 
@@ -140,7 +140,10 @@ impl TabletReader {
             )?));
         }
 
-        Ok(Chunk::from_arc_vectors(output_vectors))
+        Ok(Chunk::from_arc_vectors(
+            output_vectors,
+            self.allocator.clone(),
+        ))
     }
 
     fn load_base_rowids(
@@ -181,7 +184,7 @@ impl TabletReader {
         segment_id: u32,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Vector> {
-        let mut vector = Vector::with_capacity_and_allocator(LogicalType::BigInt, rows, allocator);
+        let mut vector = Vector::try_new(LogicalType::BigInt, rows, allocator)?;
         for (idx, row_offset) in rowids.iter().copied().enumerate() {
             let row_id = tablet
                 .encode_row_location(PhysicalRowRef::new(rowset_id, segment_id, row_offset))?;

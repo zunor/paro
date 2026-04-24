@@ -10,9 +10,12 @@ use std::sync::Mutex;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::sort_key::{compare_keys, encode_column, OrderModifiers};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
+
+use crate::memory_runtime::RetainedChunkVec;
 
 /// Global boundary value for TopN optimization.
 ///
@@ -120,7 +123,9 @@ pub struct TopNHeap {
     /// Max-heap of entries
     heap: BinaryHeap<TopNEntry>,
     /// Materialized payload data
-    heap_data: Vec<Chunk>,
+    heap_data: RetainedChunkVec,
+    /// Memory owner for retained chunk buffers.
+    memory: MemoryAccountingContext,
     /// Total heap size (limit + offset)
     heap_size: usize,
     /// OFFSET value
@@ -148,6 +153,25 @@ impl TopNHeap {
         limit: usize,
         offset: usize,
     ) -> Self {
+        Self::new_with_memory(
+            payload_types,
+            orders,
+            limit,
+            offset,
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::OrderBy,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+    }
+
+    pub fn new_with_memory(
+        payload_types: Vec<LogicalType>,
+        orders: &[OrderByNode],
+        limit: usize,
+        offset: usize,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         let heap_size = limit.saturating_add(offset);
         let modifiers = orders
             .iter()
@@ -156,7 +180,8 @@ impl TopNHeap {
 
         Self {
             heap: BinaryHeap::with_capacity(heap_size),
-            heap_data: Vec::new(),
+            heap_data: RetainedChunkVec::new(memory.clone()),
+            memory,
             heap_size,
             offset,
             modifiers,
@@ -171,12 +196,7 @@ impl TopNHeap {
                 .iter()
                 .map(|entry| entry.sort_key.capacity())
                 .sum::<usize>()
-            + self.heap_data.capacity() * size_of::<Chunk>()
-            + self
-                .heap_data
-                .iter()
-                .map(Chunk::get_allocation_size)
-                .sum::<usize>()
+            + self.heap_data.retained_bytes()
     }
 
     /// Sink input data into the heap.
@@ -262,13 +282,14 @@ impl TopNHeap {
         }
 
         // Build new compacted heap_data with only the entries we need
-        let mut new_heap_data = Vec::new();
+        let mut new_heap_data = RetainedChunkVec::new(self.memory.clone());
         let mut current_chunk_rows = Vec::new();
 
         for (new_idx, entry) in entries.iter_mut().enumerate() {
             // Find the row in old heap_data
-            let (chunk_idx, local_idx) = self.find_row_in_chunks(&self.heap_data, entry.index);
-            let old_chunk = &self.heap_data[chunk_idx];
+            let (chunk_idx, local_idx) =
+                self.find_row_in_chunks(self.heap_data.as_slice(), entry.index);
+            let old_chunk = &self.heap_data.as_slice()[chunk_idx];
 
             // Collect row for new chunk
             current_chunk_rows.push(local_idx);
@@ -278,8 +299,8 @@ impl TopNHeap {
 
             // Flush when we have enough rows for a chunk
             if current_chunk_rows.len() >= paro_common::vector::VECTOR_SIZE {
-                let new_chunk = self.copy_rows(old_chunk, &current_chunk_rows);
-                new_heap_data.push(new_chunk);
+                let new_chunk = self.copy_rows(old_chunk, &current_chunk_rows)?;
+                new_heap_data.push(new_chunk)?;
                 current_chunk_rows.clear();
             }
         }
@@ -289,13 +310,14 @@ impl TopNHeap {
             // Need to collect from potentially multiple source chunks
             let mut all_rows = Vec::new();
             for entry in &entries[entries.len() - current_chunk_rows.len()..] {
-                let (chunk_idx, local_idx) = self.find_row_in_chunks(&self.heap_data, entry.index);
+                let (chunk_idx, local_idx) =
+                    self.find_row_in_chunks(self.heap_data.as_slice(), entry.index);
                 all_rows.push((chunk_idx, local_idx));
             }
 
             // Build final chunk by copying from source chunks
             let new_chunk = self.build_chunk_from_multiple_sources(&all_rows)?;
-            new_heap_data.push(new_chunk);
+            new_heap_data.push(new_chunk)?;
         }
 
         // Replace old heap_data with compacted version
@@ -315,10 +337,11 @@ impl TopNHeap {
         let mut output_vectors = Vec::with_capacity(self.payload_types.len());
 
         for (col_idx, col_type) in self.payload_types.iter().enumerate() {
-            let mut dst_vec = Vector::with_capacity(col_type.clone(), rows.len());
+            let allocator = self.heap_data.as_slice()[rows[0].0].allocator().clone();
+            let mut dst_vec = Vector::try_new(col_type.clone(), rows.len(), allocator)?;
 
             for (dst_idx, &(chunk_idx, local_idx)) in rows.iter().enumerate() {
-                let src_vec = &self.heap_data[chunk_idx].data[col_idx];
+                let src_vec = &self.heap_data.as_slice()[chunk_idx].data[col_idx];
 
                 if src_vec.is_null(local_idx) {
                     dst_vec.set_null(dst_idx, true);
@@ -331,7 +354,10 @@ impl TopNHeap {
             output_vectors.push(Arc::new(dst_vec));
         }
 
-        let mut result = Chunk::from_arc_vectors(output_vectors);
+        let mut result = Chunk::from_arc_vectors(
+            output_vectors,
+            self.heap_data.as_slice()[rows[0].0].allocator().clone(),
+        );
         result.set_cardinality(rows.len());
         Ok(result)
     }
@@ -367,7 +393,10 @@ impl TopNHeap {
 
         if passing_rows.is_empty() {
             // No rows pass - return empty chunks
-            return Ok((Chunk::new(), Chunk::new()));
+            return Ok((
+                Chunk::try_new(payload_chunk.allocator().clone())?,
+                Chunk::try_new(sort_chunk.allocator().clone())?,
+            ));
         }
 
         if passing_rows.len() == payload_chunk.size() {
@@ -376,8 +405,8 @@ impl TopNHeap {
         }
 
         // Some rows pass - create filtered chunks
-        let filtered_payload = self.copy_rows(payload_chunk, &passing_rows);
-        let filtered_sort = self.copy_rows_generic(sort_chunk, &passing_rows);
+        let filtered_payload = self.copy_rows(payload_chunk, &passing_rows)?;
+        let filtered_sort = self.copy_rows_generic(sort_chunk, &passing_rows)?;
         Ok((filtered_payload, filtered_sort))
     }
 
@@ -428,7 +457,7 @@ impl TopNHeap {
 
         if !rows_to_copy.is_empty() {
             // Copy the selected rows from payload chunk
-            let new_chunk = self.copy_rows(payload_chunk, &rows_to_copy);
+            let new_chunk = self.copy_rows(payload_chunk, &rows_to_copy)?;
 
             // Update indices in heap
             let mut row_map = std::collections::HashMap::new();
@@ -445,7 +474,7 @@ impl TopNHeap {
             }
 
             self.heap = BinaryHeap::from(entries);
-            self.heap_data.push(new_chunk);
+            self.heap_data.push(new_chunk)?;
         }
 
         Ok(())
@@ -481,15 +510,15 @@ impl TopNHeap {
         }
 
         if !rows_to_copy.is_empty() {
-            let new_chunk = self.copy_rows(payload_chunk, &rows_to_copy);
-            self.heap_data.push(new_chunk);
+            let new_chunk = self.copy_rows(payload_chunk, &rows_to_copy)?;
+            self.heap_data.push(new_chunk)?;
         }
 
         Ok(())
     }
 
     /// Copy selected rows from a chunk (generic version for any chunk).
-    fn copy_rows_generic(&self, chunk: &Chunk, row_indices: &[usize]) -> Chunk {
+    fn copy_rows_generic(&self, chunk: &Chunk, row_indices: &[usize]) -> Result<Chunk> {
         use paro_common::vector::Vector;
         use std::sync::Arc;
 
@@ -498,7 +527,8 @@ impl TopNHeap {
         for col_idx in 0..chunk.column_count() {
             let src_vec = &chunk.data[col_idx];
             let col_type = src_vec.logical_type().clone();
-            let mut dst_vec = Vector::with_capacity(col_type, row_indices.len());
+            let mut dst_vec =
+                Vector::try_new(col_type, row_indices.len(), chunk.allocator().clone())?;
 
             for (dst_idx, &src_idx) in row_indices.iter().enumerate() {
                 if src_vec.is_null(src_idx) {
@@ -512,9 +542,9 @@ impl TopNHeap {
             output_vectors.push(Arc::new(dst_vec));
         }
 
-        let mut result = Chunk::from_arc_vectors(output_vectors);
+        let mut result = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
         result.set_cardinality(row_indices.len());
-        result
+        Ok(result)
     }
 
     /// Check if an entry should be added to the heap.
@@ -564,7 +594,7 @@ impl TopNHeap {
     }
 
     /// Copy selected rows from a chunk.
-    fn copy_rows(&self, chunk: &Chunk, row_indices: &[usize]) -> Chunk {
+    fn copy_rows(&self, chunk: &Chunk, row_indices: &[usize]) -> Result<Chunk> {
         use paro_common::vector::Vector;
         use std::sync::Arc;
 
@@ -572,7 +602,11 @@ impl TopNHeap {
 
         for (col_idx, col_type) in self.payload_types.iter().enumerate() {
             let src_vec = &chunk.data[col_idx];
-            let mut dst_vec = Vector::with_capacity(col_type.clone(), row_indices.len());
+            let mut dst_vec = Vector::try_new(
+                col_type.clone(),
+                row_indices.len(),
+                chunk.allocator().clone(),
+            )?;
 
             for (dst_idx, &src_idx) in row_indices.iter().enumerate() {
                 if src_vec.is_null(src_idx) {
@@ -586,9 +620,9 @@ impl TopNHeap {
             output_vectors.push(Arc::new(dst_vec));
         }
 
-        let mut result = Chunk::from_arc_vectors(output_vectors);
+        let mut result = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
         result.set_cardinality(row_indices.len());
-        result
+        Ok(result)
     }
 
     /// Copy a single value between vectors.
@@ -633,10 +667,11 @@ impl TopNHeap {
         if !rows_to_copy.is_empty() {
             // Copy data from other's heap_data
             for &row_idx in &rows_to_copy {
-                let (chunk_idx, local_idx) = self.find_row_in_chunks(&other.heap_data, row_idx);
-                let chunk = &other.heap_data[chunk_idx];
-                let copied = self.copy_rows(chunk, &[local_idx]);
-                self.heap_data.push(copied);
+                let (chunk_idx, local_idx) =
+                    self.find_row_in_chunks(other.heap_data.as_slice(), row_idx);
+                let chunk = &other.heap_data.as_slice()[chunk_idx];
+                let copied = self.copy_rows(chunk, &[local_idx])?;
+                self.heap_data.push(copied)?;
             }
         }
 
@@ -721,11 +756,20 @@ impl TopNHeap {
         let mut output_vectors = Vec::with_capacity(self.payload_types.len());
 
         for (col_idx, col_type) in self.payload_types.iter().enumerate() {
-            let mut dst_vec = Vector::with_capacity(col_type.clone(), row_indices.len());
+            let allocator = self
+                .heap_data
+                .as_slice()
+                .first()
+                .map(|chunk| chunk.allocator().clone())
+                .ok_or_else(|| {
+                    paro_common::error::internal("TopN heap has no payload chunks".to_string())
+                })?;
+            let mut dst_vec = Vector::try_new(col_type.clone(), row_indices.len(), allocator)?;
 
             for (dst_idx, &global_idx) in row_indices.iter().enumerate() {
-                let (chunk_idx, local_idx) = self.find_row_in_chunks(&self.heap_data, global_idx);
-                let src_vec = &self.heap_data[chunk_idx].data[col_idx];
+                let (chunk_idx, local_idx) =
+                    self.find_row_in_chunks(self.heap_data.as_slice(), global_idx);
+                let src_vec = &self.heap_data.as_slice()[chunk_idx].data[col_idx];
 
                 if src_vec.is_null(local_idx) {
                     dst_vec.set_null(dst_idx, true);
@@ -738,7 +782,15 @@ impl TopNHeap {
             output_vectors.push(Arc::new(dst_vec));
         }
 
-        let mut result = Chunk::from_arc_vectors(output_vectors);
+        let allocator = self
+            .heap_data
+            .as_slice()
+            .first()
+            .map(|chunk| chunk.allocator().clone())
+            .ok_or_else(|| {
+                paro_common::error::internal("TopN heap has no payload chunks".to_string())
+            })?;
+        let mut result = Chunk::from_arc_vectors(output_vectors, allocator);
         result.set_cardinality(row_indices.len());
         Ok(result)
     }
@@ -747,15 +799,15 @@ impl TopNHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_common::vector::Vector;
 
     fn make_int_chunk(values: &[i32]) -> Chunk {
-        let mut vector = Vector::with_capacity(LogicalType::Integer, values.len());
+        let mut vector =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, values.len());
         for (idx, value) in values.iter().enumerate() {
             vector.set_i32(idx, *value);
         }
         vector.set_count(values.len());
-        let mut chunk = Chunk::from_vectors(vec![vector]);
+        let mut chunk = paro_common::test_utils::test_chunk_from_vectors(vec![vector]);
         chunk.set_cardinality(values.len());
         chunk
     }
@@ -820,6 +872,16 @@ mod tests {
     #[test]
     fn test_combine_sorts_other_entries_before_early_stop() {
         let modifiers = vec![OrderModifiers::new(true, false)];
+        let mut left_data = RetainedChunkVec::detached(
+            paro_common::allocator::MemoryTag::OrderBy,
+            MemoryAccountingClass::Revocable,
+        );
+        left_data.push(make_int_chunk(&[5, 6, 7])).unwrap();
+        let mut right_data = RetainedChunkVec::detached(
+            paro_common::allocator::MemoryTag::OrderBy,
+            MemoryAccountingClass::Revocable,
+        );
+        right_data.push(make_int_chunk(&[9, 1, 2])).unwrap();
 
         let mut left = TopNHeap {
             heap_size: 3,
@@ -838,7 +900,11 @@ mod tests {
                     index: 2,
                 },
             ]),
-            heap_data: vec![make_int_chunk(&[5, 6, 7])],
+            heap_data: left_data,
+            memory: MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::OrderBy,
+                MemoryAccountingClass::Revocable,
+            ),
             modifiers: modifiers.clone(),
             payload_types: vec![LogicalType::Integer],
         };
@@ -859,7 +925,11 @@ mod tests {
                     index: 2,
                 },
             ]),
-            heap_data: vec![make_int_chunk(&[9, 1, 2])],
+            heap_data: right_data,
+            memory: MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::OrderBy,
+                MemoryAccountingClass::Revocable,
+            ),
             modifiers,
             payload_types: vec![LogicalType::Integer],
         };

@@ -98,8 +98,14 @@ mod tests {
 
     #[test]
     fn test_current_setting_basic() {
-        let input = Chunk::from_vectors(vec![Vector::from_strings(&["memory_limit"])]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_string_vector_with_allocator(
+                &["memory_limit"],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         let state = MockState::new(&[("memory_limit", "2097152")]);
 
         current_setting_impl(&input, &state, &mut result).unwrap();
@@ -108,8 +114,14 @@ mod tests {
 
     #[test]
     fn test_current_setting_unknown_returns_null() {
-        let input = Chunk::from_vectors(vec![Vector::from_strings(&["unknown_setting"])]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_string_vector_with_allocator(
+                &["unknown_setting"],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         let state = MockState::new(&[]);
 
         current_setting_impl(&input, &state, &mut result).unwrap();

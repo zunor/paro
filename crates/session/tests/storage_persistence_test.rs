@@ -509,7 +509,13 @@ async fn on_conflict_update_keeps_primary_key_visible_for_follow_up_updates() {
     .expect("primary key serializer");
     let key_two = serializer
         .encode_row(
-            &Chunk::from_vectors(vec![paro_common::vector::Vector::from_i32(&[2])]),
+            &Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[2],
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
             0,
         )
         .expect("encode key 2");

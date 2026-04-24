@@ -3,11 +3,14 @@
 
 use std::sync::Arc;
 
-use crate::allocator::{default_allocator, Allocator};
+use crate::allocator::Allocator;
+use crate::error::{self as paro_error, Result};
+use crate::memory::AllocationId;
 use crate::types::{InlineString, LogicalType};
 
 use super::{
-    AllocationSet, SelectionVector, StringHeap, ValidityMask, VectorBuffer, VectorType, VECTOR_SIZE,
+    AllocationSet, SelectionVector, StringHeap, ValidityMask, VectorBuffer, VectorSelection,
+    VectorType,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +42,7 @@ pub struct Vector {
     /// - FLAT (Array): Unused (data in child) — fixed-size, no offset needed
     /// - FLAT (List): Offset array [0, offset1, offset2, ..., end] to index child
     ///   (e.g., [[1,2], [3], [4,5,6]] → offsets=[0,2,3,6], child=[1,2,3,4,5,6])
-    /// - DICTIONARY: Unused (indices in sel_vector)
+    /// - DICTIONARY: Unused (indices in selection)
     /// - SEQUENCE: [start, increment]
     /// - CONSTANT: Single value
     pub(super) buffer: VectorBuffer,
@@ -47,9 +50,9 @@ pub struct Vector {
     pub(super) validity: ValidityMask,
     /// Number of logical elements
     pub(super) count: usize,
-    /// For DICTIONARY: selection indices
+    /// For DICTIONARY: logical-to-physical row mapping
     /// For SEQUENCE: unused
-    pub(super) sel_vector: Option<SelectionVector>,
+    pub(super) selection: VectorSelection,
     /// Multi-purpose shared child vector:
     /// - DICTIONARY: Shared reference to dictionary values (zero-copy!)
     /// - ARRAY/LIST: Flattened elements of the nested structure
@@ -81,44 +84,30 @@ impl std::fmt::Debug for VectorResetState {
 
 impl Clone for VectorResetState {
     fn clone(&self) -> Self {
-        Self::new(
+        Self::try_new(
             self.logical_type.clone(),
             self.initial_capacity,
             self.allocator.clone(),
         )
+        .expect("vector reset state clone allocation failed")
     }
 }
 
 impl Vector {
-    /// Create a new flat vector with the given type and capacity.
-    pub fn new(logical_type: LogicalType) -> Self {
-        Self::with_capacity(logical_type, VECTOR_SIZE)
-    }
-
-    /// Create a flat vector with specified capacity.
-    ///
-    /// NOTE: This convenience constructor uses `default_allocator()` and is mainly
-    /// intended for tests or standalone utility code. Production paths should pass
-    /// an explicit allocator via `with_capacity_and_allocator`.
-    pub fn with_capacity(logical_type: LogicalType, capacity: usize) -> Self {
-        let allocator = Arc::new(default_allocator());
-        Self::with_capacity_and_allocator(logical_type, capacity, allocator)
-    }
-
     /// Create a flat vector with specified capacity and allocator.
-    pub fn with_capacity_and_allocator(
+    pub fn try_new(
         logical_type: LogicalType,
         capacity: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> Self {
+    ) -> Result<Self> {
         let element_size = logical_type.physical_size();
         let mut vec = Self {
             vector_type: VectorType::Flat,
-            buffer: VectorBuffer::with_allocator(element_size, capacity, allocator.clone()),
+            buffer: VectorBuffer::try_with_allocator(element_size, capacity, allocator.clone())?,
             validity: ValidityMask::with_allocator(capacity, allocator.clone()),
             count: 0,
             logical_type: logical_type.clone(),
-            sel_vector: None,
+            selection: VectorSelection::None,
             child: None,
             children: Vec::new(),
             string_heap: None,
@@ -128,22 +117,18 @@ impl Vector {
         // Initialize child vectors for nested types
         match &logical_type {
             LogicalType::Array(child_type, array_size) => {
-                let child_capacity = capacity * array_size;
-                let child = Self::with_capacity_and_allocator(
-                    child_type.as_ref().clone(),
-                    child_capacity,
-                    allocator,
-                );
+                let child_capacity = capacity.checked_mul(*array_size).ok_or_else(|| {
+                    paro_error::out_of_memory(format!(
+                        "array vector capacity overflow: capacity={capacity}, array_size={array_size}"
+                    ))
+                })?;
+                let child = Self::try_new(child_type.as_ref().clone(), child_capacity, allocator)?;
                 vec.child = Some(Arc::new(child));
             }
             LogicalType::List(child_type) => {
                 // List data is stored in a child vector.
                 // Capacity of child is initially same as parent (grows as needed)
-                let child = Self::with_capacity_and_allocator(
-                    child_type.as_ref().clone(),
-                    capacity,
-                    allocator,
-                );
+                let child = Self::try_new(child_type.as_ref().clone(), capacity, allocator)?;
                 vec.child = Some(Arc::new(child));
             }
             LogicalType::Struct(_fields) => {
@@ -151,11 +136,7 @@ impl Vector {
                 if let LogicalType::Struct(fields) = &logical_type {
                     let mut children = Vec::with_capacity(fields.len());
                     for (_, field_type) in fields.iter() {
-                        let child = Self::with_capacity_and_allocator(
-                            field_type.clone(),
-                            capacity,
-                            allocator.clone(),
-                        );
+                        let child = Self::try_new(field_type.clone(), capacity, allocator.clone())?;
                         children.push(Arc::new(child));
                     }
                     vec.children = children;
@@ -163,7 +144,7 @@ impl Vector {
             }
             _ => {}
         }
-        vec
+        Ok(vec)
     }
 
     pub fn child(&self) -> Option<&Arc<Vector>> {
@@ -269,25 +250,42 @@ impl Vector {
     }
 
     /// Ensure the vector's primary buffer and validity mask are exclusively owned.
-    pub fn make_exclusive(&mut self) {
-        self.buffer.make_exclusive();
+    pub fn try_make_exclusive(&mut self) -> Result<()> {
+        self.buffer.try_make_exclusive()?;
         self.validity.make_exclusive();
-        if let Some(sel) = &mut self.sel_vector {
-            sel.make_exclusive();
-        }
+        self.selection.try_make_exclusive()?;
+        Ok(())
     }
 
-    fn ensure_buffer_capacity(&mut self, capacity: usize, allocator: Arc<dyn Allocator>) {
+    /// Ensure exclusive ownership for call sites that cannot surface errors.
+    pub fn make_exclusive(&mut self) {
+        self.try_make_exclusive()
+            .expect("vector copy-on-write allocation failed");
+    }
+
+    fn try_ensure_buffer_capacity(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<()> {
         if self.buffer.capacity() >= capacity {
-            return;
+            return Ok(());
         }
-        self.buffer =
-            VectorBuffer::with_allocator(self.logical_type.physical_size(), capacity, allocator);
+        self.buffer = VectorBuffer::try_with_allocator(
+            self.logical_type.physical_size(),
+            capacity,
+            allocator,
+        )?;
+        Ok(())
     }
 
-    pub(crate) fn reset_for_reuse(&mut self, capacity: usize, allocator: Arc<dyn Allocator>) {
+    pub(crate) fn try_reset_for_reuse(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<()> {
         self.vector_type = VectorType::Flat;
-        self.sel_vector = None;
+        self.selection = VectorSelection::None;
         self.dictionary_info = None;
         self.count = 0;
         self.validity.reset(capacity);
@@ -295,28 +293,34 @@ impl Vector {
         let logical_type = self.logical_type.clone();
         match logical_type {
             LogicalType::Array(child_type, array_size) => {
-                let child_capacity = capacity.saturating_mul(array_size);
-                let child = self.child.get_or_insert_with(|| {
-                    Arc::new(Vector::with_capacity_and_allocator(
+                let child_capacity = capacity.checked_mul(array_size).ok_or_else(|| {
+                    paro_error::out_of_memory(format!(
+                        "array vector reset capacity overflow: capacity={capacity}, array_size={array_size}"
+                    ))
+                })?;
+                if self.child.is_none() {
+                    self.child = Some(Arc::new(Vector::try_new(
                         child_type.as_ref().clone(),
                         child_capacity,
                         allocator.clone(),
-                    ))
-                });
-                Arc::make_mut(child).reset_for_reuse(child_capacity, allocator.clone());
+                    )?));
+                }
+                let child = self.child.as_mut().expect("array child must exist");
+                Arc::make_mut(child).try_reset_for_reuse(child_capacity, allocator.clone())?;
                 self.children.clear();
                 self.string_heap = None;
             }
             LogicalType::List(child_type) => {
-                self.ensure_buffer_capacity(capacity, allocator.clone());
-                let child = self.child.get_or_insert_with(|| {
-                    Arc::new(Vector::with_capacity_and_allocator(
+                self.try_ensure_buffer_capacity(capacity, allocator.clone())?;
+                if self.child.is_none() {
+                    self.child = Some(Arc::new(Vector::try_new(
                         child_type.as_ref().clone(),
                         capacity,
                         allocator.clone(),
-                    ))
-                });
-                Arc::make_mut(child).reset_for_reuse(0, allocator.clone());
+                    )?));
+                }
+                let child = self.child.as_mut().expect("list child must exist");
+                Arc::make_mut(child).try_reset_for_reuse(0, allocator.clone())?;
                 self.children.clear();
                 self.string_heap = None;
             }
@@ -325,24 +329,21 @@ impl Vector {
                     self.children = fields
                         .iter()
                         .map(|(_, field_type)| {
-                            Arc::new(Vector::with_capacity_and_allocator(
+                            Ok(Arc::new(Vector::try_new(
                                 field_type.clone(),
                                 capacity,
                                 allocator.clone(),
-                            ))
+                            )?))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                 }
                 for (child, (_, field_type)) in self.children.iter_mut().zip(fields.iter()) {
                     let child_mut = Arc::make_mut(child);
                     if child_mut.logical_type() != field_type {
-                        *child_mut = Vector::with_capacity_and_allocator(
-                            field_type.clone(),
-                            capacity,
-                            allocator.clone(),
-                        );
+                        *child_mut =
+                            Vector::try_new(field_type.clone(), capacity, allocator.clone())?;
                     } else {
-                        child_mut.reset_for_reuse(capacity, allocator.clone());
+                        child_mut.try_reset_for_reuse(capacity, allocator.clone())?;
                     }
                 }
                 self.child = None;
@@ -355,7 +356,7 @@ impl Vector {
             | LogicalType::Json
             | LogicalType::Jsonb
             | LogicalType::Blob => {
-                self.ensure_buffer_capacity(capacity, allocator.clone());
+                self.try_ensure_buffer_capacity(capacity, allocator.clone())?;
                 self.child = None;
                 self.children.clear();
                 if let Some(heap) = &mut self.string_heap {
@@ -372,17 +373,22 @@ impl Vector {
                 }
             }
             _ => {
-                self.ensure_buffer_capacity(capacity, allocator);
+                self.try_ensure_buffer_capacity(capacity, allocator)?;
                 self.child = None;
                 self.children.clear();
                 self.string_heap = None;
             }
         }
+        Ok(())
     }
 
     /// Reset this vector for execution-time reuse while preserving the logical type.
-    pub fn reset_for_execution(&mut self, capacity: usize, allocator: Arc<dyn Allocator>) {
-        self.reset_for_reuse(capacity, allocator);
+    pub fn try_reset_for_execution(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<()> {
+        self.try_reset_for_reuse(capacity, allocator)
     }
 
     // ========== Getters ==========
@@ -414,7 +420,18 @@ impl Vector {
     /// Get the selection vector for DICTIONARY types.
     #[inline]
     pub fn sel_vector(&self) -> Option<&SelectionVector> {
-        self.sel_vector.as_ref()
+        self.selection.as_materialized()
+    }
+
+    /// Get the dictionary selection mapping.
+    #[inline]
+    pub fn selection(&self) -> &VectorSelection {
+        &self.selection
+    }
+
+    #[inline]
+    pub(super) fn physical_index(&self, idx: usize) -> usize {
+        self.selection.physical_index(idx)
     }
 
     #[inline]
@@ -514,7 +531,7 @@ impl Vector {
         match self.vector_type {
             VectorType::Constant => !self.validity.is_valid(0),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.selection.physical_index(idx);
                 self.child.as_ref().unwrap().is_null(physical_idx)
             }
             _ => !self.validity.is_valid(idx),
@@ -671,15 +688,11 @@ impl Vector {
                     VectorType::Flat => (vector, idx),
                     VectorType::Constant => (vector, 0),
                     VectorType::Dictionary => {
-                        let sel = vector
-                            .sel_vector
-                            .as_ref()
-                            .expect("Dictionary vector missing selection vector");
                         let child = vector
                             .child
                             .as_ref()
                             .expect("Dictionary vector missing child");
-                        resolve_array_row(child, sel.get(idx))
+                        resolve_array_row(child, vector.selection.physical_index(idx))
                     }
                     VectorType::Sequence => {
                         panic!("Sequence vectors cannot be Array type");
@@ -708,15 +721,11 @@ impl Vector {
                     VectorType::Flat => (vector, idx),
                     VectorType::Constant => (vector, 0),
                     VectorType::Dictionary => {
-                        let sel = vector
-                            .sel_vector
-                            .as_ref()
-                            .expect("Dictionary vector missing selection vector");
                         let child = vector
                             .child
                             .as_ref()
                             .expect("Dictionary vector missing child");
-                        resolve_list_row(child, sel.get(idx))
+                        resolve_list_row(child, vector.selection.physical_index(idx))
                     }
                     VectorType::Sequence => {
                         panic!("Sequence vectors cannot be List type");
@@ -758,11 +767,9 @@ impl Vector {
             let needed = dest_offset + src_length;
             if needed > dest_capacity {
                 let new_capacity = needed.max(dest_capacity.saturating_mul(2)).max(1);
-                let mut new_child = Vector::with_capacity_and_allocator(
-                    old_child.logical_type.clone(),
-                    new_capacity,
-                    dest_allocator,
-                );
+                let mut new_child =
+                    Vector::try_new(old_child.logical_type.clone(), new_capacity, dest_allocator)
+                        .expect("list child growth allocation failed");
                 new_child.set_count(dest_offset);
                 for i in 0..dest_offset {
                     new_child.copy_at(i, &old_child, i);
@@ -793,15 +800,11 @@ impl Vector {
                     VectorType::Flat => (vector, idx),
                     VectorType::Constant => (vector, 0),
                     VectorType::Dictionary => {
-                        let sel = vector
-                            .sel_vector
-                            .as_ref()
-                            .expect("Dictionary vector missing selection vector");
                         let child = vector
                             .child
                             .as_ref()
                             .expect("Dictionary vector missing child");
-                        resolve_struct_row(child, sel.get(idx))
+                        resolve_struct_row(child, vector.selection.physical_index(idx))
                     }
                     VectorType::Sequence => {
                         panic!("Sequence vectors cannot be Struct type");
@@ -846,11 +849,7 @@ impl Vector {
                 }
                 VectorType::Dictionary => {
                     let child = source.child.as_ref().expect("Dictionary missing child");
-                    let sel = source
-                        .sel_vector
-                        .as_ref()
-                        .expect("Dictionary missing selection vector");
-                    let physical_idx = sel.get(source_idx);
+                    let physical_idx = source.selection.physical_index(source_idx);
                     let src_ptr = child.buffer.data().add(physical_idx * size);
                     std::ptr::copy_nonoverlapping(src_ptr, dest_ptr, size);
                 }
@@ -863,59 +862,6 @@ impl Vector {
             }
         }
     }
-
-    // ========== Associated functions that were forwards ==========
-
-    pub fn constant<T: Copy>(logical_type: LogicalType, value: T, count: usize) -> Self {
-        let allocator = Arc::new(default_allocator());
-        Self::constant_with_allocator(logical_type, value, count, allocator)
-    }
-
-    /// Create a constant null vector.
-    pub fn constant_null(logical_type: LogicalType, count: usize) -> Self {
-        Self::constant_null_with_allocator(logical_type, count, Arc::new(default_allocator()))
-    }
-
-    /// Create a sequence vector: start, start+inc, start+2*inc, ...
-    pub fn sequence(start: i64, increment: i64, count: usize) -> Self {
-        let allocator = Arc::new(default_allocator());
-        Self::sequence_with_allocator(start, increment, count, allocator)
-    }
-
-    /// Create an embedding vector (fixed-size float array).
-    pub fn from_embeddings(embeddings: &[Vec<f32>], dimensions: usize) -> Self {
-        Self::from_embeddings_with_allocator(embeddings, dimensions, Arc::new(default_allocator()))
-    }
-
-    /// Create a flat vector from i64 values.
-    pub fn from_i64(values: &[i64]) -> Self {
-        Self::from_i64_with_allocator(values, Arc::new(default_allocator()))
-    }
-
-    /// Create a flat vector from i32 values.
-    pub fn from_i32(values: &[i32]) -> Self {
-        Self::from_i32_with_allocator(values, Arc::new(default_allocator()))
-    }
-
-    /// Create a flat vector from f64 values.
-    pub fn from_f64(values: &[f64]) -> Self {
-        Self::from_f64_with_allocator(values, Arc::new(default_allocator()))
-    }
-
-    /// Create a flat vector from f32 values.
-    pub fn from_f32(values: &[f32]) -> Self {
-        Self::from_f32_with_allocator(values, Arc::new(default_allocator()))
-    }
-
-    /// Create a flat vector from bool values.
-    pub fn from_bool(values: &[bool]) -> Self {
-        Self::from_bool_with_allocator(values, Arc::new(default_allocator()))
-    }
-
-    /// Create a flat vector from strings.
-    pub fn from_strings(values: &[&str]) -> Self {
-        Self::from_strings_with_allocator(values, Arc::new(default_allocator()))
-    }
 }
 
 impl VectorResetState {
@@ -924,55 +870,53 @@ impl VectorResetState {
         &self.logical_type
     }
 
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         logical_type: LogicalType,
         initial_capacity: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> Self {
-        let mut cached = Vector::with_capacity_and_allocator(
-            logical_type.clone(),
-            initial_capacity,
-            allocator.clone(),
-        );
-        cached.reset_for_reuse(initial_capacity, allocator.clone());
-        Self {
+    ) -> Result<Self> {
+        let mut cached =
+            Vector::try_new(logical_type.clone(), initial_capacity, allocator.clone())?;
+        cached.try_reset_for_reuse(initial_capacity, allocator.clone())?;
+        Ok(Self {
             logical_type,
             initial_capacity,
             allocator,
             cached,
-        }
+        })
     }
 
-    fn fresh_vector(&self) -> Vector {
-        let mut vector = Vector::with_capacity_and_allocator(
+    fn try_fresh_vector(&self) -> Result<Vector> {
+        let mut vector = Vector::try_new(
             self.logical_type.clone(),
             self.initial_capacity,
             self.allocator.clone(),
-        );
-        vector.reset_for_reuse(self.initial_capacity, self.allocator.clone());
-        vector
+        )?;
+        vector.try_reset_for_reuse(self.initial_capacity, self.allocator.clone())?;
+        Ok(vector)
     }
 
-    fn recycle_cached(&mut self) {
+    fn try_recycle_cached(&mut self) -> Result<()> {
         if self.cached.logical_type() != &self.logical_type {
-            self.cached = self.fresh_vector();
-            return;
+            self.cached = self.try_fresh_vector()?;
+            return Ok(());
         }
         self.cached
-            .reset_for_reuse(self.initial_capacity, self.allocator.clone());
+            .try_reset_for_reuse(self.initial_capacity, self.allocator.clone())?;
+        Ok(())
     }
 
-    pub(crate) fn reset_unique(&mut self, target: &mut Vector) {
+    pub(crate) fn try_reset_unique(&mut self, target: &mut Vector) -> Result<()> {
         std::mem::swap(target, &mut self.cached);
-        target.reset_for_reuse(self.initial_capacity, self.allocator.clone());
-        self.recycle_cached();
+        target.try_reset_for_reuse(self.initial_capacity, self.allocator.clone())?;
+        self.try_recycle_cached()
     }
 
-    pub(crate) fn reset_shared(&mut self) -> Vector {
-        let fresh = self.fresh_vector();
+    pub(crate) fn try_reset_shared(&mut self) -> Result<Vector> {
+        let fresh = self.try_fresh_vector()?;
         let mut active = std::mem::replace(&mut self.cached, fresh);
-        active.reset_for_reuse(self.initial_capacity, self.allocator.clone());
-        active
+        active.try_reset_for_reuse(self.initial_capacity, self.allocator.clone())?;
+        Ok(active)
     }
 }
 
@@ -981,9 +925,7 @@ impl Vector {
         let mut total_size = 0;
         total_size += self.buffer.collect_allocation_size(allocations);
         total_size += self.validity.collect_allocation_size(allocations);
-        if let Some(sel) = &self.sel_vector {
-            total_size += sel.collect_allocation_size(allocations);
-        }
+        total_size += self.selection.collect_allocation_size(allocations);
         if let Some(heap) = &self.string_heap {
             total_size += allocations.add(heap.allocation_identity(), heap.allocation_size());
         }
@@ -994,6 +936,34 @@ impl Vector {
             total_size += child.collect_allocation_size(allocations);
         }
         total_size
+    }
+
+    pub fn collect_allocation_entries(&self, entries: &mut Vec<(AllocationId, usize)>) {
+        let mut raw_entries = Vec::new();
+        self.collect_raw_allocation_entries(&mut raw_entries);
+        entries.extend(
+            raw_entries
+                .into_iter()
+                .map(|(id, bytes)| (AllocationId(id as u64), bytes)),
+        );
+    }
+
+    fn collect_raw_allocation_entries(&self, entries: &mut Vec<(usize, usize)>) {
+        self.buffer.collect_allocation_entries(entries);
+        self.validity.collect_allocation_entries(entries);
+        self.selection.collect_allocation_entries(entries);
+        if let Some(heap) = &self.string_heap {
+            let bytes = heap.allocation_size();
+            if bytes > 0 {
+                entries.push((heap.allocation_identity(), bytes));
+            }
+        }
+        if let Some(child) = &self.child {
+            child.collect_raw_allocation_entries(entries);
+        }
+        for child in &self.children {
+            child.collect_raw_allocation_entries(entries);
+        }
     }
 
     pub fn verify(&self, count: usize) {
@@ -1025,16 +995,12 @@ impl Vector {
 
             match self.vector_type {
                 VectorType::Dictionary => {
-                    let sel = self
-                        .sel_vector
-                        .as_ref()
-                        .expect("Dictionary vector missing selection vector");
                     let child = self
                         .child
                         .as_ref()
                         .expect("Dictionary vector missing child");
                     debug_assert_eq!(
-                        sel.len(),
+                        self.selection.len(),
                         self.len(),
                         "Dictionary selection length mismatch for {:?}",
                         self.logical_type
@@ -1044,9 +1010,10 @@ impl Vector {
                         &self.logical_type,
                         "Dictionary child type mismatch"
                     );
-                    for &physical_idx in sel.as_slice().iter().take(count) {
+                    for row_idx in 0..count {
+                        let physical_idx = self.selection.physical_index(row_idx);
                         debug_assert!(
-                            (physical_idx as usize) < child.len(),
+                            physical_idx < child.len(),
                             "Dictionary index {} out of bounds for child len {}",
                             physical_idx,
                             child.len()

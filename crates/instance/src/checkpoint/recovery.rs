@@ -554,9 +554,7 @@ mod tests {
     use paro_common::checkpoint::{
         DeferredTaskKey, DeferredTaskKind, DeferredTaskProgress, DeferredTaskScope,
     };
-    use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
     use paro_storage::table::table_factory::TableFactory;
     use std::sync::Arc;
 
@@ -586,7 +584,9 @@ mod tests {
             )
             .expect("create table in catalog");
         art_storage
-            .append(&Chunk::from_vectors(vec![Vector::from_i32(&[1, 2, 3])]))
+            .append(&paro_common::test_utils::test_chunk_from_vectors(vec![
+                paro_common::test_utils::test_i32_vector(&[1, 2, 3]),
+            ]))
             .expect("append users");
 
         let fulltext_storage = Arc::new(
@@ -607,9 +607,9 @@ mod tests {
             )
             .expect("create docs table in catalog");
         fulltext_storage
-            .append(&Chunk::from_vectors(vec![Vector::from_strings(&[
-                "vector db",
-            ])]))
+            .append(&paro_common::test_utils::test_chunk_from_vectors(vec![
+                paro_common::test_utils::test_string_vector(&["vector db"]),
+            ]))
             .expect("append docs");
         let read_txn = CatalogSnapshot::read_only(u64::MAX);
         let schema = catalog

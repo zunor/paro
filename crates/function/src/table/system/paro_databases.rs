@@ -204,6 +204,7 @@ fn paro_databases_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoDatabasesGlobalState>());
@@ -258,64 +259,64 @@ fn paro_databases_function(
     // Set column values
     if count > 0 {
         // Column 0: database_oid (BIGINT)
-        let db_oid_vec = Vector::from_i64(&db_oids);
+        let db_oid_vec = Vector::try_from_i64(&db_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(0) {
             *col = db_oid_vec;
         }
 
         // Column 1: database_name (VARCHAR)
         let db_name_refs: Vec<&str> = db_names.iter().map(|s| s.as_str()).collect();
-        let db_name_vec = Vector::from_strings(&db_name_refs);
+        let db_name_vec = Vector::try_from_strings(&db_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(1) {
             *col = db_name_vec;
         }
 
         // Column 2: owner_oid (BIGINT)
-        let owner_oid_vec = Vector::from_i64(&owner_oids);
+        let owner_oid_vec = Vector::try_from_i64(&owner_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(2) {
             *col = owner_oid_vec;
         }
 
         // Column 3: encoding (INTEGER)
-        let encoding_vec = Vector::from_i32(&encodings);
+        let encoding_vec = Vector::try_from_i32(&encodings, output_allocator.clone())?;
         if let Some(col) = output.column_mut(3) {
             *col = encoding_vec;
         }
 
         // Column 4: collate (VARCHAR)
         let collate_refs: Vec<&str> = collates.iter().map(|s| s.as_str()).collect();
-        let collate_vec = Vector::from_strings(&collate_refs);
+        let collate_vec = Vector::try_from_strings(&collate_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(4) {
             *col = collate_vec;
         }
 
         // Column 5: ctype (VARCHAR)
         let ctype_refs: Vec<&str> = ctypes.iter().map(|s| s.as_str()).collect();
-        let ctype_vec = Vector::from_strings(&ctype_refs);
+        let ctype_vec = Vector::try_from_strings(&ctype_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(5) {
             *col = ctype_vec;
         }
 
         // Column 6: is_template (BOOLEAN)
-        let is_template_vec = Vector::from_bool(&is_templates);
+        let is_template_vec = Vector::try_from_bool(&is_templates, output_allocator.clone())?;
         if let Some(col) = output.column_mut(6) {
             *col = is_template_vec;
         }
 
         // Column 7: allow_conn (BOOLEAN)
-        let allow_conn_vec = Vector::from_bool(&allow_conns);
+        let allow_conn_vec = Vector::try_from_bool(&allow_conns, output_allocator.clone())?;
         if let Some(col) = output.column_mut(7) {
             *col = allow_conn_vec;
         }
 
         // Column 8: conn_limit (INTEGER)
-        let conn_limit_vec = Vector::from_i32(&conn_limits);
+        let conn_limit_vec = Vector::try_from_i32(&conn_limits, output_allocator.clone())?;
         if let Some(col) = output.column_mut(8) {
             *col = conn_limit_vec;
         }
 
         // Column 9: acl (VARCHAR, nullable)
-        let acl_vec = Vector::from_nullable_strings(&acls);
+        let acl_vec = Vector::try_from_nullable_strings(&acls, output_allocator.clone())?;
         if let Some(col) = output.column_mut(9) {
             *col = acl_vec;
         }
@@ -438,7 +439,7 @@ mod tests {
             global_state: Some(state),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::BigInt,
                 LogicalType::Varchar,
@@ -512,7 +513,7 @@ mod tests {
             global_state: Some(state_ref),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::BigInt,
                 LogicalType::Varchar,

@@ -18,7 +18,7 @@ ORDER_BY  (rows=2)
   ->  PROJECTION  (rows=2)
         Output: __ext_8_0
         ->  EXTERNAL_PROJECT  (rows=2)
-              Routines: py_explain[10315@1]
+              Routines: py_explain[<routine-id>@1]
               Language: python
               Backend: process@local_shm
               Batch Target: 262144 bytes (max accumulation 4194304 bytes)
@@ -36,15 +36,15 @@ SELECT py_explain(v)
 FROM (VALUES (1), (2)) AS t(v)
 ORDER BY 1;
 QUERY PLAN
-ORDER_BY  (rows=2) (actual time=36.978..38.129 rows=4 loops=3)
+ORDER_BY  (rows=2) (actual time=<time-range> rows=4 loops=3)
   Sort Key: __ext_8_0 ASC NULLS LAST
   Sort Method: quicksort
   Spilled: false
-  Peak Memory: 0 B
-  ->  PROJECTION  (rows=2) (actual time=36.957..36.972 rows=2 loops=1)
+  Peak Memory: <bytes>
+  ->  PROJECTION  (rows=2) (actual time=<time-range> rows=2 loops=1)
         Output: __ext_8_0
-        ->  EXTERNAL_PROJECT  (rows=2) (actual time=0.330..36.953 rows=2 loops=2)
-              Routines: py_explain[10315@1]
+        ->  EXTERNAL_PROJECT  (rows=2) (actual time=<time-range> rows=2 loops=2)
+              Routines: py_explain[<routine-id>@1]
               Language: python
               Backend: process@local_shm
               Batch Target: 262144 bytes (max accumulation 4194304 bytes)
@@ -53,15 +53,17 @@ ORDER_BY  (rows=2) (actual time=36.978..38.129 rows=4 loops=3)
               Batching Contract: child chunk -> runtime submission -> engine emission
               Cost: startup=1.000, per_row=1.000, bytes=4.000, queue_risk=0.200
               Runtime: submissions=1 blocked=0 input_rows=2 output_rows=2
-              Latency(us): acquire=1 queue=0 kernel=36488 encode_decode=36436
+              Latency(us): acquire=<us> queue=<us> kernel=<us> encode_decode=<us>
               Data Plane: 20 bytes, warm=0 cold=1 retired=0
               Cache: hits=0 misses=1 admissions=1 evictions=0 resident=10 bytes
               Spilled: false
-              Peak Memory: 40 B
-              ->  PROJECTION  (rows=2) (actual time=0.320..0.330 rows=2 loops=1)
+              Peak Memory: <bytes>
+              Data Plane: 20 B
+              Output Buffer: 30 B
+              ->  PROJECTION  (rows=2) (actual time=<time-range> rows=2 loops=1)
                     Output: col0
-                    ->  EXPRESSION_SCAN  (rows=2) (actual time=0.269..0.362 rows=2 loops=2)
-Execution Time: 0.522 ms
+                    ->  EXPRESSION_SCAN  (rows=2) (actual time=<time-range> rows=2 loops=2)
+Execution Time: <time-ms>
 Rows Returned: 2
 
 DROP FUNCTION py_explain(INTEGER);

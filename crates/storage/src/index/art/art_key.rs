@@ -950,6 +950,7 @@ unsafe impl Sync for ARTKey {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::*;
     use paro_common::allocator::DefaultAllocator;
     use std::sync::Arc;
 
@@ -1165,7 +1166,7 @@ mod tests {
     #[test]
     fn test_art_key_from_vector_value() {
         let mut arena = create_arena();
-        let vector = Vector::from_i32(&[-7, 42]);
+        let vector = test_i32_vector(&[-7, 42]);
 
         let key = ARTKey::from_vector_value(&vector, 1, &LogicalType::Integer, &mut arena).unwrap();
         let expected = ARTKey::from_i32(&mut arena, 42).unwrap();
@@ -1176,7 +1177,7 @@ mod tests {
     #[test]
     fn test_art_key_from_vector_value_rejects_null() {
         let mut arena = create_arena();
-        let vector = Vector::from_nullable_strings(&[Some("alpha"), None]);
+        let vector = test_nullable_string_vector(&[Some("alpha"), None]);
 
         let result = ARTKey::from_vector_value(&vector, 1, &LogicalType::Varchar, &mut arena);
         assert!(result.is_err());

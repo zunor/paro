@@ -63,6 +63,7 @@ pub use result::progress::{
     TerminalProgressBarDisplay,
 };
 pub use result::query::QueryResult;
+pub use result::retained_store::{SessionMemoryBudget, SessionRetainedResultStore};
 pub use result::sink::ResultSink;
 pub use session::{Session, TransactionState};
 pub use state::session_state::SessionState;

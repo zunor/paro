@@ -8,9 +8,10 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use paro_common::allocator::ArenaAllocator;
+use paro_common::allocator::{Allocator, ArenaAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryDomain, MemoryOwner, MemoryOwnerAllocator};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
@@ -36,6 +37,9 @@ use crate::operator::state::{
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
 use crate::result_type::{SinkCombineResultType, SinkResultType, SourceResultType};
+
+const PERFECT_HASH_AGGREGATE_MEMORY_TAG: MemoryTag = MemoryTag::HashTable;
+const PERFECT_HASH_AGGREGATE_MEMORY_CLASS: MemoryAccountingClass = MemoryAccountingClass::Revocable;
 
 pub struct PerfectHashAggregate {
     pub aggregate_data: GroupedAggregateData,
@@ -110,14 +114,6 @@ impl PerfectHashAggregate {
 
         let layout = AggregateStateLayout::new(&aggregate_objects)?;
         let has_filters = aggregate_objects.iter().any(|obj| obj.filter.is_some());
-        let global_hash_table = PerfectAggregateHashTable::new(
-            group_types.clone(),
-            aggregate_objects.clone(),
-            aggregate_data.aggregate_inputs.clone(),
-            group_minima.clone(),
-            required_bits.clone(),
-        )?;
-
         Ok(Self {
             aggregate_data,
             aggregate_objects,
@@ -129,7 +125,7 @@ impl PerfectHashAggregate {
             has_filters,
             group_minima,
             required_bits,
-            shared: Arc::new(PerfectHashAggregateShared::new(global_hash_table)),
+            shared: Arc::new(PerfectHashAggregateShared::new()),
         })
     }
 
@@ -143,13 +139,13 @@ impl PerfectHashAggregate {
             })?);
             group_vectors.push(group_vector);
         }
-        let mut groups = Chunk::from_arc_vectors(group_vectors);
+        let mut groups = Chunk::from_arc_vectors(group_vectors, payload.allocator().clone());
         groups.set_cardinality(payload.size());
         Ok(groups)
     }
 
-    fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> SelectionVector {
-        let filter_format = filter_vec.decode(row_count);
+    fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> Result<SelectionVector> {
+        let filter_format = filter_vec.try_decode(row_count)?;
         let filter_data = filter_format.get_data::<bool>();
         let mut selected_rows = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
@@ -162,7 +158,7 @@ impl PerfectHashAggregate {
                 selected_rows.push(row_idx as u32);
             }
         }
-        SelectionVector::from_indices(selected_rows)
+        SelectionVector::try_from_indices(selected_rows, filter_vec.allocator().clone())
     }
 
     fn filter_selection_for_aggregate(
@@ -205,7 +201,7 @@ impl PerfectHashAggregate {
         Ok(Some(Self::build_filter_selection(
             filter_vec,
             payload.size(),
-        )))
+        )?))
     }
 
     fn selected_state_addresses(
@@ -222,11 +218,15 @@ impl PerfectHashAggregate {
         }
         let state_offset = self.layout.state_offset(agg_idx);
 
-        let mut selected = Vector::with_capacity(LogicalType::BigInt, selection.len());
+        let mut selected = Vector::try_new(
+            LogicalType::BigInt,
+            selection.len(),
+            addresses.allocator().clone(),
+        )?;
         selected.set_count(selection.len());
         let selected_data = unsafe { selected.flat_data_mut::<*mut u8>() };
 
-        let address_format = addresses.decode(addresses.len());
+        let address_format = addresses.try_decode(addresses.len())?;
         let address_data = address_format.get_data::<*mut u8>();
         for idx in 0..selection.len() {
             let row_idx = selection.get(idx);
@@ -314,7 +314,8 @@ impl PerfectHashAggregate {
         addresses: &Vector,
         arena: &mut ArenaAllocator,
     ) -> Result<()> {
-        let all_rows = SelectionVector::incremental(payload.size());
+        let all_rows =
+            SelectionVector::try_incremental(payload.size(), payload.allocator().clone())?;
         for agg_idx in 0..self.aggregate_objects.len() {
             let aggregate_states = self.selected_state_addresses(addresses, &all_rows, agg_idx)?;
             let filter_selection = self.filter_selection_for_aggregate(agg_idx, payload)?;
@@ -329,13 +330,14 @@ impl PerfectHashAggregate {
         Ok(())
     }
 
-    fn new_hash_table(&self) -> Result<PerfectAggregateHashTable> {
+    fn new_hash_table(&self, allocator: Arc<dyn Allocator>) -> Result<PerfectAggregateHashTable> {
         PerfectAggregateHashTable::new(
             self.group_types.clone(),
             self.aggregate_objects.clone(),
             self.aggregate_data.aggregate_inputs.clone(),
             self.group_minima.clone(),
             self.required_bits.clone(),
+            allocator,
         )
     }
 }
@@ -352,16 +354,15 @@ impl fmt::Debug for PerfectHashAggregate {
 
 #[derive(Debug)]
 struct PerfectHashAggregateShared {
-    hash_table: Mutex<PerfectAggregateHashTable>,
+    hash_table: Mutex<Option<PerfectAggregateHashTable>>,
     peak_memory_bytes: AtomicUsize,
 }
 
 impl PerfectHashAggregateShared {
-    fn new(hash_table: PerfectAggregateHashTable) -> Self {
-        let initial = hash_table.memory_usage();
+    fn new() -> Self {
         Self {
-            hash_table: Mutex::new(hash_table),
-            peak_memory_bytes: AtomicUsize::new(initial),
+            hash_table: Mutex::new(None),
+            peak_memory_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -443,6 +444,7 @@ impl PhysicalOperator for PerfectHashAggregate {
             spilled: None,
             peak_memory_bytes: Some(self.shared.peak_memory_bytes() as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -507,21 +509,29 @@ impl PhysicalOperator for PerfectHashAggregate {
         true
     }
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+        let allocator = perfect_hash_aggregate_allocator(ctx);
+        let hash_table = self.new_hash_table(allocator)?;
+        self.shared.record_peak(hash_table.memory_usage());
+        *self
+            .shared
+            .hash_table
+            .lock()
+            .map_err(|e| paro_error::internal(e.to_string()))? = Some(hash_table);
         Ok(Box::new(PerfectHashAggregateGlobalState {
             shared: self.shared.clone(),
         }))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
         Ok(Box::new(PerfectHashAggregateLocalSinkState {
-            hash_table: self.new_hash_table()?,
+            hash_table: self.new_hash_table(perfect_hash_aggregate_allocator(ctx))?,
         }))
     }
 
     fn sink(
         &self,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         chunk: &Chunk,
         input: &mut OperatorSinkInput,
     ) -> Result<SinkResultType> {
@@ -536,8 +546,10 @@ impl PhysicalOperator for PerfectHashAggregate {
             .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
 
         let groups = self.build_groups_chunk(chunk)?;
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, chunk.size());
-        let mut new_groups = SelectionVector::with_capacity(chunk.size());
+        let mut addresses =
+            Vector::try_new(LogicalType::BigInt, chunk.size(), chunk.allocator().clone())?;
+        let mut new_groups =
+            SelectionVector::try_with_capacity(chunk.size(), chunk.allocator().clone())?;
         lstate
             .hash_table
             .find_or_create_groups(&groups, &mut addresses, &mut new_groups)?;
@@ -550,7 +562,7 @@ impl PhysicalOperator for PerfectHashAggregate {
             return Ok(SinkResultType::NeedMoreInput);
         }
 
-        let mut arena = ctx.arena_allocator();
+        let mut arena = ArenaAllocator::new(lstate.hash_table.allocator());
         self.update_aggregates_with_filters(chunk, &addresses, &mut arena)?;
         self.shared.record_peak(lstate.hash_table.memory_usage());
         Ok(SinkResultType::NeedMoreInput)
@@ -577,6 +589,9 @@ impl PhysicalOperator for PerfectHashAggregate {
             .hash_table
             .lock()
             .map_err(|e| paro_error::internal(e.to_string()))?;
+        let ght = ght.as_mut().ok_or_else(|| {
+            paro_error::internal("Perfect hash aggregate global state was not initialized")
+        })?;
         ght.combine(&mut lstate.hash_table)?;
         gstate.shared.record_peak(ght.memory_usage());
         Ok(SinkCombineResultType::Finished)
@@ -624,6 +639,9 @@ impl PhysicalOperator for PerfectHashAggregate {
             .hash_table
             .lock()
             .map_err(|e| paro_error::internal(e.to_string()))?;
+        let ght = ght.as_mut().ok_or_else(|| {
+            paro_error::internal("Perfect hash aggregate global state was not initialized")
+        })?;
         if ght.scan(&mut lstate.position, chunk)? {
             return Ok(SourceResultType::HaveMoreOutput);
         }
@@ -638,4 +656,15 @@ impl PhysicalOperator for PerfectHashAggregate {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+fn perfect_hash_aggregate_allocator(ctx: &ExecutionContext) -> Arc<dyn Allocator> {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    Arc::new(MemoryOwnerAllocator::new(
+        ctx.allocator(PERFECT_HASH_AGGREGATE_MEMORY_TAG),
+        owner,
+        MemoryDomain::Host,
+        PERFECT_HASH_AGGREGATE_MEMORY_TAG,
+        PERFECT_HASH_AGGREGATE_MEMORY_CLASS,
+    ))
 }

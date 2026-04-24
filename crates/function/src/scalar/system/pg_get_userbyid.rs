@@ -86,10 +86,13 @@ mod tests {
 
     #[test]
     fn test_pg_get_userbyid_basic() {
-        let input_vec = Vector::from_i64(&[0, 1, 10, 100]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[0, 1, 10, 100],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         pg_get_userbyid_impl(&chunk, &state, &mut result).unwrap();
 
@@ -101,11 +104,14 @@ mod tests {
 
     #[test]
     fn test_pg_get_userbyid_with_null() {
-        let mut input_vec = Vector::from_i64(&[0, 1]);
+        let mut input_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[0, 1],
+            paro_common::test_utils::test_allocator(),
+        );
         input_vec.validity_mut().set_null(1);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         pg_get_userbyid_impl(&chunk, &state, &mut result).unwrap();
 

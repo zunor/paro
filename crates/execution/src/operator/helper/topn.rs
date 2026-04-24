@@ -10,6 +10,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
 
@@ -73,6 +76,16 @@ impl TopN {
     pub fn total_rows(&self) -> usize {
         self.limit.saturating_add(self.offset)
     }
+}
+
+fn topn_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        paro_common::allocator::MemoryTag::OrderBy,
+        MemoryAccountingClass::Revocable,
+    )
 }
 
 /// Global sink state for TopN operator.
@@ -143,12 +156,18 @@ impl LocalSinkState for TopNLocalSinkState {
 }
 
 impl TopNLocalSinkState {
-    fn prepare_sort_chunk(&mut self, required_capacity: usize) {
+    fn prepare_sort_chunk(&mut self, required_capacity: usize) -> Result<()> {
         if self.sort_chunk.capacity() < required_capacity {
-            self.sort_chunk = Chunk::initialize(&self.sort_types, required_capacity);
+            self.sort_chunk = Chunk::try_initialize(
+                &self.sort_types,
+                required_capacity,
+                self.sort_chunk.allocator().clone(),
+            )?;
         } else {
-            self.sort_chunk.reset();
+            self.sort_chunk
+                .try_reset(self.sort_chunk.allocator().clone())?;
         }
+        Ok(())
     }
 
     fn memory_usage_bytes(&self) -> usize {
@@ -257,6 +276,7 @@ impl PhysicalOperator for TopN {
             spilled: None,
             peak_memory_bytes: Some(sink_state.peak_memory_bytes() as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -293,8 +313,14 @@ impl PhysicalOperator for TopN {
         true
     }
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        let heap = TopNHeap::new(self.types.clone(), &self.orders, self.limit, self.offset);
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+        let heap = TopNHeap::new_with_memory(
+            self.types.clone(),
+            &self.orders,
+            self.limit,
+            self.offset,
+            topn_memory_context(ctx),
+        );
         let boundary = Arc::new(TopNBoundaryValue::new());
 
         Ok(Box::new(TopNGlobalSinkState {
@@ -304,8 +330,14 @@ impl PhysicalOperator for TopN {
         }))
     }
 
-    fn get_local_sink_state(&self, _context: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        let heap = TopNHeap::new(self.types.clone(), &self.orders, self.limit, self.offset);
+    fn get_local_sink_state(&self, context: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        let heap = TopNHeap::new_with_memory(
+            self.types.clone(),
+            &self.orders,
+            self.limit,
+            self.offset,
+            topn_memory_context(context),
+        );
 
         // Clone ORDER BY expressions for this local state
         let order_expressions: Vec<Expression> = self
@@ -319,7 +351,11 @@ impl PhysicalOperator for TopN {
             .iter()
             .map(|expr| expr.return_type())
             .collect();
-        let sort_chunk = Chunk::initialize(&sort_types, paro_common::vector::VECTOR_SIZE);
+        let sort_chunk = Chunk::try_initialize(
+            &sort_types,
+            paro_common::vector::VECTOR_SIZE,
+            context.allocator(paro_common::allocator::MemoryTag::BaseTable),
+        )?;
 
         Ok(Box::new(TopNLocalSinkState {
             heap,
@@ -348,7 +384,7 @@ impl PhysicalOperator for TopN {
             .expect("Invalid local sink state type");
 
         // Evaluate ORDER BY expressions into the scratch sort chunk before heap insertion.
-        lstate.prepare_sort_chunk(chunk.size());
+        lstate.prepare_sort_chunk(chunk.size())?;
 
         let mut executor = ExpressionExecutor::with_expressions(&lstate.order_expressions);
         executor.execute_all_into(chunk, context, &mut lstate.sort_chunk)?;
@@ -521,10 +557,11 @@ impl PhysicalOperator for TopN {
 
         // Initialize output vectors
         for col_type in &self.types {
-            output_vectors.push(Arc::new(paro_common::vector::Vector::with_capacity(
+            output_vectors.push(Arc::new(paro_common::vector::Vector::try_new(
                 col_type.clone(),
                 paro_common::vector::VECTOR_SIZE,
-            )));
+                chunk.allocator().clone(),
+            )?));
         }
 
         // Copy data from result chunks
@@ -576,7 +613,7 @@ impl PhysicalOperator for TopN {
             for vec in &mut output_vectors {
                 Arc::get_mut(vec).unwrap().set_count(output_count);
             }
-            *chunk = Chunk::from_arc_vectors(output_vectors);
+            *chunk = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
             chunk.set_cardinality(output_count);
             Ok(SourceResultType::HaveMoreOutput)
         } else {
@@ -622,11 +659,14 @@ mod tests {
             heap: TopNHeap::new(vec![LogicalType::Integer], &[], 4, 0),
             order_expressions: Vec::new(),
             sort_types: sort_types.clone(),
-            sort_chunk: Chunk::initialize(&sort_types, paro_common::vector::VECTOR_SIZE),
+            sort_chunk: paro_common::test_utils::test_chunk_with_capacity(
+                &sort_types,
+                paro_common::vector::VECTOR_SIZE,
+            ),
         };
 
         let required_capacity = paro_common::vector::VECTOR_SIZE + 128;
-        state.prepare_sort_chunk(required_capacity);
+        state.prepare_sort_chunk(required_capacity).unwrap();
 
         assert!(state.sort_chunk.capacity() >= required_capacity);
         assert_eq!(state.sort_chunk.column_count(), sort_types.len());

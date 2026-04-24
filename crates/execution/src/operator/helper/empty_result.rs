@@ -51,9 +51,9 @@ impl PhysicalOperator for EmptyResult {
         _input: &mut OperatorSourceInput,
     ) -> Result<SourceResultType> {
         if chunk.column_count() != self.types.len() {
-            *chunk = Chunk::initialize(&self.types, 0);
+            *chunk = Chunk::try_initialize(&self.types, 0, chunk.allocator().clone())?;
         } else {
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
         }
         chunk.set_cardinality(0);
         Ok(SourceResultType::Finished)
@@ -74,7 +74,7 @@ mod tests {
     use crate::execution_context::ExecutionContext;
     use crate::operator::state::OperatorSourceInput;
     use crate::operator::PhysicalOperator;
-    use paro_common::chunk::Chunk;
+
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_scheduler::task::InterruptState;
@@ -98,7 +98,8 @@ mod tests {
             .expect("local source");
         let interrupt = InterruptState::default();
         let mut input = OperatorSourceInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], 1);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 1);
 
         let result = op.get_data(&ctx, &mut chunk, &mut input).expect("get data");
         assert_eq!(result, crate::result_type::SourceResultType::Finished);

@@ -832,7 +832,7 @@ fn build_key_chunk(
     allocator: Arc<dyn Allocator>,
 ) -> Result<Chunk> {
     if rows == 0 {
-        return Ok(Chunk::with_allocator(allocator));
+        return Chunk::try_new(allocator);
     }
 
     let mut data_map: HashMap<ColumnId, &ColumnBatch> = HashMap::new();
@@ -851,5 +851,5 @@ fn build_key_chunk(
         vectors.push(Arc::new(vector));
     }
 
-    Ok(Chunk::from_arc_vectors(vectors))
+    Ok(Chunk::from_arc_vectors(vectors, allocator))
 }

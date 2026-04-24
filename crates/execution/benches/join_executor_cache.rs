@@ -7,7 +7,6 @@ use divan::Bencher;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
 use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
@@ -42,10 +41,19 @@ fn bench_state() -> &'static BenchState {
 
         BenchState {
             runtime,
-            join_key_input: Chunk::from_vectors(vec![
-                Vector::from_i32(&left_values),
-                Vector::from_i32(&right_values),
-            ]),
+            join_key_input: Chunk::from_vectors(
+                vec![
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &left_values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &right_values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ),
             join_key_exprs: vec![
                 Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
                 Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
@@ -61,7 +69,10 @@ fn bench_state() -> &'static BenchState {
 }
 
 fn single_row_chunk(left: i32, right: i32) -> Chunk {
-    let mut chunk = Chunk::initialize(&[LogicalType::Integer, LogicalType::Integer], 1);
+    let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        1,
+    );
     chunk.set_cardinality(1);
     chunk
         .column_mut(0)
@@ -78,7 +89,8 @@ fn single_row_chunk(left: i32, right: i32) -> Chunk {
 fn hash_join_keys_cached_executor(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::with_expressions(&state.join_key_exprs);
-    let mut output = Chunk::new();
+    let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
     bencher
         .counter(state.join_key_input.size())
         .bench_local(|| {
@@ -92,7 +104,8 @@ fn hash_join_keys_cached_executor(bencher: Bencher) {
 #[divan::bench(sample_count = 10)]
 fn hash_join_keys_new_per_batch(bencher: Bencher) {
     let state = bench_state();
-    let mut output = Chunk::new();
+    let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
     bencher
         .counter(state.join_key_input.size())
         .bench_local(|| {

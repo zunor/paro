@@ -134,6 +134,7 @@ fn paro_property_graphs_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoPropertyGraphsGlobalState>());
@@ -185,31 +186,31 @@ fn paro_property_graphs_function(
     if count > 0 {
         let refs: Vec<&str> = graph_names.iter().map(|s| s.as_str()).collect();
         if let Some(col) = output.column_mut(0) {
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         let refs: Vec<&str> = vertex_tables.iter().map(|s| s.as_str()).collect();
         if let Some(col) = output.column_mut(1) {
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         let refs: Vec<&str> = edge_tables.iter().map(|s| s.as_str()).collect();
         if let Some(col) = output.column_mut(2) {
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(3) {
-            *col = Vector::from_i64(&vertex_counts);
+            *col = Vector::try_from_i64(&vertex_counts, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(4) {
-            *col = Vector::from_i64(&edge_counts);
+            *col = Vector::try_from_i64(&edge_counts, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(5) {
             let refs: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(6) {
-            *col = Vector::from_i64(&delta_sizes);
+            *col = Vector::try_from_i64(&delta_sizes, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(7) {
-            let mut ts = Vector::with_capacity(LogicalType::Timestamp, count);
+            let mut ts = Vector::try_new(LogicalType::Timestamp, count, output_allocator.clone())?;
             ts.set_len(count);
             for (idx, value) in last_rebuilds.iter().enumerate() {
                 match value {
@@ -221,10 +222,10 @@ fn paro_property_graphs_function(
         }
         if let Some(col) = output.column_mut(8) {
             let refs: Vec<&str> = fingerprints.iter().map(|s| s.as_str()).collect();
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(9) {
-            *col = Vector::from_i64(&index_sizes);
+            *col = Vector::try_from_i64(&index_sizes, output_allocator.clone())?;
         }
         output.set_cardinality(count);
     }

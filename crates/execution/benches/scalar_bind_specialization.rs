@@ -7,7 +7,6 @@ use divan::Bencher;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
 use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
@@ -61,8 +60,20 @@ fn bench_state() -> &'static BenchState {
 
         BenchState {
             runtime,
-            regexp_input: Chunk::from_vectors(vec![Vector::from_strings(&regexp_refs)]),
-            substring_input: Chunk::from_vectors(vec![Vector::from_strings(&substring_refs)]),
+            regexp_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_string_vector_with_allocator(
+                    &regexp_refs,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
+            substring_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_string_vector_with_allocator(
+                    &substring_refs,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
             regexp_bound: regexp_expr(true),
             regexp_unbound: regexp_expr(false),
             substring_bound: substring_expr(true),
@@ -155,7 +166,7 @@ fn substring_expr(specialized: bool) -> Expression {
 fn regexp_bound_constant_pattern(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.regexp_bound);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher.counter(state.regexp_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -175,7 +186,7 @@ fn regexp_bound_constant_pattern(bencher: Bencher) {
 fn regexp_unbound_constant_pattern(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.regexp_unbound);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher.counter(state.regexp_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -195,7 +206,7 @@ fn regexp_unbound_constant_pattern(bencher: Bencher) {
 fn substring_bound_constant_args(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.substring_bound);
-    let mut result = Vector::with_capacity(LogicalType::Varchar, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Varchar, ROWS);
     bencher
         .counter(state.substring_input.size())
         .bench_local(|| {
@@ -217,7 +228,7 @@ fn substring_bound_constant_args(bencher: Bencher) {
 fn substring_unbound_constant_args(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.substring_unbound);
-    let mut result = Vector::with_capacity(LogicalType::Varchar, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Varchar, ROWS);
     bencher
         .counter(state.substring_input.size())
         .bench_local(|| {
