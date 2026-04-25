@@ -38,7 +38,7 @@ pub(crate) fn scatter(
     output_positions: &[usize],
 ) -> Result<()> {
     for (src_idx, dst_idx) in output_positions.iter().copied().enumerate() {
-        output.copy_at(dst_idx, source, src_idx);
+        output.try_copy_at(dst_idx, source, src_idx)?;
     }
     Ok(())
 }

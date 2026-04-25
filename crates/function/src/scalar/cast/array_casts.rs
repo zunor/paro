@@ -91,17 +91,17 @@ fn materialize_array_elements(source: &Vector, count: usize) -> Result<(ArrayVie
         child_count.max(1),
         source.allocator().clone(),
     )?;
-    materialized.set_count(child_count);
+    materialized.try_set_count(child_count)?;
 
     for row in 0..count {
         for offset in 0..array.array_size() {
             let output_idx = row * array.array_size() + offset;
             if !array.is_valid(row) || !array.child_is_valid(row, offset) {
-                materialized.set_null(output_idx, true);
+                materialized.try_set_null(output_idx, true)?;
                 continue;
             }
             let physical_idx = array.physical_child_index(row, offset);
-            materialized.copy_at(output_idx, child, physical_idx);
+            materialized.try_copy_at(output_idx, child, physical_idx)?;
         }
     }
 
@@ -374,7 +374,7 @@ pub fn array_to_varchar_cast(
             append_array_literal_value(&mut output, &value);
         }
         output.push(']');
-        writer.write_str(row, &output);
+        writer.write_str(row, &output)?;
     }
 
     Ok(true)

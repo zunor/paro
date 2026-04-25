@@ -11,7 +11,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DecodedVectorOwned, SelectionVector, Vector};
+use paro_common::vector::{DecodedVectorRef, SelectionVector, Vector};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 
 use super::aggregate_kernel::{
@@ -165,7 +165,7 @@ impl PerfectAggregateHashTable {
         validate_addresses_vector(addresses, groups.size())?;
 
         if groups.size() == 0 {
-            addresses.set_count(0);
+            addresses.try_set_count(0)?;
             *new_groups =
                 SelectionVector::try_from_indices(Vec::new(), groups.allocator().clone())?;
             return Ok(0);
@@ -180,11 +180,11 @@ impl PerfectAggregateHashTable {
                             "Missing group key column for perfect hash table: group_idx={group_idx}"
                         ))
                     })
-                    .and_then(|column| column.try_decode(groups.size()))
+                    .and_then(|column| column.try_decode_ref(groups.size()))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        addresses.set_count(groups.size());
+        addresses.try_set_count(groups.size())?;
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
         let mut new_group_rows = Vec::new();
 
@@ -313,7 +313,7 @@ impl PerfectAggregateHashTable {
             )));
         }
         if position.offset >= self.total_groups {
-            result.set_cardinality(0);
+            result.try_set_cardinality(0)?;
             return Ok(false);
         }
 
@@ -328,11 +328,11 @@ impl PerfectAggregateHashTable {
         position.offset = cursor;
 
         if slots.is_empty() {
-            result.set_cardinality(0);
+            result.try_set_cardinality(0)?;
             return Ok(false);
         }
 
-        result.set_cardinality(slots.len());
+        result.try_set_cardinality(slots.len())?;
 
         for group_idx in 0..group_count {
             let result_vector = result.column_mut(group_idx).ok_or_else(|| {
@@ -340,11 +340,11 @@ impl PerfectAggregateHashTable {
                     "Missing group output column {group_idx} while scanning perfect aggregate hash table"
                 ))
             })?;
-            result_vector.set_count(slots.len());
+            result_vector.try_set_count(slots.len())?;
             for (row_idx, &slot) in slots.iter().enumerate() {
                 match self.decode_group_value(slot, group_idx)? {
                     Some(value) => result_vector.set_value(row_idx, &value),
-                    None => result_vector.set_null(row_idx, true),
+                    None => result_vector.try_set_null(row_idx, true)?,
                 }
             }
         }
@@ -352,7 +352,7 @@ impl PerfectAggregateHashTable {
         if aggregate_count > 0 {
             let mut state_addresses =
                 Vector::try_new(LogicalType::BigInt, slots.len(), result.allocator().clone())?;
-            state_addresses.set_count(slots.len());
+            state_addresses.try_set_count(slots.len())?;
             unsafe {
                 let address_data = state_addresses.flat_data_mut::<*mut u8>();
                 for (row_idx, &slot) in slots.iter().enumerate() {
@@ -390,10 +390,7 @@ impl PerfectAggregateHashTable {
                         group_count + agg_idx
                     ))
                 })?;
-                target.set_count(slots.len());
-                for row in 0..slots.len() {
-                    target.copy_at(row, source.as_ref(), row);
-                }
+                target.try_copy_range(0, source.as_ref(), 0, slots.len())?;
             }
         }
 
@@ -478,7 +475,7 @@ impl PerfectAggregateHashTable {
 
     fn compute_slot_from_decoded(
         &self,
-        decoded_groups: &[DecodedVectorOwned],
+        decoded_groups: &[DecodedVectorRef<'_>],
         row_idx: usize,
     ) -> Result<usize> {
         let mut slot = 0usize;
@@ -498,11 +495,11 @@ impl PerfectAggregateHashTable {
 
     fn encoded_group_value(
         &self,
-        decoded_group: &DecodedVectorOwned,
+        decoded_group: &DecodedVectorRef<'_>,
         row_idx: usize,
         group_idx: usize,
     ) -> Result<usize> {
-        let physical_idx = decoded_group.sel().get(row_idx);
+        let physical_idx = decoded_group.physical_index(row_idx);
         if !decoded_group.validity().is_valid(physical_idx) {
             return Ok(0);
         }
@@ -679,7 +676,7 @@ fn validate_aggregate_inputs(
 }
 
 fn read_group_value_as_i128(
-    group: &DecodedVectorOwned,
+    group: &DecodedVectorRef<'_>,
     ty: &LogicalType,
     physical_idx: usize,
 ) -> Result<i128> {

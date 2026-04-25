@@ -78,18 +78,18 @@ pub(crate) fn build_vector_from_bytes(
             let values = parse_strings(data, rows)?;
             let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
             for (idx, value) in values.iter().enumerate() {
-                vector.set_string(idx, value);
+                vector.try_set_string(idx, value)?;
             }
-            vector.set_count(rows);
+            vector.try_set_count(rows)?;
             Ok(vector)
         }
         LogicalType::Blob => {
             let values = parse_blobs(data, rows)?;
             let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
             for (idx, value) in values.iter().enumerate() {
-                vector.set_blob(idx, value);
+                vector.try_set_blob(idx, value)?;
             }
-            vector.set_count(rows);
+            vector.try_set_count(rows)?;
             Ok(vector)
         }
         LogicalType::List(child_type) => {
@@ -107,7 +107,7 @@ pub(crate) fn build_vector_from_bytes(
     }?;
 
     if matches!(logical_type, LogicalType::Null) {
-        vector.set_count(rows);
+        vector.try_set_count(rows)?;
     }
 
     Ok(vector)
@@ -157,7 +157,7 @@ fn decode_storage_dictionary_batch(
                 let value = std::str::from_utf8(&value).map_err(|_| {
                     paro_error::data_corrupted("dictionary entry is not valid UTF-8")
                 })?;
-                child.set_string(idx, value);
+                child.try_set_string(idx, value)?;
             }
         }
         LogicalType::Blob => {
@@ -165,7 +165,7 @@ fn decode_storage_dictionary_batch(
                 let value = dictionary_decoder
                     .string_at(idx as u32)
                     .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                child.set_blob(idx, &value);
+                child.try_set_blob(idx, &value)?;
             }
         }
         other => {
@@ -176,9 +176,9 @@ fn decode_storage_dictionary_batch(
         }
     }
     if has_null_slot {
-        child.set_null(dictionary_len, true);
+        child.try_set_null(dictionary_len, true)?;
     }
-    child.set_count(unique_len);
+    child.try_set_count(unique_len)?;
 
     if batch.codes.len() % std::mem::size_of::<u32>() != 0 {
         return Err(paro_error::data_corrupted(
@@ -295,7 +295,7 @@ pub(crate) fn apply_nulls(vector: &mut Vector, nulls: &[u8], rows: usize) -> Res
     }
     for (idx, &null_value) in nulls.iter().enumerate().take(rows) {
         if null_value != 0 {
-            vector.set_null(idx, true);
+            vector.try_set_null(idx, true)?;
         }
     }
     Ok(())
@@ -350,7 +350,7 @@ where
             std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
         }
     }
-    vector.set_count(rows);
+    vector.try_set_count(rows)?;
     Ok(vector)
 }
 
@@ -362,7 +362,7 @@ fn build_bool_vector(data: &Bytes, rows: usize, allocator: Arc<dyn Allocator>) -
             std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<bool>(), rows);
         }
     }
-    vector.set_count(rows);
+    vector.try_set_count(rows)?;
     Ok(vector)
 }
 
@@ -401,7 +401,7 @@ fn build_float_array_vector(
     let values = parse_primitive::<f32>(data, total)?;
     let child = Arc::new(Vector::try_from_f32(&values, allocator)?);
     let mut vector = Vector::try_from_array(LogicalType::Float, child, rows, dim)?;
-    vector.set_count(rows);
+    vector.try_set_count(rows)?;
     Ok(vector)
 }
 
@@ -431,7 +431,7 @@ fn build_list_vector(
     for (idx, value) in flat_values.iter().enumerate() {
         child_vec.set_value(idx, value);
     }
-    child_vec.set_count(flat_values.len());
+    child_vec.try_set_count(flat_values.len())?;
 
     let mut list_vec = Vector::try_new(
         LogicalType::List(Box::new(child_type.clone())),
@@ -439,7 +439,7 @@ fn build_list_vector(
         allocator,
     )?;
     list_vec.set_child(Arc::new(child_vec));
-    list_vec.set_count(rows);
+    list_vec.try_set_count(rows)?;
 
     let entries = unsafe { list_vec.flat_data_mut::<u8>() };
     for row in 0..rows {
@@ -481,7 +481,7 @@ fn build_struct_vector(
         rows,
         allocator.clone(),
     )?;
-    struct_vec.set_count(rows);
+    struct_vec.try_set_count(rows)?;
     let children = struct_vec
         .children_mut()
         .ok_or_else(|| paro_error::internal("Struct vector missing children during decode"))?;
@@ -497,7 +497,7 @@ fn build_struct_vector(
         for (row, value) in values.iter().enumerate() {
             child.set_value(row, value);
         }
-        child.set_count(rows);
+        child.try_set_count(rows)?;
     }
 
     Ok(struct_vec)

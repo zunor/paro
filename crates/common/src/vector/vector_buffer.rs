@@ -205,12 +205,6 @@ impl VectorBuffer {
         }
         Ok(())
     }
-
-    #[track_caller]
-    pub(crate) fn make_exclusive(&mut self) {
-        self.try_make_exclusive()
-            .expect("vector buffer copy-on-write allocation failed")
-    }
 }
 
 // SAFETY: VectorBuffer owns its memory exclusively. The raw pointer is only accessed
@@ -311,7 +305,7 @@ mod tests {
         let cloned = buf.clone();
 
         // Make original exclusive (should trigger deep copy)
-        buf.make_exclusive();
+        buf.try_make_exclusive().unwrap();
 
         // Modify original
         unsafe {

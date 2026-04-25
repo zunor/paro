@@ -15,12 +15,15 @@ impl Chunk {
         }
 
         match vector.logical_type() {
-            LogicalType::Array(_, array_size) => vector
-                .child()
-                .map(|child| {
-                    Self::vector_has_writable_capacity(child, required_capacity * array_size)
-                })
-                .unwrap_or(false),
+            LogicalType::Array(_, array_size) => {
+                let Some(child_capacity) = required_capacity.checked_mul(*array_size) else {
+                    return false;
+                };
+                vector
+                    .child()
+                    .map(|child| Self::vector_has_writable_capacity(child, child_capacity))
+                    .unwrap_or(false)
+            }
             LogicalType::Struct(_) => vector
                 .children()
                 .map(|children| {
@@ -41,27 +44,32 @@ impl Chunk {
                 .all(|vector| Self::vector_has_writable_capacity(vector, required_capacity))
     }
 
-    fn copy_rows(
+    fn try_copy_column_ranges(
         source: &Self,
         target: &mut Self,
         source_offset: usize,
         target_offset: usize,
         count: usize,
-    ) {
+    ) -> Result<()> {
         debug_assert_eq!(
             source.column_count(),
             target.column_count(),
             "Column count mismatch"
         );
-
-        for (col_idx, src_vec) in source.data.iter().enumerate() {
-            let dest_vec = target
-                .column_mut(col_idx)
-                .expect("destination column missing");
-            for row in 0..count {
-                dest_vec.copy_at(target_offset + row, src_vec, source_offset + row);
-            }
+        if count == 0 {
+            return Ok(());
         }
+
+        for (src_vec, dest_vec) in source.data.iter().zip(target.data.iter_mut()) {
+            Vector::try_make_arc_mut(dest_vec)?.try_copy_range(
+                target_offset,
+                src_vec,
+                source_offset,
+                count,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn try_ensure_capacity(&mut self, required_capacity: usize) -> Result<()> {
@@ -76,11 +84,13 @@ impl Chunk {
 
         let types = self.types();
         let mut resized = Chunk::try_initialize(&types, new_capacity, self.allocator.clone())?;
-        resized.set_cardinality(self.count);
-        Self::copy_rows(self, &mut resized, 0, 0, self.count);
+        Self::try_copy_column_ranges(self, &mut resized, 0, 0, self.count)?;
+        resized.try_set_cardinality(self.count)?;
 
         self.data = resized.data;
-        self.capacity = new_capacity;
+        self.capacity = resized.capacity;
+        self.initial_capacity = resized.initial_capacity;
+        self.reset_state = resized.reset_state;
         Ok(())
     }
 
@@ -130,10 +140,11 @@ impl Chunk {
         self.reset_state = None;
     }
 
-    pub fn flatten(&mut self) {
+    pub fn try_flatten(&mut self) -> Result<()> {
         for col in &mut self.data {
-            Arc::make_mut(col).flatten();
+            Vector::try_make_arc_mut(col)?.try_flatten()?;
         }
+        Ok(())
     }
 
     pub fn all_constant(&self) -> bool {
@@ -202,13 +213,14 @@ impl Chunk {
 
         let copy_count = self.count.saturating_sub(offset);
         other.try_ensure_capacity(copy_count)?;
-        other.set_cardinality(copy_count);
 
         if copy_count == 0 {
+            other.try_set_cardinality(0)?;
             return Ok(());
         }
 
-        Self::copy_rows(self, other, offset, 0, copy_count);
+        Self::try_copy_column_ranges(self, other, offset, 0, copy_count)?;
+        other.try_set_cardinality(copy_count)?;
         Ok(())
     }
 
@@ -223,10 +235,15 @@ impl Chunk {
         );
 
         let old_count = self.count;
-        let new_size = self.count + other.count;
+        let new_size = self.count.checked_add(other.count).ok_or_else(|| {
+            crate::error::internal(format!(
+                "chunk append row count overflow: left={}, right={}",
+                self.count, other.count
+            ))
+        })?;
         self.try_reserve_for_append(new_size)?;
-        self.set_cardinality(new_size);
-        Self::copy_rows(other, self, 0, old_count, other.count);
+        Self::try_copy_column_ranges(other, self, 0, old_count, other.count)?;
+        self.try_set_cardinality(new_size)?;
         Ok(())
     }
 
@@ -246,7 +263,7 @@ impl Chunk {
             *col = Arc::new(Vector::try_gather_ref(Arc::clone(col), base_sel.clone())?);
         }
 
-        self.set_cardinality(count);
+        self.try_set_cardinality(count)?;
         Ok(())
     }
 
@@ -262,7 +279,7 @@ impl Chunk {
             )?);
         }
 
-        self.set_cardinality(slice_count);
+        self.try_set_cardinality(slice_count)?;
         Ok(())
     }
 
@@ -317,16 +334,8 @@ impl Chunk {
 
         let types = self.types();
         let mut result = Chunk::try_initialize(&types, self.count, allocator)?;
-        result.set_cardinality(self.count);
-
-        for (col_idx, src_vec) in self.data.iter().enumerate() {
-            let dest_vec = result
-                .column_mut(col_idx)
-                .expect("destination column missing in deep copy");
-            for row in 0..self.count {
-                dest_vec.copy_at(row, src_vec, row);
-            }
-        }
+        Self::try_copy_column_ranges(self, &mut result, 0, 0, self.count)?;
+        result.try_set_cardinality(self.count)?;
 
         Ok(result)
     }

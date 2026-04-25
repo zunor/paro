@@ -586,9 +586,9 @@ impl PhysicalOperator for TopN {
                         let output_vec_mut = Arc::get_mut(output_vec).unwrap();
 
                         if src_vec.is_null(local_idx) {
-                            output_vec_mut.set_null(output_count, true);
+                            output_vec_mut.try_set_null(output_count, true)?;
                         } else {
-                            copy_value(src_vec, local_idx, output_vec_mut, output_count);
+                            copy_value(src_vec, local_idx, output_vec_mut, output_count)?;
                         }
                     }
 
@@ -611,10 +611,10 @@ impl PhysicalOperator for TopN {
         // Set output chunk
         if output_count > 0 {
             for vec in &mut output_vectors {
-                Arc::get_mut(vec).unwrap().set_count(output_count);
+                Arc::get_mut(vec).unwrap().try_set_count(output_count)?;
             }
             *chunk = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
-            chunk.set_cardinality(output_count);
+            chunk.try_set_cardinality(output_count)?;
             Ok(SourceResultType::HaveMoreOutput)
         } else {
             Ok(SourceResultType::Finished)
@@ -642,9 +642,8 @@ fn copy_value(
     src_idx: usize,
     dst: &mut paro_common::vector::Vector,
     dst_idx: usize,
-) {
-    // Use copy_at which handles all types including Array
-    dst.copy_at(dst_idx, src, src_idx);
+) -> Result<()> {
+    dst.try_copy_at(dst_idx, src, src_idx)
 }
 
 #[cfg(test)]

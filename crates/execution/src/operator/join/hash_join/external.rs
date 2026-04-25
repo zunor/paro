@@ -127,7 +127,7 @@ fn compute_hashes_for_keys(
     count: usize,
 ) -> Result<Vector> {
     let mut hashes = Vector::try_new(LogicalType::UBigInt, count.max(1), keys.allocator().clone())?;
-    hashes.set_count(count);
+    hashes.try_set_count(count)?;
     for out_idx in 0..count {
         let row_idx = sel.map(|s| s.get(out_idx)).unwrap_or(out_idx);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -161,7 +161,7 @@ pub(super) fn build_dictionary_chunk(
         )?));
     }
     let mut chunk = Chunk::from_arc_vectors(vectors, input.allocator().clone());
-    chunk.set_cardinality(count);
+    chunk.try_set_cardinality(count)?;
     Ok(chunk)
 }
 
@@ -195,7 +195,7 @@ pub(super) fn build_probe_spill_chunk(input: &Chunk, hashes: &Vector) -> Result<
     }
     vectors.push(Arc::new(hashes.clone()));
     let mut chunk = Chunk::from_arc_vectors(vectors, input.allocator().clone());
-    chunk.set_cardinality(input.size());
+    chunk.try_set_cardinality(input.size())?;
     Ok(chunk)
 }
 
@@ -473,7 +473,7 @@ pub(super) fn execute_external_probe(
         state
             .current_probe_input
             .try_reset(state.current_probe_input.allocator().clone())?;
-        chunk.set_cardinality(0);
+        chunk.try_set_cardinality(0)?;
         return Ok(OperatorResultType::NeedMoreInput);
     }
 
@@ -633,21 +633,21 @@ pub(super) fn drive_external_replay(
                     };
                     continue;
                 }
-                state.external_probe_chunk.set_cardinality(scanned);
+                state.external_probe_chunk.try_set_cardinality(scanned)?;
                 let replay_input = {
                     let probe_col_count = join.base().join.left.types().len();
                     let mut replay_chunk = Chunk::from_arc_vectors(
                         state.external_probe_chunk.data[..probe_col_count].to_vec(),
                         state.external_probe_chunk.allocator().clone(),
                     );
-                    replay_chunk.set_cardinality(scanned);
+                    replay_chunk.try_set_cardinality(scanned)?;
                     replay_chunk
                 };
                 drop(runtime_guard);
 
                 if ht.is_empty() {
                     if join.base().join.empty_result_if_rhs_is_empty() {
-                        chunk.set_cardinality(0);
+                        chunk.try_set_cardinality(0)?;
                     } else {
                         join.base().construct_empty_join_result(
                             &replay_input,
@@ -743,7 +743,8 @@ pub(super) fn get_data_external(
 ) -> Result<SourceResultType> {
     let source_rows_guard = gsink.external_source_rows.lock().unwrap();
     let Some(source_rows) = source_rows_guard.as_ref() else {
-        chunk.set_cardinality(0);
+        drop(source_rows_guard);
+        chunk.try_set_cardinality(0)?;
         gsink.cleanup_external_spill_state(true);
         return Ok(SourceResultType::Finished);
     };
@@ -765,7 +766,7 @@ pub(super) fn get_data_external(
     drop(source_rows_guard);
 
     if scanned == 0 {
-        chunk.set_cardinality(0);
+        chunk.try_set_cardinality(0)?;
         gsink.cleanup_external_spill_state(true);
         return Ok(SourceResultType::Finished);
     }
@@ -788,7 +789,7 @@ pub(super) fn get_data_external(
             chunk,
         ),
         _ => {
-            chunk.set_cardinality(0);
+            chunk.try_set_cardinality(0)?;
             return Ok(SourceResultType::Finished);
         }
     }?;

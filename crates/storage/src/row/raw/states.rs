@@ -5,8 +5,11 @@
 
 use crate::buffer::{BlockId, BufferHandle};
 use paro_common::allocator::{default_allocator, Allocator};
+use paro_common::error::Result;
 use paro_common::types::{ArrayType, LogicalType};
-use paro_common::vector::{DecodedVectorOwned, SelectionVector, ValidityMask, Vector, VECTOR_SIZE};
+use paro_common::vector::{
+    DataRef, DecodedVectorRef, SelectionRef, SelectionVector, ValidityMask, Vector, VECTOR_SIZE,
+};
 use std::sync::{Arc, Mutex};
 
 /// Block pinning behavior for raw row operations.
@@ -139,8 +142,6 @@ impl RawRowPinState {
 ///
 #[derive(Debug)]
 pub struct CombinedListData {
-    /// Combined decoded format for accessing combined list data
-    pub combined_data: DecodedVectorOwned,
     /// Selection data for combined entries
     pub selection_data: Option<SelectionVector>,
     /// Combined list entries
@@ -161,7 +162,6 @@ impl CombinedListData {
     /// Create a new CombinedListData with default values.
     pub fn new() -> Self {
         Self {
-            combined_data: DecodedVectorOwned::empty(),
             selection_data: None,
             combined_list_entries: vec![ListEntry::default(); VECTOR_SIZE],
             combined_validity: ValidityMask::new(VECTOR_SIZE),
@@ -175,79 +175,43 @@ impl Default for CombinedListData {
     }
 }
 
-/// Vector format for raw row operations.
+/// Borrowed vector view for raw row operations.
 ///
-/// This structure provides decoded access to vector data, handling different
-/// vector types (Flat, Constant, Dictionary) transparently through DecodedVectorOwned.
-///
-///
-/// # Key Design
-/// - `decoded`: Provides sel + data + validity for uniform access
-/// - `original_sel`: Original selection vector (if any) for slice operations
-/// - `children`: Nested formats for STRUCT/LIST/ARRAY types
-/// - `combined_list_data`: Used for within-collection operations
+/// Raw row append/scatter only needs a short-lived access layer over the source
+/// chunk. Keeping this borrowed avoids materializing incremental, constant, or
+/// range selections on every append.
 #[derive(Debug)]
-pub struct RawRowVectorFormat {
-    /// Original selection vector pointer (for slice operations)
-    pub original_sel: Option<SelectionVector>,
-    /// Owned original selection vector
-    pub original_owned_sel: Option<SelectionVector>,
-    /// Decoded vector access for data reads
-    pub decoded: DecodedVectorOwned,
-    /// Child formats for nested types (STRUCT, LIST, ARRAY)
-    pub children: Vec<RawRowVectorFormat>,
-    /// Combined list data for within-collection operations
+pub struct RawRowVectorView<'a> {
+    /// Decoded vector access for data reads.
+    pub decoded: DecodedVectorRef<'a>,
+    /// Child views for nested types (STRUCT, LIST, ARRAY).
+    pub children: Vec<RawRowVectorView<'a>>,
+    /// Combined list data for within-collection operations.
     pub combined_list_data: Option<Box<CombinedListData>>,
-    /// Optional: list entries for ArrayVector (faked as list)
+    /// Optional list entries for ARRAY vectors, exposed through decoded.data.
     pub array_list_entries: Option<Vec<ListEntry>>,
 }
 
-impl RawRowVectorFormat {
-    /// Create a new RawRowVectorFormat from a vector.
-    ///
-    /// This converts the vector to decoded format and saves the original selection
-    /// vector for slice operations.
-    ///
-    /// # Arguments
-    /// * `vector` - The source vector
-    /// * `count` - Number of elements to access
-    ///
-    pub fn from_vector(vector: &Vector, count: usize) -> Self {
-        let mut format = Self::empty();
-        Self::decode_internal(&mut format, vector, count);
-        format
-    }
-
-    /// Internal recursive entry point for decoded format conversion.
-    fn decode_internal(format: &mut Self, vector: &Vector, count: usize) {
-        format.decoded = vector.decode(count);
-
-        // Save original_sel from decoded format for slice operations.
-        let original_sel = format.decoded.sel().clone();
-        format.original_sel = Some(original_sel.clone());
-        format.original_owned_sel = Some(original_sel);
-
-        format.children.clear();
-        format.combined_list_data = None;
-        format.array_list_entries = None;
+impl<'a> RawRowVectorView<'a> {
+    /// Create a borrowed raw-row view from a vector.
+    pub fn try_from_vector(vector: &'a Vector, count: usize) -> Result<Self> {
+        let mut decoded = vector.try_decode_ref(count)?;
+        let mut children = Vec::new();
+        let mut array_list_entries = None;
 
         match vector.logical_type() {
             LogicalType::Struct(_fields) => {
-                if let Some(children) = vector.children() {
-                    for child in children.iter() {
-                        let mut child_format = Self::empty();
-                        Self::decode_internal(&mut child_format, child, count);
-                        format.children.push(child_format);
+                if let Some(struct_children) = vector.children() {
+                    children.reserve(struct_children.len());
+                    for child in struct_children.iter() {
+                        children.push(Self::try_from_vector(child, count)?);
                     }
                 }
             }
             LogicalType::List(_) => {
-                if let Some(child) = vector.child() {
-                    // For LIST, recurse with the child cardinality.
-                    let child_count = child.len();
-                    let mut child_format = Self::empty();
-                    Self::decode_internal(&mut child_format, child, child_count);
-                    format.children.push(child_format);
+                let base = Self::collection_base_vector(vector);
+                if let Some(child) = base.child() {
+                    children.push(Self::try_from_vector(child, child.len())?);
                 }
             }
             LogicalType::Array(_, array_size) => {
@@ -257,10 +221,9 @@ impl RawRowVectorFormat {
                 let list_entry_count = Self::array_list_entry_count(
                     array_size,
                     child_count,
-                    format.decoded.validity().capacity(),
+                    decoded.validity().capacity(),
                 );
 
-                // For ARRAY we fake list entries so collection logic can reuse LIST paths.
                 let mut entries = Vec::with_capacity(list_entry_count);
                 for i in 0..list_entry_count {
                     entries.push(ListEntry {
@@ -268,18 +231,28 @@ impl RawRowVectorFormat {
                         length: array_size,
                     });
                 }
-                format.array_list_entries = Some(entries);
 
-                if let Some(entries) = format.array_list_entries.as_ref() {
-                    format.decoded.set_data(entries.as_ptr() as *const u8);
-                }
-
-                let mut child_format = Self::empty();
-                Self::decode_internal(&mut child_format, child, child_count);
-                format.children.push(child_format);
+                decoded.set_data(DataRef::Ptr(entries.as_ptr() as *const u8));
+                array_list_entries = Some(entries);
+                children.push(Self::try_from_vector(child, child_count)?);
             }
             _ => {}
         }
+
+        Ok(Self {
+            decoded,
+            children,
+            combined_list_data: None,
+            array_list_entries,
+        })
+    }
+
+    fn collection_base_vector(vector: &'a Vector) -> &'a Vector {
+        if vector.vector_type() == paro_common::vector::VectorType::Dictionary {
+            let child = vector.child().expect("dictionary collection child");
+            return Self::collection_base_vector(child);
+        }
+        vector
     }
 
     /// Determine how many fake list entries are needed for ARRAY.
@@ -298,28 +271,22 @@ impl RawRowVectorFormat {
         entries_for_child.max(validity_capacity)
     }
 
-    /// Create an empty RawRowVectorFormat.
-    pub fn empty() -> Self {
-        Self {
-            original_sel: None,
-            original_owned_sel: None,
-            decoded: DecodedVectorOwned::empty(),
-            children: Vec::new(),
-            combined_list_data: None,
-            array_list_entries: None,
-        }
-    }
-
     /// Get the selection vector from decoded format.
     #[inline]
-    pub fn sel(&self) -> &SelectionVector {
+    pub fn sel(&self) -> &SelectionRef<'a> {
         self.decoded.sel()
     }
 
     /// Get the validity mask from decoded format.
     #[inline]
-    pub fn validity(&self) -> &ValidityMask {
+    pub fn validity(&self) -> &paro_common::vector::ValidityRef<'a> {
         self.decoded.validity()
+    }
+
+    /// Get the data reference from decoded format.
+    #[inline]
+    pub fn data(&self) -> DataRef {
+        self.decoded.data()
     }
 
     /// Check if value at logical index is valid.
@@ -344,9 +311,40 @@ impl RawRowVectorFormat {
     }
 }
 
-impl Default for RawRowVectorFormat {
-    fn default() -> Self {
-        Self::empty()
+/// Borrowed decoded view for a raw-row source chunk.
+#[derive(Debug)]
+pub struct RawRowChunkView<'a> {
+    /// Vector views for each column.
+    pub vector_data: Vec<Option<RawRowVectorView<'a>>>,
+}
+
+impl<'a> RawRowChunkView<'a> {
+    /// Build borrowed vector views for every column in a chunk.
+    pub fn try_decode(chunk: &'a paro_common::chunk::Chunk) -> Result<Self> {
+        let count = chunk.size();
+        let mut vector_data = Vec::with_capacity(chunk.column_count());
+        for col_idx in 0..chunk.column_count() {
+            let view = chunk
+                .column(col_idx)
+                .map(|vector| RawRowVectorView::try_from_vector(vector, count))
+                .transpose()?;
+            vector_data.push(view);
+        }
+        Ok(Self { vector_data })
+    }
+
+    /// Get vector view for a specific column.
+    #[inline]
+    pub fn get_vector_format(&self, col_idx: usize) -> Option<&RawRowVectorView<'a>> {
+        self.vector_data.get(col_idx).and_then(|view| view.as_ref())
+    }
+
+    /// Get mutable vector view for a specific column.
+    #[inline]
+    pub fn get_vector_format_mut(&mut self, col_idx: usize) -> Option<&mut RawRowVectorView<'a>> {
+        self.vector_data
+            .get_mut(col_idx)
+            .and_then(|view| view.as_mut())
     }
 }
 
@@ -355,10 +353,6 @@ impl Default for RawRowVectorFormat {
 /// Contains vectors for row/heap locations and temporary storage.
 #[derive(Debug)]
 pub struct RawRowChunkState {
-    /// Vector data formats for each column.
-    /// This provides decoded access to vector data regardless of vector type.
-    ///
-    pub vector_data: Vec<RawRowVectorFormat>,
     /// Column indices to operate on
     pub column_ids: Vec<usize>,
     /// Row location pointers (POINTER type)
@@ -387,7 +381,6 @@ impl RawRowChunkState {
     pub fn new() -> Self {
         let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
         Self {
-            vector_data: Vec::new(),
             column_ids: Vec::new(),
             row_locations: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
                 .expect("row location vector allocation failed"),
@@ -406,7 +399,6 @@ impl RawRowChunkState {
     pub fn with_columns(column_ids: Vec<usize>) -> Self {
         let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
         Self {
-            vector_data: Vec::new(),
             column_ids,
             row_locations: Vector::try_new(LogicalType::UBigInt, VECTOR_SIZE, allocator.clone())
                 .expect("row location vector allocation failed"),
@@ -423,7 +415,6 @@ impl RawRowChunkState {
 
     /// Reset the chunk state for reuse.
     pub fn reset(&mut self) {
-        self.vector_data.clear();
         self.chunk_part_indices.clear();
         for cached in self.array_cast_vectors.iter_mut() {
             if let Some(vector) = cached.as_mut() {
@@ -486,63 +477,12 @@ impl RawRowChunkState {
             .and_then(|entry| entry.as_mut())
     }
 
-    /// Initialize vector_data for the given column count.
-    ///
-    /// This allocates empty RawRowVectorFormat entries for each column.
-    /// Call `decode` to populate them with actual vector data.
-    ///
-    pub fn initialize_vector_data(&mut self, column_count: usize) {
-        self.vector_data.clear();
-        self.vector_data.reserve(column_count);
-        for _ in 0..column_count {
-            self.vector_data.push(RawRowVectorFormat::empty());
-        }
-    }
-
-    /// Convert Chunk vectors to decoded format.
-    ///
-    /// This populates vector_data with DecodedVectorOwned for each column,
-    /// enabling uniform access to vector data regardless of the underlying
-    /// vector type (Flat, Constant, Dictionary, etc.).
-    ///
-    /// # Arguments
-    /// * `chunk` - The Chunk to convert
-    ///
-    ///
-    /// # Example
-    /// ```ignore
-    /// let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![vec1, vec2]);
-    /// state.decode(&chunk);
-    /// // Now state.vector_data[0] and state.vector_data[1] contain decoded formats
-    /// ```
-    pub fn decode(&mut self, chunk: &paro_common::chunk::Chunk) {
-        let count = chunk.size();
-        let column_count = chunk.column_count();
-
-        // Ensure vector_data has space for all columns
-        if self.vector_data.len() < column_count {
-            self.vector_data
-                .resize_with(column_count, RawRowVectorFormat::empty);
-        }
-
-        // Convert each column to decoded format
-        for col_idx in 0..column_count {
-            if let Some(vector) = chunk.column(col_idx) {
-                self.vector_data[col_idx] = RawRowVectorFormat::from_vector(vector, count);
-            }
-        }
-    }
-
-    /// Get vector_data for a specific column.
-    #[inline]
-    pub fn get_vector_format(&self, col_idx: usize) -> Option<&RawRowVectorFormat> {
-        self.vector_data.get(col_idx)
-    }
-
-    /// Get mutable vector_data for a specific column.
-    #[inline]
-    pub fn get_vector_format_mut(&mut self, col_idx: usize) -> Option<&mut RawRowVectorFormat> {
-        self.vector_data.get_mut(col_idx)
+    /// Create a borrowed decoded view for the current source chunk.
+    pub fn try_decode<'a>(
+        &mut self,
+        chunk: &'a paro_common::chunk::Chunk,
+    ) -> Result<RawRowChunkView<'a>> {
+        RawRowChunkView::try_decode(chunk)
     }
 }
 
@@ -779,25 +719,15 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_row_vector_format_empty() {
-        let format = RawRowVectorFormat::empty();
-        assert!(format.children.is_empty());
-        assert!(format.combined_list_data.is_none());
-        assert!(format.array_list_entries.is_none());
-    }
-
-    #[test]
-    fn test_raw_row_vector_format_from_flat_vector() {
+    fn test_raw_row_vector_view_from_flat_vector() {
         let vec = test_i32_vector(&[10, 20, 30, 40]);
-        let format = RawRowVectorFormat::from_vector(&vec, 4);
+        let format = RawRowVectorView::try_from_vector(&vec, 4).unwrap();
 
-        // Check that decoded format is set up correctly
         assert!(format.is_valid(0));
         assert!(format.is_valid(1));
         assert!(format.is_valid(2));
         assert!(format.is_valid(3));
 
-        // Check selection maps correctly (incremental for flat)
         assert_eq!(format.sel().get(0), 0);
         assert_eq!(format.sel().get(1), 1);
         assert_eq!(format.sel().get(2), 2);
@@ -805,19 +735,17 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_row_vector_format_from_constant_vector() {
+    fn test_raw_row_vector_view_from_constant_vector() {
         use paro_common::types::LogicalType;
 
         let vec = test_constant_vector(LogicalType::Integer, 42i32, 4);
-        let format = RawRowVectorFormat::from_vector(&vec, 4);
+        let format = RawRowVectorView::try_from_vector(&vec, 4).unwrap();
 
-        // For constant vectors, all selections point to 0
         assert_eq!(format.sel().get(0), 0);
         assert_eq!(format.sel().get(1), 0);
         assert_eq!(format.sel().get(2), 0);
         assert_eq!(format.sel().get(3), 0);
 
-        // All values should be valid
         assert!(format.is_valid(0));
         assert!(format.is_valid(1));
         assert!(format.is_valid(2));
@@ -825,13 +753,13 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_row_vector_format_array_sets_unified_data_to_list_entries() {
+    fn test_raw_row_vector_view_array_sets_unified_data_to_list_entries() {
         use paro_common::types::LogicalType;
         use std::sync::Arc;
 
         let child = Arc::new(test_i32_vector(&[1, 2, 3, 4, 5, 6]));
         let array = paro_common::test_utils::test_array_vector(LogicalType::Integer, child, 2, 3);
-        let format = RawRowVectorFormat::from_vector(&array, 2);
+        let format = RawRowVectorView::try_from_vector(&array, 2).unwrap();
 
         let entries = format
             .array_list_entries
@@ -845,7 +773,10 @@ mod tests {
 
         // ARRAY should expose fake list_entry data through decoded.data.
         let expected_ptr = entries.as_ptr() as *const u8;
-        assert_eq!(format.decoded.data(), expected_ptr);
+        assert!(matches!(
+            format.decoded.data(),
+            DataRef::Ptr(ptr) if ptr == expected_ptr
+        ));
 
         // Child format should recurse over the full flattened child.
         assert_eq!(format.children.len(), 1);
@@ -853,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_row_vector_format_dictionary_array_entries_cover_selection() {
+    fn test_raw_row_vector_view_dictionary_array_entries_cover_selection() {
         use paro_common::types::LogicalType;
         use std::sync::Arc;
 
@@ -866,7 +797,7 @@ mod tests {
         ));
         let dict_array = paro_common::test_utils::test_dictionary(array, vec![2]);
 
-        let format = RawRowVectorFormat::from_vector(&dict_array, 1);
+        let format = RawRowVectorView::try_from_vector(&dict_array, 1).unwrap();
         let entries = format
             .array_list_entries
             .as_ref()
@@ -878,27 +809,14 @@ mod tests {
         assert_eq!(entries[selected_idx].length, 2);
 
         let expected_ptr = entries.as_ptr() as *const u8;
-        assert_eq!(format.decoded.data(), expected_ptr);
+        assert!(matches!(
+            format.decoded.data(),
+            DataRef::Ptr(ptr) if ptr == expected_ptr
+        ));
     }
 
     #[test]
-    fn test_chunk_state_initialize_vector_data() {
-        let mut state = RawRowChunkState::new();
-
-        // Initially empty
-        assert!(state.vector_data.is_empty());
-
-        // Initialize for 3 columns
-        state.initialize_vector_data(3);
-        assert_eq!(state.vector_data.len(), 3);
-
-        // Reset should clear
-        state.reset();
-        assert!(state.vector_data.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_state_decode() {
+    fn test_chunk_state_decode_returns_borrowed_view() {
         use std::sync::Arc;
 
         let mut state = RawRowChunkState::new();
@@ -908,21 +826,48 @@ mod tests {
         let vec2 = test_i64_vector(&[100, 200, 300]);
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(vec1), Arc::new(vec2)]);
 
-        // Convert to decoded format
-        state.decode(&chunk);
+        let view = state.try_decode(&chunk).unwrap();
 
-        // Check that vector_data has 2 entries
-        assert_eq!(state.vector_data.len(), 2);
+        assert_eq!(view.vector_data.len(), 2);
+        assert!(view.get_vector_format(0).is_some());
+        assert!(view.get_vector_format(1).is_some());
 
-        // Both formats should have valid entries
-        assert!(state.get_vector_format(0).is_some());
-        assert!(state.get_vector_format(1).is_some());
-
-        // Check values through the format (using physical indices after selection mapping)
-        let fmt0 = state.get_vector_format(0).unwrap();
+        let fmt0 = view.get_vector_format(0).unwrap();
         assert!(fmt0.is_valid(0));
         assert!(fmt0.is_valid(1));
         assert!(fmt0.is_valid(2));
+    }
+
+    #[test]
+    fn test_chunk_state_try_decode_keeps_symbolic_selections() {
+        use std::sync::Arc;
+
+        let flat = test_i64_vector(&[10, 20]);
+        let constant = test_constant_vector(LogicalType::BigInt, 99_i64, 2);
+        let range = test_i64_vector(&[1, 2, 3, 4])
+            .slice_ref(1, 2)
+            .expect("range slice");
+        let chunk =
+            test_chunk_from_arc_vectors(vec![Arc::new(flat), Arc::new(constant), Arc::new(range)]);
+
+        let mut state = RawRowChunkState::new();
+        let view = state.try_decode(&chunk).unwrap();
+
+        assert!(matches!(
+            view.get_vector_format(0).unwrap().sel(),
+            SelectionRef::Incremental { count: 2 }
+        ));
+        assert!(matches!(
+            view.get_vector_format(1).unwrap().sel(),
+            SelectionRef::Constant { count: 2 }
+        ));
+        assert!(matches!(
+            view.get_vector_format(2).unwrap().sel(),
+            SelectionRef::Range {
+                offset: 1,
+                count: 2
+            }
+        ));
     }
 
     #[test]

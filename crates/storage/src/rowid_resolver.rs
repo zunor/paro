@@ -28,7 +28,7 @@ pub(crate) fn scatter_vector_values(
     dst: &mut Vector,
 ) -> Result<()> {
     for (src_idx, &dst_idx) in indices.iter().enumerate() {
-        dst.copy_at(dst_idx, src, src_idx);
+        dst.try_copy_at(dst_idx, src, src_idx)?;
     }
     Ok(())
 }
@@ -200,11 +200,11 @@ where
             }
 
             for &original_idx in &group.original_indices {
-                vector.set_null(original_idx, true);
+                vector.try_set_null(original_idx, true)?;
             }
         }
 
-        vector.set_count(rowids.len());
+        vector.try_set_count(rowids.len())?;
         output_vectors.push(Arc::new(vector));
     }
 

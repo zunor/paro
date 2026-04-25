@@ -1,22 +1,73 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{StringHeap, ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType};
-use crate::allocator::default_allocator;
+use super::{StringHeap, ValidityMask, Vector, VectorType};
+use crate::allocator::Allocator;
 use crate::error::{self as paro_error, ParoError};
-use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
+use crate::types::{InlineString, LogicalType};
 use std::sync::Arc;
 
 impl Vector {
-    /// Merge two vectors based on a boolean mask.
-    pub fn merge(
+    /// Merge two compact vectors based on a boolean mask.
+    ///
+    /// When `mask[i]` is true this consumes the next row from `true_vec`,
+    /// otherwise it consumes the next row from `false_vec`.
+    pub fn try_merge(
         logical_type: LogicalType,
         count: usize,
         mask: &[bool],
         true_vec: &Vector,
         false_vec: &Vector,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self, ParoError> {
-        let allocator = Arc::new(default_allocator());
+        Self::try_merge_internal(
+            logical_type,
+            count,
+            mask,
+            true_vec,
+            false_vec,
+            allocator,
+            false,
+        )
+    }
+
+    /// Merge two vectors of full length based on a boolean mask.
+    /// result[i] = mask[i] ? true_vec[i] : false_vec[i]
+    pub fn try_merge_full(
+        logical_type: LogicalType,
+        count: usize,
+        mask: &[bool],
+        true_vec: &Vector,
+        false_vec: &Vector,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self, ParoError> {
+        Self::try_merge_internal(
+            logical_type,
+            count,
+            mask,
+            true_vec,
+            false_vec,
+            allocator,
+            true,
+        )
+    }
+
+    fn try_merge_internal(
+        logical_type: LogicalType,
+        count: usize,
+        mask: &[bool],
+        true_vec: &Vector,
+        false_vec: &Vector,
+        allocator: Arc<dyn Allocator>,
+        full_length_inputs: bool,
+    ) -> Result<Self, ParoError> {
+        if mask.len() < count {
+            return Err(paro_error::internal(format!(
+                "merge mask too short: count={count}, mask_len={}",
+                mask.len()
+            )));
+        }
+
         let mut result = Self::try_new(logical_type.clone(), count, allocator.clone())?;
         result.count = count;
         result.validity = ValidityMask::with_allocator(count, result.buffer.allocator().clone());
@@ -28,88 +79,83 @@ impl Vector {
             ($type:ty, $get_fn:ident) => {
                 unsafe {
                     let res_ptr = result.buffer.data() as *mut $type;
-                    for (i, &m) in mask.iter().enumerate().take(count) {
-                        if m {
-                            match true_vec.$get_fn(true_idx) {
-                                Some(val) => *res_ptr.add(i) = val,
-                                None => result.validity.set_null(i),
-                            }
-                            true_idx += 1;
-                        } else {
-                            match false_vec.$get_fn(false_idx) {
-                                Some(val) => *res_ptr.add(i) = val,
-                                None => result.validity.set_null(i),
-                            }
-                            false_idx += 1;
+                    for (i, &take_true) in mask.iter().take(count).enumerate() {
+                        let (vec, source_idx) = Self::merge_source_row(
+                            take_true,
+                            i,
+                            full_length_inputs,
+                            &mut true_idx,
+                            &mut false_idx,
+                            true_vec,
+                            false_vec,
+                        );
+                        Self::check_merge_source_bounds(source_idx, vec, full_length_inputs)?;
+                        match vec.$get_fn(source_idx) {
+                            Some(val) => *res_ptr.add(i) = val,
+                            None => result.validity.try_set_null(i)?,
                         }
                     }
                 }
             };
         }
 
-        match logical_type {
+        match &logical_type {
             LogicalType::Boolean => merge_loop!(bool, get_bool),
             LogicalType::TinyInt => merge_loop!(i8, get_i8),
             LogicalType::SmallInt => merge_loop!(i16, get_i16),
-            LogicalType::Integer => merge_loop!(i32, get_i32),
-            LogicalType::BigInt => merge_loop!(i64, get_i64),
+            LogicalType::Integer | LogicalType::Date => merge_loop!(i32, get_i32),
+            LogicalType::BigInt
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+            | LogicalType::Time => merge_loop!(i64, get_i64),
+            LogicalType::HugeInt | LogicalType::Interval => merge_loop!(i128, get_i128),
             LogicalType::UTinyInt => merge_loop!(u8, get_u8),
             LogicalType::USmallInt => merge_loop!(u16, get_u16),
             LogicalType::UInteger => merge_loop!(u32, get_u32),
             LogicalType::UBigInt => merge_loop!(u64, get_u64),
+            LogicalType::UHugeInt | LogicalType::Uuid => merge_loop!(u128, get_u128),
             LogicalType::Float => merge_loop!(f32, get_f32),
             LogicalType::Double => merge_loop!(f64, get_f64),
+            LogicalType::Decimal { precision, .. } if *precision <= 18 => {
+                merge_loop!(i64, get_i64)
+            }
+            LogicalType::Decimal { .. } => merge_loop!(i128, get_i128),
             LogicalType::Varchar
             | LogicalType::VarcharCollation(_)
             | LogicalType::TsVector
             | LogicalType::TsQuery
             | LogicalType::Json
-            | LogicalType::Jsonb => {
+            | LogicalType::Jsonb
+            | LogicalType::Blob => {
                 let mut heap: Option<StringHeap> = None;
-                let buffer = VectorBuffer::try_with_allocator(
-                    std::mem::size_of::<InlineString>(),
-                    count,
-                    allocator.clone(),
-                )?;
                 unsafe {
-                    let entries = buffer.data() as *mut InlineString;
-                    for (i, &m) in mask.iter().enumerate().take(count) {
-                        let s = if m {
-                            let s = true_vec.get_string(true_idx);
-                            true_idx += 1;
-                            s
-                        } else {
-                            let s = false_vec.get_string(false_idx);
-                            false_idx += 1;
-                            s
-                        };
-
-                        match s {
-                            Some(str_val) => {
-                                if str_val.len() <= INLINE_LENGTH {
-                                    *entries.add(i) = InlineString::new(str_val);
-                                } else {
-                                    if heap.is_none() {
-                                        heap = Some(StringHeap::with_allocator(
-                                            1024,
-                                            allocator.clone(),
-                                        ));
-                                    }
-                                    let h = heap.as_mut().unwrap();
-                                    // add_string returns InlineString with pointer to arena memory
-                                    *entries.add(i) = h.add_string(str_val);
-                                }
+                    let entries = result.buffer.data() as *mut InlineString;
+                    for (i, &take_true) in mask.iter().take(count).enumerate() {
+                        let (vec, source_idx) = Self::merge_source_row(
+                            take_true,
+                            i,
+                            full_length_inputs,
+                            &mut true_idx,
+                            &mut false_idx,
+                            true_vec,
+                            false_vec,
+                        );
+                        Self::check_merge_source_bounds(source_idx, vec, full_length_inputs)?;
+                        match Self::varlen_bytes(&logical_type, vec, source_idx) {
+                            Some(bytes) => {
+                                *entries.add(i) =
+                                    Self::copy_varlen_entry(bytes, &mut heap, allocator.clone())?;
                             }
                             None => {
-                                result.validity.set_null(i);
+                                result.validity.try_set_null(i)?;
                                 *entries.add(i) = InlineString::empty();
                             }
                         }
                     }
                 }
-                result.buffer = buffer;
                 result.string_heap = heap.map(Arc::new);
             }
+            LogicalType::Null => result.validity.try_set_range_invalid(0, count)?,
             _ => {
                 return Err(paro_error::not_implemented(format!(
                     "Merge not implemented for type {:?}",
@@ -121,269 +167,97 @@ impl Vector {
         Ok(result)
     }
 
-    /// Merge two vectors of full length based on a boolean mask.
-    /// result[i] = mask[i] ? true_vec[i] : false_vec[i]
-    pub fn merge_full(
-        logical_type: LogicalType,
-        count: usize,
-        mask: &[bool],
-        true_vec: &Vector,
-        false_vec: &Vector,
-    ) -> Result<Self, ParoError> {
-        let allocator = Arc::new(default_allocator());
-        let mut result = Self::try_new(logical_type.clone(), count, allocator.clone())?;
-        result.count = count;
-        result.validity = ValidityMask::with_allocator(count, result.buffer.allocator().clone());
-
-        macro_rules! merge_full_loop {
-            ($type:ty, $get_fn:ident) => {
-                unsafe {
-                    let res_ptr = result.buffer.data() as *mut $type;
-                    for (i, &m) in mask.iter().enumerate().take(count) {
-                        let vec = if m { true_vec } else { false_vec };
-                        match vec.$get_fn(i) {
-                            Some(val) => *res_ptr.add(i) = val,
-                            None => result.validity.set_null(i),
-                        }
-                    }
-                }
-            };
+    #[inline]
+    fn merge_source_row<'a>(
+        take_true: bool,
+        result_idx: usize,
+        full_length_inputs: bool,
+        true_idx: &mut usize,
+        false_idx: &mut usize,
+        true_vec: &'a Vector,
+        false_vec: &'a Vector,
+    ) -> (&'a Vector, usize) {
+        if full_length_inputs {
+            return (if take_true { true_vec } else { false_vec }, result_idx);
         }
 
-        match logical_type {
-            LogicalType::Boolean => merge_full_loop!(bool, get_bool),
-            LogicalType::TinyInt => merge_full_loop!(i8, get_i8),
-            LogicalType::SmallInt => merge_full_loop!(i16, get_i16),
-            LogicalType::Integer => merge_full_loop!(i32, get_i32),
-            LogicalType::BigInt => merge_full_loop!(i64, get_i64),
-            LogicalType::Float => merge_full_loop!(f32, get_f32),
-            LogicalType::Double => merge_full_loop!(f64, get_f64),
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb => {
-                let mut heap: Option<StringHeap> = None;
-                let buffer = VectorBuffer::try_with_allocator(
-                    std::mem::size_of::<InlineString>(),
-                    count,
-                    allocator.clone(),
-                )?;
-                unsafe {
-                    let entries = buffer.data() as *mut InlineString;
-                    for (i, &m) in mask.iter().enumerate().take(count) {
-                        let vec = if m { true_vec } else { false_vec };
-                        match vec.get_string(i) {
-                            Some(str_val) => {
-                                if str_val.len() <= INLINE_LENGTH {
-                                    *entries.add(i) = InlineString::new(str_val);
-                                } else {
-                                    if heap.is_none() {
-                                        heap = Some(StringHeap::with_allocator(
-                                            1024,
-                                            allocator.clone(),
-                                        ));
-                                    }
-                                    let h = heap.as_mut().unwrap();
-                                    // add_string returns InlineString with pointer to arena memory
-                                    *entries.add(i) = h.add_string(str_val);
-                                }
-                            }
-                            None => {
-                                result.validity.set_null(i);
-                                *entries.add(i) = InlineString::empty();
-                            }
-                        }
-                    }
-                }
-                result.buffer = buffer;
-                result.string_heap = heap.map(Arc::new);
-            }
-            _ => {
-                return Err(paro_error::not_implemented(format!(
-                    "Merge full not implemented for type {:?}",
-                    logical_type
-                )))
-            }
+        if take_true {
+            let source_idx = *true_idx;
+            *true_idx += 1;
+            (true_vec, source_idx)
+        } else {
+            let source_idx = *false_idx;
+            *false_idx += 1;
+            (false_vec, source_idx)
         }
-
-        Ok(result)
     }
 
-    pub fn flatten(&mut self) {
-        self.try_flatten()
-            .expect("vector flatten allocation failed")
+    #[inline]
+    fn check_merge_source_bounds(
+        source_idx: usize,
+        source: &Vector,
+        full_length_inputs: bool,
+    ) -> Result<(), ParoError> {
+        if source_idx < source.len() {
+            return Ok(());
+        }
+
+        let mode = if full_length_inputs {
+            "full"
+        } else {
+            "compact"
+        };
+        Err(paro_error::internal(format!(
+            "merge {mode} source index out of bounds: idx={source_idx}, len={}",
+            source.len()
+        )))
     }
 
     /// Fallible flatten that materializes dictionary/sequence sources and allocates buffers when needed.
     pub fn try_flatten(&mut self) -> Result<(), ParoError> {
-        match self.vector_type {
-            VectorType::Flat => {
-                // Already flat, but need to flatten nested types
-                if let LogicalType::Array(_, array_size) = &self.logical_type {
-                    // Flatten the child vector
-                    if let Some(child_arc) = &mut self.child {
-                        let child = Arc::make_mut(child_arc);
-                        let child_count = self.count * array_size;
-                        child.flatten();
-                        child.set_count(child_count);
-                    }
+        if self.vector_type == VectorType::Flat {
+            self.try_flatten_children()?;
+            return Ok(());
+        }
+
+        let count = self.count;
+        let source = self.clone();
+        let allocator = self.buffer.allocator().clone();
+        let mut result = Self::try_new(self.logical_type.clone(), count, allocator)?;
+        result.try_set_count(count)?;
+        result.try_copy_range(0, &source, 0, count)?;
+        *self = result;
+        Ok(())
+    }
+
+    fn try_flatten_children(&mut self) -> Result<(), ParoError> {
+        match &self.logical_type {
+            LogicalType::Array(_, array_size) => {
+                if let Some(child_arc) = &mut self.child {
+                    let child_count = self.count.checked_mul(*array_size).ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "array child count overflow: count={}, array_size={array_size}",
+                            self.count
+                        ))
+                    })?;
+                    let child = Self::try_make_arc_mut(child_arc)?;
+                    child.try_flatten()?;
+                    child.try_set_count(child_count)?;
                 }
             }
-            VectorType::Constant => {
-                // Replicate the single value
-                let element_size = self.logical_type.physical_size();
-                let new_buffer = VectorBuffer::try_with_allocator(
-                    element_size,
-                    self.count,
-                    self.buffer.allocator().clone(),
-                )?;
-
-                if element_size > 0 && !self.buffer.data().is_null() {
-                    // SAFETY: We're copying the constant value to all positions
-                    unsafe {
-                        let src = self.buffer.data();
-                        let dst = new_buffer.data();
-                        for i in 0..self.count {
-                            std::ptr::copy_nonoverlapping(
-                                src,
-                                dst.add(i * element_size),
-                                element_size,
-                            );
-                        }
-                    }
+            LogicalType::List(_) => {
+                if let Some(child_arc) = &mut self.child {
+                    Self::try_make_arc_mut(child_arc)?.try_flatten()?;
                 }
-
-                // Replicate validity
-                let is_null = !self.validity.is_valid(0);
-                self.validity =
-                    ValidityMask::with_allocator(self.count, self.buffer.allocator().clone());
-                if is_null {
-                    for i in 0..self.count {
-                        self.validity.set_null(i);
-                    }
-                }
-
-                self.buffer = new_buffer;
-                self.vector_type = VectorType::Flat;
-                self.dictionary_info = None;
             }
-            VectorType::Sequence => {
-                // Materialize the sequence
-                // SAFETY: Sequence stores [start, increment] as i64
-                let (start, increment) = unsafe {
-                    let ptr = self.buffer.data() as *const i64;
-                    (*ptr, *ptr.add(1))
-                };
-
-                let new_buffer = VectorBuffer::try_with_allocator(
-                    std::mem::size_of::<i64>(),
-                    self.count,
-                    self.buffer.allocator().clone(),
-                )?;
-
-                // SAFETY: We're writing i64 values
-                unsafe {
-                    let dst = new_buffer.data() as *mut i64;
-                    for i in 0..self.count {
-                        *dst.add(i) = start + (i as i64) * increment;
-                    }
+            LogicalType::Struct(_) => {
+                for child_arc in &mut self.children {
+                    let child = Self::try_make_arc_mut(child_arc)?;
+                    child.try_flatten()?;
+                    child.try_set_count(self.count)?;
                 }
-
-                self.buffer = new_buffer;
-                self.vector_type = VectorType::Flat;
-                self.dictionary_info = None;
             }
-            VectorType::Dictionary => {
-                // Materialize through selection vector
-                let child = self.child.take().unwrap();
-                let selection = std::mem::replace(&mut self.selection, VectorSelection::None);
-                let element_size = self.logical_type.physical_size();
-                let allocator = self.buffer.allocator().clone();
-
-                let new_buffer =
-                    VectorBuffer::try_with_allocator(element_size, self.count, allocator.clone())?;
-                self.validity =
-                    ValidityMask::with_allocator(self.count, self.buffer.allocator().clone());
-
-                // SAFETY: We're copying selected elements
-                unsafe {
-                    let dst = new_buffer.data();
-                    let src = child.buffer.data();
-                    for i in 0..self.count {
-                        let physical_idx = selection.physical_index(i);
-                        if !child.validity.is_valid(physical_idx) {
-                            self.validity.set_null(i);
-                        } else {
-                            std::ptr::copy_nonoverlapping(
-                                src.add(physical_idx * element_size),
-                                dst.add(i * element_size),
-                                element_size,
-                            );
-                        }
-                    }
-                }
-
-                // Copy string heap if needed (string-like types)
-                if matches!(
-                    self.logical_type,
-                    LogicalType::Varchar
-                        | LogicalType::VarcharCollation(_)
-                        | LogicalType::TsVector
-                        | LogicalType::TsQuery
-                        | LogicalType::Json
-                        | LogicalType::Jsonb
-                ) {
-                    let allocator = self.buffer.allocator().clone();
-                    let mut new_heap: Option<StringHeap> = None;
-                    let string_buffer = VectorBuffer::try_with_allocator(
-                        std::mem::size_of::<InlineString>(),
-                        self.count,
-                        allocator.clone(),
-                    )?;
-
-                    // SAFETY: We're copying InlineString values and rebuilding heap for long strings
-                    unsafe {
-                        let src_entries = child.buffer.data() as *const InlineString;
-                        let dst_entries = string_buffer.data() as *mut InlineString;
-
-                        for i in 0..self.count {
-                            let physical_idx = selection.physical_index(i);
-                            if !child.validity.is_valid(physical_idx) {
-                                self.validity.set_null(i);
-                                *dst_entries.add(i) = InlineString::empty();
-                                continue;
-                            }
-
-                            let src_str = &*src_entries.add(physical_idx);
-                            let str_data = src_str.as_str();
-
-                            if str_data.len() <= INLINE_LENGTH {
-                                // Short string: copy inline
-                                *dst_entries.add(i) = InlineString::new(str_data);
-                            } else {
-                                // Long string: copy to new heap
-                                if new_heap.is_none() {
-                                    new_heap =
-                                        Some(StringHeap::with_allocator(1024, allocator.clone()));
-                                }
-                                let h = new_heap.as_mut().unwrap();
-                                // add_string returns InlineString with pointer to arena memory
-                                *dst_entries.add(i) = h.add_string(str_data);
-                            }
-                        }
-                    }
-
-                    self.buffer = string_buffer;
-                    self.string_heap = new_heap.map(Arc::new);
-                } else {
-                    self.buffer = new_buffer;
-                }
-
-                self.vector_type = VectorType::Flat;
-                self.dictionary_info = None;
-            }
+            _ => {}
         }
 
         Ok(())

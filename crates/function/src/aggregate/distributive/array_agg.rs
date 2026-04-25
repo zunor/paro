@@ -52,10 +52,9 @@ fn ensure_list_child_capacity(result: &mut Vector, child_type: &LogicalType, nee
 
     let mut new_child = Vector::try_new(child_type.clone(), new_capacity, allocator)
         .expect("array_agg child vector allocation failed");
-    new_child.set_count(old_len);
-    for i in 0..old_len {
-        new_child.copy_at(i, &old_child, i);
-    }
+    new_child
+        .try_copy_range(0, &old_child, 0, old_len)
+        .expect("array_agg child vector copy failed");
     result.set_child(Arc::new(new_child));
 }
 

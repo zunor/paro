@@ -624,7 +624,7 @@ mod tests {
             }
 
             let mut out = test_chunk_with_capacity(types, count.max(1));
-            gather_chunk(collection, &row_locations, &mut out, count);
+            gather_chunk(collection, &row_locations, &mut out, count).unwrap();
             for row_idx in 0..count {
                 seen.push(out.column(0).unwrap().get_i32(row_idx).unwrap());
             }

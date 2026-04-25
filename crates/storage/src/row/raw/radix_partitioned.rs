@@ -409,7 +409,7 @@ impl RadixPartitionedRawRow {
                                 chunk_count.max(1),
                                 new_partitioned_data.data.chunk_allocator(),
                             )?;
-                            gather_chunk(partition, &row_locations, &mut output, chunk_count);
+                            gather_chunk(partition, &row_locations, &mut output, chunk_count)?;
                             new_partitioned_data.append(&mut append_state, &output)?;
                         }
 
@@ -568,7 +568,7 @@ mod tests {
             }
 
             let mut output = test_chunk_with_capacity(types, count.max(1));
-            gather_chunk(collection, &row_locations, &mut output, count);
+            gather_chunk(collection, &row_locations, &mut output, count).unwrap();
             for row_idx in 0..count {
                 let key = output.column(0).unwrap().get_i32(row_idx).unwrap();
                 let hash = output.column(1).unwrap().get_u64(row_idx).unwrap();
@@ -783,7 +783,7 @@ mod tests {
                 }
 
                 let mut output = test_chunk_with_capacity(&types, count.max(1));
-                gather_chunk(partition, &row_locations, &mut output, count);
+                gather_chunk(partition, &row_locations, &mut output, count).unwrap();
                 partition.finalize_pin_state(&mut scan_state.pin_state);
                 for row_idx in 0..count {
                     seen_rows += 1;
@@ -859,7 +859,7 @@ mod tests {
                 }
 
                 let mut output = test_chunk_with_capacity(&types, count.max(1));
-                gather_chunk(partition, &row_locations, &mut output, count);
+                gather_chunk(partition, &row_locations, &mut output, count).unwrap();
                 partition.finalize_pin_state(&mut scan_state.pin_state);
                 for row_idx in 0..count {
                     seen_rows += 1;
@@ -975,7 +975,7 @@ mod tests {
                 }
 
                 let mut output = test_chunk_with_capacity(&types, count.max(1));
-                gather_chunk(partition, &row_locations, &mut output, count);
+                gather_chunk(partition, &row_locations, &mut output, count).unwrap();
                 partition.finalize_pin_state(&mut scan_state.pin_state);
                 for row_idx in 0..count {
                     seen_rows += 1;

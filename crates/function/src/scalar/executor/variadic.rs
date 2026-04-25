@@ -28,7 +28,7 @@ pub fn execute_concat(input: &Chunk, result: &mut Vector) -> Result<()> {
                 concatenated.push_str(view.get_inline_string(row).as_str());
             }
         }
-        writer.write_str(row, &concatenated);
+        writer.write_str(row, &concatenated)?;
     }
 
     Ok(())
@@ -81,7 +81,7 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             wrote_any = true;
         }
 
-        writer.write_str(row, &concatenated);
+        writer.write_str(row, &concatenated)?;
     }
 
     Ok(())
@@ -93,7 +93,7 @@ pub fn apply_coalesce_child(
     unresolved: &SelectionVector,
     unresolved_count: usize,
     next_unresolved: &mut SelectionVector,
-) -> usize {
+) -> Result<usize> {
     next_unresolved.set_len(unresolved_count);
     let mut next_count = 0;
 
@@ -103,12 +103,12 @@ pub fn apply_coalesce_child(
             next_unresolved.set(next_count, logical_row);
             next_count += 1;
         } else {
-            result.copy_at(logical_row, child, row);
+            result.try_copy_at(logical_row, child, row)?;
         }
     }
 
     next_unresolved.set_len(next_count);
-    next_count
+    Ok(next_count)
 }
 
 #[cfg(test)]
@@ -219,7 +219,8 @@ mod tests {
         let mut next_unresolved = paro_common::test_utils::test_selection_with_capacity(3);
 
         let next_count =
-            apply_coalesce_child(&mut result, &child, &unresolved, 3, &mut next_unresolved);
+            apply_coalesce_child(&mut result, &child, &unresolved, 3, &mut next_unresolved)
+                .expect("coalesce child copy should succeed");
 
         assert_eq!(next_count, 1);
         assert_eq!(next_unresolved.get(0), 0);

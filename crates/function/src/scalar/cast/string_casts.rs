@@ -25,9 +25,9 @@ pub fn numeric_to_varchar_cast<T: std::fmt::Display + Copy>(
         if view.is_valid(row) {
             if let Some(data) = data {
                 let value = unsafe { *data.add(view.physical_index(row)) };
-                writer.write_str(row, &format!("{value}"));
+                writer.write_str(row, &format!("{value}"))?;
             } else {
-                writer.write_str(row, &format!("{}", input.get_value(row)));
+                writer.write_str(row, &format!("{}", input.get_value(row)))?;
             }
         } else {
             writer.set_null(row);
@@ -130,7 +130,7 @@ pub fn uuid_to_varchar_cast(
     for row in 0..count {
         if view.is_valid(row) {
             let value = unsafe { *data.add(view.physical_index(row)) };
-            writer.write_str(row, &format_uuid(value));
+            writer.write_str(row, &format_uuid(value))?;
         } else {
             writer.set_null(row);
         }
@@ -155,7 +155,7 @@ fn varchar_to_json_like_cast(
             let source_value = view.get_inline_string(row);
             let source = source_value.as_str();
             if serde_json::from_str::<JsonValue>(source).is_ok() {
-                writer.write_str(row, source);
+                writer.write_str(row, source)?;
             } else if ctx.try_cast {
                 writer.set_null(row);
                 all_success = false;

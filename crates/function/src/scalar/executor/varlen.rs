@@ -22,21 +22,23 @@ impl<'a> VarcharResultWriter<'a> {
     }
 
     #[inline]
-    pub fn write_str(&mut self, row: usize, value: &str) {
-        let entry = self.heap.add_string(value);
+    pub fn write_str(&mut self, row: usize, value: &str) -> Result<()> {
+        let entry = self.heap.try_add_string(value)?;
         unsafe {
             *self.entries.add(row) = entry;
         }
         self.validity.set_valid(row);
+        Ok(())
     }
 
     #[inline]
-    pub fn write_bytes(&mut self, row: usize, value: &[u8]) {
-        let entry = self.heap.add_blob(value);
+    pub fn write_bytes(&mut self, row: usize, value: &[u8]) -> Result<()> {
+        let entry = self.heap.try_add_blob(value)?;
         unsafe {
             *self.entries.add(row) = entry;
         }
         self.validity.set_valid(row);
+        Ok(())
     }
 
     #[inline]
@@ -235,7 +237,7 @@ mod tests {
         let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         execute_varchar_unary_to_varchar(&input, &mut result, 2, |value, row, writer| {
-            writer.write_str(row, value);
+            writer.write_str(row, value)?;
             Ok(())
         })
         .expect("varlen unary should succeed");

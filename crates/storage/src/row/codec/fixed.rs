@@ -4,28 +4,49 @@
 use std::ptr;
 
 use paro_common::error::Result;
-use paro_common::vector::{Vector, VectorType};
+use paro_common::vector::{DataRef, Vector, VectorType};
 
 fn scatter_fixed_inline<const N: usize>(
     source: &Vector,
     output: &mut Vector,
     output_positions: &[usize],
 ) -> Result<()> {
-    let decoded = source.decode(output_positions.len());
+    let decoded = source.try_decode_ref(output_positions.len())?;
     if output.vector_type() != VectorType::Flat {
-        output.flatten();
+        output.try_flatten()?;
     }
 
     unsafe {
-        let src_base = decoded.data();
+        let src_base = match decoded.data() {
+            DataRef::Ptr(ptr) => ptr,
+            DataRef::SequenceI64 { start, increment } if N == std::mem::size_of::<i64>() => {
+                let dst_base = output.flat_data_mut::<u8>();
+                for (src_idx, dst_idx) in output_positions.iter().copied().enumerate() {
+                    if !decoded.is_valid(src_idx) {
+                        output.try_set_null(dst_idx, true)?;
+                        continue;
+                    }
+
+                    output.try_set_null(dst_idx, false)?;
+                    let value = start + decoded.physical_index(src_idx) as i64 * increment;
+                    ptr::write_unaligned(dst_base.add(dst_idx * N).cast::<i64>(), value);
+                }
+                return Ok(());
+            }
+            DataRef::SequenceI64 { .. } => {
+                return Err(paro_common::error::internal(
+                    "sequence decode width does not match fixed scatter width",
+                ));
+            }
+        };
         let dst_base = output.flat_data_mut::<u8>();
         for (src_idx, dst_idx) in output_positions.iter().copied().enumerate() {
             if !decoded.is_valid(src_idx) {
-                output.set_null(dst_idx, true);
+                output.try_set_null(dst_idx, true)?;
                 continue;
             }
 
-            output.set_null(dst_idx, false);
+            output.try_set_null(dst_idx, false)?;
             let src_ptr = src_base.add(decoded.physical_index(src_idx) * N);
             let dst_ptr = dst_base.add(dst_idx * N);
             ptr::copy_nonoverlapping(src_ptr, dst_ptr, N);
@@ -41,21 +62,42 @@ fn scatter_fixed_memcpy(
     output: &mut Vector,
     output_positions: &[usize],
 ) -> Result<()> {
-    let decoded = source.decode(output_positions.len());
+    let decoded = source.try_decode_ref(output_positions.len())?;
     if output.vector_type() != VectorType::Flat {
-        output.flatten();
+        output.try_flatten()?;
     }
 
     unsafe {
-        let src_base = decoded.data();
+        let src_base = match decoded.data() {
+            DataRef::Ptr(ptr) => ptr,
+            DataRef::SequenceI64 { start, increment } if width == std::mem::size_of::<i64>() => {
+                let dst_base = output.flat_data_mut::<u8>();
+                for (src_idx, dst_idx) in output_positions.iter().copied().enumerate() {
+                    if !decoded.is_valid(src_idx) {
+                        output.try_set_null(dst_idx, true)?;
+                        continue;
+                    }
+
+                    output.try_set_null(dst_idx, false)?;
+                    let value = start + decoded.physical_index(src_idx) as i64 * increment;
+                    ptr::write_unaligned(dst_base.add(dst_idx * width).cast::<i64>(), value);
+                }
+                return Ok(());
+            }
+            DataRef::SequenceI64 { .. } => {
+                return Err(paro_common::error::internal(
+                    "sequence decode width does not match fixed scatter width",
+                ));
+            }
+        };
         let dst_base = output.flat_data_mut::<u8>();
         for (src_idx, dst_idx) in output_positions.iter().copied().enumerate() {
             if !decoded.is_valid(src_idx) {
-                output.set_null(dst_idx, true);
+                output.try_set_null(dst_idx, true)?;
                 continue;
             }
 
-            output.set_null(dst_idx, false);
+            output.try_set_null(dst_idx, false)?;
             let src_ptr = src_base.add(decoded.physical_index(src_idx) * width);
             let dst_ptr = dst_base.add(dst_idx * width);
             ptr::copy_nonoverlapping(src_ptr, dst_ptr, width);

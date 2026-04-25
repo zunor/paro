@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::allocator::Allocator;
-use crate::error::Result;
+use crate::error::{self as paro_error, Result};
 use crate::memory::AllocationId;
 use crate::runtime_value::Value;
 use crate::types::LogicalType;
@@ -205,12 +205,25 @@ impl Chunk {
     /// unnecessary CoW on hot reset/output paths.
     #[inline]
     pub fn set_cardinality(&mut self, count: usize) {
-        debug_assert!(count <= self.capacity, "count exceeds capacity");
-        if self.count == count {
-            return;
-        }
+        self.try_set_cardinality(count)
+            .expect("chunk cardinality allocation failed");
+    }
 
-        self.count = count;
+    /// Set the cardinality (row count).
+    ///
+    /// This also updates each Vector's count and validity mask to ensure
+    /// consistency between the Chunk and its vectors.
+    #[inline]
+    pub fn try_set_cardinality(&mut self, count: usize) -> Result<()> {
+        if count > self.capacity {
+            return Err(paro_error::internal(format!(
+                "chunk cardinality exceeds capacity: count={count}, capacity={}",
+                self.capacity
+            )));
+        }
+        if self.count == count {
+            return Ok(());
+        }
 
         // Update each vector's count to match the chunk's cardinality.
         // This ensures validity mask capacity is properly set for all vectors.
@@ -219,12 +232,11 @@ impl Chunk {
                 continue;
             }
 
-            if let Some(vec_mut) = Arc::get_mut(vec) {
-                vec_mut.set_count(count);
-            } else {
-                Arc::make_mut(vec).set_count(count);
-            }
+            Vector::try_make_arc_mut(vec)?.try_set_count(count)?;
         }
+
+        self.count = count;
+        Ok(())
     }
 
     /// Set capacity.

@@ -36,10 +36,7 @@ fn materialize_key_vector(
 ) -> Result<Arc<Vector>> {
     let allocator = ctx.allocator(paro_common::allocator::MemoryTag::BaseTable);
     let mut flat = Vector::try_new(logical_type, count.max(1), allocator)?;
-    flat.set_len(count);
-    for row_idx in 0..count {
-        flat.copy_at(row_idx, vector.as_ref(), row_idx);
-    }
+    flat.try_copy_range(0, vector.as_ref(), 0, count)?;
     Ok(Arc::new(flat))
 }
 
@@ -63,7 +60,7 @@ pub(super) fn evaluate_probe_keys(
         )?);
     }
     let mut probe_keys = Chunk::from_arc_vectors(key_vectors, input.allocator().clone());
-    probe_keys.set_cardinality(input.size());
+    probe_keys.try_set_cardinality(input.size())?;
     Ok(probe_keys)
 }
 
@@ -154,7 +151,7 @@ pub(super) fn filter_residual_matches(
         match_count,
         left_input.allocator().clone(),
     )?;
-    build_chunk.set_cardinality(match_count);
+    build_chunk.try_set_cardinality(match_count)?;
 
     for (build_col_idx, _build_type) in build_payload_types.iter().enumerate() {
         let column = build_chunk.column_mut(build_col_idx).ok_or_else(|| {

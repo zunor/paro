@@ -94,11 +94,11 @@ impl UngroupedAggregate {
     }
 
     fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> Result<SelectionVector> {
-        let filter_format = filter_vec.try_decode(row_count)?;
+        let filter_format = filter_vec.try_decode_ref(row_count)?;
         let filter_data = filter_format.get_data::<bool>();
         let mut selected_rows = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
-            let physical_idx = filter_format.sel().get(row_idx);
+            let physical_idx = filter_format.physical_index(row_idx);
             if !filter_format.validity().is_valid(physical_idx) {
                 continue;
             }

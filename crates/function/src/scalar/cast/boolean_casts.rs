@@ -95,7 +95,7 @@ pub fn bool_to_varchar(
     for row in 0..count {
         if view.is_valid(row) {
             let value = unsafe { *data.add(view.physical_index(row)) };
-            writer.write_str(row, if value { "true" } else { "false" });
+            writer.write_str(row, if value { "true" } else { "false" })?;
         } else {
             writer.set_null(row);
         }

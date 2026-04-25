@@ -264,7 +264,11 @@ impl RawRowCollection {
                 let allocator = segment.allocator();
 
                 // Prepare row_locations vector
-                state.chunk_state.row_locations.set_count(row_chunk.count);
+                state
+                    .chunk_state
+                    .row_locations
+                    .try_set_count(row_chunk.count)
+                    .map_err(|err| err.to_string())?;
 
                 // Collect chunk parts for this chunk
                 let mut chunk_parts_refs: Vec<&RawRowChunkPart> = Vec::new();
@@ -370,10 +374,9 @@ impl RawRowCollection {
             return Ok((0, Vec::new(), Vec::new()));
         }
 
-        // Decode the input vectors once, then compute heap sizes.
-        append_state.chunk_state.decode(chunk);
-        let heap_sizes =
-            scatter::compute_heap_sizes(&self.layout, &mut append_state.chunk_state, None, count);
+        // Decode the input vectors once as a borrowed view, then compute heap sizes.
+        let mut chunk_view = append_state.chunk_state.try_decode(chunk)?;
+        let heap_sizes = scatter::compute_heap_sizes(&self.layout, &mut chunk_view, None, count);
 
         // Get or create the target segment.
         if self.segments.is_empty() {
@@ -396,7 +399,7 @@ impl RawRowCollection {
         scatter::scatter_chunk(
             &self.layout,
             chunk,
-            &mut append_state.chunk_state,
+            &mut chunk_view,
             &row_locations,
             &mut heap_locations,
             None,
@@ -429,13 +432,9 @@ impl RawRowCollection {
             return Ok(0);
         }
 
-        append_state.chunk_state.decode(chunk);
-        let heap_sizes = scatter::compute_heap_sizes(
-            &self.layout,
-            &mut append_state.chunk_state,
-            Some(sel),
-            count,
-        );
+        let mut chunk_view = append_state.chunk_state.try_decode(chunk)?;
+        let heap_sizes =
+            scatter::compute_heap_sizes(&self.layout, &mut chunk_view, Some(sel), count);
 
         if self.segments.is_empty() {
             self.segments.push(RawRowSegment::new(self.new_allocator()));
@@ -455,7 +454,7 @@ impl RawRowCollection {
         scatter::scatter_chunk(
             &self.layout,
             chunk,
-            &mut append_state.chunk_state,
+            &mut chunk_view,
             &row_locations,
             &mut heap_locations,
             Some(sel),
@@ -520,7 +519,7 @@ impl RawRowCollection {
 
         let count = row_indices.len();
         if count == 0 {
-            output.set_count(0);
+            output.try_set_count(0)?;
             return Ok(());
         }
 
@@ -534,7 +533,7 @@ impl RawRowCollection {
             count,
         )?;
 
-        output.set_count(count);
+        output.try_set_count(count)?;
         Ok(())
     }
 
@@ -655,15 +654,15 @@ impl RawRowCollection {
         gstate: &mut RawRowParallelScanState,
         lstate: &mut RawRowScanState,
         chunk: &mut Chunk,
-    ) -> usize {
+    ) -> paro_common::error::Result<usize> {
         // Keep local pin behavior aligned with global scan properties.
         lstate.pin_state.properties = gstate.scan_state.pin_state.properties;
 
         let assigned = {
             let _guard = gstate.lock.lock().unwrap();
             if self.scan_complete(&gstate.scan_state) {
-                chunk.set_cardinality(0);
-                return 0;
+                chunk.try_set_cardinality(0)?;
+                return Ok(0);
             }
 
             let assigned = match (
@@ -679,8 +678,8 @@ impl RawRowCollection {
         };
 
         let Some((segment_idx, chunk_idx)) = assigned else {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         };
 
         self.scan_chunk_at(segment_idx, chunk_idx, &mut lstate.pin_state, chunk)
@@ -763,21 +762,21 @@ impl RawRowCollection {
         chunk_idx: usize,
         pin_state: &mut RawRowPinState,
         chunk: &mut Chunk,
-    ) -> usize {
+    ) -> paro_common::error::Result<usize> {
         let Some(segment) = self.get_segment(segment_idx) else {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         };
 
         if chunk_idx >= segment.chunks.len() {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         }
 
         let row_chunk = &segment.chunks[chunk_idx];
         if row_chunk.count == 0 || row_chunk.part_indices.is_empty() {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         }
 
         let layout = self.layout();
@@ -801,12 +800,12 @@ impl RawRowCollection {
 
         let count = row_locations.len();
         if count == 0 {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         }
 
-        super::gather::gather_chunk(self, &row_locations, chunk, count);
-        count
+        super::gather::gather_chunk(self, &row_locations, chunk, count)?;
+        Ok(count)
     }
 
     /// Get a segment by index.
@@ -1016,12 +1015,16 @@ mod tests {
 
         let mut seen = Vec::new();
         loop {
-            let scanned1 = collection.scan_parallel(&mut gstate, &mut lstate1, &mut out1);
+            let scanned1 = collection
+                .scan_parallel(&mut gstate, &mut lstate1, &mut out1)
+                .unwrap();
             for i in 0..scanned1 {
                 seen.push(out1.column(0).unwrap().get_i32(i).unwrap());
             }
 
-            let scanned2 = collection.scan_parallel(&mut gstate, &mut lstate2, &mut out2);
+            let scanned2 = collection
+                .scan_parallel(&mut gstate, &mut lstate2, &mut out2)
+                .unwrap();
             for i in 0..scanned2 {
                 seen.push(out2.column(0).unwrap().get_i32(i).unwrap());
             }
@@ -1096,7 +1099,7 @@ mod tests {
 
         let mut seen_rows = 0usize;
         loop {
-            let scanned = scan_chunk(&collection, &mut scan_state, &mut output);
+            let scanned = scan_chunk(&collection, &mut scan_state, &mut output).unwrap();
             if scanned == 0 {
                 break;
             }
@@ -1171,7 +1174,7 @@ mod tests {
         }
 
         let mut out = test_chunk_with_capacity(&[LogicalType::Varchar], count);
-        crate::row::raw::gather_chunk(&collection, &row_locations, &mut out, count);
+        crate::row::raw::gather_chunk(&collection, &row_locations, &mut out, count).unwrap();
         for (idx, expected) in values.iter().enumerate() {
             assert_eq!(
                 out.column(0).unwrap().get_string(idx),
@@ -1295,7 +1298,7 @@ mod tests {
 
         let mut output_chunk =
             test_chunk_with_capacity(&[array_type], crate::buffer::DEFAULT_BLOCK_SIZE / 8);
-        let scanned = scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        let scanned = scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
 
         assert_eq!(scanned, 2);
 
@@ -1342,7 +1345,7 @@ mod tests {
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
         let mut output_chunk = test_chunk_with_capacity(&[array_type], 1024);
-        scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
 
         let output_vec = output_chunk.column(0).unwrap();
         assert!(!output_vec.is_null(0));
@@ -1397,7 +1400,7 @@ mod tests {
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
         let mut output_chunk = test_chunk_with_capacity(&[array_type], 1024);
-        scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
 
         assert_eq!(output_chunk.size(), 2);
         let output_vec = output_chunk.column(0).unwrap();
@@ -1431,7 +1434,7 @@ mod tests {
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
         let mut output_chunk = test_chunk_with_capacity(&[LogicalType::Integer], 1024);
-        scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
 
         assert_eq!(output_chunk.size(), 2);
         let output = output_chunk.column(0).unwrap();
@@ -1464,7 +1467,7 @@ mod tests {
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
         let mut output_chunk = test_chunk_with_capacity(&[outer_array_type], 1024);
-        let scanned = scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        let scanned = scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
         assert_eq!(scanned, 2);
 
         let output_vec = output_chunk.column(0).unwrap();
@@ -1507,7 +1510,7 @@ mod tests {
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
         let mut output_chunk = test_chunk_with_capacity(&[outer_array_type], 1024);
-        scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
 
         let output_vec = output_chunk.column(0).unwrap();
         let inner = output_vec.child().unwrap();
@@ -1558,7 +1561,7 @@ mod tests {
         let mut scan_state = RawRowScanState::new();
         collection.initialize_scan(&mut scan_state, RawRowPinProperties::KeepEverythingPinned);
         let mut output_chunk = test_chunk_with_capacity(&[outer_array_type], 1024);
-        scan_chunk(&collection, &mut scan_state, &mut output_chunk);
+        scan_chunk(&collection, &mut scan_state, &mut output_chunk).unwrap();
 
         let output_vec = output_chunk.column(0).unwrap();
         let inner = output_vec.child().unwrap();

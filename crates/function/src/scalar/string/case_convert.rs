@@ -22,7 +22,7 @@ fn lower_varchar(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vecto
         .column(0)
         .ok_or_else(|| paro_common::error::internal("Missing input column".to_string()))?;
     execute_varchar_unary_to_varchar(input_vec, result, input.size(), |value, row, writer| {
-        writer.write_str(row, &value.to_lowercase());
+        writer.write_str(row, &value.to_lowercase())?;
         Ok(())
     })
 }
@@ -33,7 +33,7 @@ fn upper_varchar(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vecto
         .column(0)
         .ok_or_else(|| paro_common::error::internal("Missing input column".to_string()))?;
     execute_varchar_unary_to_varchar(input_vec, result, input.size(), |value, row, writer| {
-        writer.write_str(row, &value.to_uppercase());
+        writer.write_str(row, &value.to_uppercase())?;
         Ok(())
     })
 }

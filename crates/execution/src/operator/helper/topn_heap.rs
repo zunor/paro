@@ -344,13 +344,13 @@ impl TopNHeap {
                 let src_vec = &self.heap_data.as_slice()[chunk_idx].data[col_idx];
 
                 if src_vec.is_null(local_idx) {
-                    dst_vec.set_null(dst_idx, true);
+                    dst_vec.try_set_null(dst_idx, true)?;
                 } else {
-                    self.copy_value(src_vec, local_idx, &mut dst_vec, dst_idx);
+                    self.copy_value(src_vec, local_idx, &mut dst_vec, dst_idx)?;
                 }
             }
 
-            dst_vec.set_count(rows.len());
+            dst_vec.try_set_count(rows.len())?;
             output_vectors.push(Arc::new(dst_vec));
         }
 
@@ -358,7 +358,7 @@ impl TopNHeap {
             output_vectors,
             self.heap_data.as_slice()[rows[0].0].allocator().clone(),
         );
-        result.set_cardinality(rows.len());
+        result.try_set_cardinality(rows.len())?;
         Ok(result)
     }
 
@@ -532,18 +532,18 @@ impl TopNHeap {
 
             for (dst_idx, &src_idx) in row_indices.iter().enumerate() {
                 if src_vec.is_null(src_idx) {
-                    dst_vec.set_null(dst_idx, true);
+                    dst_vec.try_set_null(dst_idx, true)?;
                 } else {
-                    dst_vec.copy_at(dst_idx, src_vec, src_idx);
+                    dst_vec.try_copy_at(dst_idx, src_vec, src_idx)?;
                 }
             }
 
-            dst_vec.set_count(row_indices.len());
+            dst_vec.try_set_count(row_indices.len())?;
             output_vectors.push(Arc::new(dst_vec));
         }
 
         let mut result = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
-        result.set_cardinality(row_indices.len());
+        result.try_set_cardinality(row_indices.len())?;
         Ok(result)
     }
 
@@ -610,18 +610,18 @@ impl TopNHeap {
 
             for (dst_idx, &src_idx) in row_indices.iter().enumerate() {
                 if src_vec.is_null(src_idx) {
-                    dst_vec.set_null(dst_idx, true);
+                    dst_vec.try_set_null(dst_idx, true)?;
                 } else {
-                    self.copy_value(src_vec, src_idx, &mut dst_vec, dst_idx);
+                    self.copy_value(src_vec, src_idx, &mut dst_vec, dst_idx)?;
                 }
             }
 
-            dst_vec.set_count(row_indices.len());
+            dst_vec.try_set_count(row_indices.len())?;
             output_vectors.push(Arc::new(dst_vec));
         }
 
         let mut result = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
-        result.set_cardinality(row_indices.len());
+        result.try_set_cardinality(row_indices.len())?;
         Ok(result)
     }
 
@@ -632,9 +632,8 @@ impl TopNHeap {
         src_idx: usize,
         dst: &mut paro_common::vector::Vector,
         dst_idx: usize,
-    ) {
-        // Use copy_at which handles all types including Array
-        dst.copy_at(dst_idx, src, src_idx);
+    ) -> Result<()> {
+        dst.try_copy_at(dst_idx, src, src_idx)
     }
 
     /// Combine another heap into this one.
@@ -772,13 +771,13 @@ impl TopNHeap {
                 let src_vec = &self.heap_data.as_slice()[chunk_idx].data[col_idx];
 
                 if src_vec.is_null(local_idx) {
-                    dst_vec.set_null(dst_idx, true);
+                    dst_vec.try_set_null(dst_idx, true)?;
                 } else {
-                    self.copy_value(src_vec, local_idx, &mut dst_vec, dst_idx);
+                    self.copy_value(src_vec, local_idx, &mut dst_vec, dst_idx)?;
                 }
             }
 
-            dst_vec.set_count(row_indices.len());
+            dst_vec.try_set_count(row_indices.len())?;
             output_vectors.push(Arc::new(dst_vec));
         }
 
@@ -791,7 +790,7 @@ impl TopNHeap {
                 paro_common::error::internal("TopN heap has no payload chunks".to_string())
             })?;
         let mut result = Chunk::from_arc_vectors(output_vectors, allocator);
-        result.set_cardinality(row_indices.len());
+        result.try_set_cardinality(row_indices.len())?;
         Ok(result)
     }
 }

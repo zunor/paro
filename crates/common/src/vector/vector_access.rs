@@ -1,9 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{StringHeap, ValidityMask, Vector, VectorType};
+use super::{StringHeap, ValidityMask, Vector, VectorBuffer, VectorType};
+use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{InlineString, LogicalType};
+use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
 use std::sync::Arc;
 
 impl Vector {
@@ -541,10 +542,10 @@ impl Vector {
                             child_mut.allocator().clone(),
                         )
                         .expect("vector allocation failed");
+                        new_child
+                            .try_copy_range(0, child_mut, 0, dest_offset)
+                            .expect("vector value list child copy allocation failed");
                         new_child.set_count(dest_offset);
-                        for i in 0..dest_offset {
-                            new_child.copy_at(i, child_mut, i);
-                        }
                         *child_mut = new_child;
                     }
                 }
@@ -678,31 +679,16 @@ impl Vector {
     /// For short strings (≤12 bytes), data is stored inline in InlineString.
     /// For longer strings, data is stored in StringHeap and InlineString.ptr points to it.
     pub fn set_string(&mut self, idx: usize, val: &str) {
-        self.make_exclusive();
+        self.try_set_string(idx, val)
+            .expect("vector string allocation failed");
+    }
 
-        // Ensure we have exclusive access to the string heap
-        let heap = match &mut self.string_heap {
-            Some(arc) => {
-                // Try to get mutable reference if we're the only owner
-                match Arc::get_mut(arc) {
-                    Some(h) => h,
-                    None => {
-                        // Multiple owners: create a new heap (expensive but correct)
-                        self.string_heap = Some(Arc::new(StringHeap::new()));
-                        Arc::get_mut(self.string_heap.as_mut().unwrap()).unwrap()
-                    }
-                }
-            }
-            None => {
-                self.string_heap = Some(Arc::new(StringHeap::new()));
-                Arc::get_mut(self.string_heap.as_mut().unwrap()).unwrap()
-            }
-        };
-
-        // add_string handles both short (inlined) and long (heap) strings
-        let inline_str = heap.add_string(val);
-        unsafe { self.set_flat(idx, inline_str) };
-        self.validity_mut().set_valid(idx);
+    /// Set string value at index.
+    ///
+    /// For short strings (≤12 bytes), data is stored inline in InlineString.
+    /// For longer strings, data is stored in StringHeap and InlineString.ptr points to it.
+    pub fn try_set_string(&mut self, idx: usize, val: &str) -> Result<()> {
+        self.try_set_varlen(idx, val.as_bytes())
     }
 
     /// Set blob value at index.
@@ -710,63 +696,100 @@ impl Vector {
     /// For short blobs (≤12 bytes), data is stored inline in InlineString.
     /// For longer blobs, data is stored in StringHeap and InlineString.ptr points to it.
     pub fn set_blob(&mut self, idx: usize, val: &[u8]) {
-        self.make_exclusive();
-
-        // Ensure we have exclusive access to the string heap
-        let heap = match &mut self.string_heap {
-            Some(arc) => {
-                // Try to get mutable reference if we're the only owner
-                match Arc::get_mut(arc) {
-                    Some(h) => h,
-                    None => {
-                        // Multiple owners: create a new heap (expensive but correct)
-                        self.string_heap = Some(Arc::new(StringHeap::new()));
-                        Arc::get_mut(self.string_heap.as_mut().unwrap()).unwrap()
-                    }
-                }
-            }
-            None => {
-                self.string_heap = Some(Arc::new(StringHeap::new()));
-                Arc::get_mut(self.string_heap.as_mut().unwrap()).unwrap()
-            }
-        };
-
-        // add_blob handles both short (inlined) and long (heap) blobs
-        let inline_str = heap.add_blob(val);
-        unsafe { self.set_flat(idx, inline_str) };
-        self.validity_mut().set_valid(idx);
+        self.try_set_blob(idx, val)
+            .expect("vector blob allocation failed");
     }
 
-    /// Slice a source vector into this vector.
-    /// This is an MVP implementation that copies data.
-    pub fn slice(&mut self, source: &Vector, start: usize, end: usize) {
-        let count = end - start;
+    /// Set blob value at index.
+    ///
+    /// For short blobs (≤12 bytes), data is stored inline in InlineString.
+    /// For longer blobs, data is stored in StringHeap and InlineString.ptr points to it.
+    pub fn try_set_blob(&mut self, idx: usize, val: &[u8]) -> Result<()> {
+        self.try_set_varlen(idx, val)
+    }
 
-        // Handle Array type specially - need to slice child vector with multiplied offset
-        if let LogicalType::Array(_, array_size) = &self.logical_type {
-            if let (Some(self_child), Some(source_child)) = (&mut self.child, &source.child) {
-                let child_start = start * array_size;
-                let child_end = end * array_size;
-                let self_child_mut = Arc::make_mut(self_child);
-                self_child_mut.slice(source_child, child_start, child_end);
-            }
-            // Copy validity for the array elements
-            for i in 0..count {
-                if source.is_null(start + i) {
-                    self.validity_mut().set_null(i);
-                } else {
-                    self.validity_mut().set_valid(i);
-                }
-            }
-            self.count = count;
-            return;
+    fn try_set_varlen(&mut self, idx: usize, val: &[u8]) -> Result<()> {
+        if idx >= self.buffer.capacity() {
+            return Err(paro_error::internal(format!(
+                "varlen write index out of bounds: idx={idx}, capacity={}",
+                self.buffer.capacity()
+            )));
         }
 
-        // Default implementation for non-Array types
-        for i in 0..count {
-            self.copy_at(i, source, start + i);
+        self.try_make_exclusive()?;
+        self.validity.try_make_exclusive()?;
+
+        let inline_value = if val.len() <= INLINE_LENGTH {
+            InlineString::from_bytes(val)
+        } else {
+            self.try_add_out_of_line_varlen(idx, val)?
+        };
+
+        unsafe { self.set_flat(idx, inline_value) };
+        if self.validity.is_mask_set() {
+            self.validity.set_valid_unsafe(idx);
         }
-        self.count = count;
+        Ok(())
+    }
+
+    fn try_add_out_of_line_varlen(&mut self, idx: usize, val: &[u8]) -> Result<InlineString> {
+        if let Some(heap) = self.string_heap.as_mut().and_then(Arc::get_mut) {
+            return heap.try_add_blob(val);
+        }
+
+        let preserve_entries = self
+            .buffer
+            .capacity()
+            .min(self.count.max(idx.saturating_add(1)));
+        let allocator = self.allocator().clone();
+        let old_heap = self.string_heap.clone();
+        let initial_capacity = old_heap
+            .as_ref()
+            .map(|heap| heap.allocation_size())
+            .unwrap_or(0)
+            .max(preserve_entries)
+            .max(idx.saturating_add(1))
+            .max(1);
+
+        let mut rebuilt_heap = StringHeap::with_allocator(initial_capacity, allocator.clone());
+        let rebuilt_buffer = VectorBuffer::try_with_allocator(
+            std::mem::size_of::<InlineString>(),
+            self.buffer.capacity(),
+            allocator,
+        )?;
+
+        unsafe {
+            let entries = self.buffer.data() as *const InlineString;
+            let rewritten_entries = rebuilt_buffer.data() as *mut InlineString;
+            for entry_idx in 0..preserve_entries {
+                let entry = *entries.add(entry_idx);
+                *rewritten_entries.add(entry_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;
+            }
+        }
+
+        let inline_value = rebuilt_heap.try_add_blob(val)?;
+
+        self.buffer = rebuilt_buffer;
+        self.string_heap = Some(Arc::new(rebuilt_heap));
+        Ok(inline_value)
+    }
+
+    /// Slice a source vector into this vector by materializing the requested range.
+    pub fn try_slice(&mut self, source: &Vector, start: usize, end: usize) -> Result<()> {
+        let count = end.checked_sub(start).ok_or_else(|| {
+            paro_error::internal(format!(
+                "vector slice end before start: start={start}, end={end}"
+            ))
+        })?;
+        if end > source.len() {
+            return Err(paro_error::internal(format!(
+                "vector slice out of bounds: end={end}, source_len={}",
+                source.len()
+            )));
+        }
+
+        self.try_copy_range(0, source, start, count)?;
+        self.try_set_count(count)
     }
 
     /// Reference a single value, converting this vector to a constant vector.
@@ -941,7 +964,9 @@ impl Vector {
 
                 // Use StringHeap which handles both short and long strings
                 let mut heap = StringHeap::with_allocator(v.len().max(64), allocator.clone());
-                let inline_str = heap.add_string(v);
+                let inline_str = heap
+                    .try_add_string(v)
+                    .expect("vector value string allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut InlineString;
                     *ptr = inline_str;
@@ -961,7 +986,9 @@ impl Vector {
 
                 // Use StringHeap which handles both short and long blobs
                 let mut heap = StringHeap::with_allocator(v.len().max(64), allocator.clone());
-                let inline_str = heap.add_blob(v);
+                let inline_str = heap
+                    .try_add_blob(v)
+                    .expect("vector value blob allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut InlineString;
                     *ptr = inline_str;

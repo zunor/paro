@@ -374,11 +374,11 @@ impl PhysicalOperator for PhysicalGraphProject {
                             selected_count,
                             combined_chunk.allocator().clone(),
                         )?;
-                        new_vec.set_len(selected_count);
+                        new_vec.try_set_len(selected_count)?;
                         let mut dst_idx = 0;
                         for (src_idx, &keep) in mask.iter().enumerate() {
                             if keep {
-                                new_vec.copy_at(dst_idx, src_col, src_idx);
+                                new_vec.try_copy_at(dst_idx, src_col, src_idx)?;
                                 dst_idx += 1;
                             }
                         }
@@ -387,7 +387,7 @@ impl PhysicalOperator for PhysicalGraphProject {
                 }
                 let mut filtered =
                     Chunk::from_arc_vectors(new_vectors, combined_chunk.allocator().clone());
-                filtered.set_cardinality(selected_count);
+                filtered.try_set_cardinality(selected_count)?;
                 filtered
             }
         };

@@ -391,7 +391,7 @@ mod tests {
         array_vec.set_count(2);
 
         // Flatten the vector
-        array_vec.flatten();
+        array_vec.try_flatten().unwrap();
 
         // Verify the child is still accessible
         let entry = ArrayVector::get_entry(&array_vec);
@@ -407,7 +407,7 @@ mod tests {
         array_vec.set_count(2);
 
         // Get the decoded tree view
-        let format = array_vec.decode_tree(2);
+        let format = array_vec.try_decode_tree(2).unwrap();
 
         // Verify the format
         assert_eq!(format.children.len(), 1);

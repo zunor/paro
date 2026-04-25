@@ -526,8 +526,8 @@ impl PartitionedColumnData {
                 "partition buffer would overflow: partition_idx={partition_idx}, current={buffer_count}, incoming={partition_length}, capacity={buffer_capacity}"
             )));
         }
-        // Grow vector lengths up-front so copy_at can write into [buffer_count, new_count).
-        buffer.set_cardinality(new_count);
+        // Grow vector lengths up-front so row copy can write into [buffer_count, new_count).
+        buffer.try_set_cardinality(new_count)?;
 
         for idx in partition_offset..partition_offset + partition_length {
             let source_row = state.partition_sel.get(idx);
@@ -549,7 +549,7 @@ impl PartitionedColumnData {
                         "missing target column while buffering partition rows: col_idx={col_idx}"
                     ))
                 })?;
-                target_col.copy_at(buffer_count, source_col.as_ref(), source_row);
+                target_col.try_copy_at(buffer_count, source_col.as_ref(), source_row)?;
             }
             buffer_count += 1;
         }
@@ -586,7 +586,7 @@ impl PartitionedColumnData {
         partition.append(partition_state, partition_buffer)?;
         self.count += partition.count().saturating_sub(count_before);
         self.data_size += partition.size_in_bytes().saturating_sub(size_before);
-        partition_buffer.set_cardinality(0);
+        partition_buffer.try_set_cardinality(0)?;
         Ok(())
     }
 
@@ -705,7 +705,7 @@ impl PartitionedColumnData {
 
 fn gather_chunk_rows(input: &Chunk, rows: &[usize], types: &[LogicalType]) -> Result<Chunk> {
     let mut gathered = Chunk::try_initialize(types, rows.len().max(1), input.allocator().clone())?;
-    gathered.set_cardinality(rows.len());
+    gathered.try_set_cardinality(rows.len())?;
 
     for col_idx in 0..input.column_count() {
         let source_col = input.column(col_idx).ok_or_else(|| {
@@ -719,7 +719,7 @@ fn gather_chunk_rows(input: &Chunk, rows: &[usize], types: &[LogicalType]) -> Re
             ))
         })?;
         for (target_row, source_row) in rows.iter().copied().enumerate() {
-            target_col.copy_at(target_row, source_col.as_ref(), source_row);
+            target_col.try_copy_at(target_row, source_col.as_ref(), source_row)?;
         }
     }
 

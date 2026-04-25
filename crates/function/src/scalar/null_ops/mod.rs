@@ -36,7 +36,7 @@ pub fn register_null_functions() -> Vec<ScalarFunctionSet> {
 
 pub(crate) fn coalesce_rows(input: &Chunk, result: &mut Vector) -> Result<()> {
     let count = input.size();
-    result.set_count(count);
+    result.try_set_count(count)?;
 
     for row in 0..count {
         let mut copied = false;
@@ -44,13 +44,13 @@ pub(crate) fn coalesce_rows(input: &Chunk, result: &mut Vector) -> Result<()> {
             if source.is_null(row) {
                 continue;
             }
-            result.copy_at(row, source, row);
+            result.try_copy_at(row, source, row)?;
             copied = true;
             break;
         }
 
         if !copied {
-            result.set_null(row, true);
+            result.try_set_null(row, true)?;
         }
     }
 
@@ -66,16 +66,16 @@ pub(crate) fn ifnull_rows(input: &Chunk, result: &mut Vector) -> Result<()> {
     }
 
     let count = input.size();
-    result.set_count(count);
+    result.try_set_count(count)?;
     let left = &input.data[0];
     let right = &input.data[1];
 
     for row in 0..count {
         let source = if left.is_null(row) { right } else { left };
         if source.is_null(row) {
-            result.set_null(row, true);
+            result.try_set_null(row, true)?;
         } else {
-            result.copy_at(row, source, row);
+            result.try_copy_at(row, source, row)?;
         }
     }
 
@@ -94,16 +94,16 @@ where
     }
 
     let count = input.size();
-    result.set_count(count);
+    result.try_set_count(count)?;
     let left = &input.data[0];
     let right = &input.data[1];
 
     for row in 0..count {
         if left.is_null(row) || right.is_null(row) {
             if left.is_null(row) {
-                result.set_null(row, true);
+                result.try_set_null(row, true)?;
             } else {
-                result.copy_at(row, left, row);
+                result.try_copy_at(row, left, row)?;
             }
             continue;
         }
@@ -111,9 +111,9 @@ where
         let left_value = left.get_value(row);
         let right_value = right.get_value(row);
         if equals(&left_value, &right_value) {
-            result.set_null(row, true);
+            result.try_set_null(row, true)?;
         } else {
-            result.copy_at(row, left, row);
+            result.try_copy_at(row, left, row)?;
         }
     }
 

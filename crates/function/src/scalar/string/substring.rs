@@ -174,7 +174,7 @@ fn substring_2_varchar(
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
         let sub = substring_unicode(str_view.get_inline_string(row).as_str(), start, None);
-        writer.write_str(row, &sub);
+        writer.write_str(row, &sub)?;
     }
 
     Ok(())
@@ -216,7 +216,7 @@ fn substring_3_varchar(
             start,
             Some(length),
         );
-        writer.write_str(row, &sub);
+        writer.write_str(row, &sub)?;
     }
 
     Ok(())
@@ -251,7 +251,7 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
             let take_count = (chars.len() as i64 + n).max(0) as usize;
             chars[..take_count].iter().collect()
         };
-        writer.write_str(row, &sub);
+        writer.write_str(row, &sub)?;
     }
 
     Ok(())
@@ -291,7 +291,7 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
             chars[skip..].iter().collect()
         };
 
-        writer.write_str(row, &sub);
+        writer.write_str(row, &sub)?;
     }
 
     Ok(())
