@@ -207,7 +207,7 @@ impl Vector {
             capacity,
             source.allocator().clone(),
         )?;
-        if source.len() > 0 {
+        if !source.is_empty() {
             materialized.try_copy_range(0, source, 0, source.len())?;
         }
         materialized.try_set_count(source.len())?;
