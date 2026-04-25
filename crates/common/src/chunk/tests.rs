@@ -2,17 +2,107 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::allocator::{Allocator, DefaultAllocator};
+use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
 use crate::types::LogicalType;
 use crate::vector::{AllocationSet, VectorType, VECTOR_SIZE};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+#[derive(Debug)]
+struct ToggleAllocator {
+    inner: DefaultAllocator,
+    fail: AtomicBool,
+}
+
+impl ToggleAllocator {
+    fn new() -> Self {
+        Self {
+            inner: DefaultAllocator::new(),
+            fail: AtomicBool::new(false),
+        }
+    }
+
+    fn set_fail(&self, fail: bool) {
+        self.fail.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl Allocator for ToggleAllocator {
+    fn allocate(&self, size: usize) -> Result<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )));
+        }
+        self.inner.allocate(size)
+    }
+
+    fn allocate_zeroed(&self, size: usize) -> Result<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )));
+        }
+        self.inner.allocate_zeroed(size)
+    }
+
+    fn free(&self, ptr: *mut u8, size: usize) {
+        self.inner.free(ptr, size);
+    }
+
+    fn reallocate(&self, ptr: *mut u8, old_size: usize, new_size: usize) -> Result<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {new_size} bytes"
+            )));
+        }
+        self.inner.reallocate(ptr, old_size, new_size)
+    }
+
+    fn name(&self) -> &'static str {
+        "ToggleAllocator"
+    }
+}
 
 fn make_int_string_chunk(ids: &[i32], labels: &[&str]) -> Chunk {
     crate::test_utils::test_chunk_from_vectors(vec![
         crate::test_utils::test_i32_vector(ids),
         crate::test_utils::test_string_vector(labels),
     ])
+}
+
+fn make_nested_chunk(rows: &[(i32, i32, Vec<i32>, &str)], capacity: usize) -> Chunk {
+    let types = vec![
+        LogicalType::Array(Box::new(LogicalType::Integer), 2),
+        LogicalType::List(Box::new(LogicalType::Integer)),
+        LogicalType::Varchar,
+    ];
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, capacity);
+    chunk.set_cardinality(rows.len());
+
+    for (row_idx, (left, right, list, label)) in rows.iter().enumerate() {
+        chunk.column_mut(0).unwrap().set_value(
+            row_idx,
+            &Value::Array(
+                vec![Value::Integer(*left), Value::Integer(*right)],
+                LogicalType::Integer,
+                2,
+            ),
+        );
+        chunk.column_mut(1).unwrap().set_value(
+            row_idx,
+            &Value::List(
+                list.iter().copied().map(Value::Integer).collect::<Vec<_>>(),
+                LogicalType::Integer,
+            ),
+        );
+        chunk.column_mut(2).unwrap().set_string(row_idx, label);
+    }
+
+    chunk
 }
 
 #[test]
@@ -60,6 +150,46 @@ fn test_set_cardinality() {
 
     chunk.set_cardinality(50);
     assert_eq!(chunk.size(), 50);
+}
+
+#[test]
+fn test_try_set_cardinality_rejects_capacity_overflow() {
+    let types = vec![LogicalType::Integer];
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 4);
+
+    let err = chunk.try_set_cardinality(5).unwrap_err();
+
+    assert!(err.to_string().contains("cardinality exceeds capacity"));
+    assert_eq!(chunk.size(), 0);
+}
+
+#[test]
+fn test_try_set_cardinality_shrink_keeps_vector_validity_capacity() {
+    let types = vec![LogicalType::Integer];
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 8);
+
+    chunk.try_set_cardinality(8).unwrap();
+    let validity_len = chunk.column(0).unwrap().validity().len();
+
+    chunk.try_set_cardinality(2).unwrap();
+
+    assert_eq!(chunk.size(), 2);
+    assert_eq!(chunk.column(0).unwrap().validity().len(), validity_len);
+}
+
+#[test]
+fn test_try_set_cardinality_growth_propagates_vector_allocation_error() {
+    let allocator = Arc::new(ToggleAllocator::new());
+    let mut chunk = Chunk::try_initialize(&[LogicalType::Null], 64, allocator.clone()).unwrap();
+    chunk.column_mut(0).unwrap().try_set_null(1, true).unwrap();
+    chunk.set_capacity(129);
+
+    allocator.set_fail(true);
+    let err = chunk.try_set_cardinality(129).unwrap_err();
+
+    assert!(err.to_string().contains("injected allocation failure"));
+    assert_eq!(chunk.size(), 0);
+    assert_eq!(chunk.column(0).unwrap().validity().len(), 64);
 }
 
 #[test]
@@ -115,7 +245,7 @@ fn test_flatten() {
     let mut chunk = crate::test_utils::test_chunk_from_vectors(vec![v1]);
 
     assert_eq!(chunk.data[0].vector_type(), VectorType::Constant);
-    chunk.flatten();
+    chunk.try_flatten().unwrap();
     assert_eq!(chunk.data[0].vector_type(), VectorType::Flat);
 }
 
@@ -717,6 +847,59 @@ fn test_append_grows_capacity_and_preserves_values() {
 }
 
 #[test]
+fn test_append_grows_capacity_with_nested_columns() {
+    let mut chunk = make_nested_chunk(&[(1, 2, vec![10, 20], "first long label")], 1);
+    let other = make_nested_chunk(
+        &[
+            (3, 4, vec![30], "second long label"),
+            (5, 6, vec![50, 60, 70], "third long label"),
+        ],
+        2,
+    );
+
+    chunk
+        .try_append(&other)
+        .expect("test chunk append allocation failed");
+
+    assert!(chunk.capacity() >= 3);
+    assert_eq!(chunk.size(), 3);
+    assert_eq!(
+        chunk.column(0).unwrap().get_value(2),
+        Value::Array(
+            vec![Value::Integer(5), Value::Integer(6)],
+            LogicalType::Integer,
+            2
+        )
+    );
+    assert_eq!(
+        chunk.column(1).unwrap().get_value(2),
+        Value::List(
+            vec![Value::Integer(50), Value::Integer(60), Value::Integer(70)],
+            LogicalType::Integer
+        )
+    );
+    assert_eq!(
+        chunk.column(2).unwrap().get_string(2),
+        Some("third long label")
+    );
+
+    let grown_capacity = chunk.capacity();
+    chunk
+        .try_reset(chunk.allocator().clone())
+        .expect("test chunk reset allocation failed");
+    assert_eq!(chunk.capacity(), grown_capacity);
+    chunk.set_cardinality(1);
+    chunk
+        .column_mut(2)
+        .unwrap()
+        .set_string(0, "reset long label");
+    assert_eq!(
+        chunk.column(2).unwrap().get_string(0),
+        Some("reset long label")
+    );
+}
+
+#[test]
 fn test_slice_filters_rows_with_dictionary_vectors() {
     let mut chunk = make_int_string_chunk(&[10, 20, 30], &["ten", "twenty", "thirty"]);
     let sel = crate::test_utils::test_selection(vec![2, 0]);
@@ -891,4 +1074,68 @@ fn test_copy_to_respects_offset() {
     assert_eq!(target.column(0).unwrap().get_i32(1), Some(4));
     assert_eq!(target.column(1).unwrap().get_string(0), Some("c"));
     assert_eq!(target.column(1).unwrap().get_string(1), Some("d"));
+}
+
+#[test]
+fn test_deep_copy_materializes_dictionary_nested_columns() {
+    let mut source = make_nested_chunk(
+        &[
+            (1, 2, vec![10, 20], "first long dictionary label"),
+            (3, 4, vec![30], "second long dictionary label"),
+            (5, 6, vec![50, 60], "third long dictionary label"),
+        ],
+        3,
+    );
+    source
+        .try_slice_range(1, 2)
+        .expect("test chunk slice_range allocation failed");
+    assert_eq!(
+        source.column(2).unwrap().vector_type(),
+        VectorType::Dictionary
+    );
+    let source_heap_id = source
+        .column(2)
+        .unwrap()
+        .child()
+        .unwrap()
+        .string_heap()
+        .unwrap()
+        .allocation_identity();
+
+    let copied = source
+        .try_deep_copy(crate::test_utils::test_allocator())
+        .expect("test chunk deep copy allocation failed");
+
+    assert_eq!(copied.size(), 2);
+    assert_eq!(copied.column(0).unwrap().vector_type(), VectorType::Flat);
+    assert_eq!(copied.column(1).unwrap().vector_type(), VectorType::Flat);
+    assert_eq!(copied.column(2).unwrap().vector_type(), VectorType::Flat);
+    assert_eq!(
+        copied.column(0).unwrap().get_value(0),
+        Value::Array(
+            vec![Value::Integer(3), Value::Integer(4)],
+            LogicalType::Integer,
+            2
+        )
+    );
+    assert_eq!(
+        copied.column(1).unwrap().get_value(1),
+        Value::List(
+            vec![Value::Integer(50), Value::Integer(60)],
+            LogicalType::Integer
+        )
+    );
+    assert_eq!(
+        copied.column(2).unwrap().get_string(0),
+        Some("second long dictionary label")
+    );
+    assert_ne!(
+        copied
+            .column(2)
+            .unwrap()
+            .string_heap()
+            .unwrap()
+            .allocation_identity(),
+        source_heap_id
+    );
 }

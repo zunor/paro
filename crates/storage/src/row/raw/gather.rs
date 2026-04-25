@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
-use paro_common::allocator::default_allocator;
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 
@@ -32,18 +33,19 @@ pub fn gather_chunk(
     row_locations: &[*const u8],
     chunk: &mut Chunk,
     count: usize,
-) {
+) -> Result<()> {
     let layout = collection.layout();
 
     // Gather each column
     for col_idx in 0..layout.column_count() {
         if let Some(vector) = chunk.column_mut(col_idx) {
             let offset = layout.get_offsets()[col_idx];
-            gather_vector(layout, vector, col_idx, offset, row_locations, count);
+            gather_vector(layout, vector, col_idx, offset, row_locations, count)?;
         }
     }
 
-    chunk.set_cardinality(count);
+    chunk.try_set_cardinality(count)?;
+    Ok(())
 }
 
 /// Gather data with a selection vector.
@@ -60,17 +62,18 @@ pub fn gather_chunk_with_sel(
     sel: &SelectionVector,
     chunk: &mut Chunk,
     count: usize,
-) {
+) -> Result<()> {
     let layout = collection.layout();
 
     for col_idx in 0..layout.column_count() {
         if let Some(vector) = chunk.column_mut(col_idx) {
             let offset = layout.get_offsets()[col_idx];
-            gather_vector_with_sel(layout, vector, col_idx, offset, row_locations, sel, count);
+            gather_vector_with_sel(layout, vector, col_idx, offset, row_locations, sel, count)?;
         }
     }
 
-    chunk.set_cardinality(count);
+    chunk.try_set_cardinality(count)?;
+    Ok(())
 }
 
 /// Gather a single vector from row storage.
@@ -81,7 +84,7 @@ fn gather_vector(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
+) -> Result<()> {
     let logical_type = vector.logical_type().clone();
 
     match &logical_type {
@@ -142,18 +145,19 @@ fn gather_vector(
         }
         LogicalType::Decimal { precision, .. } => {
             if *precision <= 18 {
-                gather_fixed::<i64>(layout, vector, col_idx, offset, row_locations, count);
+                gather_fixed::<i64>(layout, vector, col_idx, offset, row_locations, count)
             } else {
-                gather_fixed::<i128>(layout, vector, col_idx, offset, row_locations, count);
+                gather_fixed::<i128>(layout, vector, col_idx, offset, row_locations, count)
             }
         }
 
         LogicalType::Null => {
             // Null type: just set count and mark all as null
-            vector.set_len(count);
+            vector.try_set_len(count)?;
             for i in 0..count {
-                vector.set_null(i, true);
+                vector.try_set_null(i, true)?;
             }
+            Ok(())
         }
 
         LogicalType::Varchar
@@ -162,9 +166,7 @@ fn gather_vector(
         | LogicalType::TsQuery
         | LogicalType::Json
         | LogicalType::Jsonb
-        | LogicalType::Blob => {
-            gather_string(layout, vector, col_idx, offset, row_locations, count);
-        }
+        | LogicalType::Blob => gather_string(layout, vector, col_idx, offset, row_locations, count),
 
         LogicalType::Array(_, _) => {
             array_row_gather(layout, vector, col_idx, offset, row_locations, count)
@@ -172,23 +174,22 @@ fn gather_vector(
         LogicalType::List(_) => {
             list_row_gather(layout, vector, col_idx, offset, row_locations, count)
         }
-        LogicalType::Struct(fields) => {
-            gather_struct(
-                layout,
-                vector,
-                col_idx,
-                offset,
-                row_locations,
-                count,
-                fields,
-            );
-        }
+        LogicalType::Struct(fields) => gather_struct(
+            layout,
+            vector,
+            col_idx,
+            offset,
+            row_locations,
+            count,
+            fields,
+        ),
         _ => {
             // For unsupported types, set vector length first, then set all to null
-            vector.set_len(count);
+            vector.try_set_len(count)?;
             for i in 0..count {
-                vector.set_null(i, true);
+                vector.try_set_null(i, true)?;
             }
+            Ok(())
         }
     }
 }
@@ -217,37 +218,52 @@ pub unsafe fn read_value(
     col_idx: usize,
     logical_type: &LogicalType,
     layout: &RawRowLayout,
-) -> paro_common::runtime_value::Value {
+    allocator: Arc<dyn Allocator>,
+) -> Result<paro_common::runtime_value::Value> {
     use paro_common::runtime_value::Value;
 
     if !layout.all_valid() && unsafe { !is_row_valid(row_ptr, col_idx) } {
-        return Value::Null(logical_type.clone());
+        return Ok(Value::Null(logical_type.clone()));
     }
 
     let offset = layout.get_offsets()[col_idx];
     let data_ptr = row_ptr.add(offset);
 
     match logical_type {
-        LogicalType::Boolean => Value::Boolean(std::ptr::read(data_ptr) != 0),
-        LogicalType::TinyInt => Value::TinyInt(std::ptr::read(data_ptr as *const i8)),
-        LogicalType::UTinyInt => Value::UTinyInt(std::ptr::read(data_ptr)),
-        LogicalType::SmallInt => Value::SmallInt(std::ptr::read_unaligned(data_ptr as *const i16)),
-        LogicalType::USmallInt => {
-            Value::USmallInt(std::ptr::read_unaligned(data_ptr as *const u16))
-        }
-        LogicalType::Integer => Value::Integer(std::ptr::read_unaligned(data_ptr as *const i32)),
-        LogicalType::UInteger => Value::UInteger(std::ptr::read_unaligned(data_ptr as *const u32)),
-        LogicalType::BigInt => Value::BigInt(std::ptr::read_unaligned(data_ptr as *const i64)),
-        LogicalType::UBigInt => Value::UBigInt(std::ptr::read_unaligned(data_ptr as *const u64)),
-        LogicalType::Float => Value::Float(std::ptr::read_unaligned(data_ptr as *const f32)),
-        LogicalType::Double => Value::Double(std::ptr::read_unaligned(data_ptr as *const f64)),
+        LogicalType::Boolean => Ok(Value::Boolean(std::ptr::read(data_ptr) != 0)),
+        LogicalType::TinyInt => Ok(Value::TinyInt(std::ptr::read(data_ptr as *const i8))),
+        LogicalType::UTinyInt => Ok(Value::UTinyInt(std::ptr::read(data_ptr))),
+        LogicalType::SmallInt => Ok(Value::SmallInt(std::ptr::read_unaligned(
+            data_ptr as *const i16,
+        ))),
+        LogicalType::USmallInt => Ok(Value::USmallInt(std::ptr::read_unaligned(
+            data_ptr as *const u16,
+        ))),
+        LogicalType::Integer => Ok(Value::Integer(std::ptr::read_unaligned(
+            data_ptr as *const i32,
+        ))),
+        LogicalType::UInteger => Ok(Value::UInteger(std::ptr::read_unaligned(
+            data_ptr as *const u32,
+        ))),
+        LogicalType::BigInt => Ok(Value::BigInt(std::ptr::read_unaligned(
+            data_ptr as *const i64,
+        ))),
+        LogicalType::UBigInt => Ok(Value::UBigInt(std::ptr::read_unaligned(
+            data_ptr as *const u64,
+        ))),
+        LogicalType::Float => Ok(Value::Float(std::ptr::read_unaligned(
+            data_ptr as *const f32,
+        ))),
+        LogicalType::Double => Ok(Value::Double(std::ptr::read_unaligned(
+            data_ptr as *const f64,
+        ))),
         LogicalType::Decimal { precision, scale } => {
             let value = if *precision <= 18 {
                 std::ptr::read_unaligned(data_ptr as *const i64) as i128
             } else {
                 std::ptr::read_unaligned(data_ptr as *const i128)
             };
-            Value::Decimal(value, *precision, *scale)
+            Ok(Value::Decimal(value, *precision, *scale))
         }
 
         LogicalType::Varchar
@@ -260,49 +276,53 @@ pub unsafe fn read_value(
             let len = std::ptr::read(data_ptr as *const u32) as usize;
             if len == 0 {
                 if logical_type == &LogicalType::Blob {
-                    Value::Blob(vec![])
+                    Ok(Value::Blob(vec![]))
                 } else {
-                    Value::Varchar(String::new())
+                    Ok(Value::Varchar(String::new()))
                 }
             } else if len <= STRING_INLINE_LENGTH {
                 let bytes = std::slice::from_raw_parts(data_ptr.add(4), len);
                 if logical_type == &LogicalType::Blob {
-                    Value::Blob(bytes.to_vec())
+                    Ok(Value::Blob(bytes.to_vec()))
                 } else {
-                    Value::Varchar(String::from_utf8_lossy(bytes).into_owned())
+                    Ok(Value::Varchar(String::from_utf8_lossy(bytes).into_owned()))
                 }
             } else {
                 let heap_ptr = std::ptr::read(data_ptr.add(8) as *const *const u8);
                 let bytes = std::slice::from_raw_parts(heap_ptr, len);
                 if logical_type == &LogicalType::Blob {
-                    Value::Blob(bytes.to_vec())
+                    Ok(Value::Blob(bytes.to_vec()))
                 } else {
-                    Value::Varchar(String::from_utf8_lossy(bytes).into_owned())
+                    Ok(Value::Varchar(String::from_utf8_lossy(bytes).into_owned()))
                 }
             }
         }
 
         LogicalType::Array(_, _) | LogicalType::List(_) => {
             let heap_ptr = std::ptr::read(data_ptr as *const *const u8);
-            let mut vector =
-                Vector::try_new(logical_type.clone(), 1, Arc::new(default_allocator()))
-                    .expect("collection value vector allocation failed");
-            let _ = gather_collection_entry(logical_type, &mut vector, 0, heap_ptr);
-            vector.set_count(1);
-            vector.get_value(0)
+            let mut vector = Vector::try_new(logical_type.clone(), 1, Arc::clone(&allocator))?;
+            let _ = gather_collection_entry(logical_type, &mut vector, 0, heap_ptr)?;
+            vector.try_set_count(1)?;
+            Ok(vector.get_value(0))
         }
 
         LogicalType::Struct(fields) => {
             let struct_layout = RawRowLayout::struct_layout(fields);
             let mut values = Vec::with_capacity(fields.len());
             for (field_idx, (_name, field_type)) in fields.iter().enumerate() {
-                let field_val = read_value(data_ptr, field_idx, field_type, &struct_layout);
+                let field_val = read_value(
+                    data_ptr,
+                    field_idx,
+                    field_type,
+                    &struct_layout,
+                    Arc::clone(&allocator),
+                )?;
                 values.push(field_val);
             }
-            Value::Struct(values, fields.clone())
+            Ok(Value::Struct(values, fields.clone()))
         }
 
-        _ => Value::Null(logical_type.clone()),
+        _ => Ok(Value::Null(logical_type.clone())),
     }
 }
 
@@ -314,14 +334,14 @@ fn gather_fixed<T: Copy + Default>(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
+) -> Result<()> {
     let all_valid = layout.all_valid();
 
     // Dispatch to the optimal templated version
     if all_valid {
-        gather_fixed_internal::<T, true>(layout, vector, col_idx, offset, row_locations, count);
+        gather_fixed_internal::<T, true>(layout, vector, col_idx, offset, row_locations, count)
     } else {
-        gather_fixed_internal::<T, false>(layout, vector, col_idx, offset, row_locations, count);
+        gather_fixed_internal::<T, false>(layout, vector, col_idx, offset, row_locations, count)
     }
 }
 
@@ -333,14 +353,14 @@ fn gather_fixed_internal<T: Copy + Default, const ALL_VALID: bool>(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
+) -> Result<()> {
     // Set vector length first to ensure validity mask is properly sized
-    vector.set_len(count);
+    vector.try_set_len(count)?;
 
     // Get data pointer for writing
     let data_ptr = unsafe { vector.flat_data_mut::<T>() };
     if data_ptr.is_null() {
-        return;
+        return Ok(());
     }
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
@@ -358,15 +378,16 @@ fn gather_fixed_internal<T: Copy + Default, const ALL_VALID: bool>(
                 let value = std::ptr::read_unaligned(src);
                 std::ptr::write(data_ptr.add(i), value);
             }
-            vector.set_null(i, false);
+            vector.try_set_null(i, false)?;
         } else {
             // Write default value and mark as null
             unsafe {
                 std::ptr::write(data_ptr.add(i), T::default());
             }
-            vector.set_null(i, true);
+            vector.try_set_null(i, true)?;
         }
     }
+    Ok(())
 }
 
 /// Gather string values from row storage.
@@ -382,14 +403,14 @@ fn gather_string(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
+) -> Result<()> {
     let all_valid = layout.all_valid();
 
     // Dispatch to the optimal templated version
     if all_valid {
-        gather_string_internal::<true>(layout, vector, col_idx, offset, row_locations, count);
+        gather_string_internal::<true>(layout, vector, col_idx, offset, row_locations, count)
     } else {
-        gather_string_internal::<false>(layout, vector, col_idx, offset, row_locations, count);
+        gather_string_internal::<false>(layout, vector, col_idx, offset, row_locations, count)
     }
 }
 
@@ -402,19 +423,19 @@ fn gather_struct(
     row_locations: &[*const u8],
     count: usize,
     fields: &[(String, LogicalType)],
-) {
+) -> Result<()> {
     let struct_layout = RawRowLayout::struct_layout(fields);
 
     // Ensure vector length and parent validity.
-    vector.set_len(count);
+    vector.try_set_len(count)?;
     if layout.all_valid() {
         for i in 0..count {
-            vector.set_null(i, false);
+            vector.try_set_null(i, false)?;
         }
     } else {
         for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
             let valid = unsafe { is_row_valid(row_ptr, col_idx) };
-            vector.set_null(i, !valid);
+            vector.try_set_null(i, !valid)?;
         }
     }
 
@@ -426,14 +447,14 @@ fn gather_struct(
     }
 
     let Some(children) = vector.children_mut() else {
-        return;
+        return Ok(());
     };
 
     for (field_idx, _field) in fields.iter().enumerate() {
         if field_idx >= children.len() {
             continue;
         }
-        let child = Arc::make_mut(&mut children[field_idx]);
+        let child = Vector::try_make_arc_mut(&mut children[field_idx])?;
         let child_offset = struct_layout.get_offsets()[field_idx];
         gather_vector(
             &struct_layout,
@@ -442,8 +463,9 @@ fn gather_struct(
             child_offset,
             &struct_row_locations,
             count,
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Gather Struct values with selection vector.
@@ -457,20 +479,20 @@ fn gather_struct_with_sel(
     sel: &SelectionVector,
     count: usize,
     fields: &[(String, LogicalType)],
-) {
+) -> Result<()> {
     let struct_layout = RawRowLayout::struct_layout(fields);
 
-    vector.set_len(count);
+    vector.try_set_len(required_len_for_sel(sel, count))?;
     if layout.all_valid() {
         for i in 0..count {
             let dst_idx = sel.get(i);
-            vector.set_null(dst_idx, false);
+            vector.try_set_null(dst_idx, false)?;
         }
     } else {
         for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
             let valid = unsafe { is_row_valid(row_ptr, col_idx) };
             let dst_idx = sel.get(i);
-            vector.set_null(dst_idx, !valid);
+            vector.try_set_null(dst_idx, !valid)?;
         }
     }
 
@@ -482,14 +504,14 @@ fn gather_struct_with_sel(
     }
 
     let Some(children) = vector.children_mut() else {
-        return;
+        return Ok(());
     };
 
     for (field_idx, _field) in fields.iter().enumerate() {
         if field_idx >= children.len() {
             continue;
         }
-        let child = Arc::make_mut(&mut children[field_idx]);
+        let child = Vector::try_make_arc_mut(&mut children[field_idx])?;
         let child_offset = struct_layout.get_offsets()[field_idx];
         gather_vector_with_sel(
             &struct_layout,
@@ -499,8 +521,9 @@ fn gather_struct_with_sel(
             &struct_row_locations,
             sel,
             count,
-        );
+        )?;
     }
+    Ok(())
 }
 
 #[inline(always)]
@@ -511,11 +534,11 @@ fn gather_string_internal<const ALL_VALID: bool>(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
+) -> Result<()> {
     let is_blob = vector.logical_type() == &LogicalType::Blob;
 
     // Set vector length first to ensure validity mask is properly sized
-    vector.set_len(count);
+    vector.try_set_len(count)?;
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
         let is_valid = if ALL_VALID {
@@ -534,47 +557,48 @@ fn gather_string_internal<const ALL_VALID: bool>(
 
                 if len == 0 {
                     if is_blob {
-                        vector.set_blob(i, &[]);
+                        vector.try_set_blob(i, &[])?;
                     } else {
-                        vector.set_string(i, "");
+                        vector.try_set_string(i, "")?;
                     }
                 } else if len <= STRING_INLINE_LENGTH {
                     // Inline string: data starts at offset 4 (after length)
                     let data_ptr = src.add(4);
                     let slice = std::slice::from_raw_parts(data_ptr, len);
                     if is_blob {
-                        vector.set_blob(i, slice);
+                        vector.try_set_blob(i, slice)?;
                     } else if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.set_string(i, s);
+                        vector.try_set_string(i, s)?;
                     } else {
                         // Invalid UTF-8, set as empty
-                        vector.set_string(i, "");
+                        vector.try_set_string(i, "")?;
                     }
                 } else {
                     // Non-inline: read heap pointer from offset 8
                     let heap_ptr = std::ptr::read(src.add(8) as *const *const u8);
                     let slice = std::slice::from_raw_parts(heap_ptr, len);
                     if is_blob {
-                        vector.set_blob(i, slice);
+                        vector.try_set_blob(i, slice)?;
                     } else if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.set_string(i, s);
+                        vector.try_set_string(i, s)?;
                     } else {
                         // Invalid UTF-8, set as empty
-                        vector.set_string(i, "");
+                        vector.try_set_string(i, "")?;
                     }
                 }
             }
-            vector.set_null(i, false);
+            vector.try_set_null(i, false)?;
         } else {
             // Write default value based on type
             if is_blob {
-                vector.set_blob(i, &[]);
+                vector.try_set_blob(i, &[])?;
             } else {
-                vector.set_string(i, "");
+                vector.try_set_string(i, "")?;
             }
-            vector.set_null(i, true);
+            vector.try_set_null(i, true)?;
         }
     }
+    Ok(())
 }
 
 /// Gather a single vector with selection vector.
@@ -586,7 +610,7 @@ fn gather_vector_with_sel(
     row_locations: &[*const u8],
     sel: &SelectionVector,
     count: usize,
-) {
+) -> Result<()> {
     let logical_type = vector.logical_type().clone();
 
     match &logical_type {
@@ -678,7 +702,7 @@ fn gather_vector_with_sel(
                     row_locations,
                     sel,
                     count,
-                );
+                )
             } else {
                 gather_fixed_with_sel::<i128>(
                     layout,
@@ -688,7 +712,7 @@ fn gather_vector_with_sel(
                     row_locations,
                     sel,
                     count,
-                );
+                )
             }
         }
         LogicalType::Varchar
@@ -698,7 +722,7 @@ fn gather_vector_with_sel(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            gather_string_with_sel(layout, vector, col_idx, offset, row_locations, sel, count);
+            gather_string_with_sel(layout, vector, col_idx, offset, row_locations, sel, count)
         }
         LogicalType::Array(_, _) => {
             array_row_gather_with_sel(layout, vector, col_idx, offset, row_locations, sel, count)
@@ -706,25 +730,24 @@ fn gather_vector_with_sel(
         LogicalType::List(_) => {
             list_row_gather_with_sel(layout, vector, col_idx, offset, row_locations, sel, count)
         }
-        LogicalType::Struct(fields) => {
-            gather_struct_with_sel(
-                layout,
-                vector,
-                col_idx,
-                offset,
-                row_locations,
-                sel,
-                count,
-                fields,
-            );
-        }
+        LogicalType::Struct(fields) => gather_struct_with_sel(
+            layout,
+            vector,
+            col_idx,
+            offset,
+            row_locations,
+            sel,
+            count,
+            fields,
+        ),
         _ => {
             // For unsupported types, set vector length first, then set all to null
-            vector.set_len(count);
+            vector.try_set_len(required_len_for_sel(sel, count))?;
             for i in 0..count {
                 let dst_idx = sel.get(i);
-                vector.set_null(dst_idx, true);
+                vector.try_set_null(dst_idx, true)?;
             }
+            Ok(())
         }
     }
 }
@@ -738,15 +761,15 @@ fn gather_fixed_with_sel<T: Copy + Default>(
     row_locations: &[*const u8],
     sel: &SelectionVector,
     count: usize,
-) {
+) -> Result<()> {
     let all_valid = layout.all_valid();
 
     // Set vector length first to ensure validity mask is properly sized
-    vector.set_len(count);
+    vector.try_set_len(required_len_for_sel(sel, count))?;
 
     let data_ptr = unsafe { vector.flat_data_mut::<T>() };
     if data_ptr.is_null() {
-        return;
+        return Ok(());
     }
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
@@ -759,14 +782,15 @@ fn gather_fixed_with_sel<T: Copy + Default>(
                 let value = std::ptr::read_unaligned(src);
                 std::ptr::write(data_ptr.add(dst_idx), value);
             }
-            vector.set_null(dst_idx, false);
+            vector.try_set_null(dst_idx, false)?;
         } else {
             unsafe {
                 std::ptr::write(data_ptr.add(dst_idx), T::default());
             }
-            vector.set_null(dst_idx, true);
+            vector.try_set_null(dst_idx, true)?;
         }
     }
+    Ok(())
 }
 
 /// Gather string values with selection vector.
@@ -778,11 +802,11 @@ fn gather_string_with_sel(
     row_locations: &[*const u8],
     sel: &SelectionVector,
     count: usize,
-) {
+) -> Result<()> {
     let all_valid = layout.all_valid();
 
     // Set vector length first to ensure validity mask is properly sized
-    vector.set_len(count);
+    vector.try_set_len(required_len_for_sel(sel, count))?;
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
         let dst_idx = sel.get(i);
@@ -794,30 +818,39 @@ fn gather_string_with_sel(
                 let len = std::ptr::read(src as *const u32) as usize;
 
                 if len == 0 {
-                    vector.set_string(dst_idx, "");
+                    if vector.logical_type() == &LogicalType::Blob {
+                        vector.try_set_blob(dst_idx, &[])?;
+                    } else {
+                        vector.try_set_string(dst_idx, "")?;
+                    }
                 } else if len <= STRING_INLINE_LENGTH {
                     let data_ptr = src.add(4);
                     let slice = std::slice::from_raw_parts(data_ptr, len);
-                    if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.set_string(dst_idx, s);
+                    if vector.logical_type() == &LogicalType::Blob {
+                        vector.try_set_blob(dst_idx, slice)?;
+                    } else if let Ok(s) = std::str::from_utf8(slice) {
+                        vector.try_set_string(dst_idx, s)?;
                     } else {
-                        vector.set_string(dst_idx, "");
+                        vector.try_set_string(dst_idx, "")?;
                     }
                 } else {
                     let heap_ptr = std::ptr::read(src.add(8) as *const *const u8);
                     let slice = std::slice::from_raw_parts(heap_ptr, len);
-                    if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.set_string(dst_idx, s);
+                    if vector.logical_type() == &LogicalType::Blob {
+                        vector.try_set_blob(dst_idx, slice)?;
+                    } else if let Ok(s) = std::str::from_utf8(slice) {
+                        vector.try_set_string(dst_idx, s)?;
                     } else {
-                        vector.set_string(dst_idx, "");
+                        vector.try_set_string(dst_idx, "")?;
                     }
                 }
             }
-            vector.set_null(dst_idx, false);
+            vector.try_set_null(dst_idx, false)?;
         } else {
-            vector.set_null(dst_idx, true);
+            vector.try_set_null(dst_idx, true)?;
         }
     }
+    Ok(())
 }
 
 #[inline]
@@ -825,6 +858,13 @@ unsafe fn collection_mask_is_valid(mask_ptr: *const u8, idx: usize) -> bool {
     let byte_idx = idx / 8;
     let bit_idx = idx % 8;
     (std::ptr::read(mask_ptr.add(byte_idx)) & (1 << bit_idx)) != 0
+}
+
+fn required_len_for_sel(sel: &SelectionVector, count: usize) -> usize {
+    (0..count)
+        .map(|idx| sel.get(idx).saturating_add(1))
+        .max()
+        .unwrap_or(0)
 }
 
 #[inline]
@@ -835,18 +875,19 @@ unsafe fn write_list_entry(vector: &mut Vector, idx: usize, offset: u32, length:
     std::ptr::write_unaligned(ptr.add(1), length);
 }
 
-fn set_array_child_nulls(vector: &mut Vector, index: usize, array_size: usize) {
+fn set_array_child_nulls(vector: &mut Vector, index: usize, array_size: usize) -> Result<()> {
     if let Some(child) = vector.child_mut() {
-        let child_mut = Arc::make_mut(child);
+        let child_mut = Vector::try_make_arc_mut(child)?;
         let child_base = index.saturating_mul(array_size);
         let required = child_base.saturating_add(array_size);
         if child_mut.len() < required {
-            child_mut.set_len(required);
+            child_mut.try_set_len(required)?;
         }
         for i in 0..array_size {
-            child_mut.set_null(child_base + i, true);
+            child_mut.try_set_null(child_base + i, true)?;
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -858,9 +899,9 @@ unsafe fn gather_collection_payload(
     source_count: usize,
     mask_ptr: *const u8,
     payload_ptr: *const u8,
-) -> *const u8 {
+) -> Result<*const u8> {
     if child_vector.len() < child_base.saturating_add(expected_count) {
-        child_vector.set_len(child_base.saturating_add(expected_count));
+        child_vector.try_set_len(child_base.saturating_add(expected_count))?;
     }
 
     if RawRowLayout::type_is_constant_size(logical_type) {
@@ -874,12 +915,12 @@ unsafe fn gather_collection_payload(
                 let src_ptr = payload_ptr.add(elem_i * element_size);
                 let dst_ptr = child_data.add(child_idx * element_size);
                 std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, element_size);
-                child_vector.set_null(child_idx, false);
+                child_vector.try_set_null(child_idx, false)?;
             } else {
-                child_vector.set_null(child_idx, true);
+                child_vector.try_set_null(child_idx, true)?;
             }
         }
-        return payload_ptr.add(source_count * element_size);
+        return Ok(payload_ptr.add(source_count * element_size));
     }
 
     match logical_type {
@@ -896,34 +937,34 @@ unsafe fn gather_collection_payload(
                 let child_idx = child_base + elem_i;
                 let valid = elem_i < source_count && collection_mask_is_valid(mask_ptr, elem_i);
                 if !valid {
-                    child_vector.set_null(child_idx, true);
+                    child_vector.try_set_null(child_idx, true)?;
                     continue;
                 }
 
                 let string = std::ptr::read_unaligned(inline_data.add(elem_i));
                 let bytes = string.as_bytes();
                 if matches!(logical_type, LogicalType::Blob) {
-                    child_vector.set_blob(child_idx, bytes);
+                    child_vector.try_set_blob(child_idx, bytes)?;
                 } else {
                     let value = String::from_utf8_lossy(bytes);
-                    child_vector.set_string(child_idx, value.as_ref());
+                    child_vector.try_set_string(child_idx, value.as_ref())?;
                 }
                 if !string.is_inlined() && !string.is_empty() && elem_i < source_count {
                     heap_bytes = heap_bytes.saturating_add(string.len());
                 }
             }
             let inline_size = std::mem::size_of::<paro_common::types::InlineString>();
-            payload_ptr.add(source_count * inline_size + heap_bytes)
+            Ok(payload_ptr.add(source_count * inline_size + heap_bytes))
         }
         LogicalType::Struct(fields) => {
             for elem_i in 0..expected_count {
                 let child_idx = child_base + elem_i;
                 let valid = elem_i < source_count && collection_mask_is_valid(mask_ptr, elem_i);
-                child_vector.set_null(child_idx, !valid);
+                child_vector.try_set_null(child_idx, !valid)?;
             }
 
             let Some(children) = child_vector.children_mut() else {
-                return payload_ptr;
+                return Ok(payload_ptr);
             };
 
             let mut cursor = payload_ptr;
@@ -934,7 +975,7 @@ unsafe fn gather_collection_payload(
                 }
                 let field_mask_ptr = cursor;
                 let field_payload_ptr = cursor.add(field_mask_size);
-                let child = Arc::make_mut(&mut children[field_idx]);
+                let child = Vector::try_make_arc_mut(&mut children[field_idx])?;
                 cursor = gather_collection_payload(
                     field_type,
                     child,
@@ -943,9 +984,9 @@ unsafe fn gather_collection_payload(
                     source_count,
                     field_mask_ptr,
                     field_payload_ptr,
-                );
+                )?;
             }
-            cursor
+            Ok(cursor)
         }
         LogicalType::List(_) | LogicalType::Array(_, _) => {
             let nested_ptrs = payload_ptr as *const *const u8;
@@ -960,22 +1001,26 @@ unsafe fn gather_collection_payload(
                         child_vector,
                         child_idx,
                         std::ptr::null(),
-                    );
+                    )?;
                     continue;
                 }
 
                 let nested_heap_ptr = std::ptr::read_unaligned(nested_ptrs.add(elem_i));
-                let nested_end =
-                    gather_collection_entry(logical_type, child_vector, child_idx, nested_heap_ptr);
+                let nested_end = gather_collection_entry(
+                    logical_type,
+                    child_vector,
+                    child_idx,
+                    nested_heap_ptr,
+                )?;
                 cursor = nested_end;
             }
-            cursor
+            Ok(cursor)
         }
         _ => {
             for elem_i in 0..expected_count {
-                child_vector.set_null(child_base + elem_i, true);
+                child_vector.try_set_null(child_base + elem_i, true)?;
             }
-            payload_ptr
+            Ok(payload_ptr)
         }
     }
 }
@@ -985,22 +1030,22 @@ unsafe fn gather_collection_entry(
     vector: &mut Vector,
     index: usize,
     heap_ptr: *const u8,
-) -> *const u8 {
+) -> Result<*const u8> {
     if heap_ptr.is_null() {
-        vector.set_null(index, true);
+        vector.try_set_null(index, true)?;
         if let LogicalType::Array(_, array_size) = logical_type {
-            set_array_child_nulls(vector, index, *array_size);
+            set_array_child_nulls(vector, index, *array_size)?;
         }
-        return heap_ptr;
+        return Ok(heap_ptr);
     }
 
-    vector.set_null(index, false);
+    vector.try_set_null(index, false)?;
     let length = std::ptr::read_unaligned(heap_ptr as *const u64) as usize;
     if length == 0 {
         if let LogicalType::Array(_, array_size) = logical_type {
-            set_array_child_nulls(vector, index, *array_size);
+            set_array_child_nulls(vector, index, *array_size)?;
         }
-        return heap_ptr.add(8);
+        return Ok(heap_ptr.add(8));
     }
 
     let mask_ptr = heap_ptr.add(8);
@@ -1009,7 +1054,7 @@ unsafe fn gather_collection_entry(
     match logical_type {
         LogicalType::Array(child_type, array_size) => {
             if let Some(child) = vector.child_mut() {
-                let child_mut = Arc::make_mut(child);
+                let child_mut = Vector::try_make_arc_mut(child)?;
                 let child_base = index.saturating_mul(*array_size);
                 return gather_collection_payload(
                     child_type,
@@ -1026,27 +1071,25 @@ unsafe fn gather_collection_entry(
             let mut child_base = 0usize;
             let mut end_ptr = payload_ptr;
             if let Some(child) = vector.child_mut() {
-                let mut child_mut = Arc::make_mut(child);
+                let mut child_mut = Vector::try_make_arc_mut(child)?;
                 child_base = child_mut.len();
                 let required = child_base.saturating_add(length);
-                if required > child_mut.capacity() {
-                    let new_capacity = required.max(child_mut.capacity().saturating_mul(2)).max(1);
+                if required > child_mut.logical_capacity() {
+                    let new_capacity = required
+                        .max(child_mut.logical_capacity().saturating_mul(2))
+                        .max(1);
                     let mut new_child = Vector::try_new(
                         child_mut.logical_type().clone(),
                         new_capacity,
                         child_mut.allocator().clone(),
-                    )
-                    .expect("vector allocation failed");
-                    new_child.set_count(child_base);
-                    for i in 0..child_base {
-                        new_child.copy_at(i, child_mut, i);
-                    }
+                    )?;
+                    new_child.try_copy_range(0, child_mut, 0, child_base)?;
                     *child = Arc::new(new_child);
-                    child_mut = Arc::make_mut(child);
+                    child_mut = Vector::try_make_arc_mut(child)?;
                 }
 
                 // Ensure validity mask can address appended range.
-                child_mut.validity_mut().resize(required);
+                child_mut.try_set_len(required)?;
                 end_ptr = gather_collection_payload(
                     child_type,
                     child_mut,
@@ -1055,21 +1098,23 @@ unsafe fn gather_collection_entry(
                     length,
                     mask_ptr,
                     payload_ptr,
-                );
+                )?;
             }
 
             if child_base > u32::MAX as usize || length > u32::MAX as usize {
-                panic!("List entry exceeds u32 range");
+                return Err(paro_error::internal(format!(
+                    "List entry exceeds u32 range: offset={child_base}, length={length}"
+                )));
             }
             unsafe {
                 write_list_entry(vector, index, child_base as u32, length as u32);
             }
-            return end_ptr;
+            return Ok(end_ptr);
         }
         _ => {}
     }
 
-    payload_ptr
+    Ok(payload_ptr)
 }
 
 fn gather_collection_internal(
@@ -1080,8 +1125,9 @@ fn gather_collection_internal(
     row_locations: &[*const u8],
     sel: Option<&SelectionVector>,
     count: usize,
-) {
-    vector.set_len(count);
+) -> Result<()> {
+    let required_len = sel.map(|s| required_len_for_sel(s, count)).unwrap_or(count);
+    vector.try_set_len(required_len)?;
     let logical_type = vector.logical_type().clone();
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
@@ -1097,9 +1143,10 @@ fn gather_collection_internal(
         };
 
         unsafe {
-            let _ = gather_collection_entry(&logical_type, vector, dst_idx, heap_ptr);
+            let _ = gather_collection_entry(&logical_type, vector, dst_idx, heap_ptr)?;
         }
     }
+    Ok(())
 }
 
 fn array_row_gather(
@@ -1109,8 +1156,8 @@ fn array_row_gather(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
-    gather_collection_internal(layout, vector, col_idx, offset, row_locations, None, count);
+) -> Result<()> {
+    gather_collection_internal(layout, vector, col_idx, offset, row_locations, None, count)
 }
 
 fn array_row_gather_with_sel(
@@ -1121,7 +1168,7 @@ fn array_row_gather_with_sel(
     row_locations: &[*const u8],
     sel: &SelectionVector,
     count: usize,
-) {
+) -> Result<()> {
     gather_collection_internal(
         layout,
         vector,
@@ -1130,7 +1177,7 @@ fn array_row_gather_with_sel(
         row_locations,
         Some(sel),
         count,
-    );
+    )
 }
 
 fn list_row_gather(
@@ -1140,8 +1187,8 @@ fn list_row_gather(
     offset: usize,
     row_locations: &[*const u8],
     count: usize,
-) {
-    gather_collection_internal(layout, vector, col_idx, offset, row_locations, None, count);
+) -> Result<()> {
+    gather_collection_internal(layout, vector, col_idx, offset, row_locations, None, count)
 }
 
 fn list_row_gather_with_sel(
@@ -1152,7 +1199,7 @@ fn list_row_gather_with_sel(
     row_locations: &[*const u8],
     sel: &SelectionVector,
     count: usize,
-) {
+) -> Result<()> {
     gather_collection_internal(
         layout,
         vector,
@@ -1161,7 +1208,7 @@ fn list_row_gather_with_sel(
         row_locations,
         Some(sel),
         count,
-    );
+    )
 }
 
 /// Scan a chunk from a RawRowCollection.
@@ -1179,35 +1226,35 @@ pub fn scan_chunk(
     collection: &RawRowCollection,
     state: &mut RawRowScanState,
     chunk: &mut Chunk,
-) -> usize {
+) -> Result<usize> {
     if collection.scan_complete(state) {
-        chunk.set_cardinality(0);
-        return 0;
+        chunk.try_set_cardinality(0)?;
+        return Ok(0);
     }
 
     let (seg_idx, chunk_idx) = match (state.segment_index, state.chunk_index) {
         (Some(s), Some(c)) => (s, c),
         _ => {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         }
     };
 
     let segment = match collection.get_segment(seg_idx) {
         Some(s) => s,
         None => {
-            chunk.set_cardinality(0);
-            return 0;
+            chunk.try_set_cardinality(0)?;
+            return Ok(0);
         }
     };
 
     let count =
-        fetch_chunk_from_segment(collection, &mut state.pin_state, segment, chunk_idx, chunk);
+        fetch_chunk_from_segment(collection, &mut state.pin_state, segment, chunk_idx, chunk)?;
 
     // Advance to next chunk
     collection.next_scan_index(state);
 
-    count
+    Ok(count)
 }
 
 /// Fetch a specific chunk from a segment.
@@ -1217,18 +1264,18 @@ fn fetch_chunk_from_segment(
     segment: &RawRowSegment,
     chunk_idx: usize,
     chunk: &mut Chunk,
-) -> usize {
+) -> Result<usize> {
     let layout = collection.layout();
 
     if chunk_idx >= segment.chunks.len() {
-        chunk.set_cardinality(0);
-        return 0;
+        chunk.try_set_cardinality(0)?;
+        return Ok(0);
     }
 
     let row_chunk = &segment.chunks[chunk_idx];
     if row_chunk.count == 0 || row_chunk.part_indices.is_empty() {
-        chunk.set_cardinality(0);
-        return 0;
+        chunk.try_set_cardinality(0)?;
+        return Ok(0);
     }
 
     // Collect row locations from all parts
@@ -1253,12 +1300,12 @@ fn fetch_chunk_from_segment(
 
     let count = row_locations.len();
     if count == 0 {
-        chunk.set_cardinality(0);
-        return 0;
+        chunk.try_set_cardinality(0)?;
+        return Ok(0);
     }
 
-    gather_chunk(collection, &row_locations, chunk, count);
-    count
+    gather_chunk(collection, &row_locations, chunk, count)?;
+    Ok(count)
 }
 
 /// Fetch a chunk by absolute index across all segments.
@@ -1270,7 +1317,11 @@ fn fetch_chunk_from_segment(
 ///
 /// # Returns
 /// Number of rows fetched (0 if index is out of bounds)
-pub fn fetch_chunk(collection: &RawRowCollection, chunk_index: usize, chunk: &mut Chunk) -> usize {
+pub fn fetch_chunk(
+    collection: &RawRowCollection,
+    chunk_index: usize,
+    chunk: &mut Chunk,
+) -> Result<usize> {
     let mut remaining = chunk_index;
 
     for segment in (0..collection.segment_count()).map(|i| collection.get_segment(i).unwrap()) {
@@ -1281,8 +1332,8 @@ pub fn fetch_chunk(collection: &RawRowCollection, chunk_index: usize, chunk: &mu
         remaining -= segment.chunk_count();
     }
 
-    chunk.set_cardinality(0);
-    0
+    chunk.try_set_cardinality(0)?;
+    Ok(0)
 }
 
 /// Gather a single column from segments using row indices.
@@ -1303,9 +1354,9 @@ pub fn gather_column(
     column_idx: usize,
     output: &mut Vector,
     count: usize,
-) -> paro_common::error::Result<()> {
+) -> Result<()> {
     if count == 0 {
-        output.set_count(0);
+        output.try_set_count(0)?;
         return Ok(());
     }
 
@@ -1350,7 +1401,7 @@ pub fn gather_column(
     // Now gather the column using the row locations
     // The pin_state keeps blocks pinned until it goes out of scope at the end of this function
     let offset = layout.get_offsets()[column_idx];
-    gather_vector(layout, output, column_idx, offset, &row_locations, count);
+    gather_vector(layout, output, column_idx, offset, &row_locations, count)?;
 
     // pin_state is dropped here, unpinning all blocks
     Ok(())
@@ -1366,9 +1417,9 @@ pub fn gather_column_from_row_locations(
     column_idx: usize,
     output: &mut Vector,
     count: usize,
-) -> paro_common::error::Result<()> {
+) -> Result<()> {
     if count == 0 {
-        output.set_count(0);
+        output.try_set_count(0)?;
         return Ok(());
     }
     if column_idx >= collection.layout().column_count() {
@@ -1387,8 +1438,8 @@ pub fn gather_column_from_row_locations(
 
     let layout = collection.layout();
     let offset = layout.get_offsets()[column_idx];
-    gather_vector(layout, output, column_idx, offset, row_locations, count);
-    output.set_count(count);
+    gather_vector(layout, output, column_idx, offset, row_locations, count)?;
+    output.try_set_count(count)?;
     Ok(())
 }
 
@@ -1438,7 +1489,71 @@ mod tests {
         RawRowValidityType,
     };
     use crate::test_utils::*;
+    use paro_common::allocator::{Allocator, DefaultAllocator};
+    use paro_common::error::{self as paro_error, Result as ParoResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ToggleAllocator {
+        inner: DefaultAllocator,
+        fail: AtomicBool,
+    }
+
+    impl ToggleAllocator {
+        fn new() -> Self {
+            Self {
+                inner: DefaultAllocator::new(),
+                fail: AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    impl Allocator for ToggleAllocator {
+        fn allocate(&self, size: usize) -> ParoResult<*mut u8> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(paro_error::out_of_memory(format!(
+                    "injected allocation failure: {size} bytes"
+                )));
+            }
+            self.inner.allocate(size)
+        }
+
+        fn allocate_zeroed(&self, size: usize) -> ParoResult<*mut u8> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(paro_error::out_of_memory(format!(
+                    "injected allocation failure: {size} bytes"
+                )));
+            }
+            self.inner.allocate_zeroed(size)
+        }
+
+        fn free(&self, ptr: *mut u8, size: usize) {
+            self.inner.free(ptr, size);
+        }
+
+        fn reallocate(
+            &self,
+            ptr: *mut u8,
+            old_size: usize,
+            new_size: usize,
+        ) -> ParoResult<*mut u8> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(paro_error::out_of_memory(format!(
+                    "injected allocation failure: {new_size} bytes"
+                )));
+            }
+            self.inner.reallocate(ptr, old_size, new_size)
+        }
+
+        fn name(&self) -> &'static str {
+            "ToggleAllocator"
+        }
+    }
 
     fn create_test_layout(types: Vec<LogicalType>) -> RawRowLayout {
         let mut layout = RawRowLayout::new();
@@ -1485,7 +1600,7 @@ mod tests {
         let collection = create_test_collection(vec![LogicalType::Integer]);
         let mut chunk = create_test_chunk(&[LogicalType::Integer], 3);
 
-        gather_chunk(&collection, &row_locations, &mut chunk, 3);
+        gather_chunk(&collection, &row_locations, &mut chunk, 3).unwrap();
 
         // Verify values
         if let Some(v) = chunk.column(0) {
@@ -1522,7 +1637,7 @@ mod tests {
         let collection = create_test_collection(vec![LogicalType::Integer]);
         let mut chunk = create_test_chunk(&[LogicalType::Integer], 3);
 
-        gather_chunk(&collection, &row_locations, &mut chunk, 3);
+        gather_chunk(&collection, &row_locations, &mut chunk, 3).unwrap();
 
         if let Some(v) = chunk.column(0) {
             assert_eq!(v.get_i32(0), Some(42));
@@ -1554,7 +1669,7 @@ mod tests {
         let collection = create_test_collection(vec![LogicalType::Integer, LogicalType::BigInt]);
         let mut chunk = create_test_chunk(&[LogicalType::Integer, LogicalType::BigInt], 2);
 
-        gather_chunk(&collection, &row_locations, &mut chunk, 2);
+        gather_chunk(&collection, &row_locations, &mut chunk, 2).unwrap();
 
         assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(100));
         assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(200));
@@ -1590,7 +1705,7 @@ mod tests {
         let collection = create_test_collection(vec![LogicalType::Varchar]);
         let mut chunk = create_test_chunk(&[LogicalType::Varchar], 2);
 
-        gather_chunk(&collection, &row_locations, &mut chunk, 2);
+        gather_chunk(&collection, &row_locations, &mut chunk, 2).unwrap();
 
         assert_eq!(chunk.column(0).unwrap().get_string(0), Some("hello"));
         assert_eq!(chunk.column(0).unwrap().get_string(1), Some("world"));
@@ -1625,9 +1740,79 @@ mod tests {
         let collection = create_test_collection(vec![LogicalType::Varchar]);
         let mut chunk = create_test_chunk(&[LogicalType::Varchar], 1);
 
-        gather_chunk(&collection, &row_locations, &mut chunk, 1);
+        gather_chunk(&collection, &row_locations, &mut chunk, 1).unwrap();
 
         assert_eq!(chunk.column(0).unwrap().get_string(0), Some(long_string));
+    }
+
+    #[test]
+    fn test_gather_heap_string_allocation_failure_returns_error() {
+        let layout = create_test_layout(vec![LogicalType::Varchar]);
+        let row_width = layout.get_row_width();
+        let long_string = "this long string must allocate in the destination heap";
+        let heap_data = long_string.as_bytes().to_vec();
+        let mut storage = vec![vec![0xFFu8; row_width]];
+        let offset = layout.get_offsets()[0];
+
+        unsafe {
+            let dst = storage[0].as_mut_ptr().add(offset);
+            std::ptr::write(dst as *mut u32, heap_data.len() as u32);
+            std::ptr::copy_nonoverlapping(heap_data.as_ptr(), dst.add(4), 4);
+            std::ptr::write(dst.add(8) as *mut *const u8, heap_data.as_ptr());
+        }
+        let row_locations: Vec<*const u8> = storage.iter().map(|row| row.as_ptr()).collect();
+
+        let collection = create_test_collection(vec![LogicalType::Varchar]);
+        let allocator = Arc::new(ToggleAllocator::new());
+        let mut chunk =
+            Chunk::try_initialize(&[LogicalType::Varchar], 1, allocator.clone()).unwrap();
+        allocator.set_fail(true);
+
+        let err = gather_chunk(&collection, &row_locations, &mut chunk, 1).unwrap_err();
+        assert!(err.to_string().contains("injected allocation failure"));
+    }
+
+    #[test]
+    fn test_gather_list_child_growth_failure_returns_error() {
+        let list_type = LogicalType::List(Box::new(LogicalType::Integer));
+        let layout = create_test_layout(vec![list_type.clone()]);
+        let row_width = layout.get_row_width();
+        let mut storage = vec![vec![0xFFu8; row_width]];
+
+        let values: Vec<i32> = (0..16).collect();
+        let mut list_heap = Vec::new();
+        list_heap.extend_from_slice(&(values.len() as u64).to_ne_bytes());
+        list_heap.extend_from_slice(&[0xFF, 0xFF]);
+        for value in &values {
+            list_heap.extend_from_slice(&value.to_ne_bytes());
+        }
+
+        let offset = layout.get_offsets()[0];
+        unsafe {
+            let dst = storage[0].as_mut_ptr().add(offset);
+            std::ptr::write(dst as *mut *const u8, list_heap.as_ptr());
+        }
+        let row_locations: Vec<*const u8> = storage.iter().map(|row| row.as_ptr()).collect();
+
+        let collection = create_test_collection(vec![list_type.clone()]);
+        let allocator = Arc::new(ToggleAllocator::new());
+        let mut chunk = Chunk::try_initialize(&[list_type], 1, allocator.clone()).unwrap();
+        allocator.set_fail(true);
+
+        let err = gather_chunk(&collection, &row_locations, &mut chunk, 1).unwrap_err();
+        assert!(err.to_string().contains("injected allocation failure"));
+    }
+
+    #[test]
+    fn test_gather_null_validity_failure_returns_error() {
+        let row_locations: Vec<*const u8> = vec![std::ptr::null()];
+        let collection = create_test_collection(vec![LogicalType::Null]);
+        let allocator = Arc::new(ToggleAllocator::new());
+        let mut chunk = Chunk::try_initialize(&[LogicalType::Null], 1, allocator.clone()).unwrap();
+        allocator.set_fail(true);
+
+        let err = gather_chunk(&collection, &row_locations, &mut chunk, 1).unwrap_err();
+        assert!(err.to_string().contains("injected allocation failure"));
     }
 
     #[test]
@@ -1698,7 +1883,7 @@ mod tests {
             }
         }
 
-        gather_chunk(&collection, &row_locations, &mut output_chunk, 5);
+        gather_chunk(&collection, &row_locations, &mut output_chunk, 5).unwrap();
 
         // Verify roundtrip
         for i in 0..5 {
@@ -1741,7 +1926,7 @@ mod tests {
         let collection = create_test_collection(vec![LogicalType::Integer]);
         let mut chunk = create_test_chunk(&[LogicalType::Integer], 3);
 
-        gather_chunk_with_sel(&collection, &row_locations, &sel, &mut chunk, 3);
+        gather_chunk_with_sel(&collection, &row_locations, &sel, &mut chunk, 3).unwrap();
 
         // Values should be at positions specified by selection
         // row_locations[0] (10) -> position 2
@@ -1781,7 +1966,7 @@ mod tests {
         let mut chunk = create_test_chunk(&[LogicalType::Null], 2);
 
         // This used to panic: row_idx 1 out of range for capacity 1
-        gather_chunk(&collection, &row_locations, &mut chunk, 2);
+        gather_chunk(&collection, &row_locations, &mut chunk, 2).unwrap();
 
         assert_eq!(chunk.size(), 2);
         for i in 0..2 {

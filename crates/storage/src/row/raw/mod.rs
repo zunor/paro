@@ -34,8 +34,8 @@ pub use layout::{RawRowLayout, RawRowNestednessType, RawRowValidityType};
 #[allow(unused_imports)]
 pub use states::{
     BufferHandleMap, CombinedListData, ListEntry, RawRowAppendState, RawRowChunkState,
-    RawRowParallelScanState, RawRowPinProperties, RawRowPinState, RawRowScanState,
-    RawRowVectorFormat,
+    RawRowChunkView, RawRowParallelScanState, RawRowPinProperties, RawRowPinState, RawRowScanState,
+    RawRowVectorView,
 };
 
 // Re-export allocator types

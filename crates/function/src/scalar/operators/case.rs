@@ -7,9 +7,11 @@
 
 use crate::scalar::executor::TernaryOperator;
 use crate::scalar::{ScalarFunction, ScalarFunctionSet};
+use paro_common::allocator::Allocator;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use std::sync::Arc;
 
 pub struct CaseOperator;
 impl<T: Copy> TernaryOperator<bool, T, T, T> for CaseOperator {
@@ -32,6 +34,7 @@ impl CaseExecutor {
         result_if_true: &Vector,
         result_if_false: &Vector,
         count: usize,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Vector> {
         let return_type = result_if_true.logical_type().clone();
 
@@ -44,7 +47,14 @@ impl CaseExecutor {
             mask.push(is_true);
         }
 
-        Vector::merge_full(return_type, count, &mask, result_if_true, result_if_false)
+        Vector::try_merge_full(
+            return_type,
+            count,
+            &mask,
+            result_if_true,
+            result_if_false,
+            allocator,
+        )
     }
 }
 
@@ -65,6 +75,7 @@ pub fn register_case_functions(set: &mut ScalarFunctionSet) {
                     &chunk.data[1],
                     &chunk.data[2],
                     chunk.size(),
+                    result.allocator().clone(),
                 )?;
                 *result = res;
                 Ok(())

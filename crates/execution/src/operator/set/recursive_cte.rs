@@ -352,14 +352,14 @@ impl RecursiveCTE {
     fn copy_rows(chunk: &Chunk, rows: &[usize]) -> Result<Chunk> {
         let types = chunk.types();
         let mut result = Chunk::try_initialize(&types, rows.len(), chunk.allocator().clone())?;
-        result.set_cardinality(rows.len());
+        result.try_set_cardinality(rows.len())?;
 
         for (col_idx, source_col) in chunk.data.iter().enumerate() {
             let out_col = result
                 .column_mut(col_idx)
                 .expect("output column index should be valid");
             for (out_row, source_row) in rows.iter().copied().enumerate() {
-                out_col.copy_at(out_row, source_col, source_row);
+                out_col.try_copy_at(out_row, source_col, source_row)?;
             }
         }
         Ok(result)
@@ -696,7 +696,7 @@ impl PhysicalOperator for RecursiveCTE {
                     &mut lstate.scan_state,
                     chunk,
                 )?;
-                chunk.flatten();
+                chunk.try_flatten()?;
                 lstate.scan_state.clear();
                 lstate.current_chunk += 1;
                 return Ok(SourceResultType::HaveMoreOutput);

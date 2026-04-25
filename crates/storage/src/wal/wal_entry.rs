@@ -595,7 +595,7 @@ impl SerializedDataChunk {
                 .unwrap_or(false)
         }) {
             let mut flattened_chunk = chunk.clone();
-            flattened_chunk.flatten();
+            flattened_chunk.try_flatten()?;
             return Self::from_chunk(&flattened_chunk);
         }
 

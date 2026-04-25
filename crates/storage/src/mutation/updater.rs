@@ -31,7 +31,7 @@ pub(crate) fn collect_rows_by_row_ids(table: &TableHandle, row_ids: &[u64]) -> R
     }
 
     let mut rows = Chunk::try_initialize(table.types(), row_ids.len(), allocator)?;
-    rows.set_cardinality(row_ids.len());
+    rows.try_set_cardinality(row_ids.len())?;
 
     let mut found = vec![false; row_ids.len()];
     let mut found_count = 0usize;
@@ -93,7 +93,7 @@ pub(crate) fn collect_rows_by_row_ids(table: &TableHandle, row_ids: &[u64]) -> R
                 let target_col = rows.column_mut(col_idx).ok_or_else(|| {
                     paro_error::internal(format!("missing target column {}", col_idx))
                 })?;
-                target_col.copy_at(target_row_idx, source_col, source_row_idx);
+                target_col.try_copy_at(target_row_idx, source_col, source_row_idx)?;
             }
             found[target_row_idx] = true;
             found_count += 1;
@@ -188,7 +188,7 @@ pub(crate) fn build_partial_updated_rows_chunk(
     let row_count = base_rows.size();
     let mut partial_rows =
         Chunk::try_initialize(table.types(), row_count, base_rows.allocator().clone())?;
-    partial_rows.set_cardinality(row_count);
+    partial_rows.try_set_cardinality(row_count)?;
 
     let schema = table
         .tablet()
@@ -202,7 +202,7 @@ pub(crate) fn build_partial_updated_rows_chunk(
             paro_error::internal(format!("missing key column {} in partial rows", key_idx))
         })?;
         for row_idx in 0..row_count {
-            dst.copy_at(row_idx, src, row_idx);
+            dst.try_copy_at(row_idx, src, row_idx)?;
         }
     }
 

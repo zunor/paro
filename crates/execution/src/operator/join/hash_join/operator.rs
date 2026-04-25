@@ -272,7 +272,7 @@ impl HashJoin {
                 chunk.size(),
                 chunk.allocator().clone(),
             )?;
-            payload_chunk.set_cardinality(chunk.size());
+            payload_chunk.try_set_cardinality(chunk.size())?;
             return Ok(payload_chunk);
         }
 
@@ -296,7 +296,7 @@ impl HashJoin {
             .map(|column_idx| Arc::clone(&chunk.data[*column_idx]))
             .collect::<Vec<_>>();
         let mut payload_chunk = Chunk::from_arc_vectors(payload_vectors, chunk.allocator().clone());
-        payload_chunk.set_cardinality(chunk.size());
+        payload_chunk.try_set_cardinality(chunk.size())?;
         Ok(payload_chunk)
     }
 
@@ -308,10 +308,7 @@ impl HashJoin {
     ) -> Result<Arc<Vector>> {
         let allocator = ctx.allocator(paro_common::allocator::MemoryTag::BaseTable);
         let mut flat = Vector::try_new(logical_type, count.max(1), allocator)?;
-        flat.set_len(count);
-        for row_idx in 0..count {
-            flat.copy_at(row_idx, vector.as_ref(), row_idx);
-        }
+        flat.try_copy_range(0, vector.as_ref(), 0, count)?;
         Ok(Arc::new(flat))
     }
 
@@ -1487,7 +1484,7 @@ impl PhysicalOperator for HashJoin {
 
         if ht.is_empty() {
             if self.base.join.empty_result_if_rhs_is_empty() {
-                chunk.set_cardinality(0);
+                chunk.try_set_cardinality(0)?;
             } else {
                 self.base.construct_empty_join_result(
                     input,
@@ -1534,7 +1531,7 @@ impl PhysicalOperator for HashJoin {
         }
 
         if input.size() == 0 {
-            chunk.set_cardinality(0);
+            chunk.try_set_cardinality(0)?;
             return Ok(OperatorResultType::NeedMoreInput);
         }
 
@@ -1569,7 +1566,7 @@ impl PhysicalOperator for HashJoin {
                 if filtered_count > 0 {
                     perfect_executor.probe(&state.probe_keys, input, chunk, Some(&sel))?;
                 } else {
-                    chunk.set_cardinality(0);
+                    chunk.try_set_cardinality(0)?;
                 }
 
                 return Ok(OperatorResultType::NeedMoreInput);
@@ -1678,7 +1675,7 @@ impl PhysicalOperator for HashJoin {
         }
 
         let Some(scan_state) = lstate.full_outer_scan_state.as_mut() else {
-            chunk.set_cardinality(0);
+            chunk.try_set_cardinality(0)?;
             return Ok(SourceResultType::Finished);
         };
 
@@ -1686,7 +1683,7 @@ impl PhysicalOperator for HashJoin {
             JoinType::RightSemi => true,
             JoinType::Right | JoinType::Outer | JoinType::RightAnti => false,
             _ => {
-                chunk.set_cardinality(0);
+                chunk.try_set_cardinality(0)?;
                 return Ok(SourceResultType::Finished);
             }
         };
@@ -1706,7 +1703,7 @@ impl PhysicalOperator for HashJoin {
             .hash_table
             .scan_full_outer(scan_state, emit_found, &mut build_chunk)?;
         if count == 0 {
-            chunk.set_cardinality(0);
+            chunk.try_set_cardinality(0)?;
             return Ok(SourceResultType::Finished);
         }
 
@@ -2880,6 +2877,52 @@ mod tests {
         assert_eq!(seen_rows.len(), 2);
         assert_eq!(seen_rows[0], (true, Some(1)));
         assert_eq!(seen_rows[1], (true, Some(2)));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn force_external_non_source_without_source_rows_finishes_without_deadlock() {
+        let join = create_column_ref_test_join(JoinType::Inner);
+        let (session, temp_dir) = create_force_external_session(64 * 1024 * 1024);
+        let thread = ThreadContext::new(0, 1);
+        let ctx = ExecutionContext::new(session, &thread, None);
+
+        let gstate_box = join
+            .get_global_sink_state(&ctx)
+            .expect("global sink state should be created");
+        let gstate: Arc<dyn GlobalSinkState> = gstate_box.into();
+        join.set_sink_state(gstate.clone());
+
+        let sink_state = gstate
+            .as_any()
+            .downcast_ref::<HashJoinGlobalSinkState>()
+            .expect("sink state should be hash join state");
+        sink_state.externalized.store(true, Ordering::Release);
+        *sink_state.external_source_rows.lock().unwrap() = None;
+
+        let gsource = join
+            .get_global_source_state(&ctx, Some(gstate.as_ref()))
+            .expect("global source state should be created");
+        let mut lsource = join
+            .get_local_source_state(&ctx, gsource.as_ref())
+            .expect("local source state should be created");
+        let interrupt = InterruptState::new();
+        let mut source_input =
+            OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        let result = join
+            .get_data(&ctx, &mut output, &mut source_input)
+            .expect("source get_data should finish cleanly");
+
+        assert_eq!(result, SourceResultType::Finished);
+        assert_eq!(output.size(), 0);
+        assert!(
+            sink_state.external_source_rows.try_lock().is_ok(),
+            "source-row cleanup must not leave the mutex locked"
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }

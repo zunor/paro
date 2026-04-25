@@ -35,9 +35,9 @@ fn replace_varchar(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vec
         input.size(),
         |value, from, to, row, writer| {
             if from.is_empty() {
-                writer.write_str(row, value);
+                writer.write_str(row, value)?;
             } else {
-                writer.write_str(row, &value.replace(from, to));
+                writer.write_str(row, &value.replace(from, to))?;
             }
             Ok(())
         },

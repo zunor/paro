@@ -122,14 +122,14 @@ impl ColumnDataConsumer {
         output: &mut Chunk,
     ) -> Result<usize> {
         let Some(chunk_ref_index) = state.chunk_ref_index else {
-            output.set_cardinality(0);
+            output.try_set_cardinality(0)?;
             return Ok(0);
         };
 
         let storage_index = {
             let runtime = self.runtime.lock().unwrap();
             let Some(chunk_ref) = runtime.chunk_references.get(chunk_ref_index) else {
-                output.set_cardinality(0);
+                output.try_set_cardinality(0)?;
                 return Ok(0);
             };
             chunk_ref.storage_index

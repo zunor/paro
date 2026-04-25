@@ -140,16 +140,16 @@ impl PerfectHashAggregate {
             group_vectors.push(group_vector);
         }
         let mut groups = Chunk::from_arc_vectors(group_vectors, payload.allocator().clone());
-        groups.set_cardinality(payload.size());
+        groups.try_set_cardinality(payload.size())?;
         Ok(groups)
     }
 
     fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> Result<SelectionVector> {
-        let filter_format = filter_vec.try_decode(row_count)?;
+        let filter_format = filter_vec.try_decode_ref(row_count)?;
         let filter_data = filter_format.get_data::<bool>();
         let mut selected_rows = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
-            let physical_idx = filter_format.sel().get(row_idx);
+            let physical_idx = filter_format.physical_index(row_idx);
             if !filter_format.validity().is_valid(physical_idx) {
                 continue;
             }
@@ -223,10 +223,10 @@ impl PerfectHashAggregate {
             selection.len(),
             addresses.allocator().clone(),
         )?;
-        selected.set_count(selection.len());
+        selected.try_set_count(selection.len())?;
         let selected_data = unsafe { selected.flat_data_mut::<*mut u8>() };
 
-        let address_format = addresses.try_decode(addresses.len())?;
+        let address_format = addresses.try_decode_ref(addresses.len())?;
         let address_data = address_format.get_data::<*mut u8>();
         for idx in 0..selection.len() {
             let row_idx = selection.get(idx);
@@ -236,7 +236,7 @@ impl PerfectHashAggregate {
                     addresses.len()
                 )));
             }
-            let physical_idx = address_format.sel().get(row_idx);
+            let physical_idx = address_format.physical_index(row_idx);
             if !address_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
                     "Address vector contains NULL at selected row {row_idx}"

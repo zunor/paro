@@ -176,7 +176,7 @@ pub(crate) fn build_primary_key_chunk(table: &TableHandle, rows: &Chunk) -> Resu
 pub(crate) fn materialize_rows_as_flat_chunk(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk> {
     let mut materialized =
         Chunk::try_initialize(&chunk.types(), row_indices.len(), chunk.allocator().clone())?;
-    materialized.set_cardinality(row_indices.len());
+    materialized.try_set_cardinality(row_indices.len())?;
 
     for col_idx in 0..chunk.column_count() {
         let src = chunk.column(col_idx).ok_or_else(|| {
@@ -186,7 +186,7 @@ pub(crate) fn materialize_rows_as_flat_chunk(chunk: &Chunk, row_indices: &[u32])
             paro_error::internal("missing destination column during chunk row materialization")
         })?;
         for (new_row_idx, source_row_idx) in row_indices.iter().enumerate() {
-            dst.copy_at(new_row_idx, src, *source_row_idx as usize);
+            dst.try_copy_at(new_row_idx, src, *source_row_idx as usize)?;
         }
     }
 
@@ -200,7 +200,7 @@ pub(crate) fn concatenate_flat_chunks(chunks: &[Chunk]) -> Result<Chunk> {
     let total_rows: usize = chunks.iter().map(Chunk::size).sum();
     let mut combined =
         Chunk::try_initialize(&first.types(), total_rows, first.allocator().clone())?;
-    combined.set_cardinality(total_rows);
+    combined.try_set_cardinality(total_rows)?;
 
     let mut dst_row = 0;
     for chunk in chunks {
@@ -212,7 +212,7 @@ pub(crate) fn concatenate_flat_chunks(chunks: &[Chunk]) -> Result<Chunk> {
                 paro_error::internal("missing destination column during chunk concatenation")
             })?;
             for row_idx in 0..chunk.size() {
-                dst.copy_at(dst_row + row_idx, src, row_idx);
+                dst.try_copy_at(dst_row + row_idx, src, row_idx)?;
             }
         }
         dst_row += chunk.size();

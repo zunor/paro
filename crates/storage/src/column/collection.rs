@@ -357,7 +357,7 @@ impl ColumnDataCollection {
 
     pub fn scan(&self, state: &mut ColumnDataScanState, output: &mut Chunk) -> Result<bool> {
         let Some(storage_index) = self.next_live_chunk_index(state.chunk_index) else {
-            output.set_cardinality(0);
+            output.try_set_cardinality(0)?;
             return Ok(false);
         };
 
@@ -393,7 +393,7 @@ impl ColumnDataCollection {
         };
 
         let Some(storage_index) = assigned else {
-            output.set_cardinality(0);
+            output.try_set_cardinality(0)?;
             return Ok(false);
         };
 

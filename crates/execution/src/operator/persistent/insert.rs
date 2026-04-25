@@ -161,7 +161,7 @@ impl PhysicalInsert {
             lstate.buffered_rows,
             ctx.allocator(MemoryTag::MemTable),
         )?;
-        merged.set_cardinality(lstate.buffered_rows);
+        merged.try_set_cardinality(lstate.buffered_rows)?;
 
         let mut dst_row = 0;
         for chunk in lstate.buffered_chunks.drain(..) {
@@ -174,9 +174,7 @@ impl PhysicalInsert {
                     paro_error::internal("destination column missing".to_string())
                 })?;
 
-                for row_idx in 0..rows {
-                    dst_col.copy_at(dst_row + row_idx, src_col, row_idx);
-                }
+                dst_col.try_copy_range(dst_row, src_col, 0, rows)?;
             }
             dst_row += rows;
         }

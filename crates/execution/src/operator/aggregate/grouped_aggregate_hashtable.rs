@@ -312,7 +312,7 @@ impl GroupedAggregateHashTable {
         self.validate_group_chunk(groups)?;
         let count = groups.size();
         let mut hashes = Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
-        hashes.set_count(count);
+        hashes.try_set_count(count)?;
         if count == 0 {
             return Ok(hashes);
         }
@@ -366,7 +366,7 @@ impl GroupedAggregateHashTable {
         validate_addresses_vector(addresses, groups.size())?;
 
         if groups.size() == 0 {
-            addresses.set_count(0);
+            addresses.try_set_count(0)?;
             *new_groups =
                 SelectionVector::try_from_indices(Vec::new(), groups.allocator().clone())?;
             return Ok(0);
@@ -375,10 +375,10 @@ impl GroupedAggregateHashTable {
         self.ensure_capacity_for(groups.size())?;
         self.ensure_row_storage_capacity(groups.size())?;
 
-        let hash_format = hashes.try_decode(groups.size())?;
+        let hash_format = hashes.try_decode_ref(groups.size())?;
         let hash_data = hash_format.get_data::<u64>();
 
-        addresses.set_count(groups.size());
+        addresses.try_set_count(groups.size())?;
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
 
         let mut new_group_rows = Vec::new();
@@ -386,7 +386,7 @@ impl GroupedAggregateHashTable {
         let inline_key_layout = self.inline_key_layout.clone();
         if let Some(inline_layout) = inline_key_layout {
             for row_idx in 0..groups.size() {
-                let hash_idx = hash_format.sel().get(row_idx);
+                let hash_idx = hash_format.physical_index(row_idx);
                 if !hash_format.validity().is_valid(hash_idx) {
                     return Err(paro_error::internal(format!(
                         "Group hash contains NULL at row {row_idx}"
@@ -548,10 +548,10 @@ impl GroupedAggregateHashTable {
 
             let groups = other.materialize_groups(row_offset, batch_size)?;
             let mut hashes = Vector::try_new(LogicalType::UBigInt, batch_size, self.allocator())?;
-            hashes.set_count(batch_size);
+            hashes.try_set_count(batch_size)?;
             let mut source_addresses =
                 Vector::try_new(LogicalType::BigInt, batch_size, self.allocator())?;
-            source_addresses.set_count(batch_size);
+            source_addresses.try_set_count(batch_size)?;
             unsafe {
                 let hash_data = hashes.flat_data_mut::<u64>();
                 let source_data = source_addresses.flat_data_mut::<*mut u8>();
@@ -600,12 +600,12 @@ impl GroupedAggregateHashTable {
             )));
         }
         if position.offset >= self.count {
-            result.set_cardinality(0);
+            result.try_set_cardinality(0)?;
             return Ok(false);
         }
 
         let batch_size = (self.count - position.offset).min(result.capacity());
-        result.set_cardinality(batch_size);
+        result.try_set_cardinality(batch_size)?;
 
         for group_idx in 0..group_count {
             let result_vector = result.column_mut(group_idx).ok_or_else(|| {
@@ -613,7 +613,7 @@ impl GroupedAggregateHashTable {
                     "Missing group output column {group_idx} while scanning aggregate hash table"
                 ))
             })?;
-            result_vector.set_count(batch_size);
+            result_vector.try_set_count(batch_size)?;
             for row in 0..batch_size {
                 let row_ptr = self.row_ptr(position.offset + row);
                 let value =
@@ -626,7 +626,7 @@ impl GroupedAggregateHashTable {
         if aggregate_count > 0 {
             let mut state_addresses =
                 Vector::try_new(LogicalType::BigInt, batch_size, result.allocator().clone())?;
-            state_addresses.set_count(batch_size);
+            state_addresses.try_set_count(batch_size)?;
             unsafe {
                 let address_data = state_addresses.flat_data_mut::<*mut u8>();
                 for row in 0..batch_size {
@@ -664,10 +664,7 @@ impl GroupedAggregateHashTable {
                         group_count + agg_idx
                     ))
                 })?;
-                target.set_count(batch_size);
-                for row in 0..batch_size {
-                    target.copy_at(row, source.as_ref(), row);
-                }
+                target.try_copy_range(0, source.as_ref(), 0, batch_size)?;
             }
         }
 
@@ -681,7 +678,7 @@ impl GroupedAggregateHashTable {
         }
 
         let mut addresses = Vector::try_new(LogicalType::BigInt, self.count, self.allocator())?;
-        addresses.set_count(self.count);
+        addresses.try_set_count(self.count)?;
         unsafe {
             let address_data = addresses.flat_data_mut::<*mut u8>();
             for row_idx in 0..self.count {
@@ -869,10 +866,10 @@ row_width {}/{} agg_state_offset {}/{}",
             ))
         })?;
 
-        let address_format = addresses.try_decode(addresses.len())?;
+        let address_format = addresses.try_decode_ref(addresses.len())?;
         let address_data = address_format.get_data::<*mut u8>();
         for row_idx in 0..row_count {
-            let physical_idx = address_format.sel().get(row_idx);
+            let physical_idx = address_format.physical_index(row_idx);
             if !address_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
                     "Address vector contains NULL at row {row_idx} during state validation"
@@ -1274,9 +1271,9 @@ mod tests {
         states: &Vector,
         count: usize,
     ) {
-        let input = inputs[0].decode(count);
+        let input = inputs[0].try_decode_ref(count).unwrap();
         let input_data = input.get_data::<i64>();
-        let state = states.decode(count);
+        let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         for row in 0..count {
             let input_row = input.sel().get(row);
@@ -1295,8 +1292,8 @@ mod tests {
         _input_data: &AggregateInputData,
         count: usize,
     ) {
-        let source_format = source.decode(count);
-        let target_format = target.decode(count);
+        let source_format = source.try_decode_ref(count).unwrap();
+        let target_format = target.try_decode_ref(count).unwrap();
         let source_data = source_format.get_data::<*mut u8>();
         let target_data = target_format.get_data::<*mut u8>();
         for row in 0..count {
@@ -1314,7 +1311,7 @@ mod tests {
         result: &mut Vector,
         count: usize,
     ) {
-        let state = states.decode(count);
+        let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         let result_data = result.flat_data_mut::<i64>();
         for row in 0..count {

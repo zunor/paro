@@ -1278,6 +1278,7 @@ impl ExpressionExecutor {
             if_true.as_vector(),
             if_false.as_vector(),
             count,
+            result.allocator().clone(),
         )?;
         *result = merged;
         Ok(())
@@ -1317,6 +1318,7 @@ impl ExpressionExecutor {
                 if_true.as_vector(),
                 if_false.as_vector(),
                 count,
+                runtime.allocator(MemoryTag::BaseTable),
             )?,
         );
         Ok(state
@@ -1457,7 +1459,7 @@ impl ExpressionExecutor {
                         &unresolved,
                         unresolved_count,
                         &mut next_unresolved,
-                    );
+                    )?;
                     std::mem::swap(&mut unresolved, &mut next_unresolved);
                     unresolved_count = next_count;
                 }

@@ -256,7 +256,7 @@ impl RadixPartitionedAggregateHashTable {
         validate_address_capacity(addresses, groups.size())?;
 
         if groups.size() == 0 {
-            addresses.set_count(0);
+            addresses.try_set_count(0)?;
             *new_groups =
                 SelectionVector::try_from_indices(Vec::new(), groups.allocator().clone())?;
             return Ok(0);
@@ -265,10 +265,10 @@ impl RadixPartitionedAggregateHashTable {
         let mut partition_rows = vec![Vec::<usize>::new(); self.partitions.len()];
         let mut partition_hashes = vec![Vec::<u64>::new(); self.partitions.len()];
 
-        let hash_format = hashes.try_decode(groups.size())?;
+        let hash_format = hashes.try_decode_ref(groups.size())?;
         let hash_data = hash_format.get_data::<u64>();
         for row_idx in 0..groups.size() {
-            let physical_idx = hash_format.sel().get(row_idx);
+            let physical_idx = hash_format.physical_index(row_idx);
             if !hash_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
                     "Group hash contains NULL at row {row_idx}"
@@ -280,7 +280,7 @@ impl RadixPartitionedAggregateHashTable {
             partition_hashes[partition_idx].push(hash);
         }
 
-        addresses.set_count(groups.size());
+        addresses.try_set_count(groups.size())?;
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
         let mut new_group_rows = Vec::new();
 
@@ -319,10 +319,10 @@ impl RadixPartitionedAggregateHashTable {
                 &mut partition_new_groups,
             )?;
 
-            let partition_address_format = partition_addresses.try_decode(rows.len())?;
+            let partition_address_format = partition_addresses.try_decode_ref(rows.len())?;
             let partition_address_data = partition_address_format.get_data::<*mut u8>();
             for (local_row, &global_row) in rows.iter().enumerate() {
-                let physical_idx = partition_address_format.sel().get(local_row);
+                let physical_idx = partition_address_format.physical_index(local_row);
                 if !partition_address_format.validity().is_valid(physical_idx) {
                     return Err(paro_error::internal(format!(
                         "Partition address vector contains NULL: partition_idx={partition_idx}, local_row={local_row}"
@@ -383,10 +383,10 @@ impl RadixPartitionedAggregateHashTable {
         }
 
         let mut partition_rows = vec![Vec::<usize>::new(); self.partitions.len()];
-        let hash_format = hashes.try_decode(payload.size())?;
+        let hash_format = hashes.try_decode_ref(payload.size())?;
         let hash_data = hash_format.get_data::<u64>();
         for row_idx in 0..payload.size() {
-            let physical_idx = hash_format.sel().get(row_idx);
+            let physical_idx = hash_format.physical_index(row_idx);
             if !hash_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
                     "Group hash contains NULL at row {row_idx}"
@@ -476,7 +476,7 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
             }
             position.partition_idx += 1;
         }
-        result.set_cardinality(0);
+        result.try_set_cardinality(0)?;
         Ok(false)
     }
 
@@ -549,7 +549,7 @@ fn validate_address_capacity(addresses: &Vector, row_count: usize) -> Result<()>
 
 fn u64_vector_from_slice(values: &[u64], allocator: Arc<dyn Allocator>) -> Result<Vector> {
     let mut vector = Vector::try_new(LogicalType::UBigInt, values.len(), allocator)?;
-    vector.set_count(values.len());
+    vector.try_set_count(values.len())?;
     unsafe {
         let data = vector.flat_data_mut::<u64>();
         for (idx, value) in values.iter().enumerate() {
@@ -571,7 +571,7 @@ fn gather_chunk_rows(source: &Chunk, rows: &[usize]) -> Result<Chunk> {
     }
     let mut gathered =
         Chunk::try_initialize(&column_types, rows.len(), source.allocator().clone())?;
-    gathered.set_cardinality(rows.len());
+    gathered.try_set_cardinality(rows.len())?;
     for column_idx in 0..source.column_count() {
         let source_col = source.column(column_idx).ok_or_else(|| {
             paro_error::internal(format!(
@@ -590,7 +590,7 @@ fn gather_chunk_rows(source: &Chunk, rows: &[usize]) -> Result<Chunk> {
                     source.size()
                 )));
             }
-            target_col.copy_at(target_row, source_col.as_ref(), source_row);
+            target_col.try_copy_at(target_row, source_col.as_ref(), source_row)?;
         }
     }
     Ok(gathered)
@@ -602,9 +602,9 @@ fn gather_address_rows(addresses: &Vector, rows: &[usize]) -> Result<Vector> {
         rows.len(),
         addresses.allocator().clone(),
     )?;
-    gathered.set_count(rows.len());
+    gathered.try_set_count(rows.len())?;
 
-    let address_format = addresses.try_decode(addresses.len())?;
+    let address_format = addresses.try_decode_ref(addresses.len())?;
     let address_data = address_format.get_data::<*mut u8>();
     unsafe {
         let target_data = gathered.flat_data_mut::<*mut u8>();
@@ -615,7 +615,7 @@ fn gather_address_rows(addresses: &Vector, rows: &[usize]) -> Result<Vector> {
                     addresses.len()
                 )));
             }
-            let physical_idx = address_format.sel().get(source_row);
+            let physical_idx = address_format.physical_index(source_row);
             if !address_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
                     "Address vector contains NULL while gathering rows: source_row={source_row}"

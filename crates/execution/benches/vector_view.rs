@@ -68,7 +68,7 @@ fn bench_state() -> &'static BenchState {
 fn flat_to_view(bencher: Bencher) {
     let state = bench_state();
     bencher.counter(ROWS).bench_local(|| {
-        let view = state.flat.to_view(ROWS);
+        let view = state.flat.try_to_view(ROWS).unwrap();
         divan::black_box(view.get_i64(ROWS - 1));
     });
 }
@@ -77,7 +77,7 @@ fn flat_to_view(bencher: Bencher) {
 fn constant_to_view(bencher: Bencher) {
     let state = bench_state();
     bencher.counter(ROWS).bench_local(|| {
-        let view = state.constant.to_view(ROWS);
+        let view = state.constant.try_to_view(ROWS).unwrap();
         divan::black_box(view.get_i64(ROWS - 1));
     });
 }
@@ -86,7 +86,7 @@ fn constant_to_view(bencher: Bencher) {
 fn sequence_to_view(bencher: Bencher) {
     let state = bench_state();
     bencher.counter(ROWS).bench_local(|| {
-        let view = state.sequence.to_view(ROWS);
+        let view = state.sequence.try_to_view(ROWS).unwrap();
         divan::black_box(view.get_i64(ROWS - 1));
     });
 }

@@ -362,7 +362,7 @@ impl NestedLoopJoin {
                 )?;
             }
             _ => {
-                result.set_cardinality(0);
+                result.try_set_cardinality(0)?;
             }
         }
         Ok(())
@@ -777,11 +777,11 @@ impl NestedLoopJoin {
         match marker {
             Some(value) => {
                 marker_col.set_value(output_row, &Value::Boolean(value));
-                marker_col.set_null(output_row, false);
+                marker_col.try_set_null(output_row, false)?;
             }
             None => {
                 marker_col.set_value(output_row, &Value::Boolean(false));
-                marker_col.set_null(output_row, true);
+                marker_col.try_set_null(output_row, true)?;
             }
         }
         Ok(())
@@ -796,7 +796,7 @@ impl NestedLoopJoin {
     fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Result<Chunk> {
         let mut materialized =
             Chunk::try_initialize(types, chunk.size().max(1), chunk.allocator().clone())?;
-        materialized.set_cardinality(chunk.size());
+        materialized.try_set_cardinality(chunk.size())?;
         for col_idx in 0..chunk.column_count() {
             let source = chunk
                 .column(col_idx)
@@ -804,9 +804,7 @@ impl NestedLoopJoin {
             let target = materialized
                 .column_mut(col_idx)
                 .expect("materialized target column must exist");
-            for row_idx in 0..chunk.size() {
-                target.copy_at(row_idx, source, row_idx);
-            }
+            target.try_copy_range(0, source, 0, chunk.size())?;
         }
         Ok(materialized)
     }
@@ -1130,7 +1128,7 @@ impl PhysicalOperator for NestedLoopJoin {
 
         self.ensure_output_chunk(chunk)?;
         if input.size() == 0 {
-            chunk.set_cardinality(0);
+            chunk.try_set_cardinality(0)?;
             self.reset_input_state(state);
             return Ok(OperatorResultType::NeedMoreInput);
         }
@@ -1148,7 +1146,7 @@ impl PhysicalOperator for NestedLoopJoin {
 
         if rhs_row_count == 0 {
             if self.join.empty_result_if_rhs_is_empty() {
-                chunk.set_cardinality(0);
+                chunk.try_set_cardinality(0)?;
             } else {
                 self.construct_empty_join_result(input, chunk)?;
             }
@@ -1410,7 +1408,7 @@ impl PhysicalOperator for NestedLoopJoin {
             }
         }
 
-        chunk.set_cardinality(output_count);
+        chunk.try_set_cardinality(output_count)?;
         if state.left_row_idx >= input.size() {
             self.reset_input_state(state);
             Ok(OperatorResultType::NeedMoreInput)
@@ -1448,7 +1446,7 @@ impl PhysicalOperator for NestedLoopJoin {
             JoinType::RightSemi => true,
             JoinType::Right | JoinType::Outer | JoinType::RightAnti => false,
             _ => {
-                chunk.set_cardinality(0);
+                chunk.try_set_cardinality(0)?;
                 return Ok(SourceResultType::Finished);
             }
         };
@@ -1474,7 +1472,7 @@ impl PhysicalOperator for NestedLoopJoin {
             &mut build_chunk,
         )?;
         if count == 0 {
-            chunk.set_cardinality(0);
+            chunk.try_set_cardinality(0)?;
             return Ok(SourceResultType::Finished);
         }
 

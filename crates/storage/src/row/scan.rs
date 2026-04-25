@@ -54,7 +54,7 @@ fn next_chunk_with_state(
             .get(state.scan_chunk_index as usize)
             .copied()
         else {
-            output.set_cardinality(0);
+            output.try_set_cardinality(0)?;
             return Ok(0);
         };
 

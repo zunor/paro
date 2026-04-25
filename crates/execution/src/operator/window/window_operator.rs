@@ -1784,13 +1784,13 @@ impl Window {
                 let src_vec = &src_chunk.data[col_idx];
 
                 if src_vec.is_null(key.row_idx) {
-                    output_vec.set_null(i, true);
+                    output_vec.try_set_null(i, true)?;
                 } else {
-                    output_vec.copy_at(i, src_vec, key.row_idx);
+                    output_vec.try_copy_at(i, src_vec, key.row_idx)?;
                 }
             }
 
-            output_vec.set_count(actual_count);
+            output_vec.try_set_count(actual_count)?;
             output_vectors.push(Arc::new(output_vec));
         }
 
@@ -1803,20 +1803,20 @@ impl Window {
             for i in 0..actual_count {
                 let result = &results.as_slice()[start_idx + i];
                 match result {
-                    WindowValue::Null => output_vec.set_null(i, true),
+                    WindowValue::Null => output_vec.try_set_null(i, true)?,
                     WindowValue::BigInt(v) => output_vec.set_i64(i, *v),
                     WindowValue::Double(v) => output_vec.set_f64(i, *v),
                     WindowValue::Integer(v) => output_vec.set_i32(i, *v),
-                    WindowValue::Varchar(v) => output_vec.set_string(i, v),
+                    WindowValue::Varchar(v) => output_vec.try_set_string(i, v)?,
                 }
             }
 
-            output_vec.set_count(actual_count);
+            output_vec.try_set_count(actual_count)?;
             output_vectors.push(Arc::new(output_vec));
         }
 
         let mut chunk = Chunk::from_arc_vectors(output_vectors, allocator);
-        chunk.set_cardinality(actual_count);
+        chunk.try_set_cardinality(actual_count)?;
         Ok(chunk)
     }
 }

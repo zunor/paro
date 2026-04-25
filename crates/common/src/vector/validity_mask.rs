@@ -3,7 +3,8 @@
 
 use super::{AllocationSet, VectorBuffer};
 use crate::allocator::{default_allocator, Allocator};
-use crate::vector::{SelectionVector, VECTOR_SIZE};
+use crate::error::{self as paro_error, Result};
+use crate::vector::{SelectionVector, VectorSelection, VECTOR_SIZE};
 use std::fmt;
 use std::sync::Arc;
 
@@ -231,14 +232,27 @@ impl ValidityMask {
     /// Set the value at index as null (invalid).
     #[inline]
     pub fn set_invalid(&mut self, row_idx: usize) {
+        self.try_set_invalid(row_idx)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Set the value at index as null (invalid).
+    #[inline]
+    pub fn try_set_invalid(&mut self, row_idx: usize) -> Result<()> {
         self.assert_in_bounds("set_invalid", row_idx);
-        self.ensure_writable();
+        self.try_ensure_writable()?;
         self.set_invalid_unsafe(row_idx);
+        Ok(())
     }
 
     #[inline]
     pub fn set_null(&mut self, row_idx: usize) {
         self.set_invalid(row_idx);
+    }
+
+    #[inline]
+    pub fn try_set_null(&mut self, row_idx: usize) -> Result<()> {
+        self.try_set_invalid(row_idx)
     }
 
     /// Set the value at index as null (unsafe version, assumes mask is writable).
@@ -259,12 +273,21 @@ impl ValidityMask {
     /// Set the value at index as valid.
     #[inline]
     pub fn set_valid(&mut self, row_idx: usize) {
+        self.try_set_valid(row_idx)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Set the value at index as valid.
+    #[inline]
+    pub fn try_set_valid(&mut self, row_idx: usize) -> Result<()> {
         self.assert_in_bounds("set_valid", row_idx);
         if self.bits.is_none() {
             // Already valid
-            return;
+            return Ok(());
         }
+        self.try_make_exclusive()?;
         self.set_valid_unsafe(row_idx);
+        Ok(())
     }
 
     /// Set the value at index as valid (unsafe version, assumes mask is set).
@@ -285,10 +308,17 @@ impl ValidityMask {
     /// Set the value at index to either valid or invalid.
     #[inline]
     pub fn set(&mut self, row_idx: usize, valid: bool) {
+        self.try_set(row_idx, valid)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Set the value at index to either valid or invalid.
+    #[inline]
+    pub fn try_set(&mut self, row_idx: usize, valid: bool) -> Result<()> {
         if valid {
-            self.set_valid(row_idx);
+            self.try_set_valid(row_idx)
         } else {
-            self.set_invalid(row_idx);
+            self.try_set_invalid(row_idx)
         }
     }
 
@@ -296,54 +326,66 @@ impl ValidityMask {
 
     /// Set all values as invalid (null) for the given count.
     pub fn set_all_invalid(&mut self, count: usize) {
-        self.set_range_invalid(count, 0, Self::entry_count(count));
+        self.try_set_range_invalid(0, count)
+            .expect("validity mask allocation failed");
     }
 
-    /// Marks a range of entries as invalid (null). Useful for parallel initialization.
-    pub fn set_range_invalid(&mut self, count: usize, begin_entry: usize, end_entry: usize) {
-        self.ensure_writable();
-        if count == 0 {
-            return;
-        }
-
-        let last_entry_index = Self::entry_count(count).saturating_sub(1);
-        unsafe {
-            let bits = self
-                .bits
-                .as_mut()
-                .expect("invariant: mask bits must be set");
-            let slice = bits.as_mut_slice::<u64>(Self::entry_count(self.capacity));
-
-            // Set full entries to 0
-            for item in slice
-                .iter_mut()
-                .take(std::cmp::min(last_entry_index, end_entry))
-                .skip(begin_entry)
-            {
-                *item = 0;
-            }
-
-            // Handle the last entry if in range
-            if end_entry > last_entry_index {
-                let last_entry_bits = count % BITS_PER_VALUE;
-                if last_entry_bits == 0 {
-                    slice[last_entry_index] = 0;
-                } else {
-                    // Set bits beyond count as valid (1), bits within count as invalid (0)
-                    slice[last_entry_index] = MAX_ENTRY << last_entry_bits;
-                }
-            }
-        }
+    /// Set all values as invalid (null) for the given count.
+    pub fn try_set_all_invalid(&mut self, count: usize) -> Result<()> {
+        self.try_set_range_invalid(0, count)
     }
 
     /// Set all values as valid for the given count.
     pub fn set_all_valid(&mut self, count: usize) {
-        self.ensure_writable();
+        self.try_set_range_valid(0, count)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Set all values as valid for the given count.
+    pub fn try_set_all_valid(&mut self, count: usize) -> Result<()> {
+        self.try_set_range_valid(0, count)
+    }
+
+    /// Set a row range as valid.
+    pub fn try_set_range_valid(&mut self, start: usize, count: usize) -> Result<()> {
+        self.try_set_range(start, count, true)
+    }
+
+    /// Set a row range as invalid.
+    pub fn try_set_range_invalid(&mut self, start: usize, count: usize) -> Result<()> {
+        self.try_set_range(start, count, false)
+    }
+
+    fn try_set_range(&mut self, start: usize, count: usize, valid: bool) -> Result<()> {
+        let end = start.checked_add(count).ok_or_else(|| {
+            paro_error::internal(format!(
+                "ValidityMask range overflow: start={start}, count={count}"
+            ))
+        })?;
+        if end > self.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask range out of bounds: start={start}, count={count}, capacity={}",
+                self.capacity
+            )));
+        }
         if count == 0 {
-            return;
+            return Ok(());
+        }
+        if valid && self.bits.is_none() {
+            return Ok(());
         }
 
-        let last_entry_index = Self::entry_count(count).saturating_sub(1);
+        if valid {
+            self.try_make_exclusive()?;
+        } else {
+            self.try_ensure_writable()?;
+        }
+
+        let start_entry = start / BITS_PER_VALUE;
+        let end_entry = (end - 1) / BITS_PER_VALUE;
+        let start_bit = start % BITS_PER_VALUE;
+        let end_bit = end % BITS_PER_VALUE;
+
         unsafe {
             let bits = self
                 .bits
@@ -351,18 +393,325 @@ impl ValidityMask {
                 .expect("invariant: mask bits must be set");
             let slice = bits.as_mut_slice::<u64>(Self::entry_count(self.capacity));
 
-            // Set full entries to all valid
-            for item in slice.iter_mut().take(last_entry_index) {
-                *item = MAX_ENTRY;
+            if start_entry == end_entry {
+                let mask_end = if end_bit == 0 {
+                    BITS_PER_VALUE
+                } else {
+                    end_bit
+                };
+                let mask =
+                    Self::entry_with_valid_bits(mask_end) & !Self::entry_with_valid_bits(start_bit);
+                Self::apply_range_mask(&mut slice[start_entry], mask, valid);
+                return Ok(());
             }
 
-            // Handle last ragged entry
-            let last_entry_bits = count % BITS_PER_VALUE;
-            if last_entry_bits == 0 {
-                slice[last_entry_index] = MAX_ENTRY;
-            } else {
-                slice[last_entry_index] |= !(MAX_ENTRY << last_entry_bits);
+            let first_mask = MAX_ENTRY << start_bit;
+            Self::apply_range_mask(&mut slice[start_entry], first_mask, valid);
+
+            let middle_value = if valid { MAX_ENTRY } else { 0 };
+            for item in &mut slice[(start_entry + 1)..end_entry] {
+                *item = middle_value;
             }
+
+            let last_mask = if end_bit == 0 {
+                MAX_ENTRY
+            } else {
+                Self::entry_with_valid_bits(end_bit)
+            };
+            Self::apply_range_mask(&mut slice[end_entry], last_mask, valid);
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn apply_range_mask(entry: &mut u64, mask: u64, valid: bool) {
+        if valid {
+            *entry |= mask;
+        } else {
+            *entry &= !mask;
+        }
+    }
+
+    /// Copy a contiguous validity range from `source` into this mask.
+    pub fn try_copy_range_from(
+        &mut self,
+        dst_offset: usize,
+        source: &ValidityMask,
+        src_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let dst_end = dst_offset.checked_add(count).ok_or_else(|| {
+            paro_error::internal(format!(
+                "ValidityMask copy range destination overflow: offset={dst_offset}, count={count}"
+            ))
+        })?;
+        let src_end = src_offset.checked_add(count).ok_or_else(|| {
+            paro_error::internal(format!(
+                "ValidityMask copy range source overflow: offset={src_offset}, count={count}"
+            ))
+        })?;
+        if src_end > source.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask copy range source out of bounds: source={src_offset}..{src_end}/{}",
+                source.capacity
+            )));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        if dst_end > self.capacity {
+            self.try_resize(dst_end)?;
+        }
+
+        if source.all_valid() {
+            return self.try_set_range_valid(dst_offset, count);
+        }
+
+        self.try_ensure_writable()?;
+
+        if src_offset % BITS_PER_VALUE == dst_offset % BITS_PER_VALUE {
+            self.copy_range_same_alignment(dst_offset, source, src_offset, count);
+        } else {
+            self.copy_range_shifted(dst_offset, source, src_offset, count);
+        }
+        Ok(())
+    }
+
+    /// Copy validity from a source selection into a contiguous destination range.
+    pub fn try_copy_selection_from(
+        &mut self,
+        dst_offset: usize,
+        source: &ValidityMask,
+        selection: &VectorSelection,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        match selection {
+            VectorSelection::None => self.try_copy_range_from(dst_offset, source, 0, count),
+            VectorSelection::Range { offset, .. } => {
+                self.try_copy_range_from(dst_offset, source, *offset, count)
+            }
+            VectorSelection::Materialized(sel) => {
+                if count > sel.len() {
+                    return Err(paro_error::internal(format!(
+                        "ValidityMask copy selection out of bounds: count={count}, selection_len={}",
+                        sel.len()
+                    )));
+                }
+                let dst_end = dst_offset.checked_add(count).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "ValidityMask copy selection destination overflow: offset={dst_offset}, count={count}"
+                    ))
+                })?;
+                if dst_end > self.capacity {
+                    self.try_resize(dst_end)?;
+                }
+                if source.all_valid() {
+                    return self.try_set_range_valid(dst_offset, count);
+                }
+
+                self.try_ensure_writable()?;
+                for i in 0..count {
+                    let source_idx = sel.get(i);
+                    if source_idx >= source.capacity {
+                        return Err(paro_error::internal(format!(
+                            "ValidityMask copy selection source out of bounds: source_idx={source_idx}, capacity={}",
+                            source.capacity
+                        )));
+                    }
+                    let valid = source.is_valid(source_idx);
+                    self.set_prepared_bit(dst_offset + i, valid);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Copy a contiguous source range into scattered destination positions.
+    pub fn try_copy_scatter_from(
+        &mut self,
+        source: &ValidityMask,
+        src_start: usize,
+        dst_positions: &[usize],
+    ) -> Result<()> {
+        if dst_positions.is_empty() {
+            return Ok(());
+        }
+        let src_end = src_start.checked_add(dst_positions.len()).ok_or_else(|| {
+            paro_error::internal(format!(
+                "ValidityMask copy scatter source overflow: start={src_start}, count={}",
+                dst_positions.len()
+            ))
+        })?;
+        if src_end > source.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask copy scatter source out of bounds: source={src_start}..{src_end}/{}",
+                source.capacity
+            )));
+        }
+
+        let required_capacity = dst_positions
+            .iter()
+            .copied()
+            .max()
+            .and_then(|idx| idx.checked_add(1))
+            .ok_or_else(|| paro_error::internal("ValidityMask scatter destination overflow"))?;
+        if required_capacity > self.capacity {
+            self.try_resize(required_capacity)?;
+        }
+
+        if source.all_valid() {
+            for &dst_idx in dst_positions {
+                self.try_set_valid(dst_idx)?;
+            }
+            return Ok(());
+        }
+
+        self.try_ensure_writable()?;
+
+        let mut run_start = 0;
+        while run_start < dst_positions.len() {
+            let mut run_len = 1;
+            while run_start + run_len < dst_positions.len()
+                && dst_positions[run_start + run_len] == dst_positions[run_start] + run_len
+            {
+                run_len += 1;
+            }
+
+            if run_len >= 8 {
+                self.try_copy_range_from(
+                    dst_positions[run_start],
+                    source,
+                    src_start + run_start,
+                    run_len,
+                )?;
+            } else {
+                for i in 0..run_len {
+                    let src_idx = src_start + run_start + i;
+                    let dst_idx = dst_positions[run_start + i];
+                    self.set_prepared_bit(dst_idx, source.is_valid(src_idx));
+                }
+            }
+            run_start += run_len;
+        }
+        Ok(())
+    }
+
+    fn copy_range_same_alignment(
+        &mut self,
+        dst_offset: usize,
+        source: &ValidityMask,
+        src_offset: usize,
+        count: usize,
+    ) {
+        let mut copied = 0;
+        let bit_offset = dst_offset % BITS_PER_VALUE;
+
+        if bit_offset != 0 {
+            let take = count.min(BITS_PER_VALUE - bit_offset);
+            let bits = source.read_bits(src_offset, take);
+            self.write_bits(dst_offset, bits, take);
+            copied += take;
+        }
+
+        let full_words = (count - copied) / BITS_PER_VALUE;
+        if full_words > 0 {
+            let dst_entry = (dst_offset + copied) / BITS_PER_VALUE;
+            let src_entry = (src_offset + copied) / BITS_PER_VALUE;
+            unsafe {
+                let dst_bits = self
+                    .bits
+                    .as_mut()
+                    .expect("invariant: mask bits must be set");
+                let dst_slice = dst_bits.as_mut_slice::<u64>(Self::entry_count(self.capacity));
+                let src_bits = source
+                    .bits
+                    .as_ref()
+                    .expect("invariant: source mask bits must be set");
+                let src_slice = src_bits.as_slice::<u64>(Self::entry_count(source.capacity));
+                dst_slice[dst_entry..dst_entry + full_words]
+                    .copy_from_slice(&src_slice[src_entry..src_entry + full_words]);
+            }
+            copied += full_words * BITS_PER_VALUE;
+        }
+
+        if copied < count {
+            let take = count - copied;
+            let bits = source.read_bits(src_offset + copied, take);
+            self.write_bits(dst_offset + copied, bits, take);
+        }
+    }
+
+    fn copy_range_shifted(
+        &mut self,
+        dst_offset: usize,
+        source: &ValidityMask,
+        src_offset: usize,
+        count: usize,
+    ) {
+        let mut copied = 0;
+        while copied < count {
+            let dst_bit = (dst_offset + copied) % BITS_PER_VALUE;
+            let take = (count - copied).min(BITS_PER_VALUE - dst_bit);
+            let bits = source.read_bits(src_offset + copied, take);
+            self.write_bits(dst_offset + copied, bits, take);
+            copied += take;
+        }
+    }
+
+    fn read_bits(&self, offset: usize, count: usize) -> u64 {
+        debug_assert!(count > 0 && count <= BITS_PER_VALUE);
+        if self.bits.is_none() {
+            return Self::entry_with_valid_bits(count);
+        }
+
+        let entry_idx = offset / BITS_PER_VALUE;
+        let bit_idx = offset % BITS_PER_VALUE;
+        unsafe {
+            let bits = self
+                .bits
+                .as_ref()
+                .expect("invariant: mask bits must be set");
+            let slice = bits.as_slice::<u64>(Self::entry_count(self.capacity));
+            let mut value = slice[entry_idx] >> bit_idx;
+            if bit_idx + count > BITS_PER_VALUE {
+                value |= slice[entry_idx + 1] << (BITS_PER_VALUE - bit_idx);
+            }
+            value & Self::entry_with_valid_bits(count)
+        }
+    }
+
+    fn write_bits(&mut self, offset: usize, bits: u64, count: usize) {
+        debug_assert!(count > 0 && count <= BITS_PER_VALUE);
+        let entry_idx = offset / BITS_PER_VALUE;
+        let bit_idx = offset % BITS_PER_VALUE;
+        debug_assert!(bit_idx + count <= BITS_PER_VALUE);
+
+        let mask = if count == BITS_PER_VALUE {
+            MAX_ENTRY
+        } else {
+            Self::entry_with_valid_bits(count) << bit_idx
+        };
+        unsafe {
+            let dst_bits = self
+                .bits
+                .as_mut()
+                .expect("invariant: mask bits must be set");
+            let dst_slice = dst_bits.as_mut_slice::<u64>(Self::entry_count(self.capacity));
+            dst_slice[entry_idx] = (dst_slice[entry_idx] & !mask) | ((bits << bit_idx) & mask);
+        }
+    }
+
+    fn set_prepared_bit(&mut self, row_idx: usize, valid: bool) {
+        debug_assert!(self.bits.is_some());
+        if valid {
+            self.set_valid_unsafe(row_idx);
+        } else {
+            self.set_invalid_unsafe(row_idx);
         }
     }
 
@@ -425,14 +774,19 @@ impl ValidityMask {
 
     /// Ensure the validity mask is writable, allocating space if not initialized.
     pub fn ensure_writable(&mut self) {
+        self.try_ensure_writable()
+            .expect("validity mask allocation failed");
+    }
+
+    /// Ensure the validity mask is writable, allocating space if not initialized.
+    pub fn try_ensure_writable(&mut self) -> Result<()> {
         if self.bits.is_none() && self.capacity > 0 {
             let num_words = Self::entry_count(self.capacity);
             let mut buf = VectorBuffer::try_with_allocator(
                 std::mem::size_of::<u64>(),
                 num_words,
                 self.allocator.clone(),
-            )
-            .expect("vector buffer allocation failed");
+            )?;
             // Initialize to all valid
             unsafe {
                 let slice = buf.as_mut_slice::<u64>(num_words);
@@ -444,14 +798,19 @@ impl ValidityMask {
             self.bits
                 .as_mut()
                 .expect("invariant: mask bits must be set")
-                .make_exclusive();
+                .try_make_exclusive()?;
         }
+        Ok(())
     }
 
-    pub fn make_exclusive(&mut self) {
+    pub fn try_make_exclusive(&mut self) -> Result<()> {
         if self.bits.is_some() {
-            self.ensure_writable();
+            self.bits
+                .as_mut()
+                .expect("invariant: mask bits must be set")
+                .try_make_exclusive()?;
         }
+        Ok(())
     }
 
     /// Reset the mask to all-valid state with new capacity.
@@ -475,47 +834,62 @@ impl ValidityMask {
 
     /// Resize the validity mask to new size.
     pub fn resize(&mut self, new_size: usize) {
+        self.try_resize(new_size)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Resize the validity mask to new size.
+    pub fn try_resize(&mut self, new_size: usize) -> Result<()> {
         let old_size = self.capacity;
         if new_size <= old_size {
             self.capacity = new_size;
-            return;
+            return Ok(());
         }
 
-        self.capacity = new_size;
-        if self.bits.is_some() {
-            let new_word_count = Self::entry_count(new_size);
-            let old_word_count = Self::entry_count(old_size);
+        if self.bits.is_none() {
+            self.capacity = new_size;
+            return Ok(());
+        }
 
-            let mut new_buf = VectorBuffer::try_with_allocator(
-                std::mem::size_of::<u64>(),
-                new_word_count,
-                self.allocator.clone(),
-            )
-            .expect("vector buffer allocation failed");
+        let new_word_count = Self::entry_count(new_size);
+        let old_word_count = Self::entry_count(old_size);
+        if new_word_count == old_word_count {
+            self.try_make_exclusive()?;
+            self.capacity = new_size;
+            self.try_set_range_valid(old_size, new_size - old_size)?;
+            return Ok(());
+        }
 
-            unsafe {
-                let old_bits = self
-                    .bits
-                    .as_ref()
-                    .expect("invariant: mask bits must be set");
-                let old_slice = old_bits.as_slice::<u64>(old_word_count);
-                let new_slice = new_buf.as_mut_slice::<u64>(new_word_count);
+        let mut new_buf = VectorBuffer::try_with_allocator(
+            std::mem::size_of::<u64>(),
+            new_word_count,
+            self.allocator.clone(),
+        )?;
 
-                // Copy existing data
-                new_slice[..old_word_count].copy_from_slice(old_slice);
+        unsafe {
+            let old_bits = self
+                .bits
+                .as_ref()
+                .expect("invariant: mask bits must be set");
+            let old_slice = old_bits.as_slice::<u64>(old_word_count);
+            let new_slice = new_buf.as_mut_slice::<u64>(new_word_count);
 
-                // Initialize new entries as valid
-                for item in new_slice
-                    .iter_mut()
-                    .take(new_word_count)
-                    .skip(old_word_count)
-                {
-                    *item = MAX_ENTRY;
-                }
+            // Copy existing data
+            new_slice[..old_word_count].copy_from_slice(old_slice);
+
+            // Initialize new entries as valid
+            for item in new_slice
+                .iter_mut()
+                .take(new_word_count)
+                .skip(old_word_count)
+            {
+                *item = MAX_ENTRY;
             }
-
-            self.bits = Some(new_buf);
         }
+
+        self.bits = Some(new_buf);
+        self.capacity = new_size;
+        Ok(())
     }
 
     /// Initialize with the contents of another mask.
@@ -526,6 +900,18 @@ impl ValidityMask {
 
     /// Copy validity data from another mask.
     pub fn copy(&mut self, other: &ValidityMask, count: usize) {
+        self.try_copy(other, count)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Copy validity data from another mask.
+    pub fn try_copy(&mut self, other: &ValidityMask, count: usize) -> Result<()> {
+        if count > other.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask copy out of bounds: count={count}, source_capacity={}",
+                other.capacity
+            )));
+        }
         self.capacity = count;
         if other.all_valid() {
             self.bits = None;
@@ -536,8 +922,7 @@ impl ValidityMask {
                 std::mem::size_of::<u64>(),
                 num_words,
                 self.allocator.clone(),
-            )
-            .expect("vector buffer allocation failed");
+            )?;
             unsafe {
                 let other_bits = other
                     .bits
@@ -549,6 +934,7 @@ impl ValidityMask {
             }
             self.bits = Some(buf);
         }
+        Ok(())
     }
 
     /// Shallow copy from another mask (shares underlying buffer).
@@ -562,14 +948,34 @@ impl ValidityMask {
     /// Combine this mask with another using AND operation.
     /// Result has a null where either mask has a null.
     pub fn combine(&mut self, other: &ValidityMask, count: usize) {
+        self.try_combine(other, count)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Combine this mask with another using AND operation.
+    /// Result has a null where either mask has a null.
+    pub fn try_combine(&mut self, other: &ValidityMask, count: usize) -> Result<()> {
         if other.all_valid() {
             // X & 1 = X
-            return;
+            return self.try_resize(count);
+        }
+        if count > other.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask combine source out of bounds: count={count}, source_capacity={}",
+                other.capacity
+            )));
         }
         if self.all_valid() {
             // 1 & Y = Y
-            self.initialize(other);
-            return;
+            self.bits = other.bits.clone();
+            self.capacity = count;
+            return Ok(());
+        }
+        if count > self.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask combine target out of bounds: count={count}, target_capacity={}",
+                self.capacity
+            )));
         }
 
         // Check if they share the same buffer
@@ -580,7 +986,7 @@ impl ValidityMask {
                     other_bits.as_slice::<u64>(1).as_ptr(),
                 ) {
                     // X & X = X
-                    return;
+                    return self.try_resize(count);
                 }
             }
         }
@@ -591,8 +997,7 @@ impl ValidityMask {
             std::mem::size_of::<u64>(),
             entry_count,
             self.allocator.clone(),
-        )
-        .expect("vector buffer allocation failed");
+        )?;
 
         unsafe {
             let self_bits = self
@@ -614,24 +1019,36 @@ impl ValidityMask {
 
         self.bits = Some(new_buf);
         self.capacity = count;
+        Ok(())
     }
 
     /// Slice the validity mask from source_offset for count elements.
     pub fn slice(&mut self, other: &ValidityMask, source_offset: usize, count: usize) {
+        self.try_slice(other, source_offset, count)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Slice the validity mask from source_offset for count elements.
+    pub fn try_slice(
+        &mut self,
+        other: &ValidityMask,
+        source_offset: usize,
+        count: usize,
+    ) -> Result<()> {
         self.capacity = count;
         if other.all_valid() {
             self.bits = None;
-            return;
+            return Ok(());
         }
         if source_offset == 0 {
-            self.copy(other, count);
-            return;
+            return self.try_copy(other, count);
         }
 
         // Create a new mask and copy data
-        let mut new_mask = ValidityMask::new(count);
-        new_mask.slice_in_place(other, 0, source_offset, count);
+        let mut new_mask = ValidityMask::with_allocator(count, self.allocator.clone());
+        new_mask.try_slice_in_place(other, 0, source_offset, count)?;
         self.initialize(&new_mask);
+        Ok(())
     }
 
     /// Slice validity in place with bit-level precision.
@@ -642,11 +1059,43 @@ impl ValidityMask {
         source_offset: usize,
         count: usize,
     ) {
-        if self.all_valid() && other.all_valid() {
-            return;
+        self.try_slice_in_place(other, target_offset, source_offset, count)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Slice validity in place with bit-level precision.
+    pub fn try_slice_in_place(
+        &mut self,
+        other: &ValidityMask,
+        target_offset: usize,
+        source_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let target_end = target_offset.checked_add(count).ok_or_else(|| {
+            paro_error::internal(format!(
+                "ValidityMask slice target overflow: offset={target_offset}, count={count}"
+            ))
+        })?;
+        let source_end = source_offset.checked_add(count).ok_or_else(|| {
+            paro_error::internal(format!(
+                "ValidityMask slice source overflow: offset={source_offset}, count={count}"
+            ))
+        })?;
+        if target_end > self.capacity || source_end > other.capacity {
+            return Err(paro_error::internal(format!(
+                "ValidityMask slice out of bounds: target={target_offset}..{target_end}/{} source={source_offset}..{source_end}/{}",
+                self.capacity, other.capacity
+            )));
         }
 
-        self.ensure_writable();
+        if self.all_valid() && other.all_valid() {
+            return Ok(());
+        }
+
+        self.try_ensure_writable()?;
 
         let ragged = count % BITS_PER_VALUE;
         let entire_units = count / BITS_PER_VALUE;
@@ -746,17 +1195,22 @@ impl ValidityMask {
                         target_slice[target_start_entry + entire_units] = tgt_entry;
                     }
                 } else {
-                    for i in 0..count {
-                        self.set(target_offset + i, true);
+                    for i in 0..entire_units {
+                        target_slice[target_start_entry + i] = MAX_ENTRY;
+                    }
+                    if ragged > 0 {
+                        target_slice[target_start_entry + entire_units] |=
+                            Self::entry_with_valid_bits(ragged);
                     }
                 }
             }
         } else {
             // Fallback: bit-by-bit copy
             for i in 0..count {
-                self.set(target_offset + i, other.is_valid(source_offset + i));
+                self.try_set(target_offset + i, other.is_valid(source_offset + i))?;
             }
         }
+        Ok(())
     }
 
     /// Copy validity using a selection vector.
@@ -768,16 +1222,30 @@ impl ValidityMask {
         target_offset: usize,
         copy_count: usize,
     ) {
+        self.try_copy_sel(other, sel, source_offset, target_offset, copy_count)
+            .expect("validity mask allocation failed");
+    }
+
+    /// Copy validity using a selection vector.
+    pub fn try_copy_sel(
+        &mut self,
+        other: &ValidityMask,
+        sel: &SelectionVector,
+        source_offset: usize,
+        target_offset: usize,
+        copy_count: usize,
+    ) -> Result<()> {
         if !other.is_mask_set() && !self.is_mask_set() {
             // No need to copy if neither has null values
-            return;
+            return Ok(());
         }
 
         // Use selection vector
         for i in 0..copy_count {
             let source_idx = sel.get(source_offset + i);
-            self.set(target_offset + i, other.is_valid(source_idx));
+            self.try_set(target_offset + i, other.is_valid(source_idx))?;
         }
+        Ok(())
     }
 
     // --- Debug and Display ---
@@ -802,6 +1270,90 @@ impl Default for ValidityMask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocator::{Allocator, DefaultAllocator};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FailingAllocator;
+
+    impl Allocator for FailingAllocator {
+        fn allocate(&self, size: usize) -> Result<*mut u8> {
+            Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )))
+        }
+
+        fn allocate_zeroed(&self, size: usize) -> Result<*mut u8> {
+            self.allocate(size)
+        }
+
+        fn free(&self, _ptr: *mut u8, _size: usize) {}
+
+        fn reallocate(&self, _ptr: *mut u8, _old_size: usize, new_size: usize) -> Result<*mut u8> {
+            self.allocate(new_size)
+        }
+
+        fn name(&self) -> &'static str {
+            "FailingAllocator"
+        }
+    }
+
+    #[derive(Debug)]
+    struct ToggleAllocator {
+        inner: DefaultAllocator,
+        fail: AtomicBool,
+    }
+
+    impl ToggleAllocator {
+        fn new() -> Self {
+            Self {
+                inner: DefaultAllocator::new(),
+                fail: AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    impl Allocator for ToggleAllocator {
+        fn allocate(&self, size: usize) -> Result<*mut u8> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(paro_error::out_of_memory(format!(
+                    "injected allocation failure: {size} bytes"
+                )));
+            }
+            self.inner.allocate(size)
+        }
+
+        fn allocate_zeroed(&self, size: usize) -> Result<*mut u8> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(paro_error::out_of_memory(format!(
+                    "injected allocation failure: {size} bytes"
+                )));
+            }
+            self.inner.allocate_zeroed(size)
+        }
+
+        fn free(&self, ptr: *mut u8, size: usize) {
+            self.inner.free(ptr, size);
+        }
+
+        fn reallocate(&self, ptr: *mut u8, old_size: usize, new_size: usize) -> Result<*mut u8> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(paro_error::out_of_memory(format!(
+                    "injected allocation failure: {new_size} bytes"
+                )));
+            }
+            self.inner.reallocate(ptr, old_size, new_size)
+        }
+
+        fn name(&self) -> &'static str {
+            "ToggleAllocator"
+        }
+    }
 
     #[test]
     fn test_validity_mask_basic() {
@@ -879,6 +1431,74 @@ mod tests {
         for i in 0..50 {
             assert!(!mask.is_valid(i), "expected invalid at {}", i);
         }
+        for i in 50..100 {
+            assert!(
+                mask.is_valid(i),
+                "expected padding/range tail valid at {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_set_range_valid_invalid_preserves_edges() {
+        let mut mask = ValidityMask::new(130);
+
+        mask.try_set_range_invalid(3, 126).unwrap();
+        assert!(mask.is_valid(0));
+        assert!(mask.is_valid(2));
+        for idx in 3..129 {
+            assert!(!mask.is_valid(idx), "expected invalid at {idx}");
+        }
+        assert!(mask.is_valid(129));
+
+        mask.try_set_range_valid(5, 120).unwrap();
+        assert!(!mask.is_valid(3));
+        assert!(!mask.is_valid(4));
+        for idx in 5..125 {
+            assert!(mask.is_valid(idx), "expected valid at {idx}");
+        }
+        assert!(!mask.is_valid(125));
+    }
+
+    #[test]
+    fn test_try_set_invalid_propagates_allocation_error() {
+        let mut mask = ValidityMask::with_allocator(64, Arc::new(FailingAllocator));
+
+        let err = mask.try_set_invalid(0).unwrap_err();
+
+        assert!(err.to_string().contains("injected allocation failure"));
+        assert!(mask.all_valid());
+    }
+
+    #[test]
+    fn test_try_set_valid_cow_propagates_allocation_error() {
+        let allocator = Arc::new(ToggleAllocator::new());
+        let mut mask = ValidityMask::with_allocator(64, allocator.clone());
+        mask.try_set_invalid(0).unwrap();
+
+        let mut shared = mask.clone();
+        allocator.set_fail(true);
+
+        let err = shared.try_set_valid(0).unwrap_err();
+
+        assert!(err.to_string().contains("injected allocation failure"));
+        assert!(!mask.is_valid(0));
+        assert!(!shared.is_valid(0));
+    }
+
+    #[test]
+    fn test_try_resize_failure_preserves_capacity() {
+        let allocator = Arc::new(ToggleAllocator::new());
+        let mut mask = ValidityMask::with_allocator(64, allocator.clone());
+        mask.try_set_invalid(1).unwrap();
+
+        allocator.set_fail(true);
+        let err = mask.try_resize(129).unwrap_err();
+
+        assert!(err.to_string().contains("injected allocation failure"));
+        assert_eq!(mask.capacity(), 64);
+        assert!(!mask.is_valid(1));
     }
 
     #[test]
@@ -992,5 +1612,128 @@ mod tests {
         for idx in 64..81 {
             assert!(dest.is_valid(idx), "expected valid at {}", idx);
         }
+    }
+
+    #[test]
+    fn test_try_copy_range_from_same_alignment() {
+        let mut source = ValidityMask::new(200);
+        source.set_null(70);
+        source.set_null(130);
+        let mut dest = ValidityMask::new(220);
+        dest.set_all_invalid(220);
+
+        dest.try_copy_range_from(129, &source, 65, 80).unwrap();
+
+        for i in 0..80 {
+            assert_eq!(
+                dest.is_valid(129 + i),
+                source.is_valid(65 + i),
+                "mismatch at copied row {i}"
+            );
+        }
+        assert!(!dest.is_valid(128));
+        assert!(!dest.is_valid(209));
+    }
+
+    #[test]
+    fn test_try_copy_range_from_unaligned_shift() {
+        let mut source = ValidityMask::new(160);
+        for idx in [3, 4, 63, 64, 65, 101] {
+            source.set_null(idx);
+        }
+        let mut dest = ValidityMask::new(180);
+        dest.set_all_invalid(180);
+
+        dest.try_copy_range_from(70, &source, 3, 110).unwrap();
+
+        for i in 0..110 {
+            assert_eq!(
+                dest.is_valid(70 + i),
+                source.is_valid(3 + i),
+                "mismatch at copied row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_copy_range_from_all_valid_source_sets_only_range() {
+        let source = ValidityMask::new(100);
+        let mut dest = ValidityMask::new(100);
+        dest.set_all_invalid(100);
+
+        dest.try_copy_range_from(10, &source, 0, 25).unwrap();
+
+        for idx in 0..10 {
+            assert!(!dest.is_valid(idx));
+        }
+        for idx in 10..35 {
+            assert!(dest.is_valid(idx), "expected valid at {idx}");
+        }
+        for idx in 35..100 {
+            assert!(!dest.is_valid(idx));
+        }
+    }
+
+    #[test]
+    fn test_try_copy_range_from_ragged_tail_preserves_edges() {
+        let mut source = ValidityMask::new(130);
+        source.set_null(64);
+        source.set_null(126);
+        source.set_null(127);
+        let mut dest = ValidityMask::new(130);
+        dest.set_null(70);
+
+        dest.try_copy_range_from(1, &source, 64, 63).unwrap();
+
+        assert!(!dest.is_valid(1));
+        assert!(!dest.is_valid(63));
+        assert!(dest.is_valid(64));
+        assert!(!dest.is_valid(70));
+        for i in 0..63 {
+            assert_eq!(
+                dest.is_valid(1 + i),
+                source.is_valid(64 + i),
+                "mismatch at copied row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_copy_selection_from_materialized() {
+        let mut source = ValidityMask::new(16);
+        source.set_null(2);
+        source.set_null(5);
+        let selection =
+            SelectionVector::try_from_indices(vec![5, 1, 2, 3], Arc::new(DefaultAllocator::new()))
+                .unwrap();
+        let mut dest = ValidityMask::new(8);
+        dest.set_all_invalid(8);
+
+        dest.try_copy_selection_from(2, &source, &VectorSelection::materialized(selection), 4)
+            .unwrap();
+
+        assert!(!dest.is_valid(2));
+        assert!(dest.is_valid(3));
+        assert!(!dest.is_valid(4));
+        assert!(dest.is_valid(5));
+    }
+
+    #[test]
+    fn test_try_copy_scatter_from_runs_and_random_positions() {
+        let mut source = ValidityMask::new(16);
+        source.set_null(1);
+        source.set_null(4);
+        source.set_null(9);
+        let mut dest = ValidityMask::new(20);
+        dest.set_all_invalid(20);
+
+        let positions = [3, 4, 5, 10, 12, 13, 14, 15, 16];
+        dest.try_copy_scatter_from(&source, 0, &positions).unwrap();
+
+        for (src_idx, dst_idx) in positions.iter().copied().enumerate() {
+            assert_eq!(dest.is_valid(dst_idx), source.is_valid(src_idx));
+        }
+        assert!(!dest.is_valid(2));
+        assert!(!dest.is_valid(11));
     }
 }

@@ -10,6 +10,7 @@ mod allocation_set;
 mod array_vector;
 mod boolean_ops;
 mod comparison_ops;
+mod copy;
 mod definition;
 mod hash_ops;
 mod null_ops;

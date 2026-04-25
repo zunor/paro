@@ -1,7 +1,7 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build release run test check header fmt fmt-check clippy actionlint static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-setup bench-clean bench-ping python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
+.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-setup bench-clean bench-ping python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
 
 # Build the project
 build:
@@ -47,15 +47,22 @@ actionlint:
 		echo "actionlint not found, skipping"; \
 	fi
 
+# Guard memory-runtime API invariants that are easy to regress in ordinary Rust code.
+memory-guards:
+	python3 tools/ci/check_memory_runtime_api.py
+	python3 tools/ci/check_vector_copy_fallible_api.py
+
 # Run the static checks used at the front of CI
 static:
-	@echo "══════ [1/4] header ══════"
+	@echo "══════ [1/5] header ══════"
 	$(MAKE) header
-	@echo "══════ [2/4] rustfmt ══════"
+	@echo "══════ [2/5] rustfmt ══════"
 	$(MAKE) fmt-check
-	@echo "══════ [3/4] clippy ══════"
+	@echo "══════ [3/5] memory guards ══════"
+	$(MAKE) memory-guards
+	@echo "══════ [4/5] clippy ══════"
 	$(MAKE) clippy
-	@echo "══════ [4/4] actionlint ══════"
+	@echo "══════ [5/5] actionlint ══════"
 	$(MAKE) actionlint
 
 # Clean build artifacts

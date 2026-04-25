@@ -6,7 +6,7 @@
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
+use paro_common::vector::{SelectionVector, Vector, VectorSelection};
 use paro_function::aggregate::AggregateInputData;
 
 use super::aggregate_object::AggregateObject;
@@ -28,7 +28,7 @@ pub fn initialize_states(
     count: usize,
 ) -> Result<()> {
     validate_layout(layout, objects)?;
-    let address_format = addresses.try_decode(addresses.len())?;
+    let address_format = addresses.try_decode_ref(addresses.len())?;
     let address_data = address_format.get_data::<*mut u8>();
     for row in 0..count {
         let base = base_address(&address_format, address_data, addresses, row)?;
@@ -133,14 +133,14 @@ pub fn finalize_states(
         )));
     }
 
-    result.set_cardinality(count);
+    result.try_set_cardinality(count)?;
     for (agg_idx, object) in objects.iter().enumerate() {
         let states = build_state_vector(addresses, &layout, agg_idx, None, count)?;
+        let result_vector = result
+            .column_mut(agg_idx)
+            .expect("result column validated above");
+        result_vector.try_set_count(count)?;
         with_aggregate_input_data(object, input_data, |aggr_input| unsafe {
-            let result_vector = result
-                .column_mut(agg_idx)
-                .expect("result column validated above");
-            result_vector.set_count(count);
             (object.function.finalize)(&states, &aggr_input, result_vector, count);
         });
     }
@@ -202,7 +202,7 @@ fn validate_payload_mapping(
 }
 
 fn base_address(
-    format: &paro_common::vector::DecodedVectorOwned,
+    format: &paro_common::vector::DecodedVectorRef<'_>,
     address_data: *const *mut u8,
     addresses: &Vector,
     row_idx: usize,
@@ -213,7 +213,7 @@ fn base_address(
             addresses.len()
         )));
     }
-    let physical_idx = format.sel().get(row_idx);
+    let physical_idx = format.physical_index(row_idx);
     if !format.validity().is_valid(physical_idx) {
         return Err(paro_error::internal(format!(
             "Address vector contains NULL at row {row_idx}"
@@ -256,10 +256,10 @@ fn build_state_vector(
     }
 
     let mut states = Vector::try_new(LogicalType::BigInt, count, addresses.allocator().clone())?;
-    states.set_count(count);
+    states.try_set_count(count)?;
     let state_ptrs = unsafe { states.flat_data_mut::<*mut u8>() };
 
-    let address_format = addresses.try_decode(addresses.len())?;
+    let address_format = addresses.try_decode_ref(addresses.len())?;
     let address_data = address_format.get_data::<*mut u8>();
     let state_offset = layout.state_offset(agg_idx);
 
@@ -334,10 +334,12 @@ fn materialize_filtered_vector(
         count,
         source.allocator().clone(),
     )?;
-    materialized.set_count(count);
-    for row_idx in 0..count {
-        materialized.copy_at(row_idx, source, filter.get(row_idx));
-    }
+    let selection = if count == filter.len() {
+        VectorSelection::Materialized(filter.clone())
+    } else {
+        VectorSelection::Materialized(filter.try_slice_range(0, count)?)
+    };
+    materialized.try_copy_selection(0, source, &selection, count)?;
     Ok(materialized)
 }
 
@@ -381,8 +383,8 @@ mod tests {
         states: &Vector,
         count: usize,
     ) {
-        let input = inputs[0].decode(count);
-        let state = states.decode(count);
+        let input = inputs[0].try_decode_ref(count).unwrap();
+        let state = states.try_decode_ref(count).unwrap();
         let input_data = input.get_data::<i64>();
         let state_data = state.get_data::<*mut u8>();
         for row in 0..count {
@@ -402,8 +404,8 @@ mod tests {
         _input_data: &AggregateInputData,
         count: usize,
     ) {
-        let source_fmt = source.decode(count);
-        let target_fmt = target.decode(count);
+        let source_fmt = source.try_decode_ref(count).unwrap();
+        let target_fmt = target.try_decode_ref(count).unwrap();
         let source_data = source_fmt.get_data::<*mut u8>();
         let target_data = target_fmt.get_data::<*mut u8>();
         for row in 0..count {
@@ -421,7 +423,7 @@ mod tests {
         result: &mut Vector,
         count: usize,
     ) {
-        let state = states.decode(count);
+        let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         let result_data = result.flat_data_mut::<i64>();
         for row in 0..count {

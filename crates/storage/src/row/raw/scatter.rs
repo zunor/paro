@@ -6,11 +6,13 @@
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
+use paro_common::vector::{
+    DataRef, SelectionRef, SelectionVector, ValidityRef, Vector, VECTOR_SIZE,
+};
 
 use super::{
-    CombinedListData, ListEntry, RawRowChunkState, RawRowCollection, RawRowLayout, RawRowPinState,
-    RawRowSegment, RawRowVectorFormat,
+    ListEntry, RawRowChunkState, RawRowChunkView, RawRowCollection, RawRowLayout, RawRowPinState,
+    RawRowSegment, RawRowVectorView,
 };
 
 /// Size threshold for inlined strings.
@@ -207,11 +209,11 @@ fn initialize_validity_masks(row_locations: &[*mut u8], flag_width: usize, count
 /// Compute heap sizes for variable-length data in a Chunk.
 ///
 /// This function correctly handles all vector types (Flat, Constant, Dictionary)
-/// by using the DecodedVectorOwned for proper index mapping.
+/// by using borrowed raw-row vector views for proper index mapping.
 ///
 /// # Arguments
 /// * `layout` - The raw row layout
-/// * `chunk_state` - Chunk state with initialized vector_data
+/// * `chunk_view` - Borrowed decoded chunk view
 /// * `append_sel` - Optional selection vector for appending
 /// * `count` - Number of rows to process
 ///
@@ -220,7 +222,7 @@ fn initialize_validity_masks(row_locations: &[*mut u8], flag_width: usize, count
 ///
 pub fn compute_heap_sizes(
     layout: &RawRowLayout,
-    chunk_state: &mut RawRowChunkState,
+    chunk_view: &mut RawRowChunkView<'_>,
     append_sel: Option<&SelectionVector>,
     count: usize,
 ) -> Vec<usize> {
@@ -231,7 +233,7 @@ pub fn compute_heap_sizes(
     }
 
     for col_idx in layout.get_variable_columns() {
-        if let Some(format) = chunk_state.get_vector_format_mut(*col_idx) {
+        if let Some(format) = chunk_view.get_vector_format_mut(*col_idx) {
             compute_vector_heap_sizes(
                 layout.get_types().get(*col_idx),
                 format,
@@ -248,7 +250,7 @@ pub fn compute_heap_sizes(
 /// Compute heap sizes for a single vector.
 fn compute_vector_heap_sizes(
     logical_type: Option<&LogicalType>,
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
     count: usize,
@@ -298,7 +300,7 @@ fn compute_vector_heap_sizes(
 /// selection vector from DecodedVectorOwned to map indices.
 ///
 fn compute_string_heap_sizes(
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
     count: usize,
@@ -325,7 +327,7 @@ fn compute_string_heap_sizes(
 
 #[inline(always)]
 fn compute_string_heap_sizes_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
     count: usize,
@@ -370,9 +372,9 @@ fn compute_string_heap_sizes_internal<const HAS_APPEND_SEL: bool, const ALL_VALI
 }
 
 struct CollectionListData<'a> {
-    sel: &'a SelectionVector,
-    entries: &'a [ListEntry],
-    validity: &'a paro_common::vector::ValidityMask,
+    sel: SelectionRef<'a>,
+    entries: Vec<ListEntry>,
+    validity: ValidityRef<'a>,
 }
 
 #[repr(C)]
@@ -388,12 +390,12 @@ fn append_index(append_sel: Option<&SelectionVector>, idx: usize) -> usize {
 }
 
 #[inline]
-fn is_valid_at(validity: &paro_common::vector::ValidityMask, idx: usize) -> bool {
+fn is_valid_at(validity: &ValidityRef<'_>, idx: usize) -> bool {
     validity.all_valid() || (idx < validity.capacity() && validity.is_valid(idx))
 }
 
 fn max_selected_source_index(
-    sel: &SelectionVector,
+    sel: &SelectionRef<'_>,
     append_sel: Option<&SelectionVector>,
     count: usize,
 ) -> usize {
@@ -409,7 +411,7 @@ fn max_selected_source_index(
 }
 
 fn get_collection_entries(
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     append_sel: Option<&SelectionVector>,
     count: usize,
 ) -> Option<Vec<ListEntry>> {
@@ -459,7 +461,7 @@ fn compute_fixed_within_collection_heap_sizes(
             continue;
         }
         let list_idx = list_data.sel.get(append_idx);
-        if !is_valid_at(list_data.validity, list_idx) {
+        if !is_valid_at(&list_data.validity, list_idx) {
             continue;
         }
         let Some(list_entry) = list_data.entries.get(list_idx) else {
@@ -474,7 +476,7 @@ fn compute_fixed_within_collection_heap_sizes(
 }
 
 fn compute_string_within_collection_heap_sizes(
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     list_data: &CollectionListData<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
@@ -490,7 +492,7 @@ fn compute_string_within_collection_heap_sizes(
             continue;
         }
         let list_idx = list_data.sel.get(append_idx);
-        if !is_valid_at(list_data.validity, list_idx) {
+        if !is_valid_at(&list_data.validity, list_idx) {
             continue;
         }
 
@@ -531,7 +533,7 @@ fn compute_string_within_collection_heap_sizes(
 
 fn compute_struct_within_collection_heap_sizes(
     fields: &[(String, LogicalType)],
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     list_data: &CollectionListData<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
@@ -543,7 +545,7 @@ fn compute_struct_within_collection_heap_sizes(
             continue;
         }
         let list_idx = list_data.sel.get(append_idx);
-        if !is_valid_at(list_data.validity, list_idx) {
+        if !is_valid_at(&list_data.validity, list_idx) {
             continue;
         }
 
@@ -571,187 +573,14 @@ fn compute_struct_within_collection_heap_sizes(
     }
 }
 
-fn build_combined_collection_data(
-    logical_type: &LogicalType,
-    format: &mut RawRowVectorFormat,
-    list_data: &CollectionListData<'_>,
-    heap_sizes: &mut [usize],
-    append_sel: Option<&SelectionVector>,
-    count: usize,
-) -> Option<(
-    SelectionVector,
-    Vec<ListEntry>,
-    paro_common::vector::ValidityMask,
-)> {
-    if format.children.is_empty() {
-        return None;
-    }
-
-    let source_sel = format.sel().clone();
-    let source_validity = format.validity().clone();
-    let source_entries = get_collection_entries(format, None, source_sel.len())?;
-    let child_sel_len = format.children.first().map(|child| child.sel().len())?;
-
-    let max_append_idx = (0..count)
-        .map(|i| append_index(append_sel, i))
-        .max()
-        .unwrap_or(0);
-    let append_entry_count = max_append_idx.saturating_add(1);
-
-    // First pass: count total nested elements.
-    let mut combined_child_count = 0usize;
-    for i in 0..count {
-        let append_idx = append_index(append_sel, i);
-        if append_idx >= list_data.sel.len() {
-            continue;
-        }
-        let list_idx = list_data.sel.get(append_idx);
-        if !is_valid_at(list_data.validity, list_idx) {
-            continue;
-        }
-
-        let Some(list_entry) = list_data.entries.get(list_idx) else {
-            continue;
-        };
-
-        for child_i in 0..list_entry.length {
-            let child_list_idx_idx = list_entry.offset + child_i;
-            if child_list_idx_idx >= source_sel.len() {
-                continue;
-            }
-            let child_list_idx = source_sel.get(child_list_idx_idx);
-            if !is_valid_at(&source_validity, child_list_idx) {
-                continue;
-            }
-            if let Some(child_entry) = source_entries.get(child_list_idx) {
-                combined_child_count = combined_child_count.saturating_add(child_entry.length);
-            }
-        }
-    }
-
-    combined_child_count = combined_child_count.max(child_sel_len);
-
-    let mut combined_sel = SelectionVector::try_with_capacity(
-        combined_child_count.max(1),
-        source_sel.allocator().clone(),
-    )
-    .expect("combined child selection allocation failed");
-    combined_sel.set_len(combined_child_count.max(1));
-    for i in 0..combined_child_count.max(1) {
-        combined_sel.set(i, 0);
-    }
-
-    let mut combined_entries = vec![ListEntry::default(); append_entry_count.max(1)];
-    let mut combined_validity = paro_common::vector::ValidityMask::new(append_entry_count.max(1));
-
-    // Second pass: populate per-row entries and combined child selection.
-    let mut combined_list_offset = 0usize;
-    for (i, heap_size) in heap_sizes.iter_mut().enumerate().take(count) {
-        let append_idx = append_index(append_sel, i);
-        if append_idx >= list_data.sel.len() {
-            continue;
-        }
-        let list_idx = list_data.sel.get(append_idx);
-        if !is_valid_at(list_data.validity, list_idx) {
-            if append_idx < combined_validity.capacity() {
-                combined_validity.set_null(append_idx);
-            }
-            continue;
-        }
-
-        let Some(list_entry) = list_data.entries.get(list_idx) else {
-            continue;
-        };
-
-        *heap_size += RawRowLayout::validity_mask_size(list_entry.length);
-        *heap_size += list_entry.length * std::mem::size_of::<u64>();
-
-        let mut child_list_size = 0usize;
-        for child_i in 0..list_entry.length {
-            let child_list_idx_idx = list_entry.offset + child_i;
-            if child_list_idx_idx >= source_sel.len() {
-                continue;
-            }
-            let child_list_idx = source_sel.get(child_list_idx_idx);
-            if !is_valid_at(&source_validity, child_list_idx) {
-                continue;
-            }
-
-            let Some(child_list_entry) = source_entries.get(child_list_idx) else {
-                continue;
-            };
-
-            for child_value_i in 0..child_list_entry.length {
-                let idx = combined_list_offset + child_list_size + child_value_i;
-                if idx >= combined_sel.len() {
-                    continue;
-                }
-                combined_sel.set(idx, child_list_entry.offset + child_value_i);
-            }
-
-            child_list_size = child_list_size.saturating_add(child_list_entry.length);
-        }
-
-        if append_idx < combined_entries.len() {
-            combined_entries[append_idx] = ListEntry {
-                offset: combined_list_offset,
-                length: child_list_size,
-            };
-        }
-        combined_list_offset = combined_list_offset.saturating_add(child_list_size);
-    }
-
-    combined_sel.set_len(combined_list_offset.max(1));
-    let mut entries_for_recursion = combined_entries.clone();
-    if entries_for_recursion.is_empty() {
-        entries_for_recursion.push(ListEntry::default());
-    }
-    let validity_for_recursion = combined_validity.clone();
-
-    // Keep CombinedListData populated for debug inspection and future scatter/gather recursion.
-    if let Some(child_format) = format.children.get_mut(0) {
-        let combined_storage = child_format
-            .combined_list_data
-            .get_or_insert_with(|| Box::new(CombinedListData::new()));
-        combined_storage.selection_data = Some(combined_sel.clone());
-        combined_storage.combined_list_entries = combined_entries;
-        combined_storage.combined_validity = combined_validity;
-        combined_storage
-            .combined_data
-            .set_data(combined_storage.combined_list_entries.as_ptr() as *const u8);
-    }
-
-    // LIST child/ARRAY child both recurse into their element type.
-    if !matches!(
-        logical_type,
-        LogicalType::List(_) | LogicalType::Array(_, _)
-    ) {
-        return None;
-    }
-
-    Some((combined_sel, entries_for_recursion, validity_for_recursion))
-}
-
 fn compute_collection_within_collection_heap_sizes(
     logical_type: &LogicalType,
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     list_data: &CollectionListData<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
     count: usize,
 ) {
-    // Keep CombinedListData populated for debug inspection and future optimizations.
-    // We compute actual heap sizes below with per-entry recursion that mirrors scatter.
-    let mut combined_side_effect_sizes = vec![0usize; count];
-    let _ = build_combined_collection_data(
-        logical_type,
-        format,
-        list_data,
-        &mut combined_side_effect_sizes,
-        append_sel,
-        count,
-    );
-
     let Some(child_type) = logical_type.element_type() else {
         return;
     };
@@ -770,7 +599,7 @@ fn compute_collection_within_collection_heap_sizes(
             continue;
         }
         let list_idx = list_data.sel.get(append_idx);
-        if !is_valid_at(list_data.validity, list_idx) {
+        if !is_valid_at(&list_data.validity, list_idx) {
             continue;
         }
         let Some(list_entry) = list_data.entries.get(list_idx) else {
@@ -807,7 +636,7 @@ fn compute_collection_within_collection_heap_sizes(
 
 fn compute_single_collection_heap_size(
     logical_type: &LogicalType,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     list_entry: ListEntry,
 ) -> usize {
     // Per collection entry header.
@@ -894,7 +723,7 @@ fn compute_single_collection_heap_size(
 
 fn compute_within_collection_heap_sizes(
     logical_type: &LogicalType,
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     list_data: &CollectionListData<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
@@ -945,7 +774,7 @@ fn compute_within_collection_heap_sizes(
 /// Compute heap sizes for collection types (LIST, ARRAY).
 fn compute_collection_heap_sizes(
     logical_type: &LogicalType,
-    format: &mut RawRowVectorFormat,
+    format: &mut RawRowVectorView<'_>,
     heap_sizes: &mut [usize],
     append_sel: Option<&SelectionVector>,
     count: usize,
@@ -976,9 +805,9 @@ fn compute_collection_heap_sizes(
     };
 
     let list_data = CollectionListData {
-        sel: &source_sel,
-        entries: entries.as_slice(),
-        validity: &source_validity,
+        sel: source_sel,
+        entries,
+        validity: source_validity,
     };
 
     compute_within_collection_heap_sizes(
@@ -999,12 +828,12 @@ fn compute_collection_heap_sizes(
 ///
 /// This is the main entry point for writing columnar data to rows.
 /// It correctly handles all vector types (Flat, Constant, Dictionary)
-/// by using RawRowVectorFormat.
+/// by using borrowed raw-row vector views.
 ///
 /// # Arguments
 /// * `layout` - The raw row layout
 /// * `chunk` - The data chunk (needed for column type access)
-/// * `chunk_state` - Chunk state with initialized vector_data
+/// * `chunk_view` - Borrowed decoded chunk view
 /// * `row_locations` - Pointers to row storage
 /// * `heap_locations` - Pointers to heap storage
 /// * `append_sel` - Optional selection vector
@@ -1013,7 +842,7 @@ fn compute_collection_heap_sizes(
 pub fn scatter_chunk(
     layout: &RawRowLayout,
     chunk: &Chunk,
-    chunk_state: &mut RawRowChunkState,
+    chunk_view: &mut RawRowChunkView<'_>,
     row_locations: &[*mut u8],
     heap_locations: &mut [*mut u8],
     append_sel: Option<&SelectionVector>,
@@ -1033,7 +862,7 @@ pub fn scatter_chunk(
 
     // Set heap sizes if we have variable-length data
     let heap_sizes_vec = if !layout.all_constant() {
-        Some(compute_heap_sizes(layout, chunk_state, append_sel, count))
+        Some(compute_heap_sizes(layout, chunk_view, append_sel, count))
     } else {
         None
     };
@@ -1051,7 +880,7 @@ pub fn scatter_chunk(
     // Scatter each column using decoded vector access.
     for col_idx in 0..layout.column_count() {
         if let Some(vector) = chunk.column(col_idx) {
-            if let Some(format) = chunk_state.get_vector_format(col_idx) {
+            if let Some(format) = chunk_view.get_vector_format(col_idx) {
                 let offset = layout.get_offsets()[col_idx];
                 scatter_vector(
                     layout,
@@ -1092,7 +921,7 @@ pub fn scatter_chunk(
 fn scatter_vector(
     layout: &RawRowLayout,
     vector: &Vector,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -1365,7 +1194,7 @@ fn scatter_vector(
 fn scatter_struct(
     layout: &RawRowLayout,
     vector: &Vector,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -1447,7 +1276,7 @@ fn scatter_struct(
 /// based on runtime conditions.
 fn scatter_fixed<T: Copy + Default>(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -1513,7 +1342,7 @@ fn scatter_fixed<T: Copy + Default>(
 #[inline(always)]
 fn scatter_fixed_internal<T: Copy + Default, const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -1522,7 +1351,7 @@ fn scatter_fixed_internal<T: Copy + Default, const HAS_APPEND_SEL: bool, const A
 ) {
     let source_sel = format.sel();
     let source_validity = format.validity();
-    let data_ptr = format.get_data::<T>();
+    let data_ref = format.data();
 
     let entry_idx = col_idx / 8;
     let bit_idx = col_idx % 8;
@@ -1547,12 +1376,30 @@ fn scatter_fixed_internal<T: Copy + Default, const HAS_APPEND_SEL: bool, const A
             source_validity.is_valid(source_idx)
         };
 
-        if is_valid && !data_ptr.is_null() {
+        if is_valid {
             unsafe {
-                let src = data_ptr.add(source_idx);
                 let dst = row_ptr.add(offset) as *mut T;
-                let value = std::ptr::read(src);
-                std::ptr::write_unaligned(dst, value);
+                match data_ref {
+                    DataRef::Ptr(ptr) if !ptr.is_null() => {
+                        let src = (ptr as *const T).add(source_idx);
+                        let value = std::ptr::read(src);
+                        std::ptr::write_unaligned(dst, value);
+                    }
+                    DataRef::SequenceI64 { start, increment }
+                        if std::mem::size_of::<T>() == std::mem::size_of::<i64>() =>
+                    {
+                        let value = start + source_idx as i64 * increment;
+                        std::ptr::write_unaligned(dst.cast::<i64>(), value);
+                    }
+                    _ => {
+                        std::ptr::write_unaligned(dst, T::default());
+                        if !layout.all_valid() {
+                            let validity_ptr = row_ptr.add(entry_idx);
+                            let current = std::ptr::read(validity_ptr);
+                            std::ptr::write(validity_ptr, current & !(1 << bit_idx));
+                        }
+                    }
+                }
             }
         } else {
             unsafe {
@@ -1587,7 +1434,7 @@ fn scatter_fixed_internal<T: Copy + Default, const HAS_APPEND_SEL: bool, const A
 #[allow(clippy::too_many_arguments)]
 fn scatter_string(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -1649,7 +1496,7 @@ fn scatter_string(
 #[allow(clippy::too_many_arguments)]
 fn scatter_string_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -1740,7 +1587,7 @@ unsafe fn clear_collection_validity_bit(mask_ptr: *mut u8, idx: usize) {
 
 unsafe fn scatter_collection_payload(
     logical_type: &LogicalType,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     list_entry: ListEntry,
     validity_mask_ptr: *mut u8,
     payload_ptr: *mut u8,
@@ -1941,7 +1788,7 @@ unsafe fn scatter_collection_payload(
 #[allow(clippy::too_many_arguments)]
 fn scatter_collection_internal(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -2039,7 +1886,7 @@ fn scatter_collection_internal(
 #[allow(clippy::too_many_arguments)]
 fn array_row_scatter(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -2064,7 +1911,7 @@ fn array_row_scatter(
 #[allow(clippy::too_many_arguments)]
 fn list_row_scatter(
     layout: &RawRowLayout,
-    format: &RawRowVectorFormat,
+    format: &RawRowVectorView<'_>,
     col_idx: usize,
     offset: usize,
     row_locations: &[*mut u8],
@@ -2120,12 +1967,12 @@ pub fn append_chunk(
         return Ok(0);
     }
 
-    // Initialize vector_data from chunk
-    chunk_state.decode(chunk);
+    // Initialize borrowed vector views from chunk.
+    let mut chunk_view = chunk_state.try_decode(chunk)?;
 
     let layout = collection.layout();
 
-    let heap_sizes = compute_heap_sizes(layout, chunk_state, None, count);
+    let heap_sizes = compute_heap_sizes(layout, &mut chunk_view, None, count);
 
     let (row_locations, mut heap_locations) =
         build_rows(pin_state, segment, layout, &heap_sizes, count)?;
@@ -2133,7 +1980,7 @@ pub fn append_chunk(
     scatter_chunk(
         layout,
         chunk,
-        chunk_state,
+        &mut chunk_view,
         &row_locations,
         &mut heap_locations,
         None,
@@ -2173,12 +2020,12 @@ pub fn append_chunk_with_sel(
         return Ok(0);
     }
 
-    // Initialize vector_data from chunk
-    chunk_state.decode(chunk);
+    // Initialize borrowed vector views from chunk.
+    let mut chunk_view = chunk_state.try_decode(chunk)?;
 
     let layout = collection.layout();
 
-    let heap_sizes = compute_heap_sizes(layout, chunk_state, Some(sel), count);
+    let heap_sizes = compute_heap_sizes(layout, &mut chunk_view, Some(sel), count);
 
     let (row_locations, mut heap_locations) =
         build_rows(pin_state, segment, layout, &heap_sizes, count)?;
@@ -2186,7 +2033,7 @@ pub fn append_chunk_with_sel(
     scatter_chunk(
         layout,
         chunk,
-        chunk_state,
+        &mut chunk_view,
         &row_locations,
         &mut heap_locations,
         Some(sel),
@@ -2223,7 +2070,7 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(test_i32_vector(&[10, 20, 30, 40]))]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
+        let chunk_view = chunk_state.try_decode(&chunk).unwrap();
 
         let row_width = layout.get_row_width();
         let mut storage: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; row_width]).collect();
@@ -2231,7 +2078,7 @@ mod tests {
 
         initialize_validity_masks(&row_locations, layout.get_flag_width(), 4);
 
-        if let Some(format) = chunk_state.get_vector_format(0) {
+        if let Some(format) = chunk_view.get_vector_format(0) {
             scatter_fixed::<i32>(
                 &layout,
                 format,
@@ -2263,7 +2110,7 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(constant_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
+        let chunk_view = chunk_state.try_decode(&chunk).unwrap();
 
         let row_width = layout.get_row_width();
         let mut storage: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; row_width]).collect();
@@ -2271,7 +2118,7 @@ mod tests {
 
         initialize_validity_masks(&row_locations, layout.get_flag_width(), 4);
 
-        if let Some(format) = chunk_state.get_vector_format(0) {
+        if let Some(format) = chunk_view.get_vector_format(0) {
             // This should NOT panic, unlike the old code
             scatter_fixed::<i32>(
                 &layout,
@@ -2305,7 +2152,7 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(dict_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
+        let chunk_view = chunk_state.try_decode(&chunk).unwrap();
 
         let row_width = layout.get_row_width();
         let mut storage: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; row_width]).collect();
@@ -2313,7 +2160,7 @@ mod tests {
 
         initialize_validity_masks(&row_locations, layout.get_flag_width(), 4);
 
-        if let Some(format) = chunk_state.get_vector_format(0) {
+        if let Some(format) = chunk_view.get_vector_format(0) {
             scatter_fixed::<i32>(
                 &layout,
                 format,
@@ -2366,10 +2213,10 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(constant_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
+        let mut chunk_view = chunk_state.try_decode(&chunk).unwrap();
 
         // This should NOT panic
-        let heap_sizes = compute_heap_sizes(&layout, &mut chunk_state, None, 4);
+        let heap_sizes = compute_heap_sizes(&layout, &mut chunk_view, None, 4);
 
         assert_eq!(heap_sizes.len(), 4);
         // All 4 rows should have the same heap size (constant value)
@@ -2389,7 +2236,7 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(flat_vec), Arc::new(constant_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
+        let mut chunk_view = chunk_state.try_decode(&chunk).unwrap();
 
         let row_width = layout.get_row_width();
         let mut storage: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; row_width]).collect();
@@ -2400,7 +2247,7 @@ mod tests {
         scatter_chunk(
             &layout,
             &chunk,
-            &mut chunk_state,
+            &mut chunk_view,
             &row_locations,
             &mut heap_locations,
             None,
@@ -2430,7 +2277,7 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(test_i32_vector(&[10, 20, 30, 40]))]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
+        let chunk_view = chunk_state.try_decode(&chunk).unwrap();
 
         // Selection: pick indices [1, 3]
         let sel = test_selection(vec![1, 3]);
@@ -2441,7 +2288,7 @@ mod tests {
 
         initialize_validity_masks(&row_locations, layout.get_flag_width(), 2);
 
-        if let Some(format) = chunk_state.get_vector_format(0) {
+        if let Some(format) = chunk_view.get_vector_format(0) {
             scatter_fixed::<i32>(
                 &layout,
                 format,
@@ -2502,8 +2349,8 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(array_vector)]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
-        let heap_sizes = compute_heap_sizes(&layout, &mut chunk_state, None, 2);
+        let mut chunk_view = chunk_state.try_decode(&chunk).unwrap();
+        let heap_sizes = compute_heap_sizes(&layout, &mut chunk_view, None, 2);
 
         let base = std::mem::size_of::<u64>()
             + RawRowLayout::validity_mask_size(2)
@@ -2515,7 +2362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_heap_sizes_nested_array_of_array_uses_combined_list_data() {
+    fn test_compute_heap_sizes_nested_array_of_array_recurses_without_materialized_selection() {
         let inner_array_type = LogicalType::Array(Box::new(LogicalType::Integer), 2);
         let outer_array_type = LogicalType::Array(Box::new(inner_array_type.clone()), 2);
         let layout = create_test_layout(vec![outer_array_type]);
@@ -2532,8 +2379,8 @@ mod tests {
         let chunk = test_chunk_from_arc_vectors(vec![Arc::new(outer_array_vector)]);
 
         let mut chunk_state = RawRowChunkState::new();
-        chunk_state.decode(&chunk);
-        let heap_sizes = compute_heap_sizes(&layout, &mut chunk_state, None, 2);
+        let mut chunk_view = chunk_state.try_decode(&chunk).unwrap();
+        let heap_sizes = compute_heap_sizes(&layout, &mut chunk_view, None, 2);
 
         // Outer header + outer child metadata + per-inner-array headers/masks/values.
         let expected = std::mem::size_of::<u64>()
@@ -2544,7 +2391,7 @@ mod tests {
                 + 2 * std::mem::size_of::<i32>());
         assert_eq!(heap_sizes, vec![expected, expected]);
 
-        let format = chunk_state
+        let format = chunk_view
             .get_vector_format(0)
             .expect("outer format should exist");
         let inner_format = format.children.first().expect("inner array format");
@@ -2553,8 +2400,8 @@ mod tests {
             .first()
             .expect("inner array child format");
         assert!(
-            value_format.combined_list_data.is_some(),
-            "combined list data should be populated for nested collection recursion"
+            value_format.combined_list_data.is_none(),
+            "heap-size recursion should not allocate combined selection scratch"
         );
     }
 }

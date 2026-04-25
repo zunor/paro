@@ -414,7 +414,7 @@ pub fn decimal_to_varchar_cast(
         }
         let value = decimal_value_from_vector(input, row, precision)?;
         let s = format_decimal_i128(value, scale);
-        writer.write_str(row, &s);
+        writer.write_str(row, &s)?;
     }
 
     Ok(true)

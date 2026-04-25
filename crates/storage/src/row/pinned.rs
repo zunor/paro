@@ -304,7 +304,7 @@ fn ensure_output(output: &mut Chunk, required: usize) -> Result<()> {
         )));
     }
     if output.size() < required {
-        output.set_cardinality(required);
+        output.try_set_cardinality(required)?;
     }
     Ok(())
 }

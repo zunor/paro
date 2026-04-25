@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::allocator::default_allocator;
 use crate::error::Result;
 use crate::types::{InlineString, LogicalType};
 
@@ -116,7 +114,7 @@ pub enum ValidityRef<'a> {
 
 impl<'a> ValidityRef<'a> {
     #[inline]
-    fn as_mask(&self) -> &ValidityMask {
+    pub fn as_mask(&self) -> &ValidityMask {
         match self {
             Self::Borrowed(mask) => mask,
             Self::Owned(mask) => mask,
@@ -131,6 +129,11 @@ impl<'a> ValidityRef<'a> {
     #[inline]
     pub fn all_valid(&self) -> bool {
         self.as_mask().all_valid()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.as_mask().capacity()
     }
 }
 
@@ -300,6 +303,19 @@ impl<'a> DecodedVectorRef<'a> {
     }
 
     #[inline]
+    pub fn set_data(&mut self, data: DataRef) {
+        self.data = data;
+    }
+
+    #[inline]
+    pub fn get_data<T>(&self) -> *const T {
+        match self.data {
+            DataRef::Ptr(ptr) => ptr as *const T,
+            DataRef::SequenceI64 { .. } => std::ptr::null(),
+        }
+    }
+
+    #[inline]
     pub fn validity(&self) -> &ValidityRef<'a> {
         &self.validity
     }
@@ -307,6 +323,24 @@ impl<'a> DecodedVectorRef<'a> {
     #[inline]
     pub fn is_valid(&self, idx: usize) -> bool {
         self.validity.is_valid(self.physical_index(idx))
+    }
+
+    #[inline]
+    /// # Safety
+    ///
+    /// The caller must ensure pointer-backed decoded data contains initialized
+    /// `T` values and that `idx` resolves to an in-bounds physical row. Sequence
+    /// data is only valid for 8-byte scalar reads.
+    pub unsafe fn get_value<T: Copy>(&self, idx: usize) -> T {
+        let physical_idx = self.physical_index(idx);
+        match self.data {
+            DataRef::Ptr(ptr) => unsafe { *(ptr as *const T).add(physical_idx) },
+            DataRef::SequenceI64 { start, increment } => {
+                assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<i64>());
+                let value = start + physical_idx as i64 * increment;
+                unsafe { std::ptr::read_unaligned((&value as *const i64).cast::<T>()) }
+            }
+        }
     }
 }
 
@@ -337,16 +371,6 @@ unsafe impl Send for DecodedVectorOwned {}
 unsafe impl Sync for DecodedVectorOwned {}
 
 impl DecodedVectorOwned {
-    pub fn empty() -> Self {
-        Self {
-            sel: SelectionVector::try_with_capacity(0, Arc::new(default_allocator()))
-                .expect("decoded empty selection allocation failed"),
-            data: std::ptr::null(),
-            validity: ValidityMask::new(0),
-            owned: None,
-        }
-    }
-
     #[inline]
     pub fn sel(&self) -> &SelectionVector {
         &self.sel
@@ -400,16 +424,6 @@ pub struct DecodedVectorTree {
     pub logical_type: LogicalType,
 }
 
-impl DecodedVectorTree {
-    pub fn empty() -> Self {
-        Self {
-            view: DecodedVectorOwned::empty(),
-            children: Vec::new(),
-            logical_type: LogicalType::Null,
-        }
-    }
-}
-
 impl Vector {
     pub fn try_to_view(&self, count: usize) -> Result<VectorView<'_>> {
         match self.vector_type {
@@ -455,11 +469,6 @@ impl Vector {
         }
     }
 
-    pub fn to_view(&self, count: usize) -> VectorView<'_> {
-        self.try_to_view(count)
-            .expect("vector view selection allocation failed")
-    }
-
     pub fn try_to_varlen_view(&self, count: usize) -> Result<VarlenView<'_>> {
         let view = self.try_to_view(count)?;
         let DataRef::Ptr(entries) = view.data else {
@@ -471,11 +480,6 @@ impl Vector {
             validity: view.validity,
             _vector: PhantomData,
         })
-    }
-
-    pub fn to_varlen_view(&self, count: usize) -> VarlenView<'_> {
-        self.try_to_varlen_view(count)
-            .expect("varlen view selection allocation failed")
     }
 
     pub fn try_to_array_view(&self, count: usize) -> Result<ArrayView<'_>> {
@@ -490,11 +494,6 @@ impl Vector {
         })
     }
 
-    pub fn to_array_view(&self, count: usize) -> ArrayView<'_> {
-        self.try_to_array_view(count)
-            .expect("array view selection allocation failed")
-    }
-
     pub fn try_decode_ref(&self, count: usize) -> Result<DecodedVectorRef<'_>> {
         let view = self.try_to_view(count)?;
         Ok(DecodedVectorRef {
@@ -502,11 +501,6 @@ impl Vector {
             data: view.data,
             validity: view.validity,
         })
-    }
-
-    pub fn decode_ref(&self, count: usize) -> DecodedVectorRef<'_> {
-        self.try_decode_ref(count)
-            .expect("decoded vector ref allocation failed")
     }
 
     pub fn try_decode_tree(&self, count: usize) -> Result<DecodedVectorTree> {
@@ -539,11 +533,6 @@ impl Vector {
         }
 
         Ok(data)
-    }
-
-    pub fn decode_tree(&self, count: usize) -> DecodedVectorTree {
-        self.try_decode_tree(count)
-            .expect("decoded vector tree allocation failed")
     }
 
     pub fn try_decode(&self, count: usize) -> Result<DecodedVectorOwned> {
@@ -609,11 +598,6 @@ impl Vector {
             }
         }
     }
-
-    pub fn decode(&self, count: usize) -> DecodedVectorOwned {
-        self.try_decode(count)
-            .expect("decoded vector allocation failed")
-    }
 }
 
 #[cfg(test)]
@@ -626,7 +610,7 @@ mod tests {
     #[test]
     fn flat_to_view_borrows_validity_and_avoids_owned_selection() {
         let vector = crate::test_utils::test_i64_vector(&[10, 20, 30]);
-        let view = vector.to_view(3);
+        let view = vector.try_to_view(3).unwrap();
 
         assert!(matches!(view.sel(), SelectionRef::Incremental { count: 3 }));
         assert!(matches!(view.validity(), ValidityRef::Borrowed(_)));
@@ -636,7 +620,7 @@ mod tests {
     #[test]
     fn constant_to_view_uses_constant_selection() {
         let vector = crate::test_utils::test_constant(LogicalType::BigInt, 42_i64, 4);
-        let view = vector.to_view(4);
+        let view = vector.try_to_view(4).unwrap();
 
         assert!(matches!(view.sel(), SelectionRef::Constant { count: 4 }));
         assert_eq!(view.get_i64(0), 42);
@@ -655,7 +639,7 @@ mod tests {
             .sel_vector()
             .expect("canonical dictionary selection")
             .allocation_identity();
-        let view = nested.to_view(2);
+        let view = nested.try_to_view(2).unwrap();
 
         assert_eq!(view.get_i64(0), 20);
         assert_eq!(view.get_i64(1), 30);
@@ -666,7 +650,7 @@ mod tests {
     fn range_dictionary_to_view_stays_borrowed_range() {
         let vector = crate::test_utils::test_i64_vector(&[10, 20, 30, 40]);
         let sliced = vector.slice_ref(1, 2).expect("range slice");
-        let view = sliced.to_view(2);
+        let view = sliced.try_to_view(2).unwrap();
 
         assert!(matches!(
             view.sel(),
@@ -683,7 +667,7 @@ mod tests {
     fn decode_ref_keeps_range_selection() {
         let vector = crate::test_utils::test_i64_vector(&[10, 20, 30, 40]);
         let sliced = vector.slice_ref(1, 3).expect("range slice");
-        let decoded = sliced.decode_ref(3);
+        let decoded = sliced.try_decode_ref(3).unwrap();
 
         assert!(matches!(
             decoded.sel(),
@@ -696,9 +680,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_ref_hot_paths_keep_symbolic_selection() {
+        let flat = crate::test_utils::test_i64_vector(&[1, 2, 3]);
+        let flat_decoded = flat.try_decode_ref(3).unwrap();
+        assert!(matches!(
+            flat_decoded.sel(),
+            SelectionRef::Incremental { count: 3 }
+        ));
+
+        let constant = crate::test_utils::test_constant(LogicalType::BigInt, 9_i64, 4);
+        let constant_decoded = constant.try_decode_ref(4).unwrap();
+        assert!(matches!(
+            constant_decoded.sel(),
+            SelectionRef::Constant { count: 4 }
+        ));
+
+        let range = flat.slice_ref(1, 2).expect("range slice");
+        let range_decoded = range.try_decode_ref(2).unwrap();
+        assert!(matches!(
+            range_decoded.sel(),
+            SelectionRef::Range {
+                offset: 1,
+                count: 2
+            }
+        ));
+    }
+
+    #[test]
     fn sequence_to_view_uses_sequence_data_ref() {
         let vector = crate::test_utils::test_sequence(7, 3, 5);
-        let view = vector.to_view(5);
+        let view = vector.try_to_view(5).unwrap();
 
         assert!(matches!(
             view.data(),
@@ -716,7 +727,7 @@ mod tests {
             "alpha", "beta", "gamma",
         ]));
         let dictionary = crate::test_utils::test_dictionary(base, vec![2_u32, 0]);
-        let view = dictionary.to_varlen_view(2);
+        let view = dictionary.try_to_varlen_view(2).unwrap();
 
         assert_eq!(view.get_inline_string(0).as_str(), "gamma");
         assert_eq!(view.get_inline_string(1).as_str(), "alpha");
@@ -727,7 +738,7 @@ mod tests {
         let vector =
             crate::test_utils::test_embeddings_vector(&[vec![1.0_f32, 2.0], vec![3.0, 4.0]], 2);
         let dictionary = crate::test_utils::test_dictionary(Arc::new(vector), vec![1_u32]);
-        let view = dictionary.to_array_view(1);
+        let view = dictionary.try_to_array_view(1).unwrap();
 
         assert_eq!(view.array_size(), 2);
         assert_eq!(view.logical_child_index(0, 0), 2);
@@ -739,7 +750,7 @@ mod tests {
     #[test]
     fn owned_view_materializes_sequence_once() {
         let vector = crate::test_utils::test_sequence(7, 3, 4);
-        let view = vector.decode(4);
+        let view = vector.try_decode(4).unwrap();
 
         unsafe {
             assert_eq!(view.get_value::<i64>(0), 7);
@@ -755,7 +766,7 @@ mod tests {
             first,
             crate::test_utils::test_selection(vec![1, 2]),
         );
-        let view = nested.decode(2);
+        let view = nested.try_decode(2).unwrap();
 
         unsafe {
             assert_eq!(view.get_value::<i32>(0), 20);

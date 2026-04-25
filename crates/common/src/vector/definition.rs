@@ -191,6 +191,37 @@ impl Vector {
         self.buffer.allocator()
     }
 
+    #[inline]
+    pub fn logical_capacity(&self) -> usize {
+        if self.buffer.element_size() == 0 {
+            self.validity.len()
+        } else {
+            self.buffer.capacity()
+        }
+    }
+
+    pub(crate) fn try_materialize_for_write(source: &Vector) -> Result<Vector> {
+        let capacity = source.logical_capacity().max(source.len());
+        let mut materialized = Vector::try_new(
+            source.logical_type.clone(),
+            capacity,
+            source.allocator().clone(),
+        )?;
+        if !source.is_empty() {
+            materialized.try_copy_range(0, source, 0, source.len())?;
+        }
+        materialized.try_set_count(source.len())?;
+        Ok(materialized)
+    }
+
+    pub fn try_make_arc_mut(vector: &mut Arc<Vector>) -> Result<&mut Vector> {
+        if Arc::get_mut(vector).is_none() {
+            let materialized = Self::try_materialize_for_write(vector.as_ref())?;
+            *vector = Arc::new(materialized);
+        }
+        Ok(Arc::get_mut(vector).expect("vector must be uniquely owned after materialization"))
+    }
+
     /// Set the string heap for this vector.
     pub fn set_string_heap(&mut self, heap: Arc<StringHeap>) {
         self.string_heap = Some(heap);
@@ -252,7 +283,7 @@ impl Vector {
     /// Ensure the vector's primary buffer and validity mask are exclusively owned.
     pub fn try_make_exclusive(&mut self) -> Result<()> {
         self.buffer.try_make_exclusive()?;
-        self.validity.make_exclusive();
+        self.validity.try_make_exclusive()?;
         self.selection.try_make_exclusive()?;
         Ok(())
     }
@@ -306,7 +337,15 @@ impl Vector {
                     )?));
                 }
                 let child = self.child.as_mut().expect("array child must exist");
-                Arc::make_mut(child).try_reset_for_reuse(child_capacity, allocator.clone())?;
+                if let Some(child_mut) = Arc::get_mut(child) {
+                    child_mut.try_reset_for_reuse(child_capacity, allocator.clone())?;
+                } else {
+                    *child = Arc::new(Vector::try_new(
+                        child_type.as_ref().clone(),
+                        child_capacity,
+                        allocator.clone(),
+                    )?);
+                }
                 self.children.clear();
                 self.string_heap = None;
             }
@@ -320,7 +359,15 @@ impl Vector {
                     )?));
                 }
                 let child = self.child.as_mut().expect("list child must exist");
-                Arc::make_mut(child).try_reset_for_reuse(0, allocator.clone())?;
+                if let Some(child_mut) = Arc::get_mut(child) {
+                    child_mut.try_reset_for_reuse(0, allocator.clone())?;
+                } else {
+                    *child = Arc::new(Vector::try_new(
+                        child_type.as_ref().clone(),
+                        0,
+                        allocator.clone(),
+                    )?);
+                }
                 self.children.clear();
                 self.string_heap = None;
             }
@@ -338,7 +385,7 @@ impl Vector {
                         .collect::<Result<Vec<_>>>()?;
                 }
                 for (child, (_, field_type)) in self.children.iter_mut().zip(fields.iter()) {
-                    let child_mut = Arc::make_mut(child);
+                    let child_mut = Self::try_make_arc_mut(child)?;
                     if child_mut.logical_type() != field_type {
                         *child_mut =
                             Vector::try_new(field_type.clone(), capacity, allocator.clone())?;
@@ -451,7 +498,7 @@ impl Vector {
     /// Returns true when this vector and any nested children already match the
     /// requested logical cardinality and validity shape.
     pub(crate) fn count_matches_cardinality(&self, count: usize) -> bool {
-        if self.count != count || self.validity.len() != self.target_validity_len_for_count(count) {
+        if self.count != count || self.validity.len() < self.target_validity_len_for_count(count) {
             return false;
         }
 
@@ -478,30 +525,48 @@ impl Vector {
     /// `count * array_size` to ensure consistency.
     #[inline]
     pub fn set_count(&mut self, count: usize) {
+        self.try_set_count(count)
+            .expect("vector count allocation failed");
+    }
+
+    /// Set the number of logical elements.
+    ///
+    /// For Array types, this also updates the child vector's count to
+    /// `count * array_size` to ensure consistency.
+    #[inline]
+    pub fn try_set_count(&mut self, count: usize) -> Result<()> {
         if self.count_matches_cardinality(count) {
-            return;
+            return Ok(());
         }
 
-        self.count = count;
-        self.validity
-            .resize(self.target_validity_len_for_count(count));
+        let target_validity_len = self.target_validity_len_for_count(count);
+        if self.validity.len() < target_validity_len {
+            self.validity.try_resize(target_validity_len)?;
+        }
 
         // For Array types, also update the child vector's count
         if let LogicalType::Array(_, array_size) = &self.logical_type {
             if let Some(child) = &mut self.child {
-                let child_count = count * array_size;
-                let child_mut = Arc::make_mut(child);
-                child_mut.set_count(child_count);
+                let child_count = count.checked_mul(*array_size).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "array child count overflow: count={count}, array_size={array_size}"
+                    ))
+                })?;
+                let child_mut = Self::try_make_arc_mut(child)?;
+                child_mut.try_set_count(child_count)?;
             }
         }
 
         // For Struct types, keep child vectors in sync with parent count
         if matches!(self.logical_type, LogicalType::Struct(_)) && !self.children.is_empty() {
             for child in &mut self.children {
-                let child_mut = Arc::make_mut(child);
-                child_mut.set_count(count);
+                let child_mut = Self::try_make_arc_mut(child)?;
+                child_mut.try_set_count(count)?;
             }
         }
+
+        self.count = count;
+        Ok(())
     }
 
     /// Check if empty.
@@ -515,14 +580,23 @@ impl Vector {
     /// Panics if len exceeds capacity (for Flat vectors).
     #[inline]
     pub fn set_len(&mut self, len: usize) {
+        self.try_set_len(len)
+            .expect("vector length allocation failed");
+    }
+
+    /// Set the length (number of elements).
+    /// Used when manually populating the vector.
+    #[inline]
+    pub fn try_set_len(&mut self, len: usize) -> Result<()> {
         if self.vector_type == VectorType::Flat && self.buffer.element_size() > 0 {
             debug_assert!(len <= self.buffer.capacity(), "Length exceeds capacity");
         }
-        self.count = len;
         // Also need to resize validity mask if needed
         if len > self.validity.len() {
-            self.validity.resize(len);
+            self.validity.try_resize(len)?;
         }
+        self.count = len;
+        Ok(())
     }
 
     /// Check if value at index is null.
@@ -635,231 +709,16 @@ impl Vector {
 
     /// Set the null status of a value.
     pub fn set_null(&mut self, idx: usize, is_null: bool) {
-        if is_null {
-            self.validity_mut().set_null(idx);
-        } else {
-            self.validity_mut().set_valid(idx);
-        }
+        self.try_set_null(idx, is_null)
+            .expect("vector validity allocation failed");
     }
 
-    /// Copy a value from another vector at the given index.
-    ///
-    /// This is a single-value copy operation. Array values recurse into the
-    /// child vector so nested elements stay consistent.
-    pub fn copy_at(&mut self, idx: usize, source: &Vector, source_idx: usize) {
-        self.make_exclusive();
-        // Check for null - using logical index for both
-        if source.is_null(source_idx) {
-            self.set_null(idx, true);
-            return;
-        }
-
-        if matches!(
-            self.logical_type,
-            LogicalType::Varchar
-                | LogicalType::VarcharCollation(_)
-                | LogicalType::TsVector
-                | LogicalType::TsQuery
-                | LogicalType::Json
-                | LogicalType::Jsonb
-        ) {
-            if let Some(s) = source.get_string(source_idx) {
-                self.set_string(idx, s);
-            } else {
-                self.set_null(idx, true);
-            }
-            return;
-        }
-
-        if self.logical_type == LogicalType::Blob {
-            if let Some(b) = source.get_blob(source_idx) {
-                self.set_blob(idx, b);
-            } else {
-                self.set_null(idx, true);
-            }
-            return;
-        }
-
-        // Handle Array type - copy child elements
-        if let LogicalType::Array(_, array_size) = &self.logical_type {
-            let array_size = *array_size;
-            fn resolve_array_row(vector: &Vector, idx: usize) -> (&Vector, usize) {
-                match vector.vector_type {
-                    VectorType::Flat => (vector, idx),
-                    VectorType::Constant => (vector, 0),
-                    VectorType::Dictionary => {
-                        let child = vector
-                            .child
-                            .as_ref()
-                            .expect("Dictionary vector missing child");
-                        resolve_array_row(child, vector.selection.physical_index(idx))
-                    }
-                    VectorType::Sequence => {
-                        panic!("Sequence vectors cannot be Array type");
-                    }
-                }
-            }
-
-            let (src_base, src_idx) = resolve_array_row(source, source_idx);
-            if let (Some(dest_child), Some(src_child)) = (&mut self.child, src_base.child.as_ref())
-            {
-                let dest_child = Arc::make_mut(dest_child);
-                let dest_offset = idx * array_size;
-                let src_offset = src_idx * array_size;
-                for i in 0..array_size {
-                    dest_child.copy_at(dest_offset + i, src_child, src_offset + i);
-                }
-            }
-            self.set_null(idx, false);
-            return;
-        }
-
-        // Handle List type - append child elements and write list entry
-        if let LogicalType::List(_) = &self.logical_type {
-            fn resolve_list_row(vector: &Vector, idx: usize) -> (&Vector, usize) {
-                match vector.vector_type {
-                    VectorType::Flat => (vector, idx),
-                    VectorType::Constant => (vector, 0),
-                    VectorType::Dictionary => {
-                        let child = vector
-                            .child
-                            .as_ref()
-                            .expect("Dictionary vector missing child");
-                        resolve_list_row(child, vector.selection.physical_index(idx))
-                    }
-                    VectorType::Sequence => {
-                        panic!("Sequence vectors cannot be List type");
-                    }
-                }
-            }
-
-            fn read_list_entry(vector: &Vector, idx: usize) -> (usize, usize) {
-                let entry_base = unsafe { vector.flat_data::<u8>() };
-                let entry_ptr = unsafe { entry_base.add(idx * 8) as *const u32 };
-                let offset = unsafe { std::ptr::read_unaligned(entry_ptr) as usize };
-                let length = unsafe { std::ptr::read_unaligned(entry_ptr.add(1)) as usize };
-                (offset, length)
-            }
-
-            fn write_list_entry(vector: &mut Vector, idx: usize, offset: u32, length: u32) {
-                let entry_base = unsafe { vector.flat_data_mut::<u8>() };
-                let entry_ptr = unsafe { entry_base.add(idx * 8) as *mut u32 };
-                unsafe {
-                    std::ptr::write_unaligned(entry_ptr, offset);
-                    std::ptr::write_unaligned(entry_ptr.add(1), length);
-                }
-            }
-
-            let (src_base, src_idx) = resolve_list_row(source, source_idx);
-            let (src_offset, src_length) = read_list_entry(src_base, src_idx);
-            let src_child = src_base.child.as_ref().expect("List vector missing child");
-
-            let (dest_offset, dest_capacity, dest_allocator, old_child) = {
-                let child = self.child.as_ref().expect("List vector missing child");
-                (
-                    child.len(),
-                    child.buffer.capacity(),
-                    child.allocator().clone(),
-                    Arc::clone(child),
-                )
-            };
-
-            let needed = dest_offset + src_length;
-            if needed > dest_capacity {
-                let new_capacity = needed.max(dest_capacity.saturating_mul(2)).max(1);
-                let mut new_child =
-                    Vector::try_new(old_child.logical_type.clone(), new_capacity, dest_allocator)
-                        .expect("list child growth allocation failed");
-                new_child.set_count(dest_offset);
-                for i in 0..dest_offset {
-                    new_child.copy_at(i, &old_child, i);
-                }
-                self.child = Some(Arc::new(new_child));
-            }
-
-            let dest_child = Arc::make_mut(self.child.as_mut().expect("List vector missing child"));
-            // Ensure validity mask can address the appended range without bumping count.
-            dest_child.validity_mut().resize(needed);
-            for i in 0..src_length {
-                dest_child.copy_at(dest_offset + i, src_child, src_offset + i);
-            }
-            dest_child.set_count(dest_offset + src_length);
-
-            if dest_offset > u32::MAX as usize || src_length > u32::MAX as usize {
-                panic!("List entry exceeds u32 range");
-            }
-            write_list_entry(self, idx, dest_offset as u32, src_length as u32);
-            self.set_null(idx, false);
-            return;
-        }
-
-        // Handle Struct type - copy each field value
-        if let LogicalType::Struct(_fields) = &self.logical_type {
-            fn resolve_struct_row(vector: &Vector, idx: usize) -> (&Vector, usize) {
-                match vector.vector_type {
-                    VectorType::Flat => (vector, idx),
-                    VectorType::Constant => (vector, 0),
-                    VectorType::Dictionary => {
-                        let child = vector
-                            .child
-                            .as_ref()
-                            .expect("Dictionary vector missing child");
-                        resolve_struct_row(child, vector.selection.physical_index(idx))
-                    }
-                    VectorType::Sequence => {
-                        panic!("Sequence vectors cannot be Struct type");
-                    }
-                }
-            }
-
-            let (src_base, src_idx) = resolve_struct_row(source, source_idx);
-            let src_children = src_base.children().expect("Struct vector missing children");
-
-            if self.children.len() != src_children.len() {
-                panic!(
-                    "Struct child count mismatch: dest={}, src={}",
-                    self.children.len(),
-                    src_children.len()
-                );
-            }
-
-            for (dest_child, src_child) in self.children.iter_mut().zip(src_children.iter()) {
-                let dest_child = Arc::make_mut(dest_child);
-                dest_child.copy_at(idx, src_child, src_idx);
-            }
-
-            self.set_null(idx, false);
-            return;
-        }
-
-        self.set_null(idx, false);
-        let size = self.logical_type.type_size();
-        unsafe {
-            let dest_ptr = self.buffer.data().add(idx * size);
-
-            // Source could be Flat, Constant, or Dictionary; normalize access here.
-            match source.vector_type() {
-                VectorType::Flat => {
-                    let src_ptr = source.buffer.data().add(source_idx * size);
-                    std::ptr::copy_nonoverlapping(src_ptr, dest_ptr, size);
-                }
-                VectorType::Constant => {
-                    let src_ptr = source.buffer.data();
-                    std::ptr::copy_nonoverlapping(src_ptr, dest_ptr, size);
-                }
-                VectorType::Dictionary => {
-                    let child = source.child.as_ref().expect("Dictionary missing child");
-                    let physical_idx = source.selection.physical_index(source_idx);
-                    let src_ptr = child.buffer.data().add(physical_idx * size);
-                    std::ptr::copy_nonoverlapping(src_ptr, dest_ptr, size);
-                }
-                VectorType::Sequence => {
-                    // Sequence vectors only exist for i64.
-                    if let Some(val) = source.get_i64(source_idx) {
-                        *(dest_ptr as *mut i64) = val;
-                    }
-                }
-            }
+    /// Set the null status of a value.
+    pub fn try_set_null(&mut self, idx: usize, is_null: bool) -> Result<()> {
+        if is_null {
+            self.validity.try_set_null(idx)
+        } else {
+            self.validity.try_set_valid(idx)
         }
     }
 }

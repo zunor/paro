@@ -192,7 +192,7 @@ impl CteWorkingTable {
     /// Append a chunk to the working table.
     pub fn append(&self, chunk: &Chunk) -> Result<()> {
         let mut owned = chunk.clone();
-        owned.flatten();
+        owned.try_flatten()?;
         self.with_collection_mut(|collection| collection.append_chunk(&owned))
     }
 
@@ -672,7 +672,7 @@ impl PhysicalOperator for CteScan {
             &mut lstate.scan_state,
             chunk,
         )?;
-        chunk.flatten();
+        chunk.try_flatten()?;
         lstate.scan_state.clear();
 
         if chunk_idx + 1 >= gstate.storage_indexes.len() {

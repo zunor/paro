@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::allocator::{Allocator, ArenaAllocator, DefaultAllocator};
+use crate::error::Result;
 use crate::types::{InlineString, INLINE_LENGTH};
 
 /// Arena allocator for string data.
@@ -53,21 +54,37 @@ impl StringHeap {
     }
 
     /// Add a string to the heap, returning an `InlineString`.
+    #[cfg(test)]
     #[inline]
     pub fn add_string(&mut self, s: &str) -> InlineString {
-        self.add_blob(s.as_bytes())
+        self.try_add_string(s)
+            .expect("test string heap allocation failed")
+    }
+
+    /// Add a string to the heap, returning an `InlineString`.
+    #[inline]
+    pub fn try_add_string(&mut self, s: &str) -> Result<InlineString> {
+        self.try_add_blob(s.as_bytes())
+    }
+
+    /// Add bytes directly to the heap, returning an `InlineString`.
+    #[cfg(test)]
+    #[inline]
+    pub fn add_blob(&mut self, bytes: &[u8]) -> InlineString {
+        self.try_add_blob(bytes)
+            .expect("test string heap allocation failed")
     }
 
     /// Add bytes directly to the heap, returning an `InlineString`.
     #[inline]
-    pub fn add_blob(&mut self, bytes: &[u8]) -> InlineString {
+    pub fn try_add_blob(&mut self, bytes: &[u8]) -> Result<InlineString> {
         let len = bytes.len();
 
         if len <= INLINE_LENGTH {
-            return InlineString::from_bytes(bytes);
+            return Ok(InlineString::from_bytes(bytes));
         }
 
-        let result = self.empty_string(len);
+        let result = self.try_alloc_uninit(len)?;
 
         unsafe {
             let ptr = result.get_data() as *mut u8;
@@ -76,30 +93,28 @@ impl StringHeap {
 
         let mut result = result;
         result.finalize();
-        result
+        Ok(result)
     }
 
-    /// Allocate space for an empty string of the given length.
+    /// Allocate uninitialized out-of-line string storage of the given length.
     ///
     /// Returns an InlineString with uninitialized data. The caller must
     /// fill in the data and call `finalize()` on the result.
     ///
     /// # Panics
-    /// Panics if len <= INLINE_LENGTH (use InlineString::new directly for short strings).
+    /// Panics in debug builds if len <= INLINE_LENGTH (use InlineString::from_bytes
+    /// directly for short strings).
     #[inline]
-    pub fn empty_string(&mut self, len: usize) -> InlineString {
+    pub fn try_alloc_uninit(&mut self, len: usize) -> Result<InlineString> {
         debug_assert!(
             len > INLINE_LENGTH,
-            "empty_string should only be called for strings > {} bytes",
+            "try_alloc_uninit should only be called for strings > {} bytes",
             INLINE_LENGTH
         );
 
-        let ptr = self
-            .allocator
-            .allocate(len)
-            .expect("StringHeap allocation failed");
+        let ptr = self.allocator.allocate(len)?;
 
-        unsafe { InlineString::from_ptr(ptr, len as u32) }
+        Ok(unsafe { InlineString::from_ptr(ptr, len as u32) })
     }
 
     /// Total bytes used in the heap.
@@ -140,6 +155,34 @@ impl StringHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocator::{Allocator, DefaultAllocator};
+    use crate::error::{self as paro_error, Result};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FailingAllocator;
+
+    impl Allocator for FailingAllocator {
+        fn allocate(&self, size: usize) -> Result<*mut u8> {
+            Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )))
+        }
+
+        fn allocate_zeroed(&self, size: usize) -> Result<*mut u8> {
+            self.allocate(size)
+        }
+
+        fn free(&self, _ptr: *mut u8, _size: usize) {}
+
+        fn reallocate(&self, _ptr: *mut u8, _old_size: usize, new_size: usize) -> Result<*mut u8> {
+            self.allocate(new_size)
+        }
+
+        fn name(&self) -> &'static str {
+            "FailingAllocator"
+        }
+    }
 
     #[test]
     fn test_string_heap_new() {
@@ -207,12 +250,12 @@ mod tests {
     }
 
     #[test]
-    fn test_string_heap_empty_string() {
+    fn test_string_heap_try_alloc_uninit() {
         let mut heap = StringHeap::new();
 
-        // Allocate empty string of specific length
+        // Allocate uninitialized storage of specific length
         let len = 50;
-        let mut s = heap.empty_string(len);
+        let mut s = heap.try_alloc_uninit(len).unwrap();
 
         // Fill with data
         unsafe {
@@ -225,6 +268,38 @@ mod tests {
 
         assert_eq!(s.len(), len);
         assert_eq!(s.as_str(), "x".repeat(len));
+    }
+
+    #[test]
+    fn test_string_heap_try_add_short_string_no_allocation() {
+        let mut heap = StringHeap::with_allocator(0, Arc::new(FailingAllocator));
+
+        let s = heap.try_add_string("hello").unwrap();
+
+        assert!(s.is_inlined());
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_string_heap_try_add_long_string_propagates_error() {
+        let mut heap = StringHeap::with_allocator(0, Arc::new(FailingAllocator));
+
+        let err = heap
+            .try_add_string("this is a very long string that must allocate")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected allocation failure"));
+    }
+
+    #[test]
+    fn test_string_heap_try_add_blob_uses_allocator() {
+        let mut heap = StringHeap::with_allocator(0, Arc::new(DefaultAllocator::new()));
+
+        let data = b"this is a very long blob that exceeds inline length";
+        let blob = heap.try_add_blob(data).unwrap();
+
+        assert_eq!(blob.as_bytes(), data);
+        assert!(heap.size() > 0);
     }
 
     #[test]

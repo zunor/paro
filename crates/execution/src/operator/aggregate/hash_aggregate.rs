@@ -223,7 +223,7 @@ impl HashAggregate {
     fn build_groups_chunk(&self, payload: &Chunk) -> Result<Chunk> {
         if self.group_payload_refs.is_empty() {
             let mut groups = Chunk::try_init_empty(&[], payload.allocator().clone())?;
-            groups.set_cardinality(payload.size());
+            groups.try_set_cardinality(payload.size())?;
             return Ok(groups);
         }
 
@@ -237,7 +237,7 @@ impl HashAggregate {
             group_vectors.push(group_vector);
         }
         let mut groups = Chunk::from_arc_vectors(group_vectors, payload.allocator().clone());
-        groups.set_cardinality(payload.size());
+        groups.try_set_cardinality(payload.size())?;
         Ok(groups)
     }
 
@@ -321,11 +321,11 @@ impl HashAggregate {
     }
 
     fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> Result<SelectionVector> {
-        let filter_format = filter_vec.try_decode(row_count)?;
+        let filter_format = filter_vec.try_decode_ref(row_count)?;
         let filter_data = filter_format.get_data::<bool>();
         let mut selected_rows = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
-            let physical_idx = filter_format.sel().get(row_idx);
+            let physical_idx = filter_format.physical_index(row_idx);
             if !filter_format.validity().is_valid(physical_idx) {
                 continue;
             }
@@ -984,10 +984,10 @@ impl HashAggregate {
             selection.len(),
             addresses.allocator().clone(),
         )?;
-        selected.set_count(selection.len());
+        selected.try_set_count(selection.len())?;
         let selected_data = unsafe { selected.flat_data_mut::<*mut u8>() };
 
-        let address_format = addresses.try_decode(addresses.len())?;
+        let address_format = addresses.try_decode_ref(addresses.len())?;
         let address_data = address_format.get_data::<*mut u8>();
         for idx in 0..selection.len() {
             let row_idx = selection.get(idx);
@@ -997,7 +997,7 @@ impl HashAggregate {
                     addresses.len()
                 )));
             }
-            let physical_idx = address_format.sel().get(row_idx);
+            let physical_idx = address_format.physical_index(row_idx);
             if !address_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
                     "Address vector contains NULL at selected row {row_idx}"
@@ -2299,9 +2299,9 @@ mod tests {
         states: &Vector,
         count: usize,
     ) {
-        let input = inputs[0].decode(count);
+        let input = inputs[0].try_decode_ref(count).unwrap();
         let input_data = input.get_data::<i64>();
-        let state = states.decode(count);
+        let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         for row in 0..count {
             let input_row = input.sel().get(row);
@@ -2320,8 +2320,8 @@ mod tests {
         _input_data: &AggregateInputData,
         count: usize,
     ) {
-        let source_format = source.decode(count);
-        let target_format = target.decode(count);
+        let source_format = source.try_decode_ref(count).unwrap();
+        let target_format = target.try_decode_ref(count).unwrap();
         let source_data = source_format.get_data::<*mut u8>();
         let target_data = target_format.get_data::<*mut u8>();
         for row in 0..count {
@@ -2339,7 +2339,7 @@ mod tests {
         result: &mut Vector,
         count: usize,
     ) {
-        let state = states.decode(count);
+        let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         let result_data = result.flat_data_mut::<i64>();
         for row in 0..count {

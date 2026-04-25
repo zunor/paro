@@ -148,8 +148,8 @@ impl Vector {
             for (i, s) in values.iter().enumerate() {
                 match s {
                     Some(str_val) => {
-                        // add_string handles both short (inlined) and long (heap) strings
-                        *entries.add(i) = heap.add_string(str_val);
+                        // try_add_string handles both short (inlined) and long (heap) strings.
+                        *entries.add(i) = heap.try_add_string(str_val)?;
                     }
                     None => {
                         vec.validity.set_null(i);
@@ -186,8 +186,8 @@ impl Vector {
         unsafe {
             let entries = buffer.data() as *mut InlineString;
             for (i, s) in values.iter().enumerate() {
-                // add_string handles both short (inlined) and long (heap) strings
-                *entries.add(i) = heap.add_string(s);
+                // try_add_string handles both short (inlined) and long (heap) strings.
+                *entries.add(i) = heap.try_add_string(s)?;
             }
         }
 

@@ -119,14 +119,14 @@ impl PhysicalOperator for PhysicalExpressionScan {
                 count,
                 ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
             )?;
-            col_vector.set_count(count);
+            col_vector.try_set_count(count)?;
             for row_idx in 0..count {
                 let expr = &self.expressions[start_row + row_idx][col_idx];
                 // Each cell stores its own expression, so expression_scan compiles per cell.
                 let mut executor = ExpressionExecutor::new(expr);
                 let result_vector = executor.execute_expression(0, &dummy_chunk, None, 1, ctx)?;
                 // Copy value from result_vector(0) to col_vector(row_idx)
-                col_vector.copy_at(row_idx, &result_vector, 0);
+                col_vector.try_copy_at(row_idx, &result_vector, 0)?;
             }
             if col_idx < chunk.data.len() {
                 chunk.data[col_idx] = Arc::new(col_vector);
@@ -135,7 +135,7 @@ impl PhysicalOperator for PhysicalExpressionScan {
             }
         }
 
-        chunk.set_cardinality(count);
+        chunk.try_set_cardinality(count)?;
 
         // Always return HaveMoreOutput when we produced data
         // The caller will call us again and we'll return Finished then

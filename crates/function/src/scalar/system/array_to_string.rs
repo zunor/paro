@@ -237,7 +237,7 @@ fn array_to_string_impl_internal(
                 null_string,
             )?
         };
-        writer.write_str(i, &serialized);
+        writer.write_str(i, &serialized)?;
     }
 
     Ok(())

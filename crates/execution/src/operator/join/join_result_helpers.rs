@@ -46,7 +46,7 @@ pub fn construct_semi_join_result(
     result: &mut Chunk,
 ) -> Result<()> {
     project_columns(left, left_sel, left_projection_map, result, 0)?;
-    result.set_cardinality(count);
+    result.try_set_cardinality(count)?;
     Ok(())
 }
 
@@ -77,7 +77,7 @@ pub fn construct_left_outer_result(
             result.allocator().clone(),
         )?);
     }
-    result.set_cardinality(count);
+    result.try_set_cardinality(count)?;
     Ok(())
 }
 
@@ -103,15 +103,15 @@ pub fn construct_mark_join_result(
         match marker {
             Some(value) => {
                 marker_vec.set_value(idx, &Value::Boolean(*value));
-                marker_vec.set_null(idx, false);
+                marker_vec.try_set_null(idx, false)?;
             }
             None => {
                 marker_vec.set_value(idx, &Value::Boolean(false));
-                marker_vec.set_null(idx, true);
+                marker_vec.try_set_null(idx, true)?;
             }
         }
     }
-    result.set_cardinality(count);
+    result.try_set_cardinality(count)?;
     Ok(())
 }
 
@@ -137,7 +137,7 @@ pub fn construct_right_outer_scan_result(
         result,
         left_types.len(),
     )?;
-    result.set_cardinality(count);
+    result.try_set_cardinality(count)?;
     Ok(())
 }
 

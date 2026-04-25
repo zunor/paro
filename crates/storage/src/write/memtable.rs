@@ -502,7 +502,7 @@ impl MemTable {
             let dest_vec = target.column_mut(col_idx).ok_or_else(|| {
                 paro_error::internal("target column missing during memtable insert-time dedup")
             })?;
-            dest_vec.copy_at(target_row_idx, src_vec, source_row_idx);
+            dest_vec.try_copy_at(target_row_idx, src_vec, source_row_idx)?;
         }
         Ok(())
     }
@@ -513,7 +513,7 @@ impl MemTable {
             row_indices.len(),
             source.allocator().clone(),
         )?;
-        chunk.set_cardinality(row_indices.len());
+        chunk.try_set_cardinality(row_indices.len())?;
 
         for col_idx in 0..source.column_count() {
             let src_vec = source.column(col_idx).ok_or_else(|| {
@@ -523,7 +523,7 @@ impl MemTable {
                 paro_error::internal("target column missing during memtable row materialization")
             })?;
             for (new_row_idx, source_row_idx) in row_indices.iter().enumerate() {
-                dest_vec.copy_at(new_row_idx, src_vec, *source_row_idx as usize);
+                dest_vec.try_copy_at(new_row_idx, src_vec, *source_row_idx as usize)?;
             }
         }
 
