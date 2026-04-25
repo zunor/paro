@@ -3,8 +3,9 @@
 
 use super::Chunk;
 use crate::allocator::Allocator;
+use crate::error::Result;
 use crate::types::LogicalType;
-use crate::vector::{SelectionVector, Vector, VectorType};
+use crate::vector::{SelectionVector, Vector, VectorSelection, VectorType};
 use std::sync::Arc;
 
 impl Chunk {
@@ -63,9 +64,9 @@ impl Chunk {
         }
     }
 
-    fn ensure_capacity(&mut self, required_capacity: usize) {
+    fn try_ensure_capacity(&mut self, required_capacity: usize) -> Result<()> {
         if self.has_writable_capacity(required_capacity) {
-            return;
+            return Ok(());
         }
 
         let mut new_capacity = self.capacity.max(1);
@@ -74,20 +75,20 @@ impl Chunk {
         }
 
         let types = self.types();
-        let mut resized =
-            Chunk::initialize_with_allocator(&types, new_capacity, self.allocator.clone());
+        let mut resized = Chunk::try_initialize(&types, new_capacity, self.allocator.clone())?;
         resized.set_cardinality(self.count);
         Self::copy_rows(self, &mut resized, 0, 0, self.count);
 
         self.data = resized.data;
         self.capacity = new_capacity;
+        Ok(())
     }
 
-    fn reserve_for_append(&mut self, new_size: usize) {
-        self.ensure_capacity(new_size);
+    fn try_reserve_for_append(&mut self, new_size: usize) -> Result<()> {
+        self.try_ensure_capacity(new_size)
     }
 
-    pub fn reset(&mut self) {
+    pub fn try_reset(&mut self, allocator: Arc<dyn Allocator>) -> Result<()> {
         if let Some(reset_state) = &mut self.reset_state {
             debug_assert_eq!(
                 reset_state.columns.len(),
@@ -100,23 +101,25 @@ impl Chunk {
 
             for (col, state) in self.data.iter_mut().zip(reset_state.columns.iter_mut()) {
                 if let Some(vector) = Arc::get_mut(col) {
-                    state.reset_unique(vector);
+                    state.try_reset_unique(vector)?;
                 } else {
-                    *col = Arc::new(state.reset_shared());
+                    *col = Arc::new(state.try_reset_shared()?);
                 }
             }
-            return;
+            return Ok(());
         }
 
         self.count = 0;
+        self.allocator = allocator.clone();
         for col in &mut self.data {
             let logical_type = col.logical_type().clone();
-            *col = Arc::new(Vector::with_capacity_and_allocator(
+            *col = Arc::new(Vector::try_new(
                 logical_type,
                 self.capacity,
-                self.allocator.clone(),
-            ));
+                allocator.clone(),
+            )?);
         }
+        Ok(())
     }
 
     pub fn destroy(&mut self) {
@@ -189,7 +192,7 @@ impl Chunk {
         other.destroy();
     }
 
-    pub fn copy_to(&self, other: &mut Self, offset: usize) {
+    pub fn try_copy_to(&self, other: &mut Self, offset: usize) -> Result<()> {
         debug_assert_eq!(
             self.column_count(),
             other.column_count(),
@@ -198,19 +201,20 @@ impl Chunk {
         debug_assert!(other.count == 0, "Target chunk must be empty");
 
         let copy_count = self.count.saturating_sub(offset);
-        other.ensure_capacity(copy_count);
+        other.try_ensure_capacity(copy_count)?;
         other.set_cardinality(copy_count);
 
         if copy_count == 0 {
-            return;
+            return Ok(());
         }
 
         Self::copy_rows(self, other, offset, 0, copy_count);
+        Ok(())
     }
 
-    pub fn append(&mut self, other: &Self) {
+    pub fn try_append(&mut self, other: &Self) -> Result<()> {
         if other.is_empty() {
-            return;
+            return Ok(());
         }
         debug_assert_eq!(
             self.column_count(),
@@ -220,33 +224,46 @@ impl Chunk {
 
         let old_count = self.count;
         let new_size = self.count + other.count;
-        self.reserve_for_append(new_size);
+        self.try_reserve_for_append(new_size)?;
         self.set_cardinality(new_size);
         Self::copy_rows(other, self, 0, old_count, other.count);
+        Ok(())
     }
 
-    pub fn slice(&mut self, sel: &SelectionVector, count: usize) {
+    pub fn try_slice(&mut self, sel: &SelectionVector, count: usize) -> Result<()> {
         debug_assert!(count <= sel.len(), "Slice count exceeds selection length");
 
         let base_sel = if count == sel.len() {
             sel.clone()
         } else {
-            SelectionVector::from_indices(sel.as_slice()[..count].to_vec())
+            SelectionVector::try_from_indices(
+                sel.as_slice()[..count].to_vec(),
+                self.allocator.clone(),
+            )?
         };
 
         for col in &mut self.data {
-            *col = Arc::new(Vector::dictionary(Arc::clone(col), base_sel.clone()));
+            *col = Arc::new(Vector::try_gather_ref(Arc::clone(col), base_sel.clone())?);
         }
 
         self.set_cardinality(count);
+        Ok(())
     }
 
-    pub fn slice_range(&mut self, offset: usize, slice_count: usize) {
+    pub fn try_slice_range(&mut self, offset: usize, slice_count: usize) -> Result<()> {
         debug_assert!(offset + slice_count <= self.count, "Slice out of bounds");
-        let sel = SelectionVector::from_indices(
-            (offset..(offset + slice_count)).map(|i| i as u32).collect(),
-        );
-        self.slice(&sel, slice_count);
+        for col in &mut self.data {
+            *col = Arc::new(Vector::try_gather_ref(
+                Arc::clone(col),
+                VectorSelection::Range {
+                    offset,
+                    count: slice_count,
+                },
+            )?);
+        }
+
+        self.set_cardinality(slice_count);
+        Ok(())
     }
 
     pub fn split(&mut self, other: &mut Self, split_idx: usize) {
@@ -293,13 +310,13 @@ impl Chunk {
     ///
     /// This materializes all vectors and string heaps into the target allocator,
     /// ensuring the new chunk owns its buffers independently.
-    pub fn deep_copy_with_allocator(&self, allocator: Arc<dyn Allocator>) -> Self {
+    pub fn try_deep_copy(&self, allocator: Arc<dyn Allocator>) -> Result<Self> {
         if self.is_empty() {
-            return Chunk::initialize_with_allocator(&self.types(), 0, allocator);
+            return Chunk::try_initialize(&self.types(), 0, allocator);
         }
 
         let types = self.types();
-        let mut result = Chunk::initialize_with_allocator(&types, self.count, allocator);
+        let mut result = Chunk::try_initialize(&types, self.count, allocator)?;
         result.set_cardinality(self.count);
 
         for (col_idx, src_vec) in self.data.iter().enumerate() {
@@ -311,6 +328,6 @@ impl Chunk {
             }
         }
 
-        result
+        Ok(result)
     }
 }

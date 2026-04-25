@@ -80,7 +80,6 @@ mod tests {
     use crate::ExpressionState;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     struct MockState;
     impl ExpressionState for MockState {
@@ -103,12 +102,25 @@ mod tests {
         let mut set = ScalarFunctionSet::new("if".to_string());
         register_case_functions(&mut set);
 
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_nullable_bools(&[Some(true), Some(false), None]),
-            Vector::from_i32(&[1, 2, 3]),
-            Vector::from_i32(&[10, 20, 30]),
-        ]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_nullable_bool_vector(&[
+                    Some(true),
+                    Some(false),
+                    None,
+                ]),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2, 3],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20, 30],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         let func = set.functions[0].clone();
         func.dispatch

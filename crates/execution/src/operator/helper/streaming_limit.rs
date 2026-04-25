@@ -211,6 +211,7 @@ impl PhysicalOperator for StreamingLimit {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         let gstate = gstate
             .as_any()
@@ -259,14 +260,19 @@ impl PhysicalOperator for StreamingLimit {
 
                     // Create indices for the slice: [start, start+1, ..., start+count-1]
                     let indices: Vec<u32> = (start..(start + count)).map(|i| i as u32).collect();
+                    let selection = paro_common::vector::SelectionVector::try_from_indices(
+                        indices,
+                        input.allocator().clone(),
+                    )?;
 
                     let mut sliced_vectors = Vec::with_capacity(input.data.len());
                     for col in &input.data {
-                        let dict_vec = Vector::dictionary(Arc::clone(col), indices.clone());
+                        let dict_vec = Vector::try_dictionary(Arc::clone(col), &selection)?;
                         sliced_vectors.push(Arc::new(dict_vec));
                     }
 
-                    let mut sliced = Chunk::from_arc_vectors(sliced_vectors);
+                    let mut sliced =
+                        Chunk::from_arc_vectors(sliced_vectors, input.allocator().clone());
                     sliced.set_cardinality(count);
                     *chunk = sliced;
                 }
@@ -291,7 +297,7 @@ impl PhysicalOperator for StreamingLimit {
 mod tests {
     use super::*;
     use crate::thread_context::ThreadContext;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use std::sync::Arc;
 
@@ -312,11 +318,25 @@ mod tests {
             .get_global_operator_state()
             .expect("global operator state");
         let mut state = op.get_operator_state(&ctx).expect("operator state");
-        let input = Chunk::from_vectors(vec![Vector::from_i32(&[10, 20])]);
-        let mut output = Chunk::initialize(&[LogicalType::Integer], 2);
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
 
         let result = op
-            .execute(&ctx, &input, &mut output, gstate.as_ref(), state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("execute");
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);

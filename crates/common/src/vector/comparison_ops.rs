@@ -410,7 +410,12 @@ impl VectorOperations {
         let right_child = right.child().expect("Array vector missing child");
         let child_count = count * array_size;
 
-        let mut child_result = Vector::with_capacity(LogicalType::Boolean, child_count);
+        let mut child_result = Vector::try_new(
+            LogicalType::Boolean,
+            child_count,
+            result.allocator().clone(),
+        )
+        .expect("array comparison scratch allocation failed");
         match op {
             Comparison::Equal => {
                 Self::equals(left_child, right_child, &mut child_result, child_count)
@@ -568,15 +573,15 @@ mod tests {
     use crate::runtime_value::Value;
 
     fn create_bool_result(count: usize) -> Vector {
-        let mut v = Vector::with_capacity(LogicalType::Boolean, count);
+        let mut v = crate::test_utils::test_vector_with_capacity(LogicalType::Boolean, count);
         v.set_count(count);
         v
     }
 
     #[test]
     fn test_equals_flat_flat() {
-        let left = Vector::from_i32(&[1, 2, 3, 4]);
-        let right = Vector::from_i32(&[1, 3, 3, 5]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
+        let right = crate::test_utils::test_i32_vector(&[1, 3, 3, 5]);
         let mut result = create_bool_result(4);
 
         VectorOperations::equals(&left, &right, &mut result, 4);
@@ -589,8 +594,8 @@ mod tests {
 
     #[test]
     fn test_less_than_flat_flat() {
-        let left = Vector::from_i32(&[1, 2, 3, 4]);
-        let right = Vector::from_i32(&[2, 2, 2, 2]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
+        let right = crate::test_utils::test_i32_vector(&[2, 2, 2, 2]);
         let mut result = create_bool_result(4);
 
         VectorOperations::less_than(&left, &right, &mut result, 4);
@@ -603,8 +608,8 @@ mod tests {
 
     #[test]
     fn test_greater_than_equals_flat_flat() {
-        let left = Vector::from_i32(&[1, 2, 3, 4]);
-        let right = Vector::from_i32(&[2, 2, 2, 2]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
+        let right = crate::test_utils::test_i32_vector(&[2, 2, 2, 2]);
         let mut result = create_bool_result(4);
 
         VectorOperations::greater_than_equals(&left, &right, &mut result, 4);
@@ -617,10 +622,10 @@ mod tests {
 
     #[test]
     fn test_null_handling() {
-        let mut left = Vector::from_i32(&[1, 2, 3]);
+        let mut left = crate::test_utils::test_i32_vector(&[1, 2, 3]);
         left.validity_mut().set_null(1); // second element is NULL
 
-        let right = Vector::from_i32(&[1, 2, 3]);
+        let right = crate::test_utils::test_i32_vector(&[1, 2, 3]);
         let mut result = create_bool_result(3);
 
         VectorOperations::equals(&left, &right, &mut result, 3);
@@ -632,8 +637,8 @@ mod tests {
 
     #[test]
     fn test_constant_flat() {
-        let left = Vector::constant::<i32>(LogicalType::Integer, 10, 4);
-        let right = Vector::from_i32(&[5, 10, 15, 20]);
+        let left = crate::test_utils::test_constant::<i32>(LogicalType::Integer, 10, 4);
+        let right = crate::test_utils::test_i32_vector(&[5, 10, 15, 20]);
         let mut result = create_bool_result(4);
 
         VectorOperations::greater_than(&left, &right, &mut result, 4);
@@ -646,8 +651,8 @@ mod tests {
 
     #[test]
     fn test_bigint_comparison() {
-        let left = Vector::from_i64(&[100_000_000_000i64, 200_000_000_000i64]);
-        let right = Vector::from_i64(&[100_000_000_000i64, 100_000_000_000i64]);
+        let left = crate::test_utils::test_i64_vector(&[100_000_000_000i64, 200_000_000_000i64]);
+        let right = crate::test_utils::test_i64_vector(&[100_000_000_000i64, 100_000_000_000i64]);
         let mut result = create_bool_result(2);
 
         VectorOperations::equals(&left, &right, &mut result, 2);
@@ -658,8 +663,8 @@ mod tests {
 
     #[test]
     fn test_not_equals() {
-        let left = Vector::from_i32(&[1, 2, 3]);
-        let right = Vector::from_i32(&[1, 3, 3]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3]);
+        let right = crate::test_utils::test_i32_vector(&[1, 3, 3]);
         let mut result = create_bool_result(3);
 
         VectorOperations::not_equals(&left, &right, &mut result, 3);
@@ -671,8 +676,8 @@ mod tests {
 
     #[test]
     fn test_all_comparison_operators() {
-        let left = Vector::from_i32(&[5]);
-        let right = Vector::from_i32(&[3]);
+        let left = crate::test_utils::test_i32_vector(&[5]);
+        let right = crate::test_utils::test_i32_vector(&[3]);
 
         let mut result_eq = create_bool_result(1);
         let mut result_ne = create_bool_result(1);
@@ -700,8 +705,8 @@ mod tests {
 
     #[test]
     fn test_select_equals() {
-        let left = Vector::from_i32(&[1, 2, 3, 4, 5]);
-        let right = Vector::from_i32(&[1, 3, 3, 5, 5]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4, 5]);
+        let right = crate::test_utils::test_i32_vector(&[1, 3, 3, 5, 5]);
         let mut true_sel = Vec::new();
 
         let count = VectorOperations::select_equals(&left, &right, 5, &mut true_sel);
@@ -712,8 +717,8 @@ mod tests {
 
     #[test]
     fn test_select_less_than() {
-        let left = Vector::from_i32(&[1, 2, 3, 4]);
-        let right = Vector::from_i32(&[2, 2, 2, 2]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
+        let right = crate::test_utils::test_i32_vector(&[2, 2, 2, 2]);
         let mut true_sel = Vec::new();
 
         let count = VectorOperations::select_less_than(&left, &right, 4, &mut true_sel);
@@ -724,8 +729,8 @@ mod tests {
 
     #[test]
     fn test_select_greater_than_equals() {
-        let left = Vector::from_i32(&[1, 2, 3, 4]);
-        let right = Vector::from_i32(&[2, 2, 2, 2]);
+        let left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
+        let right = crate::test_utils::test_i32_vector(&[2, 2, 2, 2]);
         let mut true_sel = Vec::new();
 
         let count = VectorOperations::select_greater_than_equals(&left, &right, 4, &mut true_sel);
@@ -736,9 +741,9 @@ mod tests {
 
     #[test]
     fn test_select_with_null() {
-        let mut left = Vector::from_i32(&[1, 2, 3, 4]);
+        let mut left = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
         left.validity_mut().set_null(1); // second element is NULL
-        let right = Vector::from_i32(&[1, 2, 3, 4]);
+        let right = crate::test_utils::test_i32_vector(&[1, 2, 3, 4]);
         let mut true_sel = Vec::new();
 
         let count = VectorOperations::select_equals(&left, &right, 4, &mut true_sel);
@@ -750,8 +755,8 @@ mod tests {
 
     #[test]
     fn test_select_all_comparison_types() {
-        let left = Vector::from_i32(&[5, 5, 5]);
-        let right = Vector::from_i32(&[3, 5, 7]);
+        let left = crate::test_utils::test_i32_vector(&[5, 5, 5]);
+        let right = crate::test_utils::test_i32_vector(&[3, 5, 7]);
 
         let mut sel_eq = Vec::new();
         let mut sel_ne = Vec::new();
@@ -779,7 +784,7 @@ mod tests {
     fn test_equals_array() {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 3);
 
-        let mut v1 = Vector::new_array(array_type.clone(), 2);
+        let mut v1 = crate::test_utils::test_new_array(array_type.clone(), 2);
         v1.set_count(2);
         v1.set_value(
             0,
@@ -798,7 +803,7 @@ mod tests {
             ),
         );
 
-        let mut v2 = Vector::new_array(array_type.clone(), 2);
+        let mut v2 = crate::test_utils::test_new_array(array_type.clone(), 2);
         v2.set_count(2);
         v2.set_value(
             0,

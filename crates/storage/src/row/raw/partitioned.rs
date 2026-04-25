@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::{BufferPool, MemoryTag};
+use paro_common::allocator::{default_allocator, Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::SelectionVector;
@@ -57,8 +58,13 @@ impl PartitionedRawRowAppendState {
     pub fn new() -> Self {
         Self {
             partition_indices: Vec::new(),
-            partition_sel: SelectionVector::with_capacity(0),
-            reverse_partition_sel: SelectionVector::with_capacity(0),
+            partition_sel: SelectionVector::try_with_capacity(0, Arc::new(default_allocator()))
+                .expect("zero-capacity partition selection allocation failed"),
+            reverse_partition_sel: SelectionVector::try_with_capacity(
+                0,
+                Arc::new(default_allocator()),
+            )
+            .expect("zero-capacity reverse partition selection allocation failed"),
             fixed_partition_counts: Vec::new(),
             hash_partition_counts: HashMap::new(),
             partition_entries: Vec::new(),
@@ -165,6 +171,13 @@ pub struct PartitionedRawRow {
 }
 
 impl PartitionedRawRow {
+    pub(super) fn chunk_allocator(&self) -> Arc<dyn Allocator> {
+        Arc::new(BufferAllocator::new(
+            Arc::clone(&self.buffer_pool) as Arc<dyn BufferManager>,
+            self.tag,
+        ))
+    }
+
     fn make_partition_collection(
         buffer_pool: &Arc<BufferPool>,
         layout: &Arc<RawRowLayout>,
@@ -233,8 +246,10 @@ impl PartitionedRawRow {
     ) {
         state.partition_indices.clear();
         state.partition_entries.clear();
-        state.partition_sel = SelectionVector::with_capacity(0);
-        state.reverse_partition_sel = SelectionVector::with_capacity(0);
+        state.partition_sel = SelectionVector::try_with_capacity(0, self.chunk_allocator())
+            .expect("zero-capacity partition selection allocation failed");
+        state.reverse_partition_sel = SelectionVector::try_with_capacity(0, self.chunk_allocator())
+            .expect("zero-capacity reverse partition selection allocation failed");
         state.prepare_for_partition_count(self.partition_count());
 
         state.partition_append_states.clear();
@@ -253,7 +268,7 @@ impl PartitionedRawRow {
         state: &mut PartitionedRawRowAppendState,
         input: &Chunk,
     ) -> Result<()> {
-        let append_sel = SelectionVector::incremental(input.size());
+        let append_sel = SelectionVector::try_incremental(input.size(), input.allocator().clone())?;
         self.append_with_sel(state, input, &append_sel, input.size())
     }
 
@@ -291,7 +306,7 @@ impl PartitionedRawRow {
             }
         }
 
-        self.build_partition_sel(state, input.size(), append_sel, append_count);
+        self.build_partition_sel(state, input.size(), append_sel, append_count)?;
 
         if let Some(single_partition_idx) = state.single_partition_index() {
             let partition = &mut self.partitions[single_partition_idx];
@@ -343,7 +358,8 @@ impl PartitionedRawRow {
                 partition_sel_indices.push(state.partition_sel.get(write_offset) as u32);
             }
 
-            let partition_sel = SelectionVector::from_indices(partition_sel_indices);
+            let partition_sel =
+                SelectionVector::try_from_indices(partition_sel_indices, self.chunk_allocator())?;
             let partition = &mut self.partitions[*partition_idx];
             let partition_state = &mut state.partition_append_states[*partition_idx];
             let size_before = partition.size_in_bytes();
@@ -454,7 +470,7 @@ impl PartitionedRawRow {
         input_size: usize,
         append_sel: &SelectionVector,
         append_count: usize,
-    ) {
+    ) -> Result<()> {
         state.clear_partition_map(self.partition_count());
 
         for i in 0..append_count {
@@ -464,10 +480,12 @@ impl PartitionedRawRow {
 
         state.rebuild_partition_entries(self.partition_count());
 
-        state.partition_sel = SelectionVector::with_capacity(append_count);
+        state.partition_sel =
+            SelectionVector::try_with_capacity(append_count, self.chunk_allocator())?;
         state.partition_sel.set_len(append_count);
         let reverse_capacity = input_size.max(append_count);
-        state.reverse_partition_sel = SelectionVector::with_capacity(reverse_capacity);
+        state.reverse_partition_sel =
+            SelectionVector::try_with_capacity(reverse_capacity, self.chunk_allocator())?;
         state.reverse_partition_sel.set_len(reverse_capacity);
 
         let mut write_offsets = vec![0usize; self.partition_count()];
@@ -485,6 +503,7 @@ impl PartitionedRawRow {
                 state.reverse_partition_sel.set(source_idx, write_offset);
             }
         }
+        Ok(())
     }
 
     fn recompute_totals(&mut self) {
@@ -511,12 +530,12 @@ impl PartitionedRawRow {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use crate::buffer::{BufferPool, MemoryTag};
 
@@ -580,7 +599,7 @@ mod tests {
 
     fn build_chunk(start: i32, count: usize) -> Chunk {
         let ints: Vec<i32> = (start..start + count as i32).collect();
-        Chunk::from_vectors(vec![Vector::from_i32(&ints)])
+        test_chunk_from_vectors(vec![test_i32_vector(&ints)])
     }
 
     fn collect_keys_from_collection(
@@ -604,7 +623,7 @@ mod tests {
                 }
             }
 
-            let mut out = Chunk::initialize(types, count.max(1));
+            let mut out = test_chunk_with_capacity(types, count.max(1));
             gather_chunk(collection, &row_locations, &mut out, count);
             for row_idx in 0..count {
                 seen.push(out.column(0).unwrap().get_i32(row_idx).unwrap());

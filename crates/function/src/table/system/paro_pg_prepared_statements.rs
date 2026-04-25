@@ -96,6 +96,7 @@ fn init_global(
 }
 
 fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let Some(state) = input.global_state.and_then(|gs| {
         gs.as_any()
             .downcast_ref::<ParoPgPreparedStatementsGlobalState>()
@@ -124,22 +125,22 @@ fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableF
     let custom_plans: Vec<i64> = slice.iter().map(|row| row.custom_plans).collect();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&names);
+        *col = Vector::try_from_strings(&names, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_strings(&statements);
+        *col = Vector::try_from_strings(&statements, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_strings(&parameter_types);
+        *col = Vector::try_from_strings(&parameter_types, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
-        *col = Vector::from_bool(&from_sql);
+        *col = Vector::try_from_bool(&from_sql, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(4) {
-        *col = Vector::from_i64(&generic_plans);
+        *col = Vector::try_from_i64(&generic_plans, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(5) {
-        *col = Vector::from_i64(&custom_plans);
+        *col = Vector::try_from_i64(&custom_plans, output_allocator.clone())?;
     }
 
     output.set_cardinality(batch_size);

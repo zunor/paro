@@ -110,10 +110,11 @@ mod tests {
 
     #[test]
     fn test_current_schema_without_context() {
-        let mut chunk = Chunk::new();
+        let mut chunk = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         chunk.set_cardinality(1);
         let state = MockStateNoContext;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         current_schema_impl(&chunk, &state, &mut result).unwrap();
 
@@ -123,10 +124,11 @@ mod tests {
 
     #[test]
     fn test_current_schema_with_context() {
-        let mut chunk = Chunk::new();
+        let mut chunk = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         chunk.set_cardinality(1);
         let state = MockStateWithContext::new("myschema");
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         current_schema_impl(&chunk, &state, &mut result).unwrap();
 

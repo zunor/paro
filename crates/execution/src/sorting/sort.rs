@@ -5,13 +5,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::sort_key::{OrderModifiers, SortKeyEncoding};
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::Expression;
+use paro_storage::buffer::DEFAULT_BLOCK_SIZE;
 use paro_storage::meta::DEFAULT_SORT_PARTITION_SIZE;
 use paro_storage::row::{RowLayout, RowValidityType};
 
@@ -28,6 +33,34 @@ use super::sorted_run::{RunBuilder, SortedRun};
 use super::sorted_run_merger::{
     SortedRunMerger, SortedRunMergerGlobalState, SortedRunMergerLocalState,
 };
+use crate::memory_runtime::{OperatorExternalMemoryTracker, ReclaimStats, Reclaimer, SpillCost};
+
+const SORT_MEMORY_TAG: MemoryTag = MemoryTag::OrderBy;
+const SORT_MEMORY_CLASS: MemoryAccountingClass = MemoryAccountingClass::Revocable;
+const DEFAULT_SORT_RUN_TARGET_BYTES: usize = 64 * 1024 * 1024;
+
+fn sort_run_target_bytes(
+    query_max_memory: usize,
+    memory_limit: usize,
+    has_temporary_directory: bool,
+    num_threads: usize,
+    force_external: bool,
+) -> usize {
+    if force_external {
+        return 1;
+    }
+    if !has_temporary_directory {
+        return usize::MAX / 4;
+    }
+
+    let query_cap = query_max_memory.min(memory_limit);
+    let target = if query_cap >= usize::MAX / 8 {
+        DEFAULT_SORT_RUN_TARGET_BYTES
+    } else {
+        query_cap / num_threads.max(1)
+    };
+    target.max(DEFAULT_BLOCK_SIZE)
+}
 
 #[derive(Debug)]
 pub struct Sort {
@@ -164,7 +197,7 @@ impl Sort {
             .collect()
     }
 
-    fn prepare_output_chunk(&self, chunk: &mut Chunk) {
+    fn prepare_output_chunk(&self, chunk: &mut Chunk) -> Result<()> {
         let output_types = self.output_types();
         let chunk_types = chunk.types();
         let needs_reinit = chunk.column_count() != output_types.len()
@@ -173,39 +206,63 @@ impl Sort {
 
         if needs_reinit {
             let allocator = chunk.allocator().clone();
-            *chunk = Chunk::initialize_with_allocator(&output_types, VECTOR_SIZE, allocator);
+            *chunk = Chunk::try_initialize(&output_types, VECTOR_SIZE, allocator)?;
         } else {
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
         }
+        Ok(())
     }
 
     pub fn is_index_sort(&self) -> bool {
         self.is_index_sort
     }
 
-    pub fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        Ok(Box::new(SortLocalSinkState::new(self)))
+    pub fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        Ok(Box::new(SortLocalSinkState::new(
+            self,
+            ctx.allocator(MemoryTag::OrderBy),
+        )?))
     }
 
     pub fn get_global_sink_state(
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn GlobalSinkState>> {
-        let temp_memory_mgr = ctx.temporary_memory_manager();
-        let temp_memory_state = temp_memory_mgr.register();
-        let config = temp_memory_mgr.current_config();
-        let external = config.force_external;
-        if external && !config.has_temporary_directory {
+        let external = ctx.force_external();
+        let has_temporary_directory = ctx.has_temporary_directory();
+        if external && !has_temporary_directory {
             return Err(paro_error::out_of_memory(
                 "force_external requires a temporary directory (SET temp_directory)",
             ));
         }
 
-        Ok(Box::new(SortGlobalSinkState::new(
+        let memory_tracker = Arc::new(OperatorExternalMemoryTracker::new(
+            ctx.operator_memory_account(),
+            MemoryDomain::Host,
+            SORT_MEMORY_TAG,
+            SORT_MEMORY_CLASS,
+        ));
+        let gstate = SortGlobalSinkState::new(
             ctx.num_threads(),
-            temp_memory_state,
+            memory_tracker.clone(),
             external,
-        )))
+            has_temporary_directory,
+            sort_run_target_bytes(
+                ctx.query_max_memory(),
+                ctx.session.limits.max_memory,
+                has_temporary_directory,
+                ctx.num_threads().max(1),
+                external,
+            ),
+        );
+        let reclaimer: Arc<dyn Reclaimer> = Arc::new(SortRunReclaimer::new(
+            Arc::clone(&gstate.sorted_runs),
+            memory_tracker,
+            ctx.buffer_pool().clone(),
+            gstate.external.clone(),
+        ));
+        ctx.query_memory_pool().register_reclaimer(reclaimer);
+        Ok(Box::new(gstate))
     }
 
     pub fn sink(
@@ -226,11 +283,12 @@ impl Sort {
             .expect("invalid sort local sink state");
 
         if lstate.run_builder.is_none() {
-            lstate.run_builder = Some(RunBuilder::new(
+            lstate.run_builder = Some(RunBuilder::new_with_memory(
                 Arc::clone(ctx.buffer_pool()),
                 Arc::clone(&self.key_layout),
                 Arc::clone(&self.payload_layout),
                 Arc::clone(&self.sort_key_encoding),
+                gstate.memory_context(),
             ));
             gstate.update_local_state(lstate);
         }
@@ -257,25 +315,27 @@ impl Sort {
             return Ok(false);
         };
         let run_size = run_builder.size_in_bytes();
-        if let Some(state) = gstate.temporary_memory_state() {
-            state.set_remaining_size(run_size);
-        }
         if run_size < lstate.maximum_run_size {
             return Ok(true);
         }
 
-        if !gstate.try_increase_reservation(lstate) && lstate.external {
+        if gstate.has_temporary_directory {
+            lstate.external = true;
+        }
+        if lstate.external {
             gstate.mark_external();
             if let Some(run_builder) = lstate.run_builder.take() {
                 let run = run_builder.finish(true)?;
                 gstate.add_sorted_run(run);
             }
-            lstate.run_builder = Some(RunBuilder::new(
+            lstate.run_builder = Some(RunBuilder::new_with_memory(
                 Arc::clone(ctx.buffer_pool()),
                 Arc::clone(&self.key_layout),
                 Arc::clone(&self.payload_layout),
                 Arc::clone(&self.sort_key_encoding),
+                gstate.memory_context(),
             ));
+            gstate.update_local_state(lstate);
             return Ok(true);
         }
 
@@ -356,10 +416,7 @@ impl Sort {
         let count = *gstate.total_count.lock().unwrap();
         let external = gstate.is_external();
         let partition_size = *gstate.partition_size.lock().unwrap();
-        let temporary_memory_state = gstate.take_temporary_memory_state();
-        if let Some(state) = temporary_memory_state.as_ref() {
-            state.set_zero();
-        }
+        let memory_tracker = gstate.take_memory_tracker();
 
         let mut merger = None;
         let mut merger_gstate = None;
@@ -398,7 +455,7 @@ impl Sort {
             merger,
             merger_gstate,
             count,
-            temporary_memory_state,
+            memory_tracker,
         )))
     }
 
@@ -416,7 +473,7 @@ impl Sort {
             .expect("invalid sort global source state");
 
         if gstate.total_count() == 0 {
-            gstate.release_temporary_memory_state();
+            gstate.release_memory_tracker();
             return Ok(SourceResultType::Finished);
         }
 
@@ -425,7 +482,7 @@ impl Sort {
                 .as_any_mut()
                 .downcast_mut::<SortLocalSourceState>()
                 .expect("invalid sort local source state");
-            self.prepare_output_chunk(chunk);
+            self.prepare_output_chunk(chunk)?;
             single_run.scan(
                 chunk,
                 lstate.current_position,
@@ -433,7 +490,7 @@ impl Sort {
             )?;
             lstate.current_position += chunk.size();
             if lstate.current_position >= gstate.total_count() {
-                gstate.release_temporary_memory_state();
+                gstate.release_memory_tracker();
                 return Ok(SourceResultType::Finished);
             }
             return Ok(SourceResultType::HaveMoreOutput);
@@ -444,10 +501,10 @@ impl Sort {
                 .as_any_mut()
                 .downcast_mut::<SortLocalSourceState>()
                 .expect("invalid sort local source state");
-            self.prepare_output_chunk(chunk);
+            self.prepare_output_chunk(chunk)?;
             let result = merger.get_data(chunk, &merger_gstate, &mut lstate.merger_lstate)?;
             if result == SourceResultType::Finished {
-                gstate.release_temporary_memory_state();
+                gstate.release_memory_tracker();
             }
             return Ok(result);
         }
@@ -467,14 +524,14 @@ pub struct SortLocalSinkState {
 }
 
 impl SortLocalSinkState {
-    pub fn new(sort: &Sort) -> Self {
-        Self {
+    pub fn new(sort: &Sort, allocator: Arc<dyn paro_common::allocator::Allocator>) -> Result<Self> {
+        Ok(Self {
             run_builder: None,
             maximum_run_size: 0,
             external: false,
-            key_chunk: Chunk::init_empty(sort.key_layout.types()),
-            payload_chunk: Chunk::init_empty(sort.payload_layout.types()),
-        }
+            key_chunk: Chunk::try_init_empty(sort.key_layout.types(), allocator.clone())?,
+            payload_chunk: Chunk::try_init_empty(sort.payload_layout.types(), allocator)?,
+        })
     }
 }
 
@@ -491,10 +548,12 @@ impl LocalSinkState for SortLocalSinkState {
 pub struct SortGlobalSinkState {
     sorted_runs: Arc<Mutex<Vec<SortedRun>>>,
     sorted_tuples: Mutex<usize>,
-    external: AtomicBool,
+    external: Arc<AtomicBool>,
     any_combined: AtomicBool,
-    temporary_memory_state: Mutex<Option<Arc<paro_storage::buffer::TemporaryMemoryState>>>,
+    memory_tracker: Mutex<Option<Arc<OperatorExternalMemoryTracker>>>,
+    has_temporary_directory: bool,
     num_threads: usize,
+    run_target_bytes: usize,
     pub(crate) total_count: Mutex<usize>,
     pub(crate) partition_size: Mutex<usize>,
 }
@@ -511,44 +570,58 @@ impl std::fmt::Debug for SortGlobalSinkState {
 impl SortGlobalSinkState {
     pub fn new(
         num_threads: usize,
-        temporary_memory_state: Arc<paro_storage::buffer::TemporaryMemoryState>,
+        memory_tracker: Arc<OperatorExternalMemoryTracker>,
         external: bool,
+        has_temporary_directory: bool,
+        run_target_bytes: usize,
     ) -> Self {
         Self {
             sorted_runs: Arc::new(Mutex::new(Vec::new())),
             sorted_tuples: Mutex::new(0),
-            external: AtomicBool::new(external),
+            external: Arc::new(AtomicBool::new(external)),
             any_combined: AtomicBool::new(false),
-            temporary_memory_state: Mutex::new(Some(temporary_memory_state)),
+            memory_tracker: Mutex::new(Some(memory_tracker)),
+            has_temporary_directory,
             num_threads,
+            run_target_bytes,
             total_count: Mutex::new(0),
             partition_size: Mutex::new(DEFAULT_SORT_PARTITION_SIZE),
         }
     }
 
-    fn temporary_memory_state(&self) -> Option<Arc<paro_storage::buffer::TemporaryMemoryState>> {
-        self.temporary_memory_state
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
+    fn memory_tracker(&self) -> Option<Arc<OperatorExternalMemoryTracker>> {
+        self.memory_tracker.lock().unwrap().as_ref().map(Arc::clone)
     }
 
-    fn take_temporary_memory_state(
-        &self,
-    ) -> Option<Arc<paro_storage::buffer::TemporaryMemoryState>> {
-        self.temporary_memory_state.lock().unwrap().take()
+    fn take_memory_tracker(&self) -> Option<Arc<OperatorExternalMemoryTracker>> {
+        self.memory_tracker.lock().unwrap().take()
+    }
+
+    pub(crate) fn memory_context(&self) -> MemoryAccountingContext {
+        self.memory_tracker()
+            .map(|tracker| {
+                let owner: Arc<dyn MemoryOwner> = tracker;
+                MemoryAccountingContext::from_owner(
+                    owner,
+                    MemoryDomain::Host,
+                    SORT_MEMORY_TAG,
+                    SORT_MEMORY_CLASS,
+                )
+            })
+            .unwrap_or_else(|| {
+                MemoryAccountingContext::detached(SORT_MEMORY_TAG, SORT_MEMORY_CLASS)
+            })
     }
 
     pub fn current_reservation(&self) -> usize {
-        self.temporary_memory_state()
-            .map(|state| state.get_reservation())
+        self.memory_tracker()
+            .and_then(|tracker| tracker.reservation_bytes().ok())
             .unwrap_or(0)
     }
 
     pub fn peak_reservation(&self) -> usize {
-        self.temporary_memory_state()
-            .map(|state| state.get_peak_reservation())
+        self.memory_tracker()
+            .and_then(|tracker| tracker.peak_bytes().ok())
             .unwrap_or(0)
     }
 
@@ -565,47 +638,8 @@ impl SortGlobalSinkState {
     }
 
     pub fn update_local_state(&self, lstate: &mut SortLocalSinkState) {
-        let reservation = self.current_reservation();
-        lstate.maximum_run_size = if self.num_threads > 0 {
-            reservation / self.num_threads
-        } else {
-            reservation
-        };
+        lstate.maximum_run_size = self.run_target_bytes;
         lstate.external = self.is_external();
-    }
-
-    pub fn try_increase_reservation(&self, lstate: &mut SortLocalSinkState) -> bool {
-        if lstate.external || self.is_external() {
-            lstate.external = true;
-            self.mark_external();
-            return false;
-        }
-
-        let Some(temp_state) = self.temporary_memory_state() else {
-            lstate.external = true;
-            self.mark_external();
-            return false;
-        };
-
-        if temp_state.get_reservation() < temp_state.get_remaining_size() {
-            if !self.any_combined() {
-                lstate.external = true;
-                self.mark_external();
-            }
-            return false;
-        }
-
-        let mut request = temp_state.get_remaining_size().saturating_mul(2);
-        if request == 0 {
-            request = 1;
-        }
-        temp_state.set_remaining_size_and_update_reservation(request);
-        let got_enough = temp_state.get_reservation() >= temp_state.get_remaining_size();
-        if !got_enough && !self.any_combined() {
-            lstate.external = true;
-            self.mark_external();
-        }
-        got_enough
     }
 
     pub fn add_sorted_run(&self, run: SortedRun) {
@@ -620,6 +654,108 @@ impl SortGlobalSinkState {
 
     pub fn set_any_combined(&self) {
         self.any_combined.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct SortRunReclaimer {
+    name: String,
+    sorted_runs: Arc<Mutex<Vec<SortedRun>>>,
+    memory_tracker: Arc<OperatorExternalMemoryTracker>,
+    buffer_pool: Arc<paro_storage::buffer::BufferPool>,
+    external: Arc<AtomicBool>,
+}
+
+impl SortRunReclaimer {
+    fn new(
+        sorted_runs: Arc<Mutex<Vec<SortedRun>>>,
+        memory_tracker: Arc<OperatorExternalMemoryTracker>,
+        buffer_pool: Arc<paro_storage::buffer::BufferPool>,
+        external: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            name: "sort_runs".to_string(),
+            sorted_runs,
+            memory_tracker,
+            buffer_pool,
+            external,
+        }
+    }
+
+    fn memory_context(&self) -> MemoryAccountingContext {
+        let owner: Arc<dyn MemoryOwner> = self.memory_tracker.clone();
+        MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            SORT_MEMORY_TAG,
+            SORT_MEMORY_CLASS,
+        )
+    }
+}
+
+impl Reclaimer for SortRunReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        let completed_run_bytes = self
+            .sorted_runs
+            .lock()
+            .map(|runs| runs.iter().map(SortedRun::size_in_bytes).sum::<usize>())
+            .unwrap_or(0);
+        completed_run_bytes.min(self.memory_tracker.accounted_bytes().unwrap_or(0))
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> paro_common::memory::MemoryResult<ReclaimStats> {
+        if target_bytes == 0 {
+            return Ok(ReclaimStats::empty(0));
+        }
+
+        self.external.store(true, Ordering::Release);
+
+        let reclaimable = self.reclaimable_bytes();
+        let target_bytes = target_bytes.min(reclaimable);
+        if target_bytes == 0 {
+            return Ok(ReclaimStats::empty(0));
+        }
+
+        let mut externalized_bytes = 0usize;
+        let memory = self.memory_context();
+        let mut runs = self.sorted_runs.lock().unwrap();
+        if runs.iter().any(|run| !run.is_external()) {
+            let old_runs = std::mem::take(&mut *runs);
+            let mut new_runs = Vec::with_capacity(old_runs.len());
+            for run in old_runs {
+                if externalized_bytes >= target_bytes || run.is_external() {
+                    new_runs.push(run);
+                    continue;
+                }
+                let before = run.size_in_bytes();
+                let (external_run, reclaimed) = run
+                    .into_external(self.buffer_pool.clone(), memory.clone())
+                    .map_err(|err| {
+                        paro_common::memory::MemoryError::reclaim_failed(err.to_string())
+                    })?;
+                externalized_bytes = externalized_bytes
+                    .saturating_add(reclaimed)
+                    .saturating_add(before.saturating_sub(external_run.size_in_bytes()));
+                new_runs.push(external_run);
+            }
+            *runs = new_runs;
+        }
+        drop(runs);
+
+        let released = self.memory_tracker.reclaim_accounted_bytes(target_bytes)?;
+        Ok(ReclaimStats::new(
+            target_bytes,
+            released.max(externalized_bytes),
+            released,
+        ))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
     }
 }
 
@@ -668,7 +804,7 @@ pub struct SortGlobalSourceState {
     pub(crate) merger: Option<Arc<SortedRunMerger>>,
     pub(crate) merger_gstate: Option<Arc<SortedRunMergerGlobalState>>,
     pub(crate) total_count: usize,
-    temporary_memory_state: Mutex<Option<Arc<paro_storage::buffer::TemporaryMemoryState>>>,
+    memory_tracker: Mutex<Option<Arc<OperatorExternalMemoryTracker>>>,
 }
 
 impl SortGlobalSourceState {
@@ -677,14 +813,14 @@ impl SortGlobalSourceState {
         merger: Option<Arc<SortedRunMerger>>,
         merger_gstate: Option<Arc<SortedRunMergerGlobalState>>,
         total_count: usize,
-        temporary_memory_state: Option<Arc<paro_storage::buffer::TemporaryMemoryState>>,
+        memory_tracker: Option<Arc<OperatorExternalMemoryTracker>>,
     ) -> Self {
         Self {
             single_run,
             merger,
             merger_gstate,
             total_count,
-            temporary_memory_state: Mutex::new(temporary_memory_state),
+            memory_tracker: Mutex::new(memory_tracker),
         }
     }
 
@@ -704,18 +840,14 @@ impl SortGlobalSourceState {
         self.total_count
     }
 
-    fn release_temporary_memory_state(&self) {
-        if let Some(state) = self.temporary_memory_state.lock().unwrap().take() {
-            state.set_zero();
-        }
+    fn release_memory_tracker(&self) {
+        let _ = self.memory_tracker.lock().unwrap().take();
     }
 }
 
 impl Drop for SortGlobalSourceState {
     fn drop(&mut self) {
-        if let Some(state) = self.temporary_memory_state.get_mut().unwrap().take() {
-            state.set_zero();
-        }
+        let _ = self.memory_tracker.get_mut().unwrap().take();
     }
 }
 
@@ -752,7 +884,7 @@ fn build_key_chunk(chunk: &Chunk, orders: &[OrderByNode]) -> Chunk {
             }
         }
     }
-    Chunk::from_arc_vectors(vectors)
+    Chunk::from_arc_vectors(vectors, chunk.allocator().clone())
 }
 
 fn build_payload_chunk(chunk: &Chunk, projection_map: &[usize]) -> Chunk {
@@ -760,5 +892,5 @@ fn build_payload_chunk(chunk: &Chunk, projection_map: &[usize]) -> Chunk {
         .iter()
         .filter_map(|&column_idx| chunk.column(column_idx).map(Arc::clone))
         .collect::<Vec<_>>();
-    Chunk::from_arc_vectors(vectors)
+    Chunk::from_arc_vectors(vectors, chunk.allocator().clone())
 }

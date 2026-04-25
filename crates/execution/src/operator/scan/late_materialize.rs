@@ -3,9 +3,6 @@
 
 //! Late materialization planning and budget checks.
 
-use std::sync::Arc;
-
-use paro_storage::buffer::TemporaryMemoryState;
 use paro_storage::index::{collect_predicate_columns, ColumnId, PredicateTree};
 use paro_storage::tablet::ColumnProjection;
 
@@ -30,31 +27,24 @@ pub fn plan_late_materialization(
     predicate_tree: Option<&PredicateTree>,
     projection: &ColumnProjection,
     batch_size: usize,
-    state: &Arc<TemporaryMemoryState>,
 ) -> LateMaterializePlan {
     if predicate_tree.is_none() || projection.read_columns().is_empty() {
-        state.set_zero();
         return LateMaterializePlan::disabled();
     }
 
     let tree = predicate_tree.expect("predicate_tree checked");
     let predicate_columns = collect_predicate_columns(tree);
     if predicate_columns.is_empty() {
-        state.set_zero();
         return LateMaterializePlan::disabled();
     }
 
     let required_bytes = estimate_required_bytes(batch_size);
     if required_bytes == 0 {
-        state.set_zero();
         return LateMaterializePlan::disabled();
     }
 
-    state.set_remaining_size_and_update_reservation(required_bytes);
-    let enabled = state.get_reservation() >= required_bytes;
-
     LateMaterializePlan {
-        enabled,
+        enabled: true,
         predicate_columns,
         required_bytes,
     }

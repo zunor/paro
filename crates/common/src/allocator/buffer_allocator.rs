@@ -7,7 +7,7 @@
 //! memory without depending on storage-layer types directly.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[cfg(debug_assertions)]
@@ -16,7 +16,9 @@ use super::Allocator;
 use crate::error::Result;
 
 /// Number of memory tags (must match MemoryTag enum variants).
-pub const MEMORY_TAG_COUNT: usize = 20;
+pub const MEMORY_TAG_COUNT: usize = 21;
+
+static ALLOCATOR_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Memory tag for tracking allocation purposes.
 ///
@@ -67,6 +69,8 @@ pub enum MemoryTag {
     Wal = 18,
     /// MemTable/write-buffer working set
     MemTable = 19,
+    /// Host-side buffers owned by external runtimes and IPC bridges
+    ExternalRuntimeHost = 20,
 }
 
 impl MemoryTag {
@@ -93,6 +97,7 @@ impl MemoryTag {
             MemoryTag::VectorIndex => "VECTOR_INDEX",
             MemoryTag::Wal => "WAL",
             MemoryTag::MemTable => "MEM_TABLE",
+            MemoryTag::ExternalRuntimeHost => "EXTERNAL_RUNTIME_HOST",
         }
     }
 
@@ -119,6 +124,7 @@ impl MemoryTag {
             MemoryTag::VectorIndex,
             MemoryTag::Wal,
             MemoryTag::MemTable,
+            MemoryTag::ExternalRuntimeHost,
         ]
     }
 
@@ -151,9 +157,27 @@ impl MemoryTag {
             17 => Some(MemoryTag::VectorIndex),
             18 => Some(MemoryTag::Wal),
             19 => Some(MemoryTag::MemTable),
+            20 => Some(MemoryTag::ExternalRuntimeHost),
             _ => None,
         }
     }
+}
+
+/// Number of lock acquisitions taken by `BufferAllocator` tracking maps.
+#[inline]
+pub fn allocator_lock_count() -> u64 {
+    ALLOCATOR_LOCK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset allocator lock instrumentation for focused tests and benchmarks.
+#[inline]
+pub fn reset_allocator_lock_count() {
+    ALLOCATOR_LOCK_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_allocator_lock() {
+    ALLOCATOR_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 impl std::fmt::Display for MemoryTag {
@@ -198,6 +222,34 @@ impl MemoryUsage {
         let size = size as i64;
         self.usage_per_tag[tag.as_index()].fetch_sub(size, Ordering::AcqRel);
         self.total_usage.fetch_sub(size, Ordering::AcqRel);
+    }
+
+    /// Saturating subtract for best-effort concurrent resident accounting paths.
+    ///
+    /// Returns the number of bytes that were actually removed from the tag.
+    #[inline]
+    pub fn sub_saturating(&self, tag: MemoryTag, size: usize) -> usize {
+        if size == 0 {
+            return 0;
+        }
+
+        let slot = &self.usage_per_tag[tag.as_index()];
+        let mut current = slot.load(Ordering::Acquire);
+        loop {
+            if current <= 0 {
+                return 0;
+            }
+
+            let actual = (current as usize).min(size);
+            let next = current - actual as i64;
+            match slot.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.total_usage.fetch_sub(actual as i64, Ordering::AcqRel);
+                    return actual;
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Get memory usage for a specific tag.
@@ -402,11 +454,13 @@ impl BufferAllocator {
 
     /// Get the number of active allocations.
     pub fn allocation_count(&self) -> usize {
+        record_allocator_lock();
         self.allocations.read().unwrap().len()
     }
 
     /// Get the total allocated size.
     pub fn allocated_size(&self) -> usize {
+        record_allocator_lock();
         self.allocations
             .read()
             .unwrap()
@@ -425,6 +479,7 @@ impl Allocator for BufferAllocator {
         let ptr = self.manager.allocate(self.tag, size)?;
 
         // Track the allocation
+        record_allocator_lock();
         let mut allocations = self.allocations.write().unwrap();
         allocations.insert(
             ptr as usize,
@@ -458,6 +513,7 @@ impl Allocator for BufferAllocator {
 
         // Remove from tracking
         let entry = {
+            record_allocator_lock();
             let mut allocations = self.allocations.write().unwrap();
             allocations.remove(&(ptr as usize))
         };
@@ -484,6 +540,7 @@ impl Allocator for BufferAllocator {
 
         // Get the actual old size from tracking
         let actual_old_size = {
+            record_allocator_lock();
             let allocations = self.allocations.read().unwrap();
             allocations
                 .get(&(ptr as usize))
@@ -501,6 +558,7 @@ impl Allocator for BufferAllocator {
 
         // Update tracking
         {
+            record_allocator_lock();
             let mut allocations = self.allocations.write().unwrap();
             allocations.remove(&(ptr as usize));
             allocations.insert(
@@ -627,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_memory_tag_count() {
-        assert_eq!(MEMORY_TAG_COUNT, 20);
+        assert_eq!(MEMORY_TAG_COUNT, 21);
         assert_eq!(MemoryTag::all().len(), MEMORY_TAG_COUNT);
     }
 
@@ -637,6 +695,7 @@ mod tests {
         assert_eq!(MemoryTag::HashTable.as_index(), 1);
         assert_eq!(MemoryTag::Window.as_index(), 14);
         assert_eq!(MemoryTag::MemTable.as_index(), 19);
+        assert_eq!(MemoryTag::ExternalRuntimeHost.as_index(), 20);
     }
 
     #[test]
@@ -645,7 +704,11 @@ mod tests {
         assert_eq!(MemoryTag::from_index(14), Some(MemoryTag::Window));
         assert_eq!(MemoryTag::from_index(15), Some(MemoryTag::PageCache));
         assert_eq!(MemoryTag::from_index(19), Some(MemoryTag::MemTable));
-        assert_eq!(MemoryTag::from_index(20), None);
+        assert_eq!(
+            MemoryTag::from_index(20),
+            Some(MemoryTag::ExternalRuntimeHost)
+        );
+        assert_eq!(MemoryTag::from_index(21), None);
         assert_eq!(MemoryTag::from_index(100), None);
     }
 

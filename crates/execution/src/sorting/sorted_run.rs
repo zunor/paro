@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::{BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{GrantAllocator, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::sort_key::SortKeyEncoding;
 use paro_common::vector::VECTOR_SIZE;
 use paro_storage::buffer::{BufferPool, MemoryTag};
@@ -22,6 +24,7 @@ pub struct RunBuilder {
     buffer_pool: Arc<BufferPool>,
     key_layout: Arc<RowLayout>,
     payload_layout: Arc<RowLayout>,
+    memory: MemoryAccountingContext,
     key_store: SortKeyStore,
     key_rows: RowStoreBuilder,
     payload_rows: Option<RowStoreBuilder>,
@@ -84,17 +87,51 @@ impl RunBuilder {
         payload_layout: Arc<RowLayout>,
         encoding: Arc<SortKeyEncoding>,
     ) -> Self {
-        let key_store = SortKeyStore::new(Arc::clone(&buffer_pool), Arc::clone(&encoding));
-        let key_rows = RowStoreBuilder::new(
+        let memory =
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
+        Self::new_with_memory(buffer_pool, key_layout, payload_layout, encoding, memory)
+    }
+
+    pub fn new_with_grant_allocator(
+        buffer_pool: Arc<BufferPool>,
+        key_layout: Arc<RowLayout>,
+        payload_layout: Arc<RowLayout>,
+        encoding: Arc<SortKeyEncoding>,
+        grant_allocator: GrantAllocator<'_>,
+    ) -> Self {
+        Self::new_with_memory(
+            buffer_pool,
+            key_layout,
+            payload_layout,
+            encoding,
+            MemoryAccountingContext::from_grant_allocator(&grant_allocator),
+        )
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        key_layout: Arc<RowLayout>,
+        payload_layout: Arc<RowLayout>,
+        encoding: Arc<SortKeyEncoding>,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        let key_store = SortKeyStore::new_with_memory(
+            Arc::clone(&buffer_pool),
+            Arc::clone(&encoding),
+            memory.clone(),
+        );
+        let key_rows = RowStoreBuilder::new_with_memory(
             Arc::clone(&buffer_pool),
             Arc::clone(&key_layout),
             MemoryTag::OrderBy,
+            memory.clone(),
         );
         let payload_rows = (payload_layout.column_count() > 0).then(|| {
-            RowStoreBuilder::new(
+            RowStoreBuilder::new_with_memory(
                 Arc::clone(&buffer_pool),
                 Arc::clone(&payload_layout),
                 MemoryTag::OrderBy,
+                memory.clone(),
             )
         });
 
@@ -102,6 +139,7 @@ impl RunBuilder {
             buffer_pool,
             key_layout,
             payload_layout,
+            memory,
             key_store,
             key_rows,
             payload_rows,
@@ -178,12 +216,23 @@ impl RunBuilder {
 
         let storage = if external {
             let reordered_key_store = self.key_store.reorder_by_permutation(&permutation)?;
-            let reordered_key_rows =
-                reorder_row_store(Arc::clone(&self.buffer_pool), &key_rows, &permutation)?
-                    .into_prefix_releasable();
+            let reordered_key_rows = reorder_row_store(
+                Arc::clone(&self.buffer_pool),
+                self.memory.clone(),
+                &key_rows,
+                &permutation,
+            )?
+            .into_prefix_releasable();
             let reordered_payload_rows = payload_rows
                 .as_ref()
-                .map(|rows| reorder_row_store(Arc::clone(&self.buffer_pool), rows, &permutation))
+                .map(|rows| {
+                    reorder_row_store(
+                        Arc::clone(&self.buffer_pool),
+                        self.memory.clone(),
+                        rows,
+                        &permutation,
+                    )
+                })
                 .transpose()?
                 .map(RowStore::into_prefix_releasable);
             RunStorage::External {
@@ -215,6 +264,111 @@ impl SortedRun {
     #[inline]
     pub fn count(&self) -> usize {
         self.count as usize
+    }
+
+    #[inline]
+    pub fn size_in_bytes(&self) -> usize {
+        match &self.storage {
+            RunStorage::InMemory {
+                key_store,
+                key_rows,
+                payload_rows,
+                permutation,
+                ..
+            } => key_store
+                .size_in_bytes()
+                .saturating_add(key_rows.size_in_bytes())
+                .saturating_add(
+                    payload_rows
+                        .as_ref()
+                        .map(RowStore::size_in_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(permutation.capacity() * std::mem::size_of::<u32>()),
+            RunStorage::External {
+                key_store,
+                key_rows,
+                payload_rows,
+            } => key_store
+                .size_in_bytes()
+                .saturating_add(key_rows.size_in_bytes())
+                .saturating_add(
+                    payload_rows
+                        .as_ref()
+                        .map(PrefixReleasableRowStore::size_in_bytes)
+                        .unwrap_or(0),
+                ),
+        }
+    }
+
+    #[inline]
+    pub fn is_external(&self) -> bool {
+        matches!(self.storage, RunStorage::External { .. })
+    }
+
+    pub fn into_external(
+        self,
+        buffer_pool: Arc<BufferPool>,
+        memory: MemoryAccountingContext,
+    ) -> Result<(Self, usize)> {
+        let before = self.size_in_bytes();
+        let Self {
+            key_layout,
+            payload_layout,
+            storage,
+            count,
+        } = self;
+
+        let storage = match storage {
+            RunStorage::External { .. } => {
+                return Ok((
+                    Self {
+                        key_layout,
+                        payload_layout,
+                        storage,
+                        count,
+                    },
+                    0,
+                ));
+            }
+            RunStorage::InMemory {
+                key_store,
+                key_rows,
+                payload_rows,
+                permutation,
+                ..
+            } => {
+                let reordered_key_store = key_store.reorder_by_permutation(&permutation)?;
+                let reordered_key_rows = reorder_row_store(
+                    buffer_pool.clone(),
+                    memory.clone(),
+                    &key_rows,
+                    &permutation,
+                )?
+                .into_prefix_releasable();
+                let reordered_payload_rows = payload_rows
+                    .as_ref()
+                    .map(|rows| {
+                        reorder_row_store(buffer_pool.clone(), memory.clone(), rows, &permutation)
+                    })
+                    .transpose()?
+                    .map(RowStore::into_prefix_releasable);
+                RunStorage::External {
+                    key_store: reordered_key_store,
+                    key_rows: reordered_key_rows,
+                    payload_rows: reordered_payload_rows,
+                }
+            }
+        };
+
+        let run = Self {
+            key_layout,
+            payload_layout,
+            storage,
+            count,
+        };
+        let after = run.size_in_bytes();
+        Ok((run, before.saturating_sub(after)))
     }
 
     #[inline]
@@ -303,7 +457,7 @@ impl SortedRun {
             return Ok(());
         }
 
-        chunk.reset();
+        chunk.try_reset(chunk.allocator().clone())?;
         let output_positions: Vec<u32> = (0..count as u32).collect();
         match &self.storage {
             RunStorage::External { .. } => {
@@ -569,19 +723,25 @@ impl<'a> RunRowCursor<'a> {
 
 fn reorder_row_store(
     buffer_pool: Arc<BufferPool>,
+    memory: MemoryAccountingContext,
     source: &RowStore,
     permutation: &[u32],
 ) -> Result<RowStore> {
-    let mut builder = RowStoreBuilder::new(
+    let allocator = Arc::new(BufferAllocator::new(
+        Arc::clone(&buffer_pool) as Arc<dyn BufferManager>,
+        MemoryTag::OrderBy,
+    ));
+    let mut builder = RowStoreBuilder::new_with_memory(
         buffer_pool,
         Arc::new(source.layout().clone()),
         MemoryTag::OrderBy,
+        memory,
     );
     let column_ids: Vec<usize> = (0..source.layout().column_count()).collect();
-    let mut gathered = Chunk::initialize(source.layout().types(), VECTOR_SIZE);
+    let mut gathered = Chunk::try_initialize(source.layout().types(), VECTOR_SIZE, allocator)?;
 
     for batch in permutation.chunks(VECTOR_SIZE) {
-        gathered.reset();
+        gathered.try_reset(gathered.allocator().clone())?;
         let pinned = source.pin_ordinals(batch, RowOrdering::Arbitrary)?;
         pinned.gather_columns(&column_ids, &mut gathered, 0)?;
         gathered.set_cardinality(batch.len());

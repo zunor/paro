@@ -94,6 +94,7 @@ fn init_global(
 }
 
 fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let Some(state) = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoPgCursorsGlobalState>())
@@ -118,19 +119,19 @@ fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableF
     let scrollable: Vec<bool> = slice.iter().map(|row| row.is_scrollable).collect();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&names);
+        *col = Vector::try_from_strings(&names, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_strings(&statements);
+        *col = Vector::try_from_strings(&statements, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_bool(&holdable);
+        *col = Vector::try_from_bool(&holdable, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
-        *col = Vector::from_bool(&binary);
+        *col = Vector::try_from_bool(&binary, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(4) {
-        *col = Vector::from_bool(&scrollable);
+        *col = Vector::try_from_bool(&scrollable, output_allocator.clone())?;
     }
 
     output.set_cardinality(batch_size);

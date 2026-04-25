@@ -8,6 +8,7 @@ mod ddl;
 mod effective_settings;
 mod execution_resources;
 mod execution_tracker;
+mod memory_governance;
 mod query_resources;
 mod runtime_limits;
 mod session_metadata;
@@ -31,6 +32,9 @@ pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use effective_settings::EffectiveSettings;
 pub use execution_resources::ExecutionResources;
 pub use execution_tracker::StatementExecutionTracker;
+pub use memory_governance::{
+    QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryRegistration, QueryMemoryTarget,
+};
 pub use query_resources::{
     ConnectionInfoProvider, ConnectionInfoSnapshot, GraphIndexProvider, GraphRegistry,
     QueryResourceGovernance, QueryResources, SharedPlanCacheHandle,

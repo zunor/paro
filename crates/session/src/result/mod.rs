@@ -7,4 +7,5 @@ pub(crate) mod collecting_sink;
 pub mod profiler;
 pub mod progress;
 pub(crate) mod query;
+pub(crate) mod retained_store;
 pub(crate) mod sink;

@@ -57,7 +57,7 @@ pub fn execute_varchar_unary_to_varchar<F>(
 where
     F: FnMut(&str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
-    let view = input.to_varlen_view(count);
+    let view = input.try_to_varlen_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for row in 0..count {
@@ -80,7 +80,7 @@ pub fn execute_varchar_unary_to_i64<F>(
 where
     F: FnMut(&str) -> i64,
 {
-    let view = input.to_varlen_view(count);
+    let view = input.try_to_varlen_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -104,8 +104,8 @@ pub fn execute_varchar_binary_to_bool<F>(
 where
     F: FnMut(&str, &str) -> bool,
 {
-    let left = left.to_varlen_view(count);
-    let right = right.to_varlen_view(count);
+    let left = left.try_to_varlen_view(count)?;
+    let right = right.try_to_varlen_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -135,8 +135,8 @@ pub fn execute_varchar_binary_to_i64<F>(
 where
     F: FnMut(&str, &str) -> i64,
 {
-    let left = left.to_varlen_view(count);
-    let right = right.to_varlen_view(count);
+    let left = left.try_to_varlen_view(count)?;
+    let right = right.try_to_varlen_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -166,8 +166,8 @@ pub fn execute_varchar_binary_to_varchar<F>(
 where
     F: FnMut(&str, &str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
-    let left = left.to_varlen_view(count);
-    let right = right.to_varlen_view(count);
+    let left = left.try_to_varlen_view(count)?;
+    let right = right.try_to_varlen_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for row in 0..count {
@@ -197,9 +197,9 @@ pub fn execute_varchar_ternary_to_varchar<F>(
 where
     F: FnMut(&str, &str, &str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
-    let first = first.to_varlen_view(count);
-    let second = second.to_varlen_view(count);
-    let third = third.to_varlen_view(count);
+    let first = first.try_to_varlen_view(count)?;
+    let second = second.try_to_varlen_view(count)?;
+    let third = third.try_to_varlen_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for row in 0..count {
@@ -222,15 +222,17 @@ where
 #[cfg(test)]
 mod tests {
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use super::{execute_varchar_binary_to_bool, execute_varchar_unary_to_varchar};
 
     #[test]
     fn writer_handles_dictionary_inputs() {
-        let base = std::sync::Arc::new(Vector::from_strings(&["alpha", "beta", "gamma"]));
-        let input = Vector::dictionary(base, vec![2_u32, 0]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let base = std::sync::Arc::new(paro_common::test_utils::test_string_vector_with_allocator(
+            &["alpha", "beta", "gamma"],
+            paro_common::test_utils::test_allocator(),
+        ));
+        let input = paro_common::test_utils::test_dictionary(base, vec![2_u32, 0]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         execute_varchar_unary_to_varchar(&input, &mut result, 2, |value, row, writer| {
             writer.write_str(row, value);
@@ -244,10 +246,16 @@ mod tests {
 
     #[test]
     fn binary_bool_helper_propagates_nulls() {
-        let left = Vector::from_strings(&["hello", "world"]);
-        let mut right = Vector::from_strings(&["he", "or"]);
+        let left = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut right = paro_common::test_utils::test_string_vector_with_allocator(
+            &["he", "or"],
+            paro_common::test_utils::test_allocator(),
+        );
         right.set_null(1, true);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         execute_varchar_binary_to_bool(&left, &right, &mut result, 2, |value, prefix| {
             value.starts_with(prefix)

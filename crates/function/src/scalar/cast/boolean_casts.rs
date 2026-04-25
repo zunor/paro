@@ -86,7 +86,7 @@ pub fn bool_to_varchar(
     count: usize,
     _ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
-    let view = input.to_view(count);
+    let view = input.try_to_view(count)?;
     let data = view
         .get_data::<bool>()
         .expect("bool cast requires pointer data");
@@ -111,7 +111,7 @@ pub fn varchar_to_bool(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.to_varlen_view(count);
+    let view = input.try_to_varlen_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -171,9 +171,12 @@ mod tests {
 
     #[test]
     fn bool_to_varchar_reads_dictionary_rows() {
-        let base = Arc::new(Vector::from_bool(&[true, false, true]));
-        let input = Vector::dictionary(base, vec![2_u32, 0, 1]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let base = Arc::new(paro_common::test_utils::test_bool_vector_with_allocator(
+            &[true, false, true],
+            paro_common::test_utils::test_allocator(),
+        ));
+        let input = paro_common::test_utils::test_dictionary(base, vec![2_u32, 0, 1]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         bool_to_varchar(&input, &mut result, 3, &ctx(false)).expect("bool cast should succeed");
 
@@ -184,8 +187,11 @@ mod tests {
 
     #[test]
     fn varchar_to_bool_try_cast_nullifies_invalid_rows() {
-        let input = Vector::from_strings(&["yes", "maybe", "0"]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let input = paro_common::test_utils::test_string_vector_with_allocator(
+            &["yes", "maybe", "0"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         let all_success =
             varchar_to_bool(&input, &mut result, 3, &ctx(true)).expect("try cast should succeed");

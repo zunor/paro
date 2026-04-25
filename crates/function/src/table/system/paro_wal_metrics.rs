@@ -155,6 +155,7 @@ fn paro_wal_metrics_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoWalMetricsGlobalState>());
@@ -250,13 +251,13 @@ fn paro_wal_metrics_function(
         .collect::<Vec<_>>();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_i64(&database_oids);
+        *col = Vector::try_from_i64(&database_oids, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_strings(&database_name_refs);
+        *col = Vector::try_from_strings(&database_name_refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_strings(&recovery_mode_refs);
+        *col = Vector::try_from_strings(&recovery_mode_refs, output_allocator.clone())?;
     }
     for (index, values) in [
         (3usize, &checkpoint_success),
@@ -286,7 +287,7 @@ fn paro_wal_metrics_function(
         (30usize, &replay_delete_patches_total),
     ] {
         if let Some(col) = output.column_mut(index) {
-            *col = Vector::from_i64(values);
+            *col = Vector::try_from_i64(values, output_allocator.clone())?;
         }
     }
     for (index, values) in [
@@ -295,11 +296,11 @@ fn paro_wal_metrics_function(
         (9usize, &recovery_truncate),
     ] {
         if let Some(col) = output.column_mut(index) {
-            *col = Vector::from_bool(values);
+            *col = Vector::try_from_bool(values, output_allocator.clone())?;
         }
     }
     if let Some(col) = output.column_mut(31) {
-        *col = Vector::from_f64(&inline_patch_ratio);
+        *col = Vector::try_from_f64(&inline_patch_ratio, output_allocator.clone())?;
     }
 
     output.set_cardinality(batch_size);
@@ -419,7 +420,7 @@ mod tests {
             local_state: None,
             global_state: Some(state_ref),
         };
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::BigInt,
                 LogicalType::Varchar,

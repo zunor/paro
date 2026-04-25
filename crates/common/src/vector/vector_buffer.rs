@@ -5,7 +5,8 @@ use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::allocator::{default_allocator, Allocator};
+use crate::allocator::Allocator;
+use crate::error::{self as paro_error, Result};
 
 use super::AllocationSet;
 
@@ -40,6 +41,8 @@ pub(crate) struct VectorBuffer {
     element_size: usize,
     /// Number of elements allocated
     capacity: usize,
+    /// Allocator associated with this buffer, even for zero-capacity buffers.
+    allocator: Arc<dyn Allocator>,
 }
 
 impl fmt::Debug for VectorBuffer {
@@ -47,60 +50,52 @@ impl fmt::Debug for VectorBuffer {
         f.debug_struct("VectorBuffer")
             .field("element_size", &self.element_size)
             .field("capacity", &self.capacity)
+            .field("allocator", &self.allocator.name())
             .field("shared", &self.inner.is_some())
             .finish()
     }
 }
 
 impl VectorBuffer {
-    /// Create a new buffer with given element size and capacity using default allocator.
-    ///
-    /// NOTE: This convenience constructor uses `default_allocator()` and is mainly
-    /// intended for tests or standalone utility code. Production paths should pass
-    /// an explicit allocator via `with_allocator`.
-    pub fn new(element_size: usize, capacity: usize) -> Self {
-        Self::with_allocator(element_size, capacity, Arc::new(default_allocator()))
-    }
-
     /// Create a new buffer with a custom allocator.
-    pub fn with_allocator(
+    pub fn try_with_allocator(
         element_size: usize,
         capacity: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> Self {
+    ) -> Result<Self> {
         if element_size == 0 || capacity == 0 {
-            return Self {
+            return Ok(Self {
                 inner: None,
                 element_size,
                 capacity: 0,
-            };
+                allocator,
+            });
         }
 
-        let size = element_size * capacity;
+        let size = element_size.checked_mul(capacity).ok_or_else(|| {
+            paro_error::out_of_memory(format!(
+                "vector buffer allocation size overflow: element_size={element_size}, capacity={capacity}"
+            ))
+        })?;
 
         // Use allocator to get memory
-        let ptr = allocator.allocate_zeroed(size).expect("Allocation failed"); // We expect success locally for now
+        let ptr = allocator.allocate_zeroed(size)?;
 
-        Self {
+        Ok(Self {
             inner: Some(Arc::new(RawBuffer {
                 ptr: NonNull::new(ptr).expect("out of memory or allocator bug: ptr is null"),
                 size,
-                allocator,
+                allocator: allocator.clone(),
             })),
             element_size,
             capacity,
-        }
+            allocator,
+        })
     }
 
     /// Get the allocator used by this buffer.
     pub fn allocator(&self) -> &Arc<dyn Allocator> {
-        static DEFAULT: std::sync::OnceLock<Arc<dyn Allocator>> = std::sync::OnceLock::new();
-        self.inner
-            .as_ref()
-            .map(|i| &i.allocator)
-            .unwrap_or_else(|| {
-                DEFAULT.get_or_init(|| Arc::new(crate::allocator::DefaultAllocator::new()))
-            })
+        &self.allocator
     }
 
     /// Get raw data pointer.
@@ -142,6 +137,15 @@ impl VectorBuffer {
         }
     }
 
+    pub(crate) fn collect_allocation_entries(&self, entries: &mut Vec<(usize, usize)>) {
+        if let Some(identity) = self.allocation_identity() {
+            let size = self.size();
+            if size > 0 {
+                entries.push((identity, size));
+            }
+        }
+    }
+
     /// Get typed data slice.
     ///
     /// # Safety
@@ -170,13 +174,13 @@ impl VectorBuffer {
     }
 
     /// Create a deep copy of this buffer.
-    pub fn deep_copy(&self) -> Self {
+    pub fn try_deep_copy(&self) -> Result<Self> {
         if let Some(inner) = &self.inner {
-            let new_buffer = Self::with_allocator(
+            let new_buffer = Self::try_with_allocator(
                 self.element_size,
                 self.capacity,
                 Arc::clone(&inner.allocator),
-            );
+            )?;
             if let Some(new_inner) = &new_buffer.inner {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -186,19 +190,26 @@ impl VectorBuffer {
                     );
                 }
             }
-            new_buffer
+            Ok(new_buffer)
         } else {
-            Self::new(self.element_size, 0)
+            Self::try_with_allocator(self.element_size, 0, self.allocator().clone())
         }
     }
 
     /// Ensure the buffer is exclusively owned (Copy-on-Write).
-    pub fn make_exclusive(&mut self) {
+    pub fn try_make_exclusive(&mut self) -> Result<()> {
         if let Some(inner) = &self.inner {
             if Arc::strong_count(inner) > 1 {
-                *self = self.deep_copy();
+                *self = self.try_deep_copy()?;
             }
         }
+        Ok(())
+    }
+
+    #[track_caller]
+    pub(crate) fn make_exclusive(&mut self) {
+        self.try_make_exclusive()
+            .expect("vector buffer copy-on-write allocation failed")
     }
 }
 
@@ -215,7 +226,8 @@ mod tests {
 
     #[test]
     fn test_vector_buffer_new() {
-        let buf = VectorBuffer::new(8, 100);
+        let buf =
+            VectorBuffer::try_with_allocator(8, 100, Arc::new(DefaultAllocator::new())).unwrap();
         assert!(!buf.data().is_null());
         assert_eq!(buf.capacity(), 100);
         assert_eq!(buf.element_size(), 8);
@@ -224,14 +236,16 @@ mod tests {
 
     #[test]
     fn test_vector_buffer_zero_size() {
-        let buf = VectorBuffer::new(0, 100);
+        let buf =
+            VectorBuffer::try_with_allocator(0, 100, Arc::new(DefaultAllocator::new())).unwrap();
         assert!(buf.data().is_null());
         assert_eq!(buf.capacity(), 0);
     }
 
     #[test]
     fn test_vector_buffer_zero_capacity() {
-        let buf = VectorBuffer::new(8, 0);
+        let buf =
+            VectorBuffer::try_with_allocator(8, 0, Arc::new(DefaultAllocator::new())).unwrap();
         assert!(buf.data().is_null());
         assert_eq!(buf.capacity(), 0);
     }
@@ -239,14 +253,15 @@ mod tests {
     #[test]
     fn test_vector_buffer_with_allocator() {
         let allocator = Arc::new(DefaultAllocator::new());
-        let buf = VectorBuffer::with_allocator(4, 50, allocator);
+        let buf = VectorBuffer::try_with_allocator(4, 50, allocator).unwrap();
         assert!(!buf.data().is_null());
         assert_eq!(buf.size(), 200);
     }
 
     #[test]
     fn test_vector_buffer_clone() {
-        let mut buf = VectorBuffer::new(4, 10);
+        let mut buf =
+            VectorBuffer::try_with_allocator(4, 10, Arc::new(DefaultAllocator::new())).unwrap();
 
         // Write some data
         unsafe {
@@ -266,7 +281,8 @@ mod tests {
 
     #[test]
     fn test_vector_buffer_shallow_clone() {
-        let mut buf = VectorBuffer::new(4, 10);
+        let mut buf =
+            VectorBuffer::try_with_allocator(4, 10, Arc::new(DefaultAllocator::new())).unwrap();
         unsafe {
             buf.as_mut_slice::<i32>(10)[0] = 1;
         }
@@ -286,7 +302,8 @@ mod tests {
 
     #[test]
     fn test_vector_buffer_make_exclusive() {
-        let mut buf = VectorBuffer::new(4, 10);
+        let mut buf =
+            VectorBuffer::try_with_allocator(4, 10, Arc::new(DefaultAllocator::new())).unwrap();
         unsafe {
             buf.as_mut_slice::<i32>(10)[0] = 1;
         }

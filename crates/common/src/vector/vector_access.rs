@@ -49,11 +49,8 @@ impl Vector {
                         VectorType::Flat => (vector, idx),
                         VectorType::Constant => (vector, 0),
                         VectorType::Dictionary => {
-                            let sel = vector
-                                .sel_vector()
-                                .expect("Dictionary vector missing selection vector");
                             let child = vector.child().expect("Dictionary vector missing child");
-                            resolve_array_row(child, sel.get(idx))
+                            resolve_array_row(child, vector.selection().physical_index(idx))
                         }
                         VectorType::Sequence => {
                             panic!("Sequence vectors cannot be Array type");
@@ -77,11 +74,8 @@ impl Vector {
                         VectorType::Flat => (vector, idx),
                         VectorType::Constant => (vector, 0),
                         VectorType::Dictionary => {
-                            let sel = vector
-                                .sel_vector()
-                                .expect("Dictionary vector missing selection vector");
                             let child = vector.child().expect("Dictionary vector missing child");
-                            resolve_collection_row(child, sel.get(idx))
+                            resolve_collection_row(child, vector.selection().physical_index(idx))
                         }
                         VectorType::Sequence => {
                             panic!("Sequence vectors cannot be List type");
@@ -107,11 +101,8 @@ impl Vector {
                         VectorType::Flat => (vector, idx),
                         VectorType::Constant => (vector, 0),
                         VectorType::Dictionary => {
-                            let sel = vector
-                                .sel_vector()
-                                .expect("Dictionary vector missing selection vector");
                             let child = vector.child().expect("Dictionary vector missing child");
-                            resolve_struct_row(child, sel.get(idx))
+                            resolve_struct_row(child, vector.selection().physical_index(idx))
                         }
                         VectorType::Sequence => {
                             panic!("Sequence vectors cannot be Struct type");
@@ -174,7 +165,7 @@ impl Vector {
                 }
             }
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_i64(physical_idx)
             }
         }
@@ -189,7 +180,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<i8>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<i8>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_i8(physical_idx)
             }
             _ => None,
@@ -205,7 +196,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<i16>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<i16>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_i16(physical_idx)
             }
             _ => None,
@@ -221,7 +212,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<i32>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<i32>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_i32(physical_idx)
             }
             _ => None,
@@ -237,7 +228,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<i128>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<i128>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_i128(physical_idx)
             }
             _ => None,
@@ -253,7 +244,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<u8>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<u8>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_u8(physical_idx)
             }
             _ => None,
@@ -269,7 +260,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<u16>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<u16>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_u16(physical_idx)
             }
             _ => None,
@@ -285,7 +276,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<u32>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<u32>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_u32(physical_idx)
             }
             _ => None,
@@ -301,7 +292,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<u64>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<u64>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_u64(physical_idx)
             }
             _ => None,
@@ -317,7 +308,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<u128>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<u128>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_u128(physical_idx)
             }
             _ => None,
@@ -333,7 +324,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<f32>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<f32>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_f32(physical_idx)
             }
             _ => None,
@@ -349,7 +340,7 @@ impl Vector {
             VectorType::Flat => Some(unsafe { self.get_flat::<f64>(idx) }),
             VectorType::Constant => Some(unsafe { self.get_flat::<f64>(0) }),
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_f64(physical_idx)
             }
             _ => None,
@@ -376,7 +367,7 @@ impl Vector {
                 Some(inline_str.as_str())
             }
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref()?.get(idx);
+                let physical_idx = self.selection().physical_index(idx);
                 self.child.as_ref()?.get_string(physical_idx)
             }
             _ => None,
@@ -403,7 +394,7 @@ impl Vector {
                 Some(inline_str.as_bytes())
             }
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref()?.get(idx);
+                let physical_idx = self.selection().physical_index(idx);
                 self.child.as_ref()?.get_blob(physical_idx)
             }
             _ => None,
@@ -422,7 +413,7 @@ impl Vector {
                 Some(*ptr)
             },
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_bool(physical_idx)
             }
             _ => None,
@@ -456,7 +447,7 @@ impl Vector {
                 Some((months, days, micros))
             },
             VectorType::Dictionary => {
-                let physical_idx = self.sel_vector.as_ref().unwrap().get(idx);
+                let physical_idx = self.physical_index(idx);
                 self.child.as_ref().unwrap().get_interval(physical_idx)
             }
             _ => None,
@@ -527,11 +518,14 @@ impl Vector {
                 }
 
                 let child = self.child.get_or_insert_with(|| {
-                    Arc::new(Vector::with_capacity_and_allocator(
-                        child_type.clone(),
-                        children.len().max(1),
-                        self.buffer.allocator().clone(),
-                    ))
+                    Arc::new(
+                        Vector::try_new(
+                            child_type.clone(),
+                            children.len().max(1),
+                            self.buffer.allocator().clone(),
+                        )
+                        .expect("vector allocation failed"),
+                    )
                 });
 
                 let dest_offset = child.len();
@@ -541,11 +535,12 @@ impl Vector {
                     if required > child_mut.capacity() {
                         let new_capacity =
                             required.max(child_mut.capacity().saturating_mul(2)).max(1);
-                        let mut new_child = Vector::with_capacity_and_allocator(
+                        let mut new_child = Vector::try_new(
                             child_type.clone(),
                             new_capacity,
                             child_mut.allocator().clone(),
-                        );
+                        )
+                        .expect("vector allocation failed");
                         new_child.set_count(dest_offset);
                         for i in 0..dest_offset {
                             new_child.copy_at(i, child_mut, i);
@@ -791,11 +786,12 @@ impl Vector {
             // Create a constant null vector
             self.vector_type = VectorType::Constant;
             self.logical_type = logical_type;
-            self.buffer = super::VectorBuffer::with_allocator(0, 0, allocator);
+            self.buffer = super::VectorBuffer::try_with_allocator(0, 0, allocator)
+                .expect("vector buffer allocation failed");
             // For constant vectors, validity mask only needs 1 entry
             self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
             self.validity.set_null(0);
-            self.sel_vector = None;
+            self.selection = super::VectorSelection::None;
             self.child = None;
             self.string_heap = None;
             self.dictionary_info = None;
@@ -805,98 +801,112 @@ impl Vector {
         // Create a constant vector from the value
         match value {
             Value::Boolean(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(1, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(1, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut bool;
                     *ptr = *v;
                 }
             }
             Value::TinyInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(1, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(1, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i8;
                     *ptr = *v;
                 }
             }
             Value::SmallInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(2, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(2, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i16;
                     *ptr = *v;
                 }
             }
             Value::Integer(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(4, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i32;
                     *ptr = *v;
                 }
             }
             Value::BigInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(8, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i64;
                     *ptr = *v;
                 }
             }
             Value::HugeInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(16, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i128;
                     *ptr = *v;
                 }
             }
             Value::UTinyInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(1, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(1, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data();
                     *ptr = *v;
                 }
             }
             Value::USmallInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(2, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(2, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut u16;
                     *ptr = *v;
                 }
             }
             Value::UInteger(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(4, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut u32;
                     *ptr = *v;
                 }
             }
             Value::UBigInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(8, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut u64;
                     *ptr = *v;
                 }
             }
             Value::UHugeInt(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(16, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut u128;
                     *ptr = *v;
                 }
             }
             Value::Uuid(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(16, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut u128;
                     *ptr = *v;
                 }
             }
             Value::Float(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(4, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut f32;
                     *ptr = *v;
                 }
             }
             Value::Double(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(8, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut f64;
                     *ptr = *v;
@@ -904,7 +914,8 @@ impl Vector {
             }
             Value::Decimal(v, precision, _scale) => {
                 if *precision <= 18 {
-                    self.buffer = super::VectorBuffer::with_allocator(8, 1, allocator);
+                    self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
+                        .expect("vector buffer allocation failed");
                     let narrow =
                         i64::try_from(*v).expect("Decimal value exceeds i64 range for precision");
                     unsafe {
@@ -912,7 +923,8 @@ impl Vector {
                         *ptr = narrow;
                     }
                 } else {
-                    self.buffer = super::VectorBuffer::with_allocator(16, 1, allocator);
+                    self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
+                        .expect("vector buffer allocation failed");
                     unsafe {
                         let ptr = self.buffer.data() as *mut i128;
                         *ptr = *v;
@@ -920,11 +932,12 @@ impl Vector {
                 }
             }
             Value::Varchar(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(
+                self.buffer = super::VectorBuffer::try_with_allocator(
                     std::mem::size_of::<InlineString>(),
                     1,
                     allocator.clone(),
-                );
+                )
+                .expect("vector buffer allocation failed");
 
                 // Use StringHeap which handles both short and long strings
                 let mut heap = StringHeap::with_allocator(v.len().max(64), allocator.clone());
@@ -939,11 +952,12 @@ impl Vector {
                 }
             }
             Value::Blob(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(
+                self.buffer = super::VectorBuffer::try_with_allocator(
                     std::mem::size_of::<InlineString>(),
                     1,
                     allocator.clone(),
-                );
+                )
+                .expect("vector buffer allocation failed");
 
                 // Use StringHeap which handles both short and long blobs
                 let mut heap = StringHeap::with_allocator(v.len().max(64), allocator.clone());
@@ -958,21 +972,24 @@ impl Vector {
                 }
             }
             Value::Date(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(4, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i32;
                     *ptr = *v;
                 }
             }
             Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => {
-                self.buffer = super::VectorBuffer::with_allocator(8, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let ptr = self.buffer.data() as *mut i64;
                     *ptr = *v;
                 }
             }
             Value::Interval(months, days, micros) => {
-                self.buffer = super::VectorBuffer::with_allocator(16, 1, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
+                    .expect("vector buffer allocation failed");
                 unsafe {
                     let base = self.buffer.data();
                     *(base as *mut i32) = *months;
@@ -993,11 +1010,9 @@ impl Vector {
             Value::Array(children, child_type, array_size) => {
                 // Create a child vector with the array elements
                 let child_capacity = *array_size;
-                let mut child = Vector::with_capacity_and_allocator(
-                    child_type.clone(),
-                    child_capacity,
-                    allocator.clone(),
-                );
+                let mut child =
+                    Vector::try_new(child_type.clone(), child_capacity, allocator.clone())
+                        .expect("vector allocation failed");
                 child.set_count(child_capacity);
 
                 // Set each element in the child vector
@@ -1006,18 +1021,26 @@ impl Vector {
                 }
 
                 self.child = Some(Arc::new(child));
-                self.buffer = super::VectorBuffer::with_allocator(0, 0, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(0, 0, allocator)
+                    .expect("vector buffer allocation failed");
                 self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
             }
             Value::Struct(values, fields) => {
                 let mut children = Vec::with_capacity(values.len());
                 for (value, (_name, field_type)) in values.iter().zip(fields.iter()) {
-                    let child = Vector::constant_from_value(field_type.clone(), value.clone(), 1);
+                    let child = Vector::try_constant_from_value(
+                        field_type.clone(),
+                        value.clone(),
+                        1,
+                        allocator.clone(),
+                    )
+                    .expect("struct constant child allocation failed");
                     children.push(Arc::new(child));
                 }
                 self.children = children;
                 self.child = None;
-                self.buffer = super::VectorBuffer::with_allocator(0, 0, allocator);
+                self.buffer = super::VectorBuffer::try_with_allocator(0, 0, allocator)
+                    .expect("vector buffer allocation failed");
                 self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
             }
         }
@@ -1035,7 +1058,7 @@ impl Vector {
             // For constant vectors, validity mask only needs 1 entry
             self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
         }
-        self.sel_vector = None;
+        self.selection = super::VectorSelection::None;
         self.dictionary_info = None;
         // Only reset child if we're NOT an Array or List (which just set it)
         if !matches!(value, Value::Array(_, _, _) | Value::List(_, _)) {

@@ -34,10 +34,13 @@ use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::{JoinCondition, JoinType};
-use paro_storage::buffer::{MemoryTag, TemporaryMemoryState};
+use paro_storage::buffer::MemoryTag;
 use paro_storage::row::{RadixPartitionedRowsBuilder, RowScanState, RowStore};
 
 use crate::execution_context::ExecutionContext;
@@ -45,6 +48,9 @@ use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::join_hashtable::{JoinHashTable, JoinHashTableConfig};
 use crate::join_hashtable::perfect_hash_join::PerfectHashJoinExecutor;
+use crate::memory_runtime::{
+    OperatorExternalMemoryTracker, ReclaimStats, Reclaimer, SharedRetainedObject, SpillCost,
+};
 use crate::operator::join::join_filter_pushdown::{
     JoinFilterGlobalState, JoinFilterLocalState, JoinFilterPushdownInfo, JoinFilterRuntimeStats,
 };
@@ -76,6 +82,8 @@ const HASH_JOIN_MAX_RADIX_BITS: usize = 12;
 const HASH_JOIN_EXTERNAL_LOAD_FACTOR: f64 = 1.5;
 const HASH_JOIN_SKEW_THRESHOLD: f64 = 0.8;
 const HASH_JOIN_EXTERNAL_PARTITION_THREAD_CAP: usize = 4;
+const HASH_JOIN_MEMORY_TAG: MemoryTag = MemoryTag::HashTable;
+const HASH_JOIN_MEMORY_CLASS: MemoryAccountingClass = MemoryAccountingClass::Revocable;
 
 /// Physical Hash Join operator.
 ///
@@ -116,6 +124,7 @@ impl HashJoin {
             spilled: Some(sink_state.externalized()),
             peak_memory_bytes: Some(sink_state.peak_reservation()),
             temp_storage_bytes: Some(sink_state.temp_storage_bytes()),
+            ..Default::default()
         }
     }
 
@@ -233,22 +242,38 @@ impl HashJoin {
     }
 
     /// Initialize a JoinHashTable for this operator.
-    fn initialize_hash_table(&self, ctx: &ExecutionContext) -> Arc<JoinHashTable> {
-        Arc::new(JoinHashTable::new(
+    fn initialize_hash_table(
+        &self,
+        ctx: &ExecutionContext,
+        retained_object: Arc<SharedRetainedObject>,
+    ) -> Arc<JoinHashTable> {
+        let owner: Arc<dyn MemoryOwner> = retained_object;
+        let memory = MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            HASH_JOIN_MEMORY_TAG,
+            MemoryAccountingClass::Revocable,
+        );
+        Arc::new(JoinHashTable::new_with_memory(
             ctx.buffer_pool().clone(),
+            ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
             self.base.equality_conditions.clone(),
             self.build_layout.build_payload_types.clone(),
             self.base.join.join_type,
             JoinHashTableConfig::default(),
+            memory,
         ))
     }
 
-    fn build_payload_chunk(&self, chunk: &Chunk) -> Chunk {
+    fn build_payload_chunk(&self, chunk: &Chunk) -> Result<Chunk> {
         if self.build_layout.build_payload_columns.is_empty() {
-            let mut payload_chunk =
-                Chunk::initialize(&self.build_layout.build_payload_types, chunk.size());
+            let mut payload_chunk = Chunk::try_initialize(
+                &self.build_layout.build_payload_types,
+                chunk.size(),
+                chunk.allocator().clone(),
+            )?;
             payload_chunk.set_cardinality(chunk.size());
-            return payload_chunk;
+            return Ok(payload_chunk);
         }
 
         let is_identity_projection = self.build_layout.build_payload_columns.len()
@@ -261,7 +286,7 @@ impl HashJoin {
                 .enumerate()
                 .all(|(output_idx, input_idx)| output_idx == input_idx);
         if is_identity_projection {
-            return chunk.clone();
+            return Ok(chunk.clone());
         }
 
         let payload_vectors = self
@@ -270,9 +295,9 @@ impl HashJoin {
             .iter()
             .map(|column_idx| Arc::clone(&chunk.data[*column_idx]))
             .collect::<Vec<_>>();
-        let mut payload_chunk = Chunk::from_arc_vectors(payload_vectors);
+        let mut payload_chunk = Chunk::from_arc_vectors(payload_vectors, chunk.allocator().clone());
         payload_chunk.set_cardinality(chunk.size());
-        payload_chunk
+        Ok(payload_chunk)
     }
 
     fn materialize_key_vector(
@@ -280,14 +305,14 @@ impl HashJoin {
         vector: Arc<Vector>,
         logical_type: LogicalType,
         count: usize,
-    ) -> Arc<Vector> {
+    ) -> Result<Arc<Vector>> {
         let allocator = ctx.allocator(paro_common::allocator::MemoryTag::BaseTable);
-        let mut flat = Vector::with_capacity_and_allocator(logical_type, count.max(1), allocator);
+        let mut flat = Vector::try_new(logical_type, count.max(1), allocator)?;
         flat.set_len(count);
         for row_idx in 0..count {
             flat.copy_at(row_idx, vector.as_ref(), row_idx);
         }
-        Arc::new(flat)
+        Ok(Arc::new(flat))
     }
 
     fn finalize_in_memory_hash_table(&self, gstate: &HashJoinGlobalSinkState) -> Result<()> {
@@ -373,8 +398,11 @@ pub(super) struct HashJoinGlobalSinkState {
     /// Total number of threads for this sink.
     pub(super) num_threads: AtomicUsize,
 
-    /// Temporary memory manager state for hash join reservation arbitration.
-    pub(super) temporary_memory_state: Arc<TemporaryMemoryState>,
+    /// Runtime memory tracker for hash join build/external reservation.
+    pub(super) memory_tracker: Arc<OperatorExternalMemoryTracker>,
+
+    /// Shared build-side retained object spanning build/probe/source phases.
+    pub(super) retained_object: Arc<SharedRetainedObject>,
 
     /// Finalize-time build/probe sizing stats.
     pub(super) total_size: AtomicUsize,
@@ -389,7 +417,7 @@ pub(super) struct HashJoinGlobalSinkState {
     /// Whether the session explicitly requested external execution.
     pub(super) force_external: bool,
     /// Whether this operator externalized to spill path.
-    pub(super) externalized: AtomicBool,
+    pub(super) externalized: Arc<AtomicBool>,
 
     /// External hash join runtime.
     pub(super) external_runtime: Mutex<Option<external::HashJoinExternalRuntime>>,
@@ -408,7 +436,8 @@ impl HashJoinGlobalSinkState {
         hash_table: Arc<JoinHashTable>,
         build_types: Vec<LogicalType>,
         join_type: JoinType,
-        temporary_memory_state: Arc<TemporaryMemoryState>,
+        memory_tracker: Arc<OperatorExternalMemoryTracker>,
+        retained_object: Arc<SharedRetainedObject>,
         force_external: bool,
     ) -> Self {
         Self {
@@ -419,7 +448,8 @@ impl HashJoinGlobalSinkState {
             finalized: AtomicBool::new(false),
             active_local_states: AtomicUsize::new(0),
             num_threads: AtomicUsize::new(0),
-            temporary_memory_state,
+            memory_tracker,
+            retained_object,
             total_size: AtomicUsize::new(0),
             max_partition_size: AtomicUsize::new(0),
             max_partition_count: AtomicUsize::new(0),
@@ -428,7 +458,7 @@ impl HashJoinGlobalSinkState {
             filter_gstate: None,
             finalize_prepared: AtomicBool::new(false),
             force_external,
-            externalized: AtomicBool::new(false),
+            externalized: Arc::new(AtomicBool::new(false)),
             external_runtime: Mutex::new(None),
             external_source_rows: Mutex::new(None),
             external_source_scan_state: Mutex::new(RowScanState::default()),
@@ -462,11 +492,29 @@ impl HashJoinGlobalSinkState {
     }
 
     fn peak_reservation(&self) -> u64 {
-        self.temporary_memory_state.get_peak_reservation() as u64
+        self.memory_tracker.peak_bytes().unwrap_or(0) as u64
     }
 
     fn temp_storage_bytes(&self) -> u64 {
         self.total_size.load(Ordering::Acquire) as u64
+    }
+
+    pub(super) fn build_memory_context(&self) -> MemoryAccountingContext {
+        let owner: Arc<dyn MemoryOwner> = self.retained_object.clone();
+        MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            HASH_JOIN_MEMORY_TAG,
+            MemoryAccountingClass::Revocable,
+        )
+    }
+
+    pub(super) fn has_capacity_for_total(&self, bytes: usize) -> Result<bool> {
+        let current = self.memory_tracker.accounted_bytes()?;
+        let additional = bytes.saturating_sub(current);
+        self.memory_tracker
+            .can_acquire_capacity(additional)
+            .map_err(Into::into)
     }
 
     pub(super) fn cleanup_external_spill_state(&self, clear_source_rows: bool) {
@@ -480,7 +528,6 @@ impl HashJoinGlobalSinkState {
 
         self.hash_table.reset_runtime_state();
         self.hash_table.reset_data_collection();
-        self.temporary_memory_state.set_zero();
     }
 
     fn cleanup_after_error(&self) {
@@ -488,6 +535,38 @@ impl HashJoinGlobalSinkState {
         self.externalized.store(false, Ordering::Release);
         self.finalized.store(false, Ordering::Release);
         self.cleanup_external_spill_state(true);
+    }
+}
+
+#[derive(Debug)]
+struct HashJoinBuildReclaimer {
+    memory_tracker: Arc<OperatorExternalMemoryTracker>,
+    externalized: Arc<AtomicBool>,
+}
+
+impl Reclaimer for HashJoinBuildReclaimer {
+    fn name(&self) -> &str {
+        "hash_join_build_side"
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        if self.externalized.load(Ordering::Acquire) {
+            self.memory_tracker.accounted_bytes().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> paro_common::memory::MemoryResult<ReclaimStats> {
+        if !self.externalized.load(Ordering::Acquire) {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let reclaimed = self.memory_tracker.reclaim_accounted_bytes(target_bytes)?;
+        Ok(ReclaimStats::new(target_bytes, reclaimed, reclaimed))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::AccountingRelease
     }
 }
 
@@ -538,7 +617,6 @@ impl Drop for HashJoinGlobalSinkState {
 
         self.hash_table.reset_runtime_state();
         self.hash_table.reset_data_collection();
-        self.temporary_memory_state.set_zero();
     }
 }
 
@@ -758,7 +836,7 @@ impl PhysicalOperator for HashJoin {
         self.sink_state.lock().unwrap().clone()
     }
 
-    fn get_operator_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
+    fn get_operator_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
         let sink = self
             .sink_state()
             .ok_or_else(|| paro_error::internal("No sink".to_string()))?;
@@ -774,15 +852,24 @@ impl PhysicalOperator for HashJoin {
             .map(|c| c.left.return_type())
             .collect();
         Ok(Box::new(HashJoinOperatorState {
-            scan_structure: gsink.hash_table.create_scan_structure(),
-            probe_keys: Chunk::init_empty(&types),
+            scan_structure: gsink.hash_table.create_scan_structure()?,
+            probe_keys: Chunk::try_init_empty(
+                &types,
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
             probe_in_progress: false,
-            current_probe_input: Chunk::new(),
+            current_probe_input: Chunk::try_new(
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
             external_probe_local_state: None,
             external_probe_scan_state: RowScanState::default(),
-            external_probe_chunk: Chunk::new(),
+            external_probe_chunk: Chunk::try_new(
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
             external_build_scan_state: None,
-            external_build_chunk: Chunk::new(),
+            external_build_chunk: Chunk::try_new(
+                ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?,
             probe_key_executors: probe_engine::ProbeKeyExecutors {
                 executors: self
                     .base
@@ -809,20 +896,35 @@ impl PhysicalOperator for HashJoin {
     fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
         Self::validate_join_type(self.base.join.join_type)?;
 
-        let hash_table = self.initialize_hash_table(ctx);
-        let temporary_memory_state = ctx.temporary_memory_manager().register();
-        let force_external = ctx
-            .temporary_memory_manager()
-            .current_config()
-            .force_external;
+        let force_external = ctx.force_external();
+        let memory_tracker = Arc::new(OperatorExternalMemoryTracker::new(
+            ctx.operator_memory_account(),
+            MemoryDomain::Host,
+            HASH_JOIN_MEMORY_TAG,
+            HASH_JOIN_MEMORY_CLASS,
+        ));
+        let retained_owner: Arc<dyn MemoryOwner> = memory_tracker.clone();
+        let retained_object = Arc::new(SharedRetainedObject::new(
+            "hash_join_build_side",
+            retained_owner,
+            MemoryDomain::Host,
+            HASH_JOIN_MEMORY_TAG,
+        ));
+        let hash_table = self.initialize_hash_table(ctx, retained_object.clone());
 
         let mut gstate = HashJoinGlobalSinkState::new(
             hash_table,
             self.build_layout.build_payload_types.clone(),
             self.base.join.join_type,
-            temporary_memory_state,
+            memory_tracker.clone(),
+            retained_object,
             force_external,
         );
+        let reclaimer: Arc<dyn Reclaimer> = Arc::new(HashJoinBuildReclaimer {
+            memory_tracker,
+            externalized: gstate.externalized.clone(),
+        });
+        ctx.query_memory_pool().register_reclaimer(reclaimer);
 
         if let Some(ref filter_info) = self.filter_pushdown {
             gstate.filter_gstate = Some(filter_info.get_global_state());
@@ -833,19 +935,24 @@ impl PhysicalOperator for HashJoin {
 
     /// Get the local sink state.
     fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        if let Some(sink) = self.sink_state() {
-            if let Some(gstate) = sink.as_any().downcast_ref::<HashJoinGlobalSinkState>() {
-                gstate.active_local_states.fetch_add(1, Ordering::AcqRel);
-                gstate.num_threads.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        let sink = self.sink_state().ok_or_else(|| {
+            paro_error::internal("HashJoin local sink requires global sink state")
+        })?;
+        let gstate = sink
+            .as_any()
+            .downcast_ref::<HashJoinGlobalSinkState>()
+            .ok_or_else(|| paro_error::internal("Invalid global sink state".to_string()))?;
+        gstate.active_local_states.fetch_add(1, Ordering::AcqRel);
+        gstate.num_threads.fetch_add(1, Ordering::Relaxed);
 
-        let local_ht = Arc::new(JoinHashTable::new(
+        let local_ht = Arc::new(JoinHashTable::new_with_memory(
             ctx.buffer_pool().clone(),
+            ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
             self.base.equality_conditions.clone(),
             self.build_layout.build_payload_types.clone(),
             self.base.join.join_type,
             JoinHashTableConfig::default(),
+            gstate.build_memory_context(),
         ));
 
         let mut lstate = HashJoinLocalSinkState {
@@ -894,12 +1001,12 @@ impl PhysicalOperator for HashJoin {
                 vec,
                 cond.right.return_type(),
                 chunk.size(),
-            ));
+            )?);
         }
-        let key_chunk = Chunk::from_arc_vectors(key_chunks);
+        let key_chunk = Chunk::from_arc_vectors(key_chunks, chunk.allocator().clone());
 
         // Extract payload (projection/residual-driven build columns).
-        let payload_chunk = self.build_payload_chunk(chunk);
+        let payload_chunk = self.build_payload_chunk(chunk)?;
 
         // Build into the local hash table
         if let Some(ref local_ht) = lstate.hash_table {
@@ -1012,21 +1119,10 @@ impl PhysicalOperator for HashJoin {
         let max_partition_ht_size = max_partition_size.saturating_add(
             JoinHashTable::pointer_table_size_for_count(max_partition_count),
         );
-        gstate
-            .temporary_memory_state
-            .set_minimum_reservation(max_partition_ht_size.saturating_add(probe_side_requirement));
-
-        let (probe_row_width, _all_constant) =
-            external::row_width_and_constness(self.base.join.left.types());
-        gstate
-            .temporary_memory_state
-            .set_materialization_penalty(probe_row_width.max(1));
-
-        if total_size == 0 {
-            gstate.temporary_memory_state.set_zero();
-        } else {
-            gstate.temporary_memory_state.set_remaining_size(total_size);
-        }
+        gstate.memory_tracker.set_minimum_reservation_bytes(
+            max_partition_ht_size.saturating_add(probe_side_requirement),
+        )?;
+        let _full_target_available = gstate.has_capacity_for_total(total_size)?;
 
         gstate.total_size.store(total_size, Ordering::Release);
         gstate
@@ -1061,9 +1157,8 @@ impl PhysicalOperator for HashJoin {
             let probe_side_requirement = gstate.probe_side_requirement.load(Ordering::Acquire);
             let force_external = gstate.force_external;
             *gstate.external_fallback_reason.lock().unwrap() = None;
-            gstate.temporary_memory_state.update_reservation();
-            let mut reservation = gstate.temporary_memory_state.get_reservation();
-            let mut external = (force_external && total_size > 0) || reservation < total_size;
+            let mut full_target_available = gstate.has_capacity_for_total(total_size)?;
+            let mut external = (force_external && total_size > 0) || !full_target_available;
 
             if external && !force_external {
                 let local_tables = gstate.local_hash_tables.lock().unwrap();
@@ -1081,20 +1176,18 @@ impl PhysicalOperator for HashJoin {
                     total_count,
                     HASH_JOIN_EXTERNAL_LOAD_FACTOR,
                 );
-                if lowered_size <= reservation {
+                if gstate.has_capacity_for_total(lowered_size)? {
                     total_size = lowered_size;
                     external = false;
+                    full_target_available = true;
                     gstate.total_size.store(total_size, Ordering::Release);
                     gstate
-                        .temporary_memory_state
-                        .set_minimum_reservation(total_size.max(1));
-                    gstate
-                        .temporary_memory_state
-                        .set_remaining_size_and_update_reservation(total_size.max(1));
+                        .memory_tracker
+                        .set_minimum_reservation_bytes(total_size.max(1))?;
                 }
             }
 
-            if !external {
+            if !external && full_target_available {
                 self.finalize_in_memory_hash_table(gstate)?;
                 gstate.externalized.store(false, Ordering::Release);
                 *gstate.external_runtime.lock().unwrap() = None;
@@ -1115,11 +1208,6 @@ impl PhysicalOperator for HashJoin {
                 return Err(paro_error::invalid_input(message));
             }
 
-            // Externalization materializes partitioned spill data instead of an in-memory
-            // pointer table. Release the old HT reservation before building spill partitions
-            // so the copy-out step can use that budget.
-            gstate.temporary_memory_state.set_zero();
-
             let local_tables = {
                 let mut tables = gstate.local_hash_tables.lock().unwrap();
                 std::mem::take(&mut *tables)
@@ -1127,12 +1215,13 @@ impl PhysicalOperator for HashJoin {
             let hash_col_idx = gstate.hash_table.hash_column_index();
             let layout = Arc::new(gstate.hash_table.layout().clone());
             let mut radix_bits = HASH_JOIN_INITIAL_RADIX_BITS;
-            let mut sink_builder = RadixPartitionedRowsBuilder::new(
+            let mut sink_builder = RadixPartitionedRowsBuilder::new_with_memory(
                 gstate.hash_table.buffer_pool().clone(),
                 layout.clone(),
                 MemoryTag::HashTable,
                 radix_bits,
                 hash_col_idx,
+                gstate.build_memory_context(),
             )?;
             let global_has_null = external::repartition_local_tables_into_sink_collection(
                 &local_tables,
@@ -1171,8 +1260,7 @@ impl PhysicalOperator for HashJoin {
                 mut max_partition_size,
                 mut max_partition_ht_size,
             ) = recompute_partition_stats(&sink_collection);
-            let repartition_budget =
-                reservation.max(gstate.temporary_memory_state.get_minimum_reservation());
+            let repartition_budget = gstate.memory_tracker.minimum_reservation_bytes()?.max(1);
             let mut max_partition_count = if max_partition_size == 0 {
                 0
             } else {
@@ -1233,12 +1321,9 @@ impl PhysicalOperator for HashJoin {
                 ))
                 .saturating_add(probe_side_requirement);
             gstate
-                .temporary_memory_state
-                .set_minimum_reservation(min_reservation.max(1));
-            gstate
-                .temporary_memory_state
-                .set_remaining_size_and_update_reservation(total_size.max(1));
-            reservation = gstate.temporary_memory_state.get_reservation();
+                .memory_tracker
+                .set_minimum_reservation_bytes(min_reservation.max(1))?;
+            let _total_target_available = gstate.has_capacity_for_total(total_size.max(1))?;
 
             let mut probe_types = self.base.join.left.types().to_vec();
             probe_types.push(LogicalType::UBigInt);
@@ -1277,12 +1362,6 @@ impl PhysicalOperator for HashJoin {
             gstate.externalized.store(true, Ordering::Release);
             gstate.finalized.store(true, Ordering::Release);
 
-            if reservation < probe_side_requirement {
-                gstate
-                    .temporary_memory_state
-                    .set_remaining_size_and_update_reservation(probe_side_requirement.max(1));
-            }
-
             if gstate.hash_table.count() == 0 && self.base.join.empty_result_if_rhs_is_empty() {
                 return Ok(SinkFinalizeType::NoOutputPossible);
             }
@@ -1311,6 +1390,7 @@ impl PhysicalOperator for HashJoin {
         fn create_source_state(
             sink: &HashJoinGlobalSinkState,
         ) -> Result<Box<dyn GlobalSourceState>> {
+            sink.retained_object.rebind_reclaimer();
             Ok(Box::new(HashJoinGlobalSourceState {
                 hash_table: Arc::clone(&sink.hash_table),
                 join_type: sink.join_type,
@@ -1378,6 +1458,7 @@ impl PhysicalOperator for HashJoin {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<crate::result_type::OperatorResultType> {
         Self::validate_join_type(self.base.join.join_type)?;
 
@@ -1402,7 +1483,7 @@ impl PhysicalOperator for HashJoin {
         }
 
         // Initialize output chunk
-        probe_engine::prepare_output_chunk(chunk, &self.base.join.types, input.capacity());
+        probe_engine::prepare_output_chunk(chunk, &self.base.join.types, input.capacity())?;
 
         if ht.is_empty() {
             if self.base.join.empty_result_if_rhs_is_empty() {
@@ -1412,7 +1493,7 @@ impl PhysicalOperator for HashJoin {
                     input,
                     chunk,
                     ht.has_null.load(Ordering::Relaxed),
-                );
+                )?;
             }
             return Ok(OperatorResultType::NeedMoreInput);
         }
@@ -1442,7 +1523,9 @@ impl PhysicalOperator for HashJoin {
             )?;
             state.probe_in_progress = !state.scan_structure.finished;
             if state.scan_structure.finished {
-                state.current_probe_input.reset();
+                state
+                    .current_probe_input
+                    .try_reset(state.current_probe_input.allocator().clone())?;
             }
             return Ok(probe_engine::result_for_probe_batch(
                 count,
@@ -1462,11 +1545,13 @@ impl PhysicalOperator for HashJoin {
             &self.base.equality_conditions,
             &mut state.probe_key_executors,
         )?;
-        state.current_probe_input.reset();
+        state
+            .current_probe_input
+            .try_reset(state.current_probe_input.allocator().clone())?;
 
         // 3. Apply filter pushdown (disabled on external path to avoid
         // partition-at-a-time correctness corner cases with deferred probe).
-        let mut sel = SelectionVector::incremental(input.size());
+        let mut sel = SelectionVector::try_incremental(input.size(), input.allocator().clone())?;
         let mut filtered_count = input.size();
         if !externalized {
             if let Some(ref filter_info) = self.filter_pushdown {
@@ -1502,7 +1587,7 @@ impl PhysicalOperator for HashJoin {
                 &mut state.scan_structure,
                 Some(&sel),
                 filtered_count,
-            );
+            )?;
             state.probe_in_progress = true;
         } else {
             // Filter pushdown can prove "no matches", but some join shapes still need
@@ -1528,7 +1613,9 @@ impl PhysicalOperator for HashJoin {
         )?;
         state.probe_in_progress = !state.scan_structure.finished;
         if state.scan_structure.finished {
-            state.current_probe_input.reset();
+            state
+                .current_probe_input
+                .try_reset(state.current_probe_input.allocator().clone())?;
         }
         Ok(probe_engine::result_for_probe_batch(
             count,
@@ -1542,6 +1629,7 @@ impl PhysicalOperator for HashJoin {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorFinalizeResultType> {
         let state = state
             .as_any_mut()
@@ -1607,12 +1695,13 @@ impl PhysicalOperator for HashJoin {
             chunk,
             &self.base.join.types,
             paro_common::vector::VECTOR_SIZE,
-        );
+        )?;
 
-        let mut build_chunk = Chunk::initialize(
+        let mut build_chunk = Chunk::try_initialize(
             &self.build_layout.build_payload_types,
             paro_common::vector::VECTOR_SIZE,
-        );
+            chunk.allocator().clone(),
+        )?;
         let count = gstate
             .hash_table
             .scan_full_outer(scan_state, emit_found, &mut build_chunk)?;
@@ -1621,7 +1710,7 @@ impl PhysicalOperator for HashJoin {
             return Ok(SourceResultType::Finished);
         }
 
-        let build_sel = SelectionVector::incremental(count);
+        let build_sel = SelectionVector::try_incremental(count, chunk.allocator().clone())?;
         match self.base.join.join_type {
             JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
                 &build_chunk,
@@ -1639,7 +1728,7 @@ impl PhysicalOperator for HashJoin {
                 chunk,
             ),
             _ => unreachable!("source path is only used by right/full/right-semi/right-anti"),
-        }
+        }?;
 
         Ok(SourceResultType::HaveMoreOutput)
     }
@@ -1674,21 +1763,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use paro_common::chunk::Chunk;
+    use paro_common::memory::{MemoryDomain, MemoryOwner};
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
-    use paro_context::{StatementContext, TestStatementContextBuilder};
+
+    use paro_context::{RuntimeLimits, StatementContext, TestStatementContextBuilder};
     use paro_planner::expression::{
         ConstantExpression, Expression, OperatorExpression, OperatorType, ReferenceExpression,
     };
     use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
     use paro_scheduler::task::InterruptState;
-    use paro_storage::buffer::{
-        BufferPool, TemporaryMemoryConfig, TemporaryMemoryManager, TemporaryMemoryState,
-    };
+    use paro_storage::buffer::BufferPool;
 
     use crate::execution_context::ExecutionContext;
     use crate::join_hashtable::join_hashtable::{JoinHashTable, JoinHashTableConfig};
+    use crate::memory_runtime::{
+        OperatorExternalMemoryTracker, OperatorMemoryAccount, QueryMemoryPool, SharedRetainedObject,
+    };
     use crate::operator::projection::Projection;
     use crate::operator::scan::dummy_scan::PhysicalDummyScan;
     use crate::operator::scan::expression_scan::PhysicalExpressionScan;
@@ -1733,22 +1824,42 @@ mod tests {
         BufferPool::new_arc(64 * 1024 * 1024)
     }
 
-    fn create_test_temporary_memory_state() -> Arc<TemporaryMemoryState> {
-        static TEMP_MEM_MANAGER: OnceLock<Arc<TemporaryMemoryManager>> = OnceLock::new();
-        let manager = TEMP_MEM_MANAGER
-            .get_or_init(|| Arc::new(TemporaryMemoryManager::new()))
-            .clone();
-        manager.register()
+    fn create_test_memory_tracker() -> Arc<OperatorExternalMemoryTracker> {
+        let pool = Arc::new(QueryMemoryPool::unbounded());
+        let account = Arc::new(OperatorMemoryAccount::new(pool));
+        Arc::new(OperatorExternalMemoryTracker::new(
+            account,
+            MemoryDomain::Host,
+            super::HASH_JOIN_MEMORY_TAG,
+            super::HASH_JOIN_MEMORY_CLASS,
+        ))
+    }
+
+    fn create_test_global_sink_state(
+        hash_table: Arc<JoinHashTable>,
+        build_types: Vec<LogicalType>,
+        join_type: JoinType,
+    ) -> Arc<HashJoinGlobalSinkState> {
+        let memory_tracker = create_test_memory_tracker();
+        let retained_owner: Arc<dyn MemoryOwner> = memory_tracker.clone();
+        let retained_object = Arc::new(SharedRetainedObject::new(
+            "test_hash_join_build_side",
+            retained_owner,
+            MemoryDomain::Host,
+            super::HASH_JOIN_MEMORY_TAG,
+        ));
+        Arc::new(HashJoinGlobalSinkState::new(
+            hash_table,
+            build_types,
+            join_type,
+            memory_tracker,
+            retained_object,
+            false,
+        ))
     }
 
     fn create_test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
-    }
-
-    fn create_test_session_with_max_memory(max_memory: usize) -> Arc<StatementContext> {
-        let session = TestStatementContextBuilder::minimal().build();
-        session.buffer_pool().set_memory_limit(max_memory).unwrap();
-        session
     }
 
     fn create_test_temp_dir(prefix: &str) -> String {
@@ -1761,23 +1872,24 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
-    fn enable_force_external(session: &Arc<StatementContext>) -> String {
+    fn create_force_external_session(max_memory: usize) -> (Arc<StatementContext>, String) {
         let temp_dir = create_test_temp_dir("paro_hash_join_external");
+        let session = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits {
+                max_threads: 1,
+                max_memory,
+                use_temporary_directory: true,
+                temporary_directory: temp_dir.clone(),
+                max_temp_directory_size: None,
+                force_external: true,
+            })
+            .build();
+        session.buffer_pool().set_memory_limit(max_memory).unwrap();
         session
             .buffer_pool()
             .set_temporary_directory(temp_dir.clone())
             .expect("temp directory should be configured");
-        session
-            .temporary_memory_manager()
-            .update_configuration(TemporaryMemoryConfig {
-                memory_limit: session.limits.max_memory,
-                has_temporary_directory: true,
-                num_threads: 1,
-                num_connections: 1,
-                query_max_memory: usize::MAX,
-                force_external: true,
-            });
-        temp_dir
+        (session, temp_dir)
     }
 
     fn spill_file_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1875,21 +1987,41 @@ mod tests {
     ) -> Arc<JoinHashTable> {
         let ht = Arc::new(JoinHashTable::new(
             create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
             vec![equality_condition()],
             vec![LogicalType::Integer],
             join_type,
             JoinHashTableConfig::default(),
         ));
 
-        let keys = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(build_keys))]);
-        let payload = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(build_payload))]);
+        let keys = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    build_keys,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    build_payload,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         ht.build(&keys, &payload).unwrap();
         ht.finalize().unwrap();
         ht
     }
 
     fn chunk_from_optional_i32(values: &[Option<i32>]) -> Chunk {
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], values.len());
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::Integer],
+            values.len(),
+        );
         for (row_idx, value) in values.iter().enumerate() {
             let column = chunk.column_mut(0).expect("column must exist");
             match value {
@@ -1909,6 +2041,7 @@ mod tests {
     ) -> Arc<JoinHashTable> {
         let ht = Arc::new(JoinHashTable::new(
             create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
             vec![condition],
             vec![LogicalType::Integer],
             join_type,
@@ -1957,13 +2090,11 @@ mod tests {
             "expected default external flag in explain params, got: {params_without_sink:?}"
         );
 
-        let sink_state = Arc::new(HashJoinGlobalSinkState::new(
+        let sink_state = create_test_global_sink_state(
             build_hash_table(JoinType::Inner, &[1, 2], &[10, 20]),
             vec![LogicalType::Integer],
             JoinType::Inner,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        );
         join.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
         let params_with_sink = join.explain_params();
@@ -1993,7 +2124,15 @@ mod tests {
             .expect("local sink state should be created");
         let interrupt = InterruptState::new();
 
-        let build_chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2, 3]))]);
+        let build_chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2, 3],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let mut sink_input = OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
         join.sink(&ctx, &build_chunk, &mut sink_input)
             .expect("sink should accept build chunk");
@@ -2030,17 +2169,16 @@ mod tests {
     #[test]
     fn force_external_requires_temp_directory() {
         let join = create_column_ref_test_join(JoinType::Inner);
-        let session = create_test_session();
-        session
-            .temporary_memory_manager()
-            .update_configuration(TemporaryMemoryConfig {
-                memory_limit: session.limits.max_memory,
-                has_temporary_directory: false,
-                num_threads: 1,
-                num_connections: 1,
-                query_max_memory: usize::MAX,
+        let session = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits {
+                max_threads: 1,
+                max_memory: 64 * 1024 * 1024,
+                use_temporary_directory: false,
+                temporary_directory: String::new(),
+                max_temp_directory_size: None,
                 force_external: true,
-            });
+            })
+            .build();
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
 
@@ -2054,7 +2192,15 @@ mod tests {
             .get_local_sink_state(&ctx)
             .expect("local sink state should be created");
         let interrupt = InterruptState::new();
-        let build_chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2]))]);
+        let build_chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let mut sink_input = OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
         join.sink(&ctx, &build_chunk, &mut sink_input)
             .expect("sink should accept build chunk");
@@ -2078,13 +2224,8 @@ mod tests {
     fn mark_join_execute_returns_need_more_input_after_single_batch() {
         let join = create_test_join(JoinType::Mark);
         let hash_table = build_hash_table(JoinType::Mark, &[1], &[10]);
-        let sink_state = Arc::new(HashJoinGlobalSinkState::new(
-            hash_table,
-            vec![LogicalType::Integer],
-            JoinType::Mark,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        let sink_state =
+            create_test_global_sink_state(hash_table, vec![LogicalType::Integer], JoinType::Mark);
         sink_state.finalized.store(true, Ordering::Release);
         join.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
@@ -2092,12 +2233,28 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[7, 8]))]);
-        let mut output = Chunk::new();
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[7, 8],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -2126,6 +2283,7 @@ mod tests {
         .expect("hash join should be created");
         let hash_table = Arc::new(JoinHashTable::new(
             create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
             vec![JoinCondition::new(
                 constant_i32(5),
                 reference_i32(0),
@@ -2135,18 +2293,29 @@ mod tests {
             JoinType::Mark,
             JoinHashTableConfig::default(),
         ));
-        let keys = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
-        let payload = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
+        let keys = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         hash_table.build(&keys, &payload).unwrap();
         hash_table.finalize().unwrap();
 
-        let sink_state = Arc::new(HashJoinGlobalSinkState::new(
-            hash_table,
-            vec![LogicalType::Integer],
-            JoinType::Mark,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        let sink_state =
+            create_test_global_sink_state(hash_table, vec![LogicalType::Integer], JoinType::Mark);
         sink_state.finalized.store(true, Ordering::Release);
         join.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
@@ -2154,13 +2323,22 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let mut input = Chunk::new();
+        let mut input = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         input.set_cardinality(1);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -2188,13 +2366,8 @@ mod tests {
         )
         .expect("hash join should be created");
         let hash_table = build_hash_table(JoinType::Mark, &[5], &[5]);
-        let mut sink_state = Arc::new(HashJoinGlobalSinkState::new(
-            hash_table,
-            vec![LogicalType::Integer],
-            JoinType::Mark,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        let mut sink_state =
+            create_test_global_sink_state(hash_table, vec![LogicalType::Integer], JoinType::Mark);
 
         let filter_info = crate::operator::join::join_filter_pushdown::JoinFilterPushdownInfo::new(
             vec![0],
@@ -2212,7 +2385,15 @@ mod tests {
             false,
         );
         let mut filter_lstate = filter_info.get_local_state();
-        let build_keys = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
+        let build_keys = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         filter_info.sink(&build_keys, &mut filter_lstate);
         let filter_gstate = filter_info.get_global_state();
         filter_info.combine(&filter_gstate, filter_lstate);
@@ -2228,13 +2409,22 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let mut input = Chunk::new();
+        let mut input = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         input.set_cardinality(1);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -2269,6 +2459,7 @@ mod tests {
         );
         let inner_hash_table = Arc::new(JoinHashTable::new(
             create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
             vec![JoinCondition::new(
                 constant_i32(5),
                 reference_i32(0),
@@ -2278,24 +2469,40 @@ mod tests {
             JoinType::Mark,
             JoinHashTableConfig::default(),
         ));
-        let inner_keys = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
-        let inner_payload = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
+        let inner_keys = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let inner_payload = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         inner_hash_table.build(&inner_keys, &inner_payload).unwrap();
         inner_hash_table.finalize().unwrap();
-        let inner_sink = Arc::new(HashJoinGlobalSinkState::new(
+        let inner_sink = create_test_global_sink_state(
             inner_hash_table,
             vec![LogicalType::Integer],
             JoinType::Mark,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        );
         inner_sink.finalized.store(true, Ordering::Release);
         inner_join.set_sink_state(inner_sink as Arc<dyn GlobalSinkState>);
 
         let mut inner_state = inner_join.get_operator_state(&ctx).unwrap();
-        let mut dummy_input = Chunk::new();
+        let mut dummy_input = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         dummy_input.set_cardinality(1);
-        let mut inner_output = Chunk::new();
+        let mut inner_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         inner_join
             .execute(
                 &ctx,
@@ -2303,6 +2510,7 @@ mod tests {
                 &mut inner_output,
                 &gstate,
                 inner_state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .unwrap();
         assert_eq!(inner_output.len(), 1);
@@ -2325,6 +2533,7 @@ mod tests {
         .expect("hash join should be created");
         let outer_hash_table = Arc::new(JoinHashTable::new(
             create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
             vec![JoinCondition::new(
                 constant_i32(7),
                 reference_i32(0),
@@ -2334,22 +2543,37 @@ mod tests {
             JoinType::Mark,
             JoinHashTableConfig::default(),
         ));
-        let outer_keys = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
-        let outer_payload = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5]))]);
+        let outer_keys = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let outer_payload = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         outer_hash_table.build(&outer_keys, &outer_payload).unwrap();
         outer_hash_table.finalize().unwrap();
-        let outer_sink = Arc::new(HashJoinGlobalSinkState::new(
+        let outer_sink = create_test_global_sink_state(
             outer_hash_table,
             vec![LogicalType::Integer],
             JoinType::Mark,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        );
         outer_sink.finalized.store(true, Ordering::Release);
         outer_join.set_sink_state(outer_sink as Arc<dyn GlobalSinkState>);
 
         let mut outer_state = outer_join.get_operator_state(&ctx).unwrap();
-        let mut outer_output = Chunk::new();
+        let mut outer_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         outer_join
             .execute(
                 &ctx,
@@ -2357,6 +2581,7 @@ mod tests {
                 &mut outer_output,
                 &gstate,
                 outer_state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .unwrap();
 
@@ -2463,13 +2688,8 @@ mod tests {
     fn left_join_execute_emits_matches_then_unmatched_without_reprobe() {
         let join = create_column_ref_test_join(JoinType::Left);
         let hash_table = build_hash_table(JoinType::Left, &[2, 4], &[20, 40]);
-        let sink_state = Arc::new(HashJoinGlobalSinkState::new(
-            hash_table,
-            vec![LogicalType::Integer],
-            JoinType::Left,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        let sink_state =
+            create_test_global_sink_state(hash_table, vec![LogicalType::Integer], JoinType::Left);
         sink_state.finalized.store(true, Ordering::Release);
         join.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
@@ -2477,13 +2697,30 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2, 4]))]);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2, 4],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let gstate = EmptyGlobalOperatorState;
 
-        let mut first_output =
-            Chunk::initialize(&[LogicalType::BigInt], paro_common::vector::VECTOR_SIZE);
+        let mut first_output = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::BigInt],
+            paro_common::vector::VECTOR_SIZE,
+        );
         let first_result = join
-            .execute(&ctx, &input, &mut first_output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut first_output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
         assert_eq!(first_result, OperatorResultType::HaveMoreOutput);
         assert_eq!(first_output.size(), 2);
@@ -2494,7 +2731,14 @@ mod tests {
 
         let mut second_output = first_output.clone();
         let second_result = join
-            .execute(&ctx, &input, &mut second_output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut second_output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
         assert_eq!(second_result, OperatorResultType::NeedMoreInput);
         assert_eq!(second_output.size(), 1);
@@ -2518,7 +2762,8 @@ mod tests {
         let mut lstate = join.get_local_source_state(&ctx, &gstate).unwrap();
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(&gstate, lstate.as_mut(), &interrupt);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let result = join.get_data(&ctx, &mut output, &mut input).unwrap();
 
@@ -2535,8 +2780,7 @@ mod tests {
     #[test]
     fn force_external_right_join_scans_build_side_without_probe_input() {
         let join = create_column_ref_test_join(JoinType::Right);
-        let session = create_test_session();
-        let temp_dir = enable_force_external(&session);
+        let (session, temp_dir) = create_force_external_session(64 * 1024 * 1024);
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
 
@@ -2550,7 +2794,15 @@ mod tests {
             .get_local_sink_state(&ctx)
             .expect("local sink state should be created");
         let interrupt = InterruptState::new();
-        let build_chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2]))]);
+        let build_chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let mut sink_input = OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
         join.sink(&ctx, &build_chunk, &mut sink_input)
             .expect("sink should accept build chunk");
@@ -2582,9 +2834,16 @@ mod tests {
         let goperator = EmptyGlobalOperatorState;
 
         loop {
-            let mut final_output = Chunk::new();
+            let mut final_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+                .expect("test chunk allocation failed");
             let result = join
-                .final_execute(&ctx, &mut final_output, &goperator, operator_state.as_mut())
+                .final_execute(
+                    &ctx,
+                    &mut final_output,
+                    &goperator,
+                    operator_state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .expect("final execute should succeed");
             if result == OperatorFinalizeResultType::Finished {
                 break;
@@ -2600,8 +2859,10 @@ mod tests {
         let mut source_input =
             OperatorSourceInput::new(gsource.as_ref(), lsource.as_mut(), &interrupt);
         let mut seen_rows = Vec::new();
-        let mut source_output =
-            Chunk::initialize(&[LogicalType::BigInt], paro_common::vector::VECTOR_SIZE);
+        let mut source_output = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::BigInt],
+            paro_common::vector::VECTOR_SIZE,
+        );
         loop {
             let source_result = join
                 .get_data(&ctx, &mut source_output, &mut source_input)
@@ -2627,8 +2888,7 @@ mod tests {
     fn force_external_left_join_releases_spill_files_after_finish() {
         let _guard = spill_file_test_guard();
         let join = create_column_ref_test_join(JoinType::Left);
-        let session = create_test_session_with_max_memory(32 * 1024 * 1024);
-        let temp_dir = enable_force_external(&session);
+        let (session, temp_dir) = create_force_external_session(32 * 1024 * 1024);
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let pool = ctx.buffer_pool().clone();
@@ -2647,7 +2907,15 @@ mod tests {
         for start in (1..=20_000_i32).step_by(paro_common::vector::VECTOR_SIZE) {
             let end = (start + paro_common::vector::VECTOR_SIZE as i32 - 1).min(20_000);
             let values: Vec<i32> = (start..=end).collect();
-            let build_chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&values))]);
+            let build_chunk = Chunk::from_arc_vectors(
+                vec![Arc::new(
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                )],
+                paro_common::test_utils::test_allocator(),
+            );
             let mut sink_input =
                 OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
             join.sink(&ctx, &build_chunk, &mut sink_input)
@@ -2678,10 +2946,26 @@ mod tests {
         for start in (1..=20_000_i32).step_by(paro_common::vector::VECTOR_SIZE) {
             let end = (start + paro_common::vector::VECTOR_SIZE as i32 - 1).min(20_000);
             let values: Vec<i32> = (start..=end).collect();
-            let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&values))]);
-            let mut output = Chunk::new();
+            let input = Chunk::from_arc_vectors(
+                vec![Arc::new(
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                )],
+                paro_common::test_utils::test_allocator(),
+            );
+            let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+                .expect("test chunk allocation failed");
             let result = join
-                .execute(&ctx, &input, &mut output, &goperator, state.as_mut())
+                .execute(
+                    &ctx,
+                    &input,
+                    &mut output,
+                    &goperator,
+                    state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .expect("execute should succeed");
             assert!(
                 matches!(
@@ -2693,9 +2977,16 @@ mod tests {
         }
 
         loop {
-            let mut final_output = Chunk::new();
+            let mut final_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+                .expect("test chunk allocation failed");
             let result = join
-                .final_execute(&ctx, &mut final_output, &goperator, state.as_mut())
+                .final_execute(
+                    &ctx,
+                    &mut final_output,
+                    &goperator,
+                    state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .expect("final execute should succeed");
             if result == OperatorFinalizeResultType::Finished {
                 break;
@@ -2716,8 +3007,7 @@ mod tests {
     fn force_external_finalize_cleanup_releases_spill_files_under_tight_budget() {
         let _guard = spill_file_test_guard();
         let join = create_column_ref_test_join(JoinType::Left);
-        let session = create_test_session_with_max_memory(1024 * 1024);
-        let temp_dir = enable_force_external(&session);
+        let (session, temp_dir) = create_force_external_session(2 * 1024 * 1024);
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let pool = ctx.buffer_pool().clone();
@@ -2736,7 +3026,15 @@ mod tests {
         for start in (1..=20_000_i32).step_by(paro_common::vector::VECTOR_SIZE) {
             let end = (start + paro_common::vector::VECTOR_SIZE as i32 - 1).min(20_000);
             let values: Vec<i32> = (start..=end).collect();
-            let build_chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&values))]);
+            let build_chunk = Chunk::from_arc_vectors(
+                vec![Arc::new(
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                )],
+                paro_common::test_utils::test_allocator(),
+            );
             let mut sink_input =
                 OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
             join.sink(&ctx, &build_chunk, &mut sink_input)
@@ -2772,8 +3070,7 @@ mod tests {
 
     #[test]
     fn force_external_mark_join_buffers_correctly_under_order_by() {
-        let session = create_test_session();
-        let temp_dir = enable_force_external(&session);
+        let (session, temp_dir) = create_force_external_session(64 * 1024 * 1024);
 
         let build_source = Arc::new(PhysicalExpressionScan::new(
             vec![
@@ -2881,8 +3178,7 @@ mod tests {
     #[test]
     fn force_external_single_join_returns_one_match_per_probe_row() {
         let join = create_column_ref_test_join(JoinType::Single);
-        let session = create_test_session();
-        let temp_dir = enable_force_external(&session);
+        let (session, temp_dir) = create_force_external_session(64 * 1024 * 1024);
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
 
@@ -2896,7 +3192,15 @@ mod tests {
             .get_local_sink_state(&ctx)
             .expect("local sink state should be created");
         let interrupt = InterruptState::new();
-        let build_chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2, 4]))]);
+        let build_chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2, 4],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let mut sink_input = OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
         join.sink(&ctx, &build_chunk, &mut sink_input)
             .expect("sink should accept build chunk");
@@ -2918,13 +3222,29 @@ mod tests {
         assert!(sink_state.externalized());
 
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2, 3, 4]))]);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2, 3, 4],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let goperator = EmptyGlobalOperatorState;
         let mut rows = Vec::new();
 
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let result = join
-            .execute(&ctx, &input, &mut output, &goperator, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &goperator,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("execute should succeed");
         for row_idx in 0..output.size() {
             rows.push((
@@ -2941,9 +3261,16 @@ mod tests {
         );
 
         loop {
-            let mut final_output = Chunk::new();
+            let mut final_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+                .expect("test chunk allocation failed");
             let finalize_result = join
-                .final_execute(&ctx, &mut final_output, &goperator, state.as_mut())
+                .final_execute(
+                    &ctx,
+                    &mut final_output,
+                    &goperator,
+                    state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .expect("final execute should succeed");
             for row_idx in 0..final_output.size() {
                 rows.push((
@@ -2986,7 +3313,8 @@ mod tests {
         let mut lstate = join.get_local_source_state(&ctx, &gstate).unwrap();
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(&gstate, lstate.as_mut(), &interrupt);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let result = join.get_data(&ctx, &mut output, &mut input).unwrap();
 
@@ -3001,13 +3329,11 @@ mod tests {
         let join = create_column_ref_test_join(JoinType::RightSemi);
         let hash_table =
             build_hash_table(JoinType::RightSemi, &[1, 2, 3, 3, 6], &[10, 20, 30, 31, 60]);
-        let sink_state = Arc::new(HashJoinGlobalSinkState::new(
+        let sink_state = create_test_global_sink_state(
             hash_table.clone(),
             vec![LogicalType::Integer],
             JoinType::RightSemi,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        );
         sink_state.finalized.store(true, Ordering::Release);
         join.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
 
@@ -3015,12 +3341,28 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[1, 2, 3, 3, 4]))]);
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2, 3, 3, 4],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let gstate = EmptyGlobalOperatorState;
 
-        let mut probe_output = Chunk::new();
+        let mut probe_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let probe_result = join
-            .execute(&ctx, &input, &mut probe_output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut probe_output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
         assert_eq!(probe_result, OperatorResultType::NeedMoreInput);
         assert_eq!(probe_output.size(), 0);
@@ -3033,7 +3375,8 @@ mod tests {
         let interrupt = InterruptState::new();
         let mut source_input =
             OperatorSourceInput::new(&source_gstate, source_lstate.as_mut(), &interrupt);
-        let mut source_output = Chunk::new();
+        let mut source_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let source_result = join
             .get_data(&ctx, &mut source_output, &mut source_input)
@@ -3060,19 +3403,18 @@ mod tests {
             &[Some(2), None],
             &[Some(20), None],
         );
-        let semi_sink_state = Arc::new(HashJoinGlobalSinkState::new(
+        let semi_sink_state = create_test_global_sink_state(
             semi_hash_table,
             vec![LogicalType::Integer],
             JoinType::Semi,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        );
         semi_sink_state.finalized.store(true, Ordering::Release);
         semi_join.set_sink_state(semi_sink_state as Arc<dyn GlobalSinkState>);
 
         let mut semi_state = semi_join.get_operator_state(&ctx).unwrap();
         let semi_input = chunk_from_optional_i32(&[None, Some(2)]);
-        let mut semi_output = Chunk::new();
+        let mut semi_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let semi_result = semi_join
             .execute(
                 &ctx,
@@ -3080,6 +3422,7 @@ mod tests {
                 &mut semi_output,
                 &gstate,
                 semi_state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .unwrap();
         assert_eq!(semi_result, OperatorResultType::NeedMoreInput);
@@ -3094,18 +3437,17 @@ mod tests {
             &[Some(2), None],
             &[Some(20), None],
         );
-        let anti_sink_state = Arc::new(HashJoinGlobalSinkState::new(
+        let anti_sink_state = create_test_global_sink_state(
             anti_hash_table,
             vec![LogicalType::Integer],
             JoinType::Anti,
-            create_test_temporary_memory_state(),
-            false,
-        ));
+        );
         anti_sink_state.finalized.store(true, Ordering::Release);
         anti_join.set_sink_state(anti_sink_state as Arc<dyn GlobalSinkState>);
 
         let mut anti_state = anti_join.get_operator_state(&ctx).unwrap();
-        let mut anti_output = Chunk::new();
+        let mut anti_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let anti_result = anti_join
             .execute(
                 &ctx,
@@ -3113,6 +3455,7 @@ mod tests {
                 &mut anti_output,
                 &gstate,
                 anti_state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .unwrap();
         assert_eq!(anti_result, OperatorResultType::NeedMoreInput);

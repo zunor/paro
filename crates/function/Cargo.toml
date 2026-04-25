@@ -36,3 +36,6 @@ paro-parser = { workspace = true }
 paro-storage = { workspace = true }
 regex = "1"
 serde_json = { workspace = true }
+
+[dev-dependencies]
+paro-common = { workspace = true, features = ["test-support"] }

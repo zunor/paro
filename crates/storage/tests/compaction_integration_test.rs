@@ -1,10 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_common::allocator::{default_allocator, Allocator};
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::compaction::compaction_manager::CompactionManager;
 use paro_storage::compaction::compaction_task::{CompactionTask, HorizontalCompactionTask};
 use paro_storage::compaction::execution::rowset_merger::RowsetMerger;
@@ -29,7 +29,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 fn compaction_allocator() -> Arc<dyn Allocator> {
-    Arc::new(default_allocator())
+    test_allocator()
 }
 
 fn create_test_schema() -> Arc<TabletSchema> {
@@ -86,7 +86,14 @@ fn append_data_with_txn(tablet: &Arc<Tablet>, txn_id: u64, keys: Vec<i32>, value
     assert_eq!(keys.len(), values.len());
     let mut writer = DeltaWriter::open(tablet.clone(), txn_id).unwrap();
 
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&keys), Vector::from_i32(&values)]);
+    let allocator = test_allocator();
+    let chunk = Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_i32_vector_with_allocator(&keys, allocator.clone()),
+            paro_common::test_utils::test_i32_vector_with_allocator(&values, allocator.clone()),
+        ],
+        allocator,
+    );
 
     writer.write_chunk(&chunk).unwrap();
     writer.commit().unwrap();
@@ -106,7 +113,14 @@ fn delete_data_with_txn(tablet: &Arc<Tablet>, txn_id: u64, keys: Vec<i32>) {
     let writer = DeltaWriter::open(tablet.clone(), txn_id).unwrap();
 
     // Delete chunk only needs key columns: pk (i32)
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(&keys)]);
+    let allocator = test_allocator();
+    let chunk = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            &keys,
+            allocator.clone(),
+        )],
+        allocator,
+    );
 
     let count = writer.delete_keys(&chunk).unwrap();
     assert_eq!(count, keys.len(), "Failed to delete all requested keys");

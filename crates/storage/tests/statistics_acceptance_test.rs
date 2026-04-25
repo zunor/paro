@@ -3,10 +3,9 @@
 
 use std::sync::Arc;
 
-use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::compaction::compaction_task::{CompactionTask, HorizontalCompactionTask};
 use paro_storage::compaction::execution::statistics_merge::merge_rowset_statistics;
 use paro_storage::compaction::plan::CompactionPlanner;
@@ -50,7 +49,14 @@ fn create_tablet(tablet_id: u64, schema: Arc<TabletSchema>) -> (TabletRef, TempD
 fn append_rows(tablet: &TabletRef, txn_id: u64, keys: &[i32], values: &[i32]) {
     assert_eq!(keys.len(), values.len());
     let mut writer = DeltaWriter::open(tablet.clone(), txn_id).unwrap();
-    let chunk = Chunk::from_vectors(vec![Vector::from_i32(keys), Vector::from_i32(values)]);
+    let allocator = test_allocator();
+    let chunk = Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_i32_vector_with_allocator(keys, allocator.clone()),
+            paro_common::test_utils::test_i32_vector_with_allocator(values, allocator.clone()),
+        ],
+        allocator,
+    );
     writer.write_chunk(&chunk).unwrap();
     writer.commit().unwrap();
 }
@@ -85,7 +91,14 @@ fn test_segment_statistics() {
     assert_eq!(col0.null_count, 0);
     assert_eq!(col1.null_count, 0);
 
-    let delete_chunk = Chunk::from_vectors(vec![Vector::from_i32(&[2, 4])]);
+    let allocator = test_allocator();
+    let delete_chunk = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2, 4],
+            allocator.clone(),
+        )],
+        allocator,
+    );
     let writer = DeltaWriter::open(tablet.clone(), 1002).unwrap();
     let deleted = writer.delete_keys(&delete_chunk).unwrap();
     assert_eq!(deleted, 2);
@@ -123,8 +136,7 @@ fn test_statistics_merge() {
     let context = CompactionPlanner::plan(&tablet)
         .unwrap()
         .expect("compaction plan should exist");
-    let mut task =
-        HorizontalCompactionTask::new(tablet.clone(), context, Arc::new(default_allocator()));
+    let mut task = HorizontalCompactionTask::new(tablet.clone(), context, test_allocator());
     task.run().unwrap();
 
     assert_eq!(tablet.num_rowsets(), 1);

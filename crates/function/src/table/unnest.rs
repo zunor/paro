@@ -573,7 +573,8 @@ mod tests {
         let gstate = UnnestGlobalState::new(bind_data.cardinality);
         let mut lstate = UnnestLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -599,7 +600,8 @@ mod tests {
         let gstate = UnnestGlobalState::new(bind_data.cardinality);
         let mut lstate = UnnestLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -626,7 +628,10 @@ mod tests {
         let mut batch_count = 0;
 
         loop {
-            let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+            let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+                &[LogicalType::BigInt],
+                VECTOR_SIZE,
+            );
 
             let mut input = TableFunctionInput {
                 bind_data: Some(&bind_data as &dyn TableFunctionBindData),
@@ -661,7 +666,8 @@ mod tests {
         let gstate = UnnestGlobalState::new(bind_data.cardinality);
         let mut lstate = UnnestLocalState::new();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::BigInt], VECTOR_SIZE);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], VECTOR_SIZE);
 
         let mut input = TableFunctionInput {
             bind_data: Some(&bind_data as &dyn TableFunctionBindData),

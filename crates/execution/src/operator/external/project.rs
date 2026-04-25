@@ -8,10 +8,12 @@ use parking_lot::Mutex;
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingClass;
 use paro_common::types::LogicalType;
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::types::ExplainRuntimeStats;
+use crate::memory_runtime::OperatorMemoryScope;
 use crate::operator::state::{GlobalOperatorState, OperatorState};
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
@@ -91,6 +93,13 @@ impl ExternalProject {
         self.shared_state().map(|shared| shared.runtime_stats())
     }
 
+    fn runtime_allocator(memory: &OperatorMemoryScope<'_>) -> Arc<dyn Allocator> {
+        memory.accounted_allocator_for(
+            MemoryTag::ExternalRuntimeHost,
+            MemoryAccountingClass::NonRevocable,
+        )
+    }
+
     fn cache_stats(&self) -> Option<super::result_cache::QueryLocalResultCacheStats> {
         self.shared_state().map(|shared| shared.cache_stats())
     }
@@ -129,18 +138,18 @@ impl ExternalProject {
         }
 
         let mut batch_view = state.accumulation.clone();
-        batch_view.slice_range(0, rows);
-        let batch = batch_view.deep_copy_with_allocator(allocator.clone());
+        batch_view.try_slice_range(0, rows)?;
+        let batch = batch_view.try_deep_copy(allocator.clone())?;
 
         if rows == state.accumulation.size() {
-            state.accumulation.reset();
+            state.accumulation.try_reset(allocator.clone())?;
             state.accumulation_bytes = 0;
             return Ok(batch);
         }
 
         let mut remaining_view = state.accumulation.clone();
-        remaining_view.slice_range(rows, state.accumulation.size() - rows);
-        state.accumulation = remaining_view.deep_copy_with_allocator(allocator);
+        remaining_view.try_slice_range(rows, state.accumulation.size() - rows)?;
+        state.accumulation = remaining_view.try_deep_copy(allocator)?;
         state.accumulation_bytes = SubmissionBatchPolicy::estimate_chunk_bytes(&state.accumulation);
         Ok(batch)
     }
@@ -150,14 +159,21 @@ impl ExternalProject {
         shared: &Arc<ExternalProjectSharedState>,
         state: &mut ExternalProjectState,
         input: &Chunk,
-    ) {
+        memory: &OperatorMemoryScope<'_>,
+    ) -> Result<()> {
         if state.current_input_staged || input.is_empty() {
-            return;
+            return Ok(());
         }
-        state.accumulation.append(input);
+        if !state.accumulation_uses_runtime_allocator {
+            state.accumulation =
+                Chunk::try_init_empty(self.child.types(), Self::runtime_allocator(memory))?;
+            state.accumulation_uses_runtime_allocator = true;
+        }
+        state.accumulation.try_append(input)?;
         state.accumulation_bytes = SubmissionBatchPolicy::estimate_chunk_bytes(&state.accumulation);
         state.current_input_staged = true;
         shared.observe_accumulation_bytes(state.accumulation_bytes);
+        Ok(())
     }
 
     fn submit_if_ready(
@@ -166,6 +182,7 @@ impl ExternalProject {
         shared: &Arc<ExternalProjectSharedState>,
         state: &mut ExternalProjectState,
         tail_flush: bool,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<Option<OperatorResultType>> {
         if !self.batch_policy.should_flush(
             state.accumulation.size(),
@@ -176,7 +193,7 @@ impl ExternalProject {
             return Ok(None);
         }
 
-        let allocator = ctx.allocator(MemoryTag::Extension);
+        let allocator = Self::runtime_allocator(memory);
         let target_rows = self
             .batch_policy
             .suggest_batch_rows(self.child.types(), state.accumulation_bytes)
@@ -216,6 +233,7 @@ impl ExternalProject {
                     response,
                     false,
                     false,
+                    memory,
                 )?;
                 return Ok(None);
             }
@@ -232,7 +250,7 @@ impl ExternalProject {
         };
         state.next_batch_id = state.next_batch_id.saturating_add(1);
 
-        match self.bridge.execute_project(ctx, &submission)? {
+        match self.bridge.execute_project(ctx, &submission, memory)? {
             RuntimeBridgeOutcome::Ready(response) => {
                 shared.record_submission(input_batch.size(), input_bytes, false, &response);
                 self.finish_project_response(
@@ -243,6 +261,7 @@ impl ExternalProject {
                     response,
                     true,
                     false,
+                    memory,
                 )?;
                 Ok(None)
             }
@@ -263,13 +282,14 @@ impl ExternalProject {
 
     fn finish_project_response(
         &self,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         shared: &Arc<ExternalProjectSharedState>,
         state: &mut ExternalProjectState,
         input_batch: Chunk,
         response: RuntimeBridgeResponse,
         allow_cache_insert: bool,
         blocked_path: bool,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<()> {
         if response.output_batches.len() != 1 {
             return Err(paro_error::internal(
@@ -306,18 +326,18 @@ impl ExternalProject {
                     .map(|routine| routine.identity.clone())
                     .collect(),
             );
+            let allocator = Self::runtime_allocator(memory);
+            let cache_chunk = generated.try_deep_copy(allocator)?;
             let _ = shared.cache_insert(
                 cache_key,
-                generated.deep_copy_with_allocator(ctx.allocator(MemoryTag::Extension)),
+                cache_chunk,
                 SubmissionBatchPolicy::estimate_chunk_bytes(generated),
             );
         }
 
-        let final_output =
-            self.assemble_output(&input_batch, generated, ctx.allocator(MemoryTag::Extension))?;
-        let mut ready_batches = self
-            .batch_policy
-            .rechunk_output(&final_output, ctx.allocator(MemoryTag::Extension));
+        let allocator = Self::runtime_allocator(memory);
+        let final_output = self.assemble_output(&input_batch, generated, allocator.clone())?;
+        let mut ready_batches = self.batch_policy.rechunk_output(&final_output, allocator)?;
         state.ready_output.append(&mut ready_batches);
         state.ready_output_bytes = Self::estimate_ready_output_bytes(&state.ready_output);
         shared.observe_ready_output_bytes(state.ready_output_bytes);
@@ -333,6 +353,7 @@ impl ExternalProject {
         ctx: &ExecutionContext,
         shared: &Arc<ExternalProjectSharedState>,
         state: &mut ExternalProjectState,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<()> {
         let Some(inflight) = state.inflight.take() else {
             return Ok(());
@@ -341,9 +362,10 @@ impl ExternalProject {
         if inflight.cache_candidate && !inflight.response.metrics.cache_hit {
             if let Some(cache_key) = inflight.cache_key.clone() {
                 if let Some(generated) = inflight.response.output_batches.first() {
+                    let cache_chunk = generated.try_deep_copy(Self::runtime_allocator(memory))?;
                     let _ = shared.cache_insert(
                         cache_key,
-                        generated.deep_copy_with_allocator(ctx.allocator(MemoryTag::Extension)),
+                        cache_chunk,
                         SubmissionBatchPolicy::estimate_chunk_bytes(generated),
                     );
                 }
@@ -358,6 +380,7 @@ impl ExternalProject {
             inflight.response,
             false,
             true,
+            memory,
         )
     }
 
@@ -374,10 +397,9 @@ impl ExternalProject {
         }
 
         let mut passthrough_chunk =
-            Chunk::init_empty_with_allocator(passthrough.types().as_slice(), allocator.clone());
+            Chunk::try_init_empty(passthrough.types().as_slice(), allocator.clone())?;
         passthrough_chunk.reference(passthrough);
-        let mut generated_chunk =
-            Chunk::init_empty_with_allocator(generated.types().as_slice(), allocator);
+        let mut generated_chunk = Chunk::try_init_empty(generated.types().as_slice(), allocator)?;
         generated_chunk.reference(generated);
         passthrough_chunk.fuse(&mut generated_chunk);
         Ok(passthrough_chunk)
@@ -428,19 +450,20 @@ impl ExternalProject {
         input: Option<&Chunk>,
         chunk: &mut Chunk,
         tail_flush: bool,
+        memory: &OperatorMemoryScope<'_>,
     ) -> Result<OperatorFlow> {
         if let Some(input) = input {
-            self.stage_input(shared, state, input);
+            self.stage_input(shared, state, input, memory)?;
         }
 
         loop {
-            self.collect_inflight_if_needed(ctx, shared, state)?;
+            self.collect_inflight_if_needed(ctx, shared, state, memory)?;
 
             if let Some(result) = self.pop_ready_output(shared, state, chunk, tail_flush) {
                 return result;
             }
 
-            if let Some(blocked) = self.submit_if_ready(ctx, shared, state, tail_flush)? {
+            if let Some(blocked) = self.submit_if_ready(ctx, shared, state, tail_flush, memory)? {
                 return Ok(match blocked {
                     OperatorResultType::Blocked => OperatorFlow::Blocked,
                     _ => unreachable!("submit_if_ready only returns blocked flow"),
@@ -456,10 +479,7 @@ impl ExternalProject {
             }
 
             state.current_input_staged = false;
-            *chunk = Chunk::init_empty_with_allocator(
-                &self.output_types,
-                ctx.allocator(MemoryTag::Extension),
-            );
+            *chunk = Chunk::try_init_empty(&self.output_types, Self::runtime_allocator(memory))?;
             return Ok(OperatorFlow::NeedMoreInput);
         }
     }
@@ -570,15 +590,20 @@ impl PhysicalOperator for ExternalProject {
         };
         let stats = shared.runtime_stats();
         let cache = shared.cache_stats();
+        let output_buffer_bytes = stats
+            .peak_ready_output_bytes
+            .saturating_add(cache.resident_bytes);
         ExplainRuntimeStats {
             spilled: Some(false),
             peak_memory_bytes: Some(
                 stats
                     .peak_accumulation_bytes
-                    .saturating_add(stats.peak_ready_output_bytes)
-                    .saturating_add(cache.resident_bytes),
+                    .saturating_add(output_buffer_bytes),
             ),
             temp_storage_bytes: None,
+            data_plane_bytes: (stats.data_plane_bytes > 0).then_some(stats.data_plane_bytes),
+            output_buffer_bytes: (output_buffer_bytes > 0).then_some(output_buffer_bytes),
+            ..Default::default()
         }
     }
 
@@ -622,7 +647,7 @@ impl PhysicalOperator for ExternalProject {
         Ok(Box::new(ExternalProjectState::new(
             self.child.types(),
             ctx.allocator(MemoryTag::Extension),
-        )))
+        )?))
     }
 
     fn get_global_operator_state(&self) -> Result<Box<dyn GlobalOperatorState>> {
@@ -638,6 +663,7 @@ impl PhysicalOperator for ExternalProject {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         let gstate = gstate
             .as_any()
@@ -649,7 +675,15 @@ impl PhysicalOperator for ExternalProject {
             .ok_or_else(|| paro_error::internal("invalid external project state"))?;
 
         Ok(
-            match self.run_step(ctx, &gstate.shared, state, Some(input), chunk, false)? {
+            match self.run_step(
+                ctx,
+                &gstate.shared,
+                state,
+                Some(input),
+                chunk,
+                false,
+                &memory,
+            )? {
                 OperatorFlow::NeedMoreInput => OperatorResultType::NeedMoreInput,
                 OperatorFlow::HaveMoreOutput => OperatorResultType::HaveMoreOutput,
                 OperatorFlow::Blocked => OperatorResultType::Blocked,
@@ -664,6 +698,7 @@ impl PhysicalOperator for ExternalProject {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorFinalizeResultType> {
         let gstate = gstate
             .as_any()
@@ -675,7 +710,7 @@ impl PhysicalOperator for ExternalProject {
             .ok_or_else(|| paro_error::internal("invalid external project state"))?;
 
         Ok(
-            match self.run_step(ctx, &gstate.shared, state, None, chunk, true)? {
+            match self.run_step(ctx, &gstate.shared, state, None, chunk, true, &memory)? {
                 OperatorFlow::NeedMoreInput | OperatorFlow::Finished => {
                     OperatorFinalizeResultType::Finished
                 }
@@ -704,7 +739,7 @@ mod tests {
     use crate::operator::scan::dummy_scan::PhysicalDummyScan;
     use crate::thread_context::ThreadContext;
     use paro_common::runtime_value::Value;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
     use paro_function::scalar::ScalarFunction;
@@ -803,7 +838,13 @@ mod tests {
     }
 
     fn input_chunk(values: &[i32]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(values)])
+        Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     #[derive(Debug)]
@@ -827,7 +868,13 @@ mod tests {
             let values = (0..input.size())
                 .map(|row_idx| column.get_i32(row_idx).expect("non-null") * 2)
                 .collect::<Vec<_>>();
-            Chunk::from_vectors(vec![Vector::from_i32(&values)])
+            Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                    &values,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            )
         }
     }
 
@@ -836,6 +883,7 @@ mod tests {
             &self,
             _ctx: &ExecutionContext,
             submission: &crate::operator::external::runtime_bridge::ProjectSubmission<'_>,
+            _memory: &crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<RuntimeBridgeOutcome> {
             self.seen_rows
                 .lock()
@@ -893,10 +941,18 @@ mod tests {
         let mut state = operator.get_operator_state(&ctx).expect("operator state");
 
         let input = input_chunk(&[1, 2, 3]);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let first = operator
-            .execute(&ctx, &input, &mut output, gstate.as_ref(), state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("first execute");
         assert_eq!(first, OperatorResultType::Blocked);
         let blocked_state = state
@@ -906,7 +962,14 @@ mod tests {
         assert_eq!(blocked_state.accumulation.size(), 1);
 
         let second = operator
-            .execute(&ctx, &input, &mut output, gstate.as_ref(), state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("resume execute");
         assert_eq!(second, OperatorResultType::NeedMoreInput);
         assert_eq!(output.size(), 2);
@@ -918,9 +981,16 @@ mod tests {
             .expect("external project state");
         assert_eq!(state_ref.accumulation.size(), 1);
 
-        let mut tail_output = Chunk::new();
+        let mut tail_output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let final_result = operator
-            .final_execute(&ctx, &mut tail_output, gstate.as_ref(), state.as_mut())
+            .final_execute(
+                &ctx,
+                &mut tail_output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("tail flush");
         assert_eq!(final_result, OperatorFinalizeResultType::Finished);
         assert_eq!(tail_output.size(), 1);
@@ -940,6 +1010,7 @@ mod tests {
             &self,
             _ctx: &ExecutionContext,
             submission: &crate::operator::external::runtime_bridge::ProjectSubmission<'_>,
+            _memory: &crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<RuntimeBridgeOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let output = BlockingProjectKernel::generated_chunk(submission.input);
@@ -974,16 +1045,31 @@ mod tests {
         let mut state = operator.get_operator_state(&ctx).expect("operator state");
 
         let input = input_chunk(&[7, 8]);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let first = operator
-            .execute(&ctx, &input, &mut output, gstate.as_ref(), state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("first execute");
         assert_eq!(first, OperatorResultType::NeedMoreInput);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let second = operator
-            .execute(&ctx, &input, &mut output, gstate.as_ref(), state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .expect("second execute");
         assert!(matches!(
             second,
@@ -993,9 +1079,17 @@ mod tests {
         assert_eq!(output.get_value(1, 0), Some(Value::Integer(14)));
 
         if second == OperatorResultType::HaveMoreOutput {
-            let mut followup = Chunk::new();
+            let mut followup = Chunk::try_new(paro_common::test_utils::test_allocator())
+                .expect("test chunk allocation failed");
             let third = operator
-                .execute(&ctx, &input, &mut followup, gstate.as_ref(), state.as_mut())
+                .execute(
+                    &ctx,
+                    &input,
+                    &mut followup,
+                    gstate.as_ref(),
+                    state.as_mut(),
+                    crate::operator::state::test_operator_memory_scope(),
+                )
                 .expect("drain followup");
             assert_eq!(third, OperatorResultType::NeedMoreInput);
             assert_eq!(followup.size(), 0);
@@ -1003,5 +1097,40 @@ mod tests {
 
         let explain = operator.explain_params().join("\n");
         assert!(explain.contains("Cache: hits=1"));
+    }
+
+    #[test]
+    fn external_project_runtime_stats_keep_data_plane_out_of_memory_tags() {
+        let ctx = test_ctx();
+        let operator = ExternalProject::new(
+            binding(),
+            Arc::new(PhysicalDummyScan::with_types(vec![LogicalType::Integer])),
+            test_bridge(Arc::new(CountingProjectKernel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                kernel_time_us: 64,
+            })),
+        );
+        let gstate = operator.get_global_operator_state().expect("global state");
+        let mut state = operator.get_operator_state(&ctx).expect("operator state");
+        let input = input_chunk(&[11, 12]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        let result = operator
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                gstate.as_ref(),
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
+            .expect("execute");
+        assert_eq!(result, OperatorResultType::NeedMoreInput);
+
+        let runtime = operator.runtime_memory_stats();
+        assert!(runtime.data_plane_bytes.unwrap_or(0) > 0);
+        assert!(runtime.memory_tag_bytes.is_empty());
+        assert!(runtime.domain_memory_tag_bytes.is_empty());
     }
 }

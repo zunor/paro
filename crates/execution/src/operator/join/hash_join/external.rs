@@ -11,8 +11,8 @@ use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::JoinType;
 use paro_storage::buffer::{MemoryTag, DEFAULT_BLOCK_ALLOC_SIZE};
 use paro_storage::row::{
-    RadixPartitionedRows, RadixPartitionedRowsBuilder, RadixPartitioning, RowScanState, RowStore,
-    RowStoreBuilder,
+    RadixPartitionedRows, RadixPartitionedRowsBuilder, RadixPartitioning, RowLayout, RowScanState,
+    RowStore, RowStoreBuilder, RowValidityType,
 };
 
 use crate::execution_context::ExecutionContext;
@@ -121,8 +121,12 @@ pub(super) fn estimate_total_size_with_load_factor(
     data_size.saturating_add(scaled.max(std::mem::size_of::<usize>()))
 }
 
-fn compute_hashes_for_keys(keys: &Chunk, sel: Option<&SelectionVector>, count: usize) -> Vector {
-    let mut hashes = Vector::with_capacity(LogicalType::UBigInt, count.max(1));
+fn compute_hashes_for_keys(
+    keys: &Chunk,
+    sel: Option<&SelectionVector>,
+    count: usize,
+) -> Result<Vector> {
+    let mut hashes = Vector::try_new(LogicalType::UBigInt, count.max(1), keys.allocator().clone())?;
     hashes.set_count(count);
     for out_idx in 0..count {
         let row_idx = sel.map(|s| s.get(out_idx)).unwrap_or(out_idx);
@@ -133,7 +137,7 @@ fn compute_hashes_for_keys(keys: &Chunk, sel: Option<&SelectionVector>, count: u
         }
         hashes.set_u64(out_idx, hasher.finish());
     }
-    hashes
+    Ok(hashes)
 }
 
 pub(super) fn build_dictionary_chunk(
@@ -151,18 +155,18 @@ pub(super) fn build_dictionary_chunk(
                 "missing input column while slicing hash join chunk: column_idx={col_idx}"
             ))
         })?;
-        vectors.push(Arc::new(Vector::dictionary(
+        vectors.push(Arc::new(Vector::try_dictionary(
             Arc::clone(source),
             sel.clone(),
-        )));
+        )?));
     }
-    let mut chunk = Chunk::from_arc_vectors(vectors);
+    let mut chunk = Chunk::from_arc_vectors(vectors, input.allocator().clone());
     chunk.set_cardinality(count);
     Ok(chunk)
 }
 
-pub(super) fn materialize_chunk(chunk: &Chunk) -> Chunk {
-    chunk.deep_copy_with_allocator(chunk.allocator().clone())
+pub(super) fn materialize_chunk(chunk: &Chunk) -> Result<Chunk> {
+    chunk.try_deep_copy(chunk.allocator().clone())
 }
 
 pub(super) fn external_keys_are_skewed(selected_partition_sizes: &[usize]) -> bool {
@@ -190,7 +194,7 @@ pub(super) fn build_probe_spill_chunk(input: &Chunk, hashes: &Vector) -> Result<
         vectors.push(Arc::clone(column));
     }
     vectors.push(Arc::new(hashes.clone()));
-    let mut chunk = Chunk::from_arc_vectors(vectors);
+    let mut chunk = Chunk::from_arc_vectors(vectors, input.allocator().clone());
     chunk.set_cardinality(input.size());
     Ok(chunk)
 }
@@ -222,7 +226,7 @@ pub(super) fn prepare_external_build_round(
 ) -> Result<bool> {
     runtime.current_partitions.fill(false);
     if runtime.completed_partitions.iter().all(|done| *done) {
-        gstate.temporary_memory_state.set_zero();
+        gstate.memory_tracker.set_minimum_reservation_bytes(0)?;
         return Ok(false);
     }
 
@@ -246,7 +250,7 @@ pub(super) fn prepare_external_build_round(
     }
 
     if unfinished.is_empty() {
-        gstate.temporary_memory_state.set_zero();
+        gstate.memory_tracker.set_minimum_reservation_bytes(0)?;
         return Ok(false);
     }
 
@@ -256,7 +260,7 @@ pub(super) fn prepare_external_build_round(
             .then_with(|| l_idx.cmp(r_idx))
     });
 
-    let reservation = gstate.temporary_memory_state.get_reservation();
+    let reservation = gstate.memory_tracker.minimum_reservation_bytes()?.max(1);
     let max_ht_budget = reservation
         .saturating_sub(runtime.probe_side_requirement)
         .saturating_sub(EXTERNAL_BUILD_HEADROOM_BYTES)
@@ -265,7 +269,7 @@ pub(super) fn prepare_external_build_round(
     let mut combined_size = 0usize;
     let mut selected_partition_count = 0usize;
     let mut selected_partition_sizes = Vec::new();
-    let mut spill_chunk = Chunk::new();
+    let mut spill_chunk = Chunk::try_new(gstate.hash_table.allocator().clone())?;
 
     let mut build_store = gstate.hash_table.get_build_store();
     for (partition_idx, _size) in unfinished {
@@ -305,7 +309,6 @@ pub(super) fn prepare_external_build_round(
 
     gstate.hash_table.refresh_count_from_data_collection();
     if gstate.hash_table.count() == 0 {
-        gstate.temporary_memory_state.set_zero();
         return Ok(selected_partition_count > 0);
     }
 
@@ -314,13 +317,10 @@ pub(super) fn prepare_external_build_round(
         gstate.hash_table.count(),
     );
     let reservation_target = ht_remaining.saturating_add(runtime.probe_side_requirement);
-    if reservation_target == 0 {
-        gstate.temporary_memory_state.set_zero();
-    } else {
-        gstate
-            .temporary_memory_state
-            .set_remaining_size_and_update_reservation(reservation_target);
-    }
+    gstate
+        .memory_tracker
+        .set_minimum_reservation_bytes(reservation_target.max(1))?;
+    let _target_available = gstate.has_capacity_for_total(reservation_target.max(1))?;
 
     let _single_thread_build = external_keys_are_skewed(&selected_partition_sizes)
         || gstate
@@ -338,9 +338,9 @@ pub(super) fn split_probe_partitions(
     current_partitions: &[bool],
     count: usize,
 ) -> Result<(SelectionVector, usize, SelectionVector, usize)> {
-    let mut true_sel = SelectionVector::with_capacity(count);
+    let mut true_sel = SelectionVector::try_with_capacity(count, hashes.allocator().clone())?;
     true_sel.set_len(count);
-    let mut false_sel = SelectionVector::with_capacity(count);
+    let mut false_sel = SelectionVector::try_with_capacity(count, hashes.allocator().clone())?;
     false_sel.set_len(count);
 
     let mut true_count = 0usize;
@@ -380,10 +380,15 @@ pub(super) fn append_external_source_rows(
         return Ok(());
     }
     if runtime.source_output_rows_builder.is_none() {
-        runtime.source_output_rows_builder = Some(RowStoreBuilder::from_types(
-            gstate.hash_table.buffer_pool().clone(),
+        let layout = Arc::new(RowLayout::from_types(
             join.build_layout().build_payload_types.clone(),
+            RowValidityType::CanHaveNullValues,
+        ));
+        runtime.source_output_rows_builder = Some(RowStoreBuilder::new_with_memory(
+            gstate.hash_table.buffer_pool().clone(),
+            layout,
             MemoryTag::HashTable,
+            gstate.build_memory_context(),
         ));
     }
     if let Some(collection) = runtime.source_output_rows_builder.as_mut() {
@@ -419,7 +424,7 @@ pub(super) fn execute_external_probe(
 ) -> Result<OperatorResultType> {
     ctx.check_cancelled()?;
     let ht = &gsink.hash_table;
-    let hashes = compute_hashes_for_keys(&state.probe_keys, None, input.size());
+    let hashes = compute_hashes_for_keys(&state.probe_keys, None, input.size())?;
     let (current_partitions, radix_bits) = {
         let runtime_guard = gsink.external_runtime.lock().unwrap();
         let runtime = runtime_guard.as_ref().ok_or_else(|| {
@@ -446,7 +451,7 @@ pub(super) fn execute_external_probe(
 
     if false_count > 0 {
         let false_input = build_dictionary_chunk(input, &false_sel, false_count)?;
-        let false_hashes = Vector::dictionary(Arc::new(hashes.clone()), false_sel);
+        let false_hashes = Vector::try_dictionary(Arc::new(hashes.clone()), false_sel)?;
         let false_chunk = build_probe_spill_chunk(&false_input, &false_hashes)?;
 
         let mut runtime_guard = gsink.external_runtime.lock().unwrap();
@@ -465,7 +470,9 @@ pub(super) fn execute_external_probe(
     if true_count == 0 {
         state.scan_structure.reset();
         state.probe_in_progress = false;
-        state.current_probe_input.reset();
+        state
+            .current_probe_input
+            .try_reset(state.current_probe_input.allocator().clone())?;
         chunk.set_cardinality(0);
         return Ok(OperatorResultType::NeedMoreInput);
     }
@@ -473,14 +480,14 @@ pub(super) fn execute_external_probe(
     let true_input = build_dictionary_chunk(input, &true_sel, true_count)?;
     let true_probe_keys = build_dictionary_chunk(&state.probe_keys, &true_sel, true_count)?;
     state.probe_keys = true_probe_keys;
-    state.current_probe_input = materialize_chunk(&true_input);
+    state.current_probe_input = materialize_chunk(&true_input)?;
 
     ht.probe(
         &state.probe_keys,
         &mut state.scan_structure,
         None,
         true_count,
-    );
+    )?;
     state.probe_in_progress = true;
 
     let count = probe_engine::scan_join_results(
@@ -499,7 +506,9 @@ pub(super) fn execute_external_probe(
     )?;
     state.probe_in_progress = !state.scan_structure.finished;
     if state.scan_structure.finished {
-        state.current_probe_input.reset();
+        state
+            .current_probe_input
+            .try_reset(state.current_probe_input.allocator().clone())?;
     }
     Ok(probe_engine::result_for_probe_batch(
         count,
@@ -519,7 +528,7 @@ pub(super) fn drive_external_replay(
         chunk,
         &join.base().join.types,
         paro_common::vector::VECTOR_SIZE,
-    );
+    )?;
 
     loop {
         if state.probe_in_progress {
@@ -539,7 +548,9 @@ pub(super) fn drive_external_replay(
             )?;
             state.probe_in_progress = !state.scan_structure.finished;
             if state.scan_structure.finished {
-                state.current_probe_input.reset();
+                state
+                    .current_probe_input
+                    .try_reset(state.current_probe_input.allocator().clone())?;
             }
             if count > 0 {
                 return Ok(OperatorFinalizeResultType::HaveMoreOutput);
@@ -601,8 +612,11 @@ pub(super) fn drive_external_replay(
                 if state.external_probe_chunk.column_count() == 0 {
                     let mut probe_types = join.base().join.left.types().to_vec();
                     probe_types.push(LogicalType::UBigInt);
-                    state.external_probe_chunk =
-                        Chunk::initialize(&probe_types, paro_common::vector::VECTOR_SIZE);
+                    state.external_probe_chunk = Chunk::try_initialize(
+                        &probe_types,
+                        paro_common::vector::VECTOR_SIZE,
+                        state.external_probe_chunk.allocator().clone(),
+                    )?;
                 }
 
                 let scanned = probe_rows.scan_with_state(
@@ -624,6 +638,7 @@ pub(super) fn drive_external_replay(
                     let probe_col_count = join.base().join.left.types().len();
                     let mut replay_chunk = Chunk::from_arc_vectors(
                         state.external_probe_chunk.data[..probe_col_count].to_vec(),
+                        state.external_probe_chunk.allocator().clone(),
                     );
                     replay_chunk.set_cardinality(scanned);
                     replay_chunk
@@ -638,7 +653,7 @@ pub(super) fn drive_external_replay(
                             &replay_input,
                             chunk,
                             ht.has_null.load(std::sync::atomic::Ordering::Relaxed),
-                        );
+                        )?;
                     }
 
                     if chunk.size() > 0 {
@@ -659,7 +674,7 @@ pub(super) fn drive_external_replay(
                     &mut state.scan_structure,
                     None,
                     state.probe_keys.size(),
-                );
+                )?;
                 state.probe_in_progress = true;
             }
             HashJoinExternalProbeStage::ScanBuild => {
@@ -672,10 +687,11 @@ pub(super) fn drive_external_replay(
                         Some(gsink.hash_table.create_full_outer_scan_state());
                 }
                 if state.external_build_chunk.column_count() == 0 {
-                    state.external_build_chunk = Chunk::initialize(
+                    state.external_build_chunk = Chunk::try_initialize(
                         &join.build_layout().build_payload_types,
                         paro_common::vector::VECTOR_SIZE,
-                    );
+                        state.external_build_chunk.allocator().clone(),
+                    )?;
                 }
                 let emit_found = matches!(join.base().join.join_type, JoinType::RightSemi);
                 let scan_state = state.external_build_scan_state.as_mut().ok_or_else(|| {
@@ -736,12 +752,13 @@ pub(super) fn get_data_external(
         chunk,
         &join.base().join.types,
         paro_common::vector::VECTOR_SIZE,
-    );
+    )?;
 
-    let mut build_chunk = Chunk::initialize(
+    let mut build_chunk = Chunk::try_initialize(
         &join.build_layout().build_payload_types,
         paro_common::vector::VECTOR_SIZE,
-    );
+        chunk.allocator().clone(),
+    )?;
     let mut scan_state = gsink.external_source_scan_state.lock().unwrap();
     let scanned = source_rows.scan_with_state(&mut scan_state, &mut build_chunk)?;
     drop(scan_state);
@@ -753,7 +770,7 @@ pub(super) fn get_data_external(
         return Ok(SourceResultType::Finished);
     }
 
-    let build_sel = SelectionVector::incremental(scanned);
+    let build_sel = SelectionVector::try_incremental(scanned, chunk.allocator().clone())?;
     match join.base().join.join_type {
         JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
             &build_chunk,
@@ -774,7 +791,7 @@ pub(super) fn get_data_external(
             chunk.set_cardinality(0);
             return Ok(SourceResultType::Finished);
         }
-    }
+    }?;
 
     Ok(SourceResultType::HaveMoreOutput)
 }

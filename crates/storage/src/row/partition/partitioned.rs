@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::{Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::memory::MemoryAccountingContext;
 use paro_common::vector::VECTOR_SIZE;
 
 use crate::buffer::{BufferPool, MemoryTag};
@@ -17,15 +19,24 @@ pub struct PartitionedRows {
     buffer_pool: Arc<BufferPool>,
     layout: Arc<RowLayout>,
     tag: MemoryTag,
+    memory: MemoryAccountingContext,
     partitions: Vec<RowStore>,
     count: u64,
 }
 
 impl PartitionedRows {
+    fn chunk_allocator(&self) -> Arc<dyn Allocator> {
+        Arc::new(BufferAllocator::new(
+            Arc::clone(&self.buffer_pool) as Arc<dyn BufferManager>,
+            self.tag,
+        ))
+    }
+
     pub(crate) fn new(
         buffer_pool: Arc<BufferPool>,
         layout: Arc<RowLayout>,
         tag: MemoryTag,
+        memory: MemoryAccountingContext,
         partitions: Vec<RowStore>,
         count: u64,
     ) -> Self {
@@ -33,6 +44,7 @@ impl PartitionedRows {
             buffer_pool,
             layout,
             tag,
+            memory,
             partitions,
             count,
         }
@@ -79,15 +91,21 @@ impl PartitionedRows {
     }
 
     #[inline]
+    pub(crate) fn memory(&self) -> &MemoryAccountingContext {
+        &self.memory
+    }
+
+    #[inline]
     pub(crate) fn into_partitions(self) -> Vec<RowStore> {
         self.partitions
     }
 
     pub fn take_partition(&mut self, index: usize) -> RowStore {
-        let empty = RowStoreBuilder::new(
+        let empty = RowStoreBuilder::new_with_memory(
             Arc::clone(&self.buffer_pool),
             Arc::clone(&self.layout),
             self.tag,
+            self.memory.clone(),
         )
         .seal();
         let taken = std::mem::replace(&mut self.partitions[index], empty);
@@ -96,13 +114,15 @@ impl PartitionedRows {
     }
 
     pub fn repartition(&self, partitioner: Arc<dyn PartitionIndexComputer>) -> Result<Self> {
-        let mut builder = PartitionedRowsBuilder::new(
+        let mut builder = PartitionedRowsBuilder::new_with_memory(
             Arc::clone(&self.buffer_pool),
             Arc::clone(&self.layout),
             self.tag,
             partitioner,
+            self.memory.clone(),
         );
-        let mut chunk = Chunk::initialize(self.layout.types(), VECTOR_SIZE);
+        let mut chunk =
+            Chunk::try_initialize(self.layout.types(), VECTOR_SIZE, self.chunk_allocator())?;
 
         for partition in &self.partitions {
             let mut scanner = partition.scanner();
@@ -121,13 +141,13 @@ impl PartitionedRows {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use crate::buffer::{BufferPool, MemoryTag};
 
@@ -181,12 +201,12 @@ mod tests {
     }
 
     fn build_chunk(values: &[i32]) -> Chunk {
-        let mut ids = Vector::with_capacity(LogicalType::Integer, values.len());
+        let mut ids = test_vector_with_capacity(LogicalType::Integer, values.len());
         for (idx, value) in values.iter().enumerate() {
             ids.set_i32(idx, *value);
         }
         ids.set_count(values.len());
-        Chunk::from_vectors(vec![ids])
+        test_chunk_from_vectors(vec![ids])
     }
 
     fn collect_partition_ids(store: &crate::row::RowStore) -> Vec<i32> {
@@ -194,7 +214,7 @@ mod tests {
             return Vec::new();
         }
         let pinned = store.pin_ordinal_range(0, store.count() as u32).unwrap();
-        let mut out = Chunk::initialize(&[LogicalType::Integer], store.count() as usize);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], store.count() as usize);
         pinned.gather_columns(&[0], &mut out, 0).unwrap();
         (0..store.count() as usize)
             .map(|row| out.get_value(0, row).unwrap())
@@ -229,7 +249,7 @@ mod tests {
             .unwrap();
 
         let pinned = rows.partition(0).pin_rows(&[addr]).unwrap();
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 1);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], 1);
         pinned.gather_columns(&[0], &mut out, 0).unwrap();
         assert_eq!(out.get_value(0, 0), Some(Value::Integer(10)));
 

@@ -1,18 +1,21 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Streaming result collection backed by [`BufferedData`].
+//! Streaming result collection backed by [`QueryOutputBuffer`].
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use paro_common::allocator::Allocator;
+use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryDomain};
 use paro_common::types::LogicalType;
 
-use super::buffered_data::{AppendResult, BufferedData};
 use crate::execution_context::ExecutionContext;
+use crate::memory_runtime::{
+    OperatorMemoryAccount, OutputAppendResult, QueryMemoryPool, QueryOutputBuffer,
+};
 use crate::operator::state::{
     GlobalSinkState, LocalSinkState, OperatorSinkCombineInput, OperatorSinkInput,
 };
@@ -20,10 +23,8 @@ use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
 use crate::result_type::{SinkCombineResultType, SinkFinalizeType, SinkResultType};
 
-/// Default buffer capacity (number of chunks).
-///
-/// When the buffer reaches this capacity, the sink will block.
-const DEFAULT_BUFFER_CAPACITY: usize = 50;
+/// Default query output buffer capacity in bytes.
+const DEFAULT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 /// Physical operator that collects query results into a buffered stream.
 ///
@@ -34,8 +35,8 @@ const DEFAULT_BUFFER_CAPACITY: usize = 50;
 /// # Design
 ///
 /// Unlike the old implementation that collected all results into a `Vec<Chunk>`,
-/// this version uses `BufferedData` which provides:
-/// - Bounded buffer with configurable capacity
+/// this version uses `QueryOutputBuffer` which provides:
+/// - Bounded buffer with configurable byte capacity
 /// - Backpressure when buffer is full
 /// - Proper close semantics
 /// - Error propagation
@@ -45,7 +46,7 @@ const DEFAULT_BUFFER_CAPACITY: usize = 50;
 /// The buffer is wrapped in `Arc<Mutex<>>` to allow safe concurrent access
 /// from multiple pipeline threads.
 pub struct PhysicalResultCollector {
-    buffer: Arc<Mutex<BufferedData>>,
+    buffer: Arc<Mutex<QueryOutputBuffer>>,
     types: Vec<LogicalType>,
 }
 
@@ -53,7 +54,7 @@ impl std::fmt::Debug for PhysicalResultCollector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PhysicalResultCollector")
             .field("types", &self.types)
-            .field("buffer", &"<BufferedData>")
+            .field("buffer", &"<QueryOutputBuffer>")
             .finish()
     }
 }
@@ -65,7 +66,7 @@ impl PhysicalResultCollector {
     ///
     /// * `types` - Column types for the result
     /// * `buffer` - Shared buffer for collecting results
-    pub fn new(types: Vec<LogicalType>, buffer: Arc<Mutex<BufferedData>>) -> Self {
+    pub fn new(types: Vec<LogicalType>, buffer: Arc<Mutex<QueryOutputBuffer>>) -> Self {
         Self { buffer, types }
     }
 
@@ -85,6 +86,7 @@ impl PhysicalResultCollector {
     /// let (collector, buffer) = PhysicalResultCollector::with_shared_result(
     ///     types,
     ///     allocator,
+    ///     query_memory_pool,
     /// );
     /// // Use collector in pipeline
     /// // Read results from buffer
@@ -92,9 +94,19 @@ impl PhysicalResultCollector {
     pub fn with_shared_result(
         types: Vec<LogicalType>,
         allocator: Arc<dyn Allocator>,
-    ) -> (Self, Arc<Mutex<BufferedData>>) {
-        let buffer = Arc::new(Mutex::new(BufferedData::new(
-            DEFAULT_BUFFER_CAPACITY,
+        query_memory_pool: Arc<QueryMemoryPool>,
+    ) -> (Self, Arc<Mutex<QueryOutputBuffer>>) {
+        let account = Arc::new(OperatorMemoryAccount::new(query_memory_pool));
+        let owner: Arc<dyn paro_common::memory::MemoryOwner> = account;
+        let memory = MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            MemoryTag::Allocator,
+            MemoryAccountingClass::NonRevocable,
+        );
+        let buffer = Arc::new(Mutex::new(QueryOutputBuffer::new(
+            DEFAULT_OUTPUT_BUFFER_BYTES,
+            memory,
             allocator,
         )));
         (Self::new(types, buffer.clone()), buffer)
@@ -103,7 +115,7 @@ impl PhysicalResultCollector {
     /// Get a reference to the shared buffer.
     ///
     /// This allows external code to read results from the buffer.
-    pub fn buffer(&self) -> &Arc<Mutex<BufferedData>> {
+    pub fn buffer(&self) -> &Arc<Mutex<QueryOutputBuffer>> {
         &self.buffer
     }
 }
@@ -112,13 +124,13 @@ impl PhysicalResultCollector {
 ///
 /// Holds the shared buffer that all threads write to.
 struct ResultCollectorGlobalSinkState {
-    buffer: Arc<Mutex<BufferedData>>,
+    buffer: Arc<Mutex<QueryOutputBuffer>>,
 }
 
 impl std::fmt::Debug for ResultCollectorGlobalSinkState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResultCollectorGlobalSinkState")
-            .field("buffer", &"<BufferedData>")
+            .field("buffer", &"<QueryOutputBuffer>")
             .finish()
     }
 }
@@ -135,12 +147,8 @@ impl GlobalSinkState for ResultCollectorGlobalSinkState {
 
 /// Local sink state for the result collector.
 ///
-/// Each thread has its own local state for buffering chunks before
-/// combining them into the global buffer.
 #[derive(Debug, Default)]
 struct ResultCollectorLocalSinkState {
-    /// Buffered chunks waiting to be combined
-    chunks: Vec<Chunk>,
     /// Pending chunk that could not be appended because the buffer was full.
     pending_chunk: Option<Chunk>,
 }
@@ -184,22 +192,6 @@ impl PhysicalOperator for PhysicalResultCollector {
         chunk: &Chunk,
         input: &mut OperatorSinkInput,
     ) -> Result<SinkResultType> {
-        let lstate = input
-            .local_state
-            .as_any_mut()
-            .downcast_mut::<ResultCollectorLocalSinkState>()
-            .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
-
-        // Buffer chunk in local state
-        lstate.chunks.push(chunk.clone());
-        Ok(SinkResultType::NeedMoreInput)
-    }
-
-    fn combine(
-        &self,
-        _ctx: &ExecutionContext,
-        input: &mut OperatorSinkCombineInput,
-    ) -> Result<SinkCombineResultType> {
         let gstate = input
             .global_state
             .as_any()
@@ -212,51 +204,39 @@ impl PhysicalOperator for PhysicalResultCollector {
             .downcast_mut::<ResultCollectorLocalSinkState>()
             .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
 
+        let next = lstate.pending_chunk.take().unwrap_or_else(|| chunk.clone());
         let mut buffer = gstate
             .buffer
             .lock()
             .map_err(|e| paro_error::internal(format!("Failed to lock buffer: {}", e)))?;
-
-        // First, try to append any previously blocked chunk.
-        if let Some(pending) = lstate.pending_chunk.take() {
-            match buffer.try_append(pending) {
-                AppendResult::Success => {
-                    // Successfully appended, continue with other chunks
-                }
-                AppendResult::Full(chunk) => {
-                    // Still full, save it back and return Blocked
-                    lstate.pending_chunk = Some(chunk);
-                    return Ok(SinkCombineResultType::Blocked);
-                }
-                AppendResult::Closed => {
-                    return Err(paro_error::internal("Cannot append to closed buffer"));
-                }
+        match buffer.try_append(next)? {
+            OutputAppendResult::Success => Ok(SinkResultType::NeedMoreInput),
+            OutputAppendResult::Full(chunk) => {
+                lstate.pending_chunk = Some(chunk);
+                let _ = buffer.block_sink(input.interrupt_state.clone());
+                Ok(SinkResultType::Blocked)
+            }
+            OutputAppendResult::Closed => {
+                Err(paro_error::internal("Cannot append to closed buffer"))
             }
         }
+    }
 
-        // Then append the newly produced chunks.
-        let mut i = 0;
-        while i < lstate.chunks.len() {
-            let chunk = lstate.chunks[i].clone();
-            match buffer.try_append(chunk) {
-                AppendResult::Success => {
-                    i += 1;
-                }
-                AppendResult::Full(chunk) => {
-                    // Buffer is full, save pending chunk and return Blocked
-                    lstate.pending_chunk = Some(chunk);
-                    // Remove successfully appended chunks
-                    lstate.chunks.drain(0..i);
-                    return Ok(SinkCombineResultType::Blocked);
-                }
-                AppendResult::Closed => {
-                    return Err(paro_error::internal("Cannot append to closed buffer"));
-                }
-            }
+    fn combine(
+        &self,
+        _ctx: &ExecutionContext,
+        input: &mut OperatorSinkCombineInput,
+    ) -> Result<SinkCombineResultType> {
+        let lstate = input
+            .local_state
+            .as_any_mut()
+            .downcast_mut::<ResultCollectorLocalSinkState>()
+            .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
+
+        if lstate.pending_chunk.is_some() {
+            return Ok(SinkCombineResultType::Blocked);
         }
 
-        // All chunks appended successfully
-        lstate.chunks.clear();
         Ok(SinkCombineResultType::Finished)
     }
 

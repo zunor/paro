@@ -11,12 +11,18 @@ use parking_lot::Mutex;
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::profiler::ExplainProfiler;
+use crate::memory_runtime::{
+    BufferPoolReclaimer, LocalMemoryGrant, OperatorMemoryAccount, QueryMemoryPool, Reclaimer,
+    DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
+};
 use crate::operator::state::{
     GlobalOperatorState, GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState,
     OperatorState,
 };
 use crate::operator::{OperatorPartitionInfo, PhysicalOperator};
 use crate::thread_context::ThreadContext;
+use paro_common::allocator::MemoryTag;
+use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
 use paro_scheduler::event::Event;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_scheduler::task::ProducerToken;
@@ -57,13 +63,31 @@ impl PipelineGlobalStates {
 }
 
 #[derive(Debug)]
+pub struct LocalSourceStateSlot {
+    pub state: Box<dyn LocalSourceState>,
+    pub memory: LocalMemoryGrant,
+}
+
+#[derive(Debug)]
+pub struct LocalSinkStateSlot {
+    pub state: Box<dyn LocalSinkState>,
+    pub memory: LocalMemoryGrant,
+}
+
+#[derive(Debug)]
+pub struct LocalOperatorStateSlot {
+    pub state: Box<dyn OperatorState>,
+    pub memory: LocalMemoryGrant,
+}
+
+#[derive(Debug)]
 pub struct PipelineLocalStates {
     /// Local state for the source operator
-    pub source: Box<dyn LocalSourceState>,
+    pub source: LocalSourceStateSlot,
     /// Local states for intermediate operators
-    pub operators: Vec<Box<dyn OperatorState>>,
+    pub operators: Vec<LocalOperatorStateSlot>,
     /// Local state for the sink operator (if any)
-    pub sink: Option<Box<dyn LocalSinkState>>,
+    pub sink: Option<LocalSinkStateSlot>,
 }
 
 impl PipelineLocalStates {
@@ -76,10 +100,14 @@ impl PipelineLocalStates {
         let source_gstate = source_gstate_guard.as_ref().ok_or_else(|| {
             paro_common::error::internal("Source global state not initialized".to_string())
         })?;
-        let source = pipeline
+        let source_state = pipeline
             .source()
             .unwrap()
             .get_local_source_state(ctx, source_gstate.as_ref())?;
+        let source = LocalSourceStateSlot {
+            state: source_state,
+            memory: pipeline.new_local_memory_grant(ctx, MemoryTag::Allocator)?,
+        };
 
         let ops_gstates_guard = gstates.operators.lock();
         let _ops_gstates = ops_gstates_guard.as_ref().ok_or_else(|| {
@@ -89,11 +117,17 @@ impl PipelineLocalStates {
         let operators_list = pipeline.get_operators();
         let mut operators = Vec::with_capacity(operators_list.len());
         for op in &operators_list {
-            operators.push(op.get_operator_state(ctx)?);
+            operators.push(LocalOperatorStateSlot {
+                state: op.get_operator_state(ctx)?,
+                memory: pipeline.new_local_memory_grant(ctx, MemoryTag::Allocator)?,
+            });
         }
 
         let sink = if let Some(sink) = pipeline.get_sink() {
-            Some(sink.get_local_sink_state(ctx)?)
+            Some(LocalSinkStateSlot {
+                state: sink.get_local_sink_state(ctx)?,
+                memory: pipeline.new_local_memory_grant(ctx, MemoryTag::Allocator)?,
+            })
         } else {
             None
         };
@@ -134,33 +168,47 @@ pub struct Pipeline {
     batch_index: AtomicUsize,
     /// Active batch indexes used to track the minimum in-flight batch.
     active_batch_indexes: Mutex<BTreeSet<usize>>,
+
+    /// Query-level hard memory pool shared by pipelines in one MetaPipeline tree.
+    query_memory_pool: Arc<QueryMemoryPool>,
 }
 
 impl Pipeline {
     /// Create a new pipeline.
     pub fn new() -> Self {
+        Self::new_with_sink_and_memory_pool(None, 0, Arc::new(QueryMemoryPool::unbounded()))
+    }
+
+    pub(crate) fn new_with_sink_and_memory_pool(
+        sink: Option<Arc<dyn PhysicalOperator>>,
+        batch_index: usize,
+        query_memory_pool: Arc<QueryMemoryPool>,
+    ) -> Self {
+        if let Some(sink) = &sink {
+            assert!(sink.is_sink(), "Operator must be a sink");
+        }
         Self {
             source: Mutex::new(None),
             operators: Mutex::new(Vec::new()),
-            sink: Mutex::new(None),
+            sink: Mutex::new(sink),
             parents: Mutex::new(Vec::new()),
             dependencies: Mutex::new(Vec::new()),
             ready: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             global_states: Mutex::new(None),
-            batch_index: AtomicUsize::new(0),
+            batch_index: AtomicUsize::new(batch_index),
             active_batch_indexes: Mutex::new(BTreeSet::new()),
+            query_memory_pool,
         }
     }
 
     /// Create a new pipeline with a sink and batch index.
     pub fn new_with_sink(sink: Option<Arc<dyn PhysicalOperator>>, batch_index: usize) -> Self {
-        let p = Self::new();
-        if let Some(s) = sink {
-            p.set_sink(s);
-        }
-        p.batch_index.store(batch_index, Ordering::SeqCst);
-        p
+        Self::new_with_sink_and_memory_pool(
+            sink,
+            batch_index,
+            Arc::new(QueryMemoryPool::unbounded()),
+        )
     }
 
     /// Set the source operator for the pipeline.
@@ -203,6 +251,26 @@ impl Pipeline {
     /// Get the sink operator.
     pub fn get_sink(&self) -> Option<Arc<dyn PhysicalOperator>> {
         self.sink.lock().clone()
+    }
+
+    pub fn query_memory_pool(&self) -> Arc<QueryMemoryPool> {
+        self.query_memory_pool.clone()
+    }
+
+    fn new_local_memory_grant(
+        &self,
+        ctx: &ExecutionContext,
+        tag: MemoryTag,
+    ) -> paro_common::error::Result<LocalMemoryGrant> {
+        let account = Arc::new(OperatorMemoryAccount::new(self.query_memory_pool()));
+        let owner: Arc<dyn MemoryOwner> = account;
+        Ok(LocalMemoryGrant::new(
+            owner,
+            DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
+            tag,
+            MemoryAccountingClass::NonRevocable,
+            ctx.allocator(tag),
+        )?)
     }
 
     pub fn explain_profiler(&self) -> Option<Arc<ExplainProfiler>> {
@@ -486,6 +554,15 @@ impl Pipeline {
 
     /// Initialize the pipeline states if not already done.
     pub fn initialize(&self, ctx: &ExecutionContext) -> paro_common::error::Result<()> {
+        self.query_memory_pool
+            .admission_controller()
+            .set_max_slots(ctx.num_threads());
+        let cache_reclaimer: Arc<dyn Reclaimer> = Arc::new(BufferPoolReclaimer::new(
+            ctx.buffer_pool().clone(),
+            MemoryTag::ExternalFileCache,
+        ));
+        self.query_memory_pool
+            .register_reclaimer_once_by_name(cache_reclaimer);
         let mut guard = self.global_states.lock();
         if guard.is_none() {
             *guard = Some(Arc::new(PipelineGlobalStates::empty(ctx.session.clone())));

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 #[test]
 fn test_flat_vector_i64() {
-    let vec = Vector::from_i64(&[1, 2, 3, 4, 5]);
+    let vec = crate::test_utils::test_i64_vector(&[1, 2, 3, 4, 5]);
     assert_eq!(vec.len(), 5);
     assert_eq!(vec.vector_type(), VectorType::Flat);
     assert_eq!(vec.get_i64(0), Some(1));
@@ -17,7 +17,7 @@ fn test_flat_vector_i64() {
 
 #[test]
 fn test_flat_vector_with_nulls() {
-    let mut vec = Vector::from_i32(&[10, 20, 30]);
+    let mut vec = crate::test_utils::test_i32_vector(&[10, 20, 30]);
     vec.validity_mut().set_null(1);
 
     assert_eq!(vec.get_i32(0), Some(10));
@@ -28,7 +28,7 @@ fn test_flat_vector_with_nulls() {
 
 #[test]
 fn test_constant_vector() {
-    let vec = Vector::constant::<i64>(LogicalType::BigInt, 42, 1000);
+    let vec = crate::test_utils::test_constant::<i64>(LogicalType::BigInt, 42, 1000);
     assert_eq!(vec.len(), 1000);
     assert_eq!(vec.vector_type(), VectorType::Constant);
     assert_eq!(vec.get_i64(0), Some(42));
@@ -37,7 +37,7 @@ fn test_constant_vector() {
 
 #[test]
 fn test_sequence_vector() {
-    let vec = Vector::sequence(10, 5, 100);
+    let vec = crate::test_utils::test_sequence(10, 5, 100);
     assert_eq!(vec.len(), 100);
     assert_eq!(vec.vector_type(), VectorType::Sequence);
     assert_eq!(vec.get_i64(0), Some(10));
@@ -48,7 +48,7 @@ fn test_sequence_vector() {
 
 #[test]
 fn test_flatten_constant() {
-    let mut vec = Vector::constant::<i32>(LogicalType::Integer, 7, 5);
+    let mut vec = crate::test_utils::test_constant::<i32>(LogicalType::Integer, 7, 5);
     vec.flatten();
 
     assert_eq!(vec.vector_type(), VectorType::Flat);
@@ -58,7 +58,7 @@ fn test_flatten_constant() {
 
 #[test]
 fn test_flatten_sequence() {
-    let mut vec = Vector::sequence(0, 1, 5);
+    let mut vec = crate::test_utils::test_sequence(0, 1, 5);
     vec.flatten();
 
     assert_eq!(vec.vector_type(), VectorType::Flat);
@@ -69,7 +69,7 @@ fn test_flatten_sequence() {
 
 #[test]
 fn test_string_vector() {
-    let vec = Vector::from_strings(&["hello", "world", "test"]);
+    let vec = crate::test_utils::test_string_vector(&["hello", "world", "test"]);
     assert_eq!(vec.len(), 3);
     assert_eq!(vec.get_string(0), Some("hello"));
     assert_eq!(vec.get_string(1), Some("world"));
@@ -79,10 +79,10 @@ fn test_string_vector() {
 #[test]
 fn test_dictionary_vector_zero_copy() {
     // Create source data
-    let data = Arc::new(Vector::from_i64(&[10, 20, 30, 40, 50]));
+    let data = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40, 50]));
 
     // Create dictionary selecting indices 1, 3 (values 20, 40)
-    let dict = Vector::dictionary(data.clone(), vec![1, 3]);
+    let dict = crate::test_utils::test_dictionary(data.clone(), vec![1, 3]);
 
     assert_eq!(dict.len(), 2);
     assert_eq!(dict.vector_type(), VectorType::Dictionary);
@@ -95,8 +95,8 @@ fn test_dictionary_vector_zero_copy() {
 
 #[test]
 fn test_dictionary_flatten() {
-    let data = Arc::new(Vector::from_i64(&[100, 200, 300, 400]));
-    let mut dict = Vector::dictionary(data, vec![0, 2, 3]);
+    let data = Arc::new(crate::test_utils::test_i64_vector(&[100, 200, 300, 400]));
+    let mut dict = crate::test_utils::test_dictionary(data, vec![0, 2, 3]);
 
     assert_eq!(dict.get_i64(0), Some(100));
     assert_eq!(dict.get_i64(1), Some(300));
@@ -113,9 +113,10 @@ fn test_dictionary_flatten() {
 
 #[test]
 fn test_dictionary_collapses_nested_dictionary() {
-    let base = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
-    let dict = Arc::new(Vector::dictionary(base, vec![3, 1, 2]));
-    let nested = Vector::dictionary(dict, SelectionVector::from_indices(vec![1, 2]));
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
+    let dict = Arc::new(crate::test_utils::test_dictionary(base, vec![3, 1, 2]));
+    let nested =
+        crate::test_utils::test_dictionary(dict, crate::test_utils::test_selection(vec![1, 2]));
 
     assert_eq!(nested.vector_type(), VectorType::Dictionary);
     assert_eq!(nested.get_i64(0), Some(20));
@@ -127,11 +128,11 @@ fn test_dictionary_collapses_nested_dictionary() {
 
 #[test]
 fn test_dictionary_keeps_shared_selection_allocation() {
-    let base = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
-    let mut selection = SelectionVector::from_indices(vec![3, 1, 0]);
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
+    let mut selection = crate::test_utils::test_selection(vec![3, 1, 0]);
     let allocation = selection.allocation_identity();
 
-    let dict = Vector::dictionary(base, &selection);
+    let dict = crate::test_utils::test_dictionary(base, &selection);
 
     assert_eq!(
         dict.sel_vector()
@@ -149,8 +150,8 @@ fn test_dictionary_keeps_shared_selection_allocation() {
 
 #[test]
 fn test_dictionary_marks_generic_selection_source() {
-    let base = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
-    let dict = Vector::dictionary(base, vec![3, 1, 0]);
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
+    let dict = crate::test_utils::test_dictionary(base, vec![3, 1, 0]);
 
     let info = dict
         .dictionary_info()
@@ -162,8 +163,8 @@ fn test_dictionary_marks_generic_selection_source() {
 
 #[test]
 fn test_generic_dictionary_overlay_strips_storage_provenance() {
-    let base = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
-    let storage_dict = Arc::new(Vector::with_dictionary(
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
+    let storage_dict = Arc::new(crate::test_utils::test_with_dictionary(
         base,
         vec![3, 1, 2],
         DictionaryInfo {
@@ -172,7 +173,10 @@ fn test_generic_dictionary_overlay_strips_storage_provenance() {
             source: DictionarySource::Storage,
         },
     ));
-    let nested = Vector::dictionary(storage_dict, SelectionVector::from_indices(vec![1, 2]));
+    let nested = crate::test_utils::test_dictionary(
+        storage_dict,
+        crate::test_utils::test_selection(vec![1, 2]),
+    );
 
     let info = nested
         .dictionary_info()
@@ -184,8 +188,10 @@ fn test_generic_dictionary_overlay_strips_storage_provenance() {
 
 #[test]
 fn test_dictionary_string_zero_copy() {
-    let data = Arc::new(Vector::from_strings(&["apple", "banana", "cherry"]));
-    let dict = Vector::dictionary(data.clone(), vec![2, 0]);
+    let data = Arc::new(crate::test_utils::test_string_vector(&[
+        "apple", "banana", "cherry",
+    ]));
+    let dict = crate::test_utils::test_dictionary(data.clone(), vec![2, 0]);
 
     assert_eq!(dict.len(), 2);
     assert_eq!(dict.get_string(0), Some("cherry"));
@@ -193,10 +199,69 @@ fn test_dictionary_string_zero_copy() {
 }
 
 #[test]
+fn test_slice_ref_uses_range_selection_without_materializing() {
+    let vector = crate::test_utils::test_i64_vector(&[10, 20, 30, 40, 50]);
+
+    let sliced = vector
+        .slice_ref(1, 3)
+        .expect("range slice should not allocate selection");
+
+    assert_eq!(sliced.vector_type(), VectorType::Dictionary);
+    assert!(sliced.sel_vector().is_none());
+    assert!(matches!(
+        sliced.selection(),
+        VectorSelection::Range {
+            offset: 1,
+            count: 3
+        }
+    ));
+    assert_eq!(sliced.get_i64(0), Some(20));
+    assert_eq!(sliced.get_i64(2), Some(40));
+}
+
+#[test]
+fn test_slice_ref_composes_nested_ranges_without_materializing() {
+    let base = crate::test_utils::test_i64_vector(&[10, 20, 30, 40, 50]);
+    let sliced = Arc::new(base.slice_ref(1, 4).expect("first range slice"));
+
+    let nested = sliced.slice_ref(1, 2).expect("nested range slice");
+
+    assert_eq!(
+        nested.child().expect("dictionary child").vector_type(),
+        VectorType::Flat
+    );
+    assert!(matches!(
+        nested.selection(),
+        VectorSelection::Range {
+            offset: 2,
+            count: 2
+        }
+    ));
+    assert_eq!(nested.get_i64(0), Some(30));
+    assert_eq!(nested.get_i64(1), Some(40));
+}
+
+#[test]
+fn test_range_materialized_composition_materializes_once() {
+    let base = crate::test_utils::test_i64_vector(&[10, 20, 30, 40, 50]);
+    let range = Arc::new(base.slice_ref(1, 4).expect("range slice"));
+    let selection = crate::test_utils::test_selection(vec![3, 1]);
+
+    let gathered = Vector::try_gather_ref(range, selection).expect("range gather");
+
+    let materialized = gathered
+        .sel_vector()
+        .expect("range plus materialized selection should materialize");
+    assert_eq!(materialized.as_slice(), &[4, 2]);
+    assert_eq!(gathered.get_i64(0), Some(50));
+    assert_eq!(gathered.get_i64(1), Some(30));
+}
+
+#[test]
 fn test_embedding_vector() {
     let embeddings = vec![vec![0.1f32, 0.2, 0.3, 0.4], vec![0.5, 0.6, 0.7, 0.8]];
 
-    let vec = Vector::from_embeddings(&embeddings, 4);
+    let vec = crate::test_utils::test_embeddings_vector(&embeddings, 4);
 
     assert_eq!(vec.len(), 2);
     assert_eq!(vec.vector_type(), VectorType::Flat);
@@ -215,16 +280,18 @@ fn test_embedding_vector() {
 
 #[test]
 fn test_f32_vector() {
-    let vec = Vector::from_f32(&[1.5f32, 2.5, 3.5]);
+    let vec = crate::test_utils::test_f32_vector(&[1.5f32, 2.5, 3.5]);
     assert_eq!(vec.len(), 3);
     assert_eq!(vec.logical_type(), &LogicalType::Float);
 }
 
 #[test]
 fn test_array_from_child() {
-    let child = Arc::new(Vector::from_i32(&[1, 2, 3, 4, 5, 6, 7, 8, 9]));
+    let child = Arc::new(crate::test_utils::test_i32_vector(&[
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+    ]));
 
-    let arr = Vector::from_array(LogicalType::Integer, child.clone(), 3, 3);
+    let arr = crate::test_utils::test_array_vector(LogicalType::Integer, child.clone(), 3, 3);
 
     assert_eq!(arr.len(), 3);
     match arr.logical_type() {
@@ -240,7 +307,7 @@ fn test_array_from_child() {
 
 #[test]
 fn test_vector_shallow_clone() {
-    let mut vec1 = Vector::from_i64(&[10, 20, 30]);
+    let mut vec1 = crate::test_utils::test_i64_vector(&[10, 20, 30]);
     let vec2 = vec1.clone();
 
     unsafe {
@@ -255,7 +322,7 @@ fn test_vector_shallow_clone() {
 
 #[test]
 fn test_vector_reference_explicit() {
-    let vec1 = Vector::from_i64(&[1, 2, 3]);
+    let vec1 = crate::test_utils::test_i64_vector(&[1, 2, 3]);
     let vec2 = vec1.reference();
 
     assert_eq!(vec1.buffer.data(), vec2.buffer.data());
@@ -263,7 +330,7 @@ fn test_vector_reference_explicit() {
 
 #[test]
 fn test_vector_make_exclusive() {
-    let mut vec = Vector::from_i32(&[1, 2, 3]);
+    let mut vec = crate::test_utils::test_i32_vector(&[1, 2, 3]);
     let vec_ref = vec.reference();
 
     assert_eq!(vec.buffer.data(), vec_ref.buffer.data());
@@ -276,7 +343,7 @@ fn test_vector_make_exclusive() {
 
 #[test]
 fn test_string_vector_short_strings() {
-    let vec = Vector::from_strings(&["hi", "abc", "test", "hello world"]);
+    let vec = crate::test_utils::test_string_vector(&["hi", "abc", "test", "hello world"]);
     assert_eq!(vec.len(), 4);
     assert_eq!(vec.get_string(0), Some("hi"));
     assert_eq!(vec.get_string(1), Some("abc"));
@@ -286,7 +353,7 @@ fn test_string_vector_short_strings() {
 
 #[test]
 fn test_string_vector_long_strings() {
-    let vec = Vector::from_strings(&[
+    let vec = crate::test_utils::test_string_vector(&[
         "this is a very long string",
         "another long string here",
         "yet another long string for testing",
@@ -302,7 +369,7 @@ fn test_string_vector_long_strings() {
 
 #[test]
 fn test_string_vector_mixed_lengths() {
-    let vec = Vector::from_strings(&[
+    let vec = crate::test_utils::test_string_vector(&[
         "short",
         "123456789012",
         "1234567890123",
@@ -318,8 +385,13 @@ fn test_string_vector_mixed_lengths() {
 
 #[test]
 fn test_string_vector_with_nulls() {
-    let vec =
-        Vector::from_nullable_strings(&[Some("hello"), None, Some("world"), None, Some("test")]);
+    let vec = crate::test_utils::test_nullable_string_vector(&[
+        Some("hello"),
+        None,
+        Some("world"),
+        None,
+        Some("test"),
+    ]);
 
     assert_eq!(vec.len(), 5);
     assert_eq!(vec.get_string(0), Some("hello"));
@@ -333,7 +405,7 @@ fn test_string_vector_with_nulls() {
 
 #[test]
 fn test_string_vector_empty_strings() {
-    let vec = Vector::from_strings(&["", "a", "", "bc", ""]);
+    let vec = crate::test_utils::test_string_vector(&["", "a", "", "bc", ""]);
     assert_eq!(vec.len(), 5);
     assert_eq!(vec.get_string(0), Some(""));
     assert_eq!(vec.get_string(1), Some("a"));
@@ -344,7 +416,7 @@ fn test_string_vector_empty_strings() {
 
 #[test]
 fn test_string_vector_set_values() {
-    let mut vec = Vector::with_capacity(LogicalType::Varchar, 3);
+    let mut vec = crate::test_utils::test_vector_with_capacity(LogicalType::Varchar, 3);
     vec.set_count(3);
 
     vec.set_string(0, "hello");
@@ -358,7 +430,7 @@ fn test_string_vector_set_values() {
 
 #[test]
 fn test_string_vector_unicode() {
-    let vec = Vector::from_strings(&[
+    let vec = crate::test_utils::test_string_vector(&[
         "你好",       // Chinese
         "こんにちは", // Japanese
         "🎉🎊🎁",     // Emojis
@@ -374,7 +446,7 @@ fn test_string_vector_unicode() {
 
 #[test]
 fn test_string_vector_pointer_stability() {
-    let mut vec = Vector::with_capacity(LogicalType::Varchar, 100);
+    let mut vec = crate::test_utils::test_vector_with_capacity(LogicalType::Varchar, 100);
     vec.set_count(100);
 
     for i in 0..100 {
@@ -389,8 +461,8 @@ fn test_string_vector_pointer_stability() {
 
 #[test]
 fn test_string_copy_at() {
-    let src = Vector::from_strings(&["alpha", "beta", "gamma"]);
-    let mut dst = Vector::with_capacity(LogicalType::Varchar, 3);
+    let src = crate::test_utils::test_string_vector(&["alpha", "beta", "gamma"]);
+    let mut dst = crate::test_utils::test_vector_with_capacity(LogicalType::Varchar, 3);
     dst.set_count(3);
 
     dst.copy_at(0, &src, 2); // gamma

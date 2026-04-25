@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::{BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -184,7 +185,11 @@ impl ProbeSpill {
             Arc::clone(&self.probe_layout),
             MemoryTag::HashTable,
         );
-        let mut replay_chunk = Chunk::new();
+        let replay_allocator = Arc::new(BufferAllocator::new(
+            Arc::clone(&self.buffer_pool) as Arc<dyn BufferManager>,
+            MemoryTag::HashTable,
+        ));
+        let mut replay_chunk = Chunk::try_new(replay_allocator)?;
         for (partition_idx, active) in active_partitions.into_iter().enumerate() {
             if !active {
                 continue;
@@ -228,18 +233,30 @@ mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_storage::buffer::BufferPool;
 
     use super::ProbeSpill;
 
     fn build_chunk_with_hashes(keys: &[i32], hashes: &[u64]) -> Chunk {
-        let mut hash_vector = Vector::with_capacity(LogicalType::UBigInt, hashes.len().max(1));
+        let mut hash_vector = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::UBigInt,
+            hashes.len().max(1),
+        );
         hash_vector.set_count(hashes.len());
         for (idx, hash) in hashes.iter().enumerate() {
             hash_vector.set_u64(idx, *hash);
         }
-        Chunk::from_vectors(vec![Vector::from_i32(keys), hash_vector])
+        Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    keys,
+                    paro_common::test_utils::test_allocator(),
+                ),
+                hash_vector,
+            ],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn build_probe_chunk(start: i32, count: usize, radix_bits: usize) -> Chunk {
@@ -259,7 +276,10 @@ mod tests {
     fn scan_all_rows(store: &paro_storage::row::RowStore) -> Result<Vec<(i32, u64)>> {
         let mut rows = Vec::new();
         let mut scanner = store.scanner();
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer, LogicalType::UBigInt], 4096);
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::Integer, LogicalType::UBigInt],
+            4096,
+        );
         loop {
             let scanned = scanner.next_chunk(&mut chunk)?;
             if scanned == 0 {

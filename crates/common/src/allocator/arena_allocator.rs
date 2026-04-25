@@ -349,6 +349,39 @@ impl ArenaAllocator {
         self.allocated_size
     }
 
+    /// Return how many new backing bytes the next allocation would require.
+    pub fn additional_capacity_for_allocation(
+        &self,
+        len: usize,
+        alignment: usize,
+    ) -> Result<usize> {
+        validate_alignment(alignment)?;
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let aligned_len = if alignment == 1 {
+            len
+        } else {
+            align_value_to(len, alignment)
+        };
+
+        let need_new_block = match &self.head {
+            None => true,
+            Some(head) => {
+                let aligned_position = align_value_to(head.current_position, alignment);
+                aligned_position + aligned_len > head.maximum_size
+            }
+        };
+
+        if need_new_block {
+            Ok(self.next_block_capacity(aligned_len))
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Get the underlying allocator.
     pub fn get_allocator(&self) -> &Arc<dyn Allocator> {
         &self.allocator
@@ -356,7 +389,26 @@ impl ArenaAllocator {
 
     /// Allocate a new block with at least `min_size` capacity.
     fn allocate_new_block(&mut self, min_size: usize) -> Result<()> {
-        // Determine capacity
+        let capacity = self.next_block_capacity(min_size);
+
+        // Create new chunk
+        let mut new_chunk = Box::new(ArenaChunk::new(self.allocator.clone(), capacity)?);
+
+        // Link into list
+        if let Some(mut old_head) = self.head.take() {
+            old_head.prev = new_chunk.as_mut() as *mut ArenaChunk;
+            new_chunk.next = Some(old_head);
+        } else {
+            self.tail = new_chunk.as_mut() as *mut ArenaChunk;
+        }
+
+        self.head = Some(new_chunk);
+        self.allocated_size += capacity;
+
+        Ok(())
+    }
+
+    fn next_block_capacity(&self, min_size: usize) -> usize {
         let mut capacity = if self.head.is_none() {
             self.initial_capacity
         } else {
@@ -385,22 +437,7 @@ impl ArenaAllocator {
             }
             capacity = (capacity * 2).min(ARENA_ALLOCATOR_MAX_CAPACITY);
         }
-
-        // Create new chunk
-        let mut new_chunk = Box::new(ArenaChunk::new(self.allocator.clone(), capacity)?);
-
-        // Link into list
-        if let Some(mut old_head) = self.head.take() {
-            old_head.prev = new_chunk.as_mut() as *mut ArenaChunk;
-            new_chunk.next = Some(old_head);
-        } else {
-            self.tail = new_chunk.as_mut() as *mut ArenaChunk;
-        }
-
-        self.head = Some(new_chunk);
-        self.allocated_size += capacity;
-
-        Ok(())
+        capacity
     }
 }
 

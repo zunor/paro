@@ -49,18 +49,30 @@ fn bench_state() -> &'static BenchState {
 
         BenchState {
             runtime,
-            array_length_input: Chunk::from_vectors(vec![
-                int_array_vector(),
-                Vector::from_i32(&dim_values),
-            ]),
-            array_to_string_input: Chunk::from_vectors(vec![
-                int_array_vector(),
-                Vector::from_strings(&delimiter_values),
-            ]),
-            l2_distance_input: Chunk::from_vectors(vec![
-                embedding_vector(0.0),
-                embedding_vector(1.0),
-            ]),
+            array_length_input: Chunk::from_vectors(
+                vec![
+                    int_array_vector(),
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &dim_values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ),
+            array_to_string_input: Chunk::from_vectors(
+                vec![
+                    int_array_vector(),
+                    paro_common::test_utils::test_string_vector_with_allocator(
+                        &delimiter_values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ),
+            l2_distance_input: Chunk::from_vectors(
+                vec![embedding_vector(0.0), embedding_vector(1.0)],
+                paro_common::test_utils::test_allocator(),
+            ),
             array_length_expr: array_length_expr(array_type.clone()),
             array_to_string_expr: array_to_string_expr(array_type),
             l2_distance_expr: l2_distance_expr(float_array_type),
@@ -81,7 +93,11 @@ fn bind_function(
 
 fn int_array_vector() -> Vector {
     let array_type = LogicalType::Array(Box::new(LogicalType::Integer), INT_WIDTH);
-    let mut vector = Vector::new_array(array_type, ROWS);
+    let mut vector = paro_common::test_utils::test_new_array_with_allocator(
+        array_type,
+        ROWS,
+        paro_common::test_utils::test_allocator(),
+    );
     vector.set_count(ROWS);
 
     for row in 0..ROWS {
@@ -102,7 +118,11 @@ fn embedding_vector(offset: f32) -> Vector {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    Vector::from_embeddings(&values, FLOAT_WIDTH)
+    paro_common::test_utils::test_embeddings_vector_with_allocator(
+        &values,
+        FLOAT_WIDTH,
+        paro_common::test_utils::test_allocator(),
+    )
 }
 
 fn reference(index: usize, logical_type: LogicalType) -> Expression {
@@ -152,7 +172,7 @@ fn l2_distance_expr(array_type: LogicalType) -> Expression {
 fn array_length_fixed_array(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.array_length_expr);
-    let mut result = Vector::with_capacity(LogicalType::Integer, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, ROWS);
 
     bencher
         .counter(state.array_length_input.size())
@@ -175,7 +195,7 @@ fn array_length_fixed_array(bencher: Bencher) {
 fn array_to_string_fixed_array(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.array_to_string_expr);
-    let mut result = Vector::with_capacity(LogicalType::Varchar, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Varchar, ROWS);
 
     bencher
         .counter(state.array_to_string_input.size())
@@ -198,7 +218,7 @@ fn array_to_string_fixed_array(bencher: Bencher) {
 fn l2_distance_fixed_array(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.l2_distance_expr);
-    let mut result = Vector::with_capacity(LogicalType::Double, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Double, ROWS);
 
     bencher
         .counter(state.l2_distance_input.size())

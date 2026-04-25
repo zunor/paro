@@ -162,8 +162,8 @@ fn substring_2_varchar(
     let start_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing start column".to_string()))?;
-    let str_view = str_vec.to_varlen_view(count);
-    let start_view = start_vec.to_view(count);
+    let str_view = str_vec.try_to_varlen_view(count)?;
+    let start_view = start_vec.try_to_view(count)?;
     let bound_start = substring_bind_data(state).and_then(|data| data.start);
     let mut writer = VarcharResultWriter::new(result, count);
 
@@ -196,9 +196,9 @@ fn substring_3_varchar(
     let len_vec = input
         .column(2)
         .ok_or_else(|| paro_common::error::internal("Missing length column".to_string()))?;
-    let str_view = str_vec.to_varlen_view(count);
-    let start_view = start_vec.to_view(count);
-    let len_view = len_vec.to_view(count);
+    let str_view = str_vec.try_to_varlen_view(count)?;
+    let start_view = start_vec.try_to_view(count)?;
+    let len_view = len_vec.try_to_view(count)?;
     let bind_data = substring_bind_data(state);
     let bound_start = bind_data.and_then(|data| data.start);
     let bound_length = bind_data.and_then(|data| data.length);
@@ -231,8 +231,8 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
     let n_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing n column".to_string()))?;
-    let str_view = str_vec.to_varlen_view(count);
-    let n_view = n_vec.to_view(count);
+    let str_view = str_vec.try_to_varlen_view(count)?;
+    let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
     let mut writer = VarcharResultWriter::new(result, count);
 
@@ -266,8 +266,8 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
     let n_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing n column".to_string()))?;
-    let str_view = str_vec.to_varlen_view(count);
-    let n_view = n_vec.to_view(count);
+    let str_view = str_vec.try_to_varlen_view(count)?;
+    let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
     let mut writer = VarcharResultWriter::new(result, count);
 
@@ -431,12 +431,24 @@ mod tests {
 
     #[test]
     fn test_substring_function() {
-        let str_vec = Vector::from_strings(&["hello", "world"]);
-        let start_vec = Vector::from_i64(&[2, 1]);
-        let len_vec = Vector::from_i64(&[3, 2]);
-        let chunk = Chunk::from_vectors(vec![str_vec, start_vec, len_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let start_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[2, 1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let len_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[3, 2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, start_vec, len_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         substring_3_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -446,11 +458,20 @@ mod tests {
 
     #[test]
     fn test_left_function() {
-        let str_vec = Vector::from_strings(&["hello", "世界你好"]);
-        let n_vec = Vector::from_i64(&[3, 2]);
-        let chunk = Chunk::from_vectors(vec![str_vec, n_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "世界你好"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let n_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[3, 2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, n_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         left_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -460,11 +481,20 @@ mod tests {
 
     #[test]
     fn test_left_negative() {
-        let str_vec = Vector::from_strings(&["hello"]);
-        let n_vec = Vector::from_i64(&[-2]);
-        let chunk = Chunk::from_vectors(vec![str_vec, n_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let n_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[-2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, n_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         left_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -473,11 +503,20 @@ mod tests {
 
     #[test]
     fn test_right_function() {
-        let str_vec = Vector::from_strings(&["hello", "世界你好"]);
-        let n_vec = Vector::from_i64(&[3, 2]);
-        let chunk = Chunk::from_vectors(vec![str_vec, n_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "世界你好"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let n_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[3, 2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, n_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         right_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -487,11 +526,20 @@ mod tests {
 
     #[test]
     fn test_right_negative() {
-        let str_vec = Vector::from_strings(&["hello"]);
-        let n_vec = Vector::from_i64(&[-2]);
-        let chunk = Chunk::from_vectors(vec![str_vec, n_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let n_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[-2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, n_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         right_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -500,12 +548,21 @@ mod tests {
 
     #[test]
     fn test_substring_with_null() {
-        let mut str_vec = Vector::from_strings(&["hello", "world"]);
+        let mut str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         str_vec.validity_mut().set_null(1);
-        let start_vec = Vector::from_i64(&[1, 1]);
-        let chunk = Chunk::from_vectors(vec![str_vec, start_vec]);
+        let start_vec = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1, 1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, start_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         substring_2_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -537,12 +594,24 @@ mod tests {
             bind_data: bound.bind_data.clone().unwrap(),
         };
 
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_strings(&["hello"]),
-            Vector::from_i64(&[99]),
-            Vector::from_i64(&[99]),
-        ]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["hello"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i64_vector_with_allocator(
+                    &[99],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_i64_vector_with_allocator(
+                    &[99],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         substring_3_varchar(&chunk, &state, &mut result).unwrap();
 

@@ -28,7 +28,7 @@ pub fn initialize_states(
     count: usize,
 ) -> Result<()> {
     validate_layout(layout, objects)?;
-    let address_format = addresses.decode(addresses.len());
+    let address_format = addresses.try_decode(addresses.len())?;
     let address_data = address_format.get_data::<*mut u8>();
     for row in 0..count {
         let base = base_address(&address_format, address_data, addresses, row)?;
@@ -202,7 +202,7 @@ fn validate_payload_mapping(
 }
 
 fn base_address(
-    format: &paro_common::vector::DecodedVector,
+    format: &paro_common::vector::DecodedVectorOwned,
     address_data: *const *mut u8,
     addresses: &Vector,
     row_idx: usize,
@@ -255,15 +255,11 @@ fn build_state_vector(
         )));
     }
 
-    let mut states = Vector::with_capacity_and_allocator(
-        LogicalType::BigInt,
-        count,
-        addresses.allocator().clone(),
-    );
+    let mut states = Vector::try_new(LogicalType::BigInt, count, addresses.allocator().clone())?;
     states.set_count(count);
     let state_ptrs = unsafe { states.flat_data_mut::<*mut u8>() };
 
-    let address_format = addresses.decode(addresses.len());
+    let address_format = addresses.try_decode(addresses.len())?;
     let address_data = address_format.get_data::<*mut u8>();
     let state_offset = layout.state_offset(agg_idx);
 
@@ -333,11 +329,11 @@ fn materialize_filtered_vector(
         )));
     }
 
-    let mut materialized = Vector::with_capacity_and_allocator(
+    let mut materialized = Vector::try_new(
         source.logical_type().clone(),
         count,
         source.allocator().clone(),
-    );
+    )?;
     materialized.set_count(count);
     for row_idx in 0..count {
         materialized.copy_at(row_idx, source, filter.get(row_idx));
@@ -465,7 +461,8 @@ mod tests {
     }
 
     fn make_address_vector(rows: &mut [Vec<u8>]) -> Vector {
-        let mut addresses = Vector::with_capacity(LogicalType::BigInt, rows.len());
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, rows.len());
         addresses.set_count(rows.len());
         unsafe {
             let address_data = addresses.flat_data_mut::<*mut u8>();
@@ -502,13 +499,25 @@ mod tests {
         assert_eq!(read_state_i64(&source_rows, &layout, 0, 0), 0);
         assert_eq!(read_state_i64(&target_rows, &layout, 0, 0), 0);
 
-        let source_payload_chunk = Chunk::from_vectors(vec![Vector::from_i64(&[3])]);
+        let source_payload_chunk = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[3],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let source_inputs = vec![vec![0]];
         let source_payload = AggregatePayload {
             chunk: &source_payload_chunk,
             aggregate_inputs: &source_inputs,
         };
-        let target_payload_chunk = Chunk::from_vectors(vec![Vector::from_i64(&[7])]);
+        let target_payload_chunk = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[7],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let target_inputs = vec![vec![0]];
         let target_payload = AggregatePayload {
             chunk: &target_payload_chunk,
@@ -550,7 +559,8 @@ mod tests {
         .expect("combine");
         assert_eq!(read_state_i64(&target_rows, &layout, 0, 0), 10);
 
-        let mut result = Chunk::initialize(&[LogicalType::BigInt], 1);
+        let mut result =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 1);
         let mut finalize_input =
             AggregateInputData::new(None, &mut arena, AggregateCombineType::PreserveInput);
         finalize_states(
@@ -587,13 +597,19 @@ mod tests {
         let addresses = make_address_vector(&mut rows);
         initialize_states(&layout, &objects, &addresses, 3).expect("initialize");
 
-        let payload_chunk = Chunk::from_vectors(vec![Vector::from_i64(&[10, 20, 30])]);
+        let payload_chunk = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                &[10, 20, 30],
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let aggregate_inputs = vec![vec![0]];
         let payload = AggregatePayload {
             chunk: &payload_chunk,
             aggregate_inputs: &aggregate_inputs,
         };
-        let filter = SelectionVector::from_indices(vec![1, 2]);
+        let filter = paro_common::test_utils::test_selection(vec![1, 2]);
 
         let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
         let mut input =
@@ -608,7 +624,8 @@ mod tests {
         )
         .expect("filtered update");
 
-        let mut result = Chunk::initialize(&[LogicalType::BigInt], 3);
+        let mut result =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::BigInt], 3);
         finalize_states(&objects, &mut input, &addresses, &mut result, 3).expect("finalize");
         assert_eq!(result.column(0).expect("result col").get_i64(0), Some(0));
         assert_eq!(result.column(0).expect("result col").get_i64(1), Some(20));

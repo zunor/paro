@@ -2,15 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
+use crate::allocator::default_allocator;
+use crate::error::Result;
 use crate::types::{InlineString, LogicalType};
 
-use super::{ArrayVector, SelectionVector, ValidityMask, Vector, VectorBuffer, VectorType};
+use super::{
+    ArrayVector, SelectionVector, ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType,
+};
 
 #[derive(Debug, Clone)]
 pub enum SelectionRef<'a> {
     Borrowed(&'a SelectionVector),
     Owned(SelectionVector),
+    Range { offset: usize, count: usize },
     Constant { count: usize },
     Incremental { count: usize },
 }
@@ -21,6 +27,7 @@ impl<'a> SelectionRef<'a> {
         match self {
             Self::Borrowed(sel) => sel.len(),
             Self::Owned(sel) => sel.len(),
+            Self::Range { count, .. } => *count,
             Self::Constant { count } | Self::Incremental { count } => *count,
         }
     }
@@ -35,6 +42,7 @@ impl<'a> SelectionRef<'a> {
         match self {
             Self::Borrowed(sel) => sel.get(idx),
             Self::Owned(sel) => sel.get(idx),
+            Self::Range { offset, .. } => offset + idx,
             Self::Constant { .. } => 0,
             Self::Incremental { .. } => idx,
         }
@@ -45,16 +53,57 @@ impl<'a> SelectionRef<'a> {
         match self {
             Self::Borrowed(sel) => sel.allocation_identity(),
             Self::Owned(sel) => sel.allocation_identity(),
-            Self::Constant { .. } | Self::Incremental { .. } => None,
+            Self::Range { .. } | Self::Constant { .. } | Self::Incremental { .. } => None,
         }
     }
 
-    fn compose(self, sel: &'a SelectionVector, count: usize) -> SelectionRef<'a> {
-        match self {
-            SelectionRef::Borrowed(child_sel) => SelectionRef::Owned(child_sel.slice(sel, count)),
-            SelectionRef::Owned(child_sel) => SelectionRef::Owned(child_sel.slice(sel, count)),
-            SelectionRef::Constant { count: _ } => SelectionRef::Constant { count },
-            SelectionRef::Incremental { count: _ } => SelectionRef::Borrowed(sel),
+    fn try_compose(self, selection: &'a VectorSelection, count: usize) -> Result<SelectionRef<'a>> {
+        match (self, selection) {
+            (SelectionRef::Borrowed(child_sel), VectorSelection::Materialized(sel)) => {
+                Ok(SelectionRef::Owned(child_sel.try_slice(sel, count)?))
+            }
+            (SelectionRef::Borrowed(child_sel), VectorSelection::Range { offset, .. }) => Ok(
+                SelectionRef::Owned(child_sel.try_slice_range(*offset, count)?),
+            ),
+            (SelectionRef::Owned(child_sel), VectorSelection::Materialized(sel)) => {
+                Ok(SelectionRef::Owned(child_sel.try_slice(sel, count)?))
+            }
+            (SelectionRef::Owned(child_sel), VectorSelection::Range { offset, .. }) => Ok(
+                SelectionRef::Owned(child_sel.try_slice_range(*offset, count)?),
+            ),
+            (
+                SelectionRef::Range {
+                    offset: child_offset,
+                    ..
+                },
+                VectorSelection::Range { offset, .. },
+            ) => Ok(SelectionRef::Range {
+                offset: child_offset + offset,
+                count,
+            }),
+            (SelectionRef::Range { offset, .. }, VectorSelection::Materialized(sel)) => {
+                let mut result =
+                    SelectionVector::try_with_capacity(count, sel.allocator().clone())?;
+                result.set_len(count);
+                result.try_fill_offset_from(offset, sel, count)?;
+                Ok(SelectionRef::Owned(result))
+            }
+            (SelectionRef::Constant { count: _ }, _) => Ok(SelectionRef::Constant { count }),
+            (SelectionRef::Incremental { count: _ }, VectorSelection::Materialized(sel))
+                if count == sel.len() =>
+            {
+                Ok(SelectionRef::Borrowed(sel))
+            }
+            (SelectionRef::Incremental { count: _ }, VectorSelection::Materialized(sel)) => {
+                Ok(SelectionRef::Owned(sel.try_slice_range(0, count)?))
+            }
+            (SelectionRef::Incremental { count: _ }, VectorSelection::Range { offset, .. }) => {
+                Ok(SelectionRef::Range {
+                    offset: *offset,
+                    count,
+                })
+            }
+            (selection, VectorSelection::None) => Ok(selection),
         }
     }
 }
@@ -226,20 +275,55 @@ impl<'a> ArrayView<'a> {
     }
 }
 
+/// Borrowed decoded vector view for short-lived, zero-allocation readers.
+#[derive(Debug, Clone)]
+pub struct DecodedVectorRef<'a> {
+    sel: SelectionRef<'a>,
+    data: DataRef,
+    validity: ValidityRef<'a>,
+}
+
+impl<'a> DecodedVectorRef<'a> {
+    #[inline]
+    pub fn sel(&self) -> &SelectionRef<'a> {
+        &self.sel
+    }
+
+    #[inline]
+    pub fn physical_index(&self, idx: usize) -> usize {
+        self.sel.get(idx)
+    }
+
+    #[inline]
+    pub fn data(&self) -> DataRef {
+        self.data
+    }
+
+    #[inline]
+    pub fn validity(&self) -> &ValidityRef<'a> {
+        &self.validity
+    }
+
+    #[inline]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.validity.is_valid(self.physical_index(idx))
+    }
+}
+
 /// Owned vector view for callers that need a lifetime-free, self-contained view.
 ///
 /// This mirrors [`VectorView`], but owns or materializes the pieces needed to
 /// stay valid after the source vector borrow ends.
-pub struct DecodedVector {
+pub struct DecodedVectorOwned {
     sel: SelectionVector,
     data: *const u8,
     validity: ValidityMask,
     owned: Option<VectorBuffer>,
 }
 
-impl std::fmt::Debug for DecodedVector {
+impl std::fmt::Debug for DecodedVectorOwned {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DecodedVector")
+        f.debug_struct("DecodedVectorOwned")
             .field("sel", &self.sel)
             .field("data", &format!("{:p}", self.data))
             .field("validity", &self.validity)
@@ -247,15 +331,16 @@ impl std::fmt::Debug for DecodedVector {
     }
 }
 
-// SAFETY: DecodedVector only exposes immutable access to data owned by the
+// SAFETY: DecodedVectorOwned only exposes immutable access to data owned by the
 // source vector or by `owned`.
-unsafe impl Send for DecodedVector {}
-unsafe impl Sync for DecodedVector {}
+unsafe impl Send for DecodedVectorOwned {}
+unsafe impl Sync for DecodedVectorOwned {}
 
-impl DecodedVector {
+impl DecodedVectorOwned {
     pub fn empty() -> Self {
         Self {
-            sel: SelectionVector::with_capacity(0),
+            sel: SelectionVector::try_with_capacity(0, Arc::new(default_allocator()))
+                .expect("decoded empty selection allocation failed"),
             data: std::ptr::null(),
             validity: ValidityMask::new(0),
             owned: None,
@@ -310,7 +395,7 @@ impl DecodedVector {
 }
 
 pub struct DecodedVectorTree {
-    pub view: DecodedVector,
+    pub view: DecodedVectorOwned,
     pub children: Vec<DecodedVectorTree>,
     pub logical_type: LogicalType,
 }
@@ -318,7 +403,7 @@ pub struct DecodedVectorTree {
 impl DecodedVectorTree {
     pub fn empty() -> Self {
         Self {
-            view: DecodedVector::empty(),
+            view: DecodedVectorOwned::empty(),
             children: Vec::new(),
             logical_type: LogicalType::Null,
         }
@@ -326,79 +411,107 @@ impl DecodedVectorTree {
 }
 
 impl Vector {
-    pub fn to_view(&self, count: usize) -> VectorView<'_> {
+    pub fn try_to_view(&self, count: usize) -> Result<VectorView<'_>> {
         match self.vector_type {
-            VectorType::Flat => VectorView {
+            VectorType::Flat => Ok(VectorView {
                 logical_type: &self.logical_type,
                 sel: SelectionRef::Incremental { count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
                 _vector: PhantomData,
-            },
-            VectorType::Constant => VectorView {
+            }),
+            VectorType::Constant => Ok(VectorView {
                 logical_type: &self.logical_type,
                 sel: SelectionRef::Constant { count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
                 _vector: PhantomData,
-            },
+            }),
             VectorType::Dictionary => {
                 let child = self.child.as_ref().expect("dictionary child");
-                let sel = self.sel_vector.as_ref().expect("dictionary selection");
-                let child_count = child.len().max(sel.len());
-                let child_view = child.to_view(child_count);
-                VectorView {
+                let child_count = child.len().max(self.selection.len());
+                let child_view = child.try_to_view(child_count)?;
+                Ok(VectorView {
                     logical_type: &self.logical_type,
-                    sel: child_view.sel.compose(sel, count),
+                    sel: child_view.sel.try_compose(&self.selection, count)?,
                     validity: child_view.validity,
                     data: child_view.data,
                     _vector: PhantomData,
-                }
+                })
             }
             VectorType::Sequence => {
                 let (start, increment) = unsafe {
                     let ptr = self.buffer.data() as *const i64;
                     (*ptr, *ptr.add(1))
                 };
-                VectorView {
+                Ok(VectorView {
                     logical_type: &self.logical_type,
                     sel: SelectionRef::Incremental { count },
                     validity: ValidityRef::Borrowed(&self.validity),
                     data: DataRef::SequenceI64 { start, increment },
                     _vector: PhantomData,
-                }
+                })
             }
         }
     }
 
-    pub fn to_varlen_view(&self, count: usize) -> VarlenView<'_> {
-        let view = self.to_view(count);
+    pub fn to_view(&self, count: usize) -> VectorView<'_> {
+        self.try_to_view(count)
+            .expect("vector view selection allocation failed")
+    }
+
+    pub fn try_to_varlen_view(&self, count: usize) -> Result<VarlenView<'_>> {
+        let view = self.try_to_view(count)?;
         let DataRef::Ptr(entries) = view.data else {
             panic!("to_varlen_view requires pointer-backed data");
         };
-        VarlenView {
+        Ok(VarlenView {
             entries: entries as *const InlineString,
             sel: view.sel,
             validity: view.validity,
             _vector: PhantomData,
-        }
+        })
     }
 
-    pub fn to_array_view(&self, count: usize) -> ArrayView<'_> {
+    pub fn to_varlen_view(&self, count: usize) -> VarlenView<'_> {
+        self.try_to_varlen_view(count)
+            .expect("varlen view selection allocation failed")
+    }
+
+    pub fn try_to_array_view(&self, count: usize) -> Result<ArrayView<'_>> {
         let LogicalType::Array(_, array_size) = &self.logical_type else {
             panic!("to_array_view requires array logical type");
         };
         let child = ArrayVector::get_entry(self);
-        ArrayView {
-            parent: self.to_view(count),
-            child: child.to_view(child.len()),
+        Ok(ArrayView {
+            parent: self.try_to_view(count)?,
+            child: child.try_to_view(child.len())?,
             array_size: *array_size,
-        }
+        })
     }
 
-    pub fn decode_tree(&self, count: usize) -> DecodedVectorTree {
+    pub fn to_array_view(&self, count: usize) -> ArrayView<'_> {
+        self.try_to_array_view(count)
+            .expect("array view selection allocation failed")
+    }
+
+    pub fn try_decode_ref(&self, count: usize) -> Result<DecodedVectorRef<'_>> {
+        let view = self.try_to_view(count)?;
+        Ok(DecodedVectorRef {
+            sel: view.sel,
+            data: view.data,
+            validity: view.validity,
+        })
+    }
+
+    pub fn decode_ref(&self, count: usize) -> DecodedVectorRef<'_> {
+        self.try_decode_ref(count)
+            .expect("decoded vector ref allocation failed")
+    }
+
+    pub fn try_decode_tree(&self, count: usize) -> Result<DecodedVectorTree> {
         let mut data = DecodedVectorTree {
-            view: self.decode(count),
+            view: self.try_decode(count)?,
             children: Vec::new(),
             logical_type: self.logical_type.clone(),
         };
@@ -407,52 +520,66 @@ impl Vector {
             LogicalType::Array(_, array_size) => {
                 if let Some(child) = &self.child {
                     let child_count = count * array_size;
-                    data.children.push(child.decode_tree(child_count));
+                    data.children.push(child.try_decode_tree(child_count)?);
                 }
             }
             LogicalType::List(_) => {
                 if let Some(child) = &self.child {
-                    data.children.push(child.decode_tree(child.len()));
+                    data.children.push(child.try_decode_tree(child.len())?);
                 }
             }
             LogicalType::Struct(_) => {
                 if let Some(children) = self.children() {
                     for child in children.iter() {
-                        data.children.push(child.decode_tree(count));
+                        data.children.push(child.try_decode_tree(count)?);
                     }
                 }
             }
             _ => {}
         }
 
-        data
+        Ok(data)
     }
 
-    pub fn decode(&self, count: usize) -> DecodedVector {
+    pub fn decode_tree(&self, count: usize) -> DecodedVectorTree {
+        self.try_decode_tree(count)
+            .expect("decoded vector tree allocation failed")
+    }
+
+    pub fn try_decode(&self, count: usize) -> Result<DecodedVectorOwned> {
         match self.vector_type {
-            VectorType::Flat => DecodedVector {
-                sel: SelectionVector::incremental(count),
+            VectorType::Flat => Ok(DecodedVectorOwned {
+                sel: SelectionVector::try_incremental(count, self.buffer.allocator().clone())?,
                 data: self.buffer.data(),
                 validity: self.validity.clone(),
                 owned: None,
-            },
-            VectorType::Constant => DecodedVector {
-                sel: SelectionVector::constant(count),
+            }),
+            VectorType::Constant => Ok(DecodedVectorOwned {
+                sel: SelectionVector::try_constant(count, self.buffer.allocator().clone())?,
                 data: self.buffer.data(),
                 validity: self.validity.clone(),
                 owned: None,
-            },
+            }),
             VectorType::Dictionary => {
                 let child = self.child.as_ref().expect("dictionary child");
-                let sel = self.sel_vector.as_ref().expect("dictionary selection");
-                let child_count = child.len().max(sel.len());
-                let child_view = child.decode(child_count);
-                DecodedVector {
-                    sel: child_view.sel.slice(sel, count),
+                let child_count = child.len().max(self.selection.len());
+                let child_view = child.try_decode(child_count)?;
+                let child_selection = VectorSelection::Materialized(child_view.sel);
+                let selection = child_selection
+                    .try_compose(self.selection.clone())
+                    .and_then(|selection| {
+                        selection.try_materialize(self.buffer.allocator().clone())
+                    })?;
+                Ok(DecodedVectorOwned {
+                    sel: if selection.len() == count {
+                        selection
+                    } else {
+                        selection.try_slice_range(0, count)?
+                    },
                     data: child_view.data,
                     validity: child_view.validity,
                     owned: child_view.owned,
-                }
+                })
             }
             VectorType::Sequence => {
                 let (start, increment) = unsafe {
@@ -460,11 +587,11 @@ impl Vector {
                     (*ptr, *ptr.add(1))
                 };
 
-                let owned = VectorBuffer::with_allocator(
+                let owned = VectorBuffer::try_with_allocator(
                     std::mem::size_of::<i64>(),
                     count,
                     self.buffer.allocator().clone(),
-                );
+                )?;
 
                 unsafe {
                     let dst = owned.data() as *mut i64;
@@ -473,14 +600,19 @@ impl Vector {
                     }
                 }
 
-                DecodedVector {
-                    sel: SelectionVector::incremental(count),
+                Ok(DecodedVectorOwned {
+                    sel: SelectionVector::try_incremental(count, self.buffer.allocator().clone())?,
                     data: owned.data(),
                     validity: self.validity.clone(),
                     owned: Some(owned),
-                }
+                })
             }
         }
+    }
+
+    pub fn decode(&self, count: usize) -> DecodedVectorOwned {
+        self.try_decode(count)
+            .expect("decoded vector allocation failed")
     }
 }
 
@@ -493,7 +625,7 @@ mod tests {
 
     #[test]
     fn flat_to_view_borrows_validity_and_avoids_owned_selection() {
-        let vector = Vector::from_i64(&[10, 20, 30]);
+        let vector = crate::test_utils::test_i64_vector(&[10, 20, 30]);
         let view = vector.to_view(3);
 
         assert!(matches!(view.sel(), SelectionRef::Incremental { count: 3 }));
@@ -503,7 +635,7 @@ mod tests {
 
     #[test]
     fn constant_to_view_uses_constant_selection() {
-        let vector = Vector::constant(LogicalType::BigInt, 42_i64, 4);
+        let vector = crate::test_utils::test_constant(LogicalType::BigInt, 42_i64, 4);
         let view = vector.to_view(4);
 
         assert!(matches!(view.sel(), SelectionRef::Constant { count: 4 }));
@@ -513,9 +645,12 @@ mod tests {
 
     #[test]
     fn dictionary_to_view_collapses_nested_selection() {
-        let base = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
-        let first = Arc::new(Vector::dictionary(base, vec![3_u32, 1, 2]));
-        let nested = Vector::dictionary(first, SelectionVector::from_indices(vec![1, 2]));
+        let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
+        let first = Arc::new(crate::test_utils::test_dictionary(base, vec![3_u32, 1, 2]));
+        let nested = crate::test_utils::test_dictionary(
+            first,
+            crate::test_utils::test_selection(vec![1, 2]),
+        );
         let selection_allocation = nested
             .sel_vector()
             .expect("canonical dictionary selection")
@@ -528,8 +663,41 @@ mod tests {
     }
 
     #[test]
+    fn range_dictionary_to_view_stays_borrowed_range() {
+        let vector = crate::test_utils::test_i64_vector(&[10, 20, 30, 40]);
+        let sliced = vector.slice_ref(1, 2).expect("range slice");
+        let view = sliced.to_view(2);
+
+        assert!(matches!(
+            view.sel(),
+            SelectionRef::Range {
+                offset: 1,
+                count: 2
+            }
+        ));
+        assert_eq!(view.get_i64(0), 20);
+        assert_eq!(view.get_i64(1), 30);
+    }
+
+    #[test]
+    fn decode_ref_keeps_range_selection() {
+        let vector = crate::test_utils::test_i64_vector(&[10, 20, 30, 40]);
+        let sliced = vector.slice_ref(1, 3).expect("range slice");
+        let decoded = sliced.decode_ref(3);
+
+        assert!(matches!(
+            decoded.sel(),
+            SelectionRef::Range {
+                offset: 1,
+                count: 3
+            }
+        ));
+        assert!(decoded.is_valid(2));
+    }
+
+    #[test]
     fn sequence_to_view_uses_sequence_data_ref() {
-        let vector = Vector::sequence(7, 3, 5);
+        let vector = crate::test_utils::test_sequence(7, 3, 5);
         let view = vector.to_view(5);
 
         assert!(matches!(
@@ -544,8 +712,10 @@ mod tests {
 
     #[test]
     fn varlen_view_reads_dictionary_entries() {
-        let base = Arc::new(Vector::from_strings(&["alpha", "beta", "gamma"]));
-        let dictionary = Vector::dictionary(base, vec![2_u32, 0]);
+        let base = Arc::new(crate::test_utils::test_string_vector(&[
+            "alpha", "beta", "gamma",
+        ]));
+        let dictionary = crate::test_utils::test_dictionary(base, vec![2_u32, 0]);
         let view = dictionary.to_varlen_view(2);
 
         assert_eq!(view.get_inline_string(0).as_str(), "gamma");
@@ -554,8 +724,9 @@ mod tests {
 
     #[test]
     fn array_view_uses_parent_selection_stride() {
-        let vector = Vector::from_embeddings(&[vec![1.0_f32, 2.0], vec![3.0, 4.0]], 2);
-        let dictionary = Vector::dictionary(Arc::new(vector), vec![1_u32]);
+        let vector =
+            crate::test_utils::test_embeddings_vector(&[vec![1.0_f32, 2.0], vec![3.0, 4.0]], 2);
+        let dictionary = crate::test_utils::test_dictionary(Arc::new(vector), vec![1_u32]);
         let view = dictionary.to_array_view(1);
 
         assert_eq!(view.array_size(), 2);
@@ -567,7 +738,7 @@ mod tests {
 
     #[test]
     fn owned_view_materializes_sequence_once() {
-        let vector = Vector::sequence(7, 3, 4);
+        let vector = crate::test_utils::test_sequence(7, 3, 4);
         let view = vector.decode(4);
 
         unsafe {
@@ -578,9 +749,12 @@ mod tests {
 
     #[test]
     fn owned_view_collapses_nested_dictionary_selection() {
-        let base = Arc::new(Vector::from_i32(&[10, 20, 30, 40]));
-        let first = Arc::new(Vector::dictionary(base, vec![3_u32, 1, 2]));
-        let nested = Vector::dictionary(first, SelectionVector::from_indices(vec![1, 2]));
+        let base = Arc::new(crate::test_utils::test_i32_vector(&[10, 20, 30, 40]));
+        let first = Arc::new(crate::test_utils::test_dictionary(base, vec![3_u32, 1, 2]));
+        let nested = crate::test_utils::test_dictionary(
+            first,
+            crate::test_utils::test_selection(vec![1, 2]),
+        );
         let view = nested.decode(2);
 
         unsafe {

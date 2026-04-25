@@ -318,6 +318,7 @@ pub(crate) fn encode_chunk(types: &[LogicalType], chunk: &Chunk) -> Result<Vec<C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::*;
     use bytes::Bytes;
     use paro_common::allocator::default_allocator;
     use paro_common::vector::Vector;
@@ -329,16 +330,13 @@ mod tests {
             precision: 18,
             scale: 2,
         };
-        let mut vector = Vector::with_capacity_and_allocator(
-            decimal_type.clone(),
-            2,
-            Arc::new(default_allocator()),
-        );
+        let mut vector =
+            Vector::try_new(decimal_type.clone(), 2, Arc::new(default_allocator())).unwrap();
         vector.set_value(0, &Value::Decimal(12_345, 18, 2));
         vector.set_value(1, &Value::Decimal(-678, 18, 2));
         vector.set_count(2);
 
-        let chunk = Chunk::from_vectors(vec![vector]);
+        let chunk = test_chunk_from_vectors(vec![vector]);
         let encoded = encode_chunk(std::slice::from_ref(&decimal_type), &chunk).unwrap();
         assert_eq!(encoded[0].data.len(), 2 * std::mem::size_of::<i64>());
 

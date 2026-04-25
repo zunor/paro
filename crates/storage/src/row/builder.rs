@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{GrantAllocator, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 
 use crate::buffer::{BufferPool, MemoryTag, DEFAULT_BLOCK_SIZE};
@@ -20,6 +21,7 @@ pub struct RowStoreBuilder {
     raw_layout: Arc<RawRowLayout>,
     buffer_pool: Arc<BufferPool>,
     tag: MemoryTag,
+    memory: MemoryAccountingContext,
     regions: Vec<RawRowCollection>,
     current: RawRowCollection,
     count: u64,
@@ -27,13 +29,44 @@ pub struct RowStoreBuilder {
 
 impl RowStoreBuilder {
     pub fn new(buffer_pool: Arc<BufferPool>, layout: Arc<RowLayout>, tag: MemoryTag) -> Self {
+        let memory =
+            MemoryAccountingContext::detached(tag, MemoryAccountingClass::default_for_tag(tag));
+        Self::new_with_memory(buffer_pool, layout, tag, memory)
+    }
+
+    pub fn new_with_grant_allocator(
+        buffer_pool: Arc<BufferPool>,
+        layout: Arc<RowLayout>,
+        tag: MemoryTag,
+        grant_allocator: GrantAllocator<'_>,
+    ) -> Self {
+        Self::new_with_memory(
+            buffer_pool,
+            layout,
+            tag,
+            MemoryAccountingContext::from_grant_allocator(&grant_allocator),
+        )
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        layout: Arc<RowLayout>,
+        tag: MemoryTag,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         let raw_layout = Arc::new(layout.to_raw_layout());
-        let current = RawRowCollection::new(Arc::clone(&buffer_pool), Arc::clone(&raw_layout), tag);
+        let current = RawRowCollection::new_with_memory(
+            Arc::clone(&buffer_pool),
+            Arc::clone(&raw_layout),
+            tag,
+            memory.clone(),
+        );
         Self {
             layout,
             raw_layout,
             buffer_pool,
             tag,
+            memory,
             regions: Vec::new(),
             current,
             count: 0,
@@ -52,6 +85,23 @@ impl RowStoreBuilder {
                 RowValidityType::CanHaveNullValues,
             )),
             tag,
+        )
+    }
+
+    pub fn from_types_with_grant_allocator(
+        buffer_pool: Arc<BufferPool>,
+        types: Vec<LogicalType>,
+        tag: MemoryTag,
+        grant_allocator: GrantAllocator<'_>,
+    ) -> Self {
+        Self::new_with_grant_allocator(
+            buffer_pool,
+            Arc::new(RowLayout::from_types(
+                types,
+                RowValidityType::CanHaveNullValues,
+            )),
+            tag,
+            grant_allocator,
         )
     }
 
@@ -203,10 +253,11 @@ impl RowStoreBuilder {
     }
 
     fn finish_current_region(&mut self) {
-        let next = RawRowCollection::new(
+        let next = RawRowCollection::new_with_memory(
             Arc::clone(&self.buffer_pool),
             Arc::clone(&self.raw_layout),
             self.tag,
+            self.memory.clone(),
         );
         let current = std::mem::replace(&mut self.current, next);
         if current.count() > 0 {

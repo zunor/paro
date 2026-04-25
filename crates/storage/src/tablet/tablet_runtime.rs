@@ -2469,11 +2469,11 @@ mod tests {
     use crate::rowset::RowsetMeta;
     use crate::rowset::{RowsetWriter, RowsetWriterContext};
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
+    use crate::test_utils::*;
     use crate::wal::wal_entry::WalEntry;
     use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -2538,7 +2538,7 @@ mod tests {
     }
 
     fn chunk_with_names(ids: &[i64], names: &[&str]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i64(ids), Vector::from_strings(names)])
+        test_chunk_from_vectors(vec![test_i64_vector(ids), test_string_vector(names)])
     }
 
     #[test]

@@ -232,6 +232,7 @@ fn paro_columns_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoColumnsGlobalState>());
@@ -305,77 +306,79 @@ fn paro_columns_function(
     if count > 0 {
         // Column 0: database_name (VARCHAR)
         let db_name_refs: Vec<&str> = db_names.iter().map(|s| s.as_str()).collect();
-        let db_name_vec = Vector::from_strings(&db_name_refs);
+        let db_name_vec = Vector::try_from_strings(&db_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(0) {
             *col = db_name_vec;
         }
 
         // Column 1: database_oid (BIGINT)
-        let db_oid_vec = Vector::from_i64(&db_oids);
+        let db_oid_vec = Vector::try_from_i64(&db_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(1) {
             *col = db_oid_vec;
         }
 
         // Column 2: schema_name (VARCHAR)
         let schema_name_refs: Vec<&str> = schema_names.iter().map(|s| s.as_str()).collect();
-        let schema_name_vec = Vector::from_strings(&schema_name_refs);
+        let schema_name_vec =
+            Vector::try_from_strings(&schema_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(2) {
             *col = schema_name_vec;
         }
 
         // Column 3: schema_oid (BIGINT)
-        let schema_oid_vec = Vector::from_i64(&schema_oids);
+        let schema_oid_vec = Vector::try_from_i64(&schema_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(3) {
             *col = schema_oid_vec;
         }
 
         // Column 4: table_name (VARCHAR)
         let table_name_refs: Vec<&str> = table_names.iter().map(|s| s.as_str()).collect();
-        let table_name_vec = Vector::from_strings(&table_name_refs);
+        let table_name_vec = Vector::try_from_strings(&table_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(4) {
             *col = table_name_vec;
         }
 
         // Column 5: table_oid (BIGINT)
-        let table_oid_vec = Vector::from_i64(&table_oids);
+        let table_oid_vec = Vector::try_from_i64(&table_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(5) {
             *col = table_oid_vec;
         }
 
         // Column 6: column_name (VARCHAR)
         let column_name_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
-        let column_name_vec = Vector::from_strings(&column_name_refs);
+        let column_name_vec =
+            Vector::try_from_strings(&column_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(6) {
             *col = column_name_vec;
         }
 
         // Column 7: column_index (INTEGER)
-        let column_index_vec = Vector::from_i32(&column_indexes);
+        let column_index_vec = Vector::try_from_i32(&column_indexes, output_allocator.clone())?;
         if let Some(col) = output.column_mut(7) {
             *col = column_index_vec;
         }
 
         // Column 8: internal (BOOLEAN)
-        let internal_vec = Vector::from_bool(&internals);
+        let internal_vec = Vector::try_from_bool(&internals, output_allocator.clone())?;
         if let Some(col) = output.column_mut(8) {
             *col = internal_vec;
         }
 
         // Column 9: is_nullable (BOOLEAN)
-        let is_nullable_vec = Vector::from_bool(&is_nullables);
+        let is_nullable_vec = Vector::try_from_bool(&is_nullables, output_allocator.clone())?;
         if let Some(col) = output.column_mut(9) {
             *col = is_nullable_vec;
         }
 
         // Column 10: data_type (VARCHAR)
         let data_type_refs: Vec<&str> = data_types.iter().map(|s| s.as_str()).collect();
-        let data_type_vec = Vector::from_strings(&data_type_refs);
+        let data_type_vec = Vector::try_from_strings(&data_type_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(10) {
             *col = data_type_vec;
         }
 
         // Column 11: data_type_id (BIGINT)
-        let data_type_id_vec = Vector::from_i64(&data_type_ids);
+        let data_type_id_vec = Vector::try_from_i64(&data_type_ids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(11) {
             *col = data_type_id_vec;
         }
@@ -383,43 +386,50 @@ fn paro_columns_function(
         // Column 12: column_default (VARCHAR)
         let column_default_refs: Vec<Option<&str>> =
             column_defaults.iter().map(|s| s.as_deref()).collect();
-        let column_default_vec = Vector::from_nullable_strings(&column_default_refs);
+        let column_default_vec =
+            Vector::try_from_nullable_strings(&column_default_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(12) {
             *col = column_default_vec;
         }
 
         // Column 13: character_maximum_length (BIGINT)
-        let character_maximum_length_vec = Vector::from_nullable_u64(&character_maximum_lengths);
+        let character_maximum_length_vec =
+            Vector::try_from_nullable_u64(&character_maximum_lengths, output_allocator.clone())?;
         if let Some(col) = output.column_mut(13) {
             *col = character_maximum_length_vec;
         }
 
         // Column 14: character_octet_length (BIGINT)
-        let character_octet_length_vec = Vector::from_nullable_u64(&character_octet_lengths);
+        let character_octet_length_vec =
+            Vector::try_from_nullable_u64(&character_octet_lengths, output_allocator.clone())?;
         if let Some(col) = output.column_mut(14) {
             *col = character_octet_length_vec;
         }
 
         // Column 15: numeric_precision (BIGINT)
-        let numeric_precision_vec = Vector::from_nullable_u64(&numeric_precisions);
+        let numeric_precision_vec =
+            Vector::try_from_nullable_u64(&numeric_precisions, output_allocator.clone())?;
         if let Some(col) = output.column_mut(15) {
             *col = numeric_precision_vec;
         }
 
         // Column 16: numeric_precision_radix (BIGINT)
-        let numeric_precision_radix_vec = Vector::from_nullable_u64(&numeric_precision_radixes);
+        let numeric_precision_radix_vec =
+            Vector::try_from_nullable_u64(&numeric_precision_radixes, output_allocator.clone())?;
         if let Some(col) = output.column_mut(16) {
             *col = numeric_precision_radix_vec;
         }
 
         // Column 17: numeric_scale (BIGINT)
-        let numeric_scale_vec = Vector::from_nullable_u64(&numeric_scales);
+        let numeric_scale_vec =
+            Vector::try_from_nullable_u64(&numeric_scales, output_allocator.clone())?;
         if let Some(col) = output.column_mut(17) {
             *col = numeric_scale_vec;
         }
 
         // Column 18: datetime_precision (BIGINT)
-        let datetime_precision_vec = Vector::from_nullable_u64(&datetime_precisions);
+        let datetime_precision_vec =
+            Vector::try_from_nullable_u64(&datetime_precisions, output_allocator.clone())?;
         if let Some(col) = output.column_mut(18) {
             *col = datetime_precision_vec;
         }
@@ -560,7 +570,7 @@ mod tests {
             global_state: Some(state),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar, // database_name
                 LogicalType::BigInt,  // database_oid
@@ -682,7 +692,7 @@ mod tests {
             global_state: Some(state_ref),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar,
                 LogicalType::BigInt,
@@ -897,7 +907,7 @@ mod tests {
             global_state: Some(state_ref),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar,
                 LogicalType::BigInt,

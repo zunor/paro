@@ -3,15 +3,13 @@
 
 //! Scan-side memory budgeting and adaptive tuning.
 //!
-//! This module derives operator-level budgets from query-level limits (via TMM),
+//! This module derives operator-level budgets from query-level limits,
 //! and uses the resulting reservation to tune:
 //! - prefetch target bytes/window
 //! - decompression parallelism
 //! - scan source parallelism (backpressure)
 
-use std::sync::Arc;
-
-use paro_storage::buffer::{PrefetchOptions, TemporaryMemoryState, DEFAULT_BLOCK_ALLOC_SIZE};
+use paro_storage::buffer::{PrefetchOptions, DEFAULT_BLOCK_ALLOC_SIZE};
 
 /// Default prefetch window used by scan planning.
 const DEFAULT_PREFETCH_WINDOW_PAGES: usize = 8;
@@ -114,19 +112,16 @@ impl ScanMemoryBudget {
         PrefetchOptions {
             window_pages: self.prefetch_window_pages.max(1),
             batch_pages: self.prefetch_batch_pages.max(1),
-            // Use TemporaryMemoryState reservation as live cap.
+            // PrefetchLease enforces live in-flight bytes.
             max_inflight_bytes: 0,
-            // Let prefetcher derive concurrency from reservation dynamically.
+            // Let prefetcher derive concurrency from the lease target dynamically.
             max_concurrent_tasks: 0,
         }
     }
 }
 
-/// Compute scan memory budget and update reservation through TMM.
-pub fn plan_scan_memory_budget(
-    state: &Arc<TemporaryMemoryState>,
-    config: &ScanMemoryBudgetConfig,
-) -> ScanMemoryBudget {
+/// Compute scan memory budget. In-flight prefetch is enforced by PrefetchLease.
+pub fn plan_scan_memory_budget(config: &ScanMemoryBudgetConfig) -> ScanMemoryBudget {
     let projected_columns = config.projected_columns.max(1);
     let query_threads = config.query_max_threads.max(1);
     let modeled_concurrency = std::cmp::min(
@@ -154,10 +149,7 @@ pub fn plan_scan_memory_budget(
     };
 
     let requested_bytes = std::cmp::min(demanded_bytes, operator_cap_bytes).max(1);
-    state.set_remaining_size_and_update_reservation(requested_bytes);
-
-    // Bound by operator cap so scan cannot monopolize query memory.
-    let reservation_bytes = std::cmp::min(state.get_reservation(), operator_cap_bytes);
+    let reservation_bytes = requested_bytes;
 
     let externalize =
         config.force_external || reservation_bytes.saturating_mul(4) < demanded_bytes.max(1);
@@ -245,31 +237,11 @@ fn estimate_decode_bytes(projected_columns: usize, batch_size: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_storage::buffer::{TemporaryMemoryConfig, TemporaryMemoryManager};
-
-    fn create_state(
-        memory_limit: usize,
-        query_max_memory: usize,
-        force_external: bool,
-    ) -> (Arc<TemporaryMemoryManager>, Arc<TemporaryMemoryState>) {
-        let manager = Arc::new(TemporaryMemoryManager::new());
-        manager.update_configuration(TemporaryMemoryConfig {
-            memory_limit,
-            has_temporary_directory: true,
-            num_threads: 4,
-            num_connections: 1,
-            query_max_memory,
-            force_external,
-        });
-        let state = manager.register();
-        (manager, state)
-    }
 
     #[test]
     fn scan_budget_prefetch_enabled_when_memory_is_sufficient() {
-        let (_manager, state) = create_state(512 * 1024 * 1024, 512 * 1024 * 1024, false);
         let cfg = ScanMemoryBudgetConfig::new(4, 16, 4096, 8, 512 * 1024 * 1024, false);
-        let budget = plan_scan_memory_budget(&state, &cfg);
+        let budget = plan_scan_memory_budget(&cfg);
 
         assert!(!budget.externalize);
         assert!(budget.use_prefetch);
@@ -280,9 +252,8 @@ mod tests {
 
     #[test]
     fn scan_budget_externalizes_when_force_external_enabled() {
-        let (_manager, state) = create_state(512 * 1024 * 1024, 512 * 1024 * 1024, true);
         let cfg = ScanMemoryBudgetConfig::new(4, 16, 4096, 8, 512 * 1024 * 1024, true);
-        let budget = plan_scan_memory_budget(&state, &cfg);
+        let budget = plan_scan_memory_budget(&cfg);
 
         assert!(budget.externalize);
         assert!(!budget.use_prefetch);
@@ -294,9 +265,8 @@ mod tests {
     #[test]
     fn scan_budget_triggers_backpressure_under_low_query_cap() {
         let query_cap = 2 * 1024 * 1024; // 2MB
-        let (_manager, state) = create_state(16 * 1024 * 1024, query_cap, false);
         let cfg = ScanMemoryBudgetConfig::new(8, 32, 4096, 8, query_cap, false);
-        let budget = plan_scan_memory_budget(&state, &cfg);
+        let budget = plan_scan_memory_budget(&cfg);
 
         assert!(budget.backpressure);
         assert!(budget.externalize);

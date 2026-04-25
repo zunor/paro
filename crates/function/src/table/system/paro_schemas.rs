@@ -162,6 +162,7 @@ fn paro_schemas_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoSchemasGlobalState>());
@@ -206,33 +207,34 @@ fn paro_schemas_function(
     // Set column values
     if count > 0 {
         // Column 0: oid (BIGINT)
-        let oid_vec = Vector::from_i64(&oids);
+        let oid_vec = Vector::try_from_i64(&oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(0) {
             *col = oid_vec;
         }
 
         // Column 1: database_name (VARCHAR)
         let db_name_refs: Vec<&str> = db_names.iter().map(|s| s.as_str()).collect();
-        let db_name_vec = Vector::from_strings(&db_name_refs);
+        let db_name_vec = Vector::try_from_strings(&db_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(1) {
             *col = db_name_vec;
         }
 
         // Column 2: database_oid (BIGINT)
-        let db_oid_vec = Vector::from_i64(&db_oids);
+        let db_oid_vec = Vector::try_from_i64(&db_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(2) {
             *col = db_oid_vec;
         }
 
         // Column 3: schema_name (VARCHAR)
         let schema_name_refs: Vec<&str> = schema_names.iter().map(|s| s.as_str()).collect();
-        let schema_name_vec = Vector::from_strings(&schema_name_refs);
+        let schema_name_vec =
+            Vector::try_from_strings(&schema_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(3) {
             *col = schema_name_vec;
         }
 
         // Column 4: internal (BOOLEAN)
-        let internal_vec = Vector::from_bool(&internals);
+        let internal_vec = Vector::try_from_bool(&internals, output_allocator.clone())?;
         if let Some(col) = output.column_mut(4) {
             *col = internal_vec;
         }
@@ -345,7 +347,7 @@ mod tests {
             global_state: Some(state),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::BigInt,
                 LogicalType::Varchar,
@@ -404,7 +406,7 @@ mod tests {
             global_state: Some(state_ref),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::BigInt,
                 LogicalType::Varchar,

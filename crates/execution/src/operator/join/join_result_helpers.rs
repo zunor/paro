@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
+use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
@@ -24,16 +25,17 @@ fn project_columns(
     projection_map: &[usize],
     result: &mut Chunk,
     result_offset: usize,
-) {
+) -> Result<()> {
     for (out_idx, input_idx) in projection_indices(input.column_count(), projection_map)
         .into_iter()
         .enumerate()
     {
-        result.data[result_offset + out_idx] = Arc::new(Vector::dictionary(
+        result.data[result_offset + out_idx] = Arc::new(Vector::try_dictionary(
             Arc::clone(&input.data[input_idx]),
             sel.clone(),
-        ));
+        )?);
     }
+    Ok(())
 }
 
 pub fn construct_semi_join_result(
@@ -42,9 +44,10 @@ pub fn construct_semi_join_result(
     count: usize,
     left_projection_map: &[usize],
     result: &mut Chunk,
-) {
-    project_columns(left, left_sel, left_projection_map, result, 0);
+) -> Result<()> {
+    project_columns(left, left_sel, left_projection_map, result, 0)?;
     result.set_cardinality(count);
+    Ok(())
 }
 
 pub fn construct_anti_join_result(
@@ -53,8 +56,8 @@ pub fn construct_anti_join_result(
     count: usize,
     left_projection_map: &[usize],
     result: &mut Chunk,
-) {
-    construct_semi_join_result(left, left_sel, count, left_projection_map, result);
+) -> Result<()> {
+    construct_semi_join_result(left, left_sel, count, left_projection_map, result)
 }
 
 pub fn construct_left_outer_result(
@@ -64,13 +67,18 @@ pub fn construct_left_outer_result(
     left_projection_map: &[usize],
     right_types: &[LogicalType],
     result: &mut Chunk,
-) {
-    project_columns(left, left_sel, left_projection_map, result, 0);
+) -> Result<()> {
+    project_columns(left, left_sel, left_projection_map, result, 0)?;
     let right_offset = projection_indices(left.column_count(), left_projection_map).len();
     for (idx, typ) in right_types.iter().enumerate() {
-        result.data[right_offset + idx] = Arc::new(Vector::constant_null(typ.clone(), count));
+        result.data[right_offset + idx] = Arc::new(Vector::try_constant_null(
+            typ.clone(),
+            count,
+            result.allocator().clone(),
+        )?);
     }
     result.set_cardinality(count);
+    Ok(())
 }
 
 pub fn construct_mark_join_result(
@@ -78,10 +86,14 @@ pub fn construct_mark_join_result(
     left_projection_map: &[usize],
     markers: &[Option<bool>],
     result: &mut Chunk,
-) {
+) -> Result<()> {
     let count = markers.len();
-    let left_sel = SelectionVector::incremental(count);
-    project_columns(left, &left_sel, left_projection_map, result, 0);
+    let mut left_sel = SelectionVector::try_with_capacity(count, result.allocator().clone())?;
+    left_sel.set_len(count);
+    for idx in 0..count {
+        left_sel.set(idx, idx);
+    }
+    project_columns(left, &left_sel, left_projection_map, result, 0)?;
 
     let marker_offset = projection_indices(left.column_count(), left_projection_map).len();
     let marker_vec = result
@@ -100,6 +112,7 @@ pub fn construct_mark_join_result(
         }
     }
     result.set_cardinality(count);
+    Ok(())
 }
 
 pub fn construct_right_outer_scan_result(
@@ -109,9 +122,13 @@ pub fn construct_right_outer_scan_result(
     left_types: &[LogicalType],
     right_projection_map: &[usize],
     result: &mut Chunk,
-) {
+) -> Result<()> {
     for (idx, typ) in left_types.iter().enumerate() {
-        result.data[idx] = Arc::new(Vector::constant_null(typ.clone(), count));
+        result.data[idx] = Arc::new(Vector::try_constant_null(
+            typ.clone(),
+            count,
+            result.allocator().clone(),
+        )?);
     }
     project_columns(
         build,
@@ -119,8 +136,9 @@ pub fn construct_right_outer_scan_result(
         right_projection_map,
         result,
         left_types.len(),
-    );
+    )?;
     result.set_cardinality(count);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -130,16 +148,25 @@ mod tests {
     };
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::{SelectionVector, Vector};
+
     use std::sync::Arc;
 
     #[test]
     fn left_outer_result_projects_left_and_null_fills_right() {
-        let left = Chunk::from_arc_vectors(vec![
-            Arc::new(Vector::from_i32(&[10, 20])),
-            Arc::new(Vector::from_strings(&["a", "b"])),
-        ]);
-        let mut result = Chunk::initialize(
+        let left = Chunk::from_arc_vectors(
+            vec![
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                Arc::new(paro_common::test_utils::test_string_vector_with_allocator(
+                    &["a", "b"],
+                    paro_common::test_utils::test_allocator(),
+                )),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar,
                 LogicalType::Boolean,
@@ -148,7 +175,7 @@ mod tests {
             2,
         );
 
-        let sel = SelectionVector::from_indices(vec![1]);
+        let sel = paro_common::test_utils::test_selection(vec![1]);
         construct_left_outer_result(
             &left,
             &sel,
@@ -156,7 +183,8 @@ mod tests {
             &[1],
             &[LogicalType::Boolean, LogicalType::BigInt],
             &mut result,
-        );
+        )
+        .unwrap();
 
         assert_eq!(result.size(), 1);
         assert_eq!(result.data[0].get_value(0).to_string(), "'b'");
@@ -166,10 +194,21 @@ mod tests {
 
     #[test]
     fn mark_join_result_appends_boolean_marker() {
-        let left = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[10, 20]))]);
-        let mut result = Chunk::initialize(&[LogicalType::Integer, LogicalType::Boolean], 2);
+        let left = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::Integer, LogicalType::Boolean],
+            2,
+        );
 
-        construct_mark_join_result(&left, &[], &[Some(true), None], &mut result);
+        construct_mark_join_result(&left, &[], &[Some(true), None], &mut result).unwrap();
 
         assert_eq!(result.size(), 2);
         assert_eq!(result.data[1].get_value(0).to_string(), "true");
@@ -178,11 +217,20 @@ mod tests {
 
     #[test]
     fn right_outer_scan_result_null_fills_left_side() {
-        let build = Chunk::from_arc_vectors(vec![
-            Arc::new(Vector::from_i32(&[1, 2])),
-            Arc::new(Vector::from_strings(&["x", "y"])),
-        ]);
-        let mut result = Chunk::initialize(
+        let build = Chunk::from_arc_vectors(
+            vec![
+                Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2],
+                    paro_common::test_utils::test_allocator(),
+                )),
+                Arc::new(paro_common::test_utils::test_string_vector_with_allocator(
+                    &["x", "y"],
+                    paro_common::test_utils::test_allocator(),
+                )),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Boolean,
                 LogicalType::Integer,
@@ -193,12 +241,13 @@ mod tests {
 
         construct_right_outer_scan_result(
             &build,
-            &SelectionVector::from_indices(vec![0]),
+            &paro_common::test_utils::test_selection(vec![0]),
             1,
             &[LogicalType::Boolean],
             &[],
             &mut result,
-        );
+        )
+        .unwrap();
 
         assert!(result.data[0].is_null(0));
         assert_eq!(result.data[1].get_value(0).to_string(), "1");

@@ -207,7 +207,7 @@ fn initialize_validity_masks(row_locations: &[*mut u8], flag_width: usize, count
 /// Compute heap sizes for variable-length data in a Chunk.
 ///
 /// This function correctly handles all vector types (Flat, Constant, Dictionary)
-/// by using the DecodedVector for proper index mapping.
+/// by using the DecodedVectorOwned for proper index mapping.
 ///
 /// # Arguments
 /// * `layout` - The raw row layout
@@ -290,12 +290,12 @@ fn compute_vector_heap_sizes(
 /// Compute heap sizes for string data.
 ///
 /// This correctly handles CONSTANT and DICTIONARY vectors by using the
-/// selection vector from DecodedVector to map indices.
+/// selection vector from DecodedVectorOwned to map indices.
 ///
 /// Compute heap sizes for string data.
 ///
 /// This correctly handles CONSTANT and DICTIONARY vectors by using the
-/// selection vector from DecodedVector to map indices.
+/// selection vector from DecodedVectorOwned to map indices.
 ///
 fn compute_string_heap_sizes(
     format: &mut RawRowVectorFormat,
@@ -341,7 +341,7 @@ fn compute_string_heap_sizes_internal<const HAS_APPEND_SEL: bool, const ALL_VALI
             i
         };
 
-        // Map append index to physical source index via DecodedVector's selection
+        // Map append index to physical source index via DecodedVectorOwned's selection
         let source_idx = source_sel.get(append_idx);
 
         let is_valid = if ALL_VALID {
@@ -631,7 +631,11 @@ fn build_combined_collection_data(
 
     combined_child_count = combined_child_count.max(child_sel_len);
 
-    let mut combined_sel = SelectionVector::with_capacity(combined_child_count.max(1));
+    let mut combined_sel = SelectionVector::try_with_capacity(
+        combined_child_count.max(1),
+        source_sel.allocator().clone(),
+    )
+    .expect("combined child selection allocation failed");
     combined_sel.set_len(combined_child_count.max(1));
     for i in 0..combined_child_count.max(1) {
         combined_sel.set(i, 0);
@@ -1436,7 +1440,7 @@ fn scatter_struct(
 /// Scatter fixed-size values to row storage.
 ///
 /// This correctly handles CONSTANT and DICTIONARY vectors by using the
-/// selection vector from DecodedVector to map indices.
+/// selection vector from DecodedVectorOwned to map indices.
 ///
 ///
 /// This is the dispatch function that selects the optimal templated version
@@ -1504,7 +1508,7 @@ fn scatter_fixed<T: Copy + Default>(
 /// See `RawRowTemplatedScatterInternal<T, HAS_APPEND_SEL, HAS_SOURCE_SEL, ALL_VALID>`
 ///
 /// Note: We don't need HAS_SOURCE_SEL because in Rust we always use the selection
-/// vector from DecodedVector (it's incremental for Flat vectors, so the
+/// vector from DecodedVectorOwned (it's incremental for Flat vectors, so the
 /// overhead is minimal).
 #[inline(always)]
 fn scatter_fixed_internal<T: Copy + Default, const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
@@ -1533,7 +1537,7 @@ fn scatter_fixed_internal<T: Copy + Default, const HAS_APPEND_SEL: bool, const A
             i
         };
 
-        // Map append index to physical source index via DecodedVector's selection
+        // Map append index to physical source index via DecodedVectorOwned's selection
         let source_idx = source_sel.get(append_idx);
 
         // With const generic, this branch is evaluated at compile time
@@ -1668,7 +1672,7 @@ fn scatter_string_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
             i
         };
 
-        // Map append index to physical source index via DecodedVector's selection
+        // Map append index to physical source index via DecodedVectorOwned's selection
         let source_idx = source_sel.get(append_idx);
 
         let is_valid = if ALL_VALID {
@@ -2204,6 +2208,7 @@ pub fn append_chunk_with_sel(
 mod tests {
     use super::*;
     use crate::row::raw::RawRowValidityType;
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     fn create_test_layout(types: Vec<LogicalType>) -> RawRowLayout {
@@ -2215,7 +2220,7 @@ mod tests {
     #[test]
     fn test_scatter_fixed_flat_vector() {
         let layout = create_test_layout(vec![LogicalType::Integer]);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[10, 20, 30, 40]))]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(test_i32_vector(&[10, 20, 30, 40]))]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
@@ -2254,8 +2259,8 @@ mod tests {
         let layout = create_test_layout(vec![LogicalType::Integer]);
 
         // Create a CONSTANT vector with value 42, count 4
-        let constant_vec = Vector::constant(LogicalType::Integer, 42i32, 4);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(constant_vec)]);
+        let constant_vec = test_constant_vector(LogicalType::Integer, 42i32, 4);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(constant_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
@@ -2294,10 +2299,10 @@ mod tests {
         let layout = create_test_layout(vec![LogicalType::Integer]);
 
         // Create a DICTIONARY vector: indices [2, 0, 1, 2] into child [100, 200, 300]
-        let child = Vector::from_i32(&[100, 200, 300]);
-        let dict_vec = Vector::dictionary(Arc::new(child), vec![2, 0, 1, 2]);
+        let child = test_i32_vector(&[100, 200, 300]);
+        let dict_vec = paro_common::test_utils::test_dictionary(Arc::new(child), vec![2, 0, 1, 2]);
 
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(dict_vec)]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(dict_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
@@ -2351,13 +2356,14 @@ mod tests {
         let layout = create_test_layout(vec![LogicalType::Varchar]);
 
         // Create a CONSTANT varchar vector with a long string (> 12 bytes)
-        let constant_vec = Vector::constant_from_value(
+        let constant_value = Value::Varchar("this is a very long constant string".to_string());
+        let constant_vec = test_constant_from_value(
             LogicalType::Varchar,
-            Value::Varchar("this is a very long constant string".to_string()), // 35 bytes
+            &constant_value, // 35 bytes
             4,
         );
 
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(constant_vec)]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(constant_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
@@ -2377,10 +2383,10 @@ mod tests {
         let layout = create_test_layout(vec![LogicalType::Integer, LogicalType::BigInt]);
 
         // Create a mixed chunk: FLAT integer + CONSTANT bigint
-        let flat_vec = Vector::from_i32(&[1, 2, 3, 4]);
-        let constant_vec = Vector::constant(LogicalType::BigInt, 1000i64, 4);
+        let flat_vec = test_i32_vector(&[1, 2, 3, 4]);
+        let constant_vec = test_constant_vector(LogicalType::BigInt, 1000i64, 4);
 
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(flat_vec), Arc::new(constant_vec)]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(flat_vec), Arc::new(constant_vec)]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
@@ -2421,13 +2427,13 @@ mod tests {
     #[test]
     fn test_scatter_with_selection() {
         let layout = create_test_layout(vec![LogicalType::Integer]);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[10, 20, 30, 40]))]);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(test_i32_vector(&[10, 20, 30, 40]))]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
 
         // Selection: pick indices [1, 3]
-        let sel = SelectionVector::from_indices(vec![1, 3]);
+        let sel = test_selection(vec![1, 3]);
 
         let row_width = layout.get_row_width();
         let mut storage: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; row_width]).collect();
@@ -2490,9 +2496,10 @@ mod tests {
             "",
             "another long value",
         ];
-        let child = Arc::new(Vector::from_strings(&values));
-        let array_vector = Vector::from_array(LogicalType::Varchar, child, 2, 2);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(array_vector)]);
+        let child = Arc::new(test_string_vector(&values));
+        let array_vector =
+            paro_common::test_utils::test_array_vector(LogicalType::Varchar, child, 2, 2);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(array_vector)]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);
@@ -2513,11 +2520,16 @@ mod tests {
         let outer_array_type = LogicalType::Array(Box::new(inner_array_type.clone()), 2);
         let layout = create_test_layout(vec![outer_array_type]);
 
-        let inner_child = Arc::new(Vector::from_i32(&[1, 2, 3, 4, 5, 6, 7, 8]));
-        let inner_array_vector =
-            Arc::new(Vector::from_array(LogicalType::Integer, inner_child, 4, 2));
-        let outer_array_vector = Vector::from_array(inner_array_type, inner_array_vector, 2, 2);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(outer_array_vector)]);
+        let inner_child = Arc::new(test_i32_vector(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        let inner_array_vector = Arc::new(paro_common::test_utils::test_array_vector(
+            LogicalType::Integer,
+            inner_child,
+            4,
+            2,
+        ));
+        let outer_array_vector =
+            paro_common::test_utils::test_array_vector(inner_array_type, inner_array_vector, 2, 2);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(outer_array_vector)]);
 
         let mut chunk_state = RawRowChunkState::new();
         chunk_state.decode(&chunk);

@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -10,6 +11,7 @@ use crate::row::codec::scatter_to_positions;
 use crate::row::pin::PinSet;
 use crate::row::region::RowLocation;
 use crate::row::{Ordering, RowAddr, RowStore};
+use std::sync::Arc;
 
 /// Physical gather order plus the map back to caller-visible order.
 #[derive(Debug, Clone)]
@@ -220,7 +222,7 @@ impl<'a> PinnedRows<'a> {
         })?;
         self.store.validate_column(column_idx)?;
         let typ = self.store.layout().types()[column_idx].clone();
-        let mut tmp = Vector::with_capacity(typ, 1);
+        let mut tmp = Vector::try_new(typ, 1, Arc::new(default_allocator()))?;
         self.store
             .region(row.region_index)
             .collection()
@@ -263,7 +265,7 @@ impl<'a> PinnedRows<'a> {
                 .iter()
                 .map(|row| row.local_ordinal)
                 .collect();
-            let mut tmp = Vector::with_capacity(typ.clone(), group_len);
+            let mut tmp = Vector::try_new(typ.clone(), group_len, output.allocator().clone())?;
             self.store.region(region_idx).collection().gather_column(
                 &local_ordinals,
                 column_idx,

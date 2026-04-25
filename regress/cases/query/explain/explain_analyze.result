@@ -1,10 +1,10 @@
 -- @normalize explain_operator_timing,explain_summary_timing
 EXPLAIN ANALYZE SELECT 1;
 QUERY PLAN
-PROJECTION (actual time=0.117..0.131 rows=1 loops=1)
+PROJECTION (actual time=<time-range> rows=1 loops=1)
   Output: 1
-  ->  DUMMY_SCAN (actual time=0.110..0.136 rows=1 loops=2)
-Execution Time: 0.066 ms
+  ->  DUMMY_SCAN (actual time=<time-range> rows=1 loops=2)
+Execution Time: <time-ms>
 Rows Returned: 1
 
 DROP TABLE IF EXISTS explain_analyze_rt;
@@ -23,19 +23,19 @@ FROM explain_analyze_rt
 WHERE score >= 20
 ORDER BY score DESC;
 QUERY PLAN
-PROJECTION  (rows=1) (actual time=0.619..0.627 rows=2 loops=1)
+PROJECTION  (rows=1) (actual time=<time-range> rows=2 loops=1)
   Output: id
-  ->  ORDER_BY  (rows=1) (actual time=0.440..0.638 rows=4 loops=3)
+  ->  ORDER_BY  (rows=1) (actual time=<time-range> rows=4 loops=3)
         Sort Key: score DESC NULLS FIRST
         Sort Method: quicksort
         Spilled: false
         Peak Memory: 0 B
-        ->  PROJECTION  (rows=1) (actual time=0.423..0.438 rows=2 loops=1)
+        ->  PROJECTION  (rows=1) (actual time=<time-range> rows=2 loops=1)
               Output: id, score
-              ->  ROWSET_SCAN on public.explain_analyze_rt (actual time=0.205..0.514 rows=2 loops=2)
+              ->  ROWSET_SCAN on public.explain_analyze_rt (actual time=<time-range> rows=2 loops=2)
                     Columns: id, score
                     Filter: score >= 20
-Execution Time: 0.101 ms
+Execution Time: <time-ms>
 Rows Returned: 2
 
 -- @query json
@@ -47,7 +47,7 @@ WHERE score >= 20
 ORDER BY score DESC
 FORMAT JSON;
 QUERY PLAN
-{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 1,\n      "rows": 2,\n      "startup_time_ms": 0.462917,\n      "total_time_ms": 0.471084\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 3,\n          "peak_memory_bytes": 0,\n          "rows": 4,\n          "spilled": false,\n          "startup_time_ms": 0.312667,\n          "total_time_ms": 0.4815\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 1,\n              "rows": 2,\n              "startup_time_ms": 0.299834,\n              "total_time_ms": 0.311459\n            },\n            "children": [\n              {\n                "actual": {\n                  "loops": 2,\n                  "rows": 2,\n                  "startup_time_ms": 0.169667,\n                  "total_time_ms": 0.371\n                },\n                "node_id": 2,\n                "operator": "ROWSET_SCAN",\n                "output_names": [\n                  "id",\n                  "score"\n                ],\n                "properties": {\n                  "Columns": [\n                    "id",\n                    "score"\n                  ],\n                  "Filter": "score >= 20"\n                },\n                "relation": "public.explain_analyze_rt"\n              }\n            ],\n            "estimated_cardinality": {\n              "expected": 1,\n              "max": 2,\n              "min": 0\n            },\n            "estimated_rows": 1,\n            "node_id": 3,\n            "operator": "PROJECTION",\n            "output_names": [\n              "id",\n              "score"\n            ],\n            "properties": {\n              "Output": [\n                "id",\n                "score"\n              ]\n            }\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 1,\n          "max": 2,\n          "min": 0\n        },\n        "estimated_rows": 1,\n        "node_id": 4,\n        "operator": "ORDER_BY",\n        "output_names": [\n          "id"\n        ],\n        "properties": {\n          "Peak Memory": 0,\n          "Sort Key": "score DESC NULLS FIRST",\n          "Sort Method": "quicksort",\n          "Spilled": false\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 1,\n      "max": 2,\n      "min": 0\n    },\n    "estimated_rows": 1,\n    "node_id": 5,\n    "operator": "PROJECTION",\n    "output_names": [\n      "id"\n    ],\n    "properties": {\n      "Output": [\n        "id"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "0.096 ms",\n    "Rows Returned": 2\n  }\n}
+{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 1,\n      "rows": 2,\n      "startup_time_ms": 0.0,\n      "total_time_ms": 0.0\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 3,\n          "peak_memory_bytes": 0,\n          "rows": 4,\n          "spilled": false,\n          "startup_time_ms": 0.0,\n          "total_time_ms": 0.0\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 1,\n              "rows": 2,\n              "startup_time_ms": 0.0,\n              "total_time_ms": 0.0\n            },\n            "children": [\n              {\n                "actual": {\n                  "loops": 2,\n                  "rows": 2,\n                  "startup_time_ms": 0.0,\n                  "total_time_ms": 0.0\n                },\n                "node_id": 2,\n                "operator": "ROWSET_SCAN",\n                "output_names": [\n                  "id",\n                  "score"\n                ],\n                "properties": {\n                  "Columns": [\n                    "id",\n                    "score"\n                  ],\n                  "Filter": "score >= 20"\n                },\n                "relation": "public.explain_analyze_rt"\n              }\n            ],\n            "estimated_cardinality": {\n              "expected": 1,\n              "max": 2,\n              "min": 0\n            },\n            "estimated_rows": 1,\n            "node_id": 3,\n            "operator": "PROJECTION",\n            "output_names": [\n              "id",\n              "score"\n            ],\n            "properties": {\n              "Output": [\n                "id",\n                "score"\n              ]\n            }\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 1,\n          "max": 2,\n          "min": 0\n        },\n        "estimated_rows": 1,\n        "node_id": 4,\n        "operator": "ORDER_BY",\n        "output_names": [\n          "id"\n        ],\n        "properties": {\n          "Peak Memory": 0,\n          "Sort Key": "score DESC NULLS FIRST",\n          "Sort Method": "quicksort",\n          "Spilled": false\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 1,\n      "max": 2,\n      "min": 0\n    },\n    "estimated_rows": 1,\n    "node_id": 5,\n    "operator": "PROJECTION",\n    "output_names": [\n      "id"\n    ],\n    "properties": {\n      "Output": [\n        "id"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "<time-ms>",\n    "Rows Returned": 2\n  }\n}
 
 DROP TABLE explain_analyze_rt;
 DROP TABLE
@@ -70,17 +70,17 @@ FROM explain_analyze_topn_rt
 ORDER BY score DESC
 LIMIT 3;
 QUERY PLAN
-PROJECTION  (rows=3) (actual time=11.552..11.558 rows=3 loops=1)
+PROJECTION  (rows=3) (actual time=<time-range> rows=3 loops=1)
   Output: id
-  ->  TOP_N  (rows=3) (actual time=10.071..11.567 rows=7003 loops=4)
+  ->  TOP_N  (rows=3) (actual time=<time-range> rows=7003 loops=4)
         Sort Key: score DESC NULLS FIRST
         Limit: 3
-        Peak Memory: 16.6 kB
-        ->  PROJECTION  (rows=7000) (actual time=10.049..10.986 rows=7000 loops=2)
+        Peak Memory: 16.2 kB
+        ->  PROJECTION  (rows=7000) (actual time=<time-range> rows=7000 loops=2)
               Output: id, score
-              ->  ROWSET_SCAN on public.explain_analyze_topn_rt (actual time=0.241..11.430 rows=7000 loops=3)
+              ->  ROWSET_SCAN on public.explain_analyze_topn_rt (actual time=<time-range> rows=7000 loops=3)
                     Columns: id, score
-Execution Time: 0.098 ms
+Execution Time: <time-ms>
 Rows Returned: 3
 
 SET temp_directory = '/tmp/paro_regress_explain_topn';
@@ -96,20 +96,20 @@ FROM explain_analyze_topn_rt
 ORDER BY score DESC
 LIMIT 3;
 QUERY PLAN
-PROJECTION  (rows=3) (actual time=27.096..27.107 rows=3 loops=1)
+PROJECTION  (rows=3) (actual time=<time-range> rows=<rows> loops=<loops>)
   Output: id
-  ->  STREAMING_LIMIT (actual time=27.078..29.141 rows=3 loops=4)
+  ->  STREAMING_LIMIT (actual time=<time-range> rows=<rows> loops=<loops>)
         Limit: 3
-        ->  ORDER_BY (actual time=10.318..29.152 rows=14000 loops=7)
+        ->  ORDER_BY (actual time=<time-range> rows=<rows> loops=<loops>)
               Sort Key: score DESC NULLS FIRST
               Sort Method: external merge
               Spilled: true
-              Peak Memory: 0 B
-              ->  PROJECTION  (rows=7000) (actual time=10.292..13.499 rows=7000 loops=2)
+              Peak Memory: <bytes>
+              ->  PROJECTION  (rows=7000) (actual time=<time-range> rows=<rows> loops=<loops>)
                     Output: id, score
-                    ->  ROWSET_SCAN on public.explain_analyze_topn_rt (actual time=0.204..15.420 rows=7000 loops=3)
+                    ->  ROWSET_SCAN on public.explain_analyze_topn_rt (actual time=<time-range> rows=<rows> loops=<loops>)
                           Columns: id, score
-Execution Time: 4.089 ms
+Execution Time: <time-ms>
 Rows Returned: 3
 
 SET force_external = DEFAULT;

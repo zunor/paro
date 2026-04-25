@@ -8,7 +8,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
+use paro_common::vector::Vector;
 use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
 use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
@@ -41,7 +41,13 @@ fn bench_state() -> &'static BenchState {
         let values: Vec<i32> = (0..ROWS as i32).collect();
         BenchState {
             runtime,
-            input: Chunk::from_vectors(vec![Vector::from_i32(&values)]),
+            input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                    &values,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
             projection_expr: add_one_expr(),
             predicate_expr: greater_than_expr((ROWS / 2) as i32),
         }
@@ -101,7 +107,8 @@ fn projection_cached_executor(bencher: Bencher) {
     let state = bench_state();
     let mut executor =
         ExpressionExecutor::with_expressions(std::slice::from_ref(&state.projection_expr));
-    let mut output = Chunk::new();
+    let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
     bencher.counter(state.input.size()).bench_local(|| {
         executor
             .execute_all_into(&state.input, &state.runtime, &mut output)
@@ -113,7 +120,8 @@ fn projection_cached_executor(bencher: Bencher) {
 #[divan::bench(sample_count = 10)]
 fn projection_new_per_batch(bencher: Bencher) {
     let state = bench_state();
-    let mut output = Chunk::new();
+    let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
     bencher.counter(state.input.size()).bench_local(|| {
         let mut executor =
             ExpressionExecutor::with_expressions(std::slice::from_ref(&state.projection_expr));
@@ -128,7 +136,7 @@ fn projection_new_per_batch(bencher: Bencher) {
 fn select_cached_executor(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.predicate_expr);
-    let mut selection = SelectionVector::with_capacity(ROWS);
+    let mut selection = paro_common::test_utils::test_selection_with_capacity(ROWS);
     bencher.counter(state.input.size()).bench_local(|| {
         selection.set_len(ROWS);
         let selected = executor
@@ -147,7 +155,7 @@ fn select_cached_executor(bencher: Bencher) {
 #[divan::bench(sample_count = 10)]
 fn select_new_per_batch(bencher: Bencher) {
     let state = bench_state();
-    let mut selection = SelectionVector::with_capacity(ROWS);
+    let mut selection = paro_common::test_utils::test_selection_with_capacity(ROWS);
     bencher.counter(state.input.size()).bench_local(|| {
         selection.set_len(ROWS);
         let mut executor = ExpressionExecutor::new(&state.predicate_expr);

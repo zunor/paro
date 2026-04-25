@@ -18,14 +18,21 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::{Allocator, BufferAllocator, BufferManager, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryError,
+    MemoryGrant, MemoryOwner, MemoryOwnerAllocator, MemoryResult,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_storage::buffer::BufferPool;
 use paro_storage::column::ChunkManagementState;
 
 use crate::execution_context::ExecutionContext;
-use crate::operator::set::cte::CteWorkingTable;
+use crate::memory_runtime::{ReclaimStats, Reclaimer, RetainedChunkVec, SpillCost};
+use crate::operator::set::cte::{cte_memory_context, CteWorkingTable};
 use crate::operator::state::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, OperatorSinkCombineInput,
     OperatorSinkInput, OperatorSourceInput,
@@ -37,6 +44,86 @@ use crate::pipeline::meta_pipeline::{MetaPipeline, MetaPipelineType};
 use crate::pipeline::pipeline::Pipeline;
 use crate::query_executor::executor::Executor;
 use crate::result_type::{SinkCombineResultType, SinkResultType, SourceResultType};
+
+fn cte_metadata_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::Metadata,
+        MemoryAccountingClass::Metadata,
+    )
+}
+
+#[cfg(test)]
+fn detached_table_memory_context() -> MemoryAccountingContext {
+    MemoryAccountingContext::detached(MemoryTag::ColumnData, MemoryAccountingClass::Revocable)
+}
+
+#[cfg(test)]
+fn detached_metadata_memory_context() -> MemoryAccountingContext {
+    MemoryAccountingContext::detached(MemoryTag::Metadata, MemoryAccountingClass::Metadata)
+}
+
+fn grant_for_context(memory: &MemoryAccountingContext) -> MemoryGrant {
+    if let Some(owner) = memory.owner() {
+        MemoryGrant::new(0, memory.domain(), owner)
+            .expect("zero-byte recursive CTE grant should fit")
+    } else {
+        MemoryGrant::detached(usize::MAX / 4, memory.domain())
+    }
+}
+
+fn new_distinct_hash_set(memory: &MemoryAccountingContext) -> AccountedHashSet<u64> {
+    AccountedHashSet::new_with_accounting(
+        grant_for_context(memory),
+        memory.tag(),
+        memory.accounting_class(),
+    )
+}
+
+#[derive(Debug)]
+struct RecursiveCteReclaimer {
+    working_table: Arc<CteWorkingTable>,
+    intermediate_table: Arc<CteWorkingTable>,
+    distinct_table: Arc<CteWorkingTable>,
+}
+
+impl Reclaimer for RecursiveCteReclaimer {
+    fn name(&self) -> &str {
+        "recursive_cte_tables"
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        self.intermediate_table
+            .reclaimable_bytes()
+            .saturating_add(self.working_table.reclaimable_bytes())
+            .saturating_add(self.distinct_table.reclaimable_bytes())
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> MemoryResult<ReclaimStats> {
+        let mut reclaimed = 0usize;
+        for table in [
+            &self.intermediate_table,
+            &self.working_table,
+            &self.distinct_table,
+        ] {
+            if reclaimed >= target_bytes {
+                break;
+            }
+            let remaining = target_bytes - reclaimed;
+            let table_reclaimed = table
+                .reclaim(remaining)
+                .map_err(|err| MemoryError::reclaim_failed(err.to_string()))?;
+            reclaimed = reclaimed.saturating_add(table_reclaimed);
+        }
+        Ok(ReclaimStats::new(target_bytes, reclaimed, reclaimed))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
+    }
+}
 
 /// Physical recursive CTE operator.
 ///
@@ -65,9 +152,13 @@ pub struct RecursiveCTE {
     /// Spillable seen-state for UNION DISTINCT semantics.
     distinct_table: Arc<CteWorkingTable>,
     /// Advisory fingerprint index to avoid scanning the spillable seen-state for unique rows.
-    distinct_row_hashes: Mutex<HashSet<u64>>,
+    distinct_row_hashes: Mutex<Option<AccountedHashSet<u64>>>,
     /// Serializes UNION DISTINCT dedup against the spillable seen-state.
     distinct_lock: Mutex<()>,
+    /// Query-pool callback that spills recursive CTE tables under memory pressure.
+    reclaimer: Mutex<Option<Arc<dyn Reclaimer>>>,
+    /// Scratch scan allocation binding for distinct-table probes.
+    scan_allocation: Mutex<Option<(Arc<BufferPool>, MemoryAccountingContext)>>,
     /// Dedicated recursive MetaPipeline tree (not part of root schedule).
     recursive_meta_pipeline: Mutex<Option<Arc<MetaPipeline>>>,
     /// Tracks lifecycle of one recursive execution.
@@ -97,8 +188,10 @@ impl RecursiveCTE {
             working_table,
             intermediate_table: Arc::new(CteWorkingTable::new(types.clone())),
             distinct_table: Arc::new(CteWorkingTable::new(types.clone())),
-            distinct_row_hashes: Mutex::new(HashSet::new()),
+            distinct_row_hashes: Mutex::new(None),
             distinct_lock: Mutex::new(()),
+            reclaimer: Mutex::new(None),
+            scan_allocation: Mutex::new(None),
             recursive_meta_pipeline: Mutex::new(None),
             execution_initialized: AtomicBool::new(false),
             productive_iterations: AtomicUsize::new(0),
@@ -113,12 +206,104 @@ impl RecursiveCTE {
             .and_then(|m| m.as_ref().cloned())
     }
 
-    fn prepare_tables(&self, buffer_pool: Arc<paro_storage::buffer::BufferPool>) -> Result<()> {
+    fn prepare_tables_with_memory(
+        &self,
+        buffer_pool: Arc<paro_storage::buffer::BufferPool>,
+        table_memory: MemoryAccountingContext,
+        metadata_memory: MemoryAccountingContext,
+    ) -> Result<()> {
         self.working_table
-            .prepare_for_execution(Arc::clone(&buffer_pool))?;
+            .prepare_for_execution(Arc::clone(&buffer_pool), table_memory.clone())?;
         self.intermediate_table
-            .prepare_for_execution(Arc::clone(&buffer_pool))?;
-        self.distinct_table.prepare_for_execution(buffer_pool)?;
+            .prepare_for_execution(Arc::clone(&buffer_pool), table_memory.clone())?;
+        self.distinct_table
+            .prepare_for_execution(Arc::clone(&buffer_pool), table_memory.clone())?;
+        *self.scan_allocation.lock().map_err(|e| {
+            paro_error::internal(format!(
+                "Failed to lock recursive CTE scan allocation: {}",
+                e
+            ))
+        })? = Some((buffer_pool, table_memory.clone()));
+        let mut hashes = self.distinct_row_hashes.lock().map_err(|e| {
+            paro_error::internal(format!(
+                "Failed to lock recursive CTE distinct hashes: {}",
+                e
+            ))
+        })?;
+        if hashes.is_none() {
+            *hashes = Some(new_distinct_hash_set(&metadata_memory));
+        }
+        Ok(())
+    }
+
+    fn scan_allocator(&self) -> Result<Arc<dyn Allocator>> {
+        let guard = self.scan_allocation.lock().map_err(|e| {
+            paro_error::internal(format!(
+                "Failed to lock recursive CTE scan allocation: {}",
+                e
+            ))
+        })?;
+        let (buffer_pool, memory) = guard.as_ref().ok_or_else(|| {
+            paro_error::internal("Recursive CTE tables have not been prepared".to_string())
+        })?;
+        let inner: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
+            buffer_pool.clone() as Arc<dyn BufferManager>,
+            memory.tag(),
+        ));
+        if let Some(owner) = memory.owner() {
+            Ok(Arc::new(MemoryOwnerAllocator::new(
+                inner,
+                owner,
+                memory.domain(),
+                memory.tag(),
+                memory.accounting_class(),
+            )))
+        } else {
+            Ok(inner)
+        }
+    }
+
+    fn prepare_tables(&self, ctx: &ExecutionContext) -> Result<()> {
+        self.prepare_tables_with_memory(
+            ctx.buffer_pool().clone(),
+            cte_memory_context(ctx),
+            cte_metadata_memory_context(ctx),
+        )?;
+        self.register_reclaimer(ctx)
+    }
+
+    fn reset_tables_for_execution(&self, ctx: &ExecutionContext) -> Result<()> {
+        let table_memory = cte_memory_context(ctx);
+        self.working_table
+            .reset_with_memory(ctx.buffer_pool().clone(), table_memory.clone())?;
+        self.intermediate_table
+            .reset_with_memory(ctx.buffer_pool().clone(), table_memory.clone())?;
+        self.distinct_table
+            .reset_with_memory(ctx.buffer_pool().clone(), table_memory)?;
+        let metadata_memory = cte_metadata_memory_context(ctx);
+        let mut hashes = self.distinct_row_hashes.lock().map_err(|e| {
+            paro_error::internal(format!(
+                "Failed to lock recursive CTE distinct hashes: {}",
+                e
+            ))
+        })?;
+        *hashes = Some(new_distinct_hash_set(&metadata_memory));
+        Ok(())
+    }
+
+    fn register_reclaimer(&self, ctx: &ExecutionContext) -> Result<()> {
+        let mut slot = self.reclaimer.lock().map_err(|e| {
+            paro_error::internal(format!("Failed to lock recursive CTE reclaimer: {}", e))
+        })?;
+        let reclaimer = slot.get_or_insert_with(|| {
+            Arc::new(RecursiveCteReclaimer {
+                working_table: Arc::clone(&self.working_table),
+                intermediate_table: Arc::clone(&self.intermediate_table),
+                distinct_table: Arc::clone(&self.distinct_table),
+            }) as Arc<dyn Reclaimer>
+        });
+        ctx.query_memory_pool()
+            .register_reclaimer(reclaimer.clone());
         Ok(())
     }
 
@@ -147,7 +332,8 @@ impl RecursiveCTE {
         }
 
         let mut scan_state = ChunkManagementState::new();
-        let mut chunk = Chunk::init_empty(&self.types);
+        let allocator = self.scan_allocator()?;
+        let mut chunk = Chunk::try_init_empty(&self.types, allocator)?;
         for storage_index in storage_indexes {
             self.distinct_table.fetch_chunk_by_storage_index(
                 storage_index,
@@ -163,10 +349,9 @@ impl RecursiveCTE {
         Ok(false)
     }
 
-    fn copy_rows(chunk: &Chunk, rows: &[usize]) -> Chunk {
+    fn copy_rows(chunk: &Chunk, rows: &[usize]) -> Result<Chunk> {
         let types = chunk.types();
-        let mut result =
-            Chunk::initialize_with_allocator(&types, rows.len(), chunk.allocator().clone());
+        let mut result = Chunk::try_initialize(&types, rows.len(), chunk.allocator().clone())?;
         result.set_cardinality(rows.len());
 
         for (col_idx, source_col) in chunk.data.iter().enumerate() {
@@ -177,7 +362,7 @@ impl RecursiveCTE {
                 out_col.copy_at(out_row, source_col, source_row);
             }
         }
-        result
+        Ok(result)
     }
 
     fn append_chunk_to_intermediate(&self, chunk: Chunk) -> Result<usize> {
@@ -197,11 +382,16 @@ impl RecursiveCTE {
                 e
             ))
         })?;
-        let mut distinct_row_hashes = self.distinct_row_hashes.lock().map_err(|e| {
+        let mut distinct_row_hashes_guard = self.distinct_row_hashes.lock().map_err(|e| {
             paro_error::internal(format!(
                 "Failed to lock recursive CTE distinct row hashes: {}",
                 e
             ))
+        })?;
+        let distinct_row_hashes = distinct_row_hashes_guard.as_mut().ok_or_else(|| {
+            paro_error::internal(
+                "Recursive CTE distinct row hashes have not been initialized".to_string(),
+            )
         })?;
 
         let mut local_seen = HashSet::new();
@@ -212,7 +402,9 @@ impl RecursiveCTE {
                 continue;
             }
             let fingerprint = Self::row_fingerprint(&key);
-            let hash_seen = !distinct_row_hashes.insert(fingerprint);
+            let hash_seen = !distinct_row_hashes
+                .try_insert(fingerprint)
+                .map_err(paro_error::ParoError::from)?;
             if !hash_seen || !self.distinct_table_contains_row(&key)? {
                 new_rows.push(row);
             }
@@ -222,7 +414,7 @@ impl RecursiveCTE {
             return Ok(0);
         }
 
-        let filtered = Self::copy_rows(&chunk, &new_rows);
+        let filtered = Self::copy_rows(&chunk, &new_rows)?;
         let row_count = filtered.size();
         self.intermediate_table.append(&filtered)?;
         self.distinct_table.append(&filtered)?;
@@ -297,9 +489,17 @@ impl GlobalSinkState for RecursiveCteGlobalSinkState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RecursiveCteLocalSinkState {
-    local_chunks: Vec<Chunk>,
+    local_chunks: RetainedChunkVec,
+}
+
+impl RecursiveCteLocalSinkState {
+    fn new(memory: MemoryAccountingContext) -> Self {
+        Self {
+            local_chunks: RetainedChunkVec::new(memory),
+        }
+    }
 }
 
 impl LocalSinkState for RecursiveCteLocalSinkState {
@@ -397,21 +597,18 @@ impl PhysicalOperator for RecursiveCTE {
     }
 
     fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        self.prepare_tables(ctx.buffer_pool().clone())?;
+        self.prepare_tables(ctx)?;
         if !self.execution_initialized.swap(true, Ordering::SeqCst) {
-            self.working_table.reset()?;
-            self.intermediate_table.reset()?;
-            self.distinct_table.reset()?;
-            if let Ok(mut hashes) = self.distinct_row_hashes.lock() {
-                hashes.clear();
-            }
+            self.reset_tables_for_execution(ctx)?;
             self.productive_iterations.store(0, Ordering::Relaxed);
         }
         Ok(Box::new(RecursiveCteGlobalSinkState::default()))
     }
 
-    fn get_local_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
-        Ok(Box::new(RecursiveCteLocalSinkState::default()))
+    fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
+        Ok(Box::new(RecursiveCteLocalSinkState::new(
+            cte_memory_context(ctx),
+        )))
     }
 
     fn sink(
@@ -430,7 +627,7 @@ impl PhysicalOperator for RecursiveCTE {
             .downcast_mut::<RecursiveCteLocalSinkState>()
             .ok_or_else(|| paro_error::internal("Invalid local sink state".to_string()))?;
 
-        lstate.local_chunks.push(chunk.clone());
+        lstate.local_chunks.push(chunk.clone())?;
         Ok(SinkResultType::NeedMoreInput)
     }
 
@@ -451,7 +648,7 @@ impl PhysicalOperator for RecursiveCTE {
             .ok_or_else(|| paro_error::internal("Invalid global sink state".to_string()))?;
 
         let mut appended = 0usize;
-        for chunk in lstate.local_chunks.drain(..) {
+        for chunk in lstate.local_chunks.drain_chunks() {
             appended += self.append_chunk_to_intermediate(chunk)?;
         }
         gstate.total_rows.fetch_add(appended, Ordering::Relaxed);
@@ -464,7 +661,7 @@ impl PhysicalOperator for RecursiveCTE {
         ctx: &ExecutionContext,
         _sink_state: Option<&dyn GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
-        self.prepare_tables(ctx.buffer_pool().clone())?;
+        self.prepare_tables(ctx)?;
         Ok(Box::new(RecursiveCteGlobalSourceState))
     }
 
@@ -532,7 +729,7 @@ impl PhysicalOperator for RecursiveCTE {
         let _ = self.intermediate_table.reset();
         let _ = self.distinct_table.reset();
         if let Ok(mut hashes) = self.distinct_row_hashes.lock() {
-            hashes.clear();
+            *hashes = None;
         }
         self.productive_iterations.store(0, Ordering::Relaxed);
         if let Ok(mut slot) = self.recursive_meta_pipeline.lock() {
@@ -578,7 +775,7 @@ impl RecursiveCTE {
 
 #[cfg(test)]
 mod tests {
-    use super::RecursiveCTE;
+    use super::{detached_metadata_memory_context, detached_table_memory_context, RecursiveCTE};
     use std::fs;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -595,7 +792,8 @@ mod tests {
     use crate::pipeline::meta_pipeline::{MetaPipeline, MetaPipelineType};
 
     fn make_unique_large_string_chunk(prefix: &str, start: usize, rows: usize) -> Chunk {
-        let mut chunk = Chunk::initialize(&[LogicalType::Varchar], rows);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], rows);
         chunk.set_cardinality(rows);
         for row in 0..rows {
             chunk
@@ -665,10 +863,15 @@ mod tests {
             Arc::new(CteWorkingTable::new(vec![LogicalType::Integer])),
         );
         let (pool, temp_dir) = create_spill_test_pool("paro_recursive_cte_distinct");
-        op.prepare_tables(pool.clone())
-            .expect("prepare recursive CTE tables");
+        op.prepare_tables_with_memory(
+            pool.clone(),
+            detached_table_memory_context(),
+            detached_metadata_memory_context(),
+        )
+        .expect("prepare recursive CTE tables");
 
-        let mut input = Chunk::initialize(&[LogicalType::Integer], 4);
+        let mut input =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 4);
         input.set_cardinality(4);
         let col = input.column_mut(0).expect("integer column should exist");
         col.set_value(0, &Value::Integer(1));
@@ -704,8 +907,12 @@ mod tests {
             Arc::new(CteWorkingTable::new(vec![LogicalType::Varchar])),
         );
         let (pool, temp_dir) = create_spill_test_pool("paro_recursive_cte_seen");
-        op.prepare_tables(pool.clone())
-            .expect("prepare recursive CTE tables");
+        op.prepare_tables_with_memory(
+            pool.clone(),
+            detached_table_memory_context(),
+            detached_metadata_memory_context(),
+        )
+        .expect("prepare recursive CTE tables");
 
         let payload = "recursive_spill_payload_".repeat(256);
         for chunk_idx in 0..24 {

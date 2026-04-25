@@ -7,6 +7,9 @@ use crate::compaction::plan::types::CumulativePointAction;
 use crate::index::IndexConstraintType;
 use crate::wal::txn_record::TxnRecord;
 use crate::wal::wal_type::WalType;
+#[cfg(test)]
+use paro_common::allocator::default_allocator;
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error as paro_error;
 use paro_common::error::Result;
@@ -837,12 +840,13 @@ impl SerializedDataChunk {
     }
 
     /// Deserialize to a Chunk.
-    pub fn to_chunk(&self) -> Result<Chunk> {
+    pub fn to_chunk_with_allocator(&self, allocator: Arc<dyn Allocator>) -> Result<Chunk> {
         if self.row_count == 0 {
-            return Ok(Chunk::init_empty(&self.column_types));
+            return Chunk::try_init_empty(&self.column_types, allocator);
         }
 
-        let mut chunk = Chunk::initialize(&self.column_types, self.row_count as usize);
+        let mut chunk =
+            Chunk::try_initialize(&self.column_types, self.row_count as usize, allocator)?;
         let mut offset = 0;
 
         for col_idx in 0..self.column_types.len() {
@@ -862,6 +866,11 @@ impl SerializedDataChunk {
 
         chunk.set_cardinality(self.row_count as usize);
         Ok(chunk)
+    }
+
+    #[cfg(test)]
+    pub fn to_chunk(&self) -> Result<Chunk> {
+        self.to_chunk_with_allocator(Arc::new(default_allocator()))
     }
 
     /// Deserialize a single vector from bytes.
@@ -1777,6 +1786,7 @@ fn read_optional_u32_vec(data: &[u8], offset: &mut usize) -> Result<Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::*;
 
     #[test]
     fn test_entry_header_roundtrip() {
@@ -1826,11 +1836,9 @@ mod tests {
 
     #[test]
     fn test_serialized_data_chunk_integer_roundtrip() {
-        use paro_common::vector::Vector;
-
         // Create a Chunk with integer values
-        let vec = Vector::from_i32(&[1, 2, 3, 4, 5]);
-        let chunk = Chunk::from_vectors(vec![vec]);
+        let vec = test_i32_vector(&[1, 2, 3, 4, 5]);
+        let chunk = test_chunk_from_vectors(vec![vec]);
 
         // Serialize
         let serialized = SerializedDataChunk::from_chunk(&chunk).unwrap();
@@ -1852,12 +1860,10 @@ mod tests {
 
     #[test]
     fn test_serialized_data_chunk_multiple_columns() {
-        use paro_common::vector::Vector;
-
         // Create a Chunk with multiple columns
-        let int_vec = Vector::from_i32(&[10, 20, 30]);
-        let float_vec = Vector::from_f64(&[1.5, 2.5, 3.5]);
-        let chunk = Chunk::from_vectors(vec![int_vec, float_vec]);
+        let int_vec = test_i32_vector(&[10, 20, 30]);
+        let float_vec = test_f64_vector(&[1.5, 2.5, 3.5]);
+        let chunk = test_chunk_from_vectors(vec![int_vec, float_vec]);
 
         // Serialize
         let serialized = SerializedDataChunk::from_chunk(&chunk).unwrap();
@@ -1885,10 +1891,12 @@ mod tests {
     #[test]
     fn test_serialized_data_chunk_constant_vector_roundtrip() {
         use paro_common::types::LogicalType;
-        use paro_common::vector::Vector;
 
-        let chunk =
-            Chunk::from_vectors(vec![Vector::constant::<u32>(LogicalType::UInteger, 42, 3)]);
+        let chunk = test_chunk_from_vectors(vec![test_constant_vector::<u32>(
+            LogicalType::UInteger,
+            42,
+            3,
+        )]);
 
         let serialized = SerializedDataChunk::from_chunk(&chunk).unwrap();
         let recovered = serialized.to_chunk().unwrap();
@@ -1902,11 +1910,9 @@ mod tests {
 
     #[test]
     fn test_serialized_data_chunk_binary_roundtrip() {
-        use paro_common::vector::Vector;
-
         // Create a Chunk
-        let vec = Vector::from_i64(&[100, 200, 300]);
-        let chunk = Chunk::from_vectors(vec![vec]);
+        let vec = test_i64_vector(&[100, 200, 300]);
+        let chunk = test_chunk_from_vectors(vec![vec]);
 
         // Serialize to SerializedDataChunk
         let serialized = SerializedDataChunk::from_chunk(&chunk).unwrap();

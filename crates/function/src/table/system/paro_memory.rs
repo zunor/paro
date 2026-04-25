@@ -111,6 +111,7 @@ fn paro_memory_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let Some(gstate) = input
         .global_state
         .and_then(|state| state.as_any().downcast_ref::<ParoMemoryGlobalState>())
@@ -134,13 +135,13 @@ fn paro_memory_function(
     let temporary_storage: Vec<i64> = rows.iter().map(|row| row.temporary_storage_bytes).collect();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&tags);
+        *col = Vector::try_from_strings(&tags, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_i64(&memory_usage);
+        *col = Vector::try_from_i64(&memory_usage, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_i64(&temporary_storage);
+        *col = Vector::try_from_i64(&temporary_storage, output_allocator.clone())?;
     }
     output.set_cardinality(batch_size);
 

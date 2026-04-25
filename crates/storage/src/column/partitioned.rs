@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::{BufferPool, MemoryTag};
+use paro_common::allocator::{default_allocator, Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -68,7 +69,8 @@ impl PartitionedColumnDataAppendState {
     pub fn new() -> Self {
         Self {
             partition_indices: Vec::new(),
-            partition_sel: SelectionVector::with_capacity(0),
+            partition_sel: SelectionVector::try_with_capacity(0, Arc::new(default_allocator()))
+                .expect("zero-capacity partition selection allocation failed"),
             fixed_partition_counts: Vec::new(),
             hash_partition_counts: HashMap::new(),
             partition_entries: Vec::new(),
@@ -178,6 +180,13 @@ pub struct PartitionedColumnData {
 }
 
 impl PartitionedColumnData {
+    fn chunk_allocator(&self) -> Arc<dyn Allocator> {
+        Arc::new(BufferAllocator::new(
+            Arc::clone(&self.buffer_pool) as Arc<dyn BufferManager>,
+            self.tag,
+        ))
+    }
+
     fn make_partition_collection(
         allocator: &Arc<ColumnDataAllocator>,
         types: &[LogicalType],
@@ -298,7 +307,8 @@ impl PartitionedColumnData {
 
     pub fn initialize_append_state(&mut self, state: &mut PartitionedColumnDataAppendState) {
         state.partition_indices.clear();
-        state.partition_sel = SelectionVector::with_capacity(0);
+        state.partition_sel = SelectionVector::try_with_capacity(0, self.chunk_allocator())
+            .expect("zero-capacity partition selection allocation failed");
         state.partition_entries.clear();
         state.prepare_for_partition_count(self.partition_count());
 
@@ -317,7 +327,7 @@ impl PartitionedColumnData {
         state: &mut PartitionedColumnDataAppendState,
         input: &Chunk,
     ) -> Result<()> {
-        let append_sel = SelectionVector::incremental(input.size());
+        let append_sel = SelectionVector::try_incremental(input.size(), input.allocator().clone())?;
         self.append_with_sel(state, input, &append_sel, input.size())
     }
 
@@ -355,7 +365,7 @@ impl PartitionedColumnData {
             }
         }
 
-        self.build_partition_sel(state, append_sel, append_count);
+        self.build_partition_sel(state, append_sel, append_count)?;
 
         if let Some(single_partition_idx) = state.single_partition_index() {
             if append_count == input.size() && append_count == append_sel.len() {
@@ -504,7 +514,7 @@ impl PartitionedColumnData {
             return Ok(());
         }
 
-        self.ensure_partition_buffer(state, partition_idx);
+        self.ensure_partition_buffer(state, partition_idx)?;
         let buffer = state.partition_buffers[partition_idx]
             .as_mut()
             .expect("partition buffer should exist");
@@ -598,11 +608,15 @@ impl PartitionedColumnData {
         &self,
         state: &mut PartitionedColumnDataAppendState,
         partition_idx: usize,
-    ) {
+    ) -> Result<()> {
         if state.partition_buffers[partition_idx].is_none() {
-            state.partition_buffers[partition_idx] =
-                Some(Chunk::initialize(&self.types, self.buffer_size));
+            state.partition_buffers[partition_idx] = Some(Chunk::try_initialize(
+                &self.types,
+                self.buffer_size,
+                self.chunk_allocator(),
+            )?);
         }
+        Ok(())
     }
 
     fn gather_selected_chunk(
@@ -631,7 +645,7 @@ impl PartitionedColumnData {
         state: &mut PartitionedColumnDataAppendState,
         append_sel: &SelectionVector,
         append_count: usize,
-    ) {
+    ) -> Result<()> {
         state.clear_partition_map(self.partition_count());
 
         for i in 0..append_count {
@@ -640,7 +654,8 @@ impl PartitionedColumnData {
         }
         state.rebuild_partition_entries(self.partition_count());
 
-        state.partition_sel = SelectionVector::with_capacity(append_count);
+        state.partition_sel =
+            SelectionVector::try_with_capacity(append_count, self.chunk_allocator())?;
         state.partition_sel.set_len(append_count);
 
         let mut write_offsets = vec![0usize; self.partition_count()];
@@ -655,6 +670,7 @@ impl PartitionedColumnData {
             write_offsets[partition_idx] = write_offset.saturating_add(1);
             state.partition_sel.set(write_offset, source_idx);
         }
+        Ok(())
     }
 
     fn recompute_totals(&mut self) {
@@ -688,7 +704,7 @@ impl PartitionedColumnData {
 }
 
 fn gather_chunk_rows(input: &Chunk, rows: &[usize], types: &[LogicalType]) -> Result<Chunk> {
-    let mut gathered = Chunk::initialize(types, rows.len().max(1));
+    let mut gathered = Chunk::try_initialize(types, rows.len().max(1), input.allocator().clone())?;
     gathered.set_cardinality(rows.len());
 
     for col_idx in 0..input.column_count() {
@@ -712,12 +728,13 @@ fn gather_chunk_rows(input: &Chunk, rows: &[usize], types: &[LogicalType]) -> Re
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
     use paro_common::types::LogicalType;
-    use paro_common::vector::{SelectionVector, Vector};
+    use paro_common::vector::SelectionVector;
 
     use crate::buffer::{BufferPool, MemoryTag};
 
@@ -774,14 +791,14 @@ mod tests {
 
     fn build_chunk(start: i32, count: usize) -> Chunk {
         let ints: Vec<i32> = (start..start + count as i32).collect();
-        Chunk::from_vectors(vec![Vector::from_i32(&ints)])
+        test_chunk_from_vectors(vec![test_i32_vector(&ints)])
     }
 
     fn collect_keys_from_collection(collection: &ColumnDataCollection) -> Vec<i32> {
         let mut keys = Vec::new();
         let mut scan_state = ColumnDataScanState::new();
         collection.initialize_scan(&mut scan_state, None);
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 1);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], 1);
         while collection
             .scan(&mut scan_state, &mut out)
             .expect("scan should succeed")

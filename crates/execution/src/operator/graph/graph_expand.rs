@@ -12,14 +12,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_catalog::entry::{CatalogEntryEnum, EdgeTableInfo};
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_planner::expression::Expression;
 use paro_planner::operator::ExpandDirection;
-use paro_storage::buffer::TemporaryMemoryState;
 use paro_storage::index::graph::vertex_id_map::VertexIdMap;
 use paro_storage::index::graph::{GraphProjectionIndex, GraphReadSnapshot};
 use paro_storage::metrics::storage_metrics;
@@ -28,6 +31,7 @@ use paro_storage::tablet::TabletReaderParams;
 use crate::execution_context::ExecutionContext;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::AccountedBuffer;
 use crate::operator::state::{GlobalOperatorState, OperatorState};
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
@@ -98,7 +102,7 @@ struct MultiHopState {
     /// FixedBitSet for visited vertices (replaces HashSet<u32>).
     /// Bit at position `local_id` is set if the vertex has been visited.
     /// Memory: num_vertices / 8 bytes. O(1) test/set, no hash overhead.
-    visited: Vec<u64>,
+    visited: AccountedBuffer<u64>,
     /// Whether the current hop has been initialized.
     hop_initialized: bool,
     /// Cursor into frontier vertices for the current hop.
@@ -108,7 +112,7 @@ struct MultiHopState {
     /// Cursor into neighbor list for the current CSR.
     hop_neighbor_idx: usize,
     /// Per-hop dedup bitset to avoid duplicates within the hop.
-    hop_seen: Vec<u64>,
+    hop_seen: AccountedBuffer<u64>,
     /// Next-hop frontier computed for the current hop (accumulated incrementally).
     next_frontier: SpillableFrontier,
     /// Per-hop parent tracking for path reconstruction, present only when
@@ -134,14 +138,14 @@ struct GraphExpandOperatorState {
     /// Cached graph projection index handle (acquired once in open phase).
     cached_snapshot: Option<GraphReadSnapshot>,
     /// Scratch space for forward delta-aware neighbor merges.
-    forward_neighbor_scratch: Vec<(u32, u64)>,
+    forward_neighbor_scratch: AccountedBuffer<(u32, u64)>,
     /// Scratch space for backward delta-aware neighbor merges.
-    backward_neighbor_scratch: Vec<(u32, u64)>,
+    backward_neighbor_scratch: AccountedBuffer<(u32, u64)>,
 
     /// Pre-computed BitSet of valid target vertices.
     /// Bit at position `local_id` is set if the vertex passes target_filter.
     /// None means no target_filter or not yet computed.
-    valid_targets: Option<Vec<u64>>,
+    valid_targets: Option<AccountedBuffer<u64>>,
     /// Whether valid_targets has been computed (to distinguish None = no filter
     /// from None = not yet computed).
     valid_targets_computed: bool,
@@ -157,14 +161,14 @@ struct GraphExpandOperatorState {
     /// that spans multiple execute() calls.
     hop_state: Option<MultiHopState>,
     /// The input row values for the current multi-hop expansion.
-    multi_hop_input_vals: Option<Vec<u64>>,
+    multi_hop_input_vals: Option<AccountedBuffer<u64>>,
     /// Source local_id for the current multi-hop expansion.
     multi_hop_src: u32,
     /// Current input row index for multi-hop processing across execute() calls.
     multi_hop_row_cursor: usize,
     /// Whether multi-hop processing is in progress (has pending state).
     multi_hop_active: bool,
-    temporary_memory_state: Option<Arc<TemporaryMemoryState>>,
+    graph_memory: MemoryAccountingContext,
 }
 
 impl OperatorState for GraphExpandOperatorState {
@@ -177,6 +181,16 @@ impl OperatorState for GraphExpandOperatorState {
 }
 
 impl PhysicalGraphExpand {
+    fn graph_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+        let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+        MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        )
+    }
+
     fn multi_hop_workset_bytes(state: &MultiHopState) -> usize {
         let frontier_bytes =
             state.frontier.resident_memory_bytes() + state.next_frontier.resident_memory_bytes();
@@ -188,71 +202,36 @@ impl PhysicalGraphExpand {
         frontier_bytes + parent_bytes
     }
 
-    fn update_multi_hop_temporary_memory(
+    fn refresh_multi_hop_memory_stats(
         &self,
-        ctx: &ExecutionContext,
         op_state: &mut GraphExpandOperatorState,
     ) -> Result<()> {
         let Some(hop_state) = op_state.hop_state.as_mut() else {
-            if let Some(temp_state) = &op_state.temporary_memory_state {
-                temp_state.set_zero();
-            }
             return Ok(());
         };
 
-        if op_state.temporary_memory_state.is_none() {
-            let temp_state = ctx.temporary_memory_manager().register();
-            temp_state.set_zero();
-            op_state.temporary_memory_state = Some(temp_state);
-        }
-        let temp_state = op_state
-            .temporary_memory_state
-            .as_ref()
-            .expect("graph expand temporary memory state initialized");
-
-        let mut bytes = Self::multi_hop_workset_bytes(hop_state);
-        if bytes == 0 {
-            temp_state.set_zero();
-            return Ok(());
-        }
-
-        temp_state.set_remaining_size_and_update_reservation(bytes);
-        self.record_runtime_memory(temp_state, hop_state);
-        if temp_state.get_reservation() < bytes {
-            hop_state.frontier.ensure_external()?;
-            hop_state.next_frontier.ensure_external()?;
-            bytes = Self::multi_hop_workset_bytes(hop_state);
-            if bytes == 0 {
-                temp_state.set_zero();
-            } else {
-                temp_state.set_remaining_size_and_update_reservation(bytes);
-                self.record_runtime_memory(temp_state, hop_state);
-            }
-        }
+        let bytes = Self::multi_hop_workset_bytes(hop_state);
+        self.record_runtime_memory(bytes, hop_state);
         Ok(())
     }
 
     fn graph_frontier_threshold(&self, ctx: &ExecutionContext) -> Result<usize> {
-        let tmm_cfg = ctx.temporary_memory_manager().current_config();
-        if tmm_cfg.force_external && !tmm_cfg.has_temporary_directory {
+        let force_external = ctx.session.limits.force_external;
+        let has_temporary_directory = ctx.session.limits.use_temporary_directory;
+        if force_external && !has_temporary_directory {
             return Err(paro_error::out_of_memory(
                 "force_external requires a temporary directory (SET temp_directory)",
             ));
         }
-        Ok(if tmm_cfg.force_external {
+        Ok(if force_external {
             0
         } else {
             GRAPH_FRONTIER_SPILL_THRESHOLD_ROWS
         })
     }
 
-    fn record_runtime_memory(
-        &self,
-        temp_state: &Arc<TemporaryMemoryState>,
-        hop_state: &MultiHopState,
-    ) {
-        self.peak_memory_bytes
-            .fetch_max(temp_state.get_peak_reservation(), Ordering::AcqRel);
+    fn record_runtime_memory(&self, bytes: usize, hop_state: &MultiHopState) {
+        self.peak_memory_bytes.fetch_max(bytes, Ordering::AcqRel);
         if hop_state.frontier.is_external() || hop_state.next_frontier.is_external() {
             self.externalized.store(true, Ordering::Release);
         }
@@ -622,7 +601,8 @@ impl PhysicalGraphExpand {
         let num_vertices = vmap.num_vertices() as usize;
         let num_words = (num_vertices + 63) / 64;
         if state.hop_seen.len() != num_words {
-            state.hop_seen = vec![0u64; num_words];
+            state.hop_seen.clear();
+            state.hop_seen.try_resize(num_words, 0u64)?;
         }
 
         while state.current_hop <= self.max_hops {
@@ -811,10 +791,11 @@ impl PhysicalOperator for PhysicalGraphExpand {
                 ))
             })?;
 
+        let graph_memory = Self::graph_memory_context(ctx);
         Ok(Box::new(GraphExpandOperatorState {
             cached_snapshot: Some(snapshot),
-            forward_neighbor_scratch: Vec::new(),
-            backward_neighbor_scratch: Vec::new(),
+            forward_neighbor_scratch: AccountedBuffer::new(graph_memory.clone()),
+            backward_neighbor_scratch: AccountedBuffer::new(graph_memory.clone()),
             valid_targets: None,
             valid_targets_computed: false,
             input_row_cursor: 0,
@@ -824,7 +805,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
             multi_hop_src: 0,
             multi_hop_row_cursor: 0,
             multi_hop_active: false,
-            temporary_memory_state: None,
+            graph_memory,
         }))
     }
     fn as_any(&self) -> &dyn Any {
@@ -839,6 +820,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
             spilled: Some(self.externalized.load(Ordering::Acquire)),
             peak_memory_bytes: Some(self.peak_memory_bytes.load(Ordering::Acquire) as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -849,15 +831,9 @@ impl PhysicalOperator for PhysicalGraphExpand {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         if input.is_empty() {
-            let op_state = state
-                .as_any_mut()
-                .downcast_mut::<GraphExpandOperatorState>()
-                .expect("Invalid state type for GraphExpand");
-            if let Some(temp_state) = &op_state.temporary_memory_state {
-                temp_state.set_zero();
-            }
             return Ok(OperatorResultType::NeedMoreInput);
         }
 
@@ -889,8 +865,13 @@ impl PhysicalOperator for PhysicalGraphExpand {
             op_state.valid_targets = Some(bitset);
             op_state.valid_targets_computed = true;
         }
-        let valid_targets = op_state.valid_targets.clone();
-        let valid_targets = valid_targets.as_deref();
+        let valid_targets_ptr = op_state
+            .valid_targets
+            .as_ref()
+            .map(|bitset| bitset.as_slice() as *const [u64]);
+        // The target filter buffer is immutable for the rest of this execute call;
+        // keep a raw slice pointer so the hot loop can still mutate other state.
+        let valid_targets = valid_targets_ptr.map(|ptr| unsafe { &*ptr });
 
         let edge_label = &self.edge_info.label;
         let vmap = index.vertex_map(&self.target_label).ok_or_else(|| {
@@ -912,11 +893,12 @@ impl PhysicalOperator for PhysicalGraphExpand {
             .output_types
             .iter()
             .map(|t| {
-                let mut v = Vector::with_capacity(t.clone(), EXPAND_BATCH_SIZE);
+                let mut v =
+                    Vector::try_new(t.clone(), EXPAND_BATCH_SIZE, input.allocator().clone())?;
                 v.set_len(EXPAND_BATCH_SIZE);
-                v
+                Ok(v)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let mut out_row = 0usize;
         let mut dst_locals: Vec<u32> = Vec::with_capacity(EXPAND_BATCH_SIZE);
         let mut path_rows: Vec<MaterializedPath> = Vec::with_capacity(EXPAND_BATCH_SIZE);
@@ -932,9 +914,6 @@ impl PhysicalOperator for PhysicalGraphExpand {
         let mut have_more = false;
 
         if self.min_hops == 1 && self.max_hops == 1 {
-            if let Some(temp_state) = &op_state.temporary_memory_state {
-                temp_state.set_zero();
-            }
             // ── Single-hop vectorized expansion ──
             'outer: for row in start_row..input.size() {
                 let src_local = src_col.get_u64(row).unwrap_or(0) as u32;
@@ -963,17 +942,21 @@ impl PhysicalOperator for PhysicalGraphExpand {
                         edge_label,
                         src_local,
                         false,
-                        &mut op_state.forward_neighbor_scratch,
-                        &mut op_state.backward_neighbor_scratch,
+                        op_state.forward_neighbor_scratch.as_mut_vec(),
+                        op_state.backward_neighbor_scratch.as_mut_vec(),
                     );
+                    op_state.forward_neighbor_scratch.sync_capacity()?;
+                    op_state.backward_neighbor_scratch.sync_capacity()?;
                     let target_degree = self.expand_into_view_degree(
                         snapshot,
                         edge_label,
                         target_local,
                         true,
-                        &mut op_state.forward_neighbor_scratch,
-                        &mut op_state.backward_neighbor_scratch,
+                        op_state.forward_neighbor_scratch.as_mut_vec(),
+                        op_state.backward_neighbor_scratch.as_mut_vec(),
                     );
+                    op_state.forward_neighbor_scratch.sync_capacity()?;
+                    op_state.backward_neighbor_scratch.sync_capacity()?;
                     let search_from_source = source_degree <= target_degree;
                     let needle = if search_from_source {
                         target_local
@@ -989,8 +972,8 @@ impl PhysicalOperator for PhysicalGraphExpand {
                             target_local
                         },
                         !search_from_source,
-                        &mut op_state.forward_neighbor_scratch,
-                        &mut op_state.backward_neighbor_scratch,
+                        op_state.forward_neighbor_scratch.as_mut_vec(),
+                        op_state.backward_neighbor_scratch.as_mut_vec(),
                         |neighbor, edge_rowid| {
                             if have_more {
                                 return;
@@ -1041,6 +1024,8 @@ impl PhysicalOperator for PhysicalGraphExpand {
                             }
                         },
                     );
+                    op_state.forward_neighbor_scratch.sync_capacity()?;
+                    op_state.backward_neighbor_scratch.sync_capacity()?;
                     if have_more {
                         break 'outer;
                     }
@@ -1053,7 +1038,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
                         snapshot.neighbors_forward(
                             edge_label,
                             src_local,
-                            &mut op_state.forward_neighbor_scratch,
+                            op_state.forward_neighbor_scratch.as_mut_vec(),
                         )
                     } else {
                         None
@@ -1064,7 +1049,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
                         snapshot.neighbors_backward(
                             edge_label,
                             src_local,
-                            &mut op_state.backward_neighbor_scratch,
+                            op_state.backward_neighbor_scratch.as_mut_vec(),
                         )
                     } else {
                         None
@@ -1124,6 +1109,8 @@ impl PhysicalOperator for PhysicalGraphExpand {
                             }
                         }
                     }
+                    op_state.forward_neighbor_scratch.sync_capacity()?;
+                    op_state.backward_neighbor_scratch.sync_capacity()?;
                 }
             }
 
@@ -1155,15 +1142,24 @@ impl PhysicalOperator for PhysicalGraphExpand {
                 if op_state.hop_state.is_none() {
                     let num_vertices = vmap.num_vertices() as usize;
                     let num_words = (num_vertices + 63) / 64;
-                    let mut visited_bitset = vec![0u64; num_words];
+                    let mut visited_bitset = AccountedBuffer::new(op_state.graph_memory.clone());
+                    visited_bitset.try_resize(num_words, 0u64)?;
                     bitset_set(&mut visited_bitset, src_local);
                     let buffer_pool = ctx.buffer_pool().clone();
                     let frontier_threshold = self.graph_frontier_threshold(ctx)?;
-                    let mut frontier =
-                        SpillableFrontier::new(buffer_pool.clone(), frontier_threshold);
+                    let mut frontier = SpillableFrontier::new_with_memory(
+                        buffer_pool.clone(),
+                        frontier_threshold,
+                        op_state.graph_memory.clone(),
+                    );
                     frontier.push(src_local)?;
-                    let next_frontier =
-                        SpillableFrontier::new(buffer_pool.clone(), frontier_threshold);
+                    let next_frontier = SpillableFrontier::new_with_memory(
+                        buffer_pool.clone(),
+                        frontier_threshold,
+                        op_state.graph_memory.clone(),
+                    );
+                    let mut hop_seen = AccountedBuffer::new(op_state.graph_memory.clone());
+                    hop_seen.try_resize(num_words, 0u64)?;
 
                     op_state.hop_state = Some(MultiHopState {
                         current_hop: 1,
@@ -1174,11 +1170,17 @@ impl PhysicalOperator for PhysicalGraphExpand {
                         hop_frontier_idx: 0,
                         hop_csr_idx: 0,
                         hop_neighbor_idx: 0,
-                        hop_seen: vec![0u64; num_words],
+                        hop_seen,
                         next_frontier,
-                        parents: self
-                            .emit_path_info
-                            .then(|| SpillableParentArrays::new(num_vertices, buffer_pool)),
+                        parents: if self.emit_path_info {
+                            Some(SpillableParentArrays::new_with_memory(
+                                num_vertices,
+                                buffer_pool,
+                                op_state.graph_memory.clone(),
+                            )?)
+                        } else {
+                            None
+                        },
                         parent_lookup_state: self.emit_path_info.then(ParentLookupState::new),
                     });
                     if let Some(hop_state) = op_state.hop_state.as_ref() {
@@ -1187,9 +1189,11 @@ impl PhysicalOperator for PhysicalGraphExpand {
                             self.externalized.store(true, Ordering::Release);
                         }
                     }
-                    op_state.multi_hop_input_vals = Some(vals.clone());
+                    let mut retained_vals = AccountedBuffer::new(op_state.graph_memory.clone());
+                    retained_vals.try_extend_from_slice(&vals)?;
+                    op_state.multi_hop_input_vals = Some(retained_vals);
                     op_state.multi_hop_src = src_local;
-                    self.update_multi_hop_temporary_memory(ctx, op_state)?;
+                    self.refresh_multi_hop_memory_stats(op_state)?;
                 }
 
                 let remaining = EXPAND_BATCH_SIZE - out_row;
@@ -1203,11 +1207,13 @@ impl PhysicalOperator for PhysicalGraphExpand {
                         vmap,
                         valid_targets,
                         hop_state,
-                        &mut op_state.forward_neighbor_scratch,
-                        &mut op_state.backward_neighbor_scratch,
+                        op_state.forward_neighbor_scratch.as_mut_vec(),
+                        op_state.backward_neighbor_scratch.as_mut_vec(),
                         remaining,
                     )?
                 };
+                op_state.forward_neighbor_scratch.sync_capacity()?;
+                op_state.backward_neighbor_scratch.sync_capacity()?;
 
                 // Write results into output vectors.
                 let row_start = out_row;
@@ -1257,7 +1263,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
                     }
                     out_row += 1;
                 }
-                self.update_multi_hop_temporary_memory(ctx, op_state)?;
+                self.refresh_multi_hop_memory_stats(op_state)?;
                 if !dst_locals.is_empty() && ncols + 2 < ocols {
                     let dst_rowids = vmap.batch_local_to_rowid(&dst_locals);
                     for (i, rowid) in dst_rowids.iter().enumerate() {
@@ -1275,7 +1281,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
                     // BFS complete for this input row, move to next.
                     op_state.hop_state = None;
                     op_state.multi_hop_input_vals = None;
-                    self.update_multi_hop_temporary_memory(ctx, op_state)?;
+                    self.refresh_multi_hop_memory_stats(op_state)?;
                 } else {
                     // BFS not complete — batch is full, save state and return.
                     op_state.multi_hop_row_cursor = row;
@@ -1300,19 +1306,22 @@ impl PhysicalOperator for PhysicalGraphExpand {
             if !have_more {
                 op_state.multi_hop_active = false;
                 op_state.multi_hop_row_cursor = 0;
-                self.update_multi_hop_temporary_memory(ctx, op_state)?;
+                self.refresh_multi_hop_memory_stats(op_state)?;
             }
         }
 
         if out_row == 0 {
-            *chunk = Chunk::init_empty(&self.output_types);
+            *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
             return Ok(OperatorResultType::NeedMoreInput);
         }
 
         // Trim vectors to actual output size and build Chunk.
         let path_base = ncols + 3;
         let path_vectors = if self.emit_path_info {
-            Some(materialize_path_vectors(&path_rows))
+            Some(materialize_path_vectors(
+                &path_rows,
+                chunk.allocator().clone(),
+            )?)
         } else {
             None
         };
@@ -1336,7 +1345,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
             v.set_len(out_row);
             arcs.push(Arc::new(v));
         }
-        *chunk = Chunk::from_arc_vectors(arcs);
+        *chunk = Chunk::from_arc_vectors(arcs, chunk.allocator().clone());
         chunk.set_cardinality(out_row);
         storage_metrics().add_graph_expand_rows(out_row);
 
@@ -1350,7 +1359,7 @@ impl PhysicalOperator for PhysicalGraphExpand {
 
 impl PhysicalGraphExpand {
     /// Evaluate target_filter against the target vertex table and
-    /// build a BitSet (Vec<u64>) marking valid target local IDs.
+    /// build an accounted BitSet marking valid target local IDs.
     ///
     /// Scans the target vertex table with column pruning, evaluates the
     /// predicate via ExpressionExecutor, and maps matching rowids to local_ids
@@ -1362,7 +1371,7 @@ impl PhysicalGraphExpand {
         &self,
         ctx: &ExecutionContext,
         index: &GraphProjectionIndex,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<AccountedBuffer<u64>> {
         let filter = self.target_filter.as_ref().unwrap();
 
         let vertex_map = index.vertex_map(&self.target_label).ok_or_else(|| {
@@ -1375,7 +1384,8 @@ impl PhysicalGraphExpand {
         let num_vertices = vertex_map.num_vertices() as usize;
         // Allocate BitSet: ceil(num_vertices / 64) words
         let num_words = (num_vertices + 63) / 64;
-        let mut bitset = vec![0u64; num_words];
+        let mut bitset = AccountedBuffer::new(Self::graph_memory_context(ctx));
+        bitset.try_resize(num_words, 0u64)?;
 
         // Resolve the target vertex table name.
         // For forward edges, the target is the destination vertex table.
@@ -1441,7 +1451,11 @@ impl PhysicalGraphExpand {
             let rowid_col_idx = scan_chunk.column_count() - 1;
 
             let mut filter_executor = ExpressionExecutor::with_expressions(&filter_exprs);
-            let mut filter_result = Chunk::initialize(&[LogicalType::Boolean], scan_size);
+            let mut filter_result = Chunk::try_initialize(
+                &[LogicalType::Boolean],
+                scan_size,
+                scan_chunk.allocator().clone(),
+            )?;
             filter_executor.execute_all_into(&scan_chunk, ctx, &mut filter_result)?;
 
             let bool_col = filter_result.column(0).ok_or_else(|| {

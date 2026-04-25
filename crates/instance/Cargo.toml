@@ -34,6 +34,7 @@ tempfile = "3.8"
 tracing = { workspace = true }
 
 [dev-dependencies]
+paro-common = { workspace = true, features = ["test-support"] }
 divan = { workspace = true }
 
 [[bench]]

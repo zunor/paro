@@ -118,26 +118,72 @@ fn bench_state() -> &'static BenchState {
 
         BenchState {
             runtime,
-            cast_i32_input: Chunk::from_vectors(vec![Vector::from_i32(&cast_i32_values)]),
-            nullable_i32_input: Chunk::from_vectors(vec![nullable_i32_vector(
-                &nullable_i32_values,
-            )]),
-            coalesce_i32_input: Chunk::from_vectors(vec![
-                nullable_i32_vector(&coalesce_first),
-                nullable_i32_vector(&coalesce_second),
-            ]),
-            in_i32_input: Chunk::from_vectors(vec![nullable_i32_vector(&nullable_i32_values)]),
-            unary_i64_input: Chunk::from_vectors(vec![Vector::from_i64(&unary_i64_values)]),
-            unary_bool_input: Chunk::from_vectors(vec![Vector::from_bool(&unary_bool_values)]),
-            binary_i64_input: Chunk::from_vectors(vec![
-                Vector::from_i64(&binary_left),
-                Vector::from_i64(&binary_right),
-            ]),
-            ternary_i64_input: Chunk::from_vectors(vec![
-                Vector::from_i64(&ternary_values),
-                Vector::from_i64(&ternary_low),
-                Vector::from_i64(&ternary_high),
-            ]),
+            cast_i32_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                    &cast_i32_values,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
+            nullable_i32_input: Chunk::from_vectors(
+                vec![nullable_i32_vector(&nullable_i32_values)],
+                paro_common::test_utils::test_allocator(),
+            ),
+            coalesce_i32_input: Chunk::from_vectors(
+                vec![
+                    nullable_i32_vector(&coalesce_first),
+                    nullable_i32_vector(&coalesce_second),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ),
+            in_i32_input: Chunk::from_vectors(
+                vec![nullable_i32_vector(&nullable_i32_values)],
+                paro_common::test_utils::test_allocator(),
+            ),
+            unary_i64_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                    &unary_i64_values,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
+            unary_bool_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_bool_vector_with_allocator(
+                    &unary_bool_values,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
+            binary_i64_input: Chunk::from_vectors(
+                vec![
+                    paro_common::test_utils::test_i64_vector_with_allocator(
+                        &binary_left,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                    paro_common::test_utils::test_i64_vector_with_allocator(
+                        &binary_right,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ),
+            ternary_i64_input: Chunk::from_vectors(
+                vec![
+                    paro_common::test_utils::test_i64_vector_with_allocator(
+                        &ternary_values,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                    paro_common::test_utils::test_i64_vector_with_allocator(
+                        &ternary_low,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                    paro_common::test_utils::test_i64_vector_with_allocator(
+                        &ternary_high,
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ),
             cast_expr: cast_i32_to_i64_expr(),
             abs_expr: abs_expr(),
             not_expr: not_expr(),
@@ -170,7 +216,10 @@ fn nullable_i32_vector(values: &[Option<i32>]) -> Vector {
         .iter()
         .map(|value| value.unwrap_or_default())
         .collect();
-    let mut vector = Vector::from_i32(&dense);
+    let mut vector = paro_common::test_utils::test_i32_vector_with_allocator(
+        &dense,
+        paro_common::test_utils::test_allocator(),
+    );
     for (row_idx, value) in values.iter().enumerate() {
         if value.is_none() {
             vector.set_null(row_idx, true);
@@ -184,7 +233,7 @@ fn abs_function(
     _runtime: &dyn FunctionExecContext,
     result: &mut Vector,
 ) -> Result<()> {
-    UnaryExecutor::execute::<i64, i64, AbsOp>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<i64, i64, AbsOp>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -193,7 +242,7 @@ fn not_function(
     _runtime: &dyn FunctionExecContext,
     result: &mut Vector,
 ) -> Result<()> {
-    UnaryExecutor::execute::<bool, bool, NotOp>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<bool, bool, NotOp>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -207,7 +256,7 @@ fn add_function(
         &input.data[1],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -222,7 +271,7 @@ fn between_function(
         &input.data[2],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -347,7 +396,7 @@ fn in_list_i32_expr(values: &[i32]) -> Expression {
 fn cast_i32_to_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.cast_expr);
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     bencher
         .counter(state.cast_i32_input.size())
         .bench_local(|| {
@@ -369,7 +418,7 @@ fn cast_i32_to_i64(bencher: Bencher) {
 fn abs_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.abs_expr);
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     bencher
         .counter(state.unary_i64_input.size())
         .bench_local(|| {
@@ -391,7 +440,7 @@ fn abs_i64(bencher: Bencher) {
 fn not_bool(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.not_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher
         .counter(state.unary_bool_input.size())
         .bench_local(|| {
@@ -413,7 +462,7 @@ fn not_bool(bencher: Bencher) {
 fn add_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.add_expr);
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     bencher
         .counter(state.binary_i64_input.size())
         .bench_local(|| {
@@ -435,7 +484,7 @@ fn add_i64(bencher: Bencher) {
 fn eq_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.eq_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher
         .counter(state.binary_i64_input.size())
         .bench_local(|| {
@@ -457,7 +506,7 @@ fn eq_i64(bencher: Bencher) {
 fn lt_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.lt_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher
         .counter(state.binary_i64_input.size())
         .bench_local(|| {
@@ -479,7 +528,7 @@ fn lt_i64(bencher: Bencher) {
 fn between_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.between_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher
         .counter(state.ternary_i64_input.size())
         .bench_local(|| {
@@ -501,7 +550,7 @@ fn between_i64(bencher: Bencher) {
 fn is_null_i32(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.is_null_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher
         .counter(state.nullable_i32_input.size())
         .bench_local(|| {
@@ -523,7 +572,7 @@ fn is_null_i32(bencher: Bencher) {
 fn coalesce_i32(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.coalesce_expr);
-    let mut result = Vector::with_capacity(LogicalType::Integer, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, ROWS);
     bencher
         .counter(state.coalesce_i32_input.size())
         .bench_local(|| {
@@ -545,7 +594,7 @@ fn coalesce_i32(bencher: Bencher) {
 fn in_small_i32(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.in_small_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher.counter(state.in_i32_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -565,7 +614,7 @@ fn in_small_i32(bencher: Bencher) {
 fn in_large_i32(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.in_large_expr);
-    let mut result = Vector::with_capacity(LogicalType::Boolean, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, ROWS);
     bencher.counter(state.in_i32_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -585,7 +634,7 @@ fn in_large_i32(bencher: Bencher) {
 fn execute_into_reused_output(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.abs_expr);
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     bencher
         .counter(state.unary_i64_input.size())
         .bench_local(|| {
@@ -610,7 +659,8 @@ fn execute_into_fresh_output(bencher: Bencher) {
     bencher
         .counter(state.unary_i64_input.size())
         .bench_local(|| {
-            let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+            let mut result =
+                paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
             executor
                 .execute_into(
                     0,

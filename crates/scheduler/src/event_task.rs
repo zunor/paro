@@ -66,6 +66,7 @@ impl<T: Task> Task for EventTask<T> {
 
         // If the task finished, notify the event (only once)
         if result == TaskExecutionResult::Finished && !self.event_notified {
+            self.inner.clear_interrupt_state();
             self.event_notified = true;
             self.event.finish_task();
         }
@@ -80,6 +81,10 @@ impl<T: Task> Task for EventTask<T> {
 
     fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
         self.inner.set_interrupt_state(interrupt_state);
+    }
+
+    fn clear_interrupt_state(&mut self) {
+        self.inner.clear_interrupt_state();
     }
 
     fn get_token(&self) -> Option<ProducerToken> {
@@ -169,6 +174,7 @@ impl Task for BoxedEventTask {
         let result = self.inner.execute(mode)?;
 
         if result == TaskExecutionResult::Finished && !self.event_notified {
+            self.inner.clear_interrupt_state();
             self.event_notified = true;
             self.event.finish_task();
         }
@@ -183,6 +189,10 @@ impl Task for BoxedEventTask {
 
     fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
         self.inner.set_interrupt_state(interrupt_state);
+    }
+
+    fn clear_interrupt_state(&mut self) {
+        self.inner.clear_interrupt_state();
     }
 
     fn get_token(&self) -> Option<ProducerToken> {
@@ -222,6 +232,10 @@ impl Task for ArcMutexTaskWrapper {
 
     fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
         self.task.lock().set_interrupt_state(interrupt_state);
+    }
+
+    fn clear_interrupt_state(&mut self) {
+        self.task.lock().clear_interrupt_state();
     }
 
     fn get_token(&self) -> Option<ProducerToken> {
@@ -508,5 +522,59 @@ mod tests {
 
         scheduler.execute_tasks_for_producer(&token, &marker, 1);
         assert!(event.is_finished());
+    }
+
+    #[test]
+    fn boxed_event_task_interrupt_callback_does_not_keep_wrapped_task_alive() {
+        struct InterruptAwareFinishedTask {
+            state: Arc<ParkingMutex<Option<crate::task::InterruptState>>>,
+        }
+        impl Task for InterruptAwareFinishedTask {
+            fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
+                Ok(TaskExecutionResult::Finished)
+            }
+
+            fn set_interrupt_state(&mut self, interrupt_state: crate::task::InterruptState) {
+                *self.state.lock() = Some(interrupt_state);
+            }
+
+            fn clear_interrupt_state(&mut self) {
+                *self.state.lock() = None;
+            }
+
+            fn task_type(&self) -> &str {
+                "InterruptAwareFinishedTask"
+            }
+        }
+
+        let event = Event::new();
+        event.set_tasks(1);
+        let interrupt_state = Arc::new(ParkingMutex::new(None));
+        let inner: Arc<Mutex<dyn Task>> = Arc::new(Mutex::new(InterruptAwareFinishedTask {
+            state: interrupt_state.clone(),
+        }));
+        let wrapped = BoxedEventTask::from_arc_mutex(inner.clone(), event);
+        let weak_wrapped = Arc::downgrade(&wrapped);
+
+        assert!(
+            interrupt_state.lock().is_some(),
+            "from_arc_mutex should inject a scheduler-linked interrupt state"
+        );
+        wrapped
+            .lock()
+            .execute(TaskExecutionMode::ProcessAll)
+            .expect("finished task should execute");
+        assert!(
+            interrupt_state.lock().is_none(),
+            "finished task should clear its interrupt state"
+        );
+
+        drop(wrapped);
+        drop(inner);
+
+        assert!(
+            weak_wrapped.upgrade().is_none(),
+            "interrupt callback must not create a strong reference cycle"
+        );
     }
 }

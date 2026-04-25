@@ -350,7 +350,7 @@ mod tests {
     use crate::operator::PhysicalOperator;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
     use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
     use paro_storage::table::table_factory::TableFactory;
@@ -408,16 +408,25 @@ mod tests {
             .register_search_definition(definition)
             .expect("register fulltext definition");
         table
-            .append(&Chunk::from_vectors(vec![
-                Vector::from_i32(&[1, 2, 3, 4, 5]),
-                Vector::from_strings(&[
-                    "vector database vector",
-                    "vector database",
-                    "database vector",
-                    "vector",
-                    "noise",
-                ]),
-            ]))
+            .append(&Chunk::from_vectors(
+                vec![
+                    paro_common::test_utils::test_i32_vector_with_allocator(
+                        &[1, 2, 3, 4, 5],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                    paro_common::test_utils::test_string_vector_with_allocator(
+                        &[
+                            "vector database vector",
+                            "vector database",
+                            "database vector",
+                            "vector",
+                            "noise",
+                        ],
+                        paro_common::test_utils::test_allocator(),
+                    ),
+                ],
+                paro_common::test_utils::test_allocator(),
+            ))
             .expect("append");
         table
     }

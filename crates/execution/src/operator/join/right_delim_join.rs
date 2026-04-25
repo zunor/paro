@@ -4,15 +4,17 @@
 //! Physical right delim join.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::AccountedHashSet;
 
 use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
-use crate::operator::join::delim_join::{DelimJoin, DelimKey};
+use crate::operator::join::delim_join::{
+    delim_materialized_memory_context, new_delim_seen_set, DelimJoin, DelimKey,
+};
 use crate::operator::join::hash_join::operator::HashJoin;
 use crate::operator::join::nested_loop_join::NestedLoopJoin;
 use crate::operator::scan::column_data_scan::MaterializedChunkCollection;
@@ -69,7 +71,7 @@ impl RightDelimJoin {
 #[derive(Debug)]
 struct RightDelimJoinGlobalSinkState {
     delim_collection: Arc<MaterializedChunkCollection>,
-    seen_keys: Mutex<HashSet<DelimKey>>,
+    seen_keys: Mutex<AccountedHashSet<DelimKey>>,
 }
 
 impl GlobalSinkState for RightDelimJoinGlobalSinkState {
@@ -148,7 +150,10 @@ impl PhysicalOperator for RightDelimJoin {
     }
 
     fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        let delim_collection = Arc::new(MaterializedChunkCollection::new(self.base.delim_types()));
+        let delim_collection = Arc::new(MaterializedChunkCollection::with_memory(
+            self.base.delim_types(),
+            delim_materialized_memory_context(ctx),
+        ));
         delim_collection.reset()?;
 
         for scan in &self.base.delim_scans {
@@ -161,7 +166,7 @@ impl PhysicalOperator for RightDelimJoin {
 
         Ok(Box::new(RightDelimJoinGlobalSinkState {
             delim_collection,
-            seen_keys: Mutex::new(HashSet::new()),
+            seen_keys: Mutex::new(new_delim_seen_set(ctx)),
         }))
     }
 
@@ -200,10 +205,11 @@ impl PhysicalOperator for RightDelimJoin {
         let join_sink_state = self.base.join.sink_state().ok_or_else(|| {
             paro_error::internal("Right delim join requires wrapped join sink state".to_string())
         })?;
-        let mut join_input = OperatorSinkInput::new(
+        let mut join_input = OperatorSinkInput::with_memory(
             join_sink_state.as_ref(),
             lstate.join_local_state.as_mut(),
             input.interrupt_state,
+            input.memory.child_scope(),
         );
         self.base.join.sink(ctx, chunk, &mut join_input)?;
 
@@ -216,13 +222,13 @@ impl PhysicalOperator for RightDelimJoin {
             .seen_keys
             .lock()
             .map_err(|e| paro_error::internal(format!("Failed to lock delim seen-key set: {e}")))?;
-        let unique_chunk = self.base.select_new_delim_rows(&delim_chunk, &mut seen);
+        let unique_chunk = self.base.select_new_delim_rows(&delim_chunk, &mut seen)?;
         drop(seen);
 
         if unique_chunk.size() > 0 {
             gstate
                 .delim_collection
-                .append(unique_chunk.deep_copy_with_allocator(unique_chunk.allocator().clone()))?;
+                .append(unique_chunk.try_deep_copy(unique_chunk.allocator().clone())?)?;
         }
 
         Ok(SinkResultType::NeedMoreInput)
@@ -244,10 +250,11 @@ impl PhysicalOperator for RightDelimJoin {
         let join_sink_state = self.base.join.sink_state().ok_or_else(|| {
             paro_error::internal("Right delim join requires wrapped join sink state".to_string())
         })?;
-        let mut join_input = OperatorSinkCombineInput::new(
+        let mut join_input = OperatorSinkCombineInput::with_memory(
             join_sink_state.as_ref(),
             lstate.join_local_state.as_mut(),
             input.interrupt_state,
+            input.memory.child_scope(),
         );
         self.base.join.combine(ctx, &mut join_input)?;
 
@@ -320,7 +327,7 @@ mod tests {
     use crate::pipeline::build_state::PipelineBuildState;
     use crate::pipeline::meta_pipeline::{MetaPipeline, MetaPipelineType};
     use crate::thread_context::ThreadContext;
-    use paro_common::chunk::Chunk;
+
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
@@ -389,7 +396,8 @@ mod tests {
             .expect("local sink");
         let interrupt = InterruptState::default();
 
-        let mut chunk = Chunk::initialize(&[LogicalType::Integer], 3);
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
         chunk.set_cardinality(3);
         chunk
             .column_mut(0)
@@ -471,6 +479,9 @@ mod tests {
         let session = test_session();
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
+        let _gstate = right_delim_join
+            .get_global_sink_state(&ctx)
+            .expect("global sink");
         let lstate = right_delim_join
             .get_local_sink_state(&ctx)
             .expect("local sink");

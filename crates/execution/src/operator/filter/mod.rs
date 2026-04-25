@@ -77,7 +77,13 @@ mod tests {
     }
 
     fn integer_chunk(values: &[i32]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(values)])
+        Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn filter_predicate() -> Expression {
@@ -101,7 +107,8 @@ mod tests {
         let mut state = filter
             .get_operator_state(&ctx)
             .expect("filter state should be created");
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let input = integer_chunk(&[1, 2, 3]);
 
         let result = filter
@@ -111,6 +118,7 @@ mod tests {
                 &mut output,
                 &EmptyGlobalOperatorState,
                 state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .expect("filter execute should succeed");
         assert!(matches!(result, OperatorResultType::NeedMoreInput));
@@ -152,6 +160,7 @@ mod tests {
                 &mut output,
                 &EmptyGlobalOperatorState,
                 state,
+                crate::operator::state::test_operator_memory_scope(),
             )
             .expect("second filter execute should succeed");
         assert!(Arc::ptr_eq(
@@ -242,10 +251,10 @@ impl PhysicalOperator for Filter {
     fn get_operator_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
         Ok(Box::new(FilterOperatorState {
             predicate_executor: ExpressionExecutor::new(&self.predicate),
-            selection: SelectionVector::with_allocator(
+            selection: SelectionVector::try_with_capacity(
                 VECTOR_SIZE,
                 ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-            ),
+            )?,
         }))
     }
 
@@ -256,6 +265,7 @@ impl PhysicalOperator for Filter {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         if input.is_empty() {
             return Ok(OperatorResultType::NeedMoreInput);
@@ -267,10 +277,10 @@ impl PhysicalOperator for Filter {
             .expect("Invalid state type for Filter");
 
         if state.selection.len() < input.size() {
-            state.selection = SelectionVector::with_allocator(
+            state.selection = SelectionVector::try_with_capacity(
                 input.size(),
                 ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-            );
+            )?;
         }
         state.selection.set_len(input.size());
         let selected_count = state.predicate_executor.select_into(
@@ -291,20 +301,20 @@ impl PhysicalOperator for Filter {
         if selected_count == input.size() {
             if self.projection_map.is_empty() {
                 if chunk.column_count() != input.column_count() {
-                    *chunk = Chunk::initialize_with_allocator(
+                    *chunk = Chunk::try_initialize(
                         self.child.types(),
                         input.size().max(1),
                         ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-                    );
+                    )?;
                 }
                 chunk.reference(input);
             } else {
                 if chunk.column_count() != self.types.len() {
-                    *chunk = Chunk::initialize_with_allocator(
+                    *chunk = Chunk::try_initialize(
                         &self.types,
                         input.size().max(1),
                         ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-                    );
+                    )?;
                 }
                 chunk.reference_columns(input, &self.projection_map);
             }
@@ -312,13 +322,13 @@ impl PhysicalOperator for Filter {
         }
 
         if chunk.column_count() != self.types.len() || chunk.capacity() < selected_count.max(1) {
-            *chunk = Chunk::initialize_with_allocator(
+            *chunk = Chunk::try_initialize(
                 &self.types,
                 selected_count.max(1),
                 ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-            );
+            )?;
         } else {
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
         }
 
         let projection_columns: Vec<usize> = if self.projection_map.is_empty() {
@@ -328,7 +338,8 @@ impl PhysicalOperator for Filter {
         };
 
         for (output_idx, input_idx) in projection_columns.into_iter().enumerate() {
-            let dict_vec = Vector::dictionary(Arc::clone(&input.data[input_idx]), &state.selection);
+            let dict_vec =
+                Vector::try_dictionary(Arc::clone(&input.data[input_idx]), &state.selection)?;
             chunk.data[output_idx] = Arc::new(dict_vec);
         }
         chunk.set_cardinality(selected_count);

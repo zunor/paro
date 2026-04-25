@@ -303,14 +303,14 @@ impl JoinFilterPushdownInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_common::chunk::Chunk;
+
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
 
     #[test]
     fn test_join_filter_pushdown() {
         let types = vec![LogicalType::Integer];
-        let mut key_chunk = Chunk::initialize(&types, 10);
+        let mut key_chunk = paro_common::test_utils::test_chunk_with_capacity(&types, 10);
         for i in 0..10 {
             key_chunk
                 .column_mut(0)
@@ -358,7 +358,7 @@ mod tests {
         }
 
         // Apply filters
-        let mut probe_chunk = Chunk::initialize(&types, 10);
+        let mut probe_chunk = paro_common::test_utils::test_chunk_with_capacity(&types, 10);
         for i in 0..10 {
             probe_chunk
                 .column_mut(0)
@@ -367,7 +367,7 @@ mod tests {
         }
         probe_chunk.set_cardinality(10);
 
-        let mut sel = SelectionVector::incremental(10);
+        let mut sel = paro_common::test_utils::test_incremental_selection(10);
         let filtered_count = info.apply_filters(&gstate, &probe_chunk, &mut sel);
 
         // Values matching: 10, 15 (both in range [10, 19] AND in bloom filter likely)

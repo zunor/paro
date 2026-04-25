@@ -159,7 +159,8 @@ mod tests {
     use std::any::Any;
 
     fn create_test_chunk() -> Chunk {
-        Chunk::new()
+        Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed")
     }
 
     // Mock ExpressionState for testing
@@ -183,7 +184,7 @@ mod tests {
     fn test_now() {
         let chunk = create_test_chunk();
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Timestamp);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Timestamp);
 
         now_impl(&chunk, &state, &mut result).unwrap();
 
@@ -200,7 +201,7 @@ mod tests {
     fn test_current_date() {
         let chunk = create_test_chunk();
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Date);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Date);
 
         current_date_impl(&chunk, &state, &mut result).unwrap();
 
@@ -216,7 +217,7 @@ mod tests {
     fn test_current_time() {
         let chunk = create_test_chunk();
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Time);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Time);
 
         current_time_impl(&chunk, &state, &mut result).unwrap();
 

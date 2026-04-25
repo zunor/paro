@@ -9,6 +9,7 @@ use paro_execution::query_executor::compiled::CompiledStatement;
 use paro_execution::query_executor::executor::Executor;
 
 use crate::prepared::portal::MaterializedPortalData;
+use crate::result::retained_store::SessionRetainedResultStore;
 use crate::Session;
 
 /// Materializes a compiled statement into in-memory chunks for portal/cursor consumption.
@@ -28,10 +29,10 @@ pub(crate) async fn materialize_compiled_statement(
     session.set_executor(executor);
 
     let mut stream = session.get_executor().execute(compiled)?;
-    let mut chunks = Vec::new();
+    let store = SessionRetainedResultStore::new(session.session_memory_budget());
     while let Some(chunk) = stream.fetch()? {
-        chunks.push(chunk.deep_copy_with_allocator(chunk.allocator().clone()));
+        store.append(chunk.try_deep_copy(chunk.allocator().clone())?)?;
     }
 
-    Ok(MaterializedPortalData::new(chunks))
+    Ok(MaterializedPortalData::new(store))
 }

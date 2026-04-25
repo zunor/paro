@@ -95,7 +95,6 @@ pub fn get_nullif_functions() -> ScalarFunctionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_common::chunk::Chunk;
 
     struct MockState;
     impl ExpressionState for MockState {
@@ -115,10 +114,16 @@ mod tests {
 
     #[test]
     fn test_nullif_i32_not_equal() {
-        let a = Vector::from_i32(&[1, 2, 3]);
-        let b = Vector::from_i32(&[10, 20, 30]);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let a = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let b = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[10, 20, 30],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         nullif_eq(&chunk, &MockState, &mut result).unwrap();
 
@@ -130,10 +135,16 @@ mod tests {
 
     #[test]
     fn test_nullif_i32_equal() {
-        let a = Vector::from_i32(&[1, 2, 3]);
-        let b = Vector::from_i32(&[1, 20, 3]);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let a = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let b = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 20, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         nullif_eq(&chunk, &MockState, &mut result).unwrap();
 
@@ -144,11 +155,17 @@ mod tests {
 
     #[test]
     fn test_nullif_i32_a_null() {
-        let mut a = Vector::from_i32(&[1, 2, 3]);
+        let mut a = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
         a.validity_mut().set_null(1);
-        let b = Vector::from_i32(&[10, 20, 30]);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let b = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[10, 20, 30],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         nullif_eq(&chunk, &MockState, &mut result).unwrap();
 
@@ -159,11 +176,17 @@ mod tests {
 
     #[test]
     fn test_nullif_i32_b_null() {
-        let a = Vector::from_i32(&[1, 2, 3]);
-        let mut b = Vector::from_i32(&[10, 20, 30]);
+        let a = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut b = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[10, 20, 30],
+            paro_common::test_utils::test_allocator(),
+        );
         b.validity_mut().set_null(1);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Integer);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         nullif_eq(&chunk, &MockState, &mut result).unwrap();
 
@@ -174,10 +197,16 @@ mod tests {
 
     #[test]
     fn test_nullif_varchar() {
-        let a = Vector::from_strings(&["hello", "world", "test"]);
-        let b = Vector::from_strings(&["hello", "foo", "test"]);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let a = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world", "test"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let b = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "foo", "test"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         nullif_eq(&chunk, &MockState, &mut result).unwrap();
 
@@ -188,10 +217,16 @@ mod tests {
 
     #[test]
     fn test_nullif_f64() {
-        let a = Vector::from_f64(&[1.0, 2.5, 3.0]);
-        let b = Vector::from_f64(&[1.0, 2.0, 3.0]);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Double);
+        let a = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[1.0, 2.5, 3.0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let b = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[1.0, 2.0, 3.0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         nullif_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -202,10 +237,16 @@ mod tests {
 
     #[test]
     fn test_nullif_bool() {
-        let a = Vector::from_bool(&[true, false, true]);
-        let b = Vector::from_bool(&[true, true, false]);
-        let chunk = Chunk::from_vectors(vec![a, b]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let a = paro_common::test_utils::test_bool_vector_with_allocator(
+            &[true, false, true],
+            paro_common::test_utils::test_allocator(),
+        );
+        let b = paro_common::test_utils::test_bool_vector_with_allocator(
+            &[true, true, false],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![a, b]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         nullif_eq(&chunk, &MockState, &mut result).unwrap();
 

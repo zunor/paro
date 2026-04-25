@@ -216,8 +216,13 @@ mod tests {
 
     #[test]
     fn sequence_casts_without_materializing() {
-        let input = Vector::sequence(10, 3, 4);
-        let mut result = Vector::with_capacity(LogicalType::Double, 4);
+        let input = paro_common::test_utils::test_sequence_with_allocator(
+            10,
+            3,
+            4,
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Double, 4);
 
         let success = int64_to_double(&input, &mut result, 4, &ctx(false)).unwrap();
 
@@ -230,9 +235,15 @@ mod tests {
 
     #[test]
     fn try_cast_nullifies_out_of_range_dictionary_rows() {
-        let input =
-            Vector::dictionary(Arc::new(Vector::from_i64(&[127, 128, -129])), vec![2, 0, 1]);
-        let mut result = Vector::with_capacity(LogicalType::TinyInt, 3);
+        let input = paro_common::test_utils::test_dictionary(
+            Arc::new(paro_common::test_utils::test_i64_vector_with_allocator(
+                &[127, 128, -129],
+                paro_common::test_utils::test_allocator(),
+            )),
+            vec![2, 0, 1],
+        );
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::TinyInt, 3);
 
         let success = int64_to_int8(&input, &mut result, 3, &ctx(true)).unwrap();
 
@@ -244,15 +255,22 @@ mod tests {
 
     #[test]
     fn reusing_result_vector_clears_stale_try_cast_nulls() {
-        let input = Vector::from_i64(&[127, 128]);
-        let mut result = Vector::with_capacity(LogicalType::TinyInt, 2);
+        let input = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[127, 128],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::TinyInt, 2);
 
         let success = int64_to_int8(&input, &mut result, 2, &ctx(true)).unwrap();
         assert!(!success);
         assert_eq!(result.get_i8(0), Some(127));
         assert!(result.is_null(1));
 
-        let clean_input = Vector::from_i64(&[12, 13]);
+        let clean_input = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[12, 13],
+            paro_common::test_utils::test_allocator(),
+        );
         let success = int64_to_int8(&clean_input, &mut result, 2, &ctx(false)).unwrap();
         assert!(success);
         assert_eq!(result.get_i8(0), Some(12));

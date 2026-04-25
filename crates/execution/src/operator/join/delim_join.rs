@@ -3,11 +3,15 @@
 
 //! Shared delim-join contract.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::memory::{
+    AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryGrant,
+    MemoryOwner,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
@@ -19,6 +23,39 @@ use crate::operator::PhysicalOperator;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DelimKey(pub Vec<Value>);
+
+pub(crate) fn delim_materialized_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::ColumnData,
+        MemoryAccountingClass::Revocable,
+    )
+}
+
+pub(crate) fn new_delim_seen_set(ctx: &ExecutionContext) -> AccountedHashSet<DelimKey> {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    let memory = MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::Metadata,
+        MemoryAccountingClass::Metadata,
+    );
+    AccountedHashSet::new_with_accounting(
+        grant_for_context(&memory),
+        MemoryTag::Metadata,
+        MemoryAccountingClass::Metadata,
+    )
+}
+
+fn grant_for_context(memory: &MemoryAccountingContext) -> MemoryGrant {
+    if let Some(owner) = memory.owner() {
+        MemoryGrant::new(0, memory.domain(), owner).expect("zero-byte delim grant should fit")
+    } else {
+        MemoryGrant::detached(usize::MAX / 4, memory.domain())
+    }
+}
 
 /// Shared metadata owned by left/right delim join implementations.
 #[derive(Debug)]
@@ -87,20 +124,17 @@ impl DelimJoin {
         for executor in executors {
             vectors.push(executor.execute_expression(0, input, None, input.size(), ctx)?);
         }
-        Ok(Chunk::from_arc_vectors(vectors))
+        Ok(Chunk::from_arc_vectors(vectors, input.allocator().clone()))
     }
 
     pub(crate) fn select_new_delim_rows(
         &self,
         delim_chunk: &Chunk,
-        seen: &mut HashSet<DelimKey>,
-    ) -> Chunk {
+        seen: &mut AccountedHashSet<DelimKey>,
+    ) -> Result<Chunk> {
         let types = delim_chunk.types();
-        let mut output = Chunk::initialize_with_allocator(
-            &types,
-            delim_chunk.size(),
-            delim_chunk.allocator().clone(),
-        );
+        let mut output =
+            Chunk::try_initialize(&types, delim_chunk.size(), delim_chunk.allocator().clone())?;
 
         let mut count = 0;
         for row_idx in 0..delim_chunk.size() {
@@ -114,7 +148,7 @@ impl DelimJoin {
                     })
                     .collect(),
             );
-            if !seen.insert(key) {
+            if !seen.try_insert(key)? {
                 continue;
             }
             for col_idx in 0..delim_chunk.column_count() {
@@ -131,6 +165,6 @@ impl DelimJoin {
         }
 
         output.set_cardinality(count);
-        output
+        Ok(output)
     }
 }

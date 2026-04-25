@@ -7,16 +7,18 @@ use crate::runtime::runtime_tuning::RuntimeTuning;
 use crate::runtime::session_registry::SessionExecutionRegistry;
 use crate::runtime::{InstanceRuntime, InstanceRuntimeResources};
 use crate::{BootConfig, DatabaseFileSystem, InstanceConfig};
+use paro_execution::memory_runtime::{MemoryArbitrator, SystemReserve};
 use paro_external_runtime::host::ExternalRuntimeHost;
 use paro_function::register_system_buffer_manager;
 use paro_scheduler::scheduler::TaskScheduler;
-use paro_storage::buffer::{BufferManager, StandardBufferManager, TemporaryMemoryManager};
+use paro_storage::buffer::{BufferManager, StandardBufferManager};
 use std::sync::Arc;
 
 pub(crate) struct RuntimeResources {
     buffer_manager: Arc<dyn BufferManager>,
     scheduler: Arc<TaskScheduler>,
-    temporary_memory_manager: Arc<TemporaryMemoryManager>,
+    memory_arbitrator: Arc<MemoryArbitrator>,
+    system_reserve: Arc<SystemReserve>,
     connection_registry: Arc<ConnectionRegistry>,
     session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
@@ -45,12 +47,14 @@ impl RuntimeResources {
         let _ = scheduler.set_thread_affinity_mode(boot_config.pin_threads);
         let _ = scheduler.set_threads(boot_config.effective_max_threads());
 
+        let memory_arbitrator = Arc::new(MemoryArbitrator::new(boot_config.initial_maximum_memory));
+        let system_reserve = Arc::new(SystemReserve::new(memory_arbitrator.clone()));
+
         Self {
             buffer_manager,
             scheduler,
-            temporary_memory_manager: Arc::new(TemporaryMemoryManager::with_buffer_pool(
-                Arc::downgrade(&boot_config.buffer_pool),
-            )),
+            memory_arbitrator,
+            system_reserve,
             connection_registry: Arc::new(ConnectionRegistry::new()),
             session_registry: Arc::new(SessionExecutionRegistry::new()),
             object_cache: Arc::new(ObjectCache::new()),
@@ -64,12 +68,13 @@ impl RuntimeResources {
         config: &InstanceConfig,
         boot_config: &Arc<BootConfig>,
     ) -> InstanceRuntime {
-        let runtime = InstanceRuntime::new(
+        InstanceRuntime::new(
             InstanceRuntimeResources {
                 buffer_pool: Arc::clone(&boot_config.buffer_pool),
                 buffer_manager: self.buffer_manager,
                 scheduler: self.scheduler,
-                temporary_memory_manager: self.temporary_memory_manager,
+                memory_arbitrator: self.memory_arbitrator,
+                system_reserve: self.system_reserve,
                 connection_registry: self.connection_registry,
                 session_registry: self.session_registry,
                 object_cache: self.object_cache,
@@ -77,8 +82,6 @@ impl RuntimeResources {
                 python_runtime: self.python_runtime,
             },
             RuntimeTuning::from_options(&config.options),
-        );
-        runtime.refresh_temporary_memory_configuration(None, false);
-        runtime
+        )
     }
 }

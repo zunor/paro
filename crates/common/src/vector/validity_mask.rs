@@ -427,11 +427,12 @@ impl ValidityMask {
     pub fn ensure_writable(&mut self) {
         if self.bits.is_none() && self.capacity > 0 {
             let num_words = Self::entry_count(self.capacity);
-            let mut buf = VectorBuffer::with_allocator(
+            let mut buf = VectorBuffer::try_with_allocator(
                 std::mem::size_of::<u64>(),
                 num_words,
                 self.allocator.clone(),
-            );
+            )
+            .expect("vector buffer allocation failed");
             // Initialize to all valid
             unsafe {
                 let slice = buf.as_mut_slice::<u64>(num_words);
@@ -466,6 +467,12 @@ impl ValidityMask {
             .unwrap_or(0)
     }
 
+    pub(crate) fn collect_allocation_entries(&self, entries: &mut Vec<(usize, usize)>) {
+        if let Some(bits) = &self.bits {
+            bits.collect_allocation_entries(entries);
+        }
+    }
+
     /// Resize the validity mask to new size.
     pub fn resize(&mut self, new_size: usize) {
         let old_size = self.capacity;
@@ -479,11 +486,12 @@ impl ValidityMask {
             let new_word_count = Self::entry_count(new_size);
             let old_word_count = Self::entry_count(old_size);
 
-            let mut new_buf = VectorBuffer::with_allocator(
+            let mut new_buf = VectorBuffer::try_with_allocator(
                 std::mem::size_of::<u64>(),
                 new_word_count,
                 self.allocator.clone(),
-            );
+            )
+            .expect("vector buffer allocation failed");
 
             unsafe {
                 let old_bits = self
@@ -524,11 +532,12 @@ impl ValidityMask {
         } else {
             // Deep copy the data
             let num_words = Self::entry_count(count);
-            let mut buf = VectorBuffer::with_allocator(
+            let mut buf = VectorBuffer::try_with_allocator(
                 std::mem::size_of::<u64>(),
                 num_words,
                 self.allocator.clone(),
-            );
+            )
+            .expect("vector buffer allocation failed");
             unsafe {
                 let other_bits = other
                     .bits
@@ -578,11 +587,12 @@ impl ValidityMask {
 
         // Have to merge - create new mask with combined data
         let entry_count = Self::entry_count(count);
-        let mut new_buf = VectorBuffer::with_allocator(
+        let mut new_buf = VectorBuffer::try_with_allocator(
             std::mem::size_of::<u64>(),
             entry_count,
             self.allocator.clone(),
-        );
+        )
+        .expect("vector buffer allocation failed");
 
         unsafe {
             let self_bits = self

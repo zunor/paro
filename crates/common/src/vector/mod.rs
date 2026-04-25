@@ -33,14 +33,17 @@ pub use allocation_set::AllocationSet;
 pub use array_vector::{ArrayVector, VectorArrayBuffer};
 pub(crate) use definition::VectorResetState;
 pub use definition::{DictionaryInfo, DictionarySource, Vector};
-pub use selection_vector::SelectionVector;
+pub use selection_vector::{
+    reset_selection_materialization_count, selection_materialization_count, SelectionVector,
+    VectorSelection,
+};
 pub use string_heap::StringHeap;
 pub use validity_mask::{ValidityMask, BITS_PER_VALUE, MAX_ENTRY};
 pub(crate) use vector_buffer::VectorBuffer;
 pub use vector_type::VectorType;
 pub use view::{
-    ArrayView, DataRef, DecodedVector, DecodedVectorTree, SelectionRef, ValidityRef, VarlenView,
-    VectorView,
+    ArrayView, DataRef, DecodedVectorOwned, DecodedVectorRef, DecodedVectorTree, SelectionRef,
+    ValidityRef, VarlenView, VectorView,
 };
 
 /// Default vector size (number of rows per vector).

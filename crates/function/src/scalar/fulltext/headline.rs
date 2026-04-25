@@ -279,12 +279,24 @@ mod tests {
     #[test]
     fn test_ts_headline_highlights_matching_terms() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["Vector database systems"]),
-            Vector::from_strings(&["vector & database"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["Vector database systems"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector & database"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_with_config_fn(&input, &state, &mut result).unwrap();
         assert_eq!(
             result.get_string(0),
@@ -295,12 +307,18 @@ mod tests {
     #[test]
     fn test_ts_headline_default_signature_and_nulls() {
         let state = MockState;
-        let mut doc = Vector::from_strings(&["Vector database", "plain text"]);
-        let mut query = Vector::from_strings(&["database", "vector"]);
+        let mut doc = paro_common::test_utils::test_string_vector_with_allocator(
+            &["Vector database", "plain text"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut query = paro_common::test_utils::test_string_vector_with_allocator(
+            &["database", "vector"],
+            paro_common::test_utils::test_allocator(),
+        );
         doc.set_null(1, true);
         query.set_null(1, true);
-        let input = Chunk::from_vectors(vec![doc, query]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = paro_common::test_utils::test_chunk_from_vectors(vec![doc, query]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_default_fn(&input, &state, &mut result).unwrap();
 
         assert_eq!(result.get_string(0), Some("Vector <b>database</b>"));
@@ -310,12 +328,24 @@ mod tests {
     #[test]
     fn test_ts_headline_rejects_unsupported_config() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["unsupported_lang"]),
-            Vector::from_strings(&["Vector database systems"]),
-            Vector::from_strings(&["vector"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["unsupported_lang"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["Vector database systems"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         let err = ts_headline_with_config_fn(&input, &state, &mut result).unwrap_err();
         assert!(err.to_string().contains("not supported"));
     }
@@ -323,36 +353,72 @@ mod tests {
     #[test]
     fn test_ts_headline_phrase_and_not_semantics() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["vector database search spam"]),
-            Vector::from_strings(&["vector <-> database"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector database search spam"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector <-> database"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_with_config_fn(&input, &state, &mut result).unwrap();
         assert_eq!(
             result.get_string(0),
             Some("<b>vector</b> <b>database</b> search spam")
         );
 
-        let prefix_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["vectors everywhere"]),
-            Vector::from_strings(&["vec:*"]),
-        ]);
-        let mut prefix_result = Vector::new(LogicalType::Varchar);
+        let prefix_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vectors everywhere"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vec:*"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut prefix_result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_with_config_fn(&prefix_input, &state, &mut prefix_result).unwrap();
         assert_eq!(
             prefix_result.get_string(0),
             Some("<b>vectors</b> everywhere")
         );
 
-        let not_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["simple"]),
-            Vector::from_strings(&["vector database spam"]),
-            Vector::from_strings(&["!spam"]),
-        ]);
-        let mut not_result = Vector::new(LogicalType::Varchar);
+        let not_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["simple"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector database spam"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["!spam"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut not_result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_with_config_fn(&not_input, &state, &mut not_result).unwrap();
         assert_eq!(not_result.get_string(0), Some("vector database spam"));
     }
@@ -365,12 +431,24 @@ mod tests {
         let english_query = serialize_query(
             &parse_plainto_tsquery("database", english_tokenizer.as_ref(), 1, None).unwrap(),
         );
-        let english_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["english"]),
-            Vector::from_strings(&["Databases are practical"]),
-            Vector::from_strings(&[english_query.as_str()]),
-        ]);
-        let mut english_result = Vector::new(LogicalType::Varchar);
+        let english_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["english"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["Databases are practical"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &[english_query.as_str()],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut english_result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_with_config_fn(&english_input, &state, &mut english_result).unwrap();
         assert_eq!(
             english_result.get_string(0),
@@ -381,12 +459,24 @@ mod tests {
         let chinese_query = serialize_query(
             &parse_plainto_tsquery("向", chinese_tokenizer.as_ref(), 1, None).unwrap(),
         );
-        let chinese_input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["chinese"]),
-            Vector::from_strings(&["向量"]),
-            Vector::from_strings(&[chinese_query.as_str()]),
-        ]);
-        let mut chinese_result = Vector::new(LogicalType::Varchar);
+        let chinese_input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["chinese"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["向量"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &[chinese_query.as_str()],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut chinese_result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_with_config_fn(&chinese_input, &state, &mut chinese_result).unwrap();
         assert_eq!(chinese_result.get_string(0), Some("<b>向</b>量"));
     }
@@ -400,11 +490,20 @@ mod tests {
         let graph_query =
             serialize_query(&parse_plainto_tsquery("graph", tokenizer.as_ref(), 1, None).unwrap());
 
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["vector database", "graph storage"]),
-            Vector::from_strings(&[vector_query.as_str(), graph_query.as_str()]),
-        ]);
-        let mut result = Vector::new(LogicalType::Varchar);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector database", "graph storage"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &[vector_query.as_str(), graph_query.as_str()],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         ts_headline_default_fn(&input, &state, &mut result).unwrap();
 
         assert_eq!(result.get_string(0), Some("<b>vector</b> database"));

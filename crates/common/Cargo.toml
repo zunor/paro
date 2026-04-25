@@ -9,6 +9,7 @@ ignored = ["humantime-serde"]
 [features]
 default = []
 debug-allocation = []
+test-support = []
 
 [dependencies]
 thiserror = { workspace = true }

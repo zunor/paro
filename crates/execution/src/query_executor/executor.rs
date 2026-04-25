@@ -11,9 +11,10 @@ use paro_common::allocator::{BufferAllocator, MemoryTag};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
-use paro_context::StatementContext;
+use paro_context::{QueryMemoryBudgetSpec, QueryMemoryTarget, StatementContext};
 
 use crate::execution_context::ExecutionContext;
+use crate::memory_runtime::QueryMemoryPool;
 use crate::operator::result::result_collector::PhysicalResultCollector;
 use crate::operator::PhysicalOperator;
 use crate::operator_type::PhysicalOperatorType;
@@ -263,12 +264,17 @@ impl Executor {
             // For DML operations (INSERT/UPDATE/DELETE), the result is a single BIGINT (row count)
             vec![LogicalType::BigInt]
         };
-        let (collector, buffer) =
-            PhysicalResultCollector::with_shared_result(collector_types, allocator.clone());
+        let query_memory_pool = self.create_query_memory_pool();
+        let (collector, buffer) = PhysicalResultCollector::with_shared_result(
+            collector_types,
+            allocator.clone(),
+            query_memory_pool.clone(),
+        );
         let collector = Arc::new(collector);
 
         // Build pipelines
-        let pipelines = self.build_pipelines(physical_plan, collector)?;
+        let pipelines =
+            self.build_pipelines(physical_plan, collector, query_memory_pool.clone())?;
 
         // Start pipelines (non-blocking)
         let coordinator = self.start_pipelines(pipelines)?;
@@ -283,7 +289,8 @@ impl Executor {
             coordinator,
             self.session.cancellation.clone(),
             allocator,
-        );
+            Some(query_memory_pool),
+        )?;
         debug!(
             target: targets::EXECUTOR,
             is_query,
@@ -293,11 +300,39 @@ impl Executor {
         Ok(handler)
     }
 
+    fn create_query_memory_pool(&self) -> Arc<QueryMemoryPool> {
+        let governance = self.session.query_governance();
+        let Some(coordinator) = self.session.query_memory_coordinator() else {
+            let requested_bytes = governance.memory_quota.unwrap_or(usize::MAX / 4).max(1);
+            return Arc::new(QueryMemoryPool::new(requested_bytes));
+        };
+
+        let requested_bytes = governance
+            .memory_quota
+            .unwrap_or_else(|| coordinator.available_for_queries())
+            .max(1);
+        let pool = Arc::new(QueryMemoryPool::new(requested_bytes));
+        let query_id = coordinator.next_query_id();
+        let spec = QueryMemoryBudgetSpec::new(
+            query_id,
+            governance.query_group.clone(),
+            requested_bytes,
+            governance.memory_quota,
+        );
+        let target: Arc<dyn QueryMemoryTarget> = pool.clone();
+        let registration = coordinator
+            .clone()
+            .register_query(spec, Arc::downgrade(&target));
+        pool.attach_registration(registration);
+        pool
+    }
+
     /// Build pipelines from a physical plan using the meta-pipeline graph.
     fn build_pipelines(
         &self,
         physical_plan: Arc<dyn PhysicalOperator>,
         result_collector: Arc<PhysicalResultCollector>,
+        query_memory_pool: Arc<QueryMemoryPool>,
     ) -> Result<Vec<Arc<MetaPipeline>>> {
         use crate::pipeline::build_state::PipelineBuildState;
 
@@ -321,7 +356,11 @@ impl Executor {
             };
 
         // Create root MetaPipeline with the determined sink
-        let root_meta = MetaPipeline::new(Some(root_sink), MetaPipelineType::Regular);
+        let root_meta = MetaPipeline::new_with_memory_pool(
+            Some(root_sink),
+            MetaPipelineType::Regular,
+            query_memory_pool,
+        );
 
         // Build the pipeline tree
         let mut state = PipelineBuildState::new();

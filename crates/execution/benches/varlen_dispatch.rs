@@ -7,7 +7,6 @@ use divan::Bencher;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
 use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
@@ -61,9 +60,27 @@ fn bench_state() -> &'static BenchState {
 
         BenchState {
             runtime,
-            string_input: Chunk::from_vectors(vec![Vector::from_strings(&string_refs)]),
-            replace_input: Chunk::from_vectors(vec![Vector::from_strings(&string_refs)]),
-            cast_input: Chunk::from_vectors(vec![Vector::from_strings(&cast_refs)]),
+            string_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_string_vector_with_allocator(
+                    &string_refs,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
+            replace_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_string_vector_with_allocator(
+                    &string_refs,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
+            cast_input: Chunk::from_vectors(
+                vec![paro_common::test_utils::test_string_vector_with_allocator(
+                    &cast_refs,
+                    paro_common::test_utils::test_allocator(),
+                )],
+                paro_common::test_utils::test_allocator(),
+            ),
             length_expr: length_expr(),
             lower_expr: lower_expr(),
             replace_expr: replace_expr(),
@@ -156,7 +173,7 @@ fn cast_varchar_to_i64_expr() -> Expression {
 fn length_varchar(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.length_expr);
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     bencher.counter(state.string_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -176,7 +193,7 @@ fn length_varchar(bencher: Bencher) {
 fn lower_varchar(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.lower_expr);
-    let mut result = Vector::with_capacity(LogicalType::Varchar, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Varchar, ROWS);
     bencher.counter(state.string_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -196,7 +213,7 @@ fn lower_varchar(bencher: Bencher) {
 fn replace_varchar(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.replace_expr);
-    let mut result = Vector::with_capacity(LogicalType::Varchar, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::Varchar, ROWS);
     bencher.counter(state.replace_input.size()).bench_local(|| {
         executor
             .execute_into(
@@ -216,7 +233,7 @@ fn replace_varchar(bencher: Bencher) {
 fn cast_varchar_to_i64(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.cast_expr);
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut result = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     bencher.counter(state.cast_input.size()).bench_local(|| {
         executor
             .execute_into(

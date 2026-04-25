@@ -73,9 +73,13 @@ fn next_chunk_with_state(
             || output.types() != output_types
             || output.capacity() < required_capacity
         {
-            *output = Chunk::initialize(output_types, VECTOR_SIZE.max(required_capacity));
+            *output = Chunk::try_initialize(
+                output_types,
+                VECTOR_SIZE.max(required_capacity),
+                output.allocator().clone(),
+            )?;
         } else {
-            output.reset();
+            output.try_reset(output.allocator().clone())?;
         }
 
         let pinned = store.pin_ordinal_range(start, batch_len)?;

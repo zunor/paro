@@ -898,6 +898,7 @@ mod tests {
         tablet_schema::{KeysType, TabletColumn, TabletSchema},
         Tablet,
     };
+    use crate::test_utils::*;
     use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::types::LogicalType;
     use std::sync::Arc;
@@ -918,9 +919,9 @@ mod tests {
     }
 
     fn sample_chunk(num: i32) -> Chunk {
-        let v0 = paro_common::vector::Vector::from_i32(&(0..num).collect::<Vec<i32>>());
-        let v1 = paro_common::vector::Vector::from_i32(&(100..100 + num).collect::<Vec<i32>>());
-        Chunk::from_vectors(vec![v0, v1])
+        let v0 = test_i32_vector(&(0..num).collect::<Vec<i32>>());
+        let v1 = test_i32_vector(&(100..100 + num).collect::<Vec<i32>>());
+        test_chunk_from_vectors(vec![v0, v1])
     }
 
     #[test]
@@ -974,9 +975,10 @@ mod tests {
     fn delta_writer_dedup_in_chunk() {
         let (tablet, _tmp) = create_test_tablet();
         let alloc = std::sync::Arc::new(paro_common::allocator::default_allocator());
-        let ids = paro_common::vector::Vector::from_i32_with_allocator(&[1, 2, 2], alloc.clone());
-        let vals = paro_common::vector::Vector::from_i32_with_allocator(&[10, 20, 30], alloc);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(ids), Arc::new(vals)]);
+        let ids =
+            paro_common::test_utils::test_i32_vector_with_allocator(&[1, 2, 2], alloc.clone());
+        let vals = paro_common::test_utils::test_i32_vector_with_allocator(&[10, 20, 30], alloc);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(ids), Arc::new(vals)]);
 
         let mut writer = DeltaWriter::open(tablet.clone(), 3).unwrap();
         writer.write_chunk(&chunk).unwrap();

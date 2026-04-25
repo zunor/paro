@@ -318,7 +318,7 @@ pub enum TaskExecutionResult {
 ///
 /// Tasks are the unit of work scheduled by TaskScheduler.
 /// Each task can be executed in ProcessAll or ProcessPartial mode.
-pub trait Task: Send + Sync {
+pub trait Task: Send {
     /// Execute the task.
     /// Returns the result of the execution.
     fn execute(&mut self, mode: TaskExecutionMode) -> Result<TaskExecutionResult>;
@@ -328,6 +328,9 @@ pub trait Task: Send + Sync {
 
     /// Inject the interrupt state that should be used when this task blocks.
     fn set_interrupt_state(&mut self, _interrupt_state: InterruptState) {}
+
+    /// Clear any injected interrupt state after a task can no longer block.
+    fn clear_interrupt_state(&mut self) {}
 
     /// Get the producer token for the task.
     fn get_token(&self) -> Option<ProducerToken> {

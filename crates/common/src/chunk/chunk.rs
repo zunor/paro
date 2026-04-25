@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use crate::allocator::{default_allocator, Allocator};
+use crate::allocator::Allocator;
+use crate::error::Result;
+use crate::memory::AllocationId;
 use crate::runtime_value::Value;
 use crate::types::LogicalType;
 use crate::vector::{AllocationSet, Vector, VectorResetState, VECTOR_SIZE};
@@ -62,120 +64,91 @@ impl std::fmt::Debug for Chunk {
 }
 
 impl Chunk {
-    fn build_reset_state(
+    fn try_build_reset_state(
         types: &[LogicalType],
         capacity: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> ChunkResetState {
-        ChunkResetState {
+    ) -> Result<ChunkResetState> {
+        Ok(ChunkResetState {
             allocator: allocator.clone(),
             columns: types
                 .iter()
-                .map(|t| VectorResetState::new(t.clone(), capacity, allocator.clone()))
-                .collect(),
-        }
-    }
-
-    /// Create an empty Chunk with default capacity.
-    ///
-    /// NOTE: This convenience constructor uses `default_allocator()` and is mainly
-    /// intended for tests or standalone utility code. Production paths should pass
-    /// an explicit allocator via `with_allocator`.
-    pub fn new() -> Self {
-        Self::with_allocator(Arc::new(default_allocator()))
+                .map(|t| VectorResetState::try_new(t.clone(), capacity, allocator.clone()))
+                .collect::<Result<Vec<_>>>()?,
+        })
     }
 
     /// Create an empty Chunk with the given allocator.
-    pub fn with_allocator(allocator: Arc<dyn Allocator>) -> Self {
-        Self {
+    pub fn try_new(allocator: Arc<dyn Allocator>) -> Result<Self> {
+        Ok(Self {
             data: Vec::new(),
             count: 0,
             capacity: VECTOR_SIZE,
             initial_capacity: VECTOR_SIZE,
             reset_state: None,
             allocator,
-        }
-    }
-
-    /// Initialize an empty Chunk with the given types (no data allocation).
-    pub fn init_empty(types: &[LogicalType]) -> Self {
-        Self::init_empty_with_allocator(types, Arc::new(default_allocator()))
+        })
     }
 
     /// Initialize an empty Chunk with the given types and allocator (no data allocation).
-    pub fn init_empty_with_allocator(types: &[LogicalType], allocator: Arc<dyn Allocator>) -> Self {
+    pub fn try_init_empty(types: &[LogicalType], allocator: Arc<dyn Allocator>) -> Result<Self> {
         let data = types
             .iter()
-            .map(|t| {
-                Arc::new(Vector::with_capacity_and_allocator(
-                    t.clone(),
-                    0,
-                    allocator.clone(),
-                ))
-            })
-            .collect();
-        Self {
+            .map(|t| Ok(Arc::new(Vector::try_new(t.clone(), 0, allocator.clone())?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             data,
             count: 0,
             capacity: VECTOR_SIZE,
             initial_capacity: 0,
             reset_state: None,
             allocator,
-        }
+        })
     }
 
     /// Initialize a Chunk with the given types, capacity, and allocator.
-    pub fn initialize_with_allocator(
+    pub fn try_initialize(
         types: &[LogicalType],
         capacity: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> Self {
+    ) -> Result<Self> {
         let data = types
             .iter()
             .map(|t| {
-                Arc::new(Vector::with_capacity_and_allocator(
+                Ok(Arc::new(Vector::try_new(
                     t.clone(),
                     capacity,
                     allocator.clone(),
-                ))
+                )?))
             })
-            .collect();
-        let reset_state = Some(Self::build_reset_state(types, capacity, allocator.clone()));
+            .collect::<Result<Vec<_>>>()?;
+        let reset_state = Some(Self::try_build_reset_state(
+            types,
+            capacity,
+            allocator.clone(),
+        )?);
 
-        Self {
+        Ok(Self {
             data,
             count: 0,
             capacity,
             initial_capacity: capacity,
             reset_state,
             allocator,
-        }
-    }
-
-    /// Initialize a Chunk with the given types and capacity.
-    ///
-    /// NOTE: This convenience constructor uses `default_allocator()`. Production
-    /// paths should use `initialize_with_allocator`.
-    pub fn initialize(types: &[LogicalType], capacity: usize) -> Self {
-        Self::initialize_with_allocator(types, capacity, Arc::new(default_allocator()))
+        })
     }
 
     /// Create a Chunk from existing vectors.
-    pub fn from_vectors(vectors: Vec<Vector>) -> Self {
+    pub fn from_vectors(vectors: Vec<Vector>, allocator: Arc<dyn Allocator>) -> Self {
         let arc_vectors = vectors.into_iter().map(Arc::new).collect();
-        Self::from_arc_vectors(arc_vectors)
+        Self::from_arc_vectors(arc_vectors, allocator)
     }
 
     /// Create a Chunk from existing Arc<Vector>s.
     /// All vectors must have the same length.
-    pub fn from_arc_vectors(vectors: Vec<Arc<Vector>>) -> Self {
+    pub fn from_arc_vectors(vectors: Vec<Arc<Vector>>, allocator: Arc<dyn Allocator>) -> Self {
         let count = vectors.first().map(|v| v.len()).unwrap_or(0);
         let capacity = count.max(VECTOR_SIZE);
-        // Fallback to default allocator if no vectors, or take from first vector
-        let allocator = vectors
-            .first()
-            .map(|v| v.allocator().clone())
-            .unwrap_or_else(|| Arc::new(default_allocator()));
 
         debug_assert!(
             vectors.iter().all(|v| v.len() == count),
@@ -310,6 +283,12 @@ impl Chunk {
             .sum()
     }
 
+    pub fn collect_allocation_entries(&self, entries: &mut Vec<(AllocationId, usize)>) {
+        for column in &self.data {
+            column.collect_allocation_entries(entries);
+        }
+    }
+
     pub fn get_allocation_size(&self) -> usize {
         let mut allocations = AllocationSet::new();
         self.collect_allocation_size(&mut allocations)
@@ -375,8 +354,10 @@ impl std::fmt::Display for Chunk {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for Chunk {
     fn default() -> Self {
-        Self::new()
+        Self::try_new(Arc::new(crate::allocator::default_allocator()))
+            .expect("test chunk allocation failed")
     }
 }

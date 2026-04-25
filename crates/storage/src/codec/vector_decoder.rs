@@ -76,8 +76,7 @@ pub(crate) fn build_vector_from_bytes(
         | LogicalType::Json
         | LogicalType::Jsonb => {
             let values = parse_strings(data, rows)?;
-            let mut vector =
-                Vector::with_capacity_and_allocator(logical_type.clone(), rows, allocator);
+            let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
             for (idx, value) in values.iter().enumerate() {
                 vector.set_string(idx, value);
             }
@@ -86,8 +85,7 @@ pub(crate) fn build_vector_from_bytes(
         }
         LogicalType::Blob => {
             let values = parse_blobs(data, rows)?;
-            let mut vector =
-                Vector::with_capacity_and_allocator(logical_type.clone(), rows, allocator);
+            let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
             for (idx, value) in values.iter().enumerate() {
                 vector.set_blob(idx, value);
             }
@@ -101,11 +99,7 @@ pub(crate) fn build_vector_from_bytes(
         LogicalType::Array(inner, dim) if matches!(**inner, LogicalType::Float) => {
             build_float_array_vector(data, rows, *dim, allocator)
         }
-        LogicalType::Null => Ok(Vector::constant_null_with_allocator(
-            LogicalType::Null,
-            rows,
-            allocator,
-        )),
+        LogicalType::Null => Vector::try_constant_null(LogicalType::Null, rows, allocator),
         other => Err(paro_error::not_supported(format!(
             "Logical type {:?} not yet supported in vector decoder",
             other
@@ -148,8 +142,7 @@ fn decode_storage_dictionary_batch(
     let has_null_slot = nulls.is_some();
     let unique_len = dictionary_len + usize::from(has_null_slot);
 
-    let mut child =
-        Vector::with_capacity_and_allocator(logical_type.clone(), unique_len.max(1), allocator);
+    let mut child = Vector::try_new(logical_type.clone(), unique_len.max(1), allocator.clone())?;
     match logical_type {
         LogicalType::Varchar
         | LogicalType::VarcharCollation(_)
@@ -225,15 +218,15 @@ fn decode_storage_dictionary_batch(
         selection.push(code);
     }
 
-    Ok(Vector::with_dictionary(
+    Vector::try_with_dictionary(
         Arc::new(child),
-        SelectionVector::from_indices(selection),
+        SelectionVector::try_from_indices(selection, allocator)?,
         DictionaryInfo {
             unique_len,
             provenance_id,
             source: DictionarySource::Storage,
         },
-    ))
+    )
 }
 
 pub(crate) fn decode_column_batch(
@@ -351,7 +344,7 @@ where
     T: Default + Copy + FromPrimitiveLe,
 {
     let values = parse_primitive::<T>(data, rows)?;
-    let mut vector = Vector::with_capacity_and_allocator(logical_type, rows, allocator);
+    let mut vector = Vector::try_new(logical_type, rows, allocator)?;
     if rows > 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
@@ -363,7 +356,7 @@ where
 
 fn build_bool_vector(data: &Bytes, rows: usize, allocator: Arc<dyn Allocator>) -> Result<Vector> {
     let values = parse_bool(data, rows)?;
-    let mut vector = Vector::with_capacity_and_allocator(LogicalType::Boolean, rows, allocator);
+    let mut vector = Vector::try_new(LogicalType::Boolean, rows, allocator)?;
     if rows > 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<bool>(), rows);
@@ -406,8 +399,8 @@ fn build_float_array_vector(
         .checked_mul(dim)
         .ok_or_else(|| paro_error::data_corrupted("Array element count overflow"))?;
     let values = parse_primitive::<f32>(data, total)?;
-    let child = Arc::new(Vector::from_f32_with_allocator(&values, allocator));
-    let mut vector = Vector::from_array(LogicalType::Float, child, rows, dim);
+    let child = Arc::new(Vector::try_from_f32(&values, allocator)?);
+    let mut vector = Vector::try_from_array(LogicalType::Float, child, rows, dim)?;
     vector.set_count(rows);
     Ok(vector)
 }
@@ -430,21 +423,21 @@ fn build_list_vector(
         flat_values.extend(values);
     }
 
-    let mut child_vec = Vector::with_capacity_and_allocator(
+    let mut child_vec = Vector::try_new(
         child_type.clone(),
         flat_values.len().max(1),
         allocator.clone(),
-    );
+    )?;
     for (idx, value) in flat_values.iter().enumerate() {
         child_vec.set_value(idx, value);
     }
     child_vec.set_count(flat_values.len());
 
-    let mut list_vec = Vector::with_capacity_and_allocator(
+    let mut list_vec = Vector::try_new(
         LogicalType::List(Box::new(child_type.clone())),
         rows,
         allocator,
-    );
+    )?;
     list_vec.set_child(Arc::new(child_vec));
     list_vec.set_count(rows);
 
@@ -483,11 +476,11 @@ fn build_struct_vector(
         }
     }
 
-    let mut struct_vec = Vector::with_capacity_and_allocator(
+    let mut struct_vec = Vector::try_new(
         LogicalType::Struct(fields.to_vec()),
         rows,
         allocator.clone(),
-    );
+    )?;
     struct_vec.set_count(rows);
     let children = struct_vec
         .children_mut()

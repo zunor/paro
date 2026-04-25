@@ -36,16 +36,29 @@ fn bench_state() -> &'static BenchState {
         let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
         let runtime = ExecutionContext::new(session, thread, None);
         let values: Vec<i64> = (0..ROWS as i64).collect();
-        let selection = SelectionVector::from_indices((0..ROWS as u32).rev().collect());
-        let flat = Arc::new(Vector::from_i64(&values));
+        let selection = paro_common::test_utils::test_selection((0..ROWS as u32).rev().collect());
+        let flat = Arc::new(paro_common::test_utils::test_i64_vector_with_allocator(
+            &values,
+            paro_common::test_utils::test_allocator(),
+        ));
 
         BenchState {
             runtime,
             flat: Arc::clone(&flat),
-            constant: Vector::constant(LogicalType::BigInt, 7_i64, ROWS),
-            sequence: Vector::sequence(11, 3, ROWS),
+            constant: paro_common::test_utils::test_constant_with_allocator(
+                LogicalType::BigInt,
+                7_i64,
+                ROWS,
+                paro_common::test_utils::test_allocator(),
+            ),
+            sequence: paro_common::test_utils::test_sequence_with_allocator(
+                11,
+                3,
+                ROWS,
+                paro_common::test_utils::test_allocator(),
+            ),
             selection,
-            input: Chunk::from_arc_vectors(vec![flat]),
+            input: paro_common::test_utils::test_chunk_from_arc_vectors(vec![flat]),
             reference_expr: Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
         }
     })
@@ -82,7 +95,8 @@ fn sequence_to_view(bencher: Bencher) {
 fn dictionary_overlay_shared_selection(bencher: Bencher) {
     let state = bench_state();
     bencher.counter(ROWS).bench_local(|| {
-        let dict = Vector::dictionary(Arc::clone(&state.flat), &state.selection);
+        let dict =
+            paro_common::test_utils::test_dictionary(Arc::clone(&state.flat), &state.selection);
         divan::black_box(dict.sel_vector().and_then(|sel| sel.allocation_identity()));
     });
 }
@@ -91,7 +105,13 @@ fn dictionary_overlay_shared_selection(bencher: Bencher) {
 fn dictionary_overlay_deep_copy_selection(bencher: Bencher) {
     let state = bench_state();
     bencher.counter(ROWS).bench_local(|| {
-        let dict = Vector::dictionary(Arc::clone(&state.flat), state.selection.deep_copy());
+        let dict = paro_common::test_utils::test_dictionary(
+            Arc::clone(&state.flat),
+            state
+                .selection
+                .try_deep_copy()
+                .expect("selection copy allocation failed"),
+        );
         divan::black_box(dict.sel_vector().and_then(|sel| sel.allocation_identity()));
     });
 }

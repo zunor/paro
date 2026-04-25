@@ -182,15 +182,19 @@ fn array_to_string_impl_internal(
         None
     };
     let array_view = matches!(array_vec.logical_type(), LogicalType::Array(_, _))
-        .then(|| array_vec.to_array_view(count));
-    let list_entries =
-        matches!(array_vec.logical_type(), LogicalType::List(_)).then(|| array_vec.to_view(count));
+        .then(|| array_vec.try_to_array_view(count))
+        .transpose()?;
+    let list_entries = matches!(array_vec.logical_type(), LogicalType::List(_))
+        .then(|| array_vec.try_to_view(count))
+        .transpose()?;
     let list_child = if matches!(array_vec.logical_type(), LogicalType::List(_)) {
         Some(list_child_vector(array_vec)?)
     } else {
         None
     };
-    let list_child_view = list_child.map(|child| child.to_view(child.len()));
+    let list_child_view = list_child
+        .map(|child| child.try_to_view(child.len()))
+        .transpose()?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for i in 0..count {
@@ -332,7 +336,11 @@ mod tests {
 
     fn int_array(values: &[Option<Vec<i32>>], width: usize) -> Vector {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), width);
-        let mut vec = Vector::new_array(array_type, values.len());
+        let mut vec = paro_common::test_utils::test_new_array_with_allocator(
+            array_type,
+            values.len(),
+            paro_common::test_utils::test_allocator(),
+        );
         vec.set_count(values.len());
         for (idx, row) in values.iter().enumerate() {
             match row {
@@ -353,10 +361,16 @@ mod tests {
     #[test]
     fn test_array_to_string_basic() {
         let array_vec = int_array(&[Some(vec![1, 2, 3])], 3);
-        let delimiter_vec = Vector::from_strings(&[","]);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[","],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some("1,2,3"));
@@ -364,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_array_to_string_skips_null_without_null_string() {
-        let array_vec = Vector::constant_from_value(
+        let array_vec = paro_common::test_utils::test_constant_from_value(
             LogicalType::Array(Box::new(LogicalType::Integer), 3),
             Value::Array(
                 vec![
@@ -377,10 +391,16 @@ mod tests {
             ),
             1,
         );
-        let delimiter_vec = Vector::from_strings(&[","]);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[","],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some("1,3"));
@@ -388,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_array_to_string_with_null_string() {
-        let array_vec = Vector::constant_from_value(
+        let array_vec = paro_common::test_utils::test_constant_from_value(
             LogicalType::Array(Box::new(LogicalType::Integer), 3),
             Value::Array(
                 vec![
@@ -401,11 +421,20 @@ mod tests {
             ),
             1,
         );
-        let delimiter_vec = Vector::from_strings(&[","]);
-        let null_string_vec = Vector::from_strings(&["*"]);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec, null_string_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[","],
+            paro_common::test_utils::test_allocator(),
+        );
+        let null_string_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["*"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec, null_string_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_with_null_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some("1,*,3"));
@@ -414,7 +443,7 @@ mod tests {
     #[test]
     fn test_array_to_string_string_elements_not_quoted() {
         let array_type = LogicalType::Array(Box::new(LogicalType::Varchar), 3);
-        let array_vec = Vector::constant_from_value(
+        let array_vec = paro_common::test_utils::test_constant_from_value(
             array_type,
             Value::Array(
                 vec![
@@ -427,10 +456,16 @@ mod tests {
             ),
             1,
         );
-        let delimiter_vec = Vector::from_strings(&["|"]);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["|"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some("alpha|beta|gamma"));
@@ -438,10 +473,17 @@ mod tests {
 
     #[test]
     fn test_array_to_string_list_input() {
-        let mut list_vec =
-            Vector::with_capacity(LogicalType::List(Box::new(LogicalType::Integer)), 2);
+        let mut list_vec = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::List(Box::new(LogicalType::Integer)),
+            2,
+        );
         list_vec.set_count(2);
-        list_vec.set_child(Arc::new(Vector::from_i32(&[1, 2, 3, 4, 5])));
+        list_vec.set_child(Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                &[1, 2, 3, 4, 5],
+                paro_common::test_utils::test_allocator(),
+            ),
+        ));
         unsafe {
             let entries = list_vec.flat_data_mut::<u32>();
             *entries.add(0) = 0;
@@ -450,10 +492,16 @@ mod tests {
             *entries.add(3) = 3;
         }
 
-        let delimiter_vec = Vector::from_strings(&["|", "|"]);
-        let chunk = Chunk::from_vectors(vec![list_vec, delimiter_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["|", "|"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![list_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some("1|2"));
@@ -464,10 +512,16 @@ mod tests {
     fn test_array_to_string_null_propagation() {
         let mut array_vec = int_array(&[Some(vec![1, 2, 3])], 3);
         array_vec.set_null(0, true);
-        let delimiter_vec = Vector::from_strings(&[","]);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[","],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert!(result.is_null(0));
@@ -476,11 +530,17 @@ mod tests {
     #[test]
     fn test_array_to_string_null_delimiter_produces_null() {
         let array_vec = int_array(&[Some(vec![1, 2, 3])], 3);
-        let mut delimiter_vec = Vector::from_strings(&[","]);
+        let mut delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[","],
+            paro_common::test_utils::test_allocator(),
+        );
         delimiter_vec.set_null(0, true);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec]);
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert!(result.is_null(0));
@@ -489,15 +549,21 @@ mod tests {
     #[test]
     fn test_array_to_string_empty_array() {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 0);
-        let array_vec = Vector::constant_from_value(
+        let array_vec = paro_common::test_utils::test_constant_from_value(
             array_type,
             Value::Array(vec![], LogicalType::Integer, 0),
             1,
         );
-        let delimiter_vec = Vector::from_strings(&[","]);
-        let chunk = Chunk::from_vectors(vec![array_vec, delimiter_vec]);
+        let delimiter_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &[","],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, delimiter_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         array_to_string_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_string(0), Some(""));

@@ -237,7 +237,6 @@ pub(crate) fn reconcile_effective_settings(session: &mut Session) -> Result<()> 
     }
 
     session.effective_settings = next_effective_settings.into_iter().collect();
-    session.refresh_temporary_memory_configuration();
     Ok(())
 }
 
@@ -772,12 +771,9 @@ async fn emit_string_result<S: ResultSink>(
                 .iter()
                 .map(|row| row[col_idx].as_str())
                 .collect::<Vec<_>>();
-            vectors.push(Vector::from_strings_with_allocator(
-                &values,
-                allocator.clone(),
-            ));
+            vectors.push(Vector::try_from_strings(&values, allocator.clone())?);
         }
-        let chunk = Chunk::from_vectors(vectors);
+        let chunk = Chunk::from_vectors(vectors, allocator);
         sink.push_chunk(&chunk).await?;
     }
 

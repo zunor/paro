@@ -21,7 +21,7 @@ mod page_cache;
 mod prefetch;
 mod standard_buffer_manager;
 mod temporary_file_manager;
-mod temporary_memory_manager;
+mod write_buffer_reserve;
 
 pub use block_handle::{BlockHandle, BlockId, SharedBlockHandle};
 pub use buffer_handle::BufferHandle;
@@ -33,14 +33,14 @@ pub use page_cache::{
     PageCache, PageCacheHandle, PageCacheStatsSnapshot, PageContentKind, PageKey,
 };
 pub use paro_common::allocator::MemoryTag;
-pub use prefetch::{PrefetchItem, PrefetchOptions, Prefetcher};
+pub use prefetch::{PrefetchBudget, PrefetchItem, PrefetchOptions, Prefetcher};
 pub use standard_buffer_manager::StandardBufferManager;
 pub use temporary_file_manager::{
     TemporaryBufferSize, TemporaryFileIdentifier, TemporaryFileIndex, TemporaryFileInfo,
     TemporaryFileManager, TemporarySpillMetricsSnapshot,
 };
-pub use temporary_memory_manager::{
-    TemporaryMemoryConfig, TemporaryMemoryManager, TemporaryMemoryState,
+pub use write_buffer_reserve::{
+    FixedWriteBufferReserve, WriteBufferReservation, WriteBufferReserve,
 };
 
 /// Default block allocation size (256 KB).

@@ -15,7 +15,7 @@ use serde_json::to_string_pretty;
 
 use crate::explain::annotated_operator::ExplainAnnotatedOperator;
 use crate::explain::types::{
-    ExplainActualStats, ExplainDoc, ExplainLogicalInfo, ExplainNode, ExplainProperty,
+    format_bytes, ExplainActualStats, ExplainDoc, ExplainLogicalInfo, ExplainNode, ExplainProperty,
     ExplainRuntimeStats, ExplainSchema, ExplainValue,
 };
 use crate::operator::aggregate::hash_aggregate::HashAggregate;
@@ -206,9 +206,7 @@ fn actual_stats(
         || actual.loops > 0
         || actual.startup_time_ms.is_some()
         || actual.total_time_ms.is_some()
-        || actual.runtime.spilled.is_some()
-        || actual.runtime.peak_memory_bytes.is_some()
-        || actual.runtime.temp_storage_bytes.is_some()
+        || actual.runtime.has_any()
     {
         Some(actual)
     } else {
@@ -840,6 +838,112 @@ fn append_runtime_memory_properties(
         properties.push(ExplainProperty::new(
             "Temp Storage",
             ExplainValue::Bytes(temp_storage_bytes),
+        ));
+    }
+    if let Some(data_plane_bytes) = runtime.data_plane_bytes {
+        properties.push(ExplainProperty::new(
+            "Data Plane",
+            ExplainValue::Bytes(data_plane_bytes),
+        ));
+    }
+    if !runtime.memory_tag_bytes.is_empty() {
+        properties.push(ExplainProperty::new(
+            "Memory Tags",
+            ExplainValue::List(
+                runtime
+                    .memory_tag_bytes
+                    .iter()
+                    .map(|entry| {
+                        ExplainValue::String(format!("{}={}", entry.tag, format_bytes(entry.bytes)))
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    if !runtime.domain_memory_tag_bytes.is_empty() {
+        properties.push(ExplainProperty::new(
+            "Domain Memory Tags",
+            ExplainValue::List(
+                runtime
+                    .domain_memory_tag_bytes
+                    .iter()
+                    .map(|entry| {
+                        ExplainValue::String(format!(
+                            "{}:{}={}",
+                            entry.domain,
+                            entry.tag,
+                            format_bytes(entry.bytes)
+                        ))
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(bytes) = runtime.leaked_grant_bytes {
+        properties.push(ExplainProperty::new(
+            "Leaked Grant",
+            ExplainValue::Bytes(bytes),
+        ));
+    }
+    if runtime.local_refill_count.is_some() || runtime.local_refill_bytes.is_some() {
+        properties.push(ExplainProperty::new(
+            "Grant Refills",
+            ExplainValue::String(format!(
+                "count={} bytes={}",
+                runtime.local_refill_count.unwrap_or(0),
+                format_bytes(runtime.local_refill_bytes.unwrap_or(0))
+            )),
+        ));
+    }
+    if runtime.reclaim_attempt_count.is_some()
+        || runtime.reclaimed_bytes.is_some()
+        || runtime.spilled_bytes.is_some()
+    {
+        properties.push(ExplainProperty::new(
+            "Reclaim",
+            ExplainValue::String(format!(
+                "attempts={} reclaimed={} spilled={}",
+                runtime.reclaim_attempt_count.unwrap_or(0),
+                format_bytes(runtime.reclaimed_bytes.unwrap_or(0)),
+                format_bytes(runtime.spilled_bytes.unwrap_or(0))
+            )),
+        ));
+    }
+    if runtime.reclaim_latency_us.is_some() || runtime.spill_latency_us.is_some() {
+        properties.push(ExplainProperty::new(
+            "Reclaim Latency",
+            ExplainValue::String(format!(
+                "reclaim={}us spill={}us",
+                runtime.reclaim_latency_us.unwrap_or(0),
+                runtime.spill_latency_us.unwrap_or(0)
+            )),
+        ));
+    }
+    if let Some(count) = runtime.allocator_lock_count {
+        properties.push(ExplainProperty::new(
+            "Allocator Locks",
+            ExplainValue::Unsigned(count),
+        ));
+    }
+    if let Some(count) = runtime.selection_materialization_count {
+        properties.push(ExplainProperty::new(
+            "Selection Materializations",
+            ExplainValue::Unsigned(count),
+        ));
+    }
+    if let Some(bytes) = runtime.peak_rss_bytes {
+        properties.push(ExplainProperty::new("Peak RSS", ExplainValue::Bytes(bytes)));
+    }
+    if let Some(bytes) = runtime.output_buffer_bytes {
+        properties.push(ExplainProperty::new(
+            "Output Buffer",
+            ExplainValue::Bytes(bytes),
+        ));
+    }
+    if let Some(bytes) = runtime.session_retained_bytes {
+        properties.push(ExplainProperty::new(
+            "Session Retained",
+            ExplainValue::Bytes(bytes),
         ));
     }
 }

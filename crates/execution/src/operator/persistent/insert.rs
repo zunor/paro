@@ -156,11 +156,11 @@ impl PhysicalInsert {
         }
 
         let table_types = storage.types();
-        let mut merged = Chunk::initialize_with_allocator(
+        let mut merged = Chunk::try_initialize(
             table_types,
             lstate.buffered_rows,
             ctx.allocator(MemoryTag::MemTable),
-        );
+        )?;
         merged.set_cardinality(lstate.buffered_rows);
 
         let mut dst_row = 0;
@@ -421,8 +421,7 @@ impl PhysicalOperator for PhysicalInsert {
         // 2. Prepare chunk for append
         let table_types = storage.types();
         let allocator = ctx.allocator(MemoryTag::Allocator);
-        let mut append_chunk =
-            Chunk::initialize_with_allocator(table_types, chunk.size(), allocator.clone());
+        let mut append_chunk = Chunk::try_initialize(table_types, chunk.size(), allocator.clone())?;
 
         // 3. Map input columns to table columns
         for (input_idx, table_idx) in self.column_index_map.iter().enumerate() {
@@ -433,8 +432,7 @@ impl PhysicalOperator for PhysicalInsert {
 
         // Materialize into MemTable allocator so write-buffer memory is tracked
         // under the dedicated MemTable memory tag.
-        let append_chunk =
-            append_chunk.deep_copy_with_allocator(ctx.allocator(MemoryTag::MemTable));
+        let append_chunk = append_chunk.try_deep_copy(ctx.allocator(MemoryTag::MemTable))?;
 
         let txn = ctx.active_transaction();
         let mut affected_rows = chunk.size();

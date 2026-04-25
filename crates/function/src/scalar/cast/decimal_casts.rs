@@ -319,7 +319,7 @@ pub fn varchar_to_decimal_cast(
 ) -> Result<bool> {
     let (precision, scale) = decimal_params(result.logical_type())?;
     let mut all_success = true;
-    let view = input.to_varlen_view(count);
+    let view = input.try_to_varlen_view(count)?;
     result.set_count(count);
 
     for row in 0..count {

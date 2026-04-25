@@ -81,12 +81,16 @@ fn copy_array_parent_validity(array: &ArrayView<'_>, result: &mut Vector, count:
 }
 
 fn materialize_array_elements(source: &Vector, count: usize) -> Result<(ArrayView<'_>, Vector)> {
-    let array = source.to_array_view(count);
+    let array = source.try_to_array_view(count)?;
     let child = ArrayVector::get_entry(source);
     let child_count = count
         .checked_mul(array.array_size())
         .ok_or_else(|| paro_error::internal("ARRAY child count overflow"))?;
-    let mut materialized = Vector::with_capacity(child.logical_type().clone(), child_count.max(1));
+    let mut materialized = Vector::try_new(
+        child.logical_type().clone(),
+        child_count.max(1),
+        source.allocator().clone(),
+    )?;
     materialized.set_count(child_count);
 
     for row in 0..count {
@@ -230,8 +234,12 @@ pub fn varchar_to_array_cast(
     let child_count = count
         .checked_mul(target_size)
         .ok_or_else(|| paro_error::internal("ARRAY child count overflow"))?;
-    let source_view = source.to_varlen_view(count);
-    let mut parsed_child = Vector::with_capacity(LogicalType::Float, child_count.max(1));
+    let source_view = source.try_to_varlen_view(count)?;
+    let mut parsed_child = Vector::try_new(
+        LogicalType::Float,
+        child_count.max(1),
+        result.allocator().clone(),
+    )?;
     parsed_child.set_count(child_count);
     result.set_count(count);
     let mut all_success = true;
@@ -341,7 +349,7 @@ pub fn array_to_varchar_cast(
     count: usize,
     _ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
-    let array = source.to_array_view(count);
+    let array = source.try_to_array_view(count)?;
     let child = ArrayVector::get_entry(source);
     let mut writer = VarcharResultWriter::new(result, count);
 
@@ -493,8 +501,7 @@ pub fn array_to_list_cast(
         .ok_or_else(|| paro_error::internal("ARRAY child count overflow"))?;
     let (array, materialized_child) = materialize_array_elements(source, count)?;
     let allocator = result.allocator().clone();
-    let mut result_child =
-        Vector::with_capacity_and_allocator(target_child, child_count.max(1), allocator);
+    let mut result_child = Vector::try_new(target_child, child_count.max(1), allocator)?;
     result_child.set_count(child_count);
 
     let child_ctx = CastExecCtx {
@@ -685,9 +692,16 @@ mod tests {
 
     #[test]
     fn test_varchar_to_array_cast() {
-        let source = Vector::from_strings(&["[1, 2, 3]", "[4, 5, 6]"]);
+        let source = paro_common::test_utils::test_string_vector_with_allocator(
+            &["[1, 2, 3]", "[4, 5, 6]"],
+            paro_common::test_utils::test_allocator(),
+        );
         let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
-        let mut result = Vector::new_array(array_type, 2);
+        let mut result = paro_common::test_utils::test_new_array_with_allocator(
+            array_type,
+            2,
+            paro_common::test_utils::test_allocator(),
+        );
         result.set_count(2);
 
         let ctx = test_ctx(false);
@@ -713,9 +727,16 @@ mod tests {
 
     #[test]
     fn test_varchar_to_array_cast_size_mismatch() {
-        let source = Vector::from_strings(&["[1, 2]"]); // 2 elements
+        let source = paro_common::test_utils::test_string_vector_with_allocator(
+            &["[1, 2]"],
+            paro_common::test_utils::test_allocator(),
+        ); // 2 elements
         let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3); // expects 3
-        let mut result = Vector::new_array(array_type, 1);
+        let mut result = paro_common::test_utils::test_new_array_with_allocator(
+            array_type,
+            1,
+            paro_common::test_utils::test_allocator(),
+        );
         result.set_count(1);
 
         // Non-try_cast should fail
@@ -725,7 +746,11 @@ mod tests {
 
         // try_cast should succeed with NULL
         let ctx = test_ctx(true);
-        let mut result = Vector::new_array(LogicalType::Array(Box::new(LogicalType::Float), 3), 1);
+        let mut result = paro_common::test_utils::test_new_array_with_allocator(
+            LogicalType::Array(Box::new(LogicalType::Float), 3),
+            1,
+            paro_common::test_utils::test_allocator(),
+        );
         result.set_count(1);
         let success = varchar_to_array_cast(&source, &mut result, 1, &ctx).unwrap();
         assert!(!success);
@@ -735,7 +760,11 @@ mod tests {
     #[test]
     fn test_array_to_varchar_cast() {
         let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
-        let mut source = Vector::new_array(array_type, 2);
+        let mut source = paro_common::test_utils::test_new_array_with_allocator(
+            array_type,
+            2,
+            paro_common::test_utils::test_allocator(),
+        );
         source.set_count(2);
 
         // Set array values
@@ -752,7 +781,7 @@ mod tests {
         source.set_value(0, &val1);
         source.set_value(1, &val2);
 
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
         result.set_count(2);
         let ctx = test_ctx(false);
         let success = array_to_varchar_cast(&source, &mut result, 2, &ctx).unwrap();
@@ -764,13 +793,15 @@ mod tests {
 
     #[test]
     fn test_varchar_to_array_cast_with_capacity() {
-        // This test uses Vector::with_capacity instead of Vector::new_array
-        // to match what execute_cast does
-        let source = Vector::from_strings(&["[1, 2, 3]", "[4, 5, 6]"]);
+        // Match the generic allocation path used by execute_cast.
+        let source = paro_common::test_utils::test_string_vector_with_allocator(
+            &["[1, 2, 3]", "[4, 5, 6]"],
+            paro_common::test_utils::test_allocator(),
+        );
         let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
 
-        // Use with_capacity like execute_cast does
-        let mut result = Vector::with_capacity(array_type.clone(), 2);
+        // Use the generic vector allocation path like execute_cast does.
+        let mut result = paro_common::test_utils::test_vector_with_capacity(array_type.clone(), 2);
         result.set_len(2);
 
         // Verify child vector exists

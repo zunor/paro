@@ -830,10 +830,19 @@ mod tests {
         let layout = TupleLayout::build(&[LogicalType::Integer, LogicalType::Varchar], &objects)
             .expect("layout");
 
-        let groups = Chunk::from_vectors(vec![
-            Vector::from_i32(&[42]),
-            Vector::from_strings(&["paro"]),
-        ]);
+        let groups = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[42],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["paro"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let mut row = vec![0u8; layout.row_width];
         let mut varlen_heap = VarlenHeap::new();
@@ -870,8 +879,19 @@ mod tests {
 
         let text = "paro-varlen-key";
         assert!(text.len() > VarlenRef::inline_capacity());
-        let groups =
-            Chunk::from_vectors(vec![Vector::from_i32(&[42]), Vector::from_strings(&[text])]);
+        let groups = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[42],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &[text],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let mut row = vec![0u8; layout.row_width];
         let mut varlen_heap = VarlenHeap::new();
@@ -900,9 +920,21 @@ mod tests {
         let layout = TupleLayout::build(&[LogicalType::Integer, LogicalType::Varchar], &objects)
             .expect("layout");
 
-        let mut strings = Vector::from_strings(&["x", "y"]);
+        let mut strings = paro_common::test_utils::test_string_vector_with_allocator(
+            &["x", "y"],
+            paro_common::test_utils::test_allocator(),
+        );
         strings.set_null(0, true);
-        let groups = Chunk::from_vectors(vec![Vector::from_i32(&[1, 2]), strings]);
+        let groups = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[1, 2],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                strings,
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
 
         let mut row = vec![0u8; layout.row_width];
         let mut varlen_heap = VarlenHeap::new();

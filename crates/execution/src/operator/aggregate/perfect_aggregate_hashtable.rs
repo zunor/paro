@@ -6,12 +6,12 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
-use paro_common::allocator::{default_allocator, ArenaAllocator};
+use paro_common::allocator::{Allocator, ArenaAllocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DecodedVector, SelectionVector, Vector};
+use paro_common::vector::{DecodedVectorOwned, SelectionVector, Vector};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 
 use super::aggregate_kernel::{
@@ -55,6 +55,7 @@ impl PerfectAggregateHashTable {
         aggregate_inputs: Vec<Vec<usize>>,
         group_minima: Vec<i128>,
         required_bits: Vec<usize>,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         if group_types.is_empty() {
             return Err(paro_error::internal(
@@ -136,7 +137,7 @@ impl PerfectAggregateHashTable {
             occupancy,
             data,
             row_width,
-            aggregate_allocator: ArenaAllocator::new(Arc::new(default_allocator())),
+            aggregate_allocator: ArenaAllocator::new(allocator),
             count: 0,
         })
     }
@@ -147,6 +148,10 @@ impl PerfectAggregateHashTable {
 
     pub fn total_groups(&self) -> usize {
         self.total_groups
+    }
+
+    pub fn allocator(&self) -> Arc<dyn Allocator> {
+        self.aggregate_allocator.get_allocator().clone()
     }
 
     /// Probe and insert grouped keys, returning state addresses for each input row.
@@ -161,7 +166,8 @@ impl PerfectAggregateHashTable {
 
         if groups.size() == 0 {
             addresses.set_count(0);
-            *new_groups = SelectionVector::from_indices(Vec::new());
+            *new_groups =
+                SelectionVector::try_from_indices(Vec::new(), groups.allocator().clone())?;
             return Ok(0);
         }
 
@@ -174,7 +180,7 @@ impl PerfectAggregateHashTable {
                             "Missing group key column for perfect hash table: group_idx={group_idx}"
                         ))
                     })
-                    .map(|column| column.decode(groups.size()))
+                    .and_then(|column| column.try_decode(groups.size()))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -196,7 +202,8 @@ impl PerfectAggregateHashTable {
             }
         }
 
-        *new_groups = SelectionVector::from_indices(new_group_rows);
+        *new_groups =
+            SelectionVector::try_from_indices(new_group_rows, groups.allocator().clone())?;
         Ok(new_groups.len())
     }
 
@@ -343,7 +350,8 @@ impl PerfectAggregateHashTable {
         }
 
         if aggregate_count > 0 {
-            let mut state_addresses = Vector::with_capacity(LogicalType::BigInt, slots.len());
+            let mut state_addresses =
+                Vector::try_new(LogicalType::BigInt, slots.len(), result.allocator().clone())?;
             state_addresses.set_count(slots.len());
             unsafe {
                 let address_data = state_addresses.flat_data_mut::<*mut u8>();
@@ -352,7 +360,11 @@ impl PerfectAggregateHashTable {
                 }
             }
 
-            let mut aggregate_chunk = Chunk::initialize(&self.aggregate_return_types, slots.len());
+            let mut aggregate_chunk = Chunk::try_initialize(
+                &self.aggregate_return_types,
+                slots.len(),
+                result.allocator().clone(),
+            )?;
             let mut input_data = AggregateInputData::new(
                 None,
                 &mut self.aggregate_allocator,
@@ -404,7 +416,8 @@ impl PerfectAggregateHashTable {
         }
 
         if !ptrs.is_empty() {
-            let addresses = pointer_vector_from_slice(&ptrs);
+            let addresses =
+                pointer_vector_from_slice(&ptrs, self.aggregate_allocator.get_allocator().clone())?;
             let mut input_data = AggregateInputData::new(
                 None,
                 &mut self.aggregate_allocator,
@@ -425,9 +438,11 @@ impl PerfectAggregateHashTable {
     }
 
     pub fn memory_usage(&self) -> usize {
-        self.data.capacity() * size_of::<u64>()
-            + self.occupancy.capacity() * size_of::<u8>()
-            + self.aggregate_allocator.allocation_size()
+        self.external_accounted_memory_usage() + self.aggregate_allocator.allocation_size()
+    }
+
+    pub fn external_accounted_memory_usage(&self) -> usize {
+        self.data.capacity() * size_of::<u64>() + self.occupancy.capacity() * size_of::<u8>()
     }
 
     fn combine_pointer_batch(
@@ -439,8 +454,14 @@ impl PerfectAggregateHashTable {
         if source_ptrs.is_empty() {
             return Ok(());
         }
-        let source = pointer_vector_from_slice(source_ptrs);
-        let target = pointer_vector_from_slice(target_ptrs);
+        let source = pointer_vector_from_slice(
+            source_ptrs,
+            self.aggregate_allocator.get_allocator().clone(),
+        )?;
+        let target = pointer_vector_from_slice(
+            target_ptrs,
+            self.aggregate_allocator.get_allocator().clone(),
+        )?;
         let mut input_data = AggregateInputData::new(
             None,
             &mut self.aggregate_allocator,
@@ -457,7 +478,7 @@ impl PerfectAggregateHashTable {
 
     fn compute_slot_from_decoded(
         &self,
-        decoded_groups: &[DecodedVector],
+        decoded_groups: &[DecodedVectorOwned],
         row_idx: usize,
     ) -> Result<usize> {
         let mut slot = 0usize;
@@ -477,7 +498,7 @@ impl PerfectAggregateHashTable {
 
     fn encoded_group_value(
         &self,
-        decoded_group: &DecodedVector,
+        decoded_group: &DecodedVectorOwned,
         row_idx: usize,
         group_idx: usize,
     ) -> Result<usize> {
@@ -658,7 +679,7 @@ fn validate_aggregate_inputs(
 }
 
 fn read_group_value_as_i128(
-    group: &DecodedVector,
+    group: &DecodedVectorOwned,
     ty: &LogicalType,
     physical_idx: usize,
 ) -> Result<i128> {
@@ -746,8 +767,11 @@ fn validate_filter(filter: &SelectionVector, payload_rows: usize) -> Result<()> 
     Ok(())
 }
 
-fn pointer_vector_from_slice(ptrs: &[*mut u8]) -> Vector {
-    let mut result = Vector::with_capacity(LogicalType::BigInt, ptrs.len());
+fn pointer_vector_from_slice(
+    ptrs: &[*mut u8],
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
+) -> Result<Vector> {
+    let mut result = Vector::try_new(LogicalType::BigInt, ptrs.len(), allocator)?;
     result.set_count(ptrs.len());
     unsafe {
         let result_data = result.flat_data_mut::<*mut u8>();
@@ -755,7 +779,7 @@ fn pointer_vector_from_slice(ptrs: &[*mut u8]) -> Vector {
             *result_data.add(idx) = *ptr;
         }
     }
-    result
+    Ok(result)
 }
 
 fn bytes_to_words(bytes: usize) -> Result<usize> {

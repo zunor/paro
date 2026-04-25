@@ -132,6 +132,7 @@ fn paro_graph_statistics_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoGraphStatisticsGlobalState>());
@@ -175,17 +176,17 @@ fn paro_graph_statistics_function(
     if count > 0 {
         let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
         if let Some(col) = output.column_mut(0) {
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         let refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
         if let Some(col) = output.column_mut(1) {
-            *col = Vector::from_strings(&refs);
+            *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(2) {
-            *col = Vector::from_i64(&counts);
+            *col = Vector::try_from_i64(&counts, output_allocator.clone())?;
         }
         if let Some(col) = output.column_mut(3) {
-            let mut vec = Vector::from_f64(&avg_degrees);
+            let mut vec = Vector::try_from_f64(&avg_degrees, output_allocator.clone())?;
             for (i, is_null) in avg_degree_nulls.iter().enumerate() {
                 if *is_null {
                     vec.set_null(i, true);
@@ -194,7 +195,7 @@ fn paro_graph_statistics_function(
             *col = vec;
         }
         if let Some(col) = output.column_mut(4) {
-            *col = Vector::from_i64(&index_sizes);
+            *col = Vector::try_from_i64(&index_sizes, output_allocator.clone())?;
         }
         output.set_cardinality(count);
     }

@@ -3,7 +3,7 @@
 
 //! Prefetcher - async/batched page prefetch into PageCache.
 //!
-//! Prefetch is a best-effort optimization. It uses TemporaryMemoryState
+//! Prefetch is a best-effort optimization. It uses a prefetch budget lease
 //! to size its in-flight queue and schedules I/O via TaskScheduler.
 
 use std::collections::HashMap;
@@ -22,9 +22,7 @@ use paro_scheduler::task::TaskExecutionMode;
 use paro_scheduler::task::TaskExecutionResult;
 use tracing::trace;
 
-use crate::buffer::{
-    PageCache, PageContentKind, PageKey, TemporaryMemoryState, DEFAULT_BLOCK_ALLOC_SIZE,
-};
+use crate::buffer::{PageCache, PageContentKind, PageKey, DEFAULT_BLOCK_ALLOC_SIZE};
 use crate::metrics::storage_metrics;
 
 const SLOW_PREFETCH_ITEM_THRESHOLD: Duration = Duration::from_millis(8);
@@ -52,6 +50,17 @@ impl Default for PrefetchOptions {
             max_concurrent_tasks: 0,
         }
     }
+}
+
+/// Budget contract used by storage prefetch without depending on execution.
+pub trait PrefetchBudget: Send + Sync + std::fmt::Debug {
+    fn target_bytes(&self) -> usize;
+
+    fn update_target_bytes(&self, bytes: usize);
+
+    fn try_acquire(&self, bytes: usize) -> bool;
+
+    fn release(&self, bytes: usize);
 }
 
 /// A page prefetch item (PageKey + raw page location).
@@ -118,14 +127,16 @@ impl PrefetchRegistry {
     }
 }
 
-struct PrefetchTaskGuard {
+struct PrefetchTaskReservation {
+    lease: Arc<dyn PrefetchBudget>,
     inflight_bytes: Arc<AtomicUsize>,
     inflight_tasks: Arc<AtomicUsize>,
     bytes: usize,
 }
 
-impl Drop for PrefetchTaskGuard {
+impl Drop for PrefetchTaskReservation {
     fn drop(&mut self) {
+        self.lease.release(self.bytes);
         self.inflight_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
         self.inflight_tasks.fetch_sub(1, Ordering::Relaxed);
     }
@@ -136,9 +147,7 @@ struct PrefetchTask {
     registry: Arc<PrefetchRegistry>,
     items: Vec<PrefetchItem>,
     file_path: PathBuf,
-    inflight_bytes: Arc<AtomicUsize>,
-    inflight_tasks: Arc<AtomicUsize>,
-    batch_bytes: usize,
+    reservation: Option<PrefetchTaskReservation>,
 }
 
 impl PrefetchTask {
@@ -159,11 +168,12 @@ impl PrefetchTask {
 
 impl Task for PrefetchTask {
     fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
-        let _guard = PrefetchTaskGuard {
-            inflight_bytes: self.inflight_bytes.clone(),
-            inflight_tasks: self.inflight_tasks.clone(),
-            bytes: self.batch_bytes,
-        };
+        let batch_bytes = self
+            .reservation
+            .as_ref()
+            .map(|reservation| reservation.bytes)
+            .unwrap_or(0);
+        let _reservation = self.reservation.take();
         let batch_start = Instant::now();
 
         let mut file = match File::open(&self.file_path) {
@@ -210,7 +220,7 @@ impl Task for PrefetchTask {
                 file = %self.file_path.display(),
                 pages = self.items.len(),
                 ready = ready_count,
-                batch_bytes = self.batch_bytes,
+                batch_bytes,
                 elapsed_ms = batch_elapsed.as_secs_f64() * 1000.0,
                 "slow prefetch batch",
             );
@@ -229,7 +239,7 @@ impl Task for PrefetchTask {
 pub struct Prefetcher {
     cache: Arc<PageCache>,
     scheduler: Arc<TaskScheduler>,
-    state: Arc<TemporaryMemoryState>,
+    lease: Arc<dyn PrefetchBudget>,
     options: PrefetchOptions,
     registry: Arc<PrefetchRegistry>,
     inflight_bytes: Arc<AtomicUsize>,
@@ -240,13 +250,13 @@ impl Prefetcher {
     pub fn new(
         cache: Arc<PageCache>,
         scheduler: Arc<TaskScheduler>,
-        state: Arc<TemporaryMemoryState>,
+        lease: Arc<dyn PrefetchBudget>,
         options: PrefetchOptions,
     ) -> Self {
         let prefetcher = Self {
             cache,
             scheduler,
-            state,
+            lease,
             options,
             registry: Arc::new(PrefetchRegistry::new()),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
@@ -263,12 +273,7 @@ impl Prefetcher {
 
     /// Update the target bytes for the temporary memory state.
     pub fn update_target_bytes(&self, bytes: usize) {
-        if bytes == 0 {
-            self.state.set_zero();
-        } else {
-            self.state
-                .set_remaining_size_and_update_reservation(bytes.max(1));
-        }
+        self.lease.update_target_bytes(bytes);
     }
 
     /// Record a page consumption (hit/wait).
@@ -285,7 +290,7 @@ impl Prefetcher {
     }
 
     fn budget_bytes(&self) -> usize {
-        let reservation = self.state.get_reservation();
+        let reservation = self.lease.target_bytes();
         if reservation == 0 {
             return 0;
         }
@@ -297,7 +302,7 @@ impl Prefetcher {
     }
 
     fn max_tasks(&self) -> usize {
-        let reservation = self.state.get_reservation();
+        let reservation = self.lease.target_bytes();
         if reservation == 0 {
             return 0;
         }
@@ -324,6 +329,9 @@ impl Prefetcher {
             return false;
         }
 
+        if !self.lease.try_acquire(bytes) {
+            return false;
+        }
         self.inflight_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.inflight_tasks.fetch_add(1, Ordering::Relaxed);
         true
@@ -383,9 +391,12 @@ impl Prefetcher {
                 registry: self.registry.clone(),
                 items: batch,
                 file_path: file_path.to_path_buf(),
-                inflight_bytes: self.inflight_bytes.clone(),
-                inflight_tasks: self.inflight_tasks.clone(),
-                batch_bytes,
+                reservation: Some(PrefetchTaskReservation {
+                    lease: self.lease.clone(),
+                    inflight_bytes: self.inflight_bytes.clone(),
+                    inflight_tasks: self.inflight_tasks.clone(),
+                    bytes: batch_bytes,
+                }),
             };
             let task: Arc<Mutex<dyn Task>> = Arc::new(Mutex::new(task));
             tasks.push(task);
@@ -403,7 +414,7 @@ impl std::fmt::Debug for Prefetcher {
         f.debug_struct("Prefetcher")
             .field("window_pages", &self.options.window_pages)
             .field("batch_pages", &self.options.batch_pages)
-            .field("reservation", &self.state.get_reservation())
+            .field("target_bytes", &self.lease.target_bytes())
             .field(
                 "inflight_bytes",
                 &self.inflight_bytes.load(Ordering::Relaxed),

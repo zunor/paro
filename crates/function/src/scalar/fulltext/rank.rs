@@ -194,11 +194,20 @@ mod tests {
     #[test]
     fn test_bm25_ranking_prefers_repeated_terms() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["hello world", "hello hello world"]),
-            Vector::from_strings(&["hello", "hello"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Float);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["hello world", "hello hello world"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["hello", "hello"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Float);
         bm25_fn(&input, &state, &mut result).unwrap();
         assert!(result.get_f32(1) >= result.get_f32(0));
     }
@@ -206,13 +215,22 @@ mod tests {
     #[test]
     fn test_ts_rank_cd_differs_from_ts_rank() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["alpha beta", "alpha x beta"]),
-            Vector::from_strings(&["alpha & beta", "alpha & beta"]),
-        ]);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["alpha beta", "alpha x beta"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["alpha & beta", "alpha & beta"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
 
-        let mut rank = Vector::new(LogicalType::Float);
-        let mut rank_cd = Vector::new(LogicalType::Float);
+        let mut rank = paro_common::test_utils::test_vector(LogicalType::Float);
+        let mut rank_cd = paro_common::test_utils::test_vector(LogicalType::Float);
         ts_rank_fn(&input, &state, &mut rank).unwrap();
         ts_rank_cd_fn(&input, &state, &mut rank_cd).unwrap();
         let rank0 = rank.get_f32(0).unwrap_or_default();
@@ -226,11 +244,20 @@ mod tests {
     #[test]
     fn test_non_constant_query_rows_keep_distinct_scores() {
         let state = MockState;
-        let input = Chunk::from_vectors(vec![
-            Vector::from_strings(&["vector database", "graph graph storage"]),
-            Vector::from_strings(&["vector", "graph"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Float);
+        let input = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector database", "graph graph storage"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["vector", "graph"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Float);
         bm25_fn(&input, &state, &mut result).unwrap();
         assert!(result.get_f32(0).unwrap_or_default() > 0.0);
         assert!(result.get_f32(1).unwrap_or_default() > result.get_f32(0).unwrap_or_default());

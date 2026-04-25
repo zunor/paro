@@ -14,7 +14,7 @@ use paro_context::StatementCancellation;
 use paro_scheduler::coordinator::EventCoordinator;
 use paro_scheduler::scheduler::TaskScheduler;
 
-use crate::operator::result::buffered_data::BufferedData;
+use crate::memory_runtime::{QueryMemoryPool, QueryOutputBuffer};
 
 /// Result handler for streaming query execution.
 ///
@@ -31,11 +31,13 @@ pub struct ResultHandler {
     /// Allocator for memory management.
     allocator: Arc<dyn Allocator>,
     /// Shared buffer with pipeline sink.
-    buffer: Arc<Mutex<BufferedData>>,
+    buffer: Arc<Mutex<QueryOutputBuffer>>,
     /// Event coordinator for pipeline execution.
     coordinator: Arc<EventCoordinator>,
     /// Statement-scoped cancellation state shared with the session.
     cancellation: StatementCancellation,
+    /// Active query pool registration, detached when execution is closed.
+    query_memory_pool: Option<Arc<QueryMemoryPool>>,
     /// Whether the handler is closed.
     closed: bool,
 }
@@ -55,18 +57,19 @@ impl ResultHandler {
     pub fn new(
         names: Vec<String>,
         types: Vec<LogicalType>,
-        buffer: Arc<Mutex<BufferedData>>,
+        buffer: Arc<Mutex<QueryOutputBuffer>>,
         coordinator: Arc<EventCoordinator>,
         cancellation: StatementCancellation,
         allocator: Arc<dyn Allocator>,
-    ) -> Self {
+        query_memory_pool: Option<Arc<QueryMemoryPool>>,
+    ) -> Result<Self> {
         let output_chunk = if types.is_empty() {
-            Chunk::with_allocator(allocator.clone())
+            Chunk::try_new(allocator.clone())?
         } else {
-            Chunk::initialize_with_allocator(&types, VECTOR_SIZE, allocator.clone())
+            Chunk::try_initialize(&types, VECTOR_SIZE, allocator.clone())?
         };
 
-        Self {
+        Ok(Self {
             names,
             types,
             output_chunk,
@@ -74,22 +77,26 @@ impl ResultHandler {
             buffer,
             coordinator,
             cancellation,
+            query_memory_pool,
             closed: false,
-        }
+        })
     }
 
     /// Create an empty ResultHandler (for DDL/DML that return no rows).
-    pub fn empty(allocator: Arc<dyn Allocator>) -> Self {
-        let buffer = Arc::new(Mutex::new(BufferedData::new(1, allocator.clone())));
+    pub fn empty(allocator: Arc<dyn Allocator>) -> Result<Self> {
+        let buffer = Arc::new(Mutex::new(QueryOutputBuffer::detached(
+            1,
+            allocator.clone(),
+        )));
         buffer.lock().unwrap().close();
 
         let dummy_scheduler = Arc::new(TaskScheduler::new());
         let coordinator = Arc::new(EventCoordinator::new(dummy_scheduler));
 
-        Self {
+        Ok(Self {
             names: Vec::new(),
             types: Vec::new(),
-            output_chunk: Chunk::with_allocator(allocator.clone()),
+            output_chunk: Chunk::try_new(allocator.clone())?,
             allocator,
             buffer,
             coordinator,
@@ -97,8 +104,9 @@ impl ResultHandler {
                 tokio_util::sync::CancellationToken::new(),
                 None,
             ),
+            query_memory_pool: None,
             closed: true,
-        }
+        })
     }
 
     /// Fetch the next chunk of results.
@@ -130,16 +138,16 @@ impl ResultHandler {
 
                 // No chunk available and execution finished
                 drop(buffer_guard);
-                self.closed = true;
+                self.mark_closed();
                 Ok(None)
             }
             StreamExecutionResult::Cancelled => {
-                self.closed = true;
+                self.mark_closed();
                 self.cancellation.check()?;
                 Ok(None)
             }
             StreamExecutionResult::Error => {
-                self.closed = true;
+                self.mark_closed();
                 // Try to get error from buffer first
                 let buffer_guard = self.buffer.lock().map_err(|e| {
                     paro_common::error::internal(format!("Failed to lock buffer: {}", e))
@@ -175,7 +183,7 @@ impl ResultHandler {
             }
             StreamExecutionResult::Blocked => {
                 // This shouldn't happen in replenish_buffer, but handle it
-                self.closed = true;
+                self.mark_closed();
                 Err(paro_common::error::internal(
                     "Unexpected blocked state".to_string(),
                 ))
@@ -340,10 +348,11 @@ impl ResultHandler {
     /// 3. Marks the handler as closed
     pub fn close(&mut self) {
         if self.closed {
+            self.detach_query_memory_pool();
             return;
         }
 
-        self.closed = true;
+        self.mark_closed();
 
         // Cancel execution
         self.coordinator.cancel();
@@ -351,6 +360,17 @@ impl ResultHandler {
         // Close buffer
         if let Ok(mut buffer_guard) = self.buffer.lock() {
             buffer_guard.close();
+        }
+    }
+
+    fn mark_closed(&mut self) {
+        self.closed = true;
+        self.detach_query_memory_pool();
+    }
+
+    fn detach_query_memory_pool(&mut self) {
+        if let Some(pool) = self.query_memory_pool.take() {
+            pool.detach_registration();
         }
     }
 
@@ -380,13 +400,14 @@ impl ResultHandler {
     }
 
     /// Get the shared buffer.
-    pub fn buffer(&self) -> &Arc<Mutex<BufferedData>> {
+    pub fn buffer(&self) -> &Arc<Mutex<QueryOutputBuffer>> {
         &self.buffer
     }
 
     /// Create a ResultHandler for testing with pre-materialized chunks.
     ///
     /// **Note**: This is only for testing. Production code should use streaming execution.
+    #[cfg(test)]
     pub fn from_materialized_for_test(
         names: Vec<String>,
         types: Vec<LogicalType>,
@@ -394,8 +415,8 @@ impl ResultHandler {
         allocator: Arc<dyn Allocator>,
     ) -> Self {
         // Create a buffer and fill it with chunks
-        let buffer = Arc::new(Mutex::new(BufferedData::new(
-            chunks.len() + 1,
+        let buffer = Arc::new(Mutex::new(QueryOutputBuffer::detached(
+            64 * 1024 * 1024,
             allocator.clone(),
         )));
 
@@ -405,7 +426,7 @@ impl ResultHandler {
                 assert!(
                     matches!(
                         buffer_guard.try_append(chunk),
-                        crate::operator::result::buffered_data::AppendResult::Success
+                        Ok(crate::memory_runtime::OutputAppendResult::Success)
                     ),
                     "test buffer should accept materialized chunks"
                 );
@@ -424,7 +445,9 @@ impl ResultHandler {
             coordinator,
             StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
             allocator,
+            None,
         )
+        .expect("test result handler allocation failed")
     }
 }
 
@@ -464,7 +487,7 @@ mod tests {
     #[test]
     fn test_result_handler_empty() {
         let allocator = Arc::new(default_allocator().clone());
-        let handler = ResultHandler::empty(allocator);
+        let handler = ResultHandler::empty(allocator).expect("empty result handler");
 
         assert!(handler.closed);
         assert_eq!(handler.names().len(), 0);
@@ -490,7 +513,10 @@ mod tests {
     fn test_wait_for_task_integration() {
         // This test verifies that wait_for_task() doesn't panic
         let allocator = Arc::new(default_allocator().clone());
-        let buffer = Arc::new(Mutex::new(BufferedData::new(10, allocator.clone())));
+        let buffer = Arc::new(Mutex::new(QueryOutputBuffer::detached(
+            64 * 1024 * 1024,
+            allocator.clone(),
+        )));
         let scheduler = Arc::new(TaskScheduler::new());
         let coordinator = Arc::new(EventCoordinator::new(scheduler));
 
@@ -501,7 +527,9 @@ mod tests {
             coordinator,
             StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
             allocator,
-        );
+            None,
+        )
+        .expect("result handler");
 
         // Call wait_for_task - should timeout gracefully
         handler.wait_for_task();
@@ -510,7 +538,10 @@ mod tests {
     #[test]
     fn blocked_fetch_returns_promptly_after_cancellation() {
         let allocator = Arc::new(default_allocator().clone());
-        let buffer = Arc::new(Mutex::new(BufferedData::new(10, allocator.clone())));
+        let buffer = Arc::new(Mutex::new(QueryOutputBuffer::detached(
+            64 * 1024 * 1024,
+            allocator.clone(),
+        )));
         let scheduler = Arc::new(TaskScheduler::new());
         let coordinator = Arc::new(EventCoordinator::new(scheduler));
         coordinator.add_event(Event::new());
@@ -533,7 +564,9 @@ mod tests {
             coordinator.clone(),
             cancellation,
             allocator,
-        );
+            None,
+        )
+        .expect("result handler");
 
         let cancel_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));

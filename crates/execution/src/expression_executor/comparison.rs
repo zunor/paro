@@ -40,8 +40,7 @@ macro_rules! define_fixed_width_comparison {
             count: usize,
             _ctx: &ComparisonExecCtx,
         ) -> Result<()> {
-            BinaryExecutor::execute::<$ty, $ty, bool, $op>(left, right, result, count);
-            Ok(())
+            BinaryExecutor::execute::<$ty, $ty, bool, $op>(left, right, result, count)
         }
 
         fn $select_name(
@@ -51,9 +50,7 @@ macro_rules! define_fixed_width_comparison {
             count: usize,
             output: &mut SelectionVector,
         ) -> Result<usize> {
-            Ok(BinaryExecutor::select_into::<$ty, $ty, $op>(
-                left, right, input_sel, count, output,
-            ))
+            BinaryExecutor::select_into::<$ty, $ty, $op>(left, right, input_sel, count, output)
         }
     };
 }

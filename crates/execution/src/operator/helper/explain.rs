@@ -81,8 +81,7 @@ impl PhysicalOperator for Explain {
         let remaining = self.plan_lines.len() - lstate.next_line;
         let output_count = remaining.min(VECTOR_SIZE);
         let allocator = ctx.allocator(MemoryTag::Allocator);
-        let mut output_chunk =
-            Chunk::initialize_with_allocator(&self.output_types, output_count, allocator);
+        let mut output_chunk = Chunk::try_initialize(&self.output_types, output_count, allocator)?;
 
         let output_vector = output_chunk.column_mut(0).ok_or_else(|| {
             paro_error::internal("Explain output chunk missing column".to_string())

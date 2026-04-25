@@ -98,11 +98,20 @@ mod tests {
 
     #[test]
     fn test_prefix_basic() {
-        let str_vec = Vector::from_strings(&["hello world", "foo bar", "test"]);
-        let prefix_vec = Vector::from_strings(&["hello", "bar", ""]);
-        let chunk = Chunk::from_vectors(vec![str_vec, prefix_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar", "test"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let prefix_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "bar", ""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, prefix_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         prefix_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -113,11 +122,20 @@ mod tests {
 
     #[test]
     fn test_prefix_unicode() {
-        let str_vec = Vector::from_strings(&["你好世界", "hello"]);
-        let prefix_vec = Vector::from_strings(&["你好", "你好"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, prefix_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["你好世界", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let prefix_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["你好", "你好"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, prefix_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         prefix_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -127,12 +145,21 @@ mod tests {
 
     #[test]
     fn test_prefix_with_null() {
-        let mut str_vec = Vector::from_strings(&["hello", "world"]);
+        let mut str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         str_vec.validity_mut().set_null(1);
-        let prefix_vec = Vector::from_strings(&["hel", "wor"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, prefix_vec]);
+        let prefix_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hel", "wor"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, prefix_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         prefix_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -142,11 +169,20 @@ mod tests {
 
     #[test]
     fn test_suffix_basic() {
-        let str_vec = Vector::from_strings(&["hello world", "foo bar", "test"]);
-        let suffix_vec = Vector::from_strings(&["world", "foo", ""]);
-        let chunk = Chunk::from_vectors(vec![str_vec, suffix_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar", "test"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let suffix_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "foo", ""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, suffix_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         suffix_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -157,11 +193,20 @@ mod tests {
 
     #[test]
     fn test_suffix_unicode() {
-        let str_vec = Vector::from_strings(&["你好世界", "hello"]);
-        let suffix_vec = Vector::from_strings(&["世界", "世界"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, suffix_vec]);
+        let str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["你好世界", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let suffix_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["世界", "世界"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, suffix_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         suffix_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -171,12 +216,21 @@ mod tests {
 
     #[test]
     fn test_suffix_with_null() {
-        let mut str_vec = Vector::from_strings(&["hello", "world"]);
+        let mut str_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         str_vec.validity_mut().set_null(1);
-        let suffix_vec = Vector::from_strings(&["llo", "rld"]);
-        let chunk = Chunk::from_vectors(vec![str_vec, suffix_vec]);
+        let suffix_vec = paro_common::test_utils::test_string_vector_with_allocator(
+            &["llo", "rld"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![str_vec, suffix_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         suffix_varchar(&chunk, &state, &mut result).unwrap();
 

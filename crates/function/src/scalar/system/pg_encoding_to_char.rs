@@ -140,10 +140,13 @@ mod tests {
 
     #[test]
     fn test_pg_encoding_to_char_utf8() {
-        let input_vec = Vector::from_i32(&[6]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[6],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         pg_encoding_to_char_impl(&chunk, &state, &mut result).unwrap();
 
@@ -152,10 +155,13 @@ mod tests {
 
     #[test]
     fn test_pg_encoding_to_char_common_encodings() {
-        let input_vec = Vector::from_i32(&[0, 6, 8, 24]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[0, 6, 8, 24],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         pg_encoding_to_char_impl(&chunk, &state, &mut result).unwrap();
 
@@ -167,10 +173,13 @@ mod tests {
 
     #[test]
     fn test_pg_encoding_to_char_unknown() {
-        let input_vec = Vector::from_i32(&[999, -1]);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let input_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[999, -1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         pg_encoding_to_char_impl(&chunk, &state, &mut result).unwrap();
 
@@ -180,11 +189,14 @@ mod tests {
 
     #[test]
     fn test_pg_encoding_to_char_with_null() {
-        let mut input_vec = Vector::from_i32(&[6, 0]);
+        let mut input_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[6, 0],
+            paro_common::test_utils::test_allocator(),
+        );
         input_vec.validity_mut().set_null(1);
-        let chunk = Chunk::from_vectors(vec![input_vec]);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input_vec]);
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         pg_encoding_to_char_impl(&chunk, &state, &mut result).unwrap();
 

@@ -75,9 +75,10 @@ mod tests {
 
     #[test]
     fn test_version_basic() {
-        let chunk = Chunk::new();
+        let chunk = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Varchar);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
 
         version_impl(&chunk, &state, &mut result).unwrap();
 

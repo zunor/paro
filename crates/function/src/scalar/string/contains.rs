@@ -165,11 +165,20 @@ mod tests {
 
     #[test]
     fn test_contains_basic() {
-        let haystack = Vector::from_strings(&["hello world", "foo bar", "test"]);
-        let needle = Vector::from_strings(&["world", "baz", ""]);
-        let chunk = Chunk::from_vectors(vec![haystack, needle]);
+        let haystack = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar", "test"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let needle = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "baz", ""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![haystack, needle],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         contains_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -180,11 +189,20 @@ mod tests {
 
     #[test]
     fn test_contains_unicode() {
-        let haystack = Vector::from_strings(&["你好世界", "hello"]);
-        let needle = Vector::from_strings(&["世界", "世界"]);
-        let chunk = Chunk::from_vectors(vec![haystack, needle]);
+        let haystack = paro_common::test_utils::test_string_vector_with_allocator(
+            &["你好世界", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let needle = paro_common::test_utils::test_string_vector_with_allocator(
+            &["世界", "世界"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![haystack, needle],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         contains_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -194,12 +212,21 @@ mod tests {
 
     #[test]
     fn test_contains_with_null() {
-        let mut haystack = Vector::from_strings(&["hello", "world"]);
+        let mut haystack = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         haystack.validity_mut().set_null(1);
-        let needle = Vector::from_strings(&["ell", "orl"]);
-        let chunk = Chunk::from_vectors(vec![haystack, needle]);
+        let needle = paro_common::test_utils::test_string_vector_with_allocator(
+            &["ell", "orl"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![haystack, needle],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         contains_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -209,11 +236,20 @@ mod tests {
 
     #[test]
     fn test_position_basic() {
-        let needle = Vector::from_strings(&["world", "baz", ""]);
-        let haystack = Vector::from_strings(&["hello world", "foo bar", "test"]);
-        let chunk = Chunk::from_vectors(vec![needle, haystack]);
+        let needle = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "baz", ""],
+            paro_common::test_utils::test_allocator(),
+        );
+        let haystack = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar", "test"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![needle, haystack],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         position_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -224,11 +260,20 @@ mod tests {
 
     #[test]
     fn test_position_unicode() {
-        let needle = Vector::from_strings(&["世界"]);
-        let haystack = Vector::from_strings(&["你好世界"]);
-        let chunk = Chunk::from_vectors(vec![needle, haystack]);
+        let needle = paro_common::test_utils::test_string_vector_with_allocator(
+            &["世界"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let haystack = paro_common::test_utils::test_string_vector_with_allocator(
+            &["你好世界"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![needle, haystack],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         position_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -237,11 +282,20 @@ mod tests {
 
     #[test]
     fn test_instr_basic() {
-        let haystack = Vector::from_strings(&["hello world", "foo bar"]);
-        let needle = Vector::from_strings(&["world", "baz"]);
-        let chunk = Chunk::from_vectors(vec![haystack, needle]);
+        let haystack = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let needle = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world", "baz"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![haystack, needle],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::BigInt);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         instr_varchar(&chunk, &state, &mut result).unwrap();
 

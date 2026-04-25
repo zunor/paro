@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
@@ -22,6 +25,7 @@ use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_join_condition;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::{RetainedChunkVec, RetainedMemoryHandle};
 use crate::operator::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
     construct_right_outer_scan_result, construct_semi_join_result,
@@ -53,36 +57,106 @@ struct SortedRowLocation {
 
 #[derive(Debug)]
 struct PiecewiseMergeJoinMaterializedRhs {
-    payload_chunks: Vec<Chunk>,
-    key_values: Vec<Value>,
-    key_locations: Vec<SortedRowLocation>,
+    memory: MemoryAccountingContext,
+    payload_chunks: RetainedChunkVec,
+    key_values: AccountedVec<Value>,
+    key_value_payloads: AccountedVec<RetainedMemoryHandle>,
+    key_locations: AccountedVec<SortedRowLocation>,
     row_count: usize,
     null_row_count: usize,
 }
 
 struct PiecewiseMergeJoinGlobalSinkState {
     sort_state: Box<dyn GlobalSinkState>,
-    materialized: Mutex<Option<Arc<PiecewiseMergeJoinMaterializedRhs>>>,
+    materialized: Mutex<Option<Arc<Mutex<PiecewiseMergeJoinMaterializedRhs>>>>,
     right_key_executor: Mutex<ExpressionExecutor>,
     right_outer: Arc<OuterJoinMarker>,
 }
 
 impl PiecewiseMergeJoinMaterializedRhs {
+    fn new(memory: MemoryAccountingContext) -> Self {
+        let metadata_memory = memory.with_class(MemoryAccountingClass::Metadata);
+        Self {
+            memory: memory.clone(),
+            payload_chunks: RetainedChunkVec::new(memory),
+            key_values: AccountedVec::new_with_accounting(
+                grant_for_context(&metadata_memory),
+                MemoryTag::Metadata,
+                MemoryAccountingClass::Metadata,
+            ),
+            key_value_payloads: AccountedVec::new_with_accounting(
+                grant_for_context(&metadata_memory),
+                MemoryTag::Metadata,
+                MemoryAccountingClass::Metadata,
+            ),
+            key_locations: AccountedVec::new_with_accounting(
+                grant_for_context(&metadata_memory),
+                MemoryTag::Metadata,
+                MemoryAccountingClass::Metadata,
+            ),
+            row_count: 0,
+            null_row_count: 0,
+        }
+    }
+
+    fn push_payload_chunk(&mut self, chunk: Chunk) -> Result<usize> {
+        let chunk_idx = self.payload_chunks.len();
+        self.payload_chunks.push(chunk)?;
+        Ok(chunk_idx)
+    }
+
+    fn push_key(&mut self, value: Value, location: SortedRowLocation) -> Result<()> {
+        let release = self.memory.retain(value.allocation_size())?;
+        if let Err(err) = self.key_values.try_push(value) {
+            release.release();
+            return Err(err.into());
+        }
+        if let Err(err) = self
+            .key_value_payloads
+            .try_push(RetainedMemoryHandle::new(release))
+        {
+            let _ = self.key_values.pop();
+            return Err(err.into());
+        }
+        if let Err(err) = self.key_locations.try_push(location) {
+            let _ = self.key_values.pop();
+            let _ = self.key_value_payloads.pop();
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
     fn memory_usage_bytes(&self) -> usize {
-        self.payload_chunks.capacity() * size_of::<Chunk>()
-            + self
-                .payload_chunks
-                .iter()
-                .map(Chunk::get_allocation_size)
-                .sum::<usize>()
+        self.payload_chunks.retained_bytes()
             + self.key_values.capacity() * size_of::<Value>()
             + self
-                .key_values
+                .key_value_payloads
                 .iter()
-                .map(Value::allocation_size)
+                .map(RetainedMemoryHandle::bytes)
                 .sum::<usize>()
             + self.key_locations.capacity() * size_of::<SortedRowLocation>()
     }
+}
+
+fn grant_for_context(memory: &MemoryAccountingContext) -> MemoryGrant {
+    if let Some(owner) = memory.owner() {
+        MemoryGrant::new(0, memory.domain(), owner)
+            .expect("zero-byte piecewise merge join grant should fit")
+    } else {
+        MemoryGrant::detached(usize::MAX / 4, memory.domain())
+    }
+}
+
+fn sort_memory_context_from_sink_state(
+    sort_state: &dyn GlobalSinkState,
+) -> MemoryAccountingContext {
+    sort_state
+        .as_any()
+        .downcast_ref::<crate::sorting::sort::SortGlobalSinkState>()
+        .map(|state| state.memory_context())
+        .unwrap_or_else(|| {
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable)
+        })
 }
 
 impl PiecewiseMergeJoinGlobalSinkState {
@@ -100,7 +174,7 @@ impl PiecewiseMergeJoinGlobalSinkState {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|materialized| materialized.memory_usage_bytes() as u64)
+            .map(|materialized| materialized.lock().unwrap().memory_usage_bytes() as u64)
             .unwrap_or(0);
         let sort_peak = sort_sink_state.peak_reservation() as u64;
 
@@ -108,6 +182,7 @@ impl PiecewiseMergeJoinGlobalSinkState {
             spilled: Some(sort_sink_state.is_external()),
             peak_memory_bytes: Some(sort_peak.max(materialized_peak)),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 }
@@ -162,7 +237,7 @@ impl LocalSinkState for PiecewiseMergeJoinLocalSinkState {
 
 #[derive(Debug)]
 struct PiecewiseMergeJoinGlobalSourceState {
-    payload_chunks: Arc<Vec<Chunk>>,
+    materialized: Arc<Mutex<PiecewiseMergeJoinMaterializedRhs>>,
     right_outer: Arc<OuterJoinMarker>,
     join_type: JoinType,
 }
@@ -317,23 +392,33 @@ impl PiecewiseMergeJoin {
         )
     }
 
-    fn ensure_output_chunk(&self, chunk: &mut Chunk) {
+    fn ensure_output_chunk(&self, chunk: &mut Chunk) -> Result<()> {
         if chunk.column_count() == 0 {
-            *chunk = Chunk::initialize(&self.types, paro_common::vector::VECTOR_SIZE);
+            *chunk = Chunk::try_initialize(
+                &self.types,
+                paro_common::vector::VECTOR_SIZE,
+                chunk.allocator().clone(),
+            )?;
         }
+        Ok(())
     }
 
-    fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk) {
+    fn construct_empty_join_result(&self, input: &Chunk, result: &mut Chunk) -> Result<()> {
         match self.join_type {
             JoinType::Anti => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_anti_join_result(
                     input,
                     &sel,
                     input.size(),
                     &self.join.left_projection_map,
                     result,
-                );
+                )?;
             }
             JoinType::Mark => {
                 construct_mark_join_result(
@@ -341,10 +426,15 @@ impl PiecewiseMergeJoin {
                     &self.join.left_projection_map,
                     &vec![Some(false); input.size()],
                     result,
-                );
+                )?;
             }
             JoinType::Left | JoinType::Outer | JoinType::Single => {
-                let sel = SelectionVector::incremental(input.size());
+                let mut sel =
+                    SelectionVector::try_with_capacity(input.size(), input.allocator().clone())?;
+                sel.set_len(input.size());
+                for idx in 0..input.size() {
+                    sel.set(idx, idx);
+                }
                 construct_left_outer_result(
                     input,
                     &sel,
@@ -352,14 +442,16 @@ impl PiecewiseMergeJoin {
                     &self.join.left_projection_map,
                     &self.join.right_output_types,
                     result,
-                );
+                )?;
             }
             _ => result.set_cardinality(0),
         }
+        Ok(())
     }
 
-    fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Chunk {
-        let mut materialized = Chunk::initialize(types, chunk.size().max(1));
+    fn materialize_chunk(chunk: &Chunk, types: &[LogicalType]) -> Result<Chunk> {
+        let mut materialized =
+            Chunk::try_initialize(types, chunk.size().max(1), chunk.allocator().clone())?;
         materialized.set_cardinality(chunk.size());
         for col_idx in 0..chunk.column_count() {
             let source = chunk
@@ -372,7 +464,7 @@ impl PiecewiseMergeJoin {
                 target.copy_at(row_idx, source, row_idx);
             }
         }
-        materialized
+        Ok(materialized)
     }
 
     fn ensure_input_state(
@@ -389,11 +481,11 @@ impl PiecewiseMergeJoin {
             state
                 .left_key_executor
                 .execute_expression(0, input, None, input.size(), ctx)?;
-        let mut key_chunk = Chunk::from_arc_vectors(vec![key_vector]);
+        let mut key_chunk = Chunk::from_arc_vectors(vec![key_vector], input.allocator().clone());
         key_chunk.set_cardinality(input.size());
 
         state.left_key_chunk =
-            Self::materialize_chunk(&key_chunk, &[self.condition.left.return_type()]);
+            Self::materialize_chunk(&key_chunk, &[self.condition.left.return_type()])?;
         state.input_initialized = true;
         state.row_prepared = false;
         state.left_row_idx = 0;
@@ -670,7 +762,7 @@ impl PiecewiseMergeJoin {
         &self,
         ctx: &ExecutionContext,
         sink: &PiecewiseMergeJoinGlobalSinkState,
-    ) -> Result<Arc<PiecewiseMergeJoinMaterializedRhs>> {
+    ) -> Result<Arc<Mutex<PiecewiseMergeJoinMaterializedRhs>>> {
         let mut guard = sink.materialized.lock().unwrap();
         if let Some(materialized) = guard.as_ref() {
             return Ok(materialized.clone());
@@ -682,11 +774,15 @@ impl PiecewiseMergeJoin {
         let mut sort_lstate = self
             .sort
             .get_local_source_state(ctx, sort_gstate.as_ref())?;
-        let mut chunk = Chunk::initialize(self.right.types(), paro_common::vector::VECTOR_SIZE);
+        let mut chunk = Chunk::try_initialize(
+            self.right.types(),
+            paro_common::vector::VECTOR_SIZE,
+            ctx.allocator(MemoryTag::OrderBy),
+        )?;
         let allocator = ctx.allocator(MemoryTag::OrderBy);
-        let mut payload_chunks = Vec::new();
-        let mut key_values = Vec::new();
-        let mut key_locations = Vec::new();
+        let mut materialized = PiecewiseMergeJoinMaterializedRhs::new(
+            sort_memory_context_from_sink_state(sink.sort_state.as_ref()),
+        );
         let mut global_idx = 0usize;
         let mut null_row_count = 0usize;
 
@@ -695,7 +791,8 @@ impl PiecewiseMergeJoin {
                 self.sort
                     .get_data(ctx, &mut chunk, sort_gstate.as_ref(), sort_lstate.as_mut())?;
             if chunk.size() > 0 {
-                let copied = chunk.deep_copy_with_allocator(allocator.clone());
+                let copied = chunk.try_deep_copy(allocator.clone())?;
+                let chunk_idx = materialized.push_payload_chunk(copied.clone())?;
                 let key_vector = sink.right_key_executor.lock().unwrap().execute_expression(
                     0,
                     &copied,
@@ -708,21 +805,22 @@ impl PiecewiseMergeJoin {
                     if value.is_null() {
                         null_row_count += 1;
                     } else {
-                        key_values.push(value);
-                        key_locations.push(SortedRowLocation {
-                            chunk_idx: payload_chunks.len(),
-                            row_idx,
-                            global_idx,
-                        });
+                        materialized.push_key(
+                            value,
+                            SortedRowLocation {
+                                chunk_idx,
+                                row_idx,
+                                global_idx,
+                            },
+                        )?;
                     }
                     global_idx += 1;
                 }
-                payload_chunks.push(copied);
             }
             if matches!(result, SourceResultType::Finished) {
                 break;
             }
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
         }
 
         if sink.right_outer.enabled() {
@@ -730,13 +828,9 @@ impl PiecewiseMergeJoin {
             sink.right_outer.add_rows(global_idx);
         }
 
-        let materialized = Arc::new(PiecewiseMergeJoinMaterializedRhs {
-            payload_chunks,
-            key_values,
-            key_locations,
-            row_count: global_idx,
-            null_row_count,
-        });
+        materialized.row_count = global_idx;
+        materialized.null_row_count = null_row_count;
+        let materialized = Arc::new(Mutex::new(materialized));
         *guard = Some(materialized.clone());
         Ok(materialized)
     }
@@ -839,11 +933,14 @@ impl PhysicalOperator for PiecewiseMergeJoin {
         join_sink_state.runtime_memory_stats()
     }
 
-    fn get_operator_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
+    fn get_operator_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn OperatorState>> {
         Ok(Box::new(PiecewiseMergeJoinOperatorState {
             input_initialized: false,
             row_prepared: false,
-            left_key_chunk: Chunk::init_empty(&[self.condition.left.return_type()]),
+            left_key_chunk: Chunk::try_init_empty(
+                &[self.condition.left.return_type()],
+                ctx.allocator(MemoryTag::OrderBy),
+            )?,
             left_key_executor: ExpressionExecutor::new(&self.condition.left),
             left_row_idx: 0,
             range_start: 0,
@@ -952,7 +1049,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
         let build_source_state = |sink: &PiecewiseMergeJoinGlobalSinkState| {
             let materialized = self.materialize_sorted_rhs(ctx, sink)?;
             Ok(Box::new(PiecewiseMergeJoinGlobalSourceState {
-                payload_chunks: Arc::new(materialized.payload_chunks.clone()),
+                materialized,
                 right_outer: sink.right_outer.clone(),
                 join_type: self.join_type,
             }) as Box<dyn GlobalSourceState>)
@@ -1001,6 +1098,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         Self::validate_join_type(self.join_type)?;
 
@@ -1011,7 +1109,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
                 paro_error::internal("Invalid piecewise merge join operator state".to_string())
             })?;
 
-        self.ensure_output_chunk(chunk);
+        self.ensure_output_chunk(chunk)?;
         if input.size() == 0 {
             chunk.set_cardinality(0);
             self.reset_input_state(state);
@@ -1028,12 +1126,13 @@ impl PhysicalOperator for PiecewiseMergeJoin {
                 paro_error::internal("Invalid piecewise merge join sink state".to_string())
             })?;
         let materialized = self.materialize_sorted_rhs(ctx, gsink)?;
+        let materialized = materialized.lock().unwrap();
 
         if materialized.row_count == 0 {
             if self.join.empty_result_if_rhs_is_empty() {
                 chunk.set_cardinality(0);
             } else {
-                self.construct_empty_join_result(input, chunk);
+                self.construct_empty_join_result(input, chunk)?;
             }
             self.reset_input_state(state);
             return Ok(OperatorResultType::NeedMoreInput);
@@ -1057,7 +1156,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
                             output_count,
                             input,
                             state.left_row_idx,
-                            &materialized.payload_chunks,
+                            materialized.payload_chunks.as_slice(),
                             location,
                         )?;
                         state.range_pos += 1;
@@ -1117,7 +1216,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
                             output_count,
                             input,
                             state.left_row_idx,
-                            &materialized.payload_chunks,
+                            materialized.payload_chunks.as_slice(),
                             location,
                         )?;
                     } else {
@@ -1186,13 +1285,21 @@ impl PhysicalOperator for PiecewiseMergeJoin {
         };
 
         if chunk.column_count() == 0 {
-            *chunk = Chunk::initialize(&self.types, paro_common::vector::VECTOR_SIZE);
+            *chunk = Chunk::try_initialize(
+                &self.types,
+                paro_common::vector::VECTOR_SIZE,
+                chunk.allocator().clone(),
+            )?;
         }
 
-        let mut build_chunk =
-            Chunk::initialize(self.right.types(), paro_common::vector::VECTOR_SIZE);
+        let mut build_chunk = Chunk::try_initialize(
+            self.right.types(),
+            paro_common::vector::VECTOR_SIZE,
+            chunk.allocator().clone(),
+        )?;
+        let materialized = gstate.materialized.lock().unwrap();
         let count = gstate.right_outer.scan(
-            gstate.payload_chunks.as_ref(),
+            materialized.payload_chunks.as_slice(),
             &mut lstate.scan_state,
             emit_found,
             &mut build_chunk,
@@ -1202,7 +1309,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
             return Ok(SourceResultType::Finished);
         }
 
-        let build_sel = SelectionVector::incremental(count);
+        let build_sel = SelectionVector::try_incremental(count, chunk.allocator().clone())?;
         match gstate.join_type {
             JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
                 &build_chunk,
@@ -1220,7 +1327,7 @@ impl PhysicalOperator for PiecewiseMergeJoin {
                 chunk,
             ),
             _ => unreachable!("source phase only runs for right/full/right-semi/right-anti"),
-        }
+        }?;
 
         Ok(SourceResultType::HaveMoreOutput)
     }
@@ -1257,10 +1364,12 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
 
+    use paro_common::allocator::MemoryTag;
     use paro_common::chunk::Chunk;
+    use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::expression::{Expression, ReferenceExpression};
     use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
@@ -1316,15 +1425,16 @@ mod tests {
         null_row_count: usize,
         enable_right_outer: bool,
     ) {
+        let materialized = test_materialized_rhs(
+            payload_chunks,
+            key_values,
+            key_locations,
+            row_count,
+            null_row_count,
+        );
         let sink_state = Arc::new(PiecewiseMergeJoinGlobalSinkState {
             sort_state: Box::new(EmptyGlobalSinkState::default()),
-            materialized: Mutex::new(Some(Arc::new(PiecewiseMergeJoinMaterializedRhs {
-                payload_chunks,
-                key_values,
-                key_locations,
-                row_count,
-                null_row_count,
-            }))),
+            materialized: Mutex::new(Some(materialized)),
             right_key_executor: Mutex::new(
                 crate::expression_executor::executor::ExpressionExecutor::new(
                     &join.condition.right,
@@ -1340,10 +1450,39 @@ mod tests {
         join.set_sink_state(sink_state as Arc<dyn GlobalSinkState>);
     }
 
+    fn test_materialized_rhs(
+        payload_chunks: Vec<Chunk>,
+        key_values: Vec<Value>,
+        key_locations: Vec<SortedRowLocation>,
+        row_count: usize,
+        null_row_count: usize,
+    ) -> Arc<Mutex<PiecewiseMergeJoinMaterializedRhs>> {
+        let memory =
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
+        let mut materialized = PiecewiseMergeJoinMaterializedRhs::new(memory);
+        for chunk in payload_chunks {
+            materialized.push_payload_chunk(chunk).unwrap();
+        }
+        for (value, location) in key_values.into_iter().zip(key_locations.into_iter()) {
+            materialized.push_key(value, location).unwrap();
+        }
+        materialized.row_count = row_count;
+        materialized.null_row_count = null_row_count;
+        Arc::new(Mutex::new(materialized))
+    }
+
     #[test]
     fn inner_piecewise_join_scans_sorted_match_suffix() {
         let join = comparison_join(JoinType::Inner, JoinComparisonType::LessThan);
-        let payload = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[2, 4, 6]))]);
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[2, 4, 6],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         set_materialized_sink_state(
             &join,
             vec![payload],
@@ -1374,12 +1513,28 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[5, 1]))]);
-        let mut output = Chunk::new();
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[5, 1],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -1394,7 +1549,8 @@ mod tests {
     #[test]
     fn mark_piecewise_join_returns_null_when_only_unknown_matches_exist() {
         let join = comparison_join(JoinType::Mark, JoinComparisonType::LessThan);
-        let mut payload = Chunk::initialize(&[LogicalType::Integer], 2);
+        let mut payload =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
         payload
             .column_mut(0)
             .unwrap()
@@ -1422,12 +1578,28 @@ mod tests {
         let thread = ThreadContext::new(0, 1);
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut state = join.get_operator_state(&ctx).unwrap();
-        let input = Chunk::from_arc_vectors(vec![Arc::new(Vector::from_i32(&[7]))]);
-        let mut output = Chunk::new();
+        let input = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[7],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
         let gstate = EmptyGlobalOperatorState;
 
         let result = join
-            .execute(&ctx, &input, &mut output, &gstate, state.as_mut())
+            .execute(
+                &ctx,
+                &input,
+                &mut output,
+                &gstate,
+                state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
+            )
             .unwrap();
 
         assert_eq!(result, OperatorResultType::NeedMoreInput);
@@ -1438,15 +1610,22 @@ mod tests {
     #[test]
     fn right_piecewise_join_source_emits_unmatched_build_rows() {
         let join = comparison_join(JoinType::Right, JoinComparisonType::LessThan);
-        let payload_chunks = Arc::new(vec![Chunk::from_arc_vectors(vec![Arc::new(
-            Vector::from_i32(&[10, 20]),
-        )])]);
+        let payload_chunks = vec![Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &[10, 20],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )];
+        let materialized = test_materialized_rhs(payload_chunks, vec![], vec![], 2, 0);
         let marker = Arc::new(crate::operator::join::outer_join_marker::OuterJoinMarker::new(true));
         marker.add_rows(2);
         marker.set_match(0);
 
         let gstate = PiecewiseMergeJoinGlobalSourceState {
-            payload_chunks,
+            materialized,
             right_outer: marker,
             join_type: JoinType::Right,
         };
@@ -1457,7 +1636,8 @@ mod tests {
         let mut lstate = join.get_local_source_state(&ctx, &gstate).unwrap();
         let interrupt = InterruptState::new();
         let mut input = OperatorSourceInput::new(&gstate, lstate.as_mut(), &interrupt);
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let result = join.get_data(&ctx, &mut output, &mut input).unwrap();
 

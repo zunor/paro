@@ -268,9 +268,12 @@ mod tests {
     #[test]
     fn test_epoch_from_timestamp() {
         // 1 second = 1_000_000 microseconds
-        let input = Vector::from_i64(&[1_000_000, 2_000_000, 0]);
-        let chunk = Chunk::from_vectors(vec![input]);
-        let mut result = Vector::new(LogicalType::BigInt);
+        let input = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1_000_000, 2_000_000, 0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         epoch_from_timestamp(&chunk, &MockState, &mut result).unwrap();
 
@@ -282,9 +285,12 @@ mod tests {
     #[test]
     fn test_epoch_ms_from_timestamp() {
         // 1 millisecond = 1_000 microseconds
-        let input = Vector::from_i64(&[1_000, 2_000, 0]);
-        let chunk = Chunk::from_vectors(vec![input]);
-        let mut result = Vector::new(LogicalType::BigInt);
+        let input = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1_000, 2_000, 0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::BigInt);
 
         epoch_ms_from_timestamp(&chunk, &MockState, &mut result).unwrap();
 
@@ -295,9 +301,12 @@ mod tests {
 
     #[test]
     fn test_to_timestamp_from_seconds() {
-        let input = Vector::from_i64(&[1, 2, 0]);
-        let chunk = Chunk::from_vectors(vec![input]);
-        let mut result = Vector::new(LogicalType::Timestamp);
+        let input = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[1, 2, 0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Timestamp);
 
         to_timestamp_from_seconds(&chunk, &MockState, &mut result).unwrap();
 
@@ -311,13 +320,16 @@ mod tests {
         // epoch(to_timestamp(x)) == x
         let original_seconds = 1704067200_i64; // 2024-01-01 00:00:00 UTC
 
-        let input = Vector::from_i64(&[original_seconds]);
-        let chunk = Chunk::from_vectors(vec![input]);
-        let mut ts_result = Vector::new(LogicalType::Timestamp);
+        let input = paro_common::test_utils::test_i64_vector_with_allocator(
+            &[original_seconds],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![input]);
+        let mut ts_result = paro_common::test_utils::test_vector(LogicalType::Timestamp);
         to_timestamp_from_seconds(&chunk, &MockState, &mut ts_result).unwrap();
 
-        let ts_chunk = Chunk::from_vectors(vec![ts_result]);
-        let mut epoch_result = Vector::new(LogicalType::BigInt);
+        let ts_chunk = paro_common::test_utils::test_chunk_from_vectors(vec![ts_result]);
+        let mut epoch_result = paro_common::test_utils::test_vector(LogicalType::BigInt);
         epoch_from_timestamp(&ts_chunk, &MockState, &mut epoch_result).unwrap();
 
         assert_eq!(epoch_result.get_i64(0), Some(original_seconds));

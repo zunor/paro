@@ -40,8 +40,11 @@ pub mod filter_propagate;
 pub mod identity;
 pub mod journal;
 pub mod logging;
+pub mod memory;
 pub mod runtime_value;
 pub mod sort_key;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_utils;
 pub mod typed_parameters;
 pub mod types;
 pub mod vector;

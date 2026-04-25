@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
+use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -28,16 +29,17 @@ impl EvaluatedValue {
         }
     }
 
-    pub fn write_into(self, result: &mut Vector) {
+    pub fn write_into(self, result: &mut Vector) -> Result<()> {
         match self {
             Self::Borrowed(vector) => {
                 *result = vector;
             }
             Self::Scratch(vector) => {
                 *result = vector;
-                result.make_exclusive();
+                result.try_make_exclusive()?;
             }
         }
+        Ok(())
     }
 }
 
@@ -76,25 +78,25 @@ impl ValueSlot {
         logical_type: &LogicalType,
         count: usize,
         allocator: Arc<dyn Allocator>,
-    ) -> &mut Vector {
+    ) -> Result<&mut Vector> {
         let required_capacity = count.max(1);
         match self {
             Self::Empty => {
-                *self = Self::Value(Vector::with_capacity_and_allocator(
+                *self = Self::Value(Vector::try_new(
                     logical_type.clone(),
                     required_capacity,
                     allocator.clone(),
-                ));
+                )?);
             }
             Self::Value(vector) => {
                 if vector.logical_type() != logical_type || vector.capacity() < required_capacity {
-                    *vector = Vector::with_capacity_and_allocator(
+                    *vector = Vector::try_new(
                         logical_type.clone(),
                         required_capacity,
                         allocator.clone(),
-                    );
+                    )?;
                 } else {
-                    vector.reset_for_execution(required_capacity, allocator.clone());
+                    vector.try_reset_for_execution(required_capacity, allocator.clone())?;
                 }
             }
         }
@@ -104,7 +106,7 @@ impl ValueSlot {
             Self::Value(vector) => vector,
         };
         vector.set_len(count);
-        vector
+        Ok(vector)
     }
 }
 

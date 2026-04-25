@@ -120,6 +120,15 @@ impl Task for PipelineTask {
             return Ok(TaskExecutionResult::Blocked);
         }
 
+        let Some(_admission) = self
+            .pipeline
+            .query_memory_pool()
+            .admission_controller()
+            .try_acquire(self.interrupt_state.clone())
+        else {
+            return Ok(TaskExecutionResult::Blocked);
+        };
+
         // Initialize executor if needed
         if self.executor.is_none() {
             let total_threads = self.pipeline.compute_max_threads();
@@ -188,6 +197,13 @@ impl Task for PipelineTask {
         }
     }
 
+    fn clear_interrupt_state(&mut self) {
+        self.interrupt_state = InterruptState::new();
+        if let Some(executor) = self.executor.as_mut() {
+            executor.interrupt_state = InterruptState::new();
+        }
+    }
+
     fn get_token(&self) -> Option<ProducerToken> {
         self.token.lock().clone()
     }
@@ -226,6 +242,15 @@ impl PipelineTask {
         if self.task_blocked_on_result() {
             return Ok(TaskExecutionResult::Blocked);
         }
+
+        let Some(_admission) = self
+            .pipeline
+            .query_memory_pool()
+            .admission_controller()
+            .try_acquire(self.interrupt_state.clone())
+        else {
+            return Ok(TaskExecutionResult::Blocked);
+        };
 
         let gstates = self
             .pipeline

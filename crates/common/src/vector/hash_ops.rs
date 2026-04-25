@@ -40,7 +40,12 @@ impl VectorOperations {
         let child_count = count * array_size;
 
         // 1. Hash child vector elements
-        let mut child_hashes = Vector::with_capacity(LogicalType::UBigInt, child_count);
+        let mut child_hashes = Vector::try_new(
+            LogicalType::UBigInt,
+            child_count,
+            result.allocator().clone(),
+        )
+        .expect("array hash scratch allocation failed");
         Self::hash(child, &mut child_hashes, child_count);
 
         // 2. Combine hashes for each array
@@ -133,7 +138,7 @@ mod tests {
         // Array 2: [1, 2, 3] (same)
         // Array 3: [4, 5, 6] (different)
 
-        let mut v = Vector::new_array(array_type.clone(), 3);
+        let mut v = crate::test_utils::test_new_array(array_type.clone(), 3);
         v.set_count(3);
         v.set_value(
             0,
@@ -160,7 +165,7 @@ mod tests {
             ),
         );
 
-        let mut hashes = Vector::with_capacity(LogicalType::UBigInt, 3);
+        let mut hashes = crate::test_utils::test_vector_with_capacity(LogicalType::UBigInt, 3);
         VectorOperations::hash(&v, &mut hashes, 3);
 
         let h0 = hashes.get_u64(0).unwrap();

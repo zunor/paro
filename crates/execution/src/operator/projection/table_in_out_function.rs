@@ -318,6 +318,7 @@ impl PhysicalOperator for TableInOutFunction {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         let gstate = gstate
             .as_any()
@@ -384,6 +385,7 @@ impl PhysicalOperator for TableInOutFunction {
         chunk: &mut Chunk,
         gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<ExecFinalizeResultType> {
         // Check if we have a final function
         let final_fn = match self.bind_data.function.in_out_function_final {

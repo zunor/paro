@@ -212,6 +212,7 @@ fn paro_indexes_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoIndexesGlobalState>());
@@ -277,98 +278,100 @@ fn paro_indexes_function(
     if count > 0 {
         // Column 0: database_name (VARCHAR)
         let db_name_refs: Vec<&str> = db_names.iter().map(|s| s.as_str()).collect();
-        let db_name_vec = Vector::from_strings(&db_name_refs);
+        let db_name_vec = Vector::try_from_strings(&db_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(0) {
             *col = db_name_vec;
         }
 
         // Column 1: database_oid (BIGINT)
-        let db_oid_vec = Vector::from_i64(&db_oids);
+        let db_oid_vec = Vector::try_from_i64(&db_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(1) {
             *col = db_oid_vec;
         }
 
         // Column 2: schema_name (VARCHAR)
         let schema_name_refs: Vec<&str> = schema_names.iter().map(|s| s.as_str()).collect();
-        let schema_name_vec = Vector::from_strings(&schema_name_refs);
+        let schema_name_vec =
+            Vector::try_from_strings(&schema_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(2) {
             *col = schema_name_vec;
         }
 
         // Column 3: schema_oid (BIGINT)
-        let schema_oid_vec = Vector::from_i64(&schema_oids);
+        let schema_oid_vec = Vector::try_from_i64(&schema_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(3) {
             *col = schema_oid_vec;
         }
 
         // Column 4: index_name (VARCHAR)
         let index_name_refs: Vec<&str> = index_names.iter().map(|s| s.as_str()).collect();
-        let index_name_vec = Vector::from_strings(&index_name_refs);
+        let index_name_vec = Vector::try_from_strings(&index_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(4) {
             *col = index_name_vec;
         }
 
         // Column 5: index_oid (BIGINT)
-        let index_oid_vec = Vector::from_i64(&index_oids);
+        let index_oid_vec = Vector::try_from_i64(&index_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(5) {
             *col = index_oid_vec;
         }
 
         // Column 6: table_name (VARCHAR)
         let table_name_refs: Vec<&str> = table_names.iter().map(|s| s.as_str()).collect();
-        let table_name_vec = Vector::from_strings(&table_name_refs);
+        let table_name_vec = Vector::try_from_strings(&table_name_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(6) {
             *col = table_name_vec;
         }
 
         // Column 7: table_oid (BIGINT)
-        let table_oid_vec = Vector::from_i64(&table_oids);
+        let table_oid_vec = Vector::try_from_i64(&table_oids, output_allocator.clone())?;
         if let Some(col) = output.column_mut(7) {
             *col = table_oid_vec;
         }
 
         // Column 8: is_unique (BOOLEAN)
-        let is_unique_vec = Vector::from_bool(&is_uniques);
+        let is_unique_vec = Vector::try_from_bool(&is_uniques, output_allocator.clone())?;
         if let Some(col) = output.column_mut(8) {
             *col = is_unique_vec;
         }
 
         // Column 9: is_primary (BOOLEAN)
-        let is_primary_vec = Vector::from_bool(&is_primaries);
+        let is_primary_vec = Vector::try_from_bool(&is_primaries, output_allocator.clone())?;
         if let Some(col) = output.column_mut(9) {
             *col = is_primary_vec;
         }
 
         // Column 10: index_type (VARCHAR)
         let index_type_refs: Vec<&str> = index_types.iter().map(|s| s.as_str()).collect();
-        let index_type_vec = Vector::from_strings(&index_type_refs);
+        let index_type_vec = Vector::try_from_strings(&index_type_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(10) {
             *col = index_type_vec;
         }
 
         // Column 11: build_state (VARCHAR)
         let build_state_refs: Vec<&str> = build_states.iter().map(|s| s.as_str()).collect();
-        let build_state_vec = Vector::from_strings(&build_state_refs);
+        let build_state_vec =
+            Vector::try_from_strings(&build_state_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(11) {
             *col = build_state_vec;
         }
 
         // Column 12: entry_count (BIGINT)
-        let entry_count_vec = Vector::from_i64(&entry_counts);
+        let entry_count_vec = Vector::try_from_i64(&entry_counts, output_allocator.clone())?;
         if let Some(col) = output.column_mut(12) {
             *col = entry_count_vec;
         }
 
         // Column 13: extra_info (VARCHAR)
         let extra_info_refs: Vec<&str> = extra_infos.iter().map(|s| s.as_str()).collect();
-        let extra_info_vec = Vector::from_strings(&extra_info_refs);
+        let extra_info_vec = Vector::try_from_strings(&extra_info_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(13) {
             *col = extra_info_vec;
         }
 
         // Column 14: sql (VARCHAR)
         let sql_refs: Vec<&str> = sqls.iter().map(|s| s.as_str()).collect();
-        let sql_vec = Vector::from_strings(&sql_refs);
+        let sql_vec = Vector::try_from_strings(&sql_refs, output_allocator.clone())?;
         if let Some(col) = output.column_mut(14) {
             *col = sql_vec;
         }
@@ -500,7 +503,7 @@ mod tests {
             global_state: Some(state),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar, // database_name
                 LogicalType::BigInt,  // database_oid
@@ -605,7 +608,7 @@ mod tests {
             global_state: Some(state_ref),
         };
 
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar, // database_name
                 LogicalType::BigInt,  // database_oid

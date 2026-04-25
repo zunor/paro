@@ -123,6 +123,7 @@ fn pragma_database_size_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let Some(gstate) = input.global_state.and_then(|state| {
         state
             .as_any()
@@ -149,19 +150,19 @@ fn pragma_database_size_function(
     let memory_limits: Vec<i64> = rows.iter().map(|row| row.memory_limit).collect();
 
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&database_names);
+        *col = Vector::try_from_strings(&database_names, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_i64(&database_sizes);
+        *col = Vector::try_from_i64(&database_sizes, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_i64(&block_sizes);
+        *col = Vector::try_from_i64(&block_sizes, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
-        *col = Vector::from_i64(&memory_usages);
+        *col = Vector::try_from_i64(&memory_usages, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(4) {
-        *col = Vector::from_i64(&memory_limits);
+        *col = Vector::try_from_i64(&memory_limits, output_allocator.clone())?;
     }
     output.set_cardinality(batch_size);
 

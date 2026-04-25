@@ -9,7 +9,7 @@
 //! - Decide when to flush based on thresholds
 //! - Provide flush to hand buffered chunks to a downstream sink
 
-use crate::buffer::{TemporaryMemoryManager, TemporaryMemoryState};
+use crate::buffer::{WriteBufferReservation, WriteBufferReserve};
 use crate::primary_key::PrimaryKeySerializer;
 use crate::tablet::{KeysType, TabletSchemaRef};
 use paro_common::allocator::{default_allocator, Allocator};
@@ -56,7 +56,7 @@ pub struct MemTableOptions {
     pub soft_max_bytes: usize,
     pub hard_max_bytes: usize,
     pub allocator: Arc<dyn Allocator>,
-    pub temp_manager: Option<Arc<TemporaryMemoryManager>>,
+    pub write_buffer_reserve: Option<Arc<dyn WriteBufferReserve>>,
     /// Spill is optional and disabled by default.
     pub spill_enabled: bool,
 }
@@ -68,7 +68,10 @@ impl std::fmt::Debug for MemTableOptions {
             .field("soft_max_bytes", &self.soft_max_bytes)
             .field("hard_max_bytes", &self.hard_max_bytes)
             .field("allocator", &self.allocator.name())
-            .field("has_temp_manager", &self.temp_manager.is_some())
+            .field(
+                "has_write_buffer_reserve",
+                &self.write_buffer_reserve.is_some(),
+            )
             .field("spill_enabled", &self.spill_enabled)
             .finish()
     }
@@ -82,7 +85,7 @@ impl MemTableOptions {
             soft_max_bytes,
             hard_max_bytes,
             allocator,
-            temp_manager: None,
+            write_buffer_reserve: None,
             spill_enabled: false,
         }
     }
@@ -103,8 +106,8 @@ impl MemTableOptions {
         self
     }
 
-    pub fn with_temp_manager(mut self, manager: Arc<TemporaryMemoryManager>) -> Self {
-        self.temp_manager = Some(manager);
+    pub fn with_write_buffer_reserve(mut self, reserve: Arc<dyn WriteBufferReserve>) -> Self {
+        self.write_buffer_reserve = Some(reserve);
         self
     }
 
@@ -131,7 +134,7 @@ pub struct MemTable {
     hard_max_bytes: usize,
     row_size: usize,
     allocator: Arc<dyn Allocator>,
-    temp_state: Option<Arc<TemporaryMemoryState>>,
+    write_buffer_reservation: Option<WriteBufferReservation>,
     #[allow(dead_code)]
     spill_enabled: bool,
     pk_serializer: Option<PrimaryKeySerializer>,
@@ -148,7 +151,10 @@ impl std::fmt::Debug for MemTable {
             .field("hard_max_bytes", &self.hard_max_bytes)
             .field("buffered_chunks", &self.buffered.len())
             .field("allocator", &self.allocator.name())
-            .field("has_temp_state", &self.temp_state.is_some())
+            .field(
+                "has_write_buffer_reservation",
+                &self.write_buffer_reservation.is_some(),
+            )
             .field("primary_keys", &self.is_primary_keys())
             .finish()
     }
@@ -252,12 +258,9 @@ impl MemTable {
             .map(|c| c.logical_type.type_size())
             .sum();
 
-        let temp_state = options.temp_manager.as_ref().map(|mgr| {
-            let state = mgr.register();
-            state.set_minimum_reservation(0);
-            state.set_zero();
-            state
-        });
+        let write_buffer_reservation = options
+            .write_buffer_reserve
+            .map(WriteBufferReservation::new);
 
         Self {
             tablet_id,
@@ -269,7 +272,7 @@ impl MemTable {
             hard_max_bytes: options.hard_max_bytes.max(options.soft_max_bytes),
             row_size,
             allocator: options.allocator,
-            temp_state,
+            write_buffer_reservation,
             spill_enabled: options.spill_enabled,
             pk_serializer: None,
             pk_row_index: HashMap::new(),
@@ -306,7 +309,7 @@ impl MemTable {
         let stored = if Arc::ptr_eq(chunk.allocator(), &self.allocator) {
             chunk.clone()
         } else {
-            chunk.deep_copy_with_allocator(self.allocator.clone())
+            chunk.try_deep_copy(self.allocator.clone())?
         };
 
         if self.is_primary_keys() {
@@ -336,7 +339,7 @@ impl MemTable {
         self.buffered.clear();
         self.pk_row_index.clear();
         self.rows = 0;
-        self.update_temp_state(0);
+        self.update_write_buffer_reservation(0);
         Ok(())
     }
 
@@ -366,7 +369,7 @@ impl MemTable {
     pub fn drain_sorted_dedup(&mut self) -> Result<MemTableDrainResult> {
         let buffered = std::mem::take(&mut self.buffered);
         self.rows = 0;
-        self.update_temp_state(0);
+        self.update_write_buffer_reservation(0);
 
         if !self.is_primary_keys() {
             self.pk_row_index.clear();
@@ -396,7 +399,7 @@ impl MemTable {
         self.buffered = mark.buffered.clone();
         self.rows = mark.rows;
         self.pk_row_index = mark.pk_row_index.clone();
-        self.update_temp_state(self.estimated_bytes());
+        self.update_write_buffer_reservation(self.estimated_bytes());
     }
 
     fn insert_primary_keys_chunk(&mut self, mut stored: Chunk) -> Result<MemTableDecision> {
@@ -469,9 +472,9 @@ impl MemTable {
         self.rows += stored.size();
         self.buffered.push(stored);
         let bytes = self.estimated_bytes();
-        self.update_temp_state(bytes);
+        let reserve_available = self.update_write_buffer_reservation(bytes);
 
-        if self.is_backpressure(bytes) {
+        if self.is_backpressure(bytes, reserve_available) {
             return Ok(MemTableDecision::Backpressure);
         }
 
@@ -505,11 +508,11 @@ impl MemTable {
     }
 
     fn materialize_rows_as_flat_chunk(source: &Chunk, row_indices: &[u32]) -> Result<Chunk> {
-        let mut chunk = Chunk::initialize_with_allocator(
+        let mut chunk = Chunk::try_initialize(
             &source.types(),
             row_indices.len(),
             source.allocator().clone(),
-        );
+        )?;
         chunk.set_cardinality(row_indices.len());
 
         for col_idx in 0..source.column_count() {
@@ -531,34 +534,30 @@ impl MemTable {
         self.rows >= self.max_rows || bytes >= self.soft_max_bytes
     }
 
-    fn is_backpressure(&self, bytes: usize) -> bool {
+    fn is_backpressure(&self, bytes: usize, reserve_available: bool) -> bool {
         if bytes >= self.hard_max_bytes {
             return true;
         }
-        if let Some(state) = &self.temp_state {
-            return state.get_reservation() < bytes;
-        }
-        false
+        !reserve_available
     }
 
-    fn update_temp_state(&self, bytes: usize) {
-        if let Some(state) = &self.temp_state {
-            if bytes == 0 {
-                state.set_zero();
-            } else {
-                state.set_remaining_size_and_update_reservation(bytes);
-            }
-        }
+    fn update_write_buffer_reservation(&self, bytes: usize) -> bool {
+        self.write_buffer_reservation
+            .as_ref()
+            .map(|reservation| reservation.resize(bytes))
+            .unwrap_or(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::WriteBufferReserve;
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
+    use crate::test_utils::*;
     use paro_common::allocator::default_allocator;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -588,9 +587,13 @@ mod tests {
 
     fn sample_chunk() -> Chunk {
         let alloc = Arc::new(default_allocator());
-        let v1 = Vector::from_i32_with_allocator(&[1, 2, 3, 4], alloc.clone());
-        let v2 = Vector::from_strings_with_allocator(&["a", "b", "c", "d"], alloc);
-        Chunk::from_arc_vectors(vec![Arc::new(v1), Arc::new(v2)])
+        let v1 =
+            paro_common::test_utils::test_i32_vector_with_allocator(&[1, 2, 3, 4], alloc.clone());
+        let v2 = paro_common::test_utils::test_string_vector_with_allocator(
+            &["a", "b", "c", "d"],
+            alloc,
+        );
+        test_chunk_from_arc_vectors(vec![Arc::new(v1), Arc::new(v2)])
     }
 
     #[test]
@@ -600,6 +603,22 @@ mod tests {
         let decision = mt.insert(&sample_chunk()).unwrap();
         assert_eq!(decision, MemTableDecision::Flush); // reached max_rows
         assert_eq!(mt.stats().rows, 4);
+    }
+
+    #[test]
+    fn write_buffer_reserve_drives_backpressure_and_releases_on_flush() {
+        let schema = test_schema();
+        let reserve = Arc::new(crate::buffer::FixedWriteBufferReserve::new(16));
+        let options = MemTableOptions::new(1024, 1024 * 1024, Arc::new(default_allocator()))
+            .with_write_buffer_reserve(reserve.clone());
+        let mut mt = MemTable::new_with_options(1, schema, options);
+
+        let decision = mt.insert(&sample_chunk()).unwrap();
+        assert_eq!(decision, MemTableDecision::Backpressure);
+        assert_eq!(reserve.reserved_bytes(), 0);
+
+        mt.flush(|_, _| Ok(())).unwrap();
+        assert_eq!(reserve.reserved_bytes(), 0);
     }
 
     #[test]
@@ -626,14 +645,19 @@ mod tests {
         let mut mt = MemTable::with_primary_keys(1, schema, serializer.clone(), 1024, 1024 * 1024);
 
         let alloc = Arc::new(default_allocator());
-        let ids = Vector::from_i32_with_allocator(&[1, 2, 2], alloc.clone());
-        let names = Vector::from_strings_with_allocator(&["old-1", "old-2", "mid-2"], alloc);
-        let first = Chunk::from_arc_vectors(vec![Arc::new(ids), Arc::new(names)]);
+        let ids =
+            paro_common::test_utils::test_i32_vector_with_allocator(&[1, 2, 2], alloc.clone());
+        let names = paro_common::test_utils::test_string_vector_with_allocator(
+            &["old-1", "old-2", "mid-2"],
+            alloc,
+        );
+        let first = test_chunk_from_arc_vectors(vec![Arc::new(ids), Arc::new(names)]);
 
         let alloc = Arc::new(default_allocator());
-        let ids = Vector::from_i32_with_allocator(&[2, 3], alloc.clone());
-        let names = Vector::from_strings_with_allocator(&["new-2", "new-3"], alloc);
-        let second = Chunk::from_arc_vectors(vec![Arc::new(ids), Arc::new(names)]);
+        let ids = paro_common::test_utils::test_i32_vector_with_allocator(&[2, 3], alloc.clone());
+        let names =
+            paro_common::test_utils::test_string_vector_with_allocator(&["new-2", "new-3"], alloc);
+        let second = test_chunk_from_arc_vectors(vec![Arc::new(ids), Arc::new(names)]);
 
         mt.insert(&first).unwrap();
         mt.insert(&second).unwrap();

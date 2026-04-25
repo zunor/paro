@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use divan::Bencher;
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DictionaryInfo, DictionarySource, Vector};
+use paro_common::vector::{DictionaryInfo, DictionarySource};
 use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
 use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
@@ -50,8 +50,11 @@ fn storage_dictionary_varchar_input(provenance_id: u64) -> Chunk {
         .collect();
     let refs: Vec<&str> = values.iter().map(String::as_str).collect();
     let selection: Vec<u32> = (0..ROWS).map(|idx| (idx % UNIQUE_VALUES) as u32).collect();
-    let vector = Vector::with_dictionary(
-        Arc::new(Vector::from_strings(&refs)),
+    let vector = paro_common::test_utils::test_with_dictionary(
+        Arc::new(paro_common::test_utils::test_string_vector_with_allocator(
+            &refs,
+            paro_common::test_utils::test_allocator(),
+        )),
         selection,
         DictionaryInfo {
             unique_len: UNIQUE_VALUES,
@@ -59,7 +62,7 @@ fn storage_dictionary_varchar_input(provenance_id: u64) -> Chunk {
             source: DictionarySource::Storage,
         },
     );
-    Chunk::from_vectors(vec![vector])
+    paro_common::test_utils::test_chunk_from_vectors(vec![vector])
 }
 
 fn length_expr() -> Expression {
@@ -87,7 +90,7 @@ fn length_expr() -> Expression {
 fn length_storage_dictionary_cache_hit(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.expr);
-    let mut output = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut output = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
 
     bencher.counter(ROWS).bench_local(|| {
         executor
@@ -108,7 +111,7 @@ fn length_storage_dictionary_cache_hit(bencher: Bencher) {
 fn length_storage_dictionary_provenance_miss(bencher: Bencher) {
     let state = bench_state();
     let mut executor = ExpressionExecutor::new(&state.expr);
-    let mut output = Vector::with_capacity(LogicalType::BigInt, ROWS);
+    let mut output = paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, ROWS);
     let mut toggle = false;
 
     bencher.counter(ROWS).bench_local(|| {

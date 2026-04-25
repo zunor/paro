@@ -11,10 +11,10 @@ py_degraded_probe(1)
 5
 
 SELECT py_degraded_probe(1);
-ERROR: python worker closed stdout unexpectedly (status: Some(ExitStatus(unix_wait_status(24832)))) (SQLSTATE=XX000)
+ERROR: python worker closed stdout unexpectedly (SQLSTATE=XX000)
 
 SELECT py_degraded_probe(1);
-ERROR: Python runtime is degraded and unavailable for external routine execution: python worker closed stdout unexpectedly (status: Some(ExitStatus(unix_wait_status(24832)))) (SQLSTATE=XX000)
+ERROR: Python runtime is degraded and unavailable for external routine execution: python worker closed stdout unexpectedly (SQLSTATE=XX000)
 
 SELECT 6 * 7;
 6 * 7

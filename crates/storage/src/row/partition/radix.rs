@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::{BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{GrantAllocator, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
 
@@ -142,6 +144,39 @@ impl RadixPartitionedRowsBuilder {
         radix_bits: usize,
         hash_col_idx: usize,
     ) -> Result<Self> {
+        let memory = MemoryAccountingContext::detached(
+            tag,
+            paro_common::memory::MemoryAccountingClass::default_for_tag(tag),
+        );
+        Self::new_with_memory(buffer_pool, layout, tag, radix_bits, hash_col_idx, memory)
+    }
+
+    pub fn new_with_grant_allocator(
+        buffer_pool: Arc<BufferPool>,
+        layout: Arc<RowLayout>,
+        tag: MemoryTag,
+        radix_bits: usize,
+        hash_col_idx: usize,
+        grant_allocator: GrantAllocator<'_>,
+    ) -> Result<Self> {
+        Self::new_with_memory(
+            buffer_pool,
+            layout,
+            tag,
+            radix_bits,
+            hash_col_idx,
+            MemoryAccountingContext::from_grant_allocator(&grant_allocator),
+        )
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        layout: Arc<RowLayout>,
+        tag: MemoryTag,
+        radix_bits: usize,
+        hash_col_idx: usize,
+        memory: MemoryAccountingContext,
+    ) -> Result<Self> {
         let partitioner = Arc::new(RadixPartitionComputer::try_new(
             layout.as_ref(),
             radix_bits,
@@ -150,7 +185,13 @@ impl RadixPartitionedRowsBuilder {
         Ok(Self {
             radix_bits,
             hash_col_idx,
-            inner: PartitionedRowsBuilder::new(buffer_pool, layout, tag, partitioner),
+            inner: PartitionedRowsBuilder::new_with_memory(
+                buffer_pool,
+                layout,
+                tag,
+                partitioner,
+                memory,
+            ),
         })
     }
 
@@ -293,8 +334,14 @@ impl RadixPartitionedRows {
             new_radix_bits,
             self.hash_col_idx,
         )?);
-        let mut builder = PartitionedRowsBuilder::new(buffer_pool, layout, tag, partitioner);
-        let mut chunk = Chunk::new();
+        let allocator = Arc::new(BufferAllocator::new(
+            Arc::clone(&buffer_pool) as Arc<dyn BufferManager>,
+            tag,
+        ));
+        let memory = self.inner.memory().clone();
+        let mut builder =
+            PartitionedRowsBuilder::new_with_memory(buffer_pool, layout, tag, partitioner, memory);
+        let mut chunk = Chunk::try_new(allocator)?;
 
         for partition in self.inner.into_partitions() {
             let mut scanner = partition.scanner();
@@ -317,31 +364,31 @@ impl RadixPartitionedRows {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use super::*;
 
     fn radix_input() -> Chunk {
-        let mut hashes = Vector::with_capacity(LogicalType::UBigInt, 4);
+        let mut hashes = test_vector_with_capacity(LogicalType::UBigInt, 4);
         hashes.set_u64(0, 0);
         hashes.set_u64(1, 1 << 63);
         hashes.set_u64(2, 0);
         hashes.set_u64(3, 1 << 63);
         hashes.set_count(4);
 
-        let mut payload = Vector::with_capacity(LogicalType::Integer, 4);
+        let mut payload = test_vector_with_capacity(LogicalType::Integer, 4);
         payload.set_i32(0, 10);
         payload.set_i32(1, 20);
         payload.set_i32(2, 30);
         payload.set_i32(3, 40);
         payload.set_count(4);
 
-        Chunk::from_vectors(vec![hashes, payload])
+        test_chunk_from_vectors(vec![hashes, payload])
     }
 
     #[test]
@@ -410,7 +457,7 @@ mod tests {
         assert_eq!(repartitioned.partition_count(), 4);
 
         let pinned = first_partition.pin_rows(&[addr]).unwrap();
-        let mut output = Chunk::initialize(first_partition.layout().types(), 1);
+        let mut output = test_chunk_with_capacity(first_partition.layout().types(), 1);
         pinned.gather_columns(&[0, 1], &mut output, 0).unwrap();
 
         assert_eq!(output.get_value(0, 0), Some(Value::UBigInt(0)));

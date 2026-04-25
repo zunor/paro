@@ -4,12 +4,11 @@
 use crate::database::opener::DatabaseOpenContext;
 use crate::file_system::DatabaseFileSystem;
 use crate::{BootConfig, Instance};
+use paro_execution::memory_runtime::{MemoryArbitrator, SystemReserve};
 use paro_external_runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
-use paro_storage::buffer::{
-    BufferManager, BufferPool, TemporaryMemoryConfig, TemporaryMemoryManager,
-};
+use paro_storage::buffer::{BufferManager, BufferPool};
 use std::sync::Arc;
 
 pub mod connection_registry;
@@ -29,7 +28,8 @@ pub struct InstanceRuntime {
     buffer_pool: Arc<BufferPool>,
     buffer_manager: Arc<dyn BufferManager>,
     scheduler: Arc<TaskScheduler>,
-    temporary_memory_manager: Arc<TemporaryMemoryManager>,
+    memory_arbitrator: Arc<MemoryArbitrator>,
+    system_reserve: Arc<SystemReserve>,
     connection_registry: Arc<ConnectionRegistry>,
     session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
@@ -42,7 +42,8 @@ pub(crate) struct InstanceRuntimeResources {
     pub(crate) buffer_pool: Arc<BufferPool>,
     pub(crate) buffer_manager: Arc<dyn BufferManager>,
     pub(crate) scheduler: Arc<TaskScheduler>,
-    pub(crate) temporary_memory_manager: Arc<TemporaryMemoryManager>,
+    pub(crate) memory_arbitrator: Arc<MemoryArbitrator>,
+    pub(crate) system_reserve: Arc<SystemReserve>,
     pub(crate) connection_registry: Arc<ConnectionRegistry>,
     pub(crate) session_registry: Arc<SessionExecutionRegistry>,
     pub(crate) object_cache: Arc<ObjectCache>,
@@ -56,7 +57,8 @@ impl InstanceRuntime {
             buffer_pool,
             buffer_manager,
             scheduler,
-            temporary_memory_manager,
+            memory_arbitrator,
+            system_reserve,
             connection_registry,
             session_registry,
             object_cache,
@@ -67,7 +69,8 @@ impl InstanceRuntime {
             buffer_pool,
             buffer_manager,
             scheduler,
-            temporary_memory_manager,
+            memory_arbitrator,
+            system_reserve,
             connection_registry,
             session_registry,
             object_cache,
@@ -89,8 +92,12 @@ impl InstanceRuntime {
         &self.scheduler
     }
 
-    pub fn temporary_memory_manager(&self) -> &Arc<TemporaryMemoryManager> {
-        &self.temporary_memory_manager
+    pub fn memory_arbitrator(&self) -> &Arc<MemoryArbitrator> {
+        &self.memory_arbitrator
+    }
+
+    pub fn system_reserve(&self) -> &Arc<SystemReserve> {
+        &self.system_reserve
     }
 
     pub fn connection_registry(&self) -> &Arc<ConnectionRegistry> {
@@ -133,43 +140,16 @@ impl InstanceRuntime {
         }
     }
 
-    pub fn refresh_temporary_memory_configuration(
-        &self,
-        session_threads: Option<usize>,
-        force_external: bool,
-    ) {
-        let options = self.tuning.snapshot();
-        let memory_limit = self.buffer_manager.get_max_memory();
-        let num_threads = session_threads.unwrap_or_else(|| options.effective_max_threads());
-        let num_connections = self
-            .connection_registry
-            .get_active_connection_count()
-            .max(1);
-        let has_temp_dir =
-            options.use_temporary_directory && self.buffer_pool.has_temporary_directory();
-
-        self.temporary_memory_manager
-            .update_configuration(TemporaryMemoryConfig {
-                memory_limit,
-                has_temporary_directory: has_temp_dir,
-                num_threads,
-                num_connections,
-                query_max_memory: memory_limit,
-                force_external,
-            });
-    }
-
     pub fn set_memory_limit(&self, limit: usize) -> paro_common::error::Result<()> {
         self.buffer_manager.set_memory_limit(limit)?;
         self.tuning.set_maximum_memory(limit);
-        self.refresh_temporary_memory_configuration(None, false);
+        self.memory_arbitrator.set_buffer_pool_limit(limit);
         Ok(())
     }
 
     pub fn set_temporary_directory(&self, path: String) -> paro_common::error::Result<()> {
         self.buffer_manager.set_temporary_directory(path.clone())?;
         self.tuning.set_temporary_directory(path);
-        self.refresh_temporary_memory_configuration(None, false);
         Ok(())
     }
 
@@ -185,7 +165,6 @@ impl InstanceRuntime {
     pub fn set_threads(&self, threads: usize) -> paro_common::error::Result<()> {
         self.scheduler.set_threads(threads)?;
         self.tuning.set_maximum_threads(Some(threads));
-        self.refresh_temporary_memory_configuration(None, false);
         Ok(())
     }
 }
@@ -199,8 +178,12 @@ impl Instance {
         self.runtime.buffer_manager()
     }
 
-    pub fn get_temporary_memory_manager(&self) -> &Arc<TemporaryMemoryManager> {
-        self.runtime.temporary_memory_manager()
+    pub fn get_memory_arbitrator(&self) -> &Arc<MemoryArbitrator> {
+        self.runtime.memory_arbitrator()
+    }
+
+    pub fn get_system_reserve(&self) -> &Arc<SystemReserve> {
+        self.runtime.system_reserve()
     }
 
     pub fn get_scheduler(&self) -> &Arc<TaskScheduler> {
@@ -241,15 +224,6 @@ impl Instance {
 
     pub fn cast_functions(&self) -> &Arc<CastFunctionSet> {
         &self.boot_config.cast_functions
-    }
-
-    pub fn refresh_temporary_memory_configuration(
-        &self,
-        session_threads: Option<usize>,
-        force_external: bool,
-    ) {
-        self.runtime
-            .refresh_temporary_memory_configuration(session_threads, force_external);
     }
 
     pub fn set_memory_limit(&self, limit: usize) -> paro_common::error::Result<()> {

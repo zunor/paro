@@ -14,13 +14,15 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
+use paro_context::QueryMemoryCoordinator;
 use paro_planner::operator::{ExplainFormat, ExplainSpec};
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::{
     build_explain_doc, render_explain_json_string, render_explain_text_lines,
 };
-use crate::explain::types::{ExplainProperty, ExplainValue};
+use crate::explain::types::{format_bytes, ExplainProperty, ExplainValue};
+use crate::memory_runtime::QueryMemoryPool;
 use crate::operator::state::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, OperatorSinkCombineInput,
     OperatorSinkFinalizeInput, OperatorSinkInput, OperatorSourceInput,
@@ -38,6 +40,8 @@ pub struct ExplainAnalyze {
     child: Arc<dyn PhysicalOperator>,
     spec: ExplainSpec,
     sink_state: Mutex<Option<Arc<dyn GlobalSinkState>>>,
+    query_memory_pool: Mutex<Option<Arc<QueryMemoryPool>>>,
+    memory_coordinator: Mutex<Option<Arc<dyn QueryMemoryCoordinator>>>,
 }
 
 impl ExplainAnalyze {
@@ -47,6 +51,24 @@ impl ExplainAnalyze {
             child,
             spec,
             sink_state: Mutex::new(None),
+            query_memory_pool: Mutex::new(None),
+            memory_coordinator: Mutex::new(None),
+        }
+    }
+
+    fn capture_runtime_context(&self, ctx: &ExecutionContext) {
+        if !self.spec.detail.memory {
+            return;
+        }
+        let mut query_memory_pool = self.query_memory_pool.lock();
+        if query_memory_pool.is_none() {
+            *query_memory_pool = Some(ctx.query_memory_pool());
+        }
+        drop(query_memory_pool);
+
+        let mut memory_coordinator = self.memory_coordinator.lock();
+        if memory_coordinator.is_none() {
+            *memory_coordinator = ctx.session.services.infra.query_memory_coordinator.clone();
         }
     }
 
@@ -74,12 +96,63 @@ impl ExplainAnalyze {
                     ExplainValue::Bytes(temp_storage_bytes),
                 ));
             }
+            if self.spec.detail.memory {
+                if let Some(pool) = self.query_memory_pool.lock().clone() {
+                    let stats = pool.runtime_stats();
+                    let has_observable_events = query_memory_stats_has_observable_events(&stats);
+                    if has_observable_events {
+                        doc.summary.push(ExplainProperty::new(
+                            "Query Memory",
+                            ExplainValue::String(format!(
+                                "capacity={} issued={} published={} reclaimable={}",
+                                format_bytes(stats.capacity_bytes as u64),
+                                format_bytes(stats.issued_bytes as u64),
+                                format_bytes(stats.published_used_bytes as u64),
+                                format_bytes(stats.reclaimable_bytes as u64)
+                            )),
+                        ));
+                    }
+                    if has_observable_events {
+                        doc.summary.push(ExplainProperty::new(
+                            "Query Memory Events",
+                            ExplainValue::String(format!(
+                                "leaked={} output_buffer={} refills={} reclaim_attempts={}",
+                                format_bytes(stats.leaked_grant_bytes as u64),
+                                format_bytes(stats.output_buffer_bytes as u64),
+                                stats.local_refill_count,
+                                stats.reclaim_attempt_count
+                            )),
+                        ));
+                    }
+                }
+                if let Some(coordinator) = self.memory_coordinator.lock().clone() {
+                    let retained = coordinator.session_retained_bytes();
+                    if retained > 0 {
+                        doc.summary.push(ExplainProperty::new(
+                            "Session Retained",
+                            ExplainValue::Bytes(retained as u64),
+                        ));
+                    }
+                }
+            }
         }
         match self.spec.format {
             ExplainFormat::Text => render_explain_text_lines(&doc),
             ExplainFormat::Json => vec![render_explain_json_string(&doc)],
         }
     }
+}
+
+fn query_memory_stats_has_observable_events(
+    stats: &crate::memory_runtime::MemoryRuntimeStats,
+) -> bool {
+    stats.leaked_grant_bytes > 0
+        || stats.output_buffer_bytes > 0
+        || stats.reclaim_attempt_count > 0
+        || stats.reclaimed_bytes > 0
+        || stats.spilled_bytes > 0
+        || stats.reclaim_latency_us > 0
+        || stats.spill_latency_us > 0
 }
 
 #[derive(Debug)]
@@ -194,7 +267,8 @@ impl PhysicalOperator for ExplainAnalyze {
         true
     }
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+        self.capture_runtime_context(ctx);
         Ok(Box::new(ExplainAnalyzeGlobalSinkState {
             start_time: Instant::now(),
             rows_returned: Mutex::new(0),
@@ -209,10 +283,11 @@ impl PhysicalOperator for ExplainAnalyze {
 
     fn sink(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         chunk: &Chunk,
         input: &mut OperatorSinkInput,
     ) -> Result<SinkResultType> {
+        self.capture_runtime_context(ctx);
         let lstate = input
             .local_state
             .as_any_mut()
@@ -352,8 +427,7 @@ impl PhysicalOperator for ExplainAnalyze {
         let remaining = gstate.analyzed_lines.len() - lstate.next_line;
         let output_count = remaining.min(VECTOR_SIZE);
         let allocator = ctx.allocator(MemoryTag::Allocator);
-        let mut output_chunk =
-            Chunk::initialize_with_allocator(&self.output_types, output_count, allocator);
+        let mut output_chunk = Chunk::try_initialize(&self.output_types, output_count, allocator)?;
 
         let output_vector = output_chunk.column_mut(0).ok_or_else(|| {
             paro_error::internal("ExplainAnalyze output chunk missing column".to_string())

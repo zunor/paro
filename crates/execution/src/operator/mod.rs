@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::execution_context::ExecutionContext;
 use crate::explain::profiler::ExplainProfiler;
 use crate::explain::types::{ExplainNodeId, ExplainRuntimeStats, ExplainSchema};
+use crate::memory_runtime::OperatorMemoryScope;
 use crate::operator::state::{
     EmptyGlobalOperatorState, EmptyGlobalSinkState, EmptyGlobalSourceState, EmptyLocalSinkState,
     EmptyLocalSourceState, EmptyOperatorState, GlobalOperatorState, GlobalSinkState,
@@ -337,6 +338,7 @@ pub trait PhysicalOperator: Send + Sync + fmt::Debug {
         _chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         _state: &mut dyn OperatorState,
+        _memory: OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         Err(paro_error::internal(
             "Execute called on non-operator".to_string(),
@@ -353,6 +355,7 @@ pub trait PhysicalOperator: Send + Sync + fmt::Debug {
         _chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         _state: &mut dyn OperatorState,
+        _memory: OperatorMemoryScope<'_>,
     ) -> Result<OperatorFinalizeResultType> {
         Ok(OperatorFinalizeResultType::Finished)
     }

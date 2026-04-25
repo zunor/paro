@@ -109,7 +109,7 @@ fn array_length_impl(
             }
         }
         LogicalType::List(_) => {
-            let entries = array_vec.to_view(count);
+            let entries = array_vec.try_to_view(count)?;
             let child = list_child_vector(array_vec)?;
 
             for i in 0..count {
@@ -193,7 +193,11 @@ mod tests {
 
     fn sample_array_vector() -> Vector {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 3);
-        let mut array_vec = Vector::new_array(array_type, 2);
+        let mut array_vec = paro_common::test_utils::test_new_array_with_allocator(
+            array_type,
+            2,
+            paro_common::test_utils::test_allocator(),
+        );
         array_vec.set_count(2);
         array_vec.set_value(
             0,
@@ -217,10 +221,16 @@ mod tests {
     #[test]
     fn test_array_length_array_dim1() {
         let array_vec = sample_array_vector();
-        let dim_vec = Vector::from_i32(&[1, 1]);
-        let chunk = Chunk::from_vectors(vec![array_vec, dim_vec]);
+        let dim_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, dim_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         array_length_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_i32(0), Some(3));
@@ -233,7 +243,11 @@ mod tests {
             Box::new(LogicalType::Array(Box::new(LogicalType::Integer), 3)),
             2,
         );
-        let mut array_vec = Vector::new_array(nested_type, 2);
+        let mut array_vec = paro_common::test_utils::test_new_array_with_allocator(
+            nested_type,
+            2,
+            paro_common::test_utils::test_allocator(),
+        );
         array_vec.set_count(2);
         array_vec.set_value(
             0,
@@ -274,10 +288,16 @@ mod tests {
             ),
         );
 
-        let dim_vec = Vector::from_i32(&[1, 2]);
-        let chunk = Chunk::from_vectors(vec![array_vec, dim_vec]);
+        let dim_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, dim_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         array_length_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_i32(0), Some(2));
@@ -286,10 +306,17 @@ mod tests {
 
     #[test]
     fn test_array_length_list_dim1() {
-        let mut list_vec =
-            Vector::with_capacity(LogicalType::List(Box::new(LogicalType::Integer)), 2);
+        let mut list_vec = paro_common::test_utils::test_vector_with_capacity(
+            LogicalType::List(Box::new(LogicalType::Integer)),
+            2,
+        );
         list_vec.set_count(2);
-        list_vec.set_child(Arc::new(Vector::from_i32(&[10, 20, 30, 40, 50])));
+        list_vec.set_child(Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20, 30, 40, 50],
+                paro_common::test_utils::test_allocator(),
+            ),
+        ));
 
         unsafe {
             let entries = list_vec.flat_data_mut::<u32>();
@@ -299,10 +326,16 @@ mod tests {
             *entries.add(3) = 3;
         }
 
-        let dim_vec = Vector::from_i32(&[1, 1]);
-        let chunk = Chunk::from_vectors(vec![list_vec, dim_vec]);
+        let dim_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 1],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![list_vec, dim_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         array_length_impl(&chunk, &state, &mut result).unwrap();
         assert_eq!(result.get_i32(0), Some(2));
@@ -312,10 +345,16 @@ mod tests {
     #[test]
     fn test_array_length_invalid_dimension_errors() {
         let array_vec = sample_array_vector();
-        let dim_vec = Vector::from_i32(&[2, 2]);
-        let chunk = Chunk::from_vectors(vec![array_vec, dim_vec]);
+        let dim_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2, 2],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, dim_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         let err = array_length_impl(&chunk, &state, &mut result).unwrap_err();
         assert!(err.to_string().contains("array_length dimension"));
@@ -325,11 +364,17 @@ mod tests {
     fn test_array_length_null_propagation() {
         let mut array_vec = sample_array_vector();
         array_vec.set_null(1, true);
-        let mut dim_vec = Vector::from_i32(&[1, 1]);
+        let mut dim_vec = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 1],
+            paro_common::test_utils::test_allocator(),
+        );
         dim_vec.set_null(0, true);
-        let chunk = Chunk::from_vectors(vec![array_vec, dim_vec]);
+        let chunk = Chunk::from_vectors(
+            vec![array_vec, dim_vec],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Integer);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
 
         array_length_impl(&chunk, &state, &mut result).unwrap();
         assert!(result.is_null(0));

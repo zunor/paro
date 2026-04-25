@@ -5,15 +5,17 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-use paro_common::allocator::{default_allocator, ArenaAllocator};
+use paro_common::allocator::{Allocator, ArenaAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner, MemoryOwnerAllocator,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
@@ -22,6 +24,9 @@ use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_bound_expression;
 use crate::explain::types::ExplainRuntimeStats;
+use crate::operator::aggregate::accounted_rows::{
+    aggregate_modifier_memory_context, AccountedValueRow, AccountedValueRowSet, AccountedValueRows,
+};
 use crate::operator::aggregate::aggregate_kernel::{
     combine_states, destroy_states, finalize_states, initialize_states, update_filtered_states,
     update_states, AggregatePayload,
@@ -50,6 +55,12 @@ pub struct UngroupedAggregate {
     shared: Arc<UngroupedAggregateShared>,
 }
 
+type DistinctRows = Option<AccountedValueRowSet>;
+type OrderedRows = AccountedValueRows;
+
+const UNGROUPED_AGGREGATE_MEMORY_TAG: MemoryTag = MemoryTag::HashTable;
+const UNGROUPED_AGGREGATE_MEMORY_CLASS: MemoryAccountingClass = MemoryAccountingClass::Revocable;
+
 impl UngroupedAggregate {
     pub fn new(
         aggregate_data: GroupedAggregateData,
@@ -69,11 +80,7 @@ impl UngroupedAggregate {
             }
         }
         let layout = AggregateStateLayout::new(&aggregate_objects)?;
-        let shared = Arc::new(UngroupedAggregateShared::new(
-            &layout,
-            &aggregate_objects,
-            ArenaAllocator::new(Arc::new(default_allocator())),
-        )?);
+        let shared = Arc::new(UngroupedAggregateShared::new());
         Ok(Self {
             aggregate_data,
             aggregate_objects,
@@ -86,8 +93,8 @@ impl UngroupedAggregate {
         })
     }
 
-    fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> SelectionVector {
-        let filter_format = filter_vec.decode(row_count);
+    fn build_filter_selection(filter_vec: &Vector, row_count: usize) -> Result<SelectionVector> {
+        let filter_format = filter_vec.try_decode(row_count)?;
         let filter_data = filter_format.get_data::<bool>();
         let mut selected_rows = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
@@ -100,7 +107,7 @@ impl UngroupedAggregate {
                 selected_rows.push(row_idx as u32);
             }
         }
-        SelectionVector::from_indices(selected_rows)
+        SelectionVector::try_from_indices(selected_rows, filter_vec.allocator().clone())
     }
 
     fn compare_order_values(
@@ -165,14 +172,18 @@ impl UngroupedAggregate {
                 filter_vec.logical_type()
             )));
         }
-        Ok(Some(Self::build_filter_selection(filter_vec, chunk.size())))
+        Ok(Some(Self::build_filter_selection(
+            filter_vec,
+            chunk.size(),
+        )?))
     }
 
     fn collect_distinct_rows_for_aggregate(
         &self,
         agg_idx: usize,
         chunk: &Chunk,
-        distinct_rows: &mut Option<HashSet<Vec<Value>>>,
+        distinct_rows: &mut DistinctRows,
+        modifier_memory: &MemoryAccountingContext,
     ) -> Result<()> {
         let aggregate = &self.aggregate_objects[agg_idx];
         if !aggregate.is_distinct() {
@@ -180,7 +191,8 @@ impl UngroupedAggregate {
         }
         let input_indices = &self.aggregate_data.aggregate_inputs[agg_idx];
         let filter_selection = self.filter_selection_for_aggregate(agg_idx, chunk)?;
-        let distinct = distinct_rows.get_or_insert_with(HashSet::new);
+        let distinct =
+            distinct_rows.get_or_insert_with(|| AccountedValueRowSet::new(modifier_memory.clone()));
 
         let mut append_row = |row_idx: usize| -> Result<()> {
             let mut key = Vec::with_capacity(input_indices.len());
@@ -192,7 +204,7 @@ impl UngroupedAggregate {
                 })?;
                 key.push(input_col.get_value(row_idx));
             }
-            distinct.insert(key);
+            distinct.insert(key)?;
             Ok(())
         };
 
@@ -213,7 +225,7 @@ impl UngroupedAggregate {
         &self,
         agg_idx: usize,
         chunk: &Chunk,
-        ordered_rows: &mut Vec<Vec<Value>>,
+        ordered_rows: &mut OrderedRows,
     ) -> Result<()> {
         let aggregate = &self.aggregate_objects[agg_idx];
         if aggregate.order_bys.is_empty() {
@@ -248,7 +260,7 @@ impl UngroupedAggregate {
                 })?;
                 row_values.push(order_col.get_value(row_idx));
             }
-            ordered_rows.push(row_values);
+            ordered_rows.push(row_values)?;
             Ok(())
         };
 
@@ -280,7 +292,11 @@ impl UngroupedAggregate {
 
         let state_offset = self.layout.state_offset(agg_idx);
         let state_ptr = unsafe { state.base_ptr().add(state_offset) };
-        let mut states = Vector::with_capacity(LogicalType::BigInt, row_count);
+        let mut states = Vector::try_new(
+            LogicalType::BigInt,
+            row_count,
+            state.arena_allocator.get_allocator().clone(),
+        )?;
         states.set_count(row_count);
         let state_ptrs = unsafe { states.flat_data_mut::<*mut u8>() };
         for row_idx in 0..row_count {
@@ -355,7 +371,11 @@ impl UngroupedAggregate {
                 continue;
             }
 
-            let row_values = rows.into_iter().collect::<Vec<_>>();
+            let row_values = rows
+                .into_rows()
+                .into_iter()
+                .map(AccountedValueRow::into_values)
+                .collect::<Vec<_>>();
             let input_count = self.aggregate_data.aggregate_inputs[agg_idx].len();
             for row in &row_values {
                 if row.len() != input_count {
@@ -375,8 +395,14 @@ impl UngroupedAggregate {
                 .collect::<Vec<_>>();
             let mut input_vectors = input_types
                 .into_iter()
-                .map(|ty| Vector::with_capacity(ty, row_values.len()))
-                .collect::<Vec<_>>();
+                .map(|ty| {
+                    Vector::try_new(
+                        ty,
+                        row_values.len(),
+                        lstate.state.arena_allocator.get_allocator().clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
             for input_vector in &mut input_vectors {
                 input_vector.set_count(row_values.len());
             }
@@ -389,6 +415,7 @@ impl UngroupedAggregate {
 
             let offset = self.layout.state_offset(agg_idx);
             let state_ptr = unsafe { lstate.state.base_ptr().add(offset) };
+            let state_vector_allocator = lstate.state.arena_allocator.get_allocator().clone();
             let input_data = AggregateInputData::new(
                 aggregate.bind_info.as_deref(),
                 &mut lstate.state.arena_allocator,
@@ -398,7 +425,11 @@ impl UngroupedAggregate {
                 if let Some(simple_update) = aggregate.function.simple_update {
                     simple_update(&input_refs, &input_data, state_ptr, row_values.len());
                 } else {
-                    let mut states = Vector::new(LogicalType::BigInt);
+                    let mut states = Vector::try_new(
+                        LogicalType::BigInt,
+                        row_values.len(),
+                        state_vector_allocator,
+                    )?;
                     states.set_count(row_values.len());
                     let state_ptrs = states.flat_data_mut::<*mut u8>();
                     for row_idx in 0..row_values.len() {
@@ -432,7 +463,7 @@ impl UngroupedAggregate {
                 continue;
             }
 
-            let mut rows = std::mem::take(&mut lstate.ordered_rows[agg_idx]);
+            let mut rows = lstate.ordered_rows[agg_idx].take();
             if rows.is_empty() {
                 continue;
             }
@@ -486,8 +517,14 @@ impl UngroupedAggregate {
                 .collect::<Vec<_>>();
             let mut input_vectors = input_types
                 .into_iter()
-                .map(|ty| Vector::with_capacity(ty, rows.len()))
-                .collect::<Vec<_>>();
+                .map(|ty| {
+                    Vector::try_new(
+                        ty,
+                        rows.len(),
+                        lstate.state.arena_allocator.get_allocator().clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
             for input_vector in &mut input_vectors {
                 input_vector.set_count(rows.len());
             }
@@ -500,6 +537,7 @@ impl UngroupedAggregate {
 
             let offset = self.layout.state_offset(agg_idx);
             let state_ptr = unsafe { lstate.state.base_ptr().add(offset) };
+            let state_vector_allocator = lstate.state.arena_allocator.get_allocator().clone();
             let input_data = AggregateInputData::new(
                 aggregate.bind_info.as_deref(),
                 &mut lstate.state.arena_allocator,
@@ -509,7 +547,8 @@ impl UngroupedAggregate {
                 if let Some(simple_update) = aggregate.function.simple_update {
                     simple_update(&input_refs, &input_data, state_ptr, rows.len());
                 } else {
-                    let mut states = Vector::new(LogicalType::BigInt);
+                    let mut states =
+                        Vector::try_new(LogicalType::BigInt, rows.len(), state_vector_allocator)?;
                     states.set_count(rows.len());
                     let state_ptrs = states.flat_data_mut::<*mut u8>();
                     for row_idx in 0..rows.len() {
@@ -536,27 +575,16 @@ impl fmt::Debug for UngroupedAggregate {
 
 #[derive(Debug)]
 struct UngroupedAggregateShared {
-    state: Mutex<UngroupedAggregateState>,
+    state: Mutex<Option<UngroupedAggregateState>>,
     peak_memory_bytes: AtomicUsize,
 }
 
 impl UngroupedAggregateShared {
-    fn new(
-        layout: &AggregateStateLayout,
-        aggregate_objects: &[AggregateObject],
-        arena_allocator: ArenaAllocator,
-    ) -> Result<Self> {
-        let mut buffer = allocate_state_buffer(layout.total_size())?;
-        initialize_state_buffer(layout, aggregate_objects, &mut buffer)?;
-        let state = UngroupedAggregateState {
-            state_buffer: buffer,
-            arena_allocator,
-            destroyed: false,
-        };
-        Ok(Self {
-            peak_memory_bytes: AtomicUsize::new(state.memory_usage_bytes()),
-            state: Mutex::new(state),
-        })
+    fn new() -> Self {
+        Self {
+            peak_memory_bytes: AtomicUsize::new(0),
+            state: Mutex::new(None),
+        }
     }
 
     fn record_peak(&self, bytes: usize) {
@@ -600,9 +628,10 @@ impl GlobalSourceState for UngroupedAggregateGlobalState {
 struct UngroupedAggregateLocalSinkState {
     state: UngroupedAggregateState,
     aggregate_objects: Vec<AggregateObject>,
-    ordered_rows: Vec<Vec<Vec<Value>>>,
+    modifier_memory: MemoryAccountingContext,
+    ordered_rows: Vec<OrderedRows>,
     ordered_finalized: bool,
-    distinct_rows: Vec<Option<HashSet<Vec<Value>>>>,
+    distinct_rows: Vec<DistinctRows>,
     distinct_finalized: bool,
 }
 
@@ -660,7 +689,10 @@ impl UngroupedAggregateState {
         if self.destroyed {
             return Ok(());
         }
-        let addresses = single_state_addresses(self.base_ptr());
+        let addresses = single_state_addresses(
+            self.base_ptr(),
+            self.arena_allocator.get_allocator().clone(),
+        )?;
         let mut input_data = AggregateInputData::new(
             None,
             &mut self.arena_allocator,
@@ -684,61 +716,28 @@ impl Drop for UngroupedAggregateGlobalState {
             return;
         }
         if let Ok(mut guard) = self.shared.state.lock() {
-            let _ = guard.destroy_once(&self.aggregate_objects);
+            if let Some(state) = guard.as_mut() {
+                let _ = state.destroy_once(&self.aggregate_objects);
+            }
         }
     }
 }
 
-fn single_state_addresses(base_ptr: *mut u8) -> Vector {
-    let mut addresses = Vector::new(LogicalType::BigInt);
+fn single_state_addresses(
+    base_ptr: *mut u8,
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
+) -> Result<Vector> {
+    let mut addresses = Vector::try_new(LogicalType::BigInt, 1, allocator)?;
     addresses.set_count(1);
     unsafe {
         *addresses.flat_data_mut::<*mut u8>() = base_ptr;
     }
-    addresses
-}
-
-fn values_memory_usage(values: &Vec<Value>) -> usize {
-    values.capacity() * size_of::<Value>()
-        + values.iter().map(Value::allocation_size).sum::<usize>()
-}
-
-fn nested_values_memory_usage(rows: &Vec<Vec<Value>>) -> usize {
-    rows.capacity() * size_of::<Vec<Value>>()
-        + rows
-            .iter()
-            .map(|row| values_memory_usage(row))
-            .sum::<usize>()
-}
-
-fn distinct_rows_memory_usage(rows: &Vec<Option<HashSet<Vec<Value>>>>) -> usize {
-    rows.capacity() * size_of::<Option<HashSet<Vec<Value>>>>()
-        + rows
-            .iter()
-            .map(|row_set| {
-                row_set
-                    .as_ref()
-                    .map(|set| {
-                        set.iter()
-                            .map(|row| values_memory_usage(row))
-                            .sum::<usize>()
-                            + set.len() * size_of::<Vec<Value>>()
-                    })
-                    .unwrap_or(0)
-            })
-            .sum::<usize>()
+    Ok(addresses)
 }
 
 impl UngroupedAggregateLocalSinkState {
     fn memory_usage_bytes(&self) -> usize {
         self.state.memory_usage_bytes()
-            + self.ordered_rows.capacity() * size_of::<Vec<Vec<Value>>>()
-            + self
-                .ordered_rows
-                .iter()
-                .map(|rows| nested_values_memory_usage(rows))
-                .sum::<usize>()
-            + distinct_rows_memory_usage(&self.distinct_rows)
     }
 }
 
@@ -746,6 +745,7 @@ fn initialize_state_buffer(
     layout: &AggregateStateLayout,
     aggregate_objects: &[AggregateObject],
     state_buffer: &mut Vec<u64>,
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
 ) -> Result<()> {
     let buffer_bytes = state_buffer
         .len()
@@ -763,7 +763,7 @@ fn initialize_state_buffer(
             buffer_bytes
         )));
     }
-    let addresses = single_state_addresses(state_buffer.as_mut_ptr() as *mut u8);
+    let addresses = single_state_addresses(state_buffer.as_mut_ptr() as *mut u8, allocator)?;
     initialize_states(layout, aggregate_objects, &addresses, 1)
 }
 
@@ -777,6 +777,7 @@ impl PhysicalOperator for UngroupedAggregate {
             spilled: None,
             peak_memory_bytes: Some(self.shared.peak_memory_bytes() as u64),
             temp_storage_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -832,20 +833,25 @@ impl PhysicalOperator for UngroupedAggregate {
     }
 
     fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .map_err(|e| paro_error::internal(e.to_string()))?;
-            state.arena_allocator = ctx.arena_allocator();
-            state.destroyed = false;
-            initialize_state_buffer(
-                &self.layout,
-                &self.aggregate_objects,
-                &mut state.state_buffer,
-            )?;
-        }
+        let mut state_buffer = allocate_state_buffer(self.layout.total_size())?;
+        let arena_allocator = ArenaAllocator::new(ungrouped_aggregate_allocator(ctx));
+        initialize_state_buffer(
+            &self.layout,
+            &self.aggregate_objects,
+            &mut state_buffer,
+            arena_allocator.get_allocator().clone(),
+        )?;
+        let state = UngroupedAggregateState {
+            state_buffer,
+            arena_allocator,
+            destroyed: false,
+        };
+        self.shared.record_peak(state.memory_usage_bytes());
+        *self
+            .shared
+            .state
+            .lock()
+            .map_err(|e| paro_error::internal(e.to_string()))? = Some(state);
         Ok(Box::new(UngroupedAggregateGlobalState {
             shared: self.shared.clone(),
             aggregate_objects: self.aggregate_objects.clone(),
@@ -855,16 +861,26 @@ impl PhysicalOperator for UngroupedAggregate {
 
     fn get_local_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn LocalSinkState>> {
         let mut state_buffer = allocate_state_buffer(self.layout.total_size())?;
-        initialize_state_buffer(&self.layout, &self.aggregate_objects, &mut state_buffer)?;
+        let arena_allocator = ArenaAllocator::new(ungrouped_aggregate_allocator(ctx));
+        let modifier_memory = new_ungrouped_aggregate_modifier_memory_context(ctx);
+        initialize_state_buffer(
+            &self.layout,
+            &self.aggregate_objects,
+            &mut state_buffer,
+            arena_allocator.get_allocator().clone(),
+        )?;
 
         Ok(Box::new(UngroupedAggregateLocalSinkState {
             state: UngroupedAggregateState {
                 state_buffer,
-                arena_allocator: ctx.arena_allocator(),
+                arena_allocator,
                 destroyed: false,
             },
             aggregate_objects: self.aggregate_objects.clone(),
-            ordered_rows: vec![Vec::new(); self.aggregate_objects.len()],
+            modifier_memory: modifier_memory.clone(),
+            ordered_rows: (0..self.aggregate_objects.len())
+                .map(|_| AccountedValueRows::new(modifier_memory.clone()))
+                .collect(),
             ordered_finalized: false,
             distinct_rows: (0..self.aggregate_objects.len()).map(|_| None).collect(),
             distinct_finalized: false,
@@ -901,6 +917,7 @@ impl PhysicalOperator for UngroupedAggregate {
                     agg_idx,
                     chunk,
                     &mut lstate.distinct_rows[agg_idx],
+                    &lstate.modifier_memory,
                 )?;
                 continue;
             }
@@ -945,8 +962,17 @@ impl PhysicalOperator for UngroupedAggregate {
             .state
             .lock()
             .map_err(|e| paro_error::internal(e.to_string()))?;
-        let source_states = single_state_addresses(lstate.state.base_ptr());
-        let target_states = single_state_addresses(gstate_guard.base_ptr());
+        let gstate_guard = gstate_guard.as_mut().ok_or_else(|| {
+            paro_error::internal("Ungrouped aggregate global state was not initialized")
+        })?;
+        let source_states = single_state_addresses(
+            lstate.state.base_ptr(),
+            lstate.state.arena_allocator.get_allocator().clone(),
+        )?;
+        let target_states = single_state_addresses(
+            gstate_guard.base_ptr(),
+            gstate_guard.arena_allocator.get_allocator().clone(),
+        )?;
         let mut input_data = AggregateInputData::new(
             None,
             &mut gstate_guard.arena_allocator,
@@ -1014,7 +1040,13 @@ impl PhysicalOperator for UngroupedAggregate {
             .state
             .lock()
             .map_err(|e| paro_error::internal(e.to_string()))?;
-        let state_addresses = single_state_addresses(gstate_guard.base_ptr());
+        let gstate_guard = gstate_guard.as_mut().ok_or_else(|| {
+            paro_error::internal("Ungrouped aggregate global state was not initialized")
+        })?;
+        let state_addresses = single_state_addresses(
+            gstate_guard.base_ptr(),
+            gstate_guard.arena_allocator.get_allocator().clone(),
+        )?;
         let mut input_data = AggregateInputData::new(
             None,
             &mut gstate_guard.arena_allocator,
@@ -1050,4 +1082,22 @@ fn allocate_state_buffer(total_bytes: usize) -> Result<Vec<u64>> {
         ))
     })? / word;
     Ok(vec![0u64; words])
+}
+
+fn new_ungrouped_aggregate_modifier_memory_context(
+    ctx: &ExecutionContext,
+) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    aggregate_modifier_memory_context(owner)
+}
+
+fn ungrouped_aggregate_allocator(ctx: &ExecutionContext) -> Arc<dyn Allocator> {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    Arc::new(MemoryOwnerAllocator::new(
+        ctx.allocator(UNGROUPED_AGGREGATE_MEMORY_TAG),
+        owner,
+        MemoryDomain::Host,
+        UNGROUPED_AGGREGATE_MEMORY_TAG,
+        UNGROUPED_AGGREGATE_MEMORY_CLASS,
+    ))
 }

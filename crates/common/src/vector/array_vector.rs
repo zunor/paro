@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use crate::allocator::Allocator;
+use crate::allocator::{default_allocator, Allocator};
 use crate::types::LogicalType;
 
 use super::{Vector, VectorType};
@@ -56,7 +56,8 @@ impl VectorArrayBuffer {
 
         // Create child vector with capacity = array_size * initial_capacity
         let child_capacity = array_size * initial_capacity;
-        let child = Vector::with_capacity(child_type, child_capacity);
+        let child = Vector::try_new(child_type, child_capacity, Arc::new(default_allocator()))
+            .expect("array child allocation failed");
 
         Self {
             child,
@@ -80,7 +81,8 @@ impl VectorArrayBuffer {
 
         // Create child vector with capacity = array_size * initial_capacity
         let child_capacity = array_size * initial_capacity;
-        let child = Vector::with_capacity_and_allocator(child_type, child_capacity, allocator);
+        let child = Vector::try_new(child_type, child_capacity, allocator)
+            .expect("array child allocation failed");
 
         Self {
             child,
@@ -237,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_vector_array_buffer_from_child() {
-        let child = Vector::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let child = crate::test_utils::test_f32_vector(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let buffer = VectorArrayBuffer::from_child(child, 3, 2);
 
         assert_eq!(buffer.get_array_size(), 3);
@@ -248,8 +250,9 @@ mod tests {
     #[test]
     fn test_array_vector_get_entry() {
         // Create an array vector with 2 arrays of 3 floats each
-        let child = Vector::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let array_vec = Vector::from_array(LogicalType::Float, Arc::new(child), 2, 3);
+        let child = crate::test_utils::test_f32_vector(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let array_vec =
+            crate::test_utils::test_array_vector(LogicalType::Float, Arc::new(child), 2, 3);
 
         let entry = ArrayVector::get_entry(&array_vec);
         assert_eq!(entry.len(), 6);
@@ -257,8 +260,9 @@ mod tests {
 
     #[test]
     fn test_array_vector_get_total_size() {
-        let child = Vector::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let mut array_vec = Vector::from_array(LogicalType::Float, Arc::new(child), 2, 3);
+        let child = crate::test_utils::test_f32_vector(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut array_vec =
+            crate::test_utils::test_array_vector(LogicalType::Float, Arc::new(child), 2, 3);
         array_vec.set_count(2);
 
         let total_size = ArrayVector::get_total_size(&array_vec);
@@ -267,8 +271,9 @@ mod tests {
 
     #[test]
     fn test_array_vector_get_array_size() {
-        let child = Vector::from_f32(&[1.0, 2.0, 3.0]);
-        let array_vec = Vector::from_array(LogicalType::Float, Arc::new(child), 1, 3);
+        let child = crate::test_utils::test_f32_vector(&[1.0, 2.0, 3.0]);
+        let array_vec =
+            crate::test_utils::test_array_vector(LogicalType::Float, Arc::new(child), 1, 3);
 
         let array_size = ArrayVector::get_array_size(&array_vec);
         assert_eq!(array_size, 3);
@@ -276,8 +281,9 @@ mod tests {
 
     #[test]
     fn test_array_vector_get_child_type() {
-        let child = Vector::from_f32(&[1.0, 2.0, 3.0]);
-        let array_vec = Vector::from_array(LogicalType::Float, Arc::new(child), 1, 3);
+        let child = crate::test_utils::test_f32_vector(&[1.0, 2.0, 3.0]);
+        let array_vec =
+            crate::test_utils::test_array_vector(LogicalType::Float, Arc::new(child), 1, 3);
 
         let child_type = ArrayVector::get_child_type(&array_vec);
         assert_eq!(*child_type, LogicalType::Float);
@@ -289,7 +295,7 @@ mod tests {
 
         // Create an array vector with 2 arrays of 3 floats each
         let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
-        let mut array_vec = Vector::new_array(array_type, 2);
+        let mut array_vec = crate::test_utils::test_new_array(array_type, 2);
         array_vec.set_count(2);
 
         // Set values for first array [1.0, 2.0, 3.0]
@@ -341,7 +347,7 @@ mod tests {
 
         // Create an array vector with 2 arrays of 2 integers each
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 2);
-        let mut array_vec = Vector::new_array(array_type, 2);
+        let mut array_vec = crate::test_utils::test_new_array(array_type, 2);
         array_vec.set_count(2);
 
         // Set first array [1, 2]
@@ -379,8 +385,9 @@ mod tests {
     #[test]
     fn test_array_vector_flatten() {
         // Create an array vector
-        let child = Vector::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let mut array_vec = Vector::from_array(LogicalType::Float, Arc::new(child), 2, 3);
+        let child = crate::test_utils::test_f32_vector(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut array_vec =
+            crate::test_utils::test_array_vector(LogicalType::Float, Arc::new(child), 2, 3);
         array_vec.set_count(2);
 
         // Flatten the vector
@@ -394,8 +401,9 @@ mod tests {
     #[test]
     fn test_array_vector_recursive_unified_format() {
         // Create an array vector
-        let child = Vector::from_i32(&[10, 20, 30, 40, 50, 60]);
-        let mut array_vec = Vector::from_array(LogicalType::Integer, Arc::new(child), 2, 3);
+        let child = crate::test_utils::test_i32_vector(&[10, 20, 30, 40, 50, 60]);
+        let mut array_vec =
+            crate::test_utils::test_array_vector(LogicalType::Integer, Arc::new(child), 2, 3);
         array_vec.set_count(2);
 
         // Get the decoded tree view

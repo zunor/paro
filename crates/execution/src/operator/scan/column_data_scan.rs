@@ -10,11 +10,16 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_common::types::LogicalType;
 
 use crate::execution_context::ExecutionContext;
+use crate::memory_runtime::RetainedChunkVec;
 use crate::operator::state::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, OperatorSinkInput,
     OperatorSourceInput,
@@ -30,14 +35,24 @@ use crate::result_type::{SinkResultType, SourceResultType};
 #[derive(Debug)]
 pub struct MaterializedChunkCollection {
     pub types: Vec<LogicalType>,
-    pub chunks: Mutex<Vec<Chunk>>,
+    chunks: Mutex<RetainedChunkVec>,
 }
 
 impl MaterializedChunkCollection {
     pub fn new(types: Vec<LogicalType>) -> Self {
+        Self::with_memory(
+            types,
+            MemoryAccountingContext::detached(
+                MemoryTag::ColumnData,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+    }
+
+    pub fn with_memory(types: Vec<LogicalType>, memory: MemoryAccountingContext) -> Self {
         Self {
             types,
-            chunks: Mutex::new(Vec::new()),
+            chunks: Mutex::new(RetainedChunkVec::new(memory)),
         }
     }
 
@@ -55,7 +70,7 @@ impl MaterializedChunkCollection {
             .chunks
             .lock()
             .map_err(|e| paro_error::internal(format!("Failed to lock chunk collection: {e}")))?;
-        chunks.push(chunk);
+        chunks.push(chunk)?;
         Ok(())
     }
 
@@ -71,8 +86,30 @@ impl MaterializedChunkCollection {
             .chunks
             .lock()
             .map_err(|e| paro_error::internal(format!("Failed to lock chunk collection: {e}")))?;
-        Ok(Arc::new(chunks.clone()))
+        Ok(Arc::new(chunks.clone_chunks()))
     }
+
+    pub fn reference_chunk(&self, chunk_idx: usize, output: &mut Chunk) -> Result<bool> {
+        let chunks = self
+            .chunks
+            .lock()
+            .map_err(|e| paro_error::internal(format!("Failed to lock chunk collection: {e}")))?;
+        let Some(source) = chunks.as_slice().get(chunk_idx) else {
+            return Ok(false);
+        };
+        output.reference(source);
+        Ok(true)
+    }
+}
+
+fn materialized_collection_memory_context(ctx: &ExecutionContext) -> MemoryAccountingContext {
+    let owner: Arc<dyn MemoryOwner> = ctx.operator_memory_account();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::ColumnData,
+        MemoryAccountingClass::Revocable,
+    )
 }
 
 /// Shared binding for a materialized scan placeholder.
@@ -177,7 +214,7 @@ impl ColumnDataCollectionSink {
 
 #[derive(Debug)]
 struct ColumnDataGlobalSourceState {
-    chunks: Arc<Vec<Chunk>>,
+    collection: Arc<MaterializedChunkCollection>,
 }
 
 impl GlobalSourceState for ColumnDataGlobalSourceState {
@@ -228,9 +265,7 @@ impl PhysicalOperator for PhysicalColumnDataScan {
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
         let collection = self.binding.collection()?;
-        Ok(Box::new(ColumnDataGlobalSourceState {
-            chunks: collection.snapshot()?,
-        }))
+        Ok(Box::new(ColumnDataGlobalSourceState { collection }))
     }
 
     fn get_local_source_state(
@@ -262,14 +297,20 @@ impl PhysicalOperator for PhysicalColumnDataScan {
                 paro_error::internal("Invalid column-data local source state".to_string())
             })?;
 
-        if lstate.current_chunk >= gstate.chunks.len() {
+        let chunk_count = gstate.collection.chunk_count()?;
+        if lstate.current_chunk >= chunk_count {
             return Ok(SourceResultType::Finished);
         }
 
-        chunk.reference(&gstate.chunks[lstate.current_chunk]);
+        if !gstate
+            .collection
+            .reference_chunk(lstate.current_chunk, chunk)?
+        {
+            return Ok(SourceResultType::Finished);
+        }
         lstate.current_chunk += 1;
 
-        if lstate.current_chunk >= gstate.chunks.len() {
+        if lstate.current_chunk >= chunk_count {
             Ok(SourceResultType::Finished)
         } else {
             Ok(SourceResultType::HaveMoreOutput)
@@ -317,8 +358,11 @@ impl PhysicalOperator for ColumnDataCollectionSink {
         false
     }
 
-    fn get_global_sink_state(&self, _ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
-        let collection = Arc::new(MaterializedChunkCollection::new(self.types.clone()));
+    fn get_global_sink_state(&self, ctx: &ExecutionContext) -> Result<Box<dyn GlobalSinkState>> {
+        let collection = Arc::new(MaterializedChunkCollection::with_memory(
+            self.types.clone(),
+            materialized_collection_memory_context(ctx),
+        ));
         self.binding.set_collection(collection.clone())?;
         Ok(Box::new(ColumnDataSinkGlobalState { collection }))
     }
@@ -341,7 +385,9 @@ impl PhysicalOperator for ColumnDataCollectionSink {
             .as_any()
             .downcast_ref::<ColumnDataSinkGlobalState>()
             .ok_or_else(|| paro_error::internal("Invalid column-data sink state".to_string()))?;
-        gstate.collection.append(chunk.clone())?;
+        gstate
+            .collection
+            .append(chunk.try_deep_copy(chunk.allocator().clone())?)?;
         Ok(SinkResultType::NeedMoreInput)
     }
 
@@ -360,7 +406,7 @@ mod tests {
     use crate::execution_context::ExecutionContext;
     use crate::operator::state::OperatorSourceInput;
     use crate::operator::PhysicalOperator;
-    use paro_common::chunk::Chunk;
+
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
@@ -376,7 +422,8 @@ mod tests {
         let scan = PhysicalColumnDataScan::new(vec![LogicalType::Integer], Some(42));
         let collection = Arc::new(MaterializedChunkCollection::new(vec![LogicalType::Integer]));
 
-        let mut stored = Chunk::initialize(&[LogicalType::Integer], 2);
+        let mut stored =
+            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
         stored.set_cardinality(2);
         stored
             .column_mut(0)
@@ -402,7 +449,7 @@ mod tests {
             .expect("local source");
         let interrupt = InterruptState::default();
         let mut input = OperatorSourceInput::new(gstate.as_ref(), lstate.as_mut(), &interrupt);
-        let mut out = Chunk::initialize(&[LogicalType::Integer], 2);
+        let mut out = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
 
         let result = scan.get_data(&ctx, &mut out, &mut input).expect("get data");
         assert_eq!(result, crate::result_type::SourceResultType::Finished);

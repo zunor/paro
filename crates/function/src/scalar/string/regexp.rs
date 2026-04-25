@@ -177,8 +177,8 @@ fn execute_regexp(
     let pattern_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing pattern column".to_string()))?;
-    let text_view = text_vec.to_varlen_view(count);
-    let pattern_view = pattern_vec.to_varlen_view(count);
+    let text_view = text_vec.try_to_varlen_view(count)?;
+    let pattern_view = pattern_vec.try_to_varlen_view(count)?;
 
     result.set_count(count);
     let local_pattern = regexp_local_state(state).map(|data| &data.pattern);
@@ -339,11 +339,20 @@ mod tests {
 
     #[test]
     fn test_regexp_match_basic() {
-        let text = Vector::from_strings(&["hello world", "foo bar", "test123"]);
-        let pattern = Vector::from_strings(&["world$", "^baz", r"\d+"]);
-        let chunk = Chunk::from_vectors(vec![text, pattern]);
+        let text = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar", "test123"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let pattern = paro_common::test_utils::test_string_vector_with_allocator(
+            &["world$", "^baz", r"\d+"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![text, pattern],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_match_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -354,11 +363,20 @@ mod tests {
 
     #[test]
     fn test_regexp_match_case_sensitive() {
-        let text = Vector::from_strings(&["Hello", "hello"]);
-        let pattern = Vector::from_strings(&["hello", "hello"]);
-        let chunk = Chunk::from_vectors(vec![text, pattern]);
+        let text = paro_common::test_utils::test_string_vector_with_allocator(
+            &["Hello", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let pattern = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![text, pattern],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_match_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -368,11 +386,20 @@ mod tests {
 
     #[test]
     fn test_regexp_match_insensitive() {
-        let text = Vector::from_strings(&["Hello", "HELLO"]);
-        let pattern = Vector::from_strings(&["hello", "hello"]);
-        let chunk = Chunk::from_vectors(vec![text, pattern]);
+        let text = paro_common::test_utils::test_string_vector_with_allocator(
+            &["Hello", "HELLO"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let pattern = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "hello"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![text, pattern],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_match_insensitive_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -382,11 +409,20 @@ mod tests {
 
     #[test]
     fn test_regexp_not_match() {
-        let text = Vector::from_strings(&["hello world", "foo bar"]);
-        let pattern = Vector::from_strings(&["^pg_toast", "^pg_toast"]);
-        let chunk = Chunk::from_vectors(vec![text, pattern]);
+        let text = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello world", "foo bar"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let pattern = paro_common::test_utils::test_string_vector_with_allocator(
+            &["^pg_toast", "^pg_toast"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![text, pattern],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_not_match_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -396,12 +432,21 @@ mod tests {
 
     #[test]
     fn test_regexp_with_null() {
-        let mut text = Vector::from_strings(&["hello", "world"]);
+        let mut text = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "world"],
+            paro_common::test_utils::test_allocator(),
+        );
         text.validity_mut().set_null(1);
-        let pattern = Vector::from_strings(&["ell", "orl"]);
-        let chunk = Chunk::from_vectors(vec![text, pattern]);
+        let pattern = paro_common::test_utils::test_string_vector_with_allocator(
+            &["ell", "orl"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = Chunk::from_vectors(
+            vec![text, pattern],
+            paro_common::test_utils::test_allocator(),
+        );
         let state = MockState;
-        let mut result = Vector::new(LogicalType::Boolean);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_match_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -429,11 +474,20 @@ mod tests {
             local_state,
         };
 
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_strings(&["hello", "world"]),
-            Vector::from_strings(&["nomatch", "nomatch"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["hello", "world"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["nomatch", "nomatch"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_match_varchar(&chunk, &state, &mut result).unwrap();
 
@@ -461,11 +515,20 @@ mod tests {
             local_state,
         };
 
-        let chunk = Chunk::from_vectors(vec![
-            Vector::from_strings(&["hello"]),
-            Vector::from_strings(&["ignored"]),
-        ]);
-        let mut result = Vector::new(LogicalType::Boolean);
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["hello"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+                paro_common::test_utils::test_string_vector_with_allocator(
+                    &["ignored"],
+                    paro_common::test_utils::test_allocator(),
+                ),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
         regexp_match_varchar(&chunk, &state, &mut result).unwrap();
 

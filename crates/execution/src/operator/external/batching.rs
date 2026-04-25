@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
@@ -91,27 +92,31 @@ impl SubmissionBatchPolicy {
             || buffered_rows >= self.suggest_batch_rows(input_types, buffered_bytes)
     }
 
-    pub fn rechunk_output(&self, chunk: &Chunk, allocator: Arc<dyn Allocator>) -> VecDeque<Chunk> {
+    pub fn rechunk_output(
+        &self,
+        chunk: &Chunk,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<VecDeque<Chunk>> {
         let mut batches = VecDeque::new();
         if chunk.is_empty() {
-            return batches;
+            return Ok(batches);
         }
 
         if chunk.size() <= self.emission_chunk_rows {
-            batches.push_back(chunk.deep_copy_with_allocator(allocator));
-            return batches;
+            batches.push_back(chunk.try_deep_copy(allocator)?);
+            return Ok(batches);
         }
 
         let mut offset = 0;
         while offset < chunk.size() {
             let take = (chunk.size() - offset).min(self.emission_chunk_rows);
             let mut slice = chunk.clone();
-            slice.slice_range(offset, take);
-            batches.push_back(slice.deep_copy_with_allocator(allocator.clone()));
+            slice.try_slice_range(offset, take)?;
+            batches.push_back(slice.try_deep_copy(allocator.clone())?);
             offset += take;
         }
 
-        batches
+        Ok(batches)
     }
 }
 
@@ -121,7 +126,7 @@ mod tests {
     use paro_common::allocator::default_allocator;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
-    use paro_common::vector::{Vector, VECTOR_SIZE};
+    use paro_common::vector::VECTOR_SIZE;
     use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
     use std::sync::Arc;
 
@@ -147,14 +152,17 @@ mod tests {
     fn rechunk_output_uses_engine_friendly_chunk_size() {
         let allocator = Arc::new(default_allocator());
         let values = (0..(VECTOR_SIZE as i32 + 10)).collect::<Vec<_>>();
-        let chunk = Chunk::from_vectors(vec![Vector::from_i32_with_allocator(
-            &values,
-            allocator.clone(),
-        )]);
+        let chunk = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &values,
+                allocator.clone(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
         let policy =
             SubmissionBatchPolicy::from_dispatch_policy(&ExternalDispatchPolicy::default());
 
-        let batches = policy.rechunk_output(&chunk, allocator);
+        let batches = policy.rechunk_output(&chunk, allocator).unwrap();
         assert_eq!(batches.len(), 2);
         assert!(batches.front().expect("first batch").size() <= VECTOR_SIZE);
         assert!(batches.back().expect("second batch").size() <= VECTOR_SIZE);

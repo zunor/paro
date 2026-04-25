@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle};
 use paro_common::sort_key::{compare_keys, SortKeyEncoding};
 use paro_storage::buffer::{
     BlockId, BufferHandle, BufferPool, FileBufferType, MemoryTag, SharedBlockHandle,
@@ -23,6 +24,7 @@ const VARIABLE_INLINE_PREFIX_LEN: usize = 16;
 #[derive(Debug)]
 struct SlotBlockMeta {
     handle: Mutex<Option<SharedBlockHandle>>,
+    release: MemoryReleaseHandle,
     row_start: u32,
     row_count: u32,
 }
@@ -30,6 +32,7 @@ struct SlotBlockMeta {
 #[derive(Debug)]
 struct OverflowBlockMeta {
     handle: Mutex<Option<SharedBlockHandle>>,
+    release: MemoryReleaseHandle,
     ordinal_end: u32,
     used_bytes: usize,
     size: usize,
@@ -105,6 +108,7 @@ enum CursorMode {
 pub struct SortKeyStore {
     buffer_pool: Arc<BufferPool>,
     encoding: Arc<SortKeyEncoding>,
+    memory: MemoryAccountingContext,
     slot_block_capacity: u32,
     slot_size: usize,
     slot_blocks: Vec<SlotBlockMeta>,
@@ -142,11 +146,22 @@ impl<'cursor, 'store> KeyComparator<'cursor, 'store> {
 
 impl SortKeyStore {
     pub fn new(buffer_pool: Arc<BufferPool>, encoding: Arc<SortKeyEncoding>) -> Self {
+        let memory =
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
+        Self::new_with_memory(buffer_pool, encoding, memory)
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        encoding: Arc<SortKeyEncoding>,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         let slot_size = encoding.slot_size().max(1);
         let slot_block_capacity = (DEFAULT_BLOCK_SIZE / slot_size).max(1) as u32;
         Self {
             buffer_pool,
             encoding,
+            memory,
             slot_block_capacity,
             slot_size,
             slot_blocks: Vec::new(),
@@ -305,8 +320,11 @@ impl SortKeyStore {
     }
 
     pub fn reorder_by_permutation(&self, permutation: &[u32]) -> Result<Self> {
-        let mut reordered =
-            SortKeyStore::new(Arc::clone(&self.buffer_pool), Arc::clone(&self.encoding));
+        let mut reordered = SortKeyStore::new_with_memory(
+            Arc::clone(&self.buffer_pool),
+            Arc::clone(&self.encoding),
+            self.memory.clone(),
+        );
         let mut cursor = self.cursor_on_demand(1);
         for &ordinal in permutation {
             reordered.append_key_from_cursor(&mut cursor, ordinal)?;
@@ -450,11 +468,18 @@ impl SortKeyStore {
 
         self.current_slot = None;
         let block_size = self.slot_block_capacity as usize * self.slot_size;
-        let handle = self.buffer_pool.allocate(
+        let release = self.memory.retain(block_size)?;
+        let handle = match self.buffer_pool.allocate(
             MemoryTag::OrderBy,
             FileBufferType::ManagedBuffer,
             block_size,
-        )?;
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                release.release();
+                return Err(err);
+            }
+        };
         let block_handle = handle
             .block_handle()
             .cloned()
@@ -462,6 +487,7 @@ impl SortKeyStore {
         self.total_bytes += block_size;
         self.slot_blocks.push(SlotBlockMeta {
             handle: Mutex::new(Some(block_handle)),
+            release,
             row_start: self.count,
             row_count: 0,
         });
@@ -482,11 +508,18 @@ impl SortKeyStore {
         if needs_new_block {
             self.current_overflow = None;
             let block_size = DEFAULT_BLOCK_SIZE.max(required);
-            let handle = self.buffer_pool.allocate(
+            let release = self.memory.retain(block_size)?;
+            let handle = match self.buffer_pool.allocate(
                 MemoryTag::OrderBy,
                 FileBufferType::ManagedBuffer,
                 block_size,
-            )?;
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    release.release();
+                    return Err(err);
+                }
+            };
             let block_handle = handle
                 .block_handle()
                 .cloned()
@@ -494,6 +527,7 @@ impl SortKeyStore {
             self.total_bytes += block_size;
             self.overflow_blocks.push(OverflowBlockMeta {
                 handle: Mutex::new(Some(block_handle)),
+                release,
                 ordinal_end: ordinal,
                 used_bytes: 0,
                 size: block_size,
@@ -586,9 +620,7 @@ impl SortKeyStore {
             .released_slot_block_prefix
             .load(AtomicOrdering::Acquire);
         for block_idx in current_slot..slot_target {
-            if let Some(handle) = self.slot_blocks[block_idx].handle.lock().unwrap().take() {
-                let _ = self.buffer_pool.free(handle.block_id());
-            }
+            self.release_slot_block(block_idx);
         }
         self.release_state
             .released_slot_block_prefix
@@ -599,14 +631,7 @@ impl SortKeyStore {
             .released_overflow_block_prefix
             .load(AtomicOrdering::Acquire);
         for block_idx in current_overflow..overflow_target {
-            if let Some(handle) = self.overflow_blocks[block_idx]
-                .handle
-                .lock()
-                .unwrap()
-                .take()
-            {
-                let _ = self.buffer_pool.free(handle.block_id());
-            }
+            self.release_overflow_block(block_idx);
         }
         self.release_state
             .released_overflow_block_prefix
@@ -616,6 +641,33 @@ impl SortKeyStore {
             self.ordinal_frontier_for_slot_prefix(slot_target),
             AtomicOrdering::Release,
         );
+    }
+
+    fn release_slot_block(&self, block_idx: usize) {
+        let Some(handle) = self.slot_blocks[block_idx].handle.lock().unwrap().take() else {
+            return;
+        };
+        let block_id = handle.block_id();
+        drop(handle);
+        if self.buffer_pool.free(block_id).is_ok() {
+            self.slot_blocks[block_idx].release.release();
+        }
+    }
+
+    fn release_overflow_block(&self, block_idx: usize) {
+        let Some(handle) = self.overflow_blocks[block_idx]
+            .handle
+            .lock()
+            .unwrap()
+            .take()
+        else {
+            return;
+        };
+        let block_id = handle.block_id();
+        drop(handle);
+        if self.buffer_pool.free(block_id).is_ok() {
+            self.overflow_blocks[block_idx].release.release();
+        }
     }
 
     fn slot_block_prefix_for_frontier(&self, frontier: u64) -> usize {
@@ -967,6 +1019,19 @@ impl KeyCursor<'_> {
     }
 }
 
+impl Drop for SortKeyStore {
+    fn drop(&mut self) {
+        self.current_slot = None;
+        self.current_overflow = None;
+        for block_idx in 0..self.slot_blocks.len() {
+            self.release_slot_block(block_idx);
+        }
+        for block_idx in 0..self.overflow_blocks.len() {
+            self.release_overflow_block(block_idx);
+        }
+    }
+}
+
 trait BlockHandleProvider {
     fn block_id(&self) -> Option<BlockId>;
 }
@@ -1005,7 +1070,6 @@ fn read_u32(slot: &[u8], offset: usize) -> u32 {
 mod tests {
     use super::*;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     fn build_store(chunk: Chunk, types: Vec<LogicalType>) -> SortKeyStore {
         let pool = Arc::new(BufferPool::new(32 * 1024 * 1024));
@@ -1019,12 +1083,15 @@ mod tests {
 
     #[test]
     fn fixed_keys_compare_in_order() {
-        let mut values = Vector::new(LogicalType::Integer);
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Integer);
         values.set_i32(0, 10);
         values.set_i32(1, 20);
         values.set_i32(2, 30);
         values.set_count(3);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(values)]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
         let store = build_store(chunk, vec![LogicalType::Integer]);
 
         let mut cursor = store.cursor_pinned().unwrap();
@@ -1034,12 +1101,15 @@ mod tests {
 
     #[test]
     fn variable_keys_round_trip_and_compare() {
-        let mut values = Vector::new(LogicalType::Varchar);
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Varchar);
         values.set_string(0, "alpha");
         values.set_string(1, "alphabet");
         values.set_string(2, "beta");
         values.set_count(3);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(values)]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
         let store = build_store(chunk, vec![LogicalType::Varchar]);
 
         let mut cursor = store.cursor_on_demand(2);
@@ -1050,11 +1120,14 @@ mod tests {
 
     #[test]
     fn variable_overflow_is_row_contiguous() {
-        let mut values = Vector::new(LogicalType::Blob);
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Blob);
         values.set_blob(0, &[7; 40]);
         values.set_blob(1, &[9; 40]);
         values.set_count(2);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(values)]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
         let store = build_store(chunk, vec![LogicalType::Blob]);
 
         assert_eq!(store.overflow_blocks.len(), 1);
@@ -1063,12 +1136,15 @@ mod tests {
 
     #[test]
     fn reorder_copies_without_reencoding() {
-        let mut values = Vector::new(LogicalType::Varchar);
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Varchar);
         values.set_string(0, "c");
         values.set_string(1, "a");
         values.set_string(2, "b");
         values.set_count(3);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(values)]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
         let store = build_store(chunk, vec![LogicalType::Varchar]);
         let reordered = store.reorder_by_permutation(&[1, 2, 0]).unwrap();
 
@@ -1080,12 +1156,15 @@ mod tests {
 
     #[test]
     fn release_frontier_waits_for_cursor_drop() {
-        let mut values = Vector::new(LogicalType::Integer);
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Integer);
         for idx in 0..8 {
             values.set_i32(idx, idx as i32);
         }
         values.set_count(8);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(values)]);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
         let store = build_store(chunk, vec![LogicalType::Integer]);
 
         let cursor = store.cursor_on_demand(1);

@@ -61,6 +61,7 @@ serde_json = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+paro-common = { workspace = true, features = ["test-support"] }
 divan = { workspace = true }
 
 [[bench]]

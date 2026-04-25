@@ -17,11 +17,16 @@ struct SequenceMeta {
 }
 
 #[inline]
-pub(crate) fn prepare_result(result: &mut Vector, vector_type: VectorType, count: usize) {
+pub(crate) fn prepare_result(
+    result: &mut Vector,
+    vector_type: VectorType,
+    count: usize,
+) -> Result<()> {
     let allocator = result.allocator().clone();
-    result.reset_for_execution(count.max(1), allocator);
+    result.try_reset_for_execution(count.max(1), allocator)?;
     result.set_vector_type(vector_type);
     result.set_count(count);
+    Ok(())
 }
 
 #[inline]
@@ -88,12 +93,12 @@ where
     RESULT: Copy + 'static,
     OP: CastOperator<INPUT, RESULT>,
 {
-    prepare_result(result, VectorType::Flat, count);
+    prepare_result(result, VectorType::Flat, count)?;
     if count == 0 {
         return Ok(true);
     }
 
-    let view = input.to_view(count);
+    let view = input.try_to_view(count)?;
     let mut all_success = true;
     let result_data = unsafe { result.flat_data_mut::<RESULT>() };
 
@@ -174,14 +179,15 @@ pub(crate) fn execute_unary_flat<INPUT, RESULT, OP>(
     input: &Vector,
     result: &mut Vector,
     count: usize,
-) where
+) -> Result<()>
+where
     INPUT: Copy + 'static,
     RESULT: Copy,
     OP: UnaryOperator<INPUT, RESULT>,
 {
-    prepare_result(result, VectorType::Flat, count);
+    prepare_result(result, VectorType::Flat, count)?;
     if count == 0 {
-        return;
+        return Ok(());
     }
 
     let input_data = unsafe { input.flat_data::<INPUT>() };
@@ -193,7 +199,7 @@ pub(crate) fn execute_unary_flat<INPUT, RESULT, OP>(
                 *result_data.add(row) = OP::operation(read_ptr(input_data, row));
             }
         }
-        return;
+        return Ok(());
     }
 
     for row in 0..count {
@@ -205,32 +211,35 @@ pub(crate) fn execute_unary_flat<INPUT, RESULT, OP>(
             result.validity_mut().set_null(row);
         }
     }
+    Ok(())
 }
 
 pub(crate) fn execute_unary_view<INPUT, RESULT, OP>(
     input: &Vector,
     result: &mut Vector,
     count: usize,
-) where
+) -> Result<()>
+where
     INPUT: Copy + 'static,
     RESULT: Copy,
     OP: UnaryOperator<INPUT, RESULT>,
 {
-    prepare_result(result, VectorType::Flat, count);
+    prepare_result(result, VectorType::Flat, count)?;
     if count == 0 {
-        return;
+        return Ok(());
     }
 
-    let view = input.to_view(count);
+    let view = input.try_to_view(count)?;
     if let Some(meta) = sequence_meta::<INPUT>(&view) {
         unary_sequence_loop::<INPUT, RESULT, OP>(meta, view.sel(), view.validity(), result, count);
-        return;
+        return Ok(());
     }
 
     let ptr = view
         .get_data::<INPUT>()
         .expect("pointer-backed VectorView expected for unary execution");
     unary_ptr_loop::<INPUT, RESULT, OP>(ptr, view.sel(), view.validity(), result, count);
+    Ok(())
 }
 
 fn unary_ptr_loop<INPUT, RESULT, OP>(
@@ -339,19 +348,20 @@ pub(crate) fn execute_binary_view<LEFT, RIGHT, RESULT, OP>(
     right: &Vector,
     result: &mut Vector,
     count: usize,
-) where
+) -> Result<()>
+where
     LEFT: Copy + 'static,
     RIGHT: Copy + 'static,
     RESULT: Copy,
     OP: BinaryOperator<LEFT, RIGHT, RESULT>,
 {
-    prepare_result(result, VectorType::Flat, count);
+    prepare_result(result, VectorType::Flat, count)?;
     if count == 0 {
-        return;
+        return Ok(());
     }
 
-    let left_view = left.to_view(count);
-    let right_view = right.to_view(count);
+    let left_view = left.try_to_view(count)?;
+    let right_view = right.try_to_view(count)?;
 
     match (
         sequence_meta::<LEFT>(&left_view),
@@ -414,6 +424,7 @@ pub(crate) fn execute_binary_view<LEFT, RIGHT, RESULT, OP>(
             );
         }
     }
+    Ok(())
 }
 
 fn binary_ptr_loop<LEFT, RIGHT, RESULT, OP>(
@@ -696,21 +707,22 @@ pub(crate) fn execute_ternary_view<A, B, C, RESULT, OP>(
     c_vec: &Vector,
     result: &mut Vector,
     count: usize,
-) where
+) -> Result<()>
+where
     A: Copy + 'static,
     B: Copy + 'static,
     C: Copy + 'static,
     RESULT: Copy,
     OP: TernaryOperator<A, B, C, RESULT>,
 {
-    prepare_result(result, VectorType::Flat, count);
+    prepare_result(result, VectorType::Flat, count)?;
     if count == 0 {
-        return;
+        return Ok(());
     }
 
-    let a_view = a_vec.to_view(count);
-    let b_view = b_vec.to_view(count);
-    let c_view = c_vec.to_view(count);
+    let a_view = a_vec.try_to_view(count)?;
+    let b_view = b_vec.try_to_view(count)?;
+    let c_view = c_vec.try_to_view(count)?;
 
     if sequence_meta::<A>(&a_view).is_none()
         && sequence_meta::<B>(&b_view).is_none()
@@ -728,10 +740,11 @@ pub(crate) fn execute_ternary_view<A, B, C, RESULT, OP>(
         ternary_ptr_loop::<A, B, C, RESULT, OP>(
             a_ptr, &a_view, b_ptr, &b_view, c_ptr, &c_view, result, count,
         );
-        return;
+        return Ok(());
     }
 
     ternary_generic_view_loop::<A, B, C, RESULT, OP>(&a_view, &b_view, &c_view, result, count);
+    Ok(())
 }
 
 fn ternary_ptr_loop<A, B, C, RESULT, OP>(
@@ -823,7 +836,7 @@ pub(crate) fn select_binary_view_into<LEFT, RIGHT, OP>(
     input_sel: Option<&SelectionVector>,
     count: usize,
     selection: &mut SelectionVector,
-) -> usize
+) -> Result<usize>
 where
     LEFT: Copy + 'static,
     RIGHT: Copy + 'static,
@@ -831,11 +844,11 @@ where
 {
     if count == 0 {
         selection.set_len(0);
-        return 0;
+        return Ok(0);
     }
 
-    let left_view = left.to_view(count);
-    let right_view = right.to_view(count);
+    let left_view = left.try_to_view(count)?;
+    let right_view = right.try_to_view(count)?;
     selection.set_len(count);
     let mut selected = 0;
 
@@ -924,5 +937,5 @@ where
     }
 
     selection.set_len(selected);
-    selected
+    Ok(selected)
 }

@@ -101,6 +101,7 @@ fn paro_optimizers_function(
     input: &mut TableFunctionInput,
     output: &mut Chunk,
 ) -> Result<TableFunctionResult> {
+    let output_allocator = output.allocator().clone();
     let gstate = input
         .global_state
         .and_then(|gs| gs.as_any().downcast_ref::<ParoOptimizersGlobalState>());
@@ -132,16 +133,16 @@ fn paro_optimizers_function(
 
     let name_refs: Vec<&str> = names.iter().map(|value| value.as_str()).collect();
     if let Some(col) = output.column_mut(0) {
-        *col = Vector::from_strings(&name_refs);
+        *col = Vector::try_from_strings(&name_refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::from_bool(&enabled);
+        *col = Vector::try_from_bool(&enabled, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
-        *col = Vector::from_i64(&last_elapsed);
+        *col = Vector::try_from_i64(&last_elapsed, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
-        *col = Vector::from_i64(&invocations);
+        *col = Vector::try_from_i64(&invocations, output_allocator.clone())?;
     }
     output.set_cardinality(batch_size);
 
@@ -250,7 +251,7 @@ mod tests {
             local_state: None,
             global_state: Some(state_ref),
         };
-        let mut chunk = Chunk::initialize(
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar,
                 LogicalType::Boolean,

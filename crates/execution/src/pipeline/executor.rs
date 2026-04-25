@@ -4,6 +4,7 @@
 //! Low-level pipeline execution engine.
 
 use crate::execution_context::ExecutionContext;
+use crate::memory_runtime::{OperatorMemoryAccount, OperatorMemoryScope, PipelineRetainedMemory};
 use crate::operator::state::{OperatorSinkCombineInput, OperatorSinkInput, OperatorSourceInput};
 use crate::operator::PhysicalOperator;
 use crate::result_type::{
@@ -74,7 +75,9 @@ pub struct PipelineExecutor {
     pipeline: Arc<Pipeline>,
     gstates: Arc<PipelineGlobalStates>,
     lstates: PipelineLocalStates,
+    retained_memory: PipelineRetainedMemory,
     intermediate_chunks: Vec<Chunk>,
+    source_scratch_chunk: Chunk,
     in_process: Vec<usize>,
     pending_input: Option<Chunk>,
     pending_start_idx: usize,
@@ -160,15 +163,22 @@ impl PipelineExecutor {
         let lstates = PipelineLocalStates::new(&ctx, &pipeline, &gstates)?;
 
         let allocator = ctx.allocator(MemoryTag::Allocator);
+        let source = pipeline
+            .source()
+            .ok_or_else(|| paro_error::internal("Pipeline has no source".to_string()))?;
         let operators = pipeline.get_operators();
         let mut intermediate_chunks = Vec::with_capacity(operators.len());
         for op in &operators {
-            intermediate_chunks.push(Chunk::initialize_with_allocator(
+            intermediate_chunks.push(Chunk::try_initialize(
                 op.types(),
                 VECTOR_SIZE,
                 allocator.clone(),
-            ));
+            )?);
         }
+        let source_scratch_chunk =
+            Chunk::try_initialize(source.types(), VECTOR_SIZE, allocator.clone())?;
+        let retained_account = Arc::new(OperatorMemoryAccount::new(pipeline.query_memory_pool()));
+        let retained_memory = PipelineRetainedMemory::new(retained_account);
 
         Ok(Self {
             session,
@@ -176,7 +186,9 @@ impl PipelineExecutor {
             pipeline,
             gstates,
             lstates,
+            retained_memory,
             intermediate_chunks,
+            source_scratch_chunk,
             in_process: Vec::new(),
             pending_input: None,
             pending_start_idx: 0,
@@ -213,13 +225,16 @@ impl PipelineExecutor {
                 }
                 SinkResultType::Blocked => {
                     self.pending_sink_chunk = Some(chunk);
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Blocked);
                 }
                 SinkResultType::Interrupted => {
                     self.pending_sink_chunk = Some(chunk);
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Interrupted);
                 }
             }
+            self.refresh_retained_memory()?;
         }
 
         if let Some(chunk) = self.pending_input.take() {
@@ -230,10 +245,12 @@ impl PipelineExecutor {
                 }
                 PipelineExecuteResult::Blocked => {
                     self.pending_input = Some(chunk);
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Blocked);
                 }
                 PipelineExecuteResult::Interrupted => {
                     self.pending_input = Some(chunk);
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Interrupted);
                 }
                 PipelineExecuteResult::Finished => {
@@ -241,6 +258,7 @@ impl PipelineExecutor {
                     return self.advance_post_processing(sink_op.as_ref());
                 }
             }
+            self.refresh_retained_memory()?;
         }
 
         if self.source_done {
@@ -253,9 +271,8 @@ impl PipelineExecutor {
             .ok_or_else(|| paro_error::internal("Pipeline has no source".to_string()))?;
 
         loop {
-            let allocator = self.session.buffer_allocator();
-            let mut source_chunk =
-                Chunk::initialize_with_allocator(source.types(), VECTOR_SIZE, allocator);
+            let source_allocator = self.source_scratch_chunk.allocator().clone();
+            self.source_scratch_chunk.try_reset(source_allocator)?;
 
             let source_result = {
                 self.start_profile(source.as_ref());
@@ -269,38 +286,48 @@ impl PipelineExecutor {
                 let gstate = source_guard
                     .as_mut()
                     .ok_or_else(|| paro_error::internal("Source state missing"))?;
-                let mut source_input = OperatorSourceInput::new(
-                    gstate.as_ref(),
-                    self.lstates.source.as_mut(),
-                    &self.interrupt_state,
-                );
-                let result = source.get_data(&ctx, &mut source_chunk, &mut source_input)?;
-                self.end_profile(source.as_ref(), source_chunk.size());
+                let (result, output_rows) = {
+                    let source_slot = &mut self.lstates.source;
+                    let source_memory = OperatorMemoryScope::new(&source_slot.memory);
+                    let mut source_input = OperatorSourceInput::with_memory(
+                        gstate.as_ref(),
+                        source_slot.state.as_mut(),
+                        &self.interrupt_state,
+                        source_memory,
+                    );
+                    let result =
+                        source.get_data(&ctx, &mut self.source_scratch_chunk, &mut source_input)?;
+                    (result, self.source_scratch_chunk.size())
+                };
+                self.end_profile(source.as_ref(), output_rows);
                 result
             };
 
             match source_result {
                 SourceResultType::HaveMoreOutput => {}
                 SourceResultType::Finished => {
-                    if source_chunk.size() == 0 {
+                    if self.source_scratch_chunk.size() == 0 {
                         self.source_done = true;
                         return self.advance_post_processing(sink_op.as_ref());
                     }
                 }
                 SourceResultType::Blocked => {
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Blocked);
                 }
             }
 
-            if source_chunk.size() == 0 {
+            if self.source_scratch_chunk.size() == 0 {
                 continue;
             }
 
+            let source_chunk = self.source_scratch_chunk.clone();
             if let Some(budget) = self.budget.as_mut() {
                 budget.increment();
                 if !budget.can_continue() {
                     self.pending_input = Some(source_chunk);
                     self.pending_start_idx = 0;
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Interrupted);
                 }
             }
@@ -311,11 +338,13 @@ impl PipelineExecutor {
                 PipelineExecuteResult::Blocked => {
                     self.pending_input = Some(source_chunk);
                     self.pending_start_idx = 0;
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Blocked);
                 }
                 PipelineExecuteResult::Interrupted => {
                     self.pending_input = Some(source_chunk);
                     self.pending_start_idx = 0;
+                    self.refresh_retained_memory()?;
                     return Ok(PipelineExecuteResult::Interrupted);
                 }
                 PipelineExecuteResult::Finished => {
@@ -440,7 +469,9 @@ impl PipelineExecutor {
                     .as_mut()
                     .ok_or_else(|| paro_error::internal("Ops states missing"))?;
                 let gstate = ops_gstates[current_idx].as_ref();
-                let lstate = self.lstates.operators[current_idx].as_mut();
+                let op_slot = &mut self.lstates.operators[current_idx];
+                let lstate = op_slot.state.as_mut();
+                let op_memory = OperatorMemoryScope::new(&op_slot.memory);
 
                 // Use indices to avoid double borrow of self
                 let intermediate_chunks = &mut self.intermediate_chunks;
@@ -450,9 +481,9 @@ impl PipelineExecutor {
                     let (prev_part, out_part) = intermediate_chunks.split_at_mut(current_idx);
                     (&prev_part[current_idx - 1], &mut out_part[0])
                 };
-                out_chunk.reset();
+                out_chunk.try_reset(out_chunk.allocator().clone())?;
 
-                let result = op.execute(&ctx, prev_chunk, out_chunk, gstate, lstate)?;
+                let result = op.execute(&ctx, prev_chunk, out_chunk, gstate, lstate, op_memory)?;
                 if let Some(node_id) = node_id {
                     self.thread.end_operator(node_id, out_chunk.size() as u64);
                 }
@@ -512,8 +543,7 @@ impl PipelineExecutor {
 
             loop {
                 let allocator = self.session.buffer_allocator();
-                let mut flush_chunk =
-                    Chunk::initialize_with_allocator(op.types(), VECTOR_SIZE, allocator);
+                let mut flush_chunk = Chunk::try_initialize(op.types(), VECTOR_SIZE, allocator)?;
 
                 let finalize_result = {
                     self.start_profile(op.as_ref());
@@ -528,12 +558,15 @@ impl PipelineExecutor {
                         .as_mut()
                         .ok_or_else(|| paro_error::internal("Ops states missing"))?;
                     let gstate = ops_gstates[idx].as_ref();
+                    let op_slot = &mut self.lstates.operators[idx];
+                    let op_memory = OperatorMemoryScope::new(&op_slot.memory);
 
                     let result = op.final_execute(
                         &ctx,
                         &mut flush_chunk,
                         gstate,
-                        self.lstates.operators[idx].as_mut(),
+                        op_slot.state.as_mut(),
+                        op_memory,
                     )?;
                     self.end_profile(op.as_ref(), flush_chunk.size());
                     result
@@ -594,8 +627,13 @@ impl PipelineExecutor {
             .as_mut()
             .ok_or_else(|| paro_error::internal("Local sink state missing"))?;
 
-        let mut sink_input =
-            OperatorSinkInput::new(gstate.as_ref(), lstate.as_mut(), &self.interrupt_state);
+        let sink_memory = OperatorMemoryScope::new(&lstate.memory);
+        let mut sink_input = OperatorSinkInput::with_memory(
+            gstate.as_ref(),
+            lstate.state.as_mut(),
+            &self.interrupt_state,
+            sink_memory,
+        );
         let ctx = ExecutionContext::with_interrupt_state(
             self.session.clone(),
             &self.thread,
@@ -632,10 +670,12 @@ impl PipelineExecutor {
                     let gstate = sink_guard
                         .as_ref()
                         .ok_or_else(|| paro_error::internal("Sink state missing"))?;
-                    let mut combine_input = OperatorSinkCombineInput::new(
+                    let sink_memory = OperatorMemoryScope::new(&lstate.memory);
+                    let mut combine_input = OperatorSinkCombineInput::with_memory(
                         gstate.as_ref(),
-                        lstate.as_mut(),
+                        lstate.state.as_mut(),
                         &self.interrupt_state,
+                        sink_memory,
                     );
                     let ctx = ExecutionContext::with_interrupt_state(
                         self.session.clone(),
@@ -671,10 +711,28 @@ impl PipelineExecutor {
             self.thread.end_operator(node_id, output_rows as u64);
         }
     }
+
+    fn refresh_retained_memory(&mut self) -> Result<()> {
+        let mut chunks = Vec::new();
+        if let Some(chunk) = self.pending_input.as_ref() {
+            chunks.push(chunk);
+        }
+        if let Some(chunk) = self.pending_sink_chunk.as_ref() {
+            chunks.push(chunk);
+        }
+        for chunk in &self.intermediate_chunks {
+            if chunk.size() > 0 {
+                chunks.push(chunk);
+            }
+        }
+        self.retained_memory.refresh(chunks)?;
+        Ok(())
+    }
 }
 
 impl Drop for PipelineExecutor {
     fn drop(&mut self) {
+        self.retained_memory.clear();
         self.thread.flush_profiler();
     }
 }
@@ -989,6 +1047,7 @@ mod tests {
             chunk: &mut Chunk,
             _gstate: &dyn crate::operator::state::GlobalOperatorState,
             _state: &mut dyn crate::operator::state::OperatorState,
+            _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<crate::result_type::OperatorResultType> {
             chunk.set_cardinality(0);
             Ok(crate::result_type::OperatorResultType::Finished)
@@ -1044,6 +1103,7 @@ mod tests {
             chunk: &mut Chunk,
             _gstate: &dyn crate::operator::state::GlobalOperatorState,
             _state: &mut dyn crate::operator::state::OperatorState,
+            _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<crate::result_type::OperatorResultType> {
             chunk.set_cardinality(0);
             if !self.blocked.swap(true, Ordering::SeqCst) {
@@ -1112,6 +1172,7 @@ mod tests {
             chunk: &mut Chunk,
             _gstate: &dyn crate::operator::state::GlobalOperatorState,
             _state: &mut dyn crate::operator::state::OperatorState,
+            _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<crate::result_type::OperatorResultType> {
             chunk.set_cardinality(0);
             Ok(crate::result_type::OperatorResultType::NeedMoreInput)
@@ -1127,6 +1188,7 @@ mod tests {
             chunk: &mut Chunk,
             _gstate: &dyn crate::operator::state::GlobalOperatorState,
             _state: &mut dyn crate::operator::state::OperatorState,
+            _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
         ) -> Result<crate::result_type::OperatorFinalizeResultType> {
             self.final_calls.fetch_add(1, Ordering::SeqCst);
             if !self.finalized_once.swap(true, Ordering::SeqCst) {

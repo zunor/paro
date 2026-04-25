@@ -30,7 +30,7 @@ impl UnaryOperator<f64, f64> for LnOpF64 {
 }
 
 fn ln_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, LnOpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, LnOpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -60,7 +60,7 @@ impl UnaryOperator<f64, f64> for Log10OpF64 {
 }
 
 fn log10_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, Log10OpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, Log10OpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -81,7 +81,7 @@ fn log_base(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) ->
         &input.data[1],
         result,
         input.size(),
-    );
+    )?;
     Ok(())
 }
 
@@ -134,7 +134,7 @@ impl UnaryOperator<f64, f64> for Log2OpF64 {
 }
 
 fn log2_f64(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    UnaryExecutor::execute::<f64, f64, Log2OpF64>(&input.data[0], result, input.size());
+    UnaryExecutor::execute::<f64, f64, Log2OpF64>(&input.data[0], result, input.size())?;
     Ok(())
 }
 
@@ -173,14 +173,17 @@ mod tests {
     }
 
     fn create_f64_chunk(values: &[f64]) -> Chunk {
-        let vec = Vector::from_f64(values);
-        Chunk::from_vectors(vec![vec])
+        let vec = paro_common::test_utils::test_f64_vector_with_allocator(
+            values,
+            paro_common::test_utils::test_allocator(),
+        );
+        paro_common::test_utils::test_chunk_from_vectors(vec![vec])
     }
 
     #[test]
     fn test_ln() {
         let chunk = create_f64_chunk(&[1.0, std::f64::consts::E, std::f64::consts::E.powi(2)]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         ln_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -192,7 +195,7 @@ mod tests {
     #[test]
     fn test_log10() {
         let chunk = create_f64_chunk(&[1.0, 10.0, 100.0, 1000.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         log10_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -205,7 +208,7 @@ mod tests {
     #[test]
     fn test_log2() {
         let chunk = create_f64_chunk(&[1.0, 2.0, 4.0, 8.0, 16.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         log2_f64(&chunk, &MockState, &mut result).unwrap();
 
@@ -218,10 +221,16 @@ mod tests {
 
     #[test]
     fn test_log_base() {
-        let base = Vector::from_f64(&[2.0, 10.0, std::f64::consts::E]);
-        let value = Vector::from_f64(&[8.0, 1000.0, std::f64::consts::E.powi(3)]);
-        let chunk = Chunk::from_vectors(vec![base, value]);
-        let mut result = Vector::new(LogicalType::Double);
+        let base = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[2.0, 10.0, std::f64::consts::E],
+            paro_common::test_utils::test_allocator(),
+        );
+        let value = paro_common::test_utils::test_f64_vector_with_allocator(
+            &[8.0, 1000.0, std::f64::consts::E.powi(3)],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![base, value]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         log_base(&chunk, &MockState, &mut result).unwrap();
 
@@ -233,7 +242,7 @@ mod tests {
     #[test]
     fn test_ln_special_values() {
         let chunk = create_f64_chunk(&[0.0, -1.0]);
-        let mut result = Vector::new(LogicalType::Double);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Double);
 
         ln_f64(&chunk, &MockState, &mut result).unwrap();
 

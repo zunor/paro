@@ -11,8 +11,8 @@
 //! - Concurrent index operations
 
 use paro_common::chunk::Chunk;
+use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::TableHandle;
 use std::sync::Arc;
@@ -23,19 +23,23 @@ use std::thread;
 // ============================================================================
 
 fn create_test_chunk_i32(values: &[i32]) -> Chunk {
-    let vec = Vector::from_i32(values);
-    Chunk::from_vectors(vec![vec])
+    let allocator = test_allocator();
+    let vec = paro_common::test_utils::test_i32_vector_with_allocator(values, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![vec])
 }
 
 fn create_test_chunk_i64(values: &[i64]) -> Chunk {
-    let vec = Vector::from_i64(values);
-    Chunk::from_vectors(vec![vec])
+    let allocator = test_allocator();
+    let vec = paro_common::test_utils::test_i64_vector_with_allocator(values, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![vec])
 }
 
 fn create_test_chunk_multi(ids: &[i32], values: &[i64]) -> Chunk {
-    let id_vec = Vector::from_i32(ids);
-    let value_vec = Vector::from_i64(values);
-    Chunk::from_vectors(vec![id_vec, value_vec])
+    let allocator = test_allocator();
+    let id_vec = paro_common::test_utils::test_i32_vector_with_allocator(ids, allocator.clone());
+    let value_vec =
+        paro_common::test_utils::test_i64_vector_with_allocator(values, allocator.clone());
+    paro_common::test_utils::test_chunk_from_vectors(vec![id_vec, value_vec])
 }
 
 fn create_table(types: &[LogicalType]) -> TableHandle {

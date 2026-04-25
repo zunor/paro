@@ -343,7 +343,8 @@ impl PhysicalTableFunction {
                 .collect();
 
             // Create ordinality vector and add to chunk
-            let ordinality_vec = Vector::from_i64(&ordinality_values);
+            let ordinality_vec =
+                Vector::try_from_i64(&ordinality_values, chunk.allocator().clone())?;
 
             // The ordinality column should be the last column
             let ordinality_col_idx = chunk.column_count() - 1;

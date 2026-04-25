@@ -32,6 +32,59 @@ pub struct ExplainRuntimeStats {
     pub spilled: Option<bool>,
     pub peak_memory_bytes: Option<u64>,
     pub temp_storage_bytes: Option<u64>,
+    pub data_plane_bytes: Option<u64>,
+    pub memory_tag_bytes: Vec<ExplainMemoryTagStat>,
+    pub domain_memory_tag_bytes: Vec<ExplainMemoryDomainTagStat>,
+    pub leaked_grant_bytes: Option<u64>,
+    pub local_refill_count: Option<u64>,
+    pub local_refill_bytes: Option<u64>,
+    pub reclaim_attempt_count: Option<u64>,
+    pub reclaimed_bytes: Option<u64>,
+    pub spilled_bytes: Option<u64>,
+    pub reclaim_latency_us: Option<u64>,
+    pub spill_latency_us: Option<u64>,
+    pub allocator_lock_count: Option<u64>,
+    pub selection_materialization_count: Option<u64>,
+    pub peak_rss_bytes: Option<u64>,
+    pub output_buffer_bytes: Option<u64>,
+    pub session_retained_bytes: Option<u64>,
+}
+
+impl ExplainRuntimeStats {
+    pub fn has_any(&self) -> bool {
+        self.spilled.is_some()
+            || self.peak_memory_bytes.is_some()
+            || self.temp_storage_bytes.is_some()
+            || self.data_plane_bytes.is_some()
+            || !self.memory_tag_bytes.is_empty()
+            || !self.domain_memory_tag_bytes.is_empty()
+            || self.leaked_grant_bytes.is_some()
+            || self.local_refill_count.is_some()
+            || self.local_refill_bytes.is_some()
+            || self.reclaim_attempt_count.is_some()
+            || self.reclaimed_bytes.is_some()
+            || self.spilled_bytes.is_some()
+            || self.reclaim_latency_us.is_some()
+            || self.spill_latency_us.is_some()
+            || self.allocator_lock_count.is_some()
+            || self.selection_materialization_count.is_some()
+            || self.peak_rss_bytes.is_some()
+            || self.output_buffer_bytes.is_some()
+            || self.session_retained_bytes.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainMemoryTagStat {
+    pub tag: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainMemoryDomainTagStat {
+    pub domain: String,
+    pub tag: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -238,6 +291,122 @@ impl ExplainNode {
                 if let Some(value) = actual.runtime.temp_storage_bytes {
                     actual_object.insert("temp_storage_bytes".to_string(), JsonValue::from(value));
                 }
+                if let Some(value) = actual.runtime.data_plane_bytes {
+                    actual_object.insert("data_plane_bytes".to_string(), JsonValue::from(value));
+                }
+                if !actual.runtime.memory_tag_bytes.is_empty() {
+                    actual_object.insert(
+                        "memory_tags".to_string(),
+                        JsonValue::Array(
+                            actual
+                                .runtime
+                                .memory_tag_bytes
+                                .iter()
+                                .map(|entry| {
+                                    let mut object = Map::new();
+                                    object.insert(
+                                        "tag".to_string(),
+                                        JsonValue::String(entry.tag.clone()),
+                                    );
+                                    object
+                                        .insert("bytes".to_string(), JsonValue::from(entry.bytes));
+                                    JsonValue::Object(object)
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                if !actual.runtime.domain_memory_tag_bytes.is_empty() {
+                    actual_object.insert(
+                        "domain_memory_tags".to_string(),
+                        JsonValue::Array(
+                            actual
+                                .runtime
+                                .domain_memory_tag_bytes
+                                .iter()
+                                .map(|entry| {
+                                    let mut object = Map::new();
+                                    object.insert(
+                                        "domain".to_string(),
+                                        JsonValue::String(entry.domain.clone()),
+                                    );
+                                    object.insert(
+                                        "tag".to_string(),
+                                        JsonValue::String(entry.tag.clone()),
+                                    );
+                                    object
+                                        .insert("bytes".to_string(), JsonValue::from(entry.bytes));
+                                    JsonValue::Object(object)
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                insert_optional_u64(
+                    &mut actual_object,
+                    "leaked_grant_bytes",
+                    actual.runtime.leaked_grant_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "local_refill_count",
+                    actual.runtime.local_refill_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "local_refill_bytes",
+                    actual.runtime.local_refill_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "reclaim_attempt_count",
+                    actual.runtime.reclaim_attempt_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "reclaimed_bytes",
+                    actual.runtime.reclaimed_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "spilled_bytes",
+                    actual.runtime.spilled_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "reclaim_latency_us",
+                    actual.runtime.reclaim_latency_us,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "spill_latency_us",
+                    actual.runtime.spill_latency_us,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "allocator_lock_count",
+                    actual.runtime.allocator_lock_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "selection_materialization_count",
+                    actual.runtime.selection_materialization_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "peak_rss_bytes",
+                    actual.runtime.peak_rss_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "output_buffer_bytes",
+                    actual.runtime.output_buffer_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "session_retained_bytes",
+                    actual.runtime.session_retained_bytes,
+                );
             }
             object.insert("actual".to_string(), JsonValue::Object(actual_object));
         }
@@ -261,6 +430,12 @@ impl ExplainNode {
             );
         }
         JsonValue::Object(object)
+    }
+}
+
+fn insert_optional_u64(object: &mut Map<String, JsonValue>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), JsonValue::from(value));
     }
 }
 

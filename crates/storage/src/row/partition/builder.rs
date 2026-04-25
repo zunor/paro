@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingContext;
 use paro_common::vector::SelectionVector;
 
 use crate::buffer::{BufferPool, MemoryTag};
@@ -30,25 +31,28 @@ pub struct PartitionedRowsBuilder {
     buffer_pool: Arc<BufferPool>,
     layout: Arc<RowLayout>,
     tag: MemoryTag,
+    memory: MemoryAccountingContext,
     partitioner: Arc<dyn PartitionIndexComputer>,
     partitions: Vec<RowStoreBuilder>,
     count: u64,
 }
 
 impl PartitionedRowsBuilder {
-    pub fn new(
+    pub fn new_with_memory(
         buffer_pool: Arc<BufferPool>,
         layout: Arc<RowLayout>,
         tag: MemoryTag,
         partitioner: Arc<dyn PartitionIndexComputer>,
+        memory: MemoryAccountingContext,
     ) -> Self {
         let partition_count = partitioner.max_partition_index().saturating_add(1).max(1);
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
-            partitions.push(RowStoreBuilder::new(
+            partitions.push(RowStoreBuilder::new_with_memory(
                 Arc::clone(&buffer_pool),
                 Arc::clone(&layout),
                 tag,
+                memory.clone(),
             ));
         }
 
@@ -56,6 +60,7 @@ impl PartitionedRowsBuilder {
             buffer_pool,
             layout,
             tag,
+            memory,
             partitioner,
             partitions,
             count: 0,
@@ -69,7 +74,7 @@ impl PartitionedRowsBuilder {
         tag: MemoryTag,
         partitioner: Arc<dyn PartitionIndexComputer>,
     ) -> Self {
-        Self::new(
+        Self::new_with_memory(
             buffer_pool,
             Arc::new(RowLayout::from_types(
                 types,
@@ -77,6 +82,10 @@ impl PartitionedRowsBuilder {
             )),
             tag,
             partitioner,
+            MemoryAccountingContext::detached(
+                tag,
+                paro_common::memory::MemoryAccountingClass::default_for_tag(tag),
+            ),
         )
     }
 
@@ -109,7 +118,7 @@ impl PartitionedRowsBuilder {
     }
 
     pub fn append(&mut self, input: &Chunk) -> Result<()> {
-        let sel = SelectionVector::incremental(input.size());
+        let sel = SelectionVector::try_incremental(input.size(), input.allocator().clone())?;
         self.append_with_sel(input, &sel, input.size())
     }
 
@@ -154,9 +163,10 @@ impl PartitionedRowsBuilder {
             }
 
             let mut sliced = input.clone();
-            let selection = SelectionVector::from_indices(selected_rows);
+            let selection =
+                SelectionVector::try_from_indices(selected_rows, input.allocator().clone())?;
             let partition_count = selection.len();
-            sliced.slice(&selection, partition_count);
+            sliced.try_slice(&selection, partition_count)?;
             self.partitions[partition_idx].append(&sliced)?;
             self.count += partition_count as u64;
         }
@@ -183,6 +193,7 @@ impl PartitionedRowsBuilder {
             self.buffer_pool,
             self.layout,
             self.tag,
+            self.memory,
             partitions,
             self.count,
         )
@@ -209,13 +220,13 @@ impl PartitionedRowsBuilder {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::*;
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
 
     use crate::buffer::{BufferPool, MemoryTag};
 
@@ -268,15 +279,15 @@ mod tests {
     }
 
     fn build_chunk(values: &[(i32, &str)]) -> Chunk {
-        let mut ids = Vector::with_capacity(LogicalType::Integer, values.len());
-        let mut names = Vector::with_capacity(LogicalType::Varchar, values.len());
+        let mut ids = test_vector_with_capacity(LogicalType::Integer, values.len());
+        let mut names = test_vector_with_capacity(LogicalType::Varchar, values.len());
         for (idx, (id, name)) in values.iter().enumerate() {
             ids.set_i32(idx, *id);
             names.set_string(idx, name);
         }
         ids.set_count(values.len());
         names.set_count(values.len());
-        Chunk::from_vectors(vec![ids, names])
+        test_chunk_from_vectors(vec![ids, names])
     }
 
     fn collect_partition_ids(store: &crate::row::RowStore) -> Vec<i32> {
@@ -285,7 +296,7 @@ mod tests {
         }
 
         let pinned = store.pin_ordinal_range(0, store.count() as u32).unwrap();
-        let mut out = Chunk::initialize(&[LogicalType::Integer], store.count() as usize);
+        let mut out = test_chunk_with_capacity(&[LogicalType::Integer], store.count() as usize);
         pinned.gather_columns(&[0], &mut out, 0).unwrap();
         (0..store.count() as usize)
             .map(|row| out.get_value(0, row).unwrap())

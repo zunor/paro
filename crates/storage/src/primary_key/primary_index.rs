@@ -719,9 +719,10 @@ impl PrimaryKeySerializer {
 mod tests {
     use super::*;
     use crate::metrics::storage_metrics;
+    use crate::test_utils::*;
     use paro_common::allocator::default_allocator;
     use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
+
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use std::thread;
@@ -914,9 +915,10 @@ mod tests {
         let serializer = PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
 
         let alloc = Arc::new(default_allocator());
-        let id_vec = Vector::from_i32_with_allocator(&[1], alloc.clone());
-        let name_vec = Vector::from_strings_with_allocator(&["alice"], alloc);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(id_vec), Arc::new(name_vec)]);
+        let id_vec = paro_common::test_utils::test_i32_vector_with_allocator(&[1], alloc.clone());
+        let name_vec =
+            paro_common::test_utils::test_string_vector_with_allocator(&["alice"], alloc);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(id_vec), Arc::new(name_vec)]);
 
         let encoded = serializer.encode_row(&chunk, 0).unwrap();
         let expected: Vec<u8> = [0x80u8, 0, 0, 1].to_vec();
@@ -929,9 +931,11 @@ mod tests {
         let serializer = PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
 
         let alloc = Arc::new(default_allocator());
-        let id_vec = Vector::from_i32_with_allocator(&[1, 2, 3], alloc.clone());
-        let name_vec = Vector::from_strings_with_allocator(&["a", "b", "c"], alloc);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(id_vec), Arc::new(name_vec)]);
+        let id_vec =
+            paro_common::test_utils::test_i32_vector_with_allocator(&[1, 2, 3], alloc.clone());
+        let name_vec =
+            paro_common::test_utils::test_string_vector_with_allocator(&["a", "b", "c"], alloc);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(id_vec), Arc::new(name_vec)]);
 
         let batch = serializer.encode_chunk(&chunk).unwrap();
         assert_eq!(batch.len(), 3);
@@ -945,9 +949,11 @@ mod tests {
         let schema = sample_schema();
         let serializer = PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
         let alloc = Arc::new(default_allocator());
-        let id_vec = Vector::from_i32_with_allocator(&[10, 20], alloc.clone());
-        let name_vec = Vector::from_strings_with_allocator(&["a", "b"], alloc);
-        let chunk = Chunk::from_arc_vectors(vec![Arc::new(id_vec), Arc::new(name_vec)]);
+        let id_vec =
+            paro_common::test_utils::test_i32_vector_with_allocator(&[10, 20], alloc.clone());
+        let name_vec =
+            paro_common::test_utils::test_string_vector_with_allocator(&["a", "b"], alloc);
+        let chunk = test_chunk_from_arc_vectors(vec![Arc::new(id_vec), Arc::new(name_vec)]);
 
         let idx = PrimaryIndex::new();
         let added = idx.build_from_chunk(&serializer, &chunk, 7, 0).unwrap();

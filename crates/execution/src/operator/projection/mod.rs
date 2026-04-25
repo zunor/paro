@@ -64,7 +64,13 @@ mod tests {
     }
 
     fn integer_chunk(values: &[i32]) -> Chunk {
-        Chunk::from_vectors(vec![Vector::from_i32(values)])
+        Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        )
     }
 
     fn add_one_function(
@@ -114,7 +120,8 @@ mod tests {
         let mut state = projection
             .get_operator_state(&ctx)
             .expect("projection state should be created");
-        let mut output = Chunk::new();
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
 
         let first_input = integer_chunk(&[1, 2, 3]);
         projection
@@ -124,6 +131,7 @@ mod tests {
                 &mut output,
                 &EmptyGlobalOperatorState,
                 state.as_mut(),
+                crate::operator::state::test_operator_memory_scope(),
             )
             .expect("projection execute should succeed");
         let output_capacity = output.capacity();
@@ -150,6 +158,7 @@ mod tests {
                 &mut output,
                 &EmptyGlobalOperatorState,
                 state,
+                crate::operator::state::test_operator_memory_scope(),
             )
             .expect("second projection execute should succeed");
         assert_eq!(output.capacity(), output_capacity);
@@ -391,12 +400,17 @@ impl PhysicalOperator for Projection {
             .expect("Invalid local source state for Projection");
 
         // Create a temporary chunk to hold child data
-        let mut child_chunk = Chunk::initialize(self.child.types(), chunk.capacity());
+        let mut child_chunk = Chunk::try_initialize(
+            self.child.types(),
+            chunk.capacity(),
+            chunk.allocator().clone(),
+        )?;
 
-        let mut child_input = OperatorSourceInput::new(
+        let mut child_input = OperatorSourceInput::with_memory(
             input.global_state,
             lstate.child_local_state.as_mut(),
             input.interrupt_state,
+            input.memory.child_scope(),
         );
         let result = self
             .child
@@ -406,18 +420,18 @@ impl PhysicalOperator for Projection {
             if chunk.column_count() != self.output_types.len()
                 || chunk.capacity() < child_chunk.size().max(1)
             {
-                *chunk = Chunk::initialize_with_allocator(
+                *chunk = Chunk::try_initialize(
                     &self.output_types,
                     child_chunk.size().max(1),
                     ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-                );
+                )?;
             } else {
-                chunk.reset();
+                chunk.try_reset(chunk.allocator().clone())?;
             }
             lstate.executor.execute_all_into(&child_chunk, ctx, chunk)?;
         } else {
             // Prevent stale output propagation when child yields no rows.
-            *chunk = Chunk::init_empty(&self.output_types);
+            *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
         }
         Ok(result)
     }
@@ -429,6 +443,7 @@ impl PhysicalOperator for Projection {
         chunk: &mut Chunk,
         _gstate: &dyn GlobalOperatorState,
         state: &mut dyn OperatorState,
+        _memory: crate::memory_runtime::OperatorMemoryScope<'_>,
     ) -> Result<OperatorResultType> {
         let state = state
             .as_any_mut()
@@ -438,25 +453,25 @@ impl PhysicalOperator for Projection {
         // A 0-column input can still carry rows (e.g. DummyScan for `SELECT 42`).
         // Only treat as empty when cardinality is zero.
         if input.is_empty() {
-            *chunk = Chunk::init_empty(&self.output_types);
+            *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
             return Ok(OperatorResultType::NeedMoreInput);
         }
         if input.column_count() == 0 && Self::expressions_require_input_columns(&self.expressions) {
             // Optimizer can route empty-result branches through a 0-column chunk.
             // If expressions reference input columns, treat this as no rows.
-            *chunk = Chunk::init_empty(&self.output_types);
+            *chunk = Chunk::try_init_empty(&self.output_types, chunk.allocator().clone())?;
             return Ok(OperatorResultType::NeedMoreInput);
         }
 
         if chunk.column_count() != self.output_types.len() || chunk.capacity() < input.size().max(1)
         {
-            *chunk = Chunk::initialize_with_allocator(
+            *chunk = Chunk::try_initialize(
                 &self.output_types,
                 input.size().max(1),
                 ctx.allocator(paro_common::allocator::MemoryTag::BaseTable),
-            );
+            )?;
         } else {
-            chunk.reset();
+            chunk.try_reset(chunk.allocator().clone())?;
         }
         state.executor.execute_all_into(input, ctx, chunk)?;
 
