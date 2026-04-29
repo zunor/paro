@@ -16,6 +16,7 @@ useless-vec = "allow"
 paro-common = { workspace = true }
 paro-catalog = { workspace = true }
 paro-context = { workspace = true }
+paro-transaction = { workspace = true }
 paro-compiler = { workspace = true }
 paro-journal = { workspace = true }
 paro-parser = { workspace = true }

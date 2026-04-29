@@ -74,6 +74,7 @@ pub enum SetOperationElement {
     Offset {
         offset: Expr,
     },
+    ForUpdate,
     IgnoreResult,
     Group(SetExpr),
 }
@@ -198,6 +199,12 @@ pub fn set_operation_element(i: Input) -> IResult<WithSpan<SetOperationElement>>
         },
         |(_, offset)| SetOperationElement::Offset { offset },
     );
+    let for_update = map(
+        rule! {
+            FOR ~ ^UPDATE
+        },
+        |(_, _)| SetOperationElement::ForUpdate,
+    );
     let ignore_result = map(
         rule! {
             IGNORE_RESULT
@@ -222,6 +229,7 @@ pub fn set_operation_element(i: Input) -> IResult<WithSpan<SetOperationElement>>
             | #order_by
             | #limit
             | #offset
+            | #for_update
             | #ignore_result
         }),
         |(span, elem)| WithSpan { span, elem },
@@ -255,6 +263,7 @@ impl<'a, I: Iterator<Item = WithSpan<'a, SetOperationElement>>> PrattParser<I>
             SetOperationElement::OrderBy { .. } => Affix::Postfix(Precedence(5)),
             SetOperationElement::Limit { .. } => Affix::Postfix(Precedence(5)),
             SetOperationElement::Offset { .. } => Affix::Postfix(Precedence(5)),
+            SetOperationElement::ForUpdate => Affix::Postfix(Precedence(5)),
             SetOperationElement::IgnoreResult => Affix::Postfix(Precedence(5)),
             _ => Affix::Nilfix,
         };
@@ -367,6 +376,12 @@ impl<'a, I: Iterator<Item = WithSpan<'a, SetOperationElement>>> PrattParser<I>
                     return Err("duplicated OFFSET clause");
                 }
                 query.offset = Some(offset);
+            }
+            SetOperationElement::ForUpdate => {
+                if query.locking.is_some() {
+                    return Err("duplicated locking clause");
+                }
+                query.locking = Some(QueryLockingClause::for_update());
             }
             SetOperationElement::IgnoreResult => {
                 query.ignore_result = true;

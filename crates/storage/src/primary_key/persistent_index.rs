@@ -5,8 +5,8 @@
 
 use crate::metrics::storage_metrics;
 use crate::primary_key::{
-    ImmutableIndexReader, ImmutableIndexStats, ImmutableIndexWriter, PrimaryIndex, RowID,
-    NULL_ROW_ID,
+    ImmutableIndexReader, ImmutableIndexStats, ImmutableIndexWriter, PrimaryIndex,
+    PrimaryIndexVersion, PrimaryKeyWriteConflict, RowID, NULL_ROW_ID,
 };
 use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
@@ -15,11 +15,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const PERSISTENT_INDEX_FORMAT_VERSION: u32 = 3;
+pub const PERSISTENT_INDEX_FORMAT_VERSION: u32 = 4;
 
 const WAL_MAGIC: [u8; 4] = *b"PIWL";
 const FILE_HEADER_LEN: usize = 8;
-const VALUE_LEN: usize = 8;
+const VALUE_LEN: usize = 16;
 const MINOR_COMPACTION_THRESHOLD: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,14 +74,6 @@ fn default_manifest_format_version() -> u32 {
 
 fn default_next_file_id() -> u64 {
     1
-}
-
-fn tombstone_row_id() -> RowID {
-    RowID::from_raw(NULL_ROW_ID)
-}
-
-fn is_tombstone(row_id: &RowID) -> bool {
-    row_id.is_null()
 }
 
 #[derive(Debug, Clone)]
@@ -169,19 +161,17 @@ impl PersistentIndex {
             if id < self.active_wal_id {
                 continue;
             }
-            for (key, row_id) in self.read_wal_records(&path)? {
-                if is_tombstone(&row_id) {
-                    index.remove(&key);
-                } else {
-                    index.upsert(key, row_id);
-                }
-            }
+            index.batch_apply_versions(self.read_wal_records(&path)?);
         }
 
         Ok(index)
     }
 
     pub fn apply_upserts(&self, pairs: &[(Vec<u8>, RowID)]) -> Result<()> {
+        self.apply_upserts_at(pairs, 0)
+    }
+
+    pub fn apply_upserts_at(&self, pairs: &[(Vec<u8>, RowID)], commit_ts: u64) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -205,6 +195,9 @@ impl PersistentIndex {
                 .map_err(|e| {
                     paro_error::io_error(format!("write wal row id to {:?}: {}", wal_path, e))
                 })?;
+            file.write_all(&commit_ts.to_le_bytes()).map_err(|e| {
+                paro_error::io_error(format!("write wal commit ts to {:?}: {}", wal_path, e))
+            })?;
         }
         file.flush()
             .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", wal_path, e)))?;
@@ -212,6 +205,10 @@ impl PersistentIndex {
     }
 
     pub fn apply_deletes(&self, keys: &[Vec<u8>]) -> Result<()> {
+        self.apply_deletes_at(keys, 0)
+    }
+
+    pub fn apply_deletes_at(&self, keys: &[Vec<u8>], commit_ts: u64) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -223,7 +220,7 @@ impl PersistentIndex {
             .map_err(|e| paro_error::io_error(format!("open wal {:?}: {}", wal_path, e)))?;
         Self::ensure_file_header(&mut file)?;
 
-        let tombstone = u64::from(tombstone_row_id()).to_le_bytes();
+        let tombstone = NULL_ROW_ID.to_le_bytes();
         for key in keys {
             let key_len = key.len() as u32;
             file.write_all(&key_len.to_le_bytes()).map_err(|e| {
@@ -235,6 +232,9 @@ impl PersistentIndex {
             file.write_all(&tombstone).map_err(|e| {
                 paro_error::io_error(format!("write wal tombstone to {:?}: {}", wal_path, e))
             })?;
+            file.write_all(&commit_ts.to_le_bytes()).map_err(|e| {
+                paro_error::io_error(format!("write wal commit ts to {:?}: {}", wal_path, e))
+            })?;
         }
         file.flush()
             .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", wal_path, e)))?;
@@ -242,32 +242,39 @@ impl PersistentIndex {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<RowID>> {
+        Ok(self
+            .get_version_at(key, u64::MAX)?
+            .and_then(PrimaryIndexVersion::visible_row_id))
+    }
+
+    pub fn get_version_at(&self, key: &[u8], read_ts: u64) -> Result<Option<PrimaryIndexVersion>> {
         self.validate_current_format()?;
 
+        let mut best = None;
         let mut wal_files = self.list_wal_files()?;
         wal_files.retain(|(id, _)| *id >= self.active_wal_id);
-        wal_files.sort_by(|a, b| b.0.cmp(&a.0));
+        wal_files.sort_by_key(|(id, _)| *id);
         for (_, path) in wal_files {
-            if let Some(row_id) = self.search_wal_for_key(&path, key)? {
-                return Ok((!is_tombstone(&row_id)).then_some(row_id));
-            }
+            Self::select_newer_visible(&mut best, self.search_wal_for_key_at(&path, key, read_ts)?);
         }
 
         let mut l1_files = self.l1_files.clone();
-        l1_files.sort_by_key(|meta| std::cmp::Reverse(meta.edit_version));
+        l1_files.sort_by_key(|meta| meta.edit_version);
         for meta in l1_files {
-            if let Some(row_id) = self.search_immutable_file_for_key(&meta, key)? {
-                return Ok((!is_tombstone(&row_id)).then_some(row_id));
-            }
+            Self::select_newer_visible(
+                &mut best,
+                self.search_immutable_file_for_key_at(&meta, key, read_ts)?,
+            );
         }
 
         if let Some(l2_file) = &self.l2_file {
-            if let Some(row_id) = self.search_immutable_file_for_key(l2_file, key)? {
-                return Ok((!is_tombstone(&row_id)).then_some(row_id));
-            }
+            Self::select_newer_visible(
+                &mut best,
+                self.search_immutable_file_for_key_at(l2_file, key, read_ts)?,
+            );
         }
 
-        Ok(None)
+        Ok(best)
     }
 
     pub fn lookup_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<RowID>>> {
@@ -279,8 +286,156 @@ impl PersistentIndex {
             return Ok(vec![self.get(&keys[0])?]);
         }
 
+        self.lookup_keys_at(keys, u64::MAX)
+    }
+
+    pub fn lookup_keys_at(&self, keys: &[Vec<u8>], read_ts: u64) -> Result<Vec<Option<RowID>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .lookup_versions_at(keys, read_ts)?
+            .into_iter()
+            .map(|version| version.and_then(PrimaryIndexVersion::visible_row_id))
+            .collect())
+    }
+
+    pub fn lookup_versions_at(
+        &self,
+        keys: &[Vec<u8>],
+        read_ts: u64,
+    ) -> Result<Vec<Option<PrimaryIndexVersion>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if keys.len() == 1 {
+            return Ok(vec![self.get_version_at(&keys[0], read_ts)?]);
+        }
+
         let idx = self.load()?;
-        Ok(self.batch_get_loaded(&idx, keys))
+        Ok(idx.multi_get_versions_at(keys.iter().map(Vec::as_slice), read_ts))
+    }
+
+    pub fn has_write_in_range(&self, key: &[u8], read_ts: u64, commit_ts: u64) -> Result<bool> {
+        Ok(self
+            .first_write_in_range(key, read_ts, commit_ts)?
+            .is_some())
+    }
+
+    pub fn first_write_in_range(
+        &self,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        self.validate_current_format()?;
+        if read_ts >= commit_ts {
+            return Ok(None);
+        }
+
+        let mut best = None;
+        let mut wal_files = self.list_wal_files()?;
+        wal_files.retain(|(id, _)| *id >= self.active_wal_id);
+        wal_files.sort_by_key(|(id, _)| *id);
+        for (_, path) in wal_files {
+            if let Some(conflict) =
+                self.search_wal_for_write_in_range(&path, key, read_ts, commit_ts)?
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        let mut l1_files = self.l1_files.clone();
+        l1_files.sort_by_key(|meta| meta.edit_version);
+        for meta in l1_files {
+            if let Some(conflict) =
+                self.search_immutable_file_for_write_in_range(&meta, key, read_ts, commit_ts)?
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        if let Some(l2_file) = &self.l2_file {
+            if let Some(conflict) =
+                self.search_immutable_file_for_write_in_range(l2_file, key, read_ts, commit_ts)?
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        Ok(best)
+    }
+
+    pub fn first_write_for_keys_in_range(
+        &self,
+        keys: &[Vec<u8>],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        if keys.is_empty() || read_ts >= commit_ts {
+            return Ok(None);
+        }
+        if keys.len() == 1 {
+            return self.first_write_in_range(&keys[0], read_ts, commit_ts);
+        }
+
+        let idx = self.load()?;
+        let mut best = None;
+        for key in keys {
+            if let Some(conflict) = idx.first_write_in_range(key, read_ts, commit_ts) {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+        Ok(best)
+    }
+
+    pub fn first_key_range_write_in_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        self.validate_current_format()?;
+        if read_ts >= commit_ts {
+            return Ok(None);
+        }
+
+        let mut best = None;
+        let mut wal_files = self.list_wal_files()?;
+        wal_files.retain(|(id, _)| *id >= self.active_wal_id);
+        wal_files.sort_by_key(|(id, _)| *id);
+        for (_, path) in wal_files {
+            if let Some(conflict) = self
+                .search_wal_for_key_range_write_in_range(&path, lower, upper, read_ts, commit_ts)?
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        let mut l1_files = self.l1_files.clone();
+        l1_files.sort_by_key(|meta| meta.edit_version);
+        for meta in l1_files {
+            if let Some(conflict) =
+                ImmutableIndexReader::open_cached(self.resolve_immutable_meta_path(&meta))?
+                    .first_key_range_write_in_range(lower, upper, read_ts, commit_ts)?
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        if let Some(l2_file) = &self.l2_file {
+            if let Some(conflict) =
+                ImmutableIndexReader::open_cached(self.resolve_immutable_meta_path(l2_file))?
+                    .first_key_range_write_in_range(lower, upper, read_ts, commit_ts)?
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        Ok(best)
     }
 
     pub fn batch_get_loaded(&self, idx: &PrimaryIndex, keys: &[Vec<u8>]) -> Vec<Option<RowID>> {
@@ -376,25 +531,19 @@ impl PersistentIndex {
     }
 
     fn minor_compact(&mut self) -> Result<()> {
-        let mut merged = HashMap::<Vec<u8>, RowID>::new();
+        let mut merged = HashMap::<(Vec<u8>, u64), PrimaryIndexVersion>::new();
 
         if let Some(l2_file) = &self.l2_file {
-            for (key, row_id) in self.read_immutable_entries(l2_file)? {
-                if !is_tombstone(&row_id) {
-                    merged.insert(key, row_id);
-                }
+            for (key, version) in self.read_immutable_entries(l2_file)? {
+                merged.insert((key, version.commit_ts), version);
             }
         }
 
         let mut l1_files = self.l1_files.clone();
         l1_files.sort_by_key(|meta| meta.edit_version);
         for meta in l1_files {
-            for (key, row_id) in self.read_immutable_entries(&meta)? {
-                if is_tombstone(&row_id) {
-                    merged.remove(&key);
-                } else {
-                    merged.insert(key, row_id);
-                }
+            for (key, version) in self.read_immutable_entries(&meta)? {
+                merged.insert((key, version.commit_ts), version);
             }
         }
 
@@ -405,8 +554,11 @@ impl PersistentIndex {
             return Ok(());
         }
 
-        let mut entries: Vec<_> = merged.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut entries: Vec<_> = merged
+            .into_iter()
+            .map(|((key, _), version)| (key, version))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.commit_ts.cmp(&b.1.commit_ts)));
 
         let file_id = self.next_file_id;
         let stats = self.write_immutable_level_file("l2", file_id, &entries)?;
@@ -425,25 +577,35 @@ impl PersistentIndex {
         meta: &ImmutableFileMeta,
         index: &PrimaryIndex,
     ) -> Result<()> {
-        for (key, row_id) in self.read_immutable_entries(meta)? {
-            if is_tombstone(&row_id) {
-                index.remove(&key);
-            } else {
-                index.upsert(key, row_id);
-            }
-        }
+        index.batch_apply_versions(self.read_immutable_entries(meta)?);
         Ok(())
     }
 
-    fn search_immutable_file_for_key(
+    fn search_immutable_file_for_key_at(
         &self,
         meta: &ImmutableFileMeta,
         key: &[u8],
-    ) -> Result<Option<RowID>> {
-        ImmutableIndexReader::open_cached(self.resolve_immutable_meta_path(meta))?.get(key)
+        read_ts: u64,
+    ) -> Result<Option<PrimaryIndexVersion>> {
+        ImmutableIndexReader::open_cached(self.resolve_immutable_meta_path(meta))?
+            .get_version_at(key, read_ts)
     }
 
-    fn read_immutable_entries(&self, meta: &ImmutableFileMeta) -> Result<Vec<(Vec<u8>, RowID)>> {
+    fn search_immutable_file_for_write_in_range(
+        &self,
+        meta: &ImmutableFileMeta,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        ImmutableIndexReader::open_cached(self.resolve_immutable_meta_path(meta))?
+            .first_write_in_range(key, read_ts, commit_ts)
+    }
+
+    fn read_immutable_entries(
+        &self,
+        meta: &ImmutableFileMeta,
+    ) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
         ImmutableIndexReader::open_cached(self.resolve_immutable_meta_path(meta))?.entries()
     }
 
@@ -471,7 +633,7 @@ impl PersistentIndex {
         &self,
         level: &str,
         file_id: u64,
-        entries: &[(Vec<u8>, RowID)],
+        entries: &[(Vec<u8>, PrimaryIndexVersion)],
     ) -> Result<ImmutableIndexStats> {
         ImmutableIndexWriter::default().write_entries(self.immutable_path(level, file_id), entries)
     }
@@ -498,7 +660,7 @@ impl PersistentIndex {
             .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", path, e)))
     }
 
-    fn read_wal_records(&self, path: &Path) -> Result<Vec<(Vec<u8>, RowID)>> {
+    fn read_wal_records(&self, path: &Path) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -507,14 +669,78 @@ impl PersistentIndex {
         parse_records(&data)
     }
 
-    fn search_wal_for_key(&self, path: &Path, key: &[u8]) -> Result<Option<RowID>> {
+    fn search_wal_for_key_at(
+        &self,
+        path: &Path,
+        key: &[u8],
+        read_ts: u64,
+    ) -> Result<Option<PrimaryIndexVersion>> {
         let mut found = None;
-        for (current_key, row_id) in self.read_wal_records(path)? {
-            if current_key == key {
-                found = Some(row_id);
+        for (current_key, version) in self.read_wal_records(path)? {
+            if current_key == key && version.commit_ts <= read_ts {
+                if found
+                    .map(|current: PrimaryIndexVersion| version.commit_ts >= current.commit_ts)
+                    .unwrap_or(true)
+                {
+                    found = Some(version);
+                }
             }
         }
         Ok(found)
+    }
+
+    fn search_wal_for_write_in_range(
+        &self,
+        path: &Path,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        let mut best = None;
+        for (current_key, version) in self.read_wal_records(path)? {
+            if current_key == key && version_in_window(version, read_ts, commit_ts) {
+                select_earlier_conflict(
+                    &mut best,
+                    PrimaryKeyWriteConflict {
+                        key: current_key,
+                        version,
+                    },
+                );
+            }
+        }
+        Ok(best)
+    }
+
+    fn search_wal_for_key_range_write_in_range(
+        &self,
+        path: &Path,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        let mut best = None;
+        for (key, version) in self.read_wal_records(path)? {
+            if key_in_bounds(&key, lower, upper) && version_in_window(version, read_ts, commit_ts) {
+                select_earlier_conflict(&mut best, PrimaryKeyWriteConflict { key, version });
+            }
+        }
+        Ok(best)
+    }
+
+    fn select_newer_visible(
+        best: &mut Option<PrimaryIndexVersion>,
+        candidate: Option<PrimaryIndexVersion>,
+    ) {
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if best
+            .map(|current| candidate.commit_ts > current.commit_ts)
+            .unwrap_or(true)
+        {
+            *best = Some(candidate);
+        }
     }
 
     fn list_wal_files(&self) -> Result<Vec<(u64, PathBuf)>> {
@@ -640,7 +866,7 @@ impl PersistentIndex {
     }
 }
 
-fn parse_records(data: &[u8]) -> Result<Vec<(Vec<u8>, RowID)>> {
+fn parse_records(data: &[u8]) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
     let status = PersistentIndex::file_header_status(data);
     let mut offset = match status {
         FileHeaderStatus::Current => FILE_HEADER_LEN,
@@ -662,12 +888,39 @@ fn parse_records(data: &[u8]) -> Result<Vec<(Vec<u8>, RowID)>> {
         let key = data[offset..offset + key_len].to_vec();
         offset += key_len;
         let row_id = RowID::from_raw(u64::from_le_bytes(
-            data[offset..offset + VALUE_LEN].try_into().unwrap(),
+            data[offset..offset + 8].try_into().unwrap(),
         ));
+        let commit_ts =
+            u64::from_le_bytes(data[offset + 8..offset + VALUE_LEN].try_into().unwrap());
         offset += VALUE_LEN;
-        out.push((key, row_id));
+        out.push((key, PrimaryIndexVersion::live(row_id, commit_ts)));
     }
     Ok(out)
+}
+
+fn version_in_window(version: PrimaryIndexVersion, read_ts: u64, commit_ts: u64) -> bool {
+    version.commit_ts > read_ts && version.commit_ts <= commit_ts
+}
+
+fn key_in_bounds(key: &[u8], lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
+    lower.map_or(true, |lower| key >= lower) && upper.map_or(true, |upper| key <= upper)
+}
+
+fn select_earlier_conflict(
+    slot: &mut Option<PrimaryKeyWriteConflict>,
+    candidate: PrimaryKeyWriteConflict,
+) {
+    let should_replace = slot
+        .as_ref()
+        .map(|current| {
+            candidate.version.commit_ts < current.version.commit_ts
+                || (candidate.version.commit_ts == current.version.commit_ts
+                    && candidate.key < current.key)
+        })
+        .unwrap_or(true);
+    if should_replace {
+        *slot = Some(candidate);
+    }
 }
 
 fn file_id_with_prefix(path: &Path, prefix: &str) -> Option<u64> {
@@ -769,6 +1022,38 @@ mod tests {
     }
 
     #[test]
+    fn write_conflict_window_spans_wal_and_immutable_files() {
+        storage_metrics().reset_for_tests();
+        let dir = tempdir().unwrap();
+        let mut pi = PersistentIndex::new(dir.path()).unwrap();
+        let empty = PrimaryIndex::new();
+
+        pi.apply_upserts_at(&[(b"a".to_vec(), RowID::new(1, 1))], 10)
+            .unwrap();
+        pi.flush_l0(&empty, true).unwrap();
+        pi.apply_upserts_at(&[(b"b".to_vec(), RowID::new(1, 2))], 20)
+            .unwrap();
+        pi.apply_deletes_at(&[b"b".to_vec()], 30).unwrap();
+
+        assert!(!pi.has_write_in_range(b"a", 10, 99).unwrap());
+        assert!(pi.has_write_in_range(b"a", 9, 10).unwrap());
+
+        let conflict = pi
+            .first_write_for_keys_in_range(&[b"missing".to_vec(), b"b".to_vec()], 19, 99)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conflict.key, b"b".to_vec());
+        assert_eq!(conflict.commit_ts(), 20);
+
+        let range_conflict = pi
+            .first_key_range_write_in_range(Some(b"b"), Some(b"c"), 20, 30)
+            .unwrap()
+            .unwrap();
+        assert!(range_conflict.is_tombstone());
+        assert_eq!(range_conflict.commit_ts(), 30);
+    }
+
+    #[test]
     fn minor_compaction_merges_l1_and_cleans_tombstones() {
         storage_metrics().reset_for_tests();
         let dir = tempdir().unwrap();
@@ -838,7 +1123,8 @@ mod tests {
 
     #[test]
     fn tombstone_uses_reserved_null_row_id() {
-        assert_eq!(u64::from(tombstone_row_id()), NULL_ROW_ID);
-        assert!(is_tombstone(&tombstone_row_id()));
+        let tombstone = PrimaryIndexVersion::tombstone(7);
+        assert_eq!(u64::from(tombstone.row_id), NULL_ROW_ID);
+        assert!(tombstone.is_tombstone());
     }
 }

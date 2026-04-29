@@ -15,6 +15,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_storage::index::graph::{GraphProjectionIndex, GraphStorageGeneration};
+use paro_storage::metrics::storage_metrics;
 use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor;
@@ -24,6 +25,8 @@ use std::path::{Path, PathBuf};
 pub struct PostCommitActions;
 
 impl PostCommitActions {
+    const DEFERRED_TASK_ATTEMPTS: usize = 2;
+
     pub fn execute(session: &mut Session, outcome: CommitOutcome) -> Result<()> {
         session.on_transaction_commit_prepared();
         Self::execute_catalog_effects(session, &outcome);
@@ -60,7 +63,9 @@ impl PostCommitActions {
             }
 
             for transition in &op.runtime_transitions {
-                if let Err(err) = Self::apply_runtime_transition(session, transition) {
+                if let Err(err) =
+                    Self::apply_runtime_transition(session, transition, outcome.commit_id)
+                {
                     tracing::warn!(
                         target: targets::TRANSACTION,
                         commit_id = outcome.commit_id,
@@ -101,12 +106,22 @@ impl PostCommitActions {
                         task_kind = "graph_dml_maintenance",
                         "Dispatching deferred task after durable commit"
                     );
-                    session.apply_post_commit_hooks(
-                        &[PostCommitHookDescriptor::GraphDmlMaintenance {
-                            deltas: deltas.clone(),
-                        }],
+                    let hooks = [PostCommitHookDescriptor::GraphDmlMaintenance {
+                        deltas: deltas.clone(),
+                    }];
+                    if let Err(err) = Self::run_deferred_with_retry(
+                        "graph_dml_maintenance",
                         outcome.commit_id,
-                    );
+                        || session.apply_post_commit_hooks(&hooks, outcome.commit_id),
+                    ) {
+                        storage_metrics().record_derived_index_lag_ts(outcome.commit_id);
+                        tracing::warn!(
+                            target: targets::TRANSACTION,
+                            commit_id = outcome.commit_id,
+                            error = %err,
+                            "deferred graph publish failed after retry; keeping storage/catalog visibility published"
+                        );
+                    }
                 }
                 DeferredTask::FinalizeIndexState {
                     index,
@@ -124,16 +139,22 @@ impl PostCommitActions {
                         table = %table_name,
                         "Dispatching deferred task after durable commit"
                     );
-                    Self::finalize_index_state_task(
-                        session,
-                        outcome,
-                        &index,
-                        &table_name,
-                        &index_type,
-                        &column_ids,
-                        fulltext_config.as_deref(),
-                    )
-                    .unwrap_or_else(|err| {
+                    if let Err(err) = Self::run_deferred_with_retry(
+                        "finalize_index_state",
+                        outcome.commit_id,
+                        || {
+                            Self::finalize_index_state_task(
+                                session,
+                                outcome,
+                                &index,
+                                &table_name,
+                                &index_type,
+                                &column_ids,
+                                fulltext_config.as_deref(),
+                            )
+                        },
+                    ) {
+                        storage_metrics().record_derived_index_lag_ts(outcome.commit_id);
                         tracing::warn!(
                             target: targets::TRANSACTION,
                             commit_id = outcome.commit_id,
@@ -141,13 +162,39 @@ impl PostCommitActions {
                             table = %table_name,
                             index_type = %index_type,
                             error = %err,
-                            "deferred index runtime task failed after durable commit; keeping commit durable"
+                            "deferred index runtime task failed after retry; keeping storage/catalog visibility published"
                         );
-                    });
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    fn run_deferred_with_retry(
+        task_kind: &'static str,
+        commit_id: u64,
+        mut task: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 1..=Self::DEFERRED_TASK_ATTEMPTS {
+            match task() {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        target: targets::TRANSACTION,
+                        commit_id,
+                        task_kind,
+                        attempt,
+                        max_attempts = Self::DEFERRED_TASK_ATTEMPTS,
+                        error = %err,
+                        "deferred derived publish attempt failed"
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| paro_error::internal("deferred derived publish failed")))
     }
 
     fn finalize_index_state_task(
@@ -384,12 +431,19 @@ impl PostCommitActions {
                     ))
                 })
             }
+            StagedArtifactDescriptor::BulkLoadRowset(_artifact) => {
+                // The storage participant publishes bulk-load rowsets through
+                // StorageCommitOp so commit ordering, mutation identity, and
+                // recovery replay stay identical to ordinary rowset publish.
+                Ok(())
+            }
         }
     }
 
     fn apply_runtime_transition(
         session: &Session,
         transition: &RuntimeTransitionDescriptor,
+        commit_id: u64,
     ) -> Result<()> {
         match transition {
             RuntimeTransitionDescriptor::AttachIndexState { .. } => Ok(()),
@@ -417,7 +471,11 @@ impl PostCommitActions {
                 let graph_dir =
                     Self::graph_dir(Path::new(session.current_database.path()), &graph.name);
                 let index = GraphProjectionIndex::load(&graph_dir)?;
-                let manifest = GraphProjectionIndex::load_manifest(&graph_dir)?;
+                let mut manifest = GraphProjectionIndex::load_manifest(&graph_dir)?;
+                if manifest.indexed_through_ts() < commit_id {
+                    manifest = manifest.with_indexed_through_ts(commit_id);
+                    GraphProjectionIndex::write_manifest(&graph_dir, &manifest)?;
+                }
                 let runtime_key =
                     GraphId::new(&graph.database, schema_name, &graph.name).runtime_key();
                 session.instance.graph_manager().register_generation(

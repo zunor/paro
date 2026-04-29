@@ -13,6 +13,7 @@ use paro_common::durability::{PrepareToken, PreparedMaintenancePlan, PreparedTab
 use paro_common::effect::ArtifactRef;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::journal::MaintenanceKind;
+use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,7 +38,7 @@ impl CompactionPublisher {
                     .collect(),
                 PrepareToken {
                     visible_version: artifact.plan.read_snapshot.visible_version,
-                    rowset_epoch: artifact.plan.read_snapshot.rowset_epoch,
+                    layout_epoch: artifact.plan.read_snapshot.layout_epoch,
                     schema_epoch: artifact.plan.read_snapshot.schema_epoch,
                 },
             ),
@@ -51,7 +52,7 @@ impl CompactionPublisher {
                     .collect(),
                 PrepareToken {
                     visible_version: artifact.plan.read_snapshot.visible_version,
-                    rowset_epoch: artifact.plan.read_snapshot.rowset_epoch,
+                    layout_epoch: artifact.plan.read_snapshot.layout_epoch,
                     schema_epoch: artifact.plan.read_snapshot.schema_epoch,
                 },
             ),
@@ -107,7 +108,12 @@ impl CompactionPublisher {
     }
 
     pub fn publish(tablet: &Tablet, request: CompactionPublishRequest) -> Result<()> {
-        let CompactionPublishRequest { output, record, .. } = request;
+        let CompactionPublishRequest {
+            output,
+            record,
+            maintenance_plan,
+            ..
+        } = request;
         let retired_inputs: Vec<_> = match &output {
             CompactionBuildOutput::Rowset(artifact) => artifact
                 .plan
@@ -132,7 +138,7 @@ impl CompactionPublisher {
         };
         let final_path = PathBuf::from(&record.output_rowset_path);
         let mut installed_final_namespace = false;
-        let mut wal_durable = false;
+        let mut durable_record = false;
 
         let result = match output {
             CompactionBuildOutput::Rowset(artifact) => {
@@ -142,10 +148,11 @@ impl CompactionPublisher {
                         artifact,
                         None,
                         &record,
+                        maintenance_plan,
                         &retired_inputs,
                         &final_path,
                         &mut installed_final_namespace,
-                        &mut wal_durable,
+                        &mut durable_record,
                     )
                 })
             }
@@ -156,16 +163,17 @@ impl CompactionPublisher {
                         artifact,
                         Some(pk_delta),
                         &record,
+                        maintenance_plan,
                         &retired_inputs,
                         &final_path,
                         &mut installed_final_namespace,
-                        &mut wal_durable,
+                        &mut durable_record,
                     )
                 })
             }
         };
 
-        if result.is_err() && installed_final_namespace && !wal_durable {
+        if result.is_err() && installed_final_namespace && !durable_record {
             crate::compaction::cleanup::cleanup_now(&final_path);
         }
 
@@ -177,10 +185,11 @@ impl CompactionPublisher {
         artifact: StagedArtifact,
         pk_delta: Option<PkPublishDelta>,
         record: &CompactionPublishRecord,
+        maintenance_plan: PreparedMaintenancePlan,
         retired_inputs: &[RetiredInput],
         final_path: &Path,
         installed_final_namespace: &mut bool,
-        wal_durable: &mut bool,
+        durable_record: &mut bool,
     ) -> Result<()> {
         let staged_stats = artifact.rowset.statistics().ok();
         tablet.validate_compaction_publish_locked(
@@ -195,18 +204,35 @@ impl CompactionPublisher {
 
         let final_rowset = build_final_rowset(tablet, &artifact, final_path, staged_stats)?;
         tablet.ensure_rowset_rssids(&final_rowset);
-        tablet.write_compaction_publish_wal(record)?;
-        *wal_durable = true;
-        let checkpoint_ticket = tablet.begin_checkpoint_compaction_publish();
+        let maintenance_context = match tablet.journal_coordinator() {
+            Some(coordinator) => Some(coordinator.submit_maintenance(maintenance_plan)?),
+            None => None,
+        };
+        *durable_record = maintenance_context.is_some();
+        let checkpoint_ticket = tablet
+            .begin_checkpoint_compaction_publish()
+            .map(|mut ticket| {
+                if let Some(context) = maintenance_context.as_ref() {
+                    ticket.maintenance_id = context.maintenance_id;
+                }
+                ticket
+            });
+        let output_maintenance_id = maintenance_context
+            .as_ref()
+            .map(|context| context.maintenance_id)
+            .or_else(|| {
+                checkpoint_ticket
+                    .as_ref()
+                    .map(|ticket| ticket.maintenance_id)
+            })
+            .unwrap_or(0);
 
         final_rowset.make_visible()?;
         tablet.install_compaction_publish_locked(
             &artifact.plan.input_rowset_ptrs(),
             retired_inputs,
             final_rowset.clone(),
-            checkpoint_ticket
-                .map(|ticket| ticket.maintenance_id)
-                .unwrap_or(0),
+            output_maintenance_id,
             record.cumulative_point_action,
             false,
         )?;
@@ -228,6 +254,23 @@ impl CompactionPublisher {
         ) {
             tablet.validate_primary_index_consistency_after_compaction(&final_rowset)?;
             tablet.maybe_flush_primary_index()?;
+        }
+
+        if let (Some(runtime), Some(context)) =
+            (tablet.journal_apply_runtime(), maintenance_context.as_ref())
+        {
+            runtime.submit(ApplyRequest {
+                lsn: context.lsn,
+                durable_batch_lsn: context.durable_batch_lsn,
+                commit_id: None,
+                wait_mode: WaitMode::Published,
+                catalog_serial: false,
+                catalog_pre: Box::new(|| Ok(())),
+                tablet_parts: Vec::<TabletApplyPart>::new(),
+                descriptor_phase: Box::new(|| Ok(())),
+                catalog_post: Box::new(|| Ok(())),
+                on_published: Box::new(|| Ok(())),
+            })?;
         }
 
         if let Err(err) = tablet.persist_meta_snapshot() {

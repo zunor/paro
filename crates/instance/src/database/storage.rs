@@ -11,12 +11,12 @@ use crate::storage_manager::{
     MAIN_WAL_SUFFIX,
 };
 use paro_common::error::{self as paro_error, Result};
+use paro_journal::wal::wal_entry::WalHeaderMetadata;
+use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_storage::buffer::BufferManager;
 use paro_storage::meta::{
     FileMetadataStore, MetadataOp, MetadataStore, StorageManifest, TabletMetaManager,
 };
-use paro_storage::wal::wal_entry::WalHeaderMetadata;
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -23,19 +23,104 @@ fn query_statement(i: Input) -> IResult<Statement> {
     map(query, |query| Statement::Query(Box::new(query))).parse(i)
 }
 
-pub(crate) fn transaction_stmt(i: Input) -> IResult<Statement> {
+#[derive(Debug, Clone, Copy)]
+enum ParsedTransactionMode {
+    Isolation(TransactionIsolationLevel),
+    Read(TransactionReadMode),
+}
+
+fn transaction_mode(i: Input) -> IResult<ParsedTransactionMode> {
     alt((
-        value(
-            Statement::Transaction(TransactionStmt {
-                kind: TransactionKind::Begin,
-            }),
-            rule! { BEGIN ~ TRANSACTION? },
+        map(
+            rule! { ISOLATION ~ LEVEL ~ ( SERIALIZABLE | SNAPSHOT ) },
+            |(_, _, token)| {
+                ParsedTransactionMode::Isolation(match token.kind {
+                    TokenKind::SERIALIZABLE => TransactionIsolationLevel::Serializable,
+                    TokenKind::SNAPSHOT => TransactionIsolationLevel::Snapshot,
+                    _ => unreachable!(),
+                })
+            },
         ),
         value(
-            Statement::Transaction(TransactionStmt {
-                kind: TransactionKind::Start,
-            }),
-            rule! { START ~ TRANSACTION },
+            ParsedTransactionMode::Read(TransactionReadMode::ReadOnly),
+            rule! { READ ~ ONLY },
+        ),
+        value(
+            ParsedTransactionMode::Read(TransactionReadMode::ReadWrite),
+            rule! { READ ~ WRITE },
+        ),
+    ))
+    .parse(i)
+}
+
+fn transaction_mode_with_optional_comma(i: Input) -> IResult<ParsedTransactionMode> {
+    map(rule! { ","? ~ #transaction_mode }, |(_, mode)| mode).parse(i)
+}
+
+fn transaction_options_from_modes(modes: Vec<ParsedTransactionMode>) -> TransactionOptions {
+    let mut options = TransactionOptions::default();
+    for mode in modes {
+        match mode {
+            ParsedTransactionMode::Isolation(isolation_level) => {
+                options.isolation_level = Some(isolation_level);
+            }
+            ParsedTransactionMode::Read(read_mode) => {
+                options.read_mode = Some(read_mode);
+            }
+        }
+    }
+    options
+}
+
+fn transaction_options(i: Input) -> IResult<TransactionOptions> {
+    map(
+        rule! { #transaction_mode_with_optional_comma* },
+        transaction_options_from_modes,
+    )
+    .parse(i)
+}
+
+fn required_transaction_options(i: Input) -> IResult<TransactionOptions> {
+    map(
+        rule! { #transaction_mode_with_optional_comma+ },
+        transaction_options_from_modes,
+    )
+    .parse(i)
+}
+
+pub(crate) fn transaction_stmt(i: Input) -> IResult<Statement> {
+    alt((
+        map(
+            rule! { BEGIN ~ TRANSACTION? ~ #transaction_options },
+            |(_, _, options)| {
+                Statement::Transaction(TransactionStmt {
+                    kind: TransactionKind::Begin(options),
+                })
+            },
+        ),
+        map(
+            rule! { START ~ TRANSACTION ~ #transaction_options },
+            |(_, _, options)| {
+                Statement::Transaction(TransactionStmt {
+                    kind: TransactionKind::Start(options),
+                })
+            },
+        ),
+        map(
+            rule! { SET ~ TRANSACTION ~ #required_transaction_options },
+            |(_, _, options)| {
+                Statement::Transaction(TransactionStmt {
+                    kind: TransactionKind::SetTransaction(options),
+                })
+            },
+        ),
+        map(
+            rule! { SET ~ SESSION ~ CHARACTERISTICS ~ AS ~ TRANSACTION ~ #required_transaction_options },
+            |(_, _, _, _, _, options)| {
+                Statement::Transaction(TransactionStmt {
+                    kind: TransactionKind::SetSessionCharacteristics(options),
+                })
+            },
         ),
         map(
             rule! { COMMIT ~ PREPARED ~ #literal_string },

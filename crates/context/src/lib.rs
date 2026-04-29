@@ -25,7 +25,8 @@ mod write_guard;
 pub mod test_support;
 
 pub use attached_databases::{
-    AttachedDatabaseDirectory, AttachedDatabaseSnapshot, AttachedDatabaseWalMetricsSnapshot,
+    AttachedDatabaseDirectory, AttachedDatabaseSnapshot,
+    AttachedDatabaseTransactionMetricsSnapshot, AttachedDatabaseWalMetricsSnapshot,
     DatabaseSnapshotIdentity,
 };
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
@@ -34,6 +35,13 @@ pub use execution_resources::ExecutionResources;
 pub use execution_tracker::StatementExecutionTracker;
 pub use memory_governance::{
     QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryRegistration, QueryMemoryTarget,
+};
+pub use paro_transaction::{
+    IndexedReadTracker, NormalizedPredicate, NormalizedPredicateRead, NormalizedPredicateTerm,
+    PredicateAtom, PredicateBound, PredicateExpr, PredicateFallbackScope, PredicateNormalizer,
+    PredicateValue, ReadDependency, ReadDependencyIndex, ReadDependencyIndexOptions, ReadRecorder,
+    ReadSnapshot, ReadTrackerHandle, ReadTrackerSavepointMark, ReadTrackingPolicy,
+    RecordingReadTracker, TransactionView,
 };
 pub use query_resources::{
     ConnectionInfoProvider, ConnectionInfoSnapshot, GraphIndexProvider, GraphRegistry,
@@ -53,11 +61,12 @@ pub use statement_environment::{StatementAuthContext, StatementEnvironment};
 pub use statement_options::{ExplainOutputType, StatementOptions, StatementSource};
 pub use statement_view::StatementView;
 pub use txn_admission::{
-    CatalogEffect, DdlExecutionProfile, MixedDmlPolicy, PendingDdlAdmission, RuntimeEffect,
-    TxnAdmissionState,
+    catalog_object_resource, ddl_lock_requests, dml_table_lock_requests, schema_resource,
+    table_resource, CatalogEffect, DdlExecutionProfile, MixedDmlPolicy, PendingDdlAdmission,
+    RuntimeEffect, TxnAdmissionState,
 };
 pub use write_class::WriteClass;
-pub use write_guard::WriteGuard;
+pub use write_guard::{WriteDatabase, WriteGuard, WriteGuardMark};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::TestStatementContextBuilder;

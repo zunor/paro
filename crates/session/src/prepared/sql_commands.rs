@@ -28,7 +28,7 @@ use crate::prepared::parameters::{
 use crate::prepared::plan_cache::build_generic_plan;
 use crate::prepared::portal::{
     bind_value_types, CursorHoldability, ExecutionCursorHandle, FormatCode, PortalCursor,
-    PortalExecutionState, ScrollMode,
+    PortalExecutionState, PortalSnapshotRetention, ScrollMode,
 };
 use crate::prepared::store::{
     PortalEntry, PortalKind, PortalStatementRef, PreparedStatementEntry, PreparedStatementSource,
@@ -326,6 +326,7 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
 
     let result_schema = compiled.result_schema.clone();
     let compiled_for_portal = compiled.clone();
+    let snapshot_read_ts = snapshot.transaction_view().effective_read_ts();
     let materialized =
         match materialize_compiled_statement(session, snapshot.clone(), compiled).await {
             Ok(materialized) => materialized,
@@ -356,6 +357,7 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
             position: -1,
             execution: ExecutionCursorHandle::materialized(materialized),
         }),
+        snapshot_retention: Some(PortalSnapshotRetention::materialized(snapshot_read_ts)),
         completion: None,
         dependency_epoch: session.transaction_visible_version(),
         created_generation: 0,

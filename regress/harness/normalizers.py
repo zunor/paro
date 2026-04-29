@@ -27,6 +27,11 @@ _JSON_BYTES_FIELD_RE = re.compile(
     r'"(Memory|Disk|Peak Memory|Temp Storage|Total Temp Storage|peak_memory_bytes|temp_storage_bytes)"\s*:\s*\d+'
 )
 _COPY_ROWCOUNT_RE = re.compile(r"^COPY\s+\d+$")
+_TXN_NUMERIC_ID_RE = re.compile(
+    r"\b(TxnId|ReadTs|CommitTs|TableId|DatabaseId)\(\d+\)"
+)
+_TRANSACTION_ID_TEXT_RE = re.compile(r"\btransaction\s+\d+\b", re.IGNORECASE)
+_TXN_STRUCT_FIELD_RE = re.compile(r"\b(ssi_state_epoch|tenant_id|tablet_id):\s*\d+\b")
 _REGRESS_PATH_RE = re.compile(
     r"(?<!<repo>)/(?:[^'\"\s)]+/)*regress/(?:report/fixtures|fixtures)/[^'\"\s)]+"
 )
@@ -111,6 +116,21 @@ def normalize_copy_rowcount(lines: list[str]) -> list[str]:
     return result
 
 
+def normalize_transaction_ids(lines: list[str]) -> list[str]:
+    """Normalize volatile transaction/catalog ids in concurrency error text."""
+
+    def _replace_typed_id(match: re.Match[str]) -> str:
+        return f"{match.group(1)}(<id>)"
+
+    result: list[str] = []
+    for line in lines:
+        line = _TXN_NUMERIC_ID_RE.sub(_replace_typed_id, line)
+        line = _TRANSACTION_ID_TEXT_RE.sub("transaction <id>", line)
+        line = _TXN_STRUCT_FIELD_RE.sub(lambda m: f"{m.group(1)}: <id>", line)
+        result.append(line)
+    return result
+
+
 def normalize_regress_paths(lines: list[str]) -> list[str]:
     """Normalize workspace-specific regress fixture paths to a stable repo placeholder."""
 
@@ -131,6 +151,7 @@ def normalize_regress_paths(lines: list[str]) -> list[str]:
 # stable: normalize summary timing volatility.
 # stable: normalize runtime byte volatility for spill/memory observability.
 # stable: normalize repo-local regress fixture/report absolute paths.
+# stable: normalize volatile transaction/catalog ids in concurrency errors.
 # transitional: legacy alias kept for gradual migration from explain_runtime.
 NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_operator_timing": normalize_explain_operator_timing,
@@ -141,6 +162,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_external_runtime": normalize_explain_external_runtime,
     "explain_runtime": normalize_explain_runtime,
     "copy_rowcount": normalize_copy_rowcount,
+    "transaction_ids": normalize_transaction_ids,
     "regress_paths": normalize_regress_paths,
 }
 
@@ -179,5 +201,6 @@ __all__ = [
     "normalize_explain_runtime_bytes",
     "normalize_explain_summary_timing",
     "normalize_regress_paths",
+    "normalize_transaction_ids",
     "normalizer_profiles",
 ]

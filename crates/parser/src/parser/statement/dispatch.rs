@@ -1663,6 +1663,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
         KILL => rule!(#utility_kill_stmt : "`KILL (QUERY | CONNECTION) <object_id>`").parse(i),
         SET => rule!(
             #utility_set_priority: "`SET PRIORITY (HIGH | MEDIUM | LOW) <object_id>`"
+            | #transaction_stmt: "`SET TRANSACTION <transaction_mode> [, ...] | SET SESSION CHARACTERISTICS AS TRANSACTION <transaction_mode> [, ...]`"
             | #session_set_role: "`SET [DEFAULT] ROLE <role>`"
             | #session_set_secondary_roles: "`SET SECONDARY ROLES (ALL | NONE)`"
             | #session_set_secondary_specify_roles: "`SET SECONDARY ROLES [role_name,...]`"

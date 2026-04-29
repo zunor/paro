@@ -35,6 +35,8 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_context::dml_table_lock_requests;
+use paro_transaction::TableId;
 
 use crate::execution_context::ExecutionContext;
 use crate::operator::state::{
@@ -76,6 +78,10 @@ mod tests {
     use paro_scheduler::task::InterruptState;
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::tablet::{tablet_reader::TabletReaderParams, KeysType};
+    use paro_storage::transaction::txn::Transaction;
+    use paro_transaction::{
+        CommandId, IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTrackerHandle, ReadTs,
+    };
     use std::sync::Arc;
 
     fn create_storage(types: &[LogicalType]) -> paro_storage::table::table_handle::TableHandle {
@@ -93,6 +99,21 @@ mod tests {
 
     fn test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
+    }
+
+    fn test_session_with_transaction(txn: Arc<Transaction>) -> Arc<StatementContext> {
+        let mut session = (*test_session()).clone();
+        session.txn.transaction = paro_context::TransactionView::new(
+            txn.writer_id(),
+            txn.read_ts(),
+            ReadSnapshot::without_lease(ReadTs::new(txn.visible_commit_ts().into_raw())),
+            IsolationLevel::Snapshot,
+            CommandId::new(0),
+            ReadTrackerHandle::noop(),
+            ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]),
+        );
+        session.txn.active = Some(txn);
+        Arc::new(session)
     }
 
     fn build_update_operator() -> PhysicalUpdate {
@@ -239,7 +260,8 @@ mod tests {
         let child = Arc::new(PhysicalDummyScan::new()) as Arc<dyn PhysicalOperator>;
         let op = PhysicalUpdate::new(table, vec![0, 1], 2, child);
 
-        let session: Arc<StatementContext> = test_session();
+        let txn = Arc::new(Transaction::new(70_003, 0));
+        let session: Arc<StatementContext> = test_session_with_transaction(txn.clone());
         let thread = ThreadContext::single_threaded();
         let ctx = ExecutionContext::new(session, &thread, None);
         let mut gstate = op
@@ -291,6 +313,7 @@ mod tests {
             .sink(&ctx, &chunk, &mut input)
             .expect("PRIMARY_KEYS UPDATE should succeed");
         assert_eq!(result, SinkResultType::NeedMoreInput);
+        txn.commit(1).expect("staged UPDATE should commit");
 
         let mut rows = Vec::new();
         for chunk in storage.scan_chunks().expect("scan rows") {
@@ -527,6 +550,7 @@ impl PhysicalOperator for PhysicalUpdate {
             self.table.base.base.name.clone(),
             paro_common::ddl::DdlObjectKind::Table,
         );
+        ctx.session.bind_write_database(&target.database)?;
         if let Some(admission) = ctx.session.txn_admission() {
             let write_class = ctx
                 .session
@@ -539,11 +563,19 @@ impl PhysicalOperator for PhysicalUpdate {
                 self.table.base.base.timestamp() == ctx.transaction_id(),
             )?;
         }
+        if let Some(txn) = ctx.active_transaction() {
+            txn.acquire_lock_requests(dml_table_lock_requests(txn.lock_namespace(), &target))?;
+        }
         if let Some(write_guard) = ctx.session.write_guard() {
             write_guard.begin_dml_write()?;
         }
         if let Some(txn) = ctx.active_transaction() {
             txn.record_dml_table(self.table.base.base.object_id.raw())?;
+        }
+        if let Some(storage) = self.table.get_storage() {
+            ctx.transaction_view()
+                .read_tracker()
+                .record_table_read(TableId::new(storage.table_id()));
         }
         Ok(Box::new(UpdateGlobalSinkState::default()))
     }
@@ -614,12 +646,18 @@ impl PhysicalOperator for PhysicalUpdate {
             row_ids.push(row_id);
         }
 
-        // Update directly in table storage (storage layer performs delete+insert).
+        let txn = _ctx.active_transaction().ok_or_else(|| {
+            paro_error::internal(
+                "UPDATE reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+            )
+        })?;
+
         let total_updated = storage.update(
+            _ctx.transaction_view(),
             &row_ids,
             &self.columns,
             &column_values,
-            _ctx.active_transaction(),
+            txn.clone(),
         )?;
 
         // Update count
@@ -628,18 +666,16 @@ impl PhysicalOperator for PhysicalUpdate {
             .fetch_add(total_updated, Ordering::SeqCst);
 
         if total_updated > 0 {
-            if let Some(txn) = _ctx.active_transaction() {
-                let updated_columns: Vec<u32> = self
-                    .columns
-                    .iter()
-                    .filter_map(|&idx| u32::try_from(idx).ok())
-                    .collect();
-                txn.record_graph_update(
-                    self.table.base.base.object_id.raw(),
-                    total_updated,
-                    &updated_columns,
-                );
-            }
+            let updated_columns: Vec<u32> = self
+                .columns
+                .iter()
+                .filter_map(|&idx| u32::try_from(idx).ok())
+                .collect();
+            txn.record_graph_update(
+                self.table.base.base.object_id.raw(),
+                total_updated,
+                &updated_columns,
+            );
         }
 
         Ok(SinkResultType::NeedMoreInput)

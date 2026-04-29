@@ -177,7 +177,7 @@ def test_run_single_case_new_writes_actual(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         runner,
         "execute_blocks",
-        lambda conn, blocks, engine, float_precision, control_handler=None: execution,
+        lambda conn, blocks, engine, float_precision, control_handler=None, **_kwargs: execution,
     )
 
     outcome, _ = runner.run_single_case(object(), case_file, config)
@@ -344,6 +344,55 @@ def test_reconnect_uses_current_connection_defaults_and_overrides(monkeypatch) -
             port=6432,
             database="postgres",
             user="routine_builder",
+            password="",
+        )
+    ]
+
+
+def test_open_session_connection_applies_overrides(monkeypatch) -> None:
+    config = runner.RunnerConfig(
+        host="127.0.0.1",
+        port=6432,
+        database="postgres",
+        user="paro",
+        password="",
+        float_precision=6,
+        update=False,
+        write_actual=True,
+        jobs=1,
+        verbose=False,
+        filter_pattern=None,
+        config_path=Path("/tmp/regress/config.toml"),
+        root_dir=Path("/tmp/regress"),
+        report_dir=Path("/tmp/regress/report"),
+        runtime_profiles={"default": runner.RuntimeProfile(name="default", env={})},
+        managed_runtime_env=(),
+    )
+    opened: list[runner.ConnectionTarget] = []
+
+    def fake_open_connection(
+        resolved_config: runner.RunnerConfig,
+        target: runner.ConnectionTarget | None = None,
+    ) -> object:
+        assert resolved_config is config
+        assert target is not None
+        opened.append(target)
+        return object()
+
+    monkeypatch.setattr(runner, "_open_connection", fake_open_connection)
+
+    conn = runner._open_session_connection(
+        config,
+        {"user": "alice", "database": "analytics", "port": "6543"},
+    )
+
+    assert conn is not None
+    assert opened == [
+        runner.ConnectionTarget(
+            host="127.0.0.1",
+            port=6543,
+            database="analytics",
+            user="alice",
             password="",
         )
     ]

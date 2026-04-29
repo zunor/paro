@@ -88,6 +88,7 @@ pub struct SearchGeneration {
     pub generation_id: SearchGenerationId,
     pub build_epoch: BuildEpoch,
     pub build_snapshot_version: i64,
+    pub indexed_through_ts: u64,
     pub coverage: CoverageState,
     pub manifest_location: Option<ArtifactLocation>,
     pub generation_stats: GenerationStats,
@@ -101,6 +102,7 @@ pub struct SearchCapability {
     pub table_id: TableId,
     pub kind: SearchIndexKind,
     pub generation_id: SearchGenerationId,
+    pub indexed_through_ts: u64,
     pub coverage: CoverageState,
     pub config_fingerprint: ConfigFingerprint,
     pub generation_stats: GenerationStats,
@@ -119,6 +121,7 @@ impl SearchCapability {
             table_id: definition.table_id,
             kind: definition.kind,
             generation_id: generation.generation_id,
+            indexed_through_ts: generation.indexed_through_ts,
             coverage: generation.coverage.clone(),
             config_fingerprint: generation.config_fingerprint,
             generation_stats: generation.generation_stats.clone(),
@@ -237,6 +240,7 @@ mod tests {
             generation_id: 13,
             build_epoch: 2,
             build_snapshot_version: 42,
+            indexed_through_ts: 42,
             coverage: CoverageState::Complete,
             manifest_location: Some(ArtifactLocation::SidecarArtifactFile {
                 relative_path: "artifact/fts.manifest".into(),
@@ -270,6 +274,7 @@ mod tests {
         assert_eq!(capability.table_id, 11);
         assert_eq!(capability.definition_id, 7);
         assert_eq!(capability.generation_id, 13);
+        assert_eq!(capability.indexed_through_ts, 42);
         assert_eq!(capability.kind, SearchIndexKind::FullText);
         assert!(capability
             .execution_modes

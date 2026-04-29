@@ -41,9 +41,9 @@
 //! - `tablet_schema`: Schema definition for Tablet columns
 //! - `tablet_reader`: Cross-Rowset merge reader
 
-mod delete_intent_store;
 mod prepared_txn_registry;
 mod primary_index;
+mod schema_adapter;
 mod shutdown_sweep;
 pub mod statistics;
 mod tablet_chunk_assembler;
@@ -53,7 +53,7 @@ mod tablet_reader_params;
 mod tablet_rowid_lookup;
 mod tablet_runtime;
 pub mod tablet_schema;
-mod wal_replay;
+pub mod versioned_rowset_catalog;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -62,6 +62,7 @@ static DELETE_PATCH_INLINE_ROW_REF_THRESHOLD: AtomicUsize =
     AtomicUsize::new(DEFAULT_DELETE_PATCH_INLINE_ROW_REF_THRESHOLD);
 
 // Re-export main types
+pub use schema_adapter::TabletSchemaAdaptationPlan;
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::TabletMeta;
 pub use tablet_reader::TabletReader;
@@ -70,7 +71,7 @@ pub use tablet_runtime::{
     CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,
     CheckpointTabletSnapshot, PhysicalRowRef, PrimaryIndexUpdate, RetiredGcBarrier,
     RetiredPendingGcStatus, Tablet, TabletId, TabletIdentity, TabletReadGuard, TabletRef,
-    TabletState, Version, VersionGap,
+    TabletSnapshotMaterialization, TabletState, Version, VersionGap,
 };
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
 

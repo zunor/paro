@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::primary_key::RowID;
+use crate::primary_key::{PrimaryIndexVersion, PrimaryKeyWriteConflict, RowID};
 use paro_common::error::{self as paro_error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 pub const IMMUTABLE_INDEX_MAGIC: [u8; 4] = *b"PIIX";
-pub const IMMUTABLE_INDEX_FORMAT_VERSION: u32 = 1;
+pub const IMMUTABLE_INDEX_FORMAT_VERSION: u32 = 2;
 pub const DEFAULT_IMMUTABLE_PAGE_SIZE: usize = 4096;
 pub const DEFAULT_TARGET_BUCKET_ENTRIES: usize = 64;
 pub const DEFAULT_BLOOM_WORDS: usize = 4;
@@ -70,7 +70,7 @@ impl ImmutableIndexWriter {
     pub fn write_entries(
         &self,
         path: impl AsRef<Path>,
-        entries: &[(Vec<u8>, RowID)],
+        entries: &[(Vec<u8>, PrimaryIndexVersion)],
     ) -> Result<ImmutableIndexStats> {
         if self.options.page_size <= PAGE_HEADER_LEN {
             return Err(paro_error::invalid_input(
@@ -81,12 +81,12 @@ impl ImmutableIndexWriter {
         let entries = normalize_entries(entries);
         let bucket_count = choose_bucket_count(entries.len(), self.options.target_bucket_entries);
         let mut buckets = vec![Vec::new(); bucket_count];
-        for (key, row_id) in &entries {
+        for (key, version) in &entries {
             let bucket = bucket_index_for_key(key, bucket_count);
-            buckets[bucket].push((key.clone(), *row_id));
+            buckets[bucket].push((key.clone(), *version));
         }
         for bucket in &mut buckets {
-            bucket.sort_by(|a, b| a.0.cmp(&b.0));
+            bucket.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.commit_ts.cmp(&b.1.commit_ts)));
         }
 
         let mut directory = Vec::with_capacity(bucket_count);
@@ -261,6 +261,12 @@ impl ImmutableIndexReader {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<RowID>> {
+        Ok(self
+            .get_version_at(key, u64::MAX)?
+            .and_then(PrimaryIndexVersion::visible_row_id))
+    }
+
+    pub fn get_version_at(&self, key: &[u8], read_ts: u64) -> Result<Option<PrimaryIndexVersion>> {
         if self.bucket_directory.is_empty() {
             return Ok(None);
         }
@@ -271,20 +277,81 @@ impl ImmutableIndexReader {
             return Ok(None);
         }
 
+        let mut best = None;
         for page_idx in entry.start_page..entry.start_page + entry.page_count {
             let page = self.page(page_idx as usize)?;
             if !page.bloom.may_contain(key) {
                 continue;
             }
-            if let Some(row_id) = page.get(key)? {
-                return Ok(Some(row_id));
+            if let Some(version) = page.get_version_at(key, read_ts)? {
+                if best
+                    .map(|current: PrimaryIndexVersion| version.commit_ts > current.commit_ts)
+                    .unwrap_or(true)
+                {
+                    best = Some(version);
+                }
             }
         }
 
-        Ok(None)
+        Ok(best)
     }
 
-    pub fn entries(&self) -> Result<Vec<(Vec<u8>, RowID)>> {
+    pub fn first_write_in_range(
+        &self,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        if self.bucket_directory.is_empty() || read_ts >= commit_ts {
+            return Ok(None);
+        }
+
+        let bucket = bucket_index_for_key(key, self.bucket_directory.len());
+        let entry = self.bucket_directory[bucket];
+        if entry.page_count == 0 {
+            return Ok(None);
+        }
+
+        let mut best = None;
+        for page_idx in entry.start_page..entry.start_page + entry.page_count {
+            let page = self.page(page_idx as usize)?;
+            if !page.bloom.may_contain(key) {
+                continue;
+            }
+            if let Some(conflict) = page.first_write_in_range(key, read_ts, commit_ts)? {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+
+        Ok(best)
+    }
+
+    pub fn first_key_range_write_in_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        if self.bucket_directory.is_empty() || read_ts >= commit_ts {
+            return Ok(None);
+        }
+
+        let mut best = None;
+        for bucket in &self.bucket_directory {
+            for page_idx in bucket.start_page..bucket.start_page + bucket.page_count {
+                let page = self.page(page_idx as usize)?;
+                if let Some(conflict) =
+                    page.first_key_range_write_in_range(lower, upper, read_ts, commit_ts)?
+                {
+                    select_earlier_conflict(&mut best, conflict);
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    pub fn entries(&self) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
         let mut out = Vec::new();
         for bucket in &self.bucket_directory {
             for page_idx in bucket.start_page..bucket.start_page + bucket.page_count {
@@ -318,7 +385,7 @@ impl ImmutableIndexReader {
 
 struct PageBuilder {
     page_size: usize,
-    records: Vec<(Vec<u8>, RowID)>,
+    records: Vec<(Vec<u8>, PrimaryIndexVersion)>,
     body_len: usize,
     bloom: PageBloom,
 }
@@ -333,8 +400,8 @@ impl PageBuilder {
         }
     }
 
-    fn try_push(&mut self, key: &[u8], row_id: RowID) -> Result<bool> {
-        let record_len = 4 + key.len() + 8;
+    fn try_push(&mut self, key: &[u8], version: PrimaryIndexVersion) -> Result<bool> {
+        let record_len = 4 + key.len() + 16;
         let max_body_len = self.page_size - PAGE_HEADER_LEN;
         if record_len > max_body_len {
             return Err(paro_error::invalid_input(format!(
@@ -347,7 +414,7 @@ impl PageBuilder {
         }
         self.body_len += record_len;
         self.bloom.add(key);
-        self.records.push((key.to_vec(), row_id));
+        self.records.push((key.to_vec(), version));
         Ok(true)
     }
 
@@ -363,10 +430,11 @@ impl PageBuilder {
         for word in self.bloom.words {
             page.extend_from_slice(&word.to_le_bytes());
         }
-        for (key, row_id) in self.records {
+        for (key, version) in self.records {
             page.extend_from_slice(&(key.len() as u32).to_le_bytes());
             page.extend_from_slice(&key);
-            page.extend_from_slice(&u64::from(row_id).to_le_bytes());
+            page.extend_from_slice(&u64::from(version.row_id).to_le_bytes());
+            page.extend_from_slice(&version.commit_ts.to_le_bytes());
         }
         page.resize(self.page_size, 0);
         page
@@ -409,22 +477,84 @@ impl<'a> ImmutableIndexPage<'a> {
         })
     }
 
-    fn get(&self, key: &[u8]) -> Result<Option<RowID>> {
+    fn get_version_at(&self, key: &[u8], read_ts: u64) -> Result<Option<PrimaryIndexVersion>> {
         let mut offset = 0usize;
+        let mut best = None;
         for _ in 0..self.entry_count {
-            let (current_key, row_id, next_offset) = read_record(self.body, offset)?;
+            let (current_key, version, next_offset) = read_record(self.body, offset)?;
             if current_key == key {
-                return Ok(Some(row_id));
+                if version.commit_ts <= read_ts
+                    && best
+                        .map(|current: PrimaryIndexVersion| version.commit_ts > current.commit_ts)
+                        .unwrap_or(true)
+                {
+                    best = Some(version);
+                }
             }
             if current_key > key {
-                return Ok(None);
+                return Ok(best);
             }
             offset = next_offset;
         }
-        Ok(None)
+        Ok(best)
     }
 
-    fn extend_entries(&self, out: &mut Vec<(Vec<u8>, RowID)>) -> Result<()> {
+    fn first_write_in_range(
+        &self,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        let mut offset = 0usize;
+        let mut best = None;
+        for _ in 0..self.entry_count {
+            let (current_key, version, next_offset) = read_record(self.body, offset)?;
+            if current_key == key && version_in_window(version, read_ts, commit_ts) {
+                select_earlier_conflict(
+                    &mut best,
+                    PrimaryKeyWriteConflict {
+                        key: current_key.to_vec(),
+                        version,
+                    },
+                );
+            }
+            if current_key > key {
+                return Ok(best);
+            }
+            offset = next_offset;
+        }
+        Ok(best)
+    }
+
+    fn first_key_range_write_in_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<PrimaryKeyWriteConflict>> {
+        let mut offset = 0usize;
+        let mut best = None;
+        for _ in 0..self.entry_count {
+            let (key, version, next_offset) = read_record(self.body, offset)?;
+            if upper.map_or(false, |upper| key > upper) {
+                return Ok(best);
+            }
+            if key_in_bounds(key, lower, upper) && version_in_window(version, read_ts, commit_ts) {
+                select_earlier_conflict(
+                    &mut best,
+                    PrimaryKeyWriteConflict {
+                        key: key.to_vec(),
+                        version,
+                    },
+                );
+            }
+            offset = next_offset;
+        }
+        Ok(best)
+    }
+
+    fn extend_entries(&self, out: &mut Vec<(Vec<u8>, PrimaryIndexVersion)>) -> Result<()> {
         let mut offset = 0usize;
         for _ in 0..self.entry_count {
             let (key, row_id, next_offset) = read_record(self.body, offset)?;
@@ -432,6 +562,31 @@ impl<'a> ImmutableIndexPage<'a> {
             offset = next_offset;
         }
         Ok(())
+    }
+}
+
+fn version_in_window(version: PrimaryIndexVersion, read_ts: u64, commit_ts: u64) -> bool {
+    version.commit_ts > read_ts && version.commit_ts <= commit_ts
+}
+
+fn key_in_bounds(key: &[u8], lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
+    lower.map_or(true, |lower| key >= lower) && upper.map_or(true, |upper| key <= upper)
+}
+
+fn select_earlier_conflict(
+    slot: &mut Option<PrimaryKeyWriteConflict>,
+    candidate: PrimaryKeyWriteConflict,
+) {
+    let should_replace = slot
+        .as_ref()
+        .map(|current| {
+            candidate.version.commit_ts < current.version.commit_ts
+                || (candidate.version.commit_ts == current.version.commit_ts
+                    && candidate.key < current.key)
+        })
+        .unwrap_or(true);
+    if should_replace {
+        *slot = Some(candidate);
     }
 }
 
@@ -466,12 +621,17 @@ impl PageBloom {
     }
 }
 
-fn normalize_entries(entries: &[(Vec<u8>, RowID)]) -> Vec<(Vec<u8>, RowID)> {
+fn normalize_entries(
+    entries: &[(Vec<u8>, PrimaryIndexVersion)],
+) -> Vec<(Vec<u8>, PrimaryIndexVersion)> {
     let mut normalized = BTreeMap::new();
-    for (key, row_id) in entries {
-        normalized.insert(key.clone(), *row_id);
+    for (key, version) in entries {
+        normalized.insert((key.clone(), version.commit_ts), *version);
     }
-    normalized.into_iter().collect()
+    normalized
+        .into_iter()
+        .map(|((key, _), version)| (key, version))
+        .collect()
 }
 
 fn choose_bucket_count(entry_count: usize, target_bucket_entries: usize) -> usize {
@@ -496,7 +656,7 @@ fn bloom_bits_for_key(key: &[u8]) -> [usize; BLOOM_HASH_ROUNDS] {
     out
 }
 
-fn read_record(body: &[u8], offset: usize) -> Result<(&[u8], RowID, usize)> {
+fn read_record(body: &[u8], offset: usize) -> Result<(&[u8], PrimaryIndexVersion, usize)> {
     if offset + 4 > body.len() {
         return Err(paro_error::data_corrupted(
             "immutable index page truncated before key length",
@@ -505,7 +665,8 @@ fn read_record(body: &[u8], offset: usize) -> Result<(&[u8], RowID, usize)> {
     let key_len = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
     let key_start = offset + 4;
     let value_start = key_start + key_len;
-    let next_offset = value_start + 8;
+    let commit_ts_start = value_start + 8;
+    let next_offset = commit_ts_start + 8;
     if next_offset > body.len() {
         return Err(paro_error::data_corrupted(
             "immutable index page truncated before value",
@@ -513,16 +674,28 @@ fn read_record(body: &[u8], offset: usize) -> Result<(&[u8], RowID, usize)> {
     }
     let key = &body[key_start..value_start];
     let row_id = RowID::from_raw(u64::from_le_bytes(
-        body[value_start..next_offset].try_into().unwrap(),
+        body[value_start..commit_ts_start].try_into().unwrap(),
     ));
-    Ok((key, row_id, next_offset))
+    let commit_ts = u64::from_le_bytes(body[commit_ts_start..next_offset].try_into().unwrap());
+    Ok((
+        key,
+        PrimaryIndexVersion::live(row_id, commit_ts),
+        next_offset,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primary_key::NULL_ROW_ID;
     use tempfile::tempdir;
+
+    fn v(row_id: RowID, commit_ts: u64) -> PrimaryIndexVersion {
+        PrimaryIndexVersion::live(row_id, commit_ts)
+    }
+
+    fn tombstone(commit_ts: u64) -> PrimaryIndexVersion {
+        PrimaryIndexVersion::tombstone(commit_ts)
+    }
 
     fn find_bloom_negative(page: &ImmutableIndexPage<'_>) -> Vec<u8> {
         for seed in 0..10_000u32 {
@@ -543,9 +716,9 @@ mod tests {
             .write_entries(
                 &path,
                 &[
-                    (b"k1".to_vec(), RowID::new(1, 10)),
-                    (b"k2".to_vec(), RowID::new(2, 20)),
-                    (b"k3".to_vec(), RowID::new(3, 30)),
+                    (b"k1".to_vec(), v(RowID::new(1, 10), 1)),
+                    (b"k2".to_vec(), v(RowID::new(2, 20), 1)),
+                    (b"k3".to_vec(), v(RowID::new(3, 30), 1)),
                 ],
             )
             .unwrap();
@@ -565,7 +738,12 @@ mod tests {
             target_bucket_entries: usize::MAX,
         });
         let entries: Vec<_> = (0..128u32)
-            .map(|i| (format!("key-{i:04}-payload").into_bytes(), RowID::new(7, i)))
+            .map(|i| {
+                (
+                    format!("key-{i:04}-payload").into_bytes(),
+                    v(RowID::new(7, i), 1),
+                )
+            })
             .collect();
         let stats = writer.write_entries(&path, &entries).unwrap();
 
@@ -581,19 +759,22 @@ mod tests {
     fn immutable_index_preserves_tombstones() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("index.idx");
-        let tombstone = RowID::from_raw(NULL_ROW_ID);
         ImmutableIndexWriter::default()
             .write_entries(
                 &path,
                 &[
-                    (b"gone".to_vec(), tombstone),
-                    (b"live".to_vec(), RowID::new(9, 1)),
+                    (b"gone".to_vec(), tombstone(2)),
+                    (b"live".to_vec(), v(RowID::new(9, 1), 1)),
                 ],
             )
             .unwrap();
 
         let reader = ImmutableIndexReader::open(&path).unwrap();
-        assert_eq!(reader.get(b"gone").unwrap(), Some(tombstone));
+        assert_eq!(reader.get(b"gone").unwrap(), None);
+        assert_eq!(
+            reader.get_version_at(b"gone", u64::MAX).unwrap(),
+            Some(tombstone(2))
+        );
         assert_eq!(reader.get(b"live").unwrap(), Some(RowID::new(9, 1)));
     }
 
@@ -605,9 +786,9 @@ mod tests {
             .write_entries(
                 &path,
                 &[
-                    (b"k2".to_vec(), RowID::new(1, 2)),
-                    (b"k1".to_vec(), RowID::new(1, 1)),
-                    (b"k2".to_vec(), RowID::new(9, 9)),
+                    (b"k2".to_vec(), v(RowID::new(1, 2), 1)),
+                    (b"k1".to_vec(), v(RowID::new(1, 1), 1)),
+                    (b"k2".to_vec(), v(RowID::new(9, 9), 1)),
                 ],
             )
             .unwrap();
@@ -617,17 +798,83 @@ mod tests {
         assert_eq!(
             reader.entries().unwrap(),
             vec![
-                (b"k1".to_vec(), RowID::new(1, 1)),
-                (b"k2".to_vec(), RowID::new(9, 9)),
+                (b"k1".to_vec(), v(RowID::new(1, 1), 1)),
+                (b"k2".to_vec(), v(RowID::new(9, 9), 1)),
             ]
         );
     }
 
     #[test]
+    fn immutable_index_lookup_filters_by_read_ts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("index.idx");
+        ImmutableIndexWriter::default()
+            .write_entries(
+                &path,
+                &[
+                    (b"k".to_vec(), v(RowID::new(1, 1), 10)),
+                    (b"k".to_vec(), v(RowID::new(2, 2), 20)),
+                    (b"k".to_vec(), tombstone(30)),
+                ],
+            )
+            .unwrap();
+
+        let reader = ImmutableIndexReader::open(&path).unwrap();
+        assert_eq!(reader.get_version_at(b"k", 9).unwrap(), None);
+        assert_eq!(reader.get(b"k").unwrap(), None);
+        assert_eq!(
+            reader.get_version_at(b"k", 10).unwrap(),
+            Some(v(RowID::new(1, 1), 10))
+        );
+        assert_eq!(
+            reader.get_version_at(b"k", 29).unwrap(),
+            Some(v(RowID::new(2, 2), 20))
+        );
+        assert_eq!(
+            reader.get_version_at(b"k", 30).unwrap(),
+            Some(tombstone(30))
+        );
+    }
+
+    #[test]
+    fn immutable_index_write_conflict_window_finds_point_and_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("index.idx");
+        ImmutableIndexWriter::default()
+            .write_entries(
+                &path,
+                &[
+                    (b"a".to_vec(), v(RowID::new(1, 1), 10)),
+                    (b"b".to_vec(), v(RowID::new(1, 2), 20)),
+                    (b"b".to_vec(), tombstone(30)),
+                    (b"z".to_vec(), v(RowID::new(1, 9), 40)),
+                ],
+            )
+            .unwrap();
+
+        let reader = ImmutableIndexReader::open(&path).unwrap();
+        assert!(reader.first_write_in_range(b"a", 10, 30).unwrap().is_none());
+        assert_eq!(
+            reader
+                .first_write_in_range(b"b", 19, 30)
+                .unwrap()
+                .unwrap()
+                .commit_ts(),
+            20
+        );
+        let conflict = reader
+            .first_key_range_write_in_range(Some(b"b"), Some(b"y"), 20, 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conflict.key, b"b".to_vec());
+        assert!(conflict.is_tombstone());
+    }
+
+    #[test]
     fn immutable_index_page_bloom_tracks_inserted_keys() {
         let mut builder = PageBuilder::new(256);
-        builder.try_push(b"alpha", RowID::new(1, 1)).unwrap();
-        builder.try_push(b"bravo", RowID::new(1, 2)).unwrap();
+        builder.try_push(b"alpha", v(RowID::new(1, 1), 1)).unwrap();
+        builder.try_push(b"bravo", v(RowID::new(1, 2), 1)).unwrap();
         let page_bytes = builder.finish();
         let page = ImmutableIndexPage::parse(&page_bytes).unwrap();
 
@@ -636,7 +883,7 @@ mod tests {
 
         let missing = find_bloom_negative(&page);
         assert!(!page.bloom.may_contain(&missing));
-        assert_eq!(page.get(&missing).unwrap(), None);
+        assert_eq!(page.get_version_at(&missing, u64::MAX).unwrap(), None);
     }
 
     #[test]
@@ -644,7 +891,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("index.idx");
         ImmutableIndexWriter::default()
-            .write_entries(&path, &[(b"k".to_vec(), RowID::new(1, 1))])
+            .write_entries(&path, &[(b"k".to_vec(), v(RowID::new(1, 1), 1))])
             .unwrap();
 
         let first = ImmutableIndexReader::open_cached(&path).unwrap();

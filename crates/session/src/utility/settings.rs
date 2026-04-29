@@ -17,6 +17,7 @@ use paro_parser::ast::{
     SetType, SetValues, Settings, VariableSetKind, VariableSetStmt, VariableShowStmt,
     VariableShowTarget,
 };
+use paro_transaction::IsolationLevel;
 
 const DEFAULT_SEARCH_PATH_DISPLAY: &str = "\"$user\", public";
 
@@ -76,6 +77,21 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         default_value: |_| Value::Integer(1),
         parse_value: parse_positive_integer_value,
         apply_effective: apply_noop,
+    },
+    SettingDescriptor {
+        name: "default_transaction_isolation",
+        category: "Client Connection Defaults",
+        description: "Default isolation level for new transactions",
+        vartype: "enum",
+        context: "user",
+        unit: None,
+        default_value: |_| {
+            Value::Varchar(
+                isolation_level_to_setting_value(IsolationLevel::Serializable).to_string(),
+            )
+        },
+        parse_value: parse_transaction_isolation_value,
+        apply_effective: apply_default_transaction_isolation,
     },
     SettingDescriptor {
         name: "default_table_cardinality",
@@ -296,6 +312,11 @@ pub(crate) async fn execute_variable_set<S: ResultSink>(
                     return Ok(());
                 }
                 SettingScope::TransactionLocal => {
+                    if descriptor.name == "default_transaction_isolation" {
+                        return Err(paro_error::not_supported(
+                            "SET LOCAL default_transaction_isolation is not supported",
+                        ));
+                    }
                     if !session.is_in_explicit_block() {
                         return Err(paro_error::invalid_transaction_state(
                             "SET LOCAL can only be used in transaction blocks".to_string(),
@@ -378,6 +399,20 @@ pub(crate) async fn execute_variable_show<S: ResultSink>(
             .await
         }
         VariableShowTarget::Name(name) => {
+            if name.name.eq_ignore_ascii_case("transaction_isolation") {
+                let rows = vec![vec![isolation_level_to_setting_value(
+                    session.transaction.isolation_level(),
+                )
+                .to_string()]];
+                return emit_string_result(
+                    session,
+                    sink,
+                    &["transaction_isolation"],
+                    &rows,
+                    StatementCompletion::Show,
+                )
+                .await;
+            }
             let descriptor = setting_descriptor(&name.name).ok_or_else(|| {
                 paro_error::invalid_input(format!(
                     "unrecognized configuration parameter \"{}\"",
@@ -567,6 +602,35 @@ fn parse_bool_value(_session: &Session, values: &[String]) -> Result<Value> {
     }
 }
 
+pub(crate) fn isolation_level_to_setting_value(level: IsolationLevel) -> &'static str {
+    match level {
+        IsolationLevel::Serializable => "serializable",
+        IsolationLevel::Snapshot => "snapshot",
+    }
+}
+
+fn parse_transaction_isolation_value(_session: &Session, values: &[String]) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(paro_error::invalid_input(
+            "default_transaction_isolation expects serializable or snapshot",
+        ));
+    }
+    let level = parse_isolation_level_text(&values[0], "default_transaction_isolation")?;
+    Ok(Value::Varchar(
+        isolation_level_to_setting_value(level).to_string(),
+    ))
+}
+
+fn parse_isolation_level_text(value: &str, setting: &str) -> Result<IsolationLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "serializable" => Ok(IsolationLevel::Serializable),
+        "snapshot" => Ok(IsolationLevel::Snapshot),
+        _ => Err(paro_error::invalid_input(format!(
+            "invalid value for {setting}: '{value}'. Expected serializable or snapshot.",
+        ))),
+    }
+}
+
 fn parse_bytes_value(_session: &Session, values: &[String]) -> Result<Value> {
     if values.len() != 1 {
         return Err(paro_error::invalid_input(
@@ -704,6 +768,21 @@ fn apply_max_temp_directory_size(session: &mut Session, value: &Value) -> Result
 fn apply_force_external(session: &mut Session, value: &Value) -> Result<()> {
     let enabled = value_to_bool(value, "force_external")?;
     session.config.force_external = enabled;
+    Ok(())
+}
+
+fn apply_default_transaction_isolation(session: &mut Session, value: &Value) -> Result<()> {
+    let level = match value {
+        Value::Varchar(value) => {
+            parse_isolation_level_text(value, "default_transaction_isolation")?
+        }
+        _ => {
+            return Err(paro_error::invalid_input(
+                "default_transaction_isolation expects serializable or snapshot",
+            ))
+        }
+    };
+    session.transaction.set_default_isolation_level(level);
     Ok(())
 }
 

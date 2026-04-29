@@ -34,7 +34,7 @@ use crate::prepared::parameters::{
 };
 use crate::prepared::portal::{
     CursorHoldability, ExecutionCursorHandle, FormatCode, PortalCursor, PortalExecutionState,
-    ScrollMode,
+    PortalSnapshotRetention, ScrollMode,
 };
 use crate::prepared::store::{
     PortalEntry, PortalKind, PortalStatementRef, PreparedStatementEntry, PreparedStatementSource,
@@ -254,20 +254,9 @@ async fn execute_bind<R: ExtendedQueryResponder>(
             stmt: Box::new(statement.raw_stmt.clone()),
             parameter_env: parameter_env.clone(),
         },
-        StatementClass::Query => {
-            let snapshot = session.freeze_statement_context(
-                StatementOptions {
-                    source: StatementSource::ExtendedQuery,
-                    ..StatementOptions::default()
-                },
-                session.compile_scope_cancellation(),
-            );
-            PortalKind::Compiled(Box::new(build_query_plan(
-                snapshot,
-                statement.raw_stmt.clone(),
-                &parameter_env,
-            )?))
-        }
+        StatementClass::Query => PortalKind::Query {
+            parameter_env: parameter_env.clone(),
+        },
     };
 
     if let Some(name) = message.portal_name.as_deref() {
@@ -293,6 +282,7 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         result_schema: statement.result_schema.clone(),
         kind,
         execution_state: PortalExecutionState::Ready,
+        snapshot_retention: None,
         completion: None,
         dependency_epoch: statement.dependency_epoch,
         created_generation: 0,
@@ -372,7 +362,26 @@ async fn execute_portal<R: ExtendedQueryResponder>(
 
     let result = match portal_kind {
         PortalKind::Compiled(compiled) => {
-            execute_query_portal(session, &mut portal, *compiled, &message, responder).await
+            execute_query_portal(
+                session,
+                &mut portal,
+                Some(*compiled),
+                None,
+                &message,
+                responder,
+            )
+            .await
+        }
+        PortalKind::Query { parameter_env } => {
+            execute_query_portal(
+                session,
+                &mut portal,
+                None,
+                Some(parameter_env),
+                &message,
+                responder,
+            )
+            .await
         }
         PortalKind::Utility(cmd) => {
             execute_utility_portal(session, &mut portal, *cmd, responder).await
@@ -575,12 +584,16 @@ fn validate_parameter_formats(
 async fn execute_query_portal<R: ExtendedQueryResponder>(
     session: &mut Session,
     portal: &mut PortalEntry,
-    compiled: CompiledStatement,
+    compiled: Option<CompiledStatement>,
+    parameter_env: Option<TypedParameterEnv>,
     message: &ExecutePortalMessage,
     responder: &mut R,
 ) -> Result<PortalProgress> {
-    if !compiled.is_query() {
-        return execute_non_row_query_portal(session, portal, compiled, responder).await;
+    if let Some(compiled) = compiled.as_ref() {
+        if !compiled.is_query() {
+            return execute_non_row_query_portal(session, portal, compiled.clone(), responder)
+                .await;
+        }
     }
 
     if matches!(portal.execution_state, PortalExecutionState::Ready) {
@@ -593,12 +606,28 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 .current_statement_cancellation()
                 .expect("portal execution requires an active statement scope"),
         );
+        let compiled = match compiled {
+            Some(compiled) => compiled,
+            None => build_query_plan(
+                snapshot.clone(),
+                portal.raw_stmt.clone(),
+                parameter_env
+                    .as_ref()
+                    .expect("query portal must carry bound parameters"),
+            )?,
+        };
+        if !compiled.is_query() {
+            return execute_non_row_query_portal(session, portal, compiled, responder).await;
+        }
         let materialized =
             materialize_compiled_statement(session, snapshot.clone(), compiled).await?;
         portal.execution_state = PortalExecutionState::Active(PortalCursor {
             position: -1,
             execution: ExecutionCursorHandle::materialized(materialized),
         });
+        portal.snapshot_retention = Some(PortalSnapshotRetention::materialized(
+            snapshot.transaction_view().effective_read_ts(),
+        ));
     }
 
     match &mut portal.execution_state {
@@ -837,7 +866,7 @@ fn should_begin_implicit_transaction_for_portal(session: &Session, kind: &Portal
         && session.is_auto_commit()
         && matches!(
             kind,
-            PortalKind::Compiled(_) | PortalKind::ClientCopy { .. }
+            PortalKind::Compiled(_) | PortalKind::Query { .. } | PortalKind::ClientCopy { .. }
         )
 }
 
@@ -1261,6 +1290,58 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_bind_defers_query_snapshot_until_execute() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut responder = TestResponder::default();
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("s1".to_string()),
+                query: "SELECT ? + 1".to_string(),
+                type_oids: vec![INT4OID],
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("p1".to_string()),
+                statement_name: Some("s1".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"41".to_vec())],
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        let portal = portal_entry(&session, Some("p1")).unwrap();
+        assert!(matches!(portal.kind, PortalKind::Query { .. }));
+        assert!(matches!(
+            portal.execution_state,
+            PortalExecutionState::Ready
+        ));
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Execute(ExecutePortalMessage {
+                name: Some("p1".to_string()),
+                max_rows: 0,
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(responder.rows, vec![vec!["42".to_string()]]);
     }
 
     #[tokio::test]

@@ -49,10 +49,6 @@ pub struct InstanceWalLifecycleMetrics {
     pub recovery_mode_no_wal: usize,
     pub recovery_mode_main_wal_only: usize,
     pub main_wal_needs_truncation_dbs: usize,
-    pub storage_wal_replay_entries: u64,
-    pub storage_wal_replay_bytes: u64,
-    pub storage_wal_truncate_bytes: u64,
-    pub storage_wal_recovery_mode_metric: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -494,13 +490,13 @@ impl ManagedDatabaseService {
             }
 
             match db_metrics.recovery_mode {
-                ::paro_storage::wal::recovery::WalRecoveryMode::Unknown => {
+                ::paro_journal::wal::recovery::WalRecoveryMode::Unknown => {
                     metrics.recovery_mode_unknown += 1
                 }
-                ::paro_storage::wal::recovery::WalRecoveryMode::NoWal => {
+                ::paro_journal::wal::recovery::WalRecoveryMode::NoWal => {
                     metrics.recovery_mode_no_wal += 1
                 }
-                ::paro_storage::wal::recovery::WalRecoveryMode::MainWalOnly => {
+                ::paro_journal::wal::recovery::WalRecoveryMode::MainWalOnly => {
                     metrics.recovery_mode_main_wal_only += 1
                 }
             }
@@ -509,12 +505,6 @@ impl ManagedDatabaseService {
                 metrics.main_wal_needs_truncation_dbs += 1;
             }
         }
-
-        let storage_metrics = ::paro_storage::metrics::storage_metrics().snapshot();
-        metrics.storage_wal_replay_entries = storage_metrics.wal_replay_entries;
-        metrics.storage_wal_replay_bytes = storage_metrics.wal_replay_bytes;
-        metrics.storage_wal_truncate_bytes = storage_metrics.wal_truncate_bytes;
-        metrics.storage_wal_recovery_mode_metric = storage_metrics.wal_recovery_mode;
 
         metrics
     }

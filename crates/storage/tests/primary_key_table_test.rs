@@ -8,8 +8,6 @@ use paro_common::chunk::Chunk;
 use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
 use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
-use paro_storage::wal::wal_entry::WalEntry;
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use paro_storage::{
     compaction::compaction_task::{CompactionTask, HorizontalCompactionTask},
     compaction::plan::CompactionPlanner,
@@ -152,7 +150,7 @@ fn delta_writer_upsert_dedup_across_batches() {
 }
 
 #[test]
-fn delta_writer_delete_keys_persists_wal_and_delvec() {
+fn delta_writer_delete_keys_persists_delete_vector() {
     let (tablet, tmp) = create_test_tablet();
     // seed
     let mut writer = DeltaWriter::open(tablet.clone(), 8).unwrap();
@@ -173,65 +171,7 @@ fn delta_writer_delete_keys_persists_wal_and_delvec() {
     assert_eq!(dv.cardinality(), 5);
     assert!(dv.is_deleted(0));
 
-    // WAL file exists and non-empty
-    let wal_path = tablet.data_dir().join("tablet.wal");
-    assert!(WriteAheadLog::exists_for_seed(&wal_path));
-
     drop(tmp);
-}
-
-#[test]
-fn recovery_from_persistent_index_and_wal() {
-    let (tablet, tmp, manager) = create_managed_test_tablet();
-    // Write two batches and delete some keys
-    let mut writer = DeltaWriter::open(tablet.clone(), 10).unwrap();
-    writer.write_chunk(&chunk_with_range(0, 30)).unwrap();
-    writer.commit().unwrap();
-
-    let del = DeltaWriter::open(tablet.clone(), 11).unwrap();
-    del.delete_keys(&chunk_with_range(0, 10)).unwrap();
-
-    // Persist tablet metadata for reload
-    tablet.save_meta().unwrap();
-
-    // Simulate restart
-    drop(tablet);
-    let reloaded = Tablet::open(1, tmp.path(), manager).unwrap();
-    // After init, primary index rebuilt from persistent index and WAL delete replayed.
-    assert_eq!(reloaded.snapshot_primary_index_entries().unwrap().len(), 20);
-}
-
-#[test]
-fn recovery_replays_duplicate_primary_delete_idempotently() {
-    let (tablet, tmp, manager) = create_managed_test_tablet();
-
-    let mut writer = DeltaWriter::open(tablet.clone(), 12).unwrap();
-    writer.write_chunk(&chunk_with_range(0, 5)).unwrap();
-    writer.commit().unwrap();
-    tablet.save_meta().unwrap();
-
-    let schema = tablet.schema().unwrap();
-    let serializer = PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
-    let key_chunk = chunk_with_range(1, 2);
-    let key_bytes = serializer.encode_row(&key_chunk, 0).unwrap();
-
-    let wal_path = tablet.data_dir().join("tablet.wal");
-    let wal = WriteAheadLog::new(&wal_path).unwrap();
-    let delete_entry = WalEntry::PrimaryDelete {
-        keys: vec![key_bytes.clone()],
-    };
-    wal.writer()
-        .write_entry(delete_entry.wal_type(), &delete_entry.serialize_data())
-        .unwrap();
-    wal.writer()
-        .write_entry(delete_entry.wal_type(), &delete_entry.serialize_data())
-        .unwrap();
-    wal.flush().unwrap();
-
-    drop(tablet);
-    let reloaded = Tablet::open(1, tmp.path(), manager).unwrap();
-    assert_eq!(reloaded.snapshot_primary_index_entries().unwrap().len(), 4);
-    assert!(reloaded.lookup_primary_key(&key_bytes).unwrap().is_none());
 }
 
 #[test]

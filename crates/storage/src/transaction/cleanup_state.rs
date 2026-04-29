@@ -5,8 +5,8 @@
 
 use crate::transaction::commit_state::{IndexDataRemover, IndexRemovalType};
 use crate::transaction::undo_buffer::{
-    ActiveTransactionState, UndoAppendInfo, UndoDeleteInfo, UndoEntry, UndoFlags, UndoPayload,
-    UndoUpdateInfo,
+    unsupported_raw_undo_entry, ActiveTransactionState, UndoAppendInfo, UndoDeleteInfo, UndoEntry,
+    UndoFlags, UndoPayload, UndoUpdateInfo,
 };
 
 #[derive(Debug)]
@@ -29,15 +29,8 @@ impl CleanupState {
     }
 
     /// Cleanup entry points used by the raw-pointer path in `UndoBuffer`.
-    pub fn cleanup_entry(&mut self, flags: UndoFlags, _data: *const u8) {
-        match flags {
-            UndoFlags::InsertTuple
-            | UndoFlags::DeleteTuple
-            | UndoFlags::UpdateTuple
-            | UndoFlags::SequenceValue
-            | UndoFlags::DatabaseAttach
-            | UndoFlags::EmptyEntry => {}
-        }
+    pub fn cleanup_entry(&mut self, flags: UndoFlags, data: *const u8) {
+        unsupported_raw_undo_entry("cleanup", flags, data);
     }
 
     pub fn cleanup_high_level_entry(&mut self, entry: &UndoEntry) {
@@ -97,7 +90,6 @@ mod tests {
     fn test_cleanup_high_level_noops() {
         let mut state = CleanupState::new(100, ActiveTransactionState::NoOtherTransactions);
 
-        state.cleanup_entry(UndoFlags::EmptyEntry, std::ptr::null());
         state.cleanup_high_level_entry(&UndoEntry {
             flags: UndoFlags::EmptyEntry,
             payload: UndoPayload::Empty,
@@ -111,6 +103,13 @@ mod tests {
         });
         state.cleanup_high_level_entry(&UndoEntry::insert(42, 100, 5));
         state.cleanup_high_level_entry(&UndoEntry::update(42, 1, vec![5, 6, 7]));
+    }
+
+    #[test]
+    #[should_panic(expected = "raw undo-buffer cleanup path is unsupported")]
+    fn test_cleanup_entry_rejects_raw_path() {
+        let mut state = CleanupState::new(100, ActiveTransactionState::NoOtherTransactions);
+        state.cleanup_entry(UndoFlags::DeleteTuple, std::ptr::null());
     }
 
     #[test]

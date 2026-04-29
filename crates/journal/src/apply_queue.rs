@@ -20,6 +20,8 @@ type PublishedHook = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
 pub struct JournalApplyMetricsSnapshot {
     pub queue_depth: u64,
     pub queue_depth_peak: u64,
+    pub async_submit_queue_depth: u64,
+    pub async_submit_queue_depth_peak: u64,
     pub active_workers: u64,
     pub active_workers_peak: u64,
     pub mailbox_count: u64,
@@ -84,6 +86,8 @@ impl JournalApplyRuntime {
             state: Mutex::new(ApplyRuntimeState::default()),
             catalog_lane: Mutex::new(()),
             dispatch_wake: Condvar::new(),
+            async_submit: Mutex::new(AsyncSubmitState::default()),
+            async_submit_wake: Condvar::new(),
             tablet_dispatch: Mutex::new(TabletDispatchState::default()),
             tablet_wake: Condvar::new(),
             metrics: ApplyRuntimeMetrics::default(),
@@ -98,6 +102,11 @@ impl JournalApplyRuntime {
                 .spawn(move || run_tablet_worker(worker_inner))
                 .expect("spawn tablet apply worker");
         }
+        let submit_inner = Arc::downgrade(&inner);
+        thread::Builder::new()
+            .name("paro-journal-apply-submit".to_string())
+            .spawn(move || run_async_submit_worker(submit_inner))
+            .expect("spawn journal apply submit worker");
         runtime
     }
 
@@ -142,6 +151,10 @@ impl JournalApplyRuntime {
 
     pub fn submit<R>(&self, request: ApplyRequest<R>) -> Result<R> {
         self.submit_observed(request).map(|observed| observed.value)
+    }
+
+    pub fn submit_async(&self, request: ApplyRequest<()>) -> Result<()> {
+        self.inner.enqueue_async_submit(request)
     }
 
     pub fn submit_observed<R>(&self, request: ApplyRequest<R>) -> Result<ApplySubmitResult<R>> {
@@ -236,6 +249,9 @@ impl Drop for JournalApplyRuntime {
             let mut state = self.inner.tablet_dispatch.lock().unwrap();
             state.shutdown = true;
             self.inner.tablet_wake.notify_all();
+            let mut state = self.inner.async_submit.lock().unwrap();
+            state.shutdown = true;
+            self.inner.async_submit_wake.notify_all();
         }
     }
 }
@@ -268,6 +284,8 @@ struct JournalApplyRuntimeInner {
     state: Mutex<ApplyRuntimeState>,
     catalog_lane: Mutex<()>,
     dispatch_wake: Condvar,
+    async_submit: Mutex<AsyncSubmitState>,
+    async_submit_wake: Condvar,
     tablet_dispatch: Mutex<TabletDispatchState>,
     tablet_wake: Condvar,
     metrics: ApplyRuntimeMetrics,
@@ -279,6 +297,14 @@ impl JournalApplyRuntimeInner {
         JournalApplyMetricsSnapshot {
             queue_depth: self.metrics.queue_depth.load(Ordering::Relaxed),
             queue_depth_peak: self.metrics.queue_depth_peak.load(Ordering::Relaxed),
+            async_submit_queue_depth: self
+                .metrics
+                .async_submit_queue_depth
+                .load(Ordering::Relaxed),
+            async_submit_queue_depth_peak: self
+                .metrics
+                .async_submit_queue_depth_peak
+                .load(Ordering::Relaxed),
             active_workers: self.metrics.active_workers.load(Ordering::Relaxed),
             active_workers_peak: self.metrics.active_workers_peak.load(Ordering::Relaxed),
             mailbox_count: self.metrics.mailbox_count.load(Ordering::Relaxed),
@@ -318,6 +344,12 @@ impl JournalApplyRuntimeInner {
             state.next_ephemeral_lsn = state.next_ephemeral_lsn.max(raw_lsn.saturating_add(1));
             raw_lsn
         };
+        if lsn < state.next_dispatch_lsn {
+            return Err(paro_error::internal(format!(
+                "journal apply lsn {} is below next dispatch frontier {}",
+                lsn, state.next_dispatch_lsn
+            )));
+        }
         let ticket = Arc::new(RecordTicket::new(
             lsn,
             commit_id,
@@ -376,6 +408,33 @@ impl JournalApplyRuntimeInner {
             )?;
         }
         Ok(())
+    }
+
+    fn enqueue_async_submit(&self, request: ApplyRequest<()>) -> Result<()> {
+        let mut state = self.async_submit.lock().unwrap();
+        if state.shutdown {
+            return Err(paro_error::internal(
+                "journal apply runtime is shutting down",
+            ));
+        }
+        state.queue.push_back(request);
+        self.metrics.increment_async_submit_queue_depth();
+        self.async_submit_wake.notify_one();
+        Ok(())
+    }
+
+    fn dequeue_async_submit(&self) -> Option<ApplyRequest<()>> {
+        let mut state = self.async_submit.lock().unwrap();
+        loop {
+            if let Some(request) = state.queue.pop_front() {
+                self.metrics.decrement_async_submit_queue_depth();
+                return Some(request);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = self.async_submit_wake.wait(state).unwrap();
+        }
     }
 
     fn enqueue_tablet_part(&self, tablet_id: u64, work: TabletApplyWork) -> Result<()> {
@@ -544,6 +603,8 @@ impl JournalApplyRuntimeInner {
 struct ApplyRuntimeMetrics {
     queue_depth: AtomicU64,
     queue_depth_peak: AtomicU64,
+    async_submit_queue_depth: AtomicU64,
+    async_submit_queue_depth_peak: AtomicU64,
     active_workers: AtomicU64,
     active_workers_peak: AtomicU64,
     mailbox_count: AtomicU64,
@@ -574,6 +635,30 @@ impl ApplyRuntimeMetrics {
 
     fn decrement_queue_depth(&self, amount: u64) {
         self.queue_depth.fetch_sub(amount, Ordering::Relaxed);
+    }
+
+    fn increment_async_submit_queue_depth(&self) {
+        let new_depth = self
+            .async_submit_queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let mut current_peak = self.async_submit_queue_depth_peak.load(Ordering::Relaxed);
+        while new_depth > current_peak {
+            match self.async_submit_queue_depth_peak.compare_exchange_weak(
+                current_peak,
+                new_depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_peak = observed,
+            }
+        }
+    }
+
+    fn decrement_async_submit_queue_depth(&self) {
+        self.async_submit_queue_depth
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     fn increment_active_workers(&self) {
@@ -728,6 +813,12 @@ impl RecordTicket {
 }
 
 #[derive(Default)]
+struct AsyncSubmitState {
+    queue: VecDeque<ApplyRequest<()>>,
+    shutdown: bool,
+}
+
+#[derive(Default)]
 struct TabletDispatchState {
     mailboxes: HashMap<u64, TabletMailbox>,
     ready_tablets: VecDeque<u64>,
@@ -778,6 +869,26 @@ fn run_tablet_worker(runtime: Weak<JournalApplyRuntimeInner>) {
             return;
         };
         runtime.complete_tablet_part(&work.ticket, result);
+    }
+}
+
+fn run_async_submit_worker(runtime: Weak<JournalApplyRuntimeInner>) {
+    loop {
+        let Some(inner) = runtime.upgrade() else {
+            return;
+        };
+        let Some(request) = inner.dequeue_async_submit() else {
+            return;
+        };
+        let apply_runtime = JournalApplyRuntime {
+            inner: Arc::clone(&inner),
+        };
+        if let Err(err) = apply_runtime.submit(request) {
+            tracing::error!(
+                error = %err,
+                "asynchronous journal apply request failed after durable append"
+            );
+        }
     }
 }
 
@@ -865,6 +976,55 @@ mod tests {
     }
 
     #[test]
+    fn async_submit_queues_apply_without_waiting_for_publish() {
+        let runtime = JournalApplyRuntime::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let release_apply = Arc::clone(&release);
+        let started_apply = Arc::clone(&started);
+
+        runtime
+            .submit_async(empty_request(
+                1,
+                Some(1),
+                WaitMode::Published,
+                vec![TabletApplyPart {
+                    tablet_id: 11,
+                    apply: Box::new(move || {
+                        started_apply.store(true, Ordering::Release);
+                        let (lock, wake) = &*release_apply;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = wake.wait(released).unwrap();
+                        }
+                        Ok(())
+                    }),
+                }],
+            ))
+            .unwrap();
+
+        for _ in 0..20 {
+            if started.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.load(Ordering::Acquire));
+        assert_eq!(runtime.frontiers().published_commit_id, 0);
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        for _ in 0..50 {
+            if runtime.frontiers().published_commit_id == 1 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("async apply did not publish commit");
+    }
+
+    #[test]
     fn maintenance_publish_advances_lsn_without_advancing_commit_frontier() {
         let runtime = JournalApplyRuntime::new();
         runtime
@@ -913,6 +1073,21 @@ mod tests {
         assert_eq!(frontiers.durable_lsn, 8);
         assert_eq!(frontiers.published_lsn, 8);
         assert_eq!(frontiers.published_commit_id, 5);
+    }
+
+    #[test]
+    fn bootstrap_frontiers_rejects_stale_live_lsn() {
+        let runtime = JournalApplyRuntime::new();
+        runtime.bootstrap_frontiers(RecoverySummary {
+            max_lsn: 7,
+            max_commit_id: 4,
+            ..RecoverySummary::default()
+        });
+
+        let err = runtime
+            .submit(empty_request(1, Some(5), WaitMode::Published, Vec::new()))
+            .expect_err("stale post-recovery lsn must fail instead of waiting forever");
+        assert!(err.to_string().contains("below next dispatch frontier"));
     }
 
     #[test]

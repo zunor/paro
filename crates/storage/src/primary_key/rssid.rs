@@ -114,6 +114,21 @@ impl RssidManager {
             .copied()
     }
 
+    /// Remove retired mappings after no snapshot or runtime handle can decode
+    /// row ids that point at them.
+    pub fn remove_many(&self, rssids: &[Rssid]) {
+        if rssids.is_empty() {
+            return;
+        }
+        let mut mapping = self.mapping.write().unwrap();
+        let mut reverse_mapping = self.reverse_mapping.write().unwrap();
+        for rssid in rssids {
+            if let Some((rowset_id, segment_id)) = mapping.remove(rssid) {
+                reverse_mapping.remove(&(rowset_id, segment_id));
+            }
+        }
+    }
+
     /// Snapshot the persisted entries in rssid order.
     pub fn snapshot_entries(&self) -> Vec<RssidMappingEntry> {
         let mut entries: Vec<_> = self

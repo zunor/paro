@@ -128,6 +128,29 @@ def test_apply_copy_rowcount_normalizer_rewrites_copy_status_lines() -> None:
     ]
 
 
+def test_apply_transaction_ids_normalizer_rewrites_concurrency_ids() -> None:
+    lines = [
+        (
+            "ERROR: transaction 4611686018427387921 blocked by conflicting locks held "
+            "by [TxnId(4611686018427387920)]"
+        ),
+        (
+            "txn_id: TxnId(7), read_ts: ReadTs(8), commit_ts: CommitTs(9), "
+            "table_id: TableId(10), database_id: DatabaseId(11), "
+            "ssi_state_epoch: 12, tenant_id: 0, tablet_id: 99"
+        ),
+    ]
+
+    assert apply_normalizers(lines, ("transaction_ids",)) == [
+        "ERROR: transaction <id> blocked by conflicting locks held by [TxnId(<id>)]",
+        (
+            "txn_id: TxnId(<id>), read_ts: ReadTs(<id>), commit_ts: CommitTs(<id>), "
+            "table_id: TableId(<id>), database_id: DatabaseId(<id>), "
+            "ssi_state_epoch: <id>, tenant_id: <id>, tablet_id: <id>"
+        ),
+    ]
+
+
 def test_apply_regress_paths_normalizer_rewrites_workspace_specific_fixture_paths() -> None:
     lines = [
         (
@@ -196,6 +219,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_external_runtime",
         "explain_runtime",
         "copy_rowcount",
+        "transaction_ids",
         "regress_paths",
     )
 

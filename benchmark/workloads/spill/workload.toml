@@ -1,6 +1,7 @@
 [meta]
 name = "spill"
 description = "Spill observability workload for ORDER BY / WINDOW / HASH AGG / HASH JOIN"
+run_order = 40
 
 [params]
 order_rows = 10000

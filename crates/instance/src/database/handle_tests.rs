@@ -264,7 +264,7 @@ fn test_check_wal_health_without_wal() {
     assert!(report.healthy);
     assert_eq!(
         report.recovery_mode,
-        paro_storage::wal::recovery::WalRecoveryMode::NoWal
+        paro_journal::wal::recovery::WalRecoveryMode::NoWal
     );
 }
 
@@ -286,7 +286,7 @@ fn test_wal_lifecycle_metrics_tracks_wal_health_check() {
     assert_eq!(metrics.wal_health_check_total, 1);
     assert_eq!(
         metrics.recovery_mode,
-        paro_storage::wal::recovery::WalRecoveryMode::NoWal
+        paro_journal::wal::recovery::WalRecoveryMode::NoWal
     );
     assert!(!metrics.main_wal_needs_truncation);
 }

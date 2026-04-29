@@ -17,6 +17,8 @@ use crate::search::cursor::{
     CandidateBatch, OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot,
     VisibleSegment,
 };
+use crate::search::delta_merge::{ensure_search_delta_merge_budget, DeltaMergeQueryShape};
+use crate::search::request::analyze_fulltext_query_stats;
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -68,15 +70,26 @@ impl FullTextTopKProvider {
         }
     }
 
-    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> OpenedSearchCursor {
+    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> Result<OpenedSearchCursor> {
         if self.k == 0 {
-            return OpenedSearchCursor {
+            return Ok(OpenedSearchCursor {
                 snapshot,
                 cursor: Box::new(ExhaustedFullTextCursor),
-            };
+            });
         }
 
-        OpenedSearchCursor {
+        let query_terms = analyze_fulltext_query_stats(&self.query).effective_query_terms();
+        ensure_search_delta_merge_budget(
+            &snapshot,
+            SearchIndexKind::FullText,
+            self.column_id as u32,
+            DeltaMergeQueryShape::FullText {
+                query_terms,
+                top_k: self.k,
+            },
+        )?;
+
+        Ok(OpenedSearchCursor {
             snapshot: snapshot.clone(),
             cursor: Box::new(FullTextTopKCursor {
                 snapshot,
@@ -91,7 +104,7 @@ impl FullTextTopKProvider {
                 telemetry: self.telemetry,
                 state: FullTextTopKState::Pending,
             }),
-        }
+        })
     }
 }
 
@@ -122,8 +135,19 @@ impl FullTextFilterProvider {
         }
     }
 
-    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> OpenedSearchCursor {
-        OpenedSearchCursor {
+    pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> Result<OpenedSearchCursor> {
+        let query_terms = analyze_fulltext_query_stats(&self.query).effective_query_terms();
+        ensure_search_delta_merge_budget(
+            &snapshot,
+            SearchIndexKind::FullText,
+            self.column_id as u32,
+            DeltaMergeQueryShape::FullText {
+                query_terms,
+                top_k: 0,
+            },
+        )?;
+
+        Ok(OpenedSearchCursor {
             snapshot: snapshot.clone(),
             cursor: Box::new(FullTextFilterCursor {
                 snapshot,
@@ -140,7 +164,7 @@ impl FullTextFilterProvider {
                 started_at: None,
                 finished: false,
             }),
-        }
+        })
     }
 }
 
@@ -255,7 +279,19 @@ impl FullTextTopKCursor {
                     self.score_mode,
                 )
                 .map(|rows| {
-                    (
+                    let ranked_rows = if self.snapshot.has_overlay_delete_vectors() {
+                        rows.into_iter()
+                            .filter_map(|point| {
+                                let row = PhysicalRowRef::new(
+                                    visible_segment.rowset_id,
+                                    visible_segment.segment_id,
+                                    point.idx as u32,
+                                );
+                                (!self.snapshot.is_overlay_deleted(row))
+                                    .then(|| RankedRow::new(row, point.score))
+                            })
+                            .collect()
+                    } else {
                         rows.into_iter()
                             .map(|point| {
                                 RankedRow::new(
@@ -267,23 +303,19 @@ impl FullTextTopKCursor {
                                     point.score,
                                 )
                             })
-                            .collect(),
-                        false,
-                    )
+                            .collect()
+                    };
+                    (ranked_rows, false)
                 });
         }
 
-        let row_ids = visible_row_ids(
-            visible_segment,
-            self.snapshot.table.visible_version,
-            self.predicate.as_ref(),
-        )?;
+        let row_ids = visible_row_ids(&self.snapshot, visible_segment, self.predicate.as_ref())?;
         if row_ids.is_empty() {
             return Ok((Vec::new(), true));
         }
         let resolved = resolve_logical_rows(
             &self.tablet,
-            self.snapshot.table.visible_version,
+            &self.snapshot,
             visible_segment,
             &row_ids,
             self.storage_col_id,
@@ -427,27 +459,32 @@ impl FullTextFilterCursor {
                 self.predicate.as_ref(),
             )?;
             let mut rows = Vec::with_capacity(bitmap.len() as usize);
-            for row_id in bitmap.iter() {
-                rows.push(PhysicalRowRef::new(
-                    segment.rowset_id,
-                    segment.segment_id,
-                    row_id,
-                ));
+            if self.snapshot.has_overlay_delete_vectors() {
+                for row_id in bitmap.iter() {
+                    let row = PhysicalRowRef::new(segment.rowset_id, segment.segment_id, row_id);
+                    if !self.snapshot.is_overlay_deleted(row) {
+                        rows.push(row);
+                    }
+                }
+            } else {
+                for row_id in bitmap.iter() {
+                    rows.push(PhysicalRowRef::new(
+                        segment.rowset_id,
+                        segment.segment_id,
+                        row_id,
+                    ));
+                }
             }
             return Ok((rows, false));
         }
 
-        let row_ids = visible_row_ids(
-            segment,
-            self.snapshot.table.visible_version,
-            self.predicate.as_ref(),
-        )?;
+        let row_ids = visible_row_ids(&self.snapshot, segment, self.predicate.as_ref())?;
         if row_ids.is_empty() {
             return Ok((Vec::new(), true));
         }
         let resolved = resolve_logical_rows(
             &self.tablet,
-            self.snapshot.table.visible_version,
+            &self.snapshot,
             segment,
             &row_ids,
             self.storage_col_id,

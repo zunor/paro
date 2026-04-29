@@ -11,6 +11,7 @@ use crate::search::capability::SearchIndexKind;
 use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
+use crate::search::delta_merge::{ensure_search_delta_merge_budget, DeltaMergeQueryShape};
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -70,6 +71,16 @@ impl VectorSearchProvider {
 
         let vector_dim = resolve_vector_dim(&self.column_types, self.column_id)?;
         validate_query_dim(&self.query, vector_dim)?;
+        ensure_search_delta_merge_budget(
+            &snapshot,
+            SearchIndexKind::Hnsw,
+            self.column_id as u32,
+            DeltaMergeQueryShape::Hnsw {
+                dimension: vector_dim,
+                ef: self.params.ef,
+                top_k: self.k,
+            },
+        )?;
         let distance = resolve_distance_metric(&self.tablet, self.column_id);
         let prepared_query = distance.prepare(&self.query);
         let cursor = VectorSearchCursor {
@@ -205,7 +216,19 @@ impl VectorSearchCursor {
                     self.predicate.as_ref(),
                 )
                 .map(|rows| {
-                    (
+                    let ranked_rows = if self.snapshot.has_overlay_delete_vectors() {
+                        rows.into_iter()
+                            .filter_map(|point| {
+                                let row = PhysicalRowRef::new(
+                                    visible_segment.rowset_id,
+                                    visible_segment.segment_id,
+                                    point.idx as u32,
+                                );
+                                (!self.snapshot.is_overlay_deleted(row))
+                                    .then(|| RankedRow::new(row, point.score))
+                            })
+                            .collect()
+                    } else {
                         rows.into_iter()
                             .map(|point| {
                                 RankedRow::new(
@@ -217,23 +240,19 @@ impl VectorSearchCursor {
                                     point.score,
                                 )
                             })
-                            .collect(),
-                        false,
-                    )
+                            .collect()
+                    };
+                    (ranked_rows, false)
                 });
         }
 
-        let row_ids = visible_row_ids(
-            visible_segment,
-            self.snapshot.table.visible_version,
-            self.predicate.as_ref(),
-        )?;
+        let row_ids = visible_row_ids(&self.snapshot, visible_segment, self.predicate.as_ref())?;
         if row_ids.is_empty() {
             return Ok((Vec::new(), true));
         }
         let resolved = resolve_logical_rows(
             &self.tablet,
-            self.snapshot.table.visible_version,
+            &self.snapshot,
             visible_segment,
             &row_ids,
             self.storage_col_id,

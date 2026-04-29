@@ -6,12 +6,12 @@
 //! Current `CREATE INDEX` execution is metadata-only:
 //! 1. Stage the catalog entry during execution.
 //! 2. Finalize to a `PreparedIndexArtifact::MetadataOnly`.
-//! 3. Let post-commit hooks attach any runtime index state (ART/HNSW/Sparse/FullText).
+//! 3. Let the commit pipeline attach runtime index state during required publish.
 //!
 //! Known limitations in the current phase:
 //! - Runtime sink builds are intentionally gone; this operator never buffers row data
 //! - Default `CREATE INDEX name ON t (col)` only stages metadata for runtime ART
-//! - Any runtime materialization happens after commit, so execution stays a pure DDL flow
+//! - Runtime materialization happens in commit publish, so execution stays a pure DDL flow
 
 use std::any::Any;
 use std::fmt;

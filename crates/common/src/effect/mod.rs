@@ -21,5 +21,7 @@ pub use data_op::{
 pub use deferred_task::DeferredTask;
 pub use post_commit_hook::{GraphDmlTableDelta, PostCommitHookDescriptor};
 pub use runtime_transition::RuntimeTransitionDescriptor;
-pub use staged_artifact::{StagedArtifactDescriptor, StagingArtifactId};
+pub use staged_artifact::{
+    BulkLoadRowsetArtifact, BulkLoadUniqueSummary, StagedArtifactDescriptor, StagingArtifactId,
+};
 pub use txn_catalog_op::CatalogTxnOp;

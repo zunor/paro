@@ -27,13 +27,35 @@ impl TableFunctionBindData for ParoPgCursorsBindData {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CursorSummaryData {
     pub name: String,
     pub statement: String,
     pub is_holdable: bool,
     pub is_binary: bool,
     pub is_scrollable: bool,
+    pub snapshot_read_ts: Option<u64>,
+    pub snapshot_pin_duration_us: Option<u64>,
+    pub snapshot_owner_session_id: Option<u64>,
+    pub snapshot_portal_id: Option<String>,
+    pub snapshot_retention_policy: String,
+}
+
+impl Default for CursorSummaryData {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            statement: String::new(),
+            is_holdable: false,
+            is_binary: false,
+            is_scrollable: false,
+            snapshot_read_ts: None,
+            snapshot_pin_duration_us: None,
+            snapshot_owner_session_id: None,
+            snapshot_portal_id: None,
+            snapshot_retention_policy: "none".to_string(),
+        }
+    }
 }
 
 pub struct ParoPgCursorsGlobalState {
@@ -74,6 +96,11 @@ fn bind(
         ("is_holdable", LogicalType::Boolean),
         ("is_binary", LogicalType::Boolean),
         ("is_scrollable", LogicalType::Boolean),
+        ("snapshot_read_ts", LogicalType::BigInt),
+        ("snapshot_pin_duration_us", LogicalType::BigInt),
+        ("snapshot_owner_session_id", LogicalType::BigInt),
+        ("snapshot_portal_id", LogicalType::Varchar),
+        ("snapshot_retention_policy", LogicalType::Varchar),
     ];
 
     for (name, ty) in columns {
@@ -117,6 +144,23 @@ fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableF
     let holdable: Vec<bool> = slice.iter().map(|row| row.is_holdable).collect();
     let binary: Vec<bool> = slice.iter().map(|row| row.is_binary).collect();
     let scrollable: Vec<bool> = slice.iter().map(|row| row.is_scrollable).collect();
+    let snapshot_read_ts: Vec<Option<u64>> = slice.iter().map(|row| row.snapshot_read_ts).collect();
+    let snapshot_pin_duration_us: Vec<Option<u64>> = slice
+        .iter()
+        .map(|row| row.snapshot_pin_duration_us)
+        .collect();
+    let snapshot_owner_session_ids: Vec<Option<u64>> = slice
+        .iter()
+        .map(|row| row.snapshot_owner_session_id)
+        .collect();
+    let snapshot_portal_ids: Vec<Option<&str>> = slice
+        .iter()
+        .map(|row| row.snapshot_portal_id.as_deref())
+        .collect();
+    let snapshot_retention_policies: Vec<&str> = slice
+        .iter()
+        .map(|row| row.snapshot_retention_policy.as_str())
+        .collect();
 
     if let Some(col) = output.column_mut(0) {
         *col = Vector::try_from_strings(&names, output_allocator.clone())?;
@@ -132,6 +176,22 @@ fn function(input: &mut TableFunctionInput, output: &mut Chunk) -> Result<TableF
     }
     if let Some(col) = output.column_mut(4) {
         *col = Vector::try_from_bool(&scrollable, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(5) {
+        *col = Vector::try_from_nullable_u64(&snapshot_read_ts, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(6) {
+        *col = Vector::try_from_nullable_u64(&snapshot_pin_duration_us, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(7) {
+        *col =
+            Vector::try_from_nullable_u64(&snapshot_owner_session_ids, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(8) {
+        *col = Vector::try_from_nullable_strings(&snapshot_portal_ids, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(9) {
+        *col = Vector::try_from_strings(&snapshot_retention_policies, output_allocator.clone())?;
     }
 
     output.set_cardinality(batch_size);

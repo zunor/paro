@@ -4,12 +4,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::rowset::{RowsetId, SegmentSharedPtr};
+use crate::rowset::{RowsetId, RowsetSharedPtr, SegmentSharedPtr};
 use crate::tablet::{TabletReadGuard, TabletRef};
+use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
 use paro_common::error::{self as paro_error, Result};
+use paro_transaction::{DerivedLagLease, RetentionLeaseInfo};
 
 use super::budget::{ResourceBudget, SearchBatchConfig};
 use super::capability::{CoverageState, SearchArtifactRef};
+use super::delta_merge::SearchDeltaWindow;
 use super::request::NormalizedSearchRequest;
 use super::stats::{
     BuildEpoch, GenerationMaintenanceState, GenerationStats, SearchDefinitionId,
@@ -25,6 +28,7 @@ pub struct TableReadSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct VisibleSegment {
+    pub(crate) rowset: RowsetSharedPtr,
     pub(crate) rowset_id: RowsetId,
     pub(crate) segment_id: SegmentId,
     pub(crate) segment: SegmentSharedPtr,
@@ -44,6 +48,7 @@ pub struct TableReadLease {
     guard: Arc<TabletReadGuard>,
     visible_segments: Arc<Vec<VisibleSegment>>,
     segment_index: Arc<HashMap<(RowsetId, SegmentId), SegmentSharedPtr>>,
+    overlay_rowset_ids: Arc<Vec<RowsetId>>,
 }
 
 impl TableReadLease {
@@ -52,17 +57,60 @@ impl TableReadLease {
         table_id: TableId,
         visible_version: i64,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
-        let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version));
+        let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version)?);
         let rowsets = tablet.capture_consistent_rowsets(visible_version)?;
+        Self::from_pinned_rowsets(
+            tablet,
+            table_id,
+            visible_version,
+            guard,
+            rowsets,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn open_with_overlay_rowsets(
+        tablet: &TabletRef,
+        table_id: TableId,
+        visible_version: i64,
+        overlay_rowsets: Vec<RowsetSharedPtr>,
+    ) -> Result<(TableReadSnapshot, Arc<Self>)> {
+        let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version)?);
+        let mut rowsets = tablet.capture_consistent_rowsets(visible_version)?;
+        let mut overlay_rowset_ids: Vec<_> = overlay_rowsets
+            .iter()
+            .map(|rowset| rowset.rowset_id())
+            .collect();
+        overlay_rowset_ids.sort_unstable();
+        overlay_rowset_ids.dedup();
+        rowsets.extend(overlay_rowsets);
+        Self::from_pinned_rowsets(
+            tablet,
+            table_id,
+            visible_version,
+            guard,
+            rowsets,
+            overlay_rowset_ids,
+        )
+    }
+
+    fn from_pinned_rowsets(
+        tablet: &TabletRef,
+        table_id: TableId,
+        visible_version: i64,
+        guard: Arc<TabletReadGuard>,
+        rowsets: Vec<RowsetSharedPtr>,
+        overlay_rowset_ids: Vec<RowsetId>,
+    ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let mut visible_segments = Vec::new();
         let mut segment_index = HashMap::new();
-
         for rowset in rowsets {
             rowset.load()?;
             let rowset_id = rowset.rowset_id();
             for segment in rowset.segments() {
                 let segment_id = segment.segment_id();
                 let entry = VisibleSegment {
+                    rowset: rowset.clone(),
                     rowset_id,
                     segment_id,
                     segment,
@@ -84,6 +132,7 @@ impl TableReadLease {
             guard,
             visible_segments: Arc::new(visible_segments),
             segment_index: Arc::new(segment_index),
+            overlay_rowset_ids: Arc::new(overlay_rowset_ids),
         });
         Ok((snapshot, lease))
     }
@@ -94,6 +143,10 @@ impl TableReadLease {
 
     pub fn visible_segment_count(&self) -> usize {
         self.visible_segments.len()
+    }
+
+    pub(crate) fn is_overlay_rowset(&self, rowset_id: RowsetId) -> bool {
+        self.overlay_rowset_ids.binary_search(&rowset_id).is_ok()
     }
 
     pub fn resolve_segment(&self, row: PhysicalRowRef) -> Result<SegmentSharedPtr> {
@@ -121,6 +174,7 @@ impl std::fmt::Debug for TableReadLease {
             .field("visible_version", &self.visible_version)
             .field("pinned_visible_version", &self.guard.visible_version())
             .field("visible_segment_count", &self.visible_segments.len())
+            .field("overlay_rowset_count", &self.overlay_rowset_ids.len())
             .finish()
     }
 }
@@ -192,6 +246,7 @@ pub struct GenerationReadSnapshot {
     pub generation_id: SearchGenerationId,
     pub build_epoch: BuildEpoch,
     pub build_snapshot_version: i64,
+    pub indexed_through_ts: u64,
     pub coverage: CoverageState,
     pub generation_stats: GenerationStats,
     pub maintenance_state: GenerationMaintenanceState,
@@ -204,6 +259,9 @@ pub struct SearchReadSnapshot {
     pub generation: GenerationReadSnapshot,
     pub table_lease: Arc<TableReadLease>,
     pub generation_lease: Arc<GenerationReadLease>,
+    derived_lag_lease: Option<Arc<DerivedLagLease>>,
+    overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
+    delta_window: SearchDeltaWindow,
 }
 
 impl SearchReadSnapshot {
@@ -213,12 +271,69 @@ impl SearchReadSnapshot {
         table_lease: Arc<TableReadLease>,
         generation_lease: Arc<GenerationReadLease>,
     ) -> Self {
+        let delta_window = SearchDeltaWindow::from_segments(
+            generation.indexed_through_ts,
+            table.visible_version,
+            table_lease.visible_segments(),
+            |rowset_id| table_lease.is_overlay_rowset(rowset_id),
+        );
         Self {
             table,
             generation,
             table_lease,
             generation_lease,
+            derived_lag_lease: None,
+            overlay_delete_vectors: None,
+            delta_window,
         }
+    }
+
+    pub fn with_derived_lag_lease(mut self, lease: Option<Arc<DerivedLagLease>>) -> Self {
+        self.derived_lag_lease = lease;
+        self
+    }
+
+    pub fn derived_lag_lease_info(&self) -> Result<Option<RetentionLeaseInfo>> {
+        self.derived_lag_lease
+            .as_ref()
+            .map(|lease| lease.info())
+            .transpose()
+            .map_err(|err| paro_error::internal(format!("derived lag lease info: {err}")))
+    }
+
+    pub(crate) fn with_overlay_delete_vectors(
+        mut self,
+        delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
+    ) -> Self {
+        self.overlay_delete_vectors = delete_vectors;
+        self
+    }
+
+    #[inline]
+    pub(crate) fn has_overlay_delete_vectors(&self) -> bool {
+        self.overlay_delete_vectors.is_some()
+    }
+
+    pub fn delta_window(&self) -> SearchDeltaWindow {
+        self.delta_window
+    }
+
+    pub(crate) fn is_delta_segment(&self, segment: &VisibleSegment) -> bool {
+        if self.table_lease.is_overlay_rowset(segment.rowset_id) {
+            return true;
+        }
+        let rowset_end = segment.rowset.end_version();
+        rowset_end >= 0
+            && (rowset_end as u64) > self.generation.indexed_through_ts
+            && (rowset_end as u64) <= self.table.visible_version.max(0) as u64
+    }
+
+    #[inline]
+    pub(crate) fn is_overlay_deleted(&self, row: PhysicalRowRef) -> bool {
+        self.overlay_delete_vectors
+            .as_ref()
+            .and_then(|delete_vectors| delete_vectors.get(&(row.rowset_id, row.segment_id)))
+            .is_some_and(|delete_vector| delete_vector.is_deleted(row.row_id))
     }
 }
 
@@ -336,6 +451,7 @@ mod tests {
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats};
     use crate::table::table_factory::TableFactory;
     use paro_common::types::LogicalType;
+    use paro_transaction::{CommitTs, RetentionLeaseKind, RetentionRegistry};
 
     #[test]
     fn physical_row_ref_round_trips_with_existing_tablet_type() {
@@ -374,6 +490,7 @@ mod tests {
             generation_id: 6,
             build_epoch: 7,
             build_snapshot_version: visible_version,
+            indexed_through_ts: visible_version.max(0) as u64,
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
@@ -381,8 +498,16 @@ mod tests {
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
 
+        let registry = RetentionRegistry::with_capacity(1, 2);
+        let derived_lag_target = visible_version.max(3) as u64;
+        let derived_lag_lease = Arc::new(
+            registry
+                .lease_derived_lag_range(CommitTs::new(3), CommitTs::new(derived_lag_target))
+                .expect("lease derived lag"),
+        );
         let snapshot =
-            SearchReadSnapshot::new(table_snapshot, generation, table_lease, generation_lease);
+            SearchReadSnapshot::new(table_snapshot, generation, table_lease, generation_lease)
+                .with_derived_lag_lease(Some(derived_lag_lease));
         assert_eq!(snapshot.table_lease.table_id, table.tablet_id());
         assert_eq!(
             snapshot.table_lease.pinned_visible_version(),
@@ -392,5 +517,15 @@ mod tests {
         assert_eq!(snapshot.generation_lease.generation_id, 6);
         assert_eq!(snapshot.generation_lease.build_epoch, 7);
         assert_eq!(snapshot.generation_lease.artifact_count(), 0);
+        let lease_info = snapshot
+            .derived_lag_lease_info()
+            .expect("lease info")
+            .expect("derived lag lease");
+        assert_eq!(lease_info.kind, RetentionLeaseKind::DerivedLag);
+        assert_eq!(lease_info.commit_ts_floor, Some(CommitTs::new(3)));
+        assert_eq!(
+            lease_info.commit_ts_ceiling,
+            Some(CommitTs::new(derived_lag_target))
+        );
     }
 }

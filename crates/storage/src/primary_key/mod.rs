@@ -25,6 +25,13 @@ pub use immutable_index::{
     ImmutableIndexBuildOptions, ImmutableIndexReader, ImmutableIndexStats, ImmutableIndexWriter,
 };
 pub use persistent_index::{PersistentIndex, PERSISTENT_INDEX_FORMAT_VERSION};
-pub use primary_index::{PrimaryIndex, PrimaryKeySerializer};
+pub use primary_index::{
+    PrimaryIndex, PrimaryIndexVersion, PrimaryKeySerializer, PrimaryKeyWriteConflict,
+};
 pub use row_id::{RowID, NULL_ROW_ID};
 pub use rssid::{Rssid, RssidManager, RssidMappingEntry};
+
+#[inline]
+pub fn primary_key_hash(key: &[u8]) -> u64 {
+    seahash::hash(key)
+}

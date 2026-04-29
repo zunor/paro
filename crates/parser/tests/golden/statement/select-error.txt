@@ -51,7 +51,7 @@ error:
   --> SQL:1:35
   |
 1 | SELECT * FROM t GROUP BY GROUPING SETS a, b
-  |                                   ^^^^ unexpected `SETS`. it's reserved keyword, you may avoid using it, expecting `SELECT`, `INTERSECT`, `WITH`, `EXCEPT`, `VALUES`, `OFFSET`, `IGNORE_RESULT`, `,`, `HAVING`, `WINDOW`, `QUALIFY`, `(`, `UNION`, `FROM`, `ORDER`, `LIMIT`, `FORMAT`, or `;`
+  |                                   ^^^^ unexpected `SETS`. it's reserved keyword, you may avoid using it, expecting `SELECT`, `INTERSECT`, `WITH`, `EXCEPT`, `VALUES`, `OFFSET`, `IGNORE_RESULT`, `,`, `HAVING`, `WINDOW`, `QUALIFY`, `(`, `UNION`, `FROM`, `ORDER`, `LIMIT`, `FOR`, `FORMAT`, or `;`
 
 
 ---------- Input ----------

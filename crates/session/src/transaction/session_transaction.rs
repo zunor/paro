@@ -5,9 +5,13 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_context::{TxnAdmissionState, WriteGuard};
+use paro_context::{ReadTrackerHandle, TxnAdmissionState, WriteGuard};
 use paro_storage::transaction::manager::TransactionManager;
 use paro_storage::transaction::txn::{StorageSavepointMark, Transaction};
+use paro_transaction::{
+    CommandId, DatabaseId, FrozenReadSet, IsolationLevel, ParticipantStateSet, ReadSnapshot,
+    ReadTrackingPolicy, ReadTs, ReadWritePromotion, TransactionView,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -29,12 +33,28 @@ pub struct SessionTransaction {
     ddl_changes: Arc<Mutex<CatalogOpBatch>>,
     admission_state: Arc<TxnAdmissionState>,
     write_guard: Arc<WriteGuard>,
+    read_tracker: ReadTrackerHandle,
+    default_isolation_level: IsolationLevel,
+    default_read_only: bool,
+    isolation_level: IsolationLevel,
+    read_only: bool,
+    participant_states: ParticipantStateSet,
 }
 
 #[derive(Debug)]
 pub struct FrozenTransaction {
     pub active: Arc<Transaction>,
     pub ddl_changes: Vec<PreparedCatalogOp>,
+    pub transaction_view: TransactionView,
+}
+
+/// Why the caller is freezing the session transaction. Commit enforces the
+/// safe-snapshot-must-restart guard; rollback/abort is allowed to freeze any
+/// state because no writes will be published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeIntent {
+    Commit,
+    Rollback,
 }
 
 impl Default for SessionTransaction {
@@ -57,7 +77,18 @@ impl SessionTransaction {
             ddl_changes: Arc::new(Mutex::new(CatalogOpBatch::new())),
             admission_state: Arc::new(TxnAdmissionState::new()),
             write_guard: Arc::new(WriteGuard::new()),
+            read_tracker: ReadTrackerHandle::noop(),
+            default_isolation_level: IsolationLevel::Serializable,
+            default_read_only: false,
+            isolation_level: IsolationLevel::Serializable,
+            read_only: false,
+            participant_states: ParticipantStateSet::empty(),
         }
+    }
+
+    fn reset_characteristics_to_defaults(&mut self) {
+        self.isolation_level = self.default_isolation_level;
+        self.read_only = self.default_read_only;
     }
 
     // ============================================================
@@ -92,6 +123,9 @@ impl SessionTransaction {
     /// transaction.
     pub fn command_counter_increment(&mut self) {
         self.command_id = self.command_id.wrapping_add(1);
+        if let Some(active) = self.active.as_ref() {
+            active.publish_command_boundary(CommandId::new(self.command_id));
+        }
         tracing::trace!(command_id = self.command_id, "command counter incremented");
     }
 
@@ -182,12 +216,17 @@ impl SessionTransaction {
             name: name.into(),
             settings_journal_mark: self.local_settings.mark(),
             portal_mark,
-            write_class_mark: self.write_guard.mark(),
+            write_guard_mark: self.write_guard.mark(),
             ddl_mark,
             storage_mark,
         };
         self.savepoints.push(frame.clone());
         frame
+    }
+
+    pub fn mark_savepoint(&self) -> Result<StorageSavepointMark> {
+        self.active_transaction()?
+            .mark_savepoint_with_read_tracker(CommandId::new(self.command_id), &self.read_tracker)
     }
 
     pub fn release_savepoint(&mut self, name: &str) -> Result<SavepointFrame> {
@@ -220,7 +259,11 @@ impl SessionTransaction {
         let frame = self.savepoints[index].clone();
         if let Some(active) = self.active.as_ref() {
             active.rollback_to_savepoint(&frame.storage_mark)?;
+            active.publish_command_boundary(frame.storage_mark.command_id_mark);
         }
+        self.read_tracker
+            .rollback_to_savepoint(&frame.storage_mark.read_dependency_mark);
+        self.command_id = frame.storage_mark.command_id_mark.into_raw();
 
         let rolled_back = self
             .ddl_changes
@@ -234,7 +277,7 @@ impl SessionTransaction {
         }
         self.admission_state.rollback_to_mark(frame.ddl_mark);
 
-        self.write_guard.restore(frame.write_class_mark);
+        self.write_guard.restore(frame.write_guard_mark.clone());
         self.local_settings
             .rollback_to_mark(frame.settings_journal_mark);
         self.savepoints.truncate(index + 1);
@@ -301,6 +344,9 @@ impl SessionTransaction {
         }
         self.admission_state.clear();
         self.write_guard.reset();
+        self.read_tracker = ReadTrackerHandle::noop();
+        self.reset_characteristics_to_defaults();
+        self.participant_states = ParticipantStateSet::empty();
     }
 
     // ============================================================
@@ -309,17 +355,19 @@ impl SessionTransaction {
 
     /// Returns the transaction ID of the active transaction, if any.
     pub fn transaction_id(&self) -> Option<u64> {
-        self.active.as_ref().map(|t| t.id)
+        self.active.as_ref().map(|t| t.writer_id().into_raw())
     }
 
     /// Returns the start time of the active transaction, if any.
     pub fn start_time(&self) -> Option<u64> {
-        self.active.as_ref().map(|t| t.start_time)
+        self.active.as_ref().map(|t| t.read_ts().into_raw())
     }
 
     /// Returns the visible version of the active transaction, if any.
     pub fn visible_version(&self) -> Option<u64> {
-        self.active.as_ref().map(|t| t.visible_version())
+        self.active
+            .as_ref()
+            .map(|t| t.visible_commit_ts().into_raw())
     }
 
     pub fn write_guard(&self) -> Arc<WriteGuard> {
@@ -334,6 +382,76 @@ impl SessionTransaction {
         self.admission_state.clone()
     }
 
+    pub fn read_tracker(&self) -> ReadTrackerHandle {
+        self.read_tracker.clone()
+    }
+
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.isolation_level
+    }
+
+    #[inline]
+    pub fn default_isolation_level(&self) -> IsolationLevel {
+        self.default_isolation_level
+    }
+
+    #[inline]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    #[inline]
+    pub fn default_read_only(&self) -> bool {
+        self.default_read_only
+    }
+
+    pub fn set_default_isolation_level(&mut self, isolation_level: IsolationLevel) {
+        self.default_isolation_level = isolation_level;
+        if self.active.is_none() {
+            self.isolation_level = isolation_level;
+        }
+    }
+
+    pub fn set_default_read_only(&mut self, read_only: bool) {
+        self.default_read_only = read_only;
+        if self.active.is_none() {
+            self.read_only = read_only;
+        }
+    }
+
+    pub fn set_transaction_characteristics(
+        &mut self,
+        isolation_level: Option<IsolationLevel>,
+        read_only: Option<bool>,
+    ) -> Result<()> {
+        if self.active.is_none() || self.block_kind != BlockKind::Explicit {
+            return Err(paro_error::invalid_transaction_state(
+                "SET TRANSACTION can only be used in transaction blocks".to_string(),
+            ));
+        }
+        if self.command_id != 0 {
+            return Err(paro_error::invalid_transaction_state(
+                "SET TRANSACTION must be called before the first query in a transaction"
+                    .to_string(),
+            ));
+        }
+        if let Some(isolation_level) = isolation_level {
+            self.isolation_level = isolation_level;
+        }
+        if let Some(read_only) = read_only {
+            self.read_only = read_only;
+        }
+        Ok(())
+    }
+
+    pub fn frozen_read_set(&self) -> FrozenReadSet {
+        self.read_tracker.frozen_read_set()
+    }
+
+    pub fn participant_states(&self) -> ParticipantStateSet {
+        self.participant_states.clone()
+    }
+
     // ============================================================
     // Transaction Lifecycle
     // ============================================================
@@ -344,12 +462,164 @@ impl SessionTransaction {
     ///
     /// Returns an error if a transaction is already active.
     pub fn begin_transaction(&mut self, manager: &TransactionManager) -> Result<Arc<Transaction>> {
+        self.begin_transaction_for_database(
+            manager,
+            manager.database_id(),
+            "",
+            ReadTrackingPolicy::SafeSnapshotPreferred,
+        )
+    }
+
+    pub fn begin_transaction_with_policy(
+        &mut self,
+        manager: &TransactionManager,
+        read_tracking_policy: ReadTrackingPolicy,
+    ) -> Result<Arc<Transaction>> {
+        self.begin_transaction_for_database(
+            manager,
+            manager.database_id(),
+            "",
+            read_tracking_policy,
+        )
+    }
+
+    pub fn begin_transaction_for_database(
+        &mut self,
+        manager: &TransactionManager,
+        database_id: DatabaseId,
+        database_name: &str,
+        read_tracking_policy: ReadTrackingPolicy,
+    ) -> Result<Arc<Transaction>> {
         if self.active.is_some() {
             return Err(paro_error::transaction_active());
         }
+        self.command_id = 0;
         let txn = manager.begin_transaction()?;
+        self.write_guard
+            .set_transaction_database(database_id, database_name);
+        self.read_tracker =
+            manager.read_tracker_for_policy(txn.txn_id(), txn.read_ts(), read_tracking_policy);
+        self.participant_states =
+            ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]);
         self.active = Some(txn.clone());
         Ok(txn)
+    }
+
+    pub fn prepare_statement_read_tracking(
+        &mut self,
+        manager: &TransactionManager,
+        policy: ReadTrackingPolicy,
+    ) -> Result<ReadWritePromotion> {
+        self.prepare_statement_read_tracking_for_database(
+            manager,
+            policy,
+            manager.database_id(),
+            "",
+        )
+    }
+
+    pub fn prepare_statement_read_tracking_for_database(
+        &mut self,
+        manager: &TransactionManager,
+        policy: ReadTrackingPolicy,
+        database_id: DatabaseId,
+        database_name: &str,
+    ) -> Result<ReadWritePromotion> {
+        self.prepare_statement_read_tracking_for_database_with_access(
+            manager,
+            policy,
+            policy != ReadTrackingPolicy::SafeSnapshotPreferred,
+            database_id,
+            database_name,
+        )
+    }
+
+    pub fn prepare_statement_read_tracking_for_database_with_access(
+        &mut self,
+        manager: &TransactionManager,
+        policy: ReadTrackingPolicy,
+        requires_read_write: bool,
+        database_id: DatabaseId,
+        database_name: &str,
+    ) -> Result<ReadWritePromotion> {
+        if self.active.is_none() {
+            self.begin_transaction_for_database(manager, database_id, database_name, policy)?;
+        }
+        if !requires_read_write {
+            self.refresh_read_tracker_for_read_only_hint(manager, policy)?;
+            return Ok(ReadWritePromotion::Promoted);
+        }
+
+        let active = self.active_transaction()?;
+        if self.read_tracker.is_safe_snapshot() {
+            if self.can_restart_safe_snapshot_for_write() {
+                self.restart_as_read_write(manager, policy, database_id, database_name)?;
+                return Ok(ReadWritePromotion::MustRestartImplicitOk);
+            }
+            return Ok(ReadWritePromotion::MustRestartUserVisible);
+        }
+
+        self.read_tracker =
+            manager.read_tracker_for_policy(active.txn_id(), active.read_ts(), policy);
+        active.promote_to_read_write()?;
+        Ok(ReadWritePromotion::Promoted)
+    }
+
+    fn refresh_read_tracker_for_read_only_hint(
+        &mut self,
+        manager: &TransactionManager,
+        policy: ReadTrackingPolicy,
+    ) -> Result<()> {
+        let active = self.active_transaction()?;
+        if policy == ReadTrackingPolicy::SafeSnapshotPreferred {
+            return Ok(());
+        }
+        if self.read_tracker.is_safe_snapshot() && self.command_id != 0 {
+            return Ok(());
+        }
+        self.read_tracker =
+            manager.read_tracker_for_policy(active.txn_id(), active.read_ts(), policy);
+        Ok(())
+    }
+
+    fn can_restart_safe_snapshot_for_write(&self) -> bool {
+        self.command_id == 0
+            && self.savepoints.is_empty()
+            && self
+                .ddl_changes
+                .lock()
+                .map(|changes| changes.is_empty())
+                .unwrap_or(false)
+    }
+
+    fn restart_as_read_write(
+        &mut self,
+        manager: &TransactionManager,
+        policy: ReadTrackingPolicy,
+        database_id: DatabaseId,
+        database_name: &str,
+    ) -> Result<()> {
+        let auto_commit = self.auto_commit;
+        let block_kind = self.block_kind;
+        if let Some(active) = self.active.take() {
+            manager.rollback_transaction(active)?;
+        }
+        self.command_id = 0;
+        self.read_tracker = ReadTrackerHandle::noop();
+        self.participant_states = ParticipantStateSet::empty();
+        if let Ok(mut ddl_state) = self.ddl_changes.lock() {
+            ddl_state.clear();
+        }
+        self.admission_state.clear();
+        self.write_guard.reset();
+        self.savepoints.clear();
+
+        let txn =
+            self.begin_transaction_for_database(manager, database_id, database_name, policy)?;
+        txn.promote_to_read_write()?;
+        self.auto_commit = auto_commit;
+        self.block_kind = block_kind;
+        Ok(())
     }
 
     /// Begins an explicit transaction block (for BEGIN command).
@@ -369,6 +639,41 @@ impl SessionTransaction {
         let txn = self.begin_transaction(manager)?;
         self.block_kind = BlockKind::Explicit;
         self.auto_commit = false;
+        Ok(txn)
+    }
+
+    pub fn begin_explicit_block_for_database(
+        &mut self,
+        manager: &TransactionManager,
+        database_id: DatabaseId,
+        database_name: &str,
+    ) -> Result<Arc<Transaction>> {
+        let txn = self.begin_transaction_for_database(
+            manager,
+            database_id,
+            database_name,
+            ReadTrackingPolicy::SafeSnapshotPreferred,
+        )?;
+        self.block_kind = BlockKind::Explicit;
+        self.auto_commit = false;
+        Ok(txn)
+    }
+
+    pub fn begin_explicit_block_with_characteristics(
+        &mut self,
+        manager: &TransactionManager,
+        database_id: DatabaseId,
+        database_name: &str,
+        isolation_level: Option<IsolationLevel>,
+        read_only: Option<bool>,
+    ) -> Result<Arc<Transaction>> {
+        let txn = self.begin_explicit_block_for_database(manager, database_id, database_name)?;
+        if let Some(isolation_level) = isolation_level {
+            self.isolation_level = isolation_level;
+        }
+        if let Some(read_only) = read_only {
+            self.read_only = read_only;
+        }
         Ok(txn)
     }
 
@@ -397,9 +702,23 @@ impl SessionTransaction {
         &mut self,
         manager: &TransactionManager,
     ) -> Result<bool> {
+        self.begin_implicit_transaction_block_for_database(manager, manager.database_id(), "")
+    }
+
+    pub fn begin_implicit_transaction_block_for_database(
+        &mut self,
+        manager: &TransactionManager,
+        database_id: DatabaseId,
+        database_name: &str,
+    ) -> Result<bool> {
         let started_new = self.active.is_none();
         if started_new {
-            self.begin_transaction(manager)?;
+            self.begin_transaction_for_database(
+                manager,
+                database_id,
+                database_name,
+                ReadTrackingPolicy::SafeSnapshotPreferred,
+            )?;
         }
 
         // Mark as implicit block and disable auto-commit
@@ -428,22 +747,6 @@ impl SessionTransaction {
             self.clear_transaction();
         }
         Ok(())
-    }
-
-    /// Commits the current transaction.
-    ///
-    /// After commit, the transaction context is cleared and auto-commit is reset to true.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there is no active transaction.
-    pub fn commit(&mut self, manager: &TransactionManager) -> Result<u64> {
-        let txn = self
-            .active
-            .take()
-            .ok_or_else(|| paro_error::no_transaction())?;
-        self.clear_transaction();
-        manager.commit_transaction(txn)
     }
 
     /// Rolls back the current transaction.
@@ -489,11 +792,62 @@ impl SessionTransaction {
             .ok_or_else(|| paro_error::no_transaction())
     }
 
+    pub fn take_read_only_noop_for_commit(&mut self) -> Option<Arc<Transaction>> {
+        let active = self.active.as_ref()?;
+        if !active.is_read_only() {
+            return None;
+        }
+        if !self
+            .ddl_changes
+            .lock()
+            .map(|changes| changes.is_empty())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let active = self.active.take()?;
+        self.clear_transaction();
+        Some(active)
+    }
+
     pub fn freeze(&mut self) -> Result<FrozenTransaction> {
+        self.freeze_for(FreezeIntent::Commit)
+    }
+
+    pub fn freeze_for(&mut self, intent: FreezeIntent) -> Result<FrozenTransaction> {
+        if matches!(intent, FreezeIntent::Commit) {
+            let has_catalog_writes = self
+                .ddl_changes
+                .lock()
+                .map(|changes| !changes.is_empty())
+                .unwrap_or(true);
+            if self.read_tracker.is_safe_snapshot()
+                && (has_catalog_writes
+                    || self
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| !active.is_read_only()))
+            {
+                return Err(paro_error::serialization_failure(
+                    "safe snapshot transaction must restart before committing writes",
+                ));
+            }
+        }
         let active = self
             .active
             .take()
             .ok_or_else(|| paro_error::no_transaction())?;
+        active.freeze_write_buffer(CommandId::new(self.command_id));
+        let transaction_view = TransactionView::new(
+            active.writer_id(),
+            active.read_ts(),
+            ReadSnapshot::without_lease(ReadTs::new(active.visible_commit_ts().into_raw())),
+            self.isolation_level,
+            CommandId::new(self.command_id),
+            self.read_tracker.clone(),
+            self.participant_states.clone(),
+        );
         let ddl_changes = self
             .ddl_changes
             .lock()
@@ -503,6 +857,7 @@ impl SessionTransaction {
         Ok(FrozenTransaction {
             active,
             ddl_changes,
+            transaction_view,
         })
     }
 }
@@ -517,6 +872,16 @@ mod tests {
 
     fn create_manager() -> TransactionManager {
         TransactionManager::new()
+    }
+
+    fn commit_frozen_for_test(
+        ctx: &mut SessionTransaction,
+        manager: &TransactionManager,
+    ) -> Result<u64> {
+        let frozen = ctx.freeze()?;
+        let commit_id = manager.durable_commit_id().saturating_add(1).max(1);
+        frozen.active.commit(commit_id)?;
+        Ok(commit_id)
     }
 
     // ============================================================
@@ -606,7 +971,7 @@ mod tests {
         let manager = create_manager();
 
         ctx.begin_transaction(&manager).unwrap();
-        ctx.commit(&manager).unwrap();
+        commit_frozen_for_test(&mut ctx, &manager).unwrap();
         assert!(!ctx.has_active_transaction());
     }
 
@@ -650,7 +1015,7 @@ mod tests {
         assert!(!ctx.is_auto_commit());
 
         // Commit should reset auto_commit to true
-        ctx.commit(&manager).unwrap();
+        commit_frozen_for_test(&mut ctx, &manager).unwrap();
 
         assert!(ctx.is_auto_commit());
         assert!(!ctx.has_active_transaction());
@@ -692,11 +1057,85 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_without_transaction_fails() {
+    fn safe_snapshot_read_only_transaction_skips_read_tracking() {
         let mut ctx = SessionTransaction::new();
         let manager = create_manager();
 
-        let result = ctx.commit(&manager);
+        ctx.begin_transaction(&manager).unwrap();
+
+        assert_eq!(
+            ctx.read_tracker().policy(),
+            ReadTrackingPolicy::SafeSnapshot
+        );
+        ctx.read_tracker()
+            .record_table_read(paro_transaction::TableId::new(10));
+        assert_eq!(ctx.frozen_read_set().dependency_count(), 0);
+    }
+
+    #[test]
+    fn read_only_exact_hint_does_not_promote_to_read_write() {
+        let mut ctx = SessionTransaction::new();
+        let manager = create_manager();
+
+        ctx.begin_transaction(&manager).unwrap();
+        let promotion = ctx
+            .prepare_statement_read_tracking_for_database_with_access(
+                &manager,
+                ReadTrackingPolicy::RangeCritical,
+                false,
+                manager.database_id(),
+                "",
+            )
+            .unwrap();
+
+        assert_eq!(promotion, ReadWritePromotion::Promoted);
+        assert!(ctx.active_transaction().unwrap().is_read_only());
+        assert_eq!(
+            ctx.read_tracker().policy(),
+            ReadTrackingPolicy::RangeCritical
+        );
+    }
+
+    #[test]
+    fn implicit_safe_snapshot_write_restarts_as_read_write() {
+        let mut ctx = SessionTransaction::new();
+        let manager = create_manager();
+
+        let original = ctx.begin_transaction(&manager).unwrap().txn_id();
+        let promotion = ctx
+            .prepare_statement_read_tracking(&manager, ReadTrackingPolicy::RangeCritical)
+            .unwrap();
+        let restarted = ctx.active_transaction().unwrap();
+
+        assert_eq!(promotion, ReadWritePromotion::MustRestartImplicitOk);
+        assert_ne!(restarted.txn_id(), original);
+        assert!(!restarted.is_read_only());
+        assert_eq!(
+            ctx.read_tracker().policy(),
+            ReadTrackingPolicy::RangeCritical
+        );
+    }
+
+    #[test]
+    fn explicit_safe_snapshot_write_requires_user_visible_restart() {
+        let mut ctx = SessionTransaction::new();
+        let manager = create_manager();
+
+        ctx.begin_explicit_block(&manager).unwrap();
+        ctx.command_counter_increment();
+        let promotion = ctx
+            .prepare_statement_read_tracking(&manager, ReadTrackingPolicy::RangeCritical)
+            .unwrap();
+
+        assert_eq!(promotion, ReadWritePromotion::MustRestartUserVisible);
+        assert!(ctx.active_transaction().unwrap().is_read_only());
+    }
+
+    #[test]
+    fn test_freeze_without_transaction_fails() {
+        let mut ctx = SessionTransaction::new();
+
+        let result = ctx.freeze();
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -896,7 +1335,7 @@ mod tests {
         let manager = create_manager();
 
         ctx.begin_explicit_block(&manager).unwrap();
-        ctx.commit(&manager).unwrap();
+        commit_frozen_for_test(&mut ctx, &manager).unwrap();
 
         assert!(!ctx.has_active_transaction());
         assert!(ctx.is_auto_commit());
@@ -1009,7 +1448,7 @@ mod tests {
         assert_eq!(ctx.current_command_id(), 2);
 
         // Commit should reset counter
-        ctx.commit(&manager).unwrap();
+        commit_frozen_for_test(&mut ctx, &manager).unwrap();
         assert_eq!(ctx.current_command_id(), 0);
     }
 
@@ -1026,6 +1465,33 @@ mod tests {
 
         // Rollback should reset counter
         ctx.rollback(&manager).unwrap();
+        assert_eq!(ctx.current_command_id(), 0);
+    }
+
+    #[test]
+    fn test_new_transaction_starts_at_command_zero_after_autocommit_increment() {
+        let mut ctx = SessionTransaction::new();
+        let manager = create_manager();
+
+        ctx.command_counter_increment();
+        assert_eq!(ctx.current_command_id(), 1);
+
+        ctx.begin_transaction(&manager).unwrap();
+        assert_eq!(ctx.current_command_id(), 0);
+    }
+
+    #[test]
+    fn test_read_only_noop_commit_fast_path_clears_transaction() {
+        let mut ctx = SessionTransaction::new();
+        let manager = create_manager();
+
+        let txn = ctx.begin_transaction(&manager).unwrap();
+        let taken = ctx
+            .take_read_only_noop_for_commit()
+            .expect("read-only transaction should use no-op commit path");
+
+        assert_eq!(taken.txn_id(), txn.txn_id());
+        assert!(!ctx.has_active_transaction());
         assert_eq!(ctx.current_command_id(), 0);
     }
 
@@ -1048,7 +1514,7 @@ mod tests {
         assert_eq!(ctx.current_command_id(), 3);
 
         // Counter persists until commit/rollback
-        ctx.commit(&manager).unwrap();
+        commit_frozen_for_test(&mut ctx, &manager).unwrap();
         assert_eq!(ctx.current_command_id(), 0);
     }
 
@@ -1170,5 +1636,36 @@ mod tests {
         );
 
         ctx.rollback_to_savepoint("sp1").unwrap();
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_restores_command_and_read_tracker() {
+        let mut ctx = SessionTransaction::new();
+        let manager = create_manager();
+
+        ctx.begin_explicit_block(&manager).unwrap();
+        ctx.prepare_statement_read_tracking(&manager, ReadTrackingPolicy::RangeCritical)
+            .unwrap();
+        ctx.read_tracker()
+            .record_table_read(paro_transaction::TableId::new(10));
+        ctx.command_counter_increment();
+        ctx.command_counter_increment();
+
+        let storage_mark = ctx.mark_savepoint().unwrap();
+        ctx.define_savepoint("sp1", PortalStoreMark::default(), storage_mark);
+
+        ctx.read_tracker()
+            .record_table_read(paro_transaction::TableId::new(20));
+        ctx.command_counter_increment();
+
+        ctx.rollback_to_savepoint("sp1").unwrap();
+
+        assert_eq!(ctx.current_command_id(), 2);
+        assert_eq!(
+            ctx.read_tracker().recorded_dependencies(),
+            vec![paro_transaction::ReadDependency::Table {
+                table_id: paro_transaction::TableId::new(10)
+            }]
+        );
     }
 }

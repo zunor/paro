@@ -121,6 +121,26 @@ impl<'handler, 'catalog> ApplyEngine<'handler, 'catalog> {
                     "Applied PublishRowset"
                 );
             }
+            TabletMutation::ApplyPrimaryDelete { keys } => {
+                let delete_version = commit_visibility.ok_or_else(|| {
+                    paro_common::error::internal(
+                        "maintenance record cannot carry ApplyPrimaryDelete without commit visibility",
+                    )
+                })?;
+                route
+                    .storage
+                    .replay_primary_delete_at_version(keys, delete_version)?;
+                tracing::info!(
+                    target: targets::INSTANCE,
+                    schema = %route.schema_name,
+                    table = %route.table_name,
+                    lsn,
+                    commit_id = delete_version,
+                    tablet_id,
+                    key_count = keys.len(),
+                    "Applied PrimaryDelete"
+                );
+            }
             TabletMutation::ApplyDeletePatch {
                 patch,
                 deleted_row_count,

@@ -1,0 +1,90 @@
+CREATE TABLE txn_e2e_commit_snapshot_overlay (
+    id INT PRIMARY KEY,
+    note VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO txn_e2e_commit_snapshot_overlay VALUES (1, 'seed');
+INSERT 0 1
+
+-- session: reader
+BEGIN ISOLATION LEVEL SNAPSHOT;
+BEGIN
+
+-- session: reader
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+
+-- session: writer
+INSERT INTO txn_e2e_commit_snapshot_overlay VALUES (2, 'writer-commit');
+INSERT 0 1
+
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+2	writer-commit
+
+-- session: reader
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+
+-- session: reader
+INSERT INTO txn_e2e_commit_snapshot_overlay VALUES (3, 'reader-own-write');
+INSERT 0 1
+
+-- session: reader
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+3	reader-own-write
+
+-- session: reader
+SAVEPOINT before_temp;
+SAVEPOINT
+
+-- session: reader
+INSERT INTO txn_e2e_commit_snapshot_overlay VALUES (4, 'temp-savepoint');
+INSERT 0 1
+
+-- session: reader
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+3	reader-own-write
+4	temp-savepoint
+
+-- session: reader
+ROLLBACK TO SAVEPOINT before_temp;
+ROLLBACK TO
+
+-- session: reader
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+3	reader-own-write
+
+-- session: reader
+COMMIT;
+COMMIT
+
+SELECT id, note
+FROM txn_e2e_commit_snapshot_overlay
+ORDER BY id;
+id	note
+1	seed
+2	writer-commit
+3	reader-own-write

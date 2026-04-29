@@ -204,6 +204,7 @@ fn publish_delta_generation(
     committed_edge_deltas: HashMap<String, Arc<DeltaAdjacency>>,
     graph_stats: Arc<GraphStatistics>,
     next_generation_id: u64,
+    indexed_through_ts: u64,
 ) -> Result<()> {
     publish_generation(
         graph_id,
@@ -214,10 +215,36 @@ fn publish_delta_generation(
             snapshot
                 .manifest()
                 .clone()
+                .with_indexed_through_ts(indexed_through_ts)
                 .with_statistics(graph_stats.as_ref().clone()),
             next_generation_id,
             committed_edge_deltas,
             graph_stats,
+        ),
+    )
+}
+
+fn publish_metadata_generation(
+    graph_id: &GraphId,
+    graph_index: &dyn GraphIndexProvider,
+    graph_registry: &dyn GraphRegistry,
+    snapshot: &paro_storage::index::graph::GraphReadSnapshot,
+    next_generation_id: u64,
+    indexed_through_ts: u64,
+) -> Result<()> {
+    publish_generation(
+        graph_id,
+        graph_index,
+        graph_registry,
+        GraphStorageGeneration::new(
+            snapshot.base().clone(),
+            snapshot
+                .manifest()
+                .clone()
+                .with_indexed_through_ts(indexed_through_ts),
+            next_generation_id,
+            snapshot.generation().committed_edge_deltas.clone(),
+            snapshot.statistics().clone(),
         ),
     )
 }
@@ -277,6 +304,7 @@ fn persist_and_publish_rebuild(
     scanned: &ScannedGraphInputs,
     next_generation_id: u64,
     schema_fingerprint: &str,
+    indexed_through_ts: u64,
 ) -> Result<()> {
     let rebuild_start = Instant::now();
     let index = build_graph_index_from_scans(graph_name, scanned)?;
@@ -286,6 +314,7 @@ fn persist_and_publish_rebuild(
         GraphState::Ready,
         schema_fingerprint.to_string(),
     )
+    .with_indexed_through_ts(indexed_through_ts)
     .with_statistics(graph_stats);
 
     let graph_dir = graph_data_dir(db_path, graph_name);
@@ -410,6 +439,7 @@ fn refresh_scanned_graph(
     graph_name: &str,
     schema_fingerprint: &str,
     scanned: &ScannedGraphInputs,
+    valid_through_ts: u64,
     refresh_policy: GraphRefreshPolicy,
     background_catalog: Option<Arc<ParoCatalog>>,
     background_graph_index: Option<Arc<dyn GraphIndexProvider>>,
@@ -430,12 +460,14 @@ fn refresh_scanned_graph(
             scanned,
             0,
             schema_fingerprint,
+            scanned.indexed_through_ts.max(valid_through_ts),
         )?;
         return Ok(());
     };
 
     let next_generation_id = snapshot.generation_id().saturating_add(1);
     let base = snapshot.base().as_ref();
+    let indexed_through_ts = scanned.indexed_through_ts.max(valid_through_ts);
 
     if !vertex_inputs_match_base(base, &scanned.vertex_inputs) {
         persist_and_publish_rebuild(
@@ -447,6 +479,7 @@ fn refresh_scanned_graph(
             scanned,
             next_generation_id,
             schema_fingerprint,
+            indexed_through_ts,
         )?;
         return Ok(());
     }
@@ -462,6 +495,7 @@ fn refresh_scanned_graph(
                 scanned,
                 next_generation_id,
                 schema_fingerprint,
+                indexed_through_ts,
             )?;
         }
         DeltaPlan::Publish {
@@ -469,6 +503,16 @@ fn refresh_scanned_graph(
             delta_edges,
         } => {
             if delta_edges == 0 {
+                if indexed_through_ts > snapshot.indexed_through_ts() {
+                    publish_metadata_generation(
+                        graph_id,
+                        graph_index,
+                        graph_registry,
+                        &snapshot,
+                        next_generation_id,
+                        indexed_through_ts,
+                    )?;
+                }
                 return Ok(());
             }
 
@@ -494,6 +538,7 @@ fn refresh_scanned_graph(
                             scanned,
                             next_generation_id,
                             schema_fingerprint,
+                            indexed_through_ts,
                         )?;
                     }
                     GraphRefreshPolicy::BackgroundCompaction => {
@@ -507,6 +552,7 @@ fn refresh_scanned_graph(
                             committed_edge_deltas,
                             graph_stats,
                             next_generation_id,
+                            indexed_through_ts,
                         )?;
                         if let (
                             Some(catalog),
@@ -539,6 +585,7 @@ fn refresh_scanned_graph(
                     committed_edge_deltas,
                     graph_stats,
                     next_generation_id,
+                    indexed_through_ts,
                 )?;
             }
         }
@@ -571,6 +618,7 @@ pub fn refresh_property_graph_committed(
         &graph_info.graph_name,
         &schema_fingerprint,
         &scanned,
+        visible_start_time,
         GraphRefreshPolicy::BackgroundCompaction,
         Some(catalog),
         Some(graph_index.clone()),
@@ -622,6 +670,7 @@ pub fn rebuild_property_graph_committed(
         &scanned,
         next_generation_id,
         &schema_fingerprint,
+        scanned.indexed_through_ts.max(visible_start_time),
     )
 }
 
@@ -723,6 +772,10 @@ impl PhysicalOperator for RefreshPropertyGraph {
             &self.info.graph_name,
             &schema_fingerprint,
             &scanned,
+            ctx.session
+                .active_transaction()
+                .map(|txn| txn.id)
+                .unwrap_or(scanned.indexed_through_ts),
             GraphRefreshPolicy::Synchronous,
             None,
             None,

@@ -17,7 +17,6 @@ use paro_storage::tablet::{
     KeysType, RetiredGcBarrier, Tablet, TabletColumn, TabletReader, TabletReaderParams,
     TabletSchema,
 };
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use paro_storage::write::DeltaWriter;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
@@ -447,10 +446,7 @@ fn test_compaction_keeps_old_snapshot_rowids_readable_until_gc() {
     drop(old_reader);
     assert_eq!(tablet.min_active_visible_version(), None);
     let retired = tablet.retired_pending_gc_statuses();
-    assert_eq!(retired.len(), 2);
-    assert!(retired
-        .iter()
-        .all(|status| { status.barrier == RetiredGcBarrier::PendingRssidRetirement }));
+    assert!(retired.is_empty());
 }
 
 #[test]
@@ -532,11 +528,12 @@ fn test_compaction_large_primary_key_bulk_insert_keeps_query_results_stable() {
 }
 
 #[test]
-fn test_compaction_crash_before_replace_recovers_atomically_with_wal() {
+fn test_compaction_crash_before_replace_restarts_from_persisted_meta() {
     let dir = TempDir::new().unwrap();
     let (tablet, manager) = create_managed_duplicate_tablet(&dir, 202);
 
-    // Persist an initial meta snapshot; later restart should recover latest data from WAL.
+    // Persist an initial meta snapshot; an unpublished staged output must not
+    // become visible after restart.
     tablet.save_meta().unwrap();
 
     append_range(&tablet, 401, 0, 200, 0);
@@ -577,7 +574,7 @@ fn test_compaction_crash_before_replace_recovers_atomically_with_wal() {
     assert_eq!(
         reloaded.num_rowsets(),
         2,
-        "WAL should recover original committed rowsets"
+        "restart should keep original committed rowsets"
     );
 }
 
@@ -674,8 +671,8 @@ fn test_compaction_final_dir_without_publish_record_is_not_recovered_visible() {
         .find_rowset_by_id(request.record.output_rowset_id)
         .is_none());
     assert!(
-        !final_rowset_path.exists(),
-        "startup orphan cleanup should remove final dir without publish record"
+        final_rowset_path.exists(),
+        "journal-tail recovery must preserve canonical rowset artifacts until replay or retention decides ownership"
     );
 }
 
@@ -708,51 +705,6 @@ fn test_duplicate_key_compaction_keeps_output_visible() {
         1,
         "compaction should converge to one rowset"
     );
-}
-
-#[test]
-fn test_compaction_publish_record_replay_recovers_replace_after_restart() {
-    let dir = TempDir::new().unwrap();
-    let (tablet, manager) = create_managed_duplicate_tablet(&dir, 304);
-
-    tablet.save_meta().unwrap();
-    append_range(&tablet, 901, 0, 500, 0);
-    append_range(&tablet, 902, 500, 1_000, 0);
-
-    let before = read_rows(tablet.clone());
-    let plan = CompactionPlanner::plan(&tablet)
-        .unwrap()
-        .expect("duplicate-key compaction plan");
-    let job_id = CompactionJobId(9_002);
-    let workspace = CompactionWorkspace::create(&tablet, job_id, plan.output_rowset_id).unwrap();
-    let output = RowsetMerger::build(&tablet, Arc::new(plan), workspace, compaction_allocator())
-        .unwrap()
-        .expect("staged compaction output");
-    CompactionValidator::validate_artifact(&tablet, &output).unwrap();
-    let request = CompactionPublisher::prepare_request(&tablet, output, job_id).unwrap();
-
-    let staged_rowset_dir = match &request.output {
-        CompactionBuildOutput::Rowset(artifact) => artifact.workspace.rowset_dir.clone(),
-        CompactionBuildOutput::PrimaryKey { .. } => panic!("expected duplicate-key output"),
-    };
-    let final_rowset_path = PathBuf::from(&request.record.output_rowset_path);
-    std::fs::rename(&staged_rowset_dir, &final_rowset_path).unwrap();
-
-    let wal = WriteAheadLog::new(tablet.data_dir().join("tablet.wal")).unwrap();
-    wal.write_compaction_publish(&request.record).unwrap();
-    wal.flush().unwrap();
-
-    drop(tablet);
-
-    let reopened = Arc::new(Tablet::open(304, dir.path(), manager).unwrap());
-    assert_eq!(read_rows(reopened.clone()), before);
-    assert_eq!(reopened.num_rowsets(), 1);
-    assert!(reopened
-        .find_rowset_by_id(request.record.output_rowset_id)
-        .is_some());
-    for input_rowset_id in request.record.replaced_inputs {
-        assert!(reopened.find_rowset_by_id(input_rowset_id).is_none());
-    }
 }
 
 #[tokio::test]

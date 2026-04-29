@@ -42,6 +42,9 @@ impl AbortPipeline {
                 StagedArtifactDescriptor::PropertyGraphBuild { staging, .. } => {
                     Self::path_from_components(&staging.path_components)
                 }
+                StagedArtifactDescriptor::BulkLoadRowset(artifact) => {
+                    Self::path_from_components(&artifact.staging.path_components)
+                }
             };
             if !path.exists() {
                 continue;
@@ -65,7 +68,9 @@ impl AbortPipeline {
 
 impl Session {
     pub(crate) fn rollback_via_pipeline(&mut self, cause: Option<&ParoError>) -> Result<()> {
-        let frozen = self.transaction.freeze()?;
+        let frozen = self
+            .transaction
+            .freeze_for(crate::transaction::session_transaction::FreezeIntent::Rollback)?;
         let pipeline = AbortPipeline::new(
             Arc::clone(self.current_database.transaction_manager()),
             frozen,

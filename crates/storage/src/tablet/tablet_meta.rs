@@ -13,15 +13,78 @@
 //! - Tracks tablet state (RUNNING, SHUTDOWN, etc.)
 
 use super::tablet_schema::{TabletSchema, TabletSchemaRef};
+use super::versioned_rowset_catalog::{
+    RowsetCatalogCheckpointEntry, RowsetCatalogCheckpointSlice, RowsetCatalogFlags,
+};
 use crate::primary_key::RssidMappingEntry;
 use crate::rowset::RowsetMeta;
 use paro_common::error::{self as paro_error, Result};
+use paro_journal::{MutationIdentity, MutationKind};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Unique identifier for a Tablet
 pub type TabletId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsetMaintenanceMeta {
+    pub rowset_id: u64,
+    pub maintenance_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AppliedMutationKind {
+    PublishRowset = 1,
+    ApplyPrimaryDelete = 2,
+    ApplyDeletePatch = 3,
+    PublishCompaction = 4,
+}
+
+impl AppliedMutationKind {
+    fn from_raw(raw: u8) -> Result<Self> {
+        match raw {
+            1 => Ok(Self::PublishRowset),
+            2 => Ok(Self::ApplyPrimaryDelete),
+            3 => Ok(Self::ApplyDeletePatch),
+            4 => Ok(Self::PublishCompaction),
+            _ => Err(paro_error::internal(format!(
+                "TabletMeta: invalid applied mutation kind {raw}"
+            ))),
+        }
+    }
+}
+
+impl From<MutationKind> for AppliedMutationKind {
+    fn from(kind: MutationKind) -> Self {
+        match kind {
+            MutationKind::PublishRowset => Self::PublishRowset,
+            MutationKind::ApplyPrimaryDelete => Self::ApplyPrimaryDelete,
+            MutationKind::ApplyDeletePatch => Self::ApplyDeletePatch,
+            MutationKind::PublishCompaction => Self::PublishCompaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AppliedMutationMeta {
+    pub commit_ts: u64,
+    pub tablet_id: u64,
+    pub mutation_kind: AppliedMutationKind,
+    pub artifact_id: u64,
+}
+
+impl AppliedMutationMeta {
+    pub fn from_journal(identity: MutationIdentity) -> Self {
+        Self {
+            commit_ts: identity.commit_ts,
+            tablet_id: identity.tablet_id,
+            mutation_kind: identity.mutation_kind.into(),
+            artifact_id: identity.artifact_id,
+        }
+    }
+}
 
 /// Tablet state enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -122,10 +185,23 @@ pub struct TabletMeta {
     row_id_format_version: u32,
 
     /// Monotonic epoch covering visible rowset/delete state.
-    rowset_epoch: u64,
+    layout_epoch: u64,
 
     /// Highest journal LSN whose synchronous storage effects are reflected by this snapshot.
     applied_lsn: u64,
+
+    /// Retired rowsets that are no longer latest-live, but are still required
+    /// by retained layout/history cuts or checkpoint replay.
+    retained_rowset_metas: Vec<RowsetMeta>,
+
+    /// Persisted rowset layout catalog slice used to rebuild history before WAL replay.
+    rowset_catalog_slice: Option<RowsetCatalogCheckpointSlice>,
+
+    /// Maintenance publish ids for live and retained rowsets.
+    rowset_maintenance_ids: Vec<RowsetMaintenanceMeta>,
+
+    /// Durable mutation identities already reflected by this tablet snapshot.
+    applied_mutations: Vec<AppliedMutationMeta>,
 }
 
 impl TabletMeta {
@@ -162,8 +238,12 @@ impl TabletMeta {
             data_dir: data_dir.into(),
             rssid_mappings: Vec::new(),
             row_id_format_version: 0,
-            rowset_epoch: 0,
+            layout_epoch: 0,
             applied_lsn: 0,
+            retained_rowset_metas: Vec::new(),
+            rowset_catalog_slice: None,
+            rowset_maintenance_ids: Vec::new(),
+            applied_mutations: Vec::new(),
         })
     }
 
@@ -250,12 +330,28 @@ impl TabletMeta {
         self.row_id_format_version
     }
 
-    pub fn rowset_epoch(&self) -> u64 {
-        self.rowset_epoch
+    pub fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
     }
 
     pub fn applied_lsn(&self) -> u64 {
         self.applied_lsn
+    }
+
+    pub fn retained_rowset_metas(&self) -> &[RowsetMeta] {
+        &self.retained_rowset_metas
+    }
+
+    pub fn rowset_catalog_slice(&self) -> Option<&RowsetCatalogCheckpointSlice> {
+        self.rowset_catalog_slice.as_ref()
+    }
+
+    pub fn rowset_maintenance_ids(&self) -> &[RowsetMaintenanceMeta] {
+        &self.rowset_maintenance_ids
+    }
+
+    pub fn applied_mutations(&self) -> &[AppliedMutationMeta] {
+        &self.applied_mutations
     }
 
     // ==================== Setters ====================
@@ -283,12 +379,39 @@ impl TabletMeta {
         self.row_id_format_version = version;
     }
 
-    pub fn set_rowset_epoch(&mut self, epoch: u64) {
-        self.rowset_epoch = epoch;
+    pub fn set_layout_epoch(&mut self, epoch: u64) {
+        self.layout_epoch = epoch;
     }
 
     pub fn set_applied_lsn(&mut self, lsn: u64) {
         self.applied_lsn = lsn;
+    }
+
+    pub fn set_retained_rowset_metas(&mut self, metas: Vec<RowsetMeta>) {
+        self.retained_rowset_metas = metas;
+    }
+
+    pub fn set_rowset_catalog_slice(&mut self, slice: Option<RowsetCatalogCheckpointSlice>) {
+        self.rowset_catalog_slice = slice;
+    }
+
+    pub fn set_rowset_maintenance_ids(&mut self, mut ids: Vec<RowsetMaintenanceMeta>) {
+        ids.sort_by_key(|entry| entry.rowset_id);
+        ids.dedup_by_key(|entry| entry.rowset_id);
+        self.rowset_maintenance_ids = ids;
+    }
+
+    pub fn set_applied_mutations(&mut self, mut mutations: Vec<AppliedMutationMeta>) {
+        mutations.sort_by_key(|entry| {
+            (
+                entry.commit_ts,
+                entry.tablet_id,
+                entry.mutation_kind as u8,
+                entry.artifact_id,
+            )
+        });
+        mutations.dedup();
+        self.applied_mutations = mutations;
     }
 
     // ==================== Rowset Management ====================
@@ -407,10 +530,74 @@ impl TabletMeta {
         }
 
         data.extend_from_slice(&self.row_id_format_version.to_le_bytes());
-        data.extend_from_slice(&self.rowset_epoch.to_le_bytes());
+        data.extend_from_slice(&self.layout_epoch.to_le_bytes());
         data.extend_from_slice(&self.applied_lsn.to_le_bytes());
 
+        Self::write_rowset_meta_vec(&mut data, &self.retained_rowset_metas)?;
+        Self::write_catalog_slice(&mut data, self.rowset_catalog_slice.as_ref());
+        data.extend_from_slice(&(self.rowset_maintenance_ids.len() as u32).to_le_bytes());
+        for entry in &self.rowset_maintenance_ids {
+            data.extend_from_slice(&entry.rowset_id.to_le_bytes());
+            data.extend_from_slice(&entry.maintenance_id.to_le_bytes());
+        }
+        data.extend_from_slice(&(self.applied_mutations.len() as u32).to_le_bytes());
+        for entry in &self.applied_mutations {
+            data.extend_from_slice(&entry.commit_ts.to_le_bytes());
+            data.extend_from_slice(&entry.tablet_id.to_le_bytes());
+            data.push(entry.mutation_kind as u8);
+            data.extend_from_slice(&entry.artifact_id.to_le_bytes());
+        }
+
         Ok(data)
+    }
+
+    fn write_rowset_meta_vec(data: &mut Vec<u8>, metas: &[RowsetMeta]) -> Result<()> {
+        data.extend_from_slice(&(metas.len() as u32).to_le_bytes());
+        for meta in metas {
+            let meta_bytes = meta.serialize()?;
+            data.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(&meta_bytes);
+        }
+        Ok(())
+    }
+
+    fn write_catalog_slice(data: &mut Vec<u8>, slice: Option<&RowsetCatalogCheckpointSlice>) {
+        let Some(slice) = slice else {
+            data.push(0);
+            return;
+        };
+
+        data.push(1);
+        data.extend_from_slice(&slice.layout_epoch_cut.to_le_bytes());
+        data.extend_from_slice(&slice.latest_published_ts.to_le_bytes());
+        data.extend_from_slice(&(slice.entries.len() as u32).to_le_bytes());
+        for entry in &slice.entries {
+            data.extend_from_slice(&entry.entry_id.to_le_bytes());
+            data.extend_from_slice(&entry.rowset_id.to_le_bytes());
+            data.extend_from_slice(&entry.version.start.to_le_bytes());
+            data.extend_from_slice(&entry.version.end.to_le_bytes());
+            data.extend_from_slice(&entry.installed_at_epoch.to_le_bytes());
+            match entry.retired_at_epoch {
+                Some(epoch) => {
+                    data.push(1);
+                    data.extend_from_slice(&epoch.to_le_bytes());
+                }
+                None => {
+                    data.push(0);
+                    data.extend_from_slice(&0u64.to_le_bytes());
+                }
+            }
+            data.extend_from_slice(&entry.schema_version.to_le_bytes());
+            data.extend_from_slice(&entry.physical_schema_token.to_le_bytes());
+            data.extend_from_slice(&entry.delete_vector_catalog_token.to_le_bytes());
+            data.extend_from_slice(&entry.artifact_id.to_le_bytes());
+            data.extend_from_slice(&entry.flags.bits().to_le_bytes());
+            data.extend_from_slice(&entry.cold_meta_id.to_le_bytes());
+        }
+        data.extend_from_slice(&(slice.delete_vector_epochs.len() as u32).to_le_bytes());
+        for epoch in &slice.delete_vector_epochs {
+            data.extend_from_slice(&epoch.to_le_bytes());
+        }
     }
 
     /// Deserialize TabletMeta from bytes
@@ -541,7 +728,7 @@ impl TabletMeta {
             0
         };
 
-        let rowset_epoch = if offset < data.len() {
+        let layout_epoch = if offset < data.len() {
             read_u64(data, &mut offset)?
         } else {
             0
@@ -551,6 +738,69 @@ impl TabletMeta {
             read_u64(data, &mut offset)?
         } else {
             0
+        };
+
+        let retained_rowset_metas = if offset < data.len() {
+            Self::read_rowset_meta_vec(data, &mut offset)?
+        } else {
+            Vec::new()
+        };
+
+        let rowset_catalog_slice = if offset < data.len() {
+            Self::read_catalog_slice(data, &mut offset)?
+        } else {
+            None
+        };
+
+        let rowset_maintenance_ids = if offset < data.len() {
+            let maintenance_count = read_u32(data, &mut offset)? as usize;
+            let mut ids = Vec::with_capacity(maintenance_count);
+            for _ in 0..maintenance_count {
+                ids.push(RowsetMaintenanceMeta {
+                    rowset_id: read_u64(data, &mut offset)?,
+                    maintenance_id: read_u64(data, &mut offset)?,
+                });
+            }
+            ids.sort_by_key(|entry| entry.rowset_id);
+            ids.dedup_by_key(|entry| entry.rowset_id);
+            ids
+        } else {
+            Vec::new()
+        };
+
+        let applied_mutations = if offset < data.len() {
+            let mutation_count = read_u32(data, &mut offset)? as usize;
+            let mut mutations = Vec::with_capacity(mutation_count);
+            for _ in 0..mutation_count {
+                let commit_ts = read_u64(data, &mut offset)?;
+                let tablet_id = read_u64(data, &mut offset)?;
+                if offset >= data.len() {
+                    return Err(paro_error::internal(
+                        "TabletMeta: truncated applied mutation kind",
+                    ));
+                }
+                let mutation_kind = AppliedMutationKind::from_raw(data[offset])?;
+                offset += 1;
+                let artifact_id = read_u64(data, &mut offset)?;
+                mutations.push(AppliedMutationMeta {
+                    commit_ts,
+                    tablet_id,
+                    mutation_kind,
+                    artifact_id,
+                });
+            }
+            mutations.sort_by_key(|entry| {
+                (
+                    entry.commit_ts,
+                    entry.tablet_id,
+                    entry.mutation_kind as u8,
+                    entry.artifact_id,
+                )
+            });
+            mutations.dedup();
+            mutations
+        } else {
+            Vec::new()
         };
 
         Ok(Self {
@@ -569,9 +819,125 @@ impl TabletMeta {
             data_dir,
             rssid_mappings,
             row_id_format_version,
-            rowset_epoch,
+            layout_epoch,
             applied_lsn,
+            retained_rowset_metas,
+            rowset_catalog_slice,
+            rowset_maintenance_ids,
+            applied_mutations,
         })
+    }
+
+    fn read_rowset_meta_vec(data: &[u8], offset: &mut usize) -> Result<Vec<RowsetMeta>> {
+        let read_u32 = |data: &[u8], offset: &mut usize| -> Result<u32> {
+            if *offset + 4 > data.len() {
+                return Err(paro_error::internal("TabletMeta: truncated data"));
+            }
+            let val = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+            *offset += 4;
+            Ok(val)
+        };
+
+        let count = read_u32(data, offset)? as usize;
+        let mut metas = Vec::with_capacity(count);
+        for _ in 0..count {
+            let meta_len = read_u32(data, offset)? as usize;
+            if *offset + meta_len > data.len() {
+                return Err(paro_error::internal(
+                    "TabletMeta: truncated retained rowset meta",
+                ));
+            }
+            metas.push(RowsetMeta::deserialize(&data[*offset..*offset + meta_len])?);
+            *offset += meta_len;
+        }
+        Ok(metas)
+    }
+
+    fn read_catalog_slice(
+        data: &[u8],
+        offset: &mut usize,
+    ) -> Result<Option<RowsetCatalogCheckpointSlice>> {
+        let read_u64 = |data: &[u8], offset: &mut usize| -> Result<u64> {
+            if *offset + 8 > data.len() {
+                return Err(paro_error::internal("TabletMeta: truncated data"));
+            }
+            let val = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+            *offset += 8;
+            Ok(val)
+        };
+        let read_i64 = |data: &[u8], offset: &mut usize| -> Result<i64> {
+            if *offset + 8 > data.len() {
+                return Err(paro_error::internal("TabletMeta: truncated data"));
+            }
+            let val = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+            *offset += 8;
+            Ok(val)
+        };
+        let read_u32 = |data: &[u8], offset: &mut usize| -> Result<u32> {
+            if *offset + 4 > data.len() {
+                return Err(paro_error::internal("TabletMeta: truncated data"));
+            }
+            let val = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+            *offset += 4;
+            Ok(val)
+        };
+        let read_u8 = |data: &[u8], offset: &mut usize| -> Result<u8> {
+            if *offset >= data.len() {
+                return Err(paro_error::internal("TabletMeta: truncated data"));
+            }
+            let val = data[*offset];
+            *offset += 1;
+            Ok(val)
+        };
+
+        if read_u8(data, offset)? == 0 {
+            return Ok(None);
+        }
+
+        let layout_epoch_cut = read_u64(data, offset)?;
+        let latest_published_ts = read_i64(data, offset)?;
+        let entry_count = read_u32(data, offset)? as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let entry_id = read_u32(data, offset)?;
+            let rowset_id = read_u64(data, offset)?;
+            let version_start = read_i64(data, offset)?;
+            let version_end = read_i64(data, offset)?;
+            let installed_at_epoch = read_u64(data, offset)?;
+            let retired_present = read_u8(data, offset)? != 0;
+            let retired_epoch = read_u64(data, offset)?;
+            let schema_version = read_u32(data, offset)?;
+            let physical_schema_token = read_u64(data, offset)?;
+            let delete_vector_catalog_token = read_u64(data, offset)?;
+            let artifact_id = read_u64(data, offset)?;
+            let flags = RowsetCatalogFlags::from_bits(read_u32(data, offset)?);
+            let cold_meta_id = read_u32(data, offset)?;
+            entries.push(RowsetCatalogCheckpointEntry {
+                entry_id,
+                rowset_id,
+                version: super::Version::new(version_start, version_end),
+                installed_at_epoch,
+                retired_at_epoch: retired_present.then_some(retired_epoch),
+                schema_version,
+                physical_schema_token,
+                delete_vector_catalog_token,
+                artifact_id,
+                flags,
+                cold_meta_id,
+            });
+        }
+        let delete_vector_epoch_count = read_u32(data, offset)? as usize;
+        let mut delete_vector_epochs = Vec::with_capacity(delete_vector_epoch_count);
+        for _ in 0..delete_vector_epoch_count {
+            delete_vector_epochs.push(read_u64(data, offset)?);
+        }
+
+        Ok(Some(RowsetCatalogCheckpointSlice {
+            layout_epoch_cut,
+            latest_published_ts,
+            entries,
+            delete_vector_epochs,
+        }))
     }
 }
 
@@ -642,8 +1008,37 @@ mod tests {
             segment_id: 0,
         }]);
         meta.set_row_id_format_version(1);
-        meta.set_rowset_epoch(9);
+        meta.set_layout_epoch(9);
         meta.set_applied_lsn(77);
+        meta.set_retained_rowset_metas(vec![RowsetMeta::new(9, 1, Version::singleton(0))]);
+        meta.set_rowset_catalog_slice(Some(RowsetCatalogCheckpointSlice {
+            layout_epoch_cut: 9,
+            latest_published_ts: 5,
+            entries: vec![RowsetCatalogCheckpointEntry {
+                entry_id: 0,
+                rowset_id: 1,
+                version: Version::singleton(0),
+                installed_at_epoch: 1,
+                retired_at_epoch: None,
+                schema_version: 1,
+                physical_schema_token: 11,
+                delete_vector_catalog_token: 0,
+                artifact_id: 1,
+                flags: RowsetCatalogFlags::empty(),
+                cold_meta_id: 0,
+            }],
+            delete_vector_epochs: vec![8],
+        }));
+        meta.set_rowset_maintenance_ids(vec![RowsetMaintenanceMeta {
+            rowset_id: 1,
+            maintenance_id: 3,
+        }]);
+        meta.set_applied_mutations(vec![AppliedMutationMeta {
+            commit_ts: 5,
+            tablet_id: 1,
+            mutation_kind: AppliedMutationKind::ApplyDeletePatch,
+            artifact_id: 99,
+        }]);
 
         let bytes = meta.serialize().unwrap();
         let restored = TabletMeta::deserialize(&bytes).unwrap();
@@ -661,8 +1056,31 @@ mod tests {
             }]
         );
         assert_eq!(restored.row_id_format_version(), 1);
-        assert_eq!(restored.rowset_epoch(), 9);
+        assert_eq!(restored.layout_epoch(), 9);
         assert_eq!(restored.applied_lsn(), 77);
+        assert_eq!(restored.retained_rowset_metas().len(), 1);
+        let slice = restored.rowset_catalog_slice().unwrap();
+        assert_eq!(slice.layout_epoch_cut, 9);
+        assert_eq!(slice.latest_published_ts, 5);
+        assert_eq!(slice.entries.len(), 1);
+        assert_eq!(slice.entries[0].rowset_id, 1);
+        assert_eq!(slice.delete_vector_epochs, vec![8]);
+        assert_eq!(
+            restored.rowset_maintenance_ids(),
+            &[RowsetMaintenanceMeta {
+                rowset_id: 1,
+                maintenance_id: 3,
+            }]
+        );
+        assert_eq!(
+            restored.applied_mutations(),
+            &[AppliedMutationMeta {
+                commit_ts: 5,
+                tablet_id: 1,
+                mutation_kind: AppliedMutationKind::ApplyDeletePatch,
+                artifact_id: 99,
+            }]
+        );
         assert!(restored.schema().is_some());
     }
 

@@ -19,7 +19,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_planner::expression::Expression;
 use paro_storage::index::graph::{GraphProjectionIndex, GraphReadSnapshot};
-use paro_storage::tablet::TabletReaderParams;
+use paro_transaction::TableId;
 
 use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
@@ -29,6 +29,7 @@ use crate::operator_type::PhysicalOperatorType;
 use crate::result_type::SourceResultType;
 
 use super::graph_cardinality::estimate_scan_cardinality;
+use super::own_write::open_overlay_table_reader;
 
 /// Physical graph scan operator.
 ///
@@ -134,7 +135,7 @@ impl PhysicalGraphScan {
 
         let catalog = ctx.catalog();
         let txn = ctx.catalog_txn_view();
-        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let txn_view = ctx.transaction_view();
 
         // Get the vertex table from catalog
         let table_entry =
@@ -154,16 +155,15 @@ impl PhysicalGraphScan {
                 self.vertex_info.table_name
             ))
         })?;
+        txn_view
+            .read_tracker()
+            .record_table_read(TableId::new(storage.table_id()));
 
         // Extract column IDs referenced by the filter for column pruning.
         let filter_col_ids = extract_column_ids(filter);
 
         // Build scan params: read only filter-relevant columns + rowid
-        let params = TabletReaderParams::with_version(visible_version)
-            .with_columns(filter_col_ids.clone())
-            .with_emit_row_id(true);
-        let mut reader = storage.create_reader(params)?;
-        reader.prepare()?;
+        let reader = open_overlay_table_reader(storage, txn_view, filter_col_ids.clone(), true)?;
 
         // Build the filter expression for evaluation.
         // The filter uses ColumnRefExpression with (table_index, column_index)
@@ -239,6 +239,12 @@ impl PhysicalOperator for PhysicalGraphScan {
                     self.graph_name
                 ))
             })?;
+        let derived_lag_lease = ctx
+            .session
+            .txn
+            .lease_derived_lag_if_needed(snapshot.indexed_through_ts())?;
+        let snapshot = snapshot.with_derived_lag_lease(derived_lag_lease);
+        snapshot.ensure_covers_read_ts(ctx.session.txn.transaction.visible_version())?;
 
         let num_vertices = snapshot
             .base()

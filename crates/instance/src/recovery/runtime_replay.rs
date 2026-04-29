@@ -96,7 +96,6 @@ impl<'a> CatalogReplayHandler<'a> {
     ) -> paro_common::error::Result<()> {
         match transition {
             RuntimeTransitionDescriptor::RegisterGraphRuntime { graph } => {
-                let _ = commit_id;
                 let Some(graph_registry) = self.graph_registry.as_ref() else {
                     return Ok(());
                 };
@@ -107,7 +106,11 @@ impl<'a> CatalogReplayHandler<'a> {
                 })?;
                 let graph_dir = self.database_root.join("graph").join(&graph.name);
                 let index = GraphProjectionIndex::load(&graph_dir)?;
-                let manifest = GraphProjectionIndex::load_manifest(&graph_dir)?;
+                let mut manifest = GraphProjectionIndex::load_manifest(&graph_dir)?;
+                if manifest.indexed_through_ts() < commit_id {
+                    manifest = manifest.with_indexed_through_ts(commit_id);
+                    GraphProjectionIndex::write_manifest(&graph_dir, &manifest)?;
+                }
                 let runtime_key =
                     GraphId::new(&graph.database, schema_name, &graph.name).runtime_key();
                 graph_registry.register_generation(

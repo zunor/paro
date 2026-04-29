@@ -30,6 +30,7 @@ use paro_storage::index::PredicateTree;
 #[cfg(test)]
 use paro_storage::search::{ResourceBudget, SearchBatchConfig, SearchBatchState};
 use paro_storage::table::table_handle::TableHandle;
+use paro_transaction::TableId;
 
 const SIMPLE_CONFIG: &str = "simple";
 const MIN_TOKEN_LEN: usize = 1;
@@ -278,26 +279,35 @@ impl PhysicalOperator for PhysicalFullTextScan {
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
         ctx.check_cancelled()?;
-        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let txn_view = ctx.transaction_view();
+        txn_view
+            .read_tracker()
+            .record_table_read(TableId::new(self.bind_data.table_data.table_id()));
         let parsed_query = self.parse_query()?;
         let opened = match self.bind_data.mode {
-            FullTextExecMode::Filter => self.bind_data.table_data.open_fulltext_filter_cursor(
-                self.bind_data.text_column_id,
-                &parsed_query,
-                &self.bind_data.config,
-                self.bind_data.predicates.clone(),
-                visible_version,
-            )?,
-            FullTextExecMode::ScoreTopK => self.bind_data.table_data.open_fulltext_search_cursor(
-                self.bind_data.text_column_id,
-                &parsed_query,
-                self.bind_data.k,
-                &self.bind_data.config,
-                self.bind_data.predicates.clone(),
-                self.collect_global_stats(),
-                self.bind_data.score_mode,
-                visible_version,
-            )?,
+            FullTextExecMode::Filter => self
+                .bind_data
+                .table_data
+                .open_fulltext_filter_cursor_for_view(
+                    self.bind_data.text_column_id,
+                    &parsed_query,
+                    &self.bind_data.config,
+                    self.bind_data.predicates.clone(),
+                    txn_view,
+                )?,
+            FullTextExecMode::ScoreTopK => self
+                .bind_data
+                .table_data
+                .open_fulltext_search_cursor_for_view(
+                    self.bind_data.text_column_id,
+                    &parsed_query,
+                    self.bind_data.k,
+                    &self.bind_data.config,
+                    self.bind_data.predicates.clone(),
+                    self.collect_global_stats(),
+                    self.bind_data.score_mode,
+                    txn_view,
+                )?,
         };
         let row_limit_hint = match self.bind_data.mode {
             FullTextExecMode::Filter => 1024,
@@ -346,15 +356,24 @@ impl PhysicalOperator for PhysicalFullTextScan {
 
 #[cfg(test)]
 mod tests {
-    use super::{FullTextExecMode, FullTextScanBindData, PhysicalFullTextScan};
+    use super::{FullTextExecMode, FullTextScanBindData, PhysicalFullTextScan, SIMPLE_CONFIG};
     use crate::operator::PhysicalOperator;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
 
     use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
-    use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
+    use paro_storage::search::{
+        OpenedSearchCursor, ResourceBudget, SearchBatchConfig, SearchBatchState,
+        SearchIndexDefinition, SearchIndexKind,
+    };
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
+    use paro_storage::tablet::TabletReaderParams;
+    use paro_storage::transaction::txn::Transaction;
+    use paro_transaction::{
+        CommandId, IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTrackerHandle, ReadTs,
+        TransactionView,
+    };
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -460,6 +479,102 @@ mod tests {
         table
     }
 
+    fn transaction_start_after_table(table: &TableHandle) -> u64 {
+        u64::try_from(table.max_version())
+            .expect("table version as u64")
+            .saturating_add(1)
+    }
+
+    fn view_for_command(txn: &Transaction, command_id: u32) -> TransactionView {
+        TransactionView::new(
+            txn.writer_id(),
+            txn.read_ts(),
+            ReadSnapshot::without_lease(ReadTs::new(txn.visible_commit_ts().into_raw())),
+            IsolationLevel::Snapshot,
+            CommandId::new(command_id),
+            ReadTrackerHandle::noop(),
+            ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]),
+        )
+    }
+
+    fn drain_opened_chunks(
+        table: &TableHandle,
+        opened: OpenedSearchCursor,
+        projected_columns: &[usize],
+        emit_score: bool,
+        row_limit: usize,
+    ) -> Vec<Chunk> {
+        let batch_config = SearchBatchConfig {
+            row_limit: row_limit.max(1),
+            preferred_bytes: 1 << 20,
+        };
+        let mut budget = ResourceBudget {
+            memory_limit_bytes: 64 * 1024 * 1024,
+            heap_budget_items: row_limit.max(1024),
+            parallelism_slots: 4,
+            cpu_step_budget: None,
+            context: None,
+        };
+        let snapshot = opened.snapshot;
+        let mut cursor = opened.cursor;
+        let mut chunks = Vec::new();
+        loop {
+            match cursor
+                .next_batch(&batch_config, &mut budget)
+                .expect("search batch")
+            {
+                SearchBatchState::Ready(batch) if batch.is_empty() => continue,
+                SearchBatchState::Ready(batch) => chunks.push(
+                    table
+                        .materialize_search_batch(&snapshot, batch, projected_columns, emit_score)
+                        .expect("materialize search batch"),
+                ),
+                SearchBatchState::Exhausted => return chunks,
+            }
+        }
+    }
+
+    fn append_pending_fulltext_row(
+        table: &Arc<TableHandle>,
+        txn: &Arc<Transaction>,
+        id: i32,
+        text: &str,
+    ) {
+        let allocator = paro_common::test_utils::test_allocator();
+        let chunk = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(&[id], allocator.clone()),
+                paro_common::test_utils::test_string_vector_with_allocator(&[text], allocator),
+            ],
+            paro_common::test_utils::test_allocator(),
+        );
+        table
+            .append_with_transaction(&view_for_command(txn, 0), &chunk, txn.clone())
+            .expect("append pending row");
+        txn.publish_command_boundary(CommandId::new(1));
+    }
+
+    fn row_id_for_id(table: &TableHandle, id: i32) -> u64 {
+        let mut reader = table
+            .create_reader(
+                TabletReaderParams::with_version(table.max_version()).with_emit_row_id(true),
+            )
+            .expect("create reader");
+        reader.prepare().expect("prepare reader");
+        while let Some(chunk) = reader.get_next_chunk().expect("read chunk") {
+            let id_col = chunk.column(0).expect("id column");
+            let row_id_col = chunk
+                .column(chunk.column_count() - 1)
+                .expect("row id column");
+            for row in 0..chunk.size() {
+                if id_col.get_i32(row).is_some_and(|value| value == id) {
+                    return row_id_col.get_i64(row).expect("row id as i64") as u64;
+                }
+            }
+        }
+        panic!("row id for id {id} not found");
+    }
+
     #[test]
     fn filter_mode_matches_score_topk_hit_set_and_ignores_k() {
         let table = setup_fulltext_table();
@@ -545,5 +660,66 @@ mod tests {
         assert_eq!(stats.total_docs, 0);
         assert_eq!(stats.total_terms, 0);
         assert_eq!(stats.avg_doc_length, 0.0);
+    }
+
+    #[test]
+    fn fulltext_filter_merges_pending_rowset_for_own_write_visibility() {
+        let table = setup_fulltext_table();
+        let txn = Arc::new(Transaction::new(
+            77_001,
+            transaction_start_after_table(&table),
+        ));
+        append_pending_fulltext_row(&table, &txn, 6, "vector database pending");
+
+        let scan = PhysicalFullTextScan::new(
+            FullTextScanBindData::new(table.clone(), "pending".to_string(), 10, 1, vec![0])
+                .with_exec_mode(FullTextExecMode::Filter),
+        );
+        let parsed_query = scan.parse_query().expect("parse query");
+        let opened = table
+            .open_fulltext_filter_cursor_for_view(
+                1,
+                &parsed_query,
+                SIMPLE_CONFIG,
+                None,
+                &view_for_command(&txn, 1),
+            )
+            .expect("open fulltext cursor with overlay");
+        let ids = collect_ids(&drain_opened_chunks(&table, opened, &[0], false, 1024));
+        assert_eq!(ids, vec![6]);
+    }
+
+    #[test]
+    fn fulltext_filter_applies_pending_delete_mask_to_committed_generation() {
+        let table = setup_fulltext_table();
+        let txn = Arc::new(Transaction::new(
+            77_002,
+            transaction_start_after_table(&table),
+        ));
+        let row_id = row_id_for_id(&table, 1);
+        table
+            .delete(&view_for_command(&txn, 0), &[row_id], txn.clone())
+            .expect("stage pending delete");
+        txn.publish_command_boundary(CommandId::new(1));
+
+        let scan = PhysicalFullTextScan::new(
+            FullTextScanBindData::new(table.clone(), "vector database".to_string(), 10, 1, vec![0])
+                .with_exec_mode(FullTextExecMode::Filter),
+        );
+        let parsed_query = scan.parse_query().expect("parse query");
+        let opened = table
+            .open_fulltext_filter_cursor_for_view(
+                1,
+                &parsed_query,
+                SIMPLE_CONFIG,
+                None,
+                &view_for_command(&txn, 1),
+            )
+            .expect("open fulltext cursor with overlay delete");
+        let ids: BTreeSet<i32> =
+            collect_ids(&drain_opened_chunks(&table, opened, &[0], false, 1024))
+                .into_iter()
+                .collect();
+        assert_eq!(ids, BTreeSet::from([2, 3]));
     }
 }

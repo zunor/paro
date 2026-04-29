@@ -26,6 +26,7 @@ pub(crate) struct GenerationManifestRoot {
     pub generation_id: SearchGenerationId,
     pub build_epoch: BuildEpoch,
     pub build_snapshot_version: i64,
+    pub indexed_through_ts: u64,
     pub config_fingerprint: u64,
     pub coverage: CoverageState,
     pub generation_stats: GenerationStats,

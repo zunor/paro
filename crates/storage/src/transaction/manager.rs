@@ -4,37 +4,27 @@
 //! Transaction manager state and cleanup orchestration.
 
 use crate::transaction::txn::Transaction;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
+use paro_transaction::{
+    ActiveTxnRegistry, CommitFenceRejectReason, CommitPlan, CommitSequencingPlan, CommitTs,
+    CommittedTxnSummary, CommittedTxnSummaryIndex, ConflictWrite, DatabaseId, FrozenReadSet,
+    IsolationLevel, LockNamespace, LockResource, ReadDependencyIndex, ReadTrackerHandle,
+    ReadTrackingPolicy, ReadTs, RetentionLeaseKind, RetentionRegistry, ShardedLockManager,
+    SsiValidationOutcome, SsiValidator, TxnId, WriteConflictIndex,
+};
+pub use paro_transaction::{MAX_TRANSACTION_ID, TRANSACTION_ID_START};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-/// Starting value for transaction IDs (high value to distinguish from timestamps).
-///
-/// ```cpp
-/// current_transaction_id = TRANSACTION_ID_START;
-/// ```
-pub const TRANSACTION_ID_START: u64 = 4611686018427387904; // 2^62
-
-/// Maximum transaction ID (used as sentinel for "no transaction").
-///
-/// ```cpp
-/// lowest_active_start = MAX_TRANSACTION_ID;
-/// ```
-pub const MAX_TRANSACTION_ID: u64 = u64::MAX;
+const RECOVERY_ADMISSION_OPEN: u8 = 0;
+const RECOVERY_ADMISSION_BLOCKED: u8 = 1;
 
 /// Collects transactions awaiting cleanup.
 ///
 /// This ensures we can clean up after releasing the transaction lock.
 /// All transactions in a cleanup info share the same `lowest_start_time`.
-///
-/// ```cpp
-/// struct DuckCleanupInfo {
-///     transaction_t lowest_start_time;
-///     void Cleanup() noexcept;
-///     bool ScheduleCleanup() noexcept;
-/// };
-/// ```
 pub struct CleanupInfo {
     /// All transactions in this cleanup info share the same lowest_start_time.
     /// This is the minimum start_time among remaining active transactions
@@ -64,16 +54,6 @@ impl CleanupInfo {
     }
 
     /// Perform cleanup on all transactions in this info.
-    ///
-    /// ```cpp
-    /// void DuckCleanupInfo::Cleanup() noexcept {
-    ///     for (auto &transaction : transactions) {
-    ///         if (transaction->awaiting_cleanup) {
-    ///             transaction->Cleanup(lowest_start_time);
-    ///         }
-    ///     }
-    /// }
-    /// ```
     pub fn cleanup(&self) {
         for transaction in &self.transactions {
             if transaction.is_awaiting_cleanup() {
@@ -83,12 +63,6 @@ impl CleanupInfo {
     }
 
     /// Check if there are transactions to clean up.
-    ///
-    /// ```cpp
-    /// bool DuckCleanupInfo::ScheduleCleanup() noexcept {
-    ///     return !transactions.empty();
-    /// }
-    /// ```
     #[inline]
     pub fn should_schedule(&self) -> bool {
         !self.transactions.is_empty()
@@ -100,40 +74,91 @@ impl CleanupInfo {
     }
 }
 
+/// Point-in-time registry metrics exposed by the transaction manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionManagerMetricsSnapshot {
+    pub txn_begin_count: u64,
+    pub txn_begin_latency_us_total: u64,
+    pub txn_begin_latency_us_peak: u64,
+    pub txn_commit_count: u64,
+    pub txn_commit_latency_us_total: u64,
+    pub txn_commit_latency_us_peak: u64,
+    pub txn_commit_prepare_latency_us_total: u64,
+    pub txn_commit_prepare_latency_us_peak: u64,
+    pub txn_commit_validate_latency_us_total: u64,
+    pub txn_commit_validate_latency_us_peak: u64,
+    pub txn_commit_durable_latency_us_total: u64,
+    pub txn_commit_durable_latency_us_peak: u64,
+    pub txn_commit_required_publish_wait_us_total: u64,
+    pub txn_commit_required_publish_wait_us_peak: u64,
+    pub txn_commit_publish_latency_us_total: u64,
+    pub txn_commit_publish_latency_us_peak: u64,
+    pub txn_commit_ack_mode_last: u64,
+    pub write_conflict_index_size: u64,
+    pub write_conflict_index_fine_entries: u64,
+    pub write_conflict_index_fine_summary_entries: u64,
+    pub write_conflict_index_coarse_entries: u64,
+    pub lock_wait_count: u64,
+    pub lock_wait_duration_us: u64,
+    pub lock_wound_wait_abort_count: u64,
+    pub lock_deadlock_abort_count: u64,
+    pub read_snapshot_lease_count: u64,
+    pub active_txn_count: u64,
+    pub active_rw_txn_count: u64,
+    pub oldest_active_rw_lag_ms: u64,
+    pub retention_watermark_lag_ms: u64,
+    pub active_registry_epoch: u64,
+    pub retention_registry_epoch: u64,
+    pub ssi_validation_abort_count: u64,
+    pub ssi_abort_due_to_exact_dependency: u64,
+    pub ssi_abort_due_to_coarse_scan_marker: u64,
+    pub read_tracker_record_count: u64,
+    pub read_tracker_coarsened_count: u64,
+    pub read_tracking_hint_count: u64,
+    pub read_tracking_policy_escalation_count: u64,
+    pub read_tracking_point_critical_count: u64,
+    pub read_tracking_range_critical_count: u64,
+    pub read_tracking_analytical_scan_count: u64,
+    pub read_tracking_safe_snapshot_preferred_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionLatencyStage {
+    CommitTotal,
+    CommitPrepare,
+    CommitValidate,
+    CommitDurable,
+    CommitRequiredPublishWait,
+    CommitPublish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAdmissionState {
+    Open,
+    Blocked,
+}
+
+impl RecoveryAdmissionState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            RECOVERY_ADMISSION_BLOCKED => Self::Blocked,
+            _ => Self::Open,
+        }
+    }
+}
+
 /// Manages transactions within the database.
-///
-/// ```cpp
-///     transaction_t next_commit_id;
-///     transaction_t current_transaction_id;
-///     atomic<transaction_t> lowest_active_id;
-///     atomic<transaction_t> lowest_active_start;
-///     atomic<transaction_t> last_commit;
-/// };
-/// ```
 #[derive(Debug)]
 pub struct TransactionManager {
     /// The next commit version to allocate inside the commit barrier.
     next_commit_id: AtomicU64,
 
+    /// Serializes provisional commit id use across durable append boundaries.
+    commit_id_sequence_lock: Mutex<()>,
+
     /// The current transaction ID for new transactions.
     /// Starts at TRANSACTION_ID_START (very high) to distinguish from timestamps.
     current_transaction_id: AtomicU64,
-
-    /// The lowest active transaction ID among all active transactions.
-    /// Used for determining which transactions can see which data.
-    ///
-    /// ```cpp
-    /// atomic<transaction_t> lowest_active_id;
-    /// ```
-    lowest_active_id: AtomicU64,
-
-    /// The lowest active start timestamp among all active transactions.
-    /// Used for garbage collection decisions.
-    ///
-    /// ```cpp
-    /// atomic<transaction_t> lowest_active_start;
-    /// ```
-    lowest_active_start: AtomicU64,
 
     /// Highest durable commit timestamp observed by the runtime.
     durable_commit_id: AtomicU64,
@@ -141,60 +166,133 @@ pub struct TransactionManager {
     /// Highest published commit timestamp visible to new transactions.
     published_commit_id: AtomicU64,
 
-    /// List of active transactions.
-    active_transactions: RwLock<Vec<Arc<Transaction>>>,
+    /// Wakes sessions waiting for an async commit floor to become visible.
+    published_commit_wait_lock: Mutex<()>,
+    published_commit_changed: Condvar,
+
+    /// Sharded active transaction registry for hot lifecycle paths.
+    active_registry: ActiveTxnRegistry,
+
+    /// Typed retention lease registry for cross-subsystem GC pins.
+    retention_registry: RetentionRegistry,
+
+    /// Database-scoped pessimistic lock manager for transactional writes.
+    lock_manager: Arc<ShardedLockManager>,
+
+    /// Durable write set index used by SI/SSI conflict checks.
+    write_conflict_index: WriteConflictIndex,
+
+    /// Serializable read dependency storage for active read-write transactions.
+    read_dependency_index: Arc<ReadDependencyIndex>,
+
+    /// Committed transaction summaries retained for SSI validation.
+    committed_txn_summaries: CommittedTxnSummaryIndex,
+
+    /// Namespace used for database-scoped table/object lock resources.
+    lock_namespace: LockNamespace,
+
+    /// Startup recovery gate. While blocked, runtime cannot admit new txns.
+    recovery_admission: AtomicU8,
+
+    /// Serializable abort counters split by exact vs analytical coarse marker.
+    ssi_abort_due_to_exact_dependency: AtomicU64,
+    ssi_abort_due_to_coarse_scan_marker: AtomicU64,
+
+    /// Statement-level read tracking policy selection counters.
+    read_tracking_hint_count: AtomicU64,
+    read_tracking_policy_escalation_count: AtomicU64,
+    read_tracking_point_critical_count: AtomicU64,
+    read_tracking_range_critical_count: AtomicU64,
+    read_tracking_analytical_scan_count: AtomicU64,
+    read_tracking_safe_snapshot_preferred_count: AtomicU64,
+
+    /// Lightweight transaction latency counters exposed through system metrics.
+    txn_begin_count: AtomicU64,
+    txn_begin_latency_us_total: AtomicU64,
+    txn_begin_latency_us_peak: AtomicU64,
+    txn_commit_count: AtomicU64,
+    txn_commit_latency_us_total: AtomicU64,
+    txn_commit_latency_us_peak: AtomicU64,
+    txn_commit_prepare_latency_us_total: AtomicU64,
+    txn_commit_prepare_latency_us_peak: AtomicU64,
+    txn_commit_validate_latency_us_total: AtomicU64,
+    txn_commit_validate_latency_us_peak: AtomicU64,
+    txn_commit_durable_latency_us_total: AtomicU64,
+    txn_commit_durable_latency_us_peak: AtomicU64,
+    txn_commit_required_publish_wait_us_total: AtomicU64,
+    txn_commit_required_publish_wait_us_peak: AtomicU64,
+    txn_commit_publish_latency_us_total: AtomicU64,
+    txn_commit_publish_latency_us_peak: AtomicU64,
+    txn_commit_ack_mode_last: AtomicU64,
 
     /// List of recently committed transactions, pending cleanup.
     /// Transactions are moved here after commit and removed during GC.
     recently_committed_transactions: RwLock<Vec<Arc<Transaction>>>,
 
     /// Lock for cleanup operations. Only one cleanup can be active at any time.
-    ///
-    /// ```cpp
-    /// mutex cleanup_lock;
-    /// ```
     cleanup_lock: Mutex<()>,
 
     /// Lock for cleanup queue modifications.
-    ///
-    /// ```cpp
-    /// mutex cleanup_queue_lock;
-    /// ```
     cleanup_queue_lock: Mutex<()>,
 
     /// Queue of cleanup infos. Cleanups must happen in-order.
-    ///
-    /// E.g., if one transaction drops a table, and another creates a table,
-    /// inverting the cleanup order can result in catalog errors.
-    ///
-    /// ```cpp
-    /// queue<unique_ptr<DuckCleanupInfo>> cleanup_queue;
-    /// ```
     cleanup_queue: Mutex<VecDeque<CleanupInfo>>,
 }
 
 impl TransactionManager {
     /// Create a new transaction manager.
-    ///
-    /// ```cpp
-    ///     next_commit_id = 1;
-    ///     current_transaction_id = TRANSACTION_ID_START;
-    ///     lowest_active_id = TRANSACTION_ID_START;
-    ///     lowest_active_start = MAX_TRANSACTION_ID;
-    /// }
-    /// ```
     pub fn new() -> Self {
+        Self::new_for_database(DatabaseId::new(0))
+    }
+
+    pub fn new_for_database_id(database_id: u64) -> Self {
+        Self::new_for_database(DatabaseId::new(database_id))
+    }
+
+    pub fn new_for_database(database_id: DatabaseId) -> Self {
+        let lock_namespace = LockNamespace::single_tenant(database_id);
         Self {
             next_commit_id: AtomicU64::new(1),
+            commit_id_sequence_lock: Mutex::new(()),
             // Transaction ID starts very high to distinguish from timestamps
             current_transaction_id: AtomicU64::new(TRANSACTION_ID_START),
-            // Initially no active transactions
-            lowest_active_id: AtomicU64::new(TRANSACTION_ID_START),
-            // MAX means no active transactions
-            lowest_active_start: AtomicU64::new(MAX_TRANSACTION_ID),
             durable_commit_id: AtomicU64::new(0),
             published_commit_id: AtomicU64::new(0),
-            active_transactions: RwLock::new(Vec::new()),
+            published_commit_wait_lock: Mutex::new(()),
+            published_commit_changed: Condvar::new(),
+            active_registry: ActiveTxnRegistry::default(),
+            retention_registry: RetentionRegistry::default(),
+            lock_manager: Arc::new(ShardedLockManager::default()),
+            write_conflict_index: WriteConflictIndex::default(),
+            read_dependency_index: Arc::new(ReadDependencyIndex::default()),
+            committed_txn_summaries: CommittedTxnSummaryIndex::default(),
+            lock_namespace,
+            recovery_admission: AtomicU8::new(RECOVERY_ADMISSION_OPEN),
+            ssi_abort_due_to_exact_dependency: AtomicU64::new(0),
+            ssi_abort_due_to_coarse_scan_marker: AtomicU64::new(0),
+            read_tracking_hint_count: AtomicU64::new(0),
+            read_tracking_policy_escalation_count: AtomicU64::new(0),
+            read_tracking_point_critical_count: AtomicU64::new(0),
+            read_tracking_range_critical_count: AtomicU64::new(0),
+            read_tracking_analytical_scan_count: AtomicU64::new(0),
+            read_tracking_safe_snapshot_preferred_count: AtomicU64::new(0),
+            txn_begin_count: AtomicU64::new(0),
+            txn_begin_latency_us_total: AtomicU64::new(0),
+            txn_begin_latency_us_peak: AtomicU64::new(0),
+            txn_commit_count: AtomicU64::new(0),
+            txn_commit_latency_us_total: AtomicU64::new(0),
+            txn_commit_latency_us_peak: AtomicU64::new(0),
+            txn_commit_prepare_latency_us_total: AtomicU64::new(0),
+            txn_commit_prepare_latency_us_peak: AtomicU64::new(0),
+            txn_commit_validate_latency_us_total: AtomicU64::new(0),
+            txn_commit_validate_latency_us_peak: AtomicU64::new(0),
+            txn_commit_durable_latency_us_total: AtomicU64::new(0),
+            txn_commit_durable_latency_us_peak: AtomicU64::new(0),
+            txn_commit_required_publish_wait_us_total: AtomicU64::new(0),
+            txn_commit_required_publish_wait_us_peak: AtomicU64::new(0),
+            txn_commit_publish_latency_us_total: AtomicU64::new(0),
+            txn_commit_publish_latency_us_peak: AtomicU64::new(0),
+            txn_commit_ack_mode_last: AtomicU64::new(0),
             recently_committed_transactions: RwLock::new(Vec::new()),
             cleanup_lock: Mutex::new(()),
             cleanup_queue_lock: Mutex::new(()),
@@ -202,65 +300,152 @@ impl TransactionManager {
         }
     }
 
+    #[inline]
+    pub const fn database_id(&self) -> DatabaseId {
+        self.lock_namespace.database_id
+    }
+
     /// Begin a new transaction.
     ///
-    /// ```cpp
-    ///     transaction_t start_time = last_commit + 1;
-    ///     transaction_t transaction_id = current_transaction_id++;
-    ///     if (active_transactions.empty()) {
-    ///         lowest_active_start = start_time;
-    ///         lowest_active_id = transaction_id;
-    ///     }
-    ///     active_transactions.push_back(std::move(transaction));
-    /// }
-    /// ```
+    /// The active registry owns hot-path lifecycle tracking; the manager keeps
+    /// only the cleanup queues and published compatibility atomics.
     pub fn begin_transaction(&self) -> Result<Arc<Transaction>> {
+        let started_at = Instant::now();
+        self.ensure_recovery_admission_open()?;
         let start_time = self
             .published_commit_id
             .load(Ordering::SeqCst)
             .saturating_add(1);
         let id = self.current_transaction_id.fetch_add(1, Ordering::SeqCst);
 
-        let txn = Arc::new(Transaction::new(id, start_time));
-
-        let mut active = self.active_transactions.write().unwrap();
-
-        // Update lowest_active_* if this is the first active transaction
-        if active.is_empty() {
-            self.lowest_active_start.store(start_time, Ordering::SeqCst);
-            self.lowest_active_id.store(id, Ordering::SeqCst);
-        }
-
-        active.push(txn.clone());
+        let txn = Arc::new(Transaction::with_catalog_version_and_locks(
+            id,
+            start_time,
+            0,
+            Arc::clone(&self.lock_manager),
+            self.lock_namespace,
+        ));
+        let handle = self
+            .active_registry
+            .register(txn.txn_id(), txn.read_ts(), ReadTs::new(start_time))
+            .map_err(|e| paro_error::internal(format!("failed to register active txn: {e}")))?;
+        txn.bind_active_registry_handle(handle)?;
+        self.record_begin_latency(started_at.elapsed());
 
         Ok(txn)
     }
 
-    /// Commit a transaction.
-    ///
-    /// ```cpp
-    ///     CommitInfo info;
-    ///     info.commit_id = GetCommitTimestamp();
-    ///     error = transaction.Commit(db, info, ...);
-    ///     last_commit = info.commit_id;
-    ///     auto cleanup_info = RemoveTransaction(transaction, store_transaction);
-    ///     if (cleanup_info->ScheduleCleanup()) {
-    ///         lock_guard<mutex> q_lock(cleanup_queue_lock);
-    ///         cleanup_queue.emplace(std::move(cleanup_info));
-    ///     }
-    /// }
-    /// ```
-    pub fn commit_transaction(&self, transaction: Arc<Transaction>) -> Result<u64> {
-        let commit_id = self.allocate_commit_id();
-        self.commit_transaction_with_commit_id(transaction, commit_id)?;
+    pub fn record_begin_latency(&self, duration: Duration) {
+        observe_counted_latency(
+            &self.txn_begin_count,
+            &self.txn_begin_latency_us_total,
+            &self.txn_begin_latency_us_peak,
+            duration,
+        );
+    }
+
+    pub fn record_commit_latency(&self, stage: TransactionLatencyStage, duration: Duration) {
+        match stage {
+            TransactionLatencyStage::CommitTotal => observe_counted_latency(
+                &self.txn_commit_count,
+                &self.txn_commit_latency_us_total,
+                &self.txn_commit_latency_us_peak,
+                duration,
+            ),
+            TransactionLatencyStage::CommitPrepare => observe_latency(
+                &self.txn_commit_prepare_latency_us_total,
+                &self.txn_commit_prepare_latency_us_peak,
+                duration,
+            ),
+            TransactionLatencyStage::CommitValidate => observe_latency(
+                &self.txn_commit_validate_latency_us_total,
+                &self.txn_commit_validate_latency_us_peak,
+                duration,
+            ),
+            TransactionLatencyStage::CommitDurable => observe_latency(
+                &self.txn_commit_durable_latency_us_total,
+                &self.txn_commit_durable_latency_us_peak,
+                duration,
+            ),
+            TransactionLatencyStage::CommitRequiredPublishWait => observe_latency(
+                &self.txn_commit_required_publish_wait_us_total,
+                &self.txn_commit_required_publish_wait_us_peak,
+                duration,
+            ),
+            TransactionLatencyStage::CommitPublish => observe_latency(
+                &self.txn_commit_publish_latency_us_total,
+                &self.txn_commit_publish_latency_us_peak,
+                duration,
+            ),
+        }
+    }
+
+    pub fn record_commit_ack_mode(&self, mode: paro_transaction::CommitAckPolicy) {
+        let encoded = match mode {
+            paro_transaction::CommitAckPolicy::RequiredPublished => 0,
+            paro_transaction::CommitAckPolicy::DurableOnlyAsync => 1,
+        };
+        self.txn_commit_ack_mode_last
+            .store(encoded, Ordering::Release);
+    }
+
+    pub fn record_read_tracking_selection(
+        &self,
+        policy: ReadTrackingPolicy,
+        had_user_hint: bool,
+        escalated: bool,
+    ) {
+        if had_user_hint {
+            self.read_tracking_hint_count.fetch_add(1, Ordering::AcqRel);
+        }
+        if escalated {
+            self.read_tracking_policy_escalation_count
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        match policy {
+            ReadTrackingPolicy::PointCritical => {
+                self.read_tracking_point_critical_count
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            ReadTrackingPolicy::RangeCritical => {
+                self.read_tracking_range_critical_count
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            ReadTrackingPolicy::AnalyticalScan => {
+                self.read_tracking_analytical_scan_count
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            ReadTrackingPolicy::SafeSnapshotPreferred | ReadTrackingPolicy::SafeSnapshot => {
+                self.read_tracking_safe_snapshot_preferred_count
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            ReadTrackingPolicy::Noop
+            | ReadTrackingPolicy::Record
+            | ReadTrackingPolicy::Serializable => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn commit_transaction(&self, transaction: Arc<Transaction>) -> Result<u64> {
+        let commit_id = self
+            .sequence_commit_id_after_durable_append(|commit_id| transaction.commit(commit_id))?;
+        self.publish_committed_transaction(transaction, commit_id)?;
         Ok(commit_id)
     }
 
-    pub fn allocate_commit_id(&self) -> u64 {
-        self.next_commit_id.fetch_add(1, Ordering::SeqCst)
+    #[cfg(test)]
+    fn sequence_commit_id_after_durable_append(
+        &self,
+        append: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
+        let _guard = self.commit_id_sequence_lock.lock().unwrap();
+        let commit_id = self.next_commit_id.load(Ordering::SeqCst);
+        append(commit_id)?;
+        self.mark_durable_commit_locked(commit_id);
+        Ok(commit_id)
     }
 
-    pub fn commit_transaction_with_commit_id(
+    pub(crate) fn publish_prepared_transaction_at(
         &self,
         transaction: Arc<Transaction>,
         commit_id: u64,
@@ -271,7 +456,7 @@ impl TransactionManager {
     }
 
     pub fn complete_read_only_transaction(&self, transaction: Arc<Transaction>) -> Result<()> {
-        let cleanup_info = self.remove_transaction(&transaction, false);
+        let cleanup_info = self.finish_transaction(&transaction, false);
         if cleanup_info.should_schedule() {
             self.schedule_cleanup(cleanup_info);
         }
@@ -279,19 +464,151 @@ impl TransactionManager {
         Ok(())
     }
 
-    pub fn mark_durable_commit(&self, commit_id: u64) {
+    fn mark_durable_commit(&self, commit_id: u64) {
+        let _guard = self.commit_id_sequence_lock.lock().unwrap();
+        self.mark_durable_commit_locked(commit_id);
+    }
+
+    pub fn register_committed_write_set(
+        &self,
+        commit_ts: CommitTs,
+        write_set: &[LockResource],
+    ) -> Result<()> {
+        self.register_committed_transaction_summary(
+            commit_ts,
+            TxnId::new(0),
+            ReadTs::new(commit_ts.into_raw()),
+            write_set,
+            &FrozenReadSet::empty(),
+        )
+    }
+
+    pub fn register_committed_transaction_summary(
+        &self,
+        commit_ts: CommitTs,
+        txn_id: TxnId,
+        read_ts: ReadTs,
+        write_set: &[LockResource],
+        read_set: &FrozenReadSet,
+    ) -> Result<()> {
+        if write_set.is_empty() {
+            self.committed_txn_summaries
+                .register_commit(CommittedTxnSummary::new(
+                    txn_id,
+                    read_ts,
+                    commit_ts,
+                    std::iter::empty(),
+                    read_set,
+                ))
+                .map_err(|error| {
+                    paro_error::internal(format!(
+                        "failed to register committed transaction summary at {}: {:?}",
+                        commit_ts, error
+                    ))
+                })?;
+            self.mark_durable_commit(commit_ts.into_raw());
+            return Ok(());
+        }
+        self.write_conflict_index
+            .register_commit(commit_ts, write_set.iter().cloned().map(ConflictWrite::new))
+            .map_err(|error| {
+                paro_error::internal(format!(
+                    "failed to register durable write conflict set at {}: {:?}",
+                    commit_ts, error
+                ))
+            })?;
+        self.committed_txn_summaries
+            .register_commit(CommittedTxnSummary::new(
+                txn_id,
+                read_ts,
+                commit_ts,
+                write_set.iter().cloned(),
+                read_set,
+            ))
+            .map_err(|error| {
+                paro_error::internal(format!(
+                    "failed to register committed transaction summary at {}: {:?}",
+                    commit_ts, error
+                ))
+            })?;
+        self.mark_durable_commit(commit_ts.into_raw());
+        Ok(())
+    }
+
+    pub fn validate_serializable_commit(
+        &self,
+        plan: &CommitPlan,
+        write_set: &[LockResource],
+    ) -> Result<SsiValidationOutcome> {
+        if plan.isolation != IsolationLevel::Serializable {
+            return Ok(SsiValidationOutcome::snapshot(
+                self.read_dependency_index.state_epoch(),
+            ));
+        }
+        SsiValidator::new(&self.read_dependency_index, &self.committed_txn_summaries)
+            .validate_commit(plan, write_set)
+            .map_err(|error| {
+                if error.coarse_scan_marker_conflict() {
+                    self.ssi_abort_due_to_coarse_scan_marker
+                        .fetch_add(1, Ordering::AcqRel);
+                } else {
+                    self.ssi_abort_due_to_exact_dependency
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                paro_error::serialization_failure(format!(
+                    "serializable validation failed: {:?}",
+                    error
+                ))
+            })
+    }
+
+    pub fn ssi_final_fence_reason(
+        &self,
+        plan: &CommitSequencingPlan,
+    ) -> Option<CommitFenceRejectReason> {
+        if plan.plan.isolation != IsolationLevel::Serializable {
+            return None;
+        }
+        let state = self.read_dependency_index.ssi_state(plan.plan.txn_id);
+        let current_epoch = state.ssi_state_epoch;
+        if current_epoch <= plan.validation_epoch {
+            return None;
+        }
+        if state.coarse_scan_marker_conflict {
+            self.ssi_abort_due_to_coarse_scan_marker
+                .fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.ssi_abort_due_to_exact_dependency
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        Some(CommitFenceRejectReason::SsiStateEpochAdvanced {
+            validation_epoch: plan.validation_epoch,
+            current_epoch,
+        })
+    }
+
+    pub fn advance_conflict_horizon(&self, published_ts: CommitTs) -> CommitTs {
+        let horizon = self
+            .write_conflict_index
+            .advance_horizon_with_confirmed_active_rw(published_ts, &self.active_registry);
+        self.committed_txn_summaries.advance_horizon(horizon);
+        horizon
+    }
+
+    fn mark_durable_commit_locked(&self, commit_id: u64) {
         Self::bump_atomic_min(&self.durable_commit_id, commit_id);
         Self::bump_atomic_min(&self.next_commit_id, commit_id.saturating_add(1));
     }
 
-    pub fn publish_committed_transaction(
+    fn publish_committed_transaction(
         &self,
         transaction: Arc<Transaction>,
         commit_id: u64,
     ) -> Result<()> {
         Self::bump_atomic_min(&self.published_commit_id, commit_id);
+        self.published_commit_changed.notify_all();
         let store_transaction = transaction.changes_made();
-        let cleanup_info = self.remove_transaction(&transaction, store_transaction);
+        let cleanup_info = self.finish_transaction(&transaction, store_transaction);
         if cleanup_info.should_schedule() {
             self.schedule_cleanup(cleanup_info);
         }
@@ -299,24 +616,35 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Rollback a transaction.
-    ///
-    /// ```cpp
-    ///     error = transaction.Rollback();
-    ///     auto cleanup_info = RemoveTransaction(transaction);
-    ///     if (cleanup_info->ScheduleCleanup()) {
-    ///         lock_guard<mutex> q_lock(cleanup_queue_lock);
-    ///         cleanup_queue.emplace(std::move(cleanup_info));
-    ///     }
-    /// }
-    /// ```
+    pub fn block_recovery_admission(&self) {
+        self.recovery_admission
+            .store(RECOVERY_ADMISSION_BLOCKED, Ordering::Release);
+    }
+
+    pub fn complete_recovery_admission(&self, durable_commit_id: u64) {
+        self.sync_commit_id_with(durable_commit_id);
+        self.recovery_admission
+            .store(RECOVERY_ADMISSION_OPEN, Ordering::Release);
+    }
+
+    pub fn recovery_admission_state(&self) -> RecoveryAdmissionState {
+        RecoveryAdmissionState::from_raw(self.recovery_admission.load(Ordering::Acquire))
+    }
+
+    fn ensure_recovery_admission_open(&self) -> Result<()> {
+        if self.recovery_admission_state() == RecoveryAdmissionState::Open {
+            return Ok(());
+        }
+        Err(paro_error::cannot_connect_now()
+            .detail("database is publishing recovered committed records"))
+    }
+
     pub fn rollback_transaction(&self, transaction: Arc<Transaction>) -> Result<()> {
         // Execute rollback logic in the undo buffer
         transaction.rollback()?;
 
-        // Remove from active transactions - always store if changes were made
         let store_transaction = transaction.changes_made();
-        let cleanup_info = self.remove_transaction(&transaction, store_transaction);
+        let cleanup_info = self.finish_transaction(&transaction, store_transaction);
 
         // Schedule cleanup if needed
         if cleanup_info.should_schedule() {
@@ -329,117 +657,36 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Remove a transaction from the active list and create cleanup info.
-    ///
-    /// ```cpp
-    ///     auto cleanup_info = make_uniq<DuckCleanupInfo>();
-    ///     // Find transaction and compute lowest values
-    ///     auto lowest_start_time = TRANSACTION_ID_START;
-    ///     auto lowest_transaction_id = MAX_TRANSACTION_ID;
-    ///     for (idx_t i = 0; i < active_transactions.size(); i++) {
-    ///         if (active_transactions[i].get() == &transaction) continue;
-    ///         lowest_start_time = MinValue(lowest_start_time, active_transactions[i]->start_time);
-    ///         lowest_transaction_id = MinValue(lowest_transaction_id, active_transactions[i]->transaction_id);
-    ///     }
-    ///     lowest_active_start = lowest_start_time;
-    ///     lowest_active_id = lowest_transaction_id;
-    ///     // Handle transaction storage
-    ///     if (store_transaction) {
-    ///         if (transaction.commit_id != 0) {
-    ///             recently_committed_transactions.push_back(std::move(current_transaction));
-    ///         } else {
-    ///             cleanup_info->transactions.push_back(std::move(current_transaction));
-    ///         }
-    ///     } else if (transaction.ChangesMade()) {
-    ///         current_transaction->awaiting_cleanup = true;
-    ///         cleanup_info->transactions.push_back(std::move(current_transaction));
-    ///     }
-    ///     cleanup_info->lowest_start_time = lowest_start_time;
-    ///     // Move eligible recently_committed to cleanup
-    ///     ...
-    ///     return cleanup_info;
-    /// }
-    /// ```
-    fn remove_transaction(
+    /// Finish a transaction lifecycle and create cleanup work.
+    fn finish_transaction(
         &self,
         transaction: &Arc<Transaction>,
         store_transaction: bool,
     ) -> CleanupInfo {
-        let mut active = self.active_transactions.write().unwrap();
-
-        // Find and remove the transaction, while computing new lowest values
-        let mut lowest_start_time = MAX_TRANSACTION_ID;
-        let mut lowest_transaction_id = MAX_TRANSACTION_ID;
-        let mut removed_transaction: Option<Arc<Transaction>> = None;
-
-        active.retain(|t| {
-            if Arc::ptr_eq(t, transaction) {
-                removed_transaction = Some(t.clone());
-                false // Remove this transaction
-            } else {
-                // Track minimum values among remaining transactions
-                if t.start_time < lowest_start_time {
-                    lowest_start_time = t.start_time;
-                }
-                if t.id < lowest_transaction_id {
-                    lowest_transaction_id = t.id;
-                }
-                true // Keep this transaction
-            }
-        });
-
-        // All remaining active transactions have been checked
-        if active.is_empty() {
-            lowest_start_time = MAX_TRANSACTION_ID;
-            lowest_transaction_id = TRANSACTION_ID_START;
-        }
-
-        // Update atomic tracking variables
-        self.lowest_active_start
-            .store(lowest_start_time, Ordering::SeqCst);
-        self.lowest_active_id
-            .store(lowest_transaction_id, Ordering::SeqCst);
-
-        // Create cleanup info
+        transaction.release_active_registry_handle();
+        self.read_dependency_index
+            .release_transaction(transaction.txn_id());
+        let lowest_start_time = self.lowest_active_start();
         let mut cleanup_info = CleanupInfo::new(lowest_start_time);
+        let commit_id = *transaction.commit_id.lock().unwrap();
 
-        // Handle the removed transaction
-        if let Some(txn) = removed_transaction {
-            let commit_id = *txn.commit_id.lock().unwrap();
-
-            if store_transaction {
-                if commit_id != 0 {
-                    // Transaction was committed - add to recently_committed
-                    let mut committed = self.recently_committed_transactions.write().unwrap();
-                    committed.push(txn.clone());
-                } else {
-                    // Transaction was aborted - schedule for cleanup
-                    cleanup_info.add_transaction(txn.clone());
-                }
-            } else if txn.changes_made() {
-                // Not storing but has changes - schedule for cleanup
-                txn.set_awaiting_cleanup(true);
-                cleanup_info.add_transaction(txn.clone());
+        if store_transaction {
+            if commit_id != 0 {
+                let mut committed = self.recently_committed_transactions.write().unwrap();
+                committed.push(transaction.clone());
+            } else {
+                cleanup_info.add_transaction(transaction.clone());
             }
+        } else if transaction.changes_made() {
+            transaction.set_awaiting_cleanup(true);
+            cleanup_info.add_transaction(transaction.clone());
         }
 
-        // Move eligible recently_committed transactions to cleanup
         self.move_committed_to_cleanup(&mut cleanup_info, lowest_start_time);
 
         cleanup_info
     }
 
-    /// Move recently committed transactions that are safe to clean up.
-    ///
-    /// ```cpp
-    /// for (; i < recently_committed_transactions.size(); i++) {
-    ///     if (recently_committed_transactions[i]->commit_id >= lowest_start_time) {
-    ///         break;
-    ///     }
-    ///     recently_committed_transactions[i]->awaiting_cleanup = true;
-    ///     cleanup_info->transactions.push_back(std::move(recently_committed_transactions[i]));
-    /// }
-    /// ```
     fn move_committed_to_cleanup(&self, cleanup_info: &mut CleanupInfo, lowest_start_time: u64) {
         let mut committed = self.recently_committed_transactions.write().unwrap();
 
@@ -463,38 +710,12 @@ impl TransactionManager {
         }
     }
 
-    /// Schedule a cleanup info for processing.
-    ///
-    /// ```cpp
-    /// if (cleanup_info->ScheduleCleanup()) {
-    ///     lock_guard<mutex> q_lock(cleanup_queue_lock);
-    ///     cleanup_queue.emplace(std::move(cleanup_info));
-    /// }
-    /// ```
     fn schedule_cleanup(&self, cleanup_info: CleanupInfo) {
         let _queue_lock = self.cleanup_queue_lock.lock().unwrap();
         let mut queue = self.cleanup_queue.lock().unwrap();
         queue.push_back(cleanup_info);
     }
 
-    /// Process pending cleanups from the queue.
-    ///
-    /// ```cpp
-    /// {
-    ///     lock_guard<mutex> c_lock(cleanup_lock);
-    ///     unique_ptr<DuckCleanupInfo> top_cleanup_info;
-    ///     {
-    ///         lock_guard<mutex> q_lock(cleanup_queue_lock);
-    ///         if (!cleanup_queue.empty()) {
-    ///             top_cleanup_info = std::move(cleanup_queue.front());
-    ///             cleanup_queue.pop();
-    ///         }
-    ///     }
-    ///     if (top_cleanup_info) {
-    ///         top_cleanup_info->Cleanup();
-    ///     }
-    /// }
-    /// ```
     fn process_cleanup(&self) {
         let _cleanup_lock = self.cleanup_lock.lock().unwrap();
 
@@ -511,73 +732,26 @@ impl TransactionManager {
         }
     }
 
-    /// Remove a transaction from the active list and update tracking variables.
-    /// This is a simplified version that doesn't create cleanup info.
-    ///
-    /// # Deprecated
-    /// Use `remove_transaction()` instead for proper cleanup handling.
-    #[allow(dead_code)]
-    fn remove_transaction_internal(&self, transaction_id: u64) {
-        let mut active = self.active_transactions.write().unwrap();
-
-        // Find and remove the transaction, while computing new lowest values
-        let mut lowest_start_time = TRANSACTION_ID_START;
-        let mut lowest_transaction_id = MAX_TRANSACTION_ID;
-
-        active.retain(|t| {
-            if t.id == transaction_id {
-                false // Remove this transaction
-            } else {
-                // Track minimum values among remaining transactions
-                if t.start_time < lowest_start_time {
-                    lowest_start_time = t.start_time;
-                }
-                if t.id < lowest_transaction_id {
-                    lowest_transaction_id = t.id;
-                }
-                true // Keep this transaction
-            }
-        });
-
-        // Update atomic tracking variables
-        self.lowest_active_start
-            .store(lowest_start_time, Ordering::SeqCst);
-        self.lowest_active_id
-            .store(lowest_transaction_id, Ordering::SeqCst);
-    }
-
-    /// Get the lowest active transaction ID.
-    ///
-    /// ```cpp
-    /// transaction_t LowestActiveId() const {
-    ///     return lowest_active_id;
-    /// }
-    /// ```
     #[inline]
     pub fn lowest_active_id(&self) -> u64 {
-        self.lowest_active_id.load(Ordering::SeqCst)
+        let watermarks = self.active_registry.watermarks();
+        if watermarks.active_count == 0 {
+            TRANSACTION_ID_START
+        } else {
+            watermarks.oldest_active_txn_id.into_raw()
+        }
     }
 
-    /// Get the lowest active start timestamp.
-    /// Used for garbage collection decisions.
-    ///
-    /// ```cpp
-    /// transaction_t LowestActiveStart() const {
-    ///     return lowest_active_start;
-    /// }
-    /// ```
     #[inline]
     pub fn lowest_active_start(&self) -> u64 {
-        self.lowest_active_start.load(Ordering::SeqCst)
+        let watermarks = self.active_registry.watermarks();
+        if watermarks.active_count == 0 {
+            MAX_TRANSACTION_ID
+        } else {
+            watermarks.oldest_active_start_ts.into_raw()
+        }
     }
 
-    /// Get the last commit timestamp.
-    ///
-    /// ```cpp
-    /// transaction_t GetLastCommit() const {
-    ///     return last_commit;
-    /// }
-    /// ```
     #[inline]
     pub fn last_commit(&self) -> u64 {
         self.published_commit_id.load(Ordering::SeqCst)
@@ -593,56 +767,248 @@ impl TransactionManager {
         self.published_commit_id.load(Ordering::SeqCst)
     }
 
+    pub fn wait_for_published_commit_id_at_least(&self, floor: u64) -> Result<()> {
+        if floor == 0 || self.published_commit_id() >= floor {
+            return Ok(());
+        }
+
+        let mut guard = self.published_commit_wait_lock.lock().map_err(|error| {
+            paro_error::internal(format!("failed to lock published commit waiter: {error}"))
+        })?;
+        while self.published_commit_id() < floor {
+            guard = self.published_commit_changed.wait(guard).map_err(|error| {
+                paro_error::internal(format!("published commit waiter poisoned: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn active_registry(&self) -> &ActiveTxnRegistry {
+        &self.active_registry
+    }
+
+    #[inline]
+    pub fn retention_registry(&self) -> &RetentionRegistry {
+        &self.retention_registry
+    }
+
+    #[inline]
+    pub fn lock_manager(&self) -> Arc<ShardedLockManager> {
+        Arc::clone(&self.lock_manager)
+    }
+
+    #[inline]
+    pub fn write_conflict_index(&self) -> &WriteConflictIndex {
+        &self.write_conflict_index
+    }
+
+    #[inline]
+    pub fn read_dependency_index(&self) -> &Arc<ReadDependencyIndex> {
+        &self.read_dependency_index
+    }
+
+    #[inline]
+    pub fn committed_txn_summaries(&self) -> &CommittedTxnSummaryIndex {
+        &self.committed_txn_summaries
+    }
+
+    #[inline]
+    pub fn serializable_read_tracker(&self, txn_id: TxnId, read_ts: ReadTs) -> ReadTrackerHandle {
+        ReadTrackerHandle::serializable(Arc::clone(&self.read_dependency_index), txn_id, read_ts)
+    }
+
+    #[inline]
+    pub fn serializable_read_tracker_with_policy(
+        &self,
+        txn_id: TxnId,
+        read_ts: ReadTs,
+        policy: ReadTrackingPolicy,
+    ) -> ReadTrackerHandle {
+        ReadTrackerHandle::serializable_with_policy(
+            Arc::clone(&self.read_dependency_index),
+            txn_id,
+            read_ts,
+            policy,
+        )
+    }
+
+    #[inline]
+    pub fn is_safe_snapshot(&self, read_ts: ReadTs) -> bool {
+        read_ts < self.active_registry.watermarks().oldest_active_rw_start_ts
+    }
+
+    pub fn read_tracker_for_policy(
+        &self,
+        txn_id: TxnId,
+        read_ts: ReadTs,
+        policy: ReadTrackingPolicy,
+    ) -> ReadTrackerHandle {
+        match policy {
+            ReadTrackingPolicy::Noop => ReadTrackerHandle::noop(),
+            ReadTrackingPolicy::Record => ReadTrackerHandle::recording(),
+            ReadTrackingPolicy::SafeSnapshot => ReadTrackerHandle::safe_snapshot(),
+            ReadTrackingPolicy::SafeSnapshotPreferred if self.is_safe_snapshot(read_ts) => {
+                ReadTrackerHandle::safe_snapshot()
+            }
+            ReadTrackingPolicy::SafeSnapshotPreferred => self
+                .serializable_read_tracker_with_policy(
+                    txn_id,
+                    read_ts,
+                    ReadTrackingPolicy::RangeCritical,
+                ),
+            other => self.serializable_read_tracker_with_policy(txn_id, read_ts, other),
+        }
+    }
+
+    #[inline]
+    pub fn lock_namespace(&self) -> LockNamespace {
+        self.lock_namespace
+    }
+
+    pub fn registry_metrics_snapshot(&self) -> TransactionManagerMetricsSnapshot {
+        let published_commit_id = self.published_commit_id();
+        let active = self.active_registry.watermarks();
+        let retention = self.retention_registry.watermarks();
+        let read_snapshot_lease_count = retention.lease_count(RetentionLeaseKind::ReadSnapshot);
+        let conflict = self.write_conflict_index.stats();
+        let lock = self.lock_manager.stats();
+        let read_dependency = self.read_dependency_index.stats();
+        let ssi_abort_due_to_exact_dependency = self
+            .ssi_abort_due_to_exact_dependency
+            .load(Ordering::Acquire);
+        let ssi_abort_due_to_coarse_scan_marker = self
+            .ssi_abort_due_to_coarse_scan_marker
+            .load(Ordering::Acquire);
+
+        TransactionManagerMetricsSnapshot {
+            txn_begin_count: self.txn_begin_count.load(Ordering::Acquire),
+            txn_begin_latency_us_total: self.txn_begin_latency_us_total.load(Ordering::Acquire),
+            txn_begin_latency_us_peak: self.txn_begin_latency_us_peak.load(Ordering::Acquire),
+            txn_commit_count: self.txn_commit_count.load(Ordering::Acquire),
+            txn_commit_latency_us_total: self.txn_commit_latency_us_total.load(Ordering::Acquire),
+            txn_commit_latency_us_peak: self.txn_commit_latency_us_peak.load(Ordering::Acquire),
+            txn_commit_prepare_latency_us_total: self
+                .txn_commit_prepare_latency_us_total
+                .load(Ordering::Acquire),
+            txn_commit_prepare_latency_us_peak: self
+                .txn_commit_prepare_latency_us_peak
+                .load(Ordering::Acquire),
+            txn_commit_validate_latency_us_total: self
+                .txn_commit_validate_latency_us_total
+                .load(Ordering::Acquire),
+            txn_commit_validate_latency_us_peak: self
+                .txn_commit_validate_latency_us_peak
+                .load(Ordering::Acquire),
+            txn_commit_durable_latency_us_total: self
+                .txn_commit_durable_latency_us_total
+                .load(Ordering::Acquire),
+            txn_commit_durable_latency_us_peak: self
+                .txn_commit_durable_latency_us_peak
+                .load(Ordering::Acquire),
+            txn_commit_required_publish_wait_us_total: self
+                .txn_commit_required_publish_wait_us_total
+                .load(Ordering::Acquire),
+            txn_commit_required_publish_wait_us_peak: self
+                .txn_commit_required_publish_wait_us_peak
+                .load(Ordering::Acquire),
+            txn_commit_publish_latency_us_total: self
+                .txn_commit_publish_latency_us_total
+                .load(Ordering::Acquire),
+            txn_commit_publish_latency_us_peak: self
+                .txn_commit_publish_latency_us_peak
+                .load(Ordering::Acquire),
+            txn_commit_ack_mode_last: self.txn_commit_ack_mode_last.load(Ordering::Acquire),
+            write_conflict_index_size: conflict.entry_count as u64,
+            write_conflict_index_fine_entries: conflict.fine_entry_count as u64,
+            write_conflict_index_fine_summary_entries: conflict.fine_summary_entry_count as u64,
+            write_conflict_index_coarse_entries: conflict.coarse_entry_count as u64,
+            lock_wait_count: lock.lock_wait_count,
+            lock_wait_duration_us: lock.lock_wait_duration_us,
+            lock_wound_wait_abort_count: lock.lock_wound_wait_abort_count,
+            lock_deadlock_abort_count: lock.lock_deadlock_abort_count,
+            read_snapshot_lease_count,
+            active_txn_count: active.active_count,
+            active_rw_txn_count: active.active_rw_count,
+            oldest_active_rw_lag_ms: lag_from_watermark(
+                published_commit_id,
+                active.oldest_active_rw_read_ts.into_raw(),
+                active.active_rw_count,
+            ),
+            retention_watermark_lag_ms: lag_from_watermark(
+                published_commit_id,
+                retention.oldest_read_ts.into_raw(),
+                read_snapshot_lease_count,
+            ),
+            active_registry_epoch: active.epoch,
+            retention_registry_epoch: retention.epoch,
+            ssi_validation_abort_count: ssi_abort_due_to_exact_dependency
+                .saturating_add(ssi_abort_due_to_coarse_scan_marker),
+            ssi_abort_due_to_exact_dependency,
+            ssi_abort_due_to_coarse_scan_marker,
+            read_tracker_record_count: read_dependency.record_count,
+            read_tracker_coarsened_count: read_dependency.coarsen_count,
+            read_tracking_hint_count: self.read_tracking_hint_count.load(Ordering::Acquire),
+            read_tracking_policy_escalation_count: self
+                .read_tracking_policy_escalation_count
+                .load(Ordering::Acquire),
+            read_tracking_point_critical_count: self
+                .read_tracking_point_critical_count
+                .load(Ordering::Acquire),
+            read_tracking_range_critical_count: self
+                .read_tracking_range_critical_count
+                .load(Ordering::Acquire),
+            read_tracking_analytical_scan_count: self
+                .read_tracking_analytical_scan_count
+                .load(Ordering::Acquire),
+            read_tracking_safe_snapshot_preferred_count: self
+                .read_tracking_safe_snapshot_preferred_count
+                .load(Ordering::Acquire),
+        }
+    }
+
     /// Align the global commit clock with an externally observed committed version.
     ///
     /// This is used to ensure `commit_id` stays monotonic and does not overlap with
     /// persisted Tablet versions loaded from disk or recovery.
     pub fn sync_commit_id_with(&self, min_committed_version: u64) {
+        let _guard = self.commit_id_sequence_lock.lock().unwrap();
         let next = min_committed_version.saturating_add(1);
         Self::bump_atomic_min(&self.next_commit_id, next);
         Self::bump_atomic_min(&self.durable_commit_id, min_committed_version);
         Self::bump_atomic_min(&self.published_commit_id, min_committed_version);
+        self.published_commit_changed.notify_all();
     }
 
     /// Get the minimum start time among all active transactions.
-    /// This is an alias for `lowest_active_start()` for backward compatibility.
-    ///
     /// Transactions older than this are safe to clean up if they are committed.
     pub fn get_min_active_start_time(&self) -> u64 {
-        let lowest = self.lowest_active_start.load(Ordering::SeqCst);
-        if lowest == MAX_TRANSACTION_ID {
+        let watermarks = self.active_registry.watermarks();
+        if watermarks.active_count == 0 {
             self.published_commit_id
                 .load(Ordering::SeqCst)
                 .saturating_add(1)
         } else {
-            lowest
+            watermarks.oldest_active_start_ts.into_raw()
         }
     }
 
     /// Check if there are other active transactions besides the given one.
     ///
-    /// ```cpp
-    ///     for (auto &active_transaction : active_transactions) {
-    ///         if (!RefersToSameObject(*active_transaction, transaction)) {
-    ///             return true;
-    ///         }
-    ///     }
-    ///     return false;
-    /// }
-    /// ```
+    /// This is not a hot-path operation; when only one transaction is active it
+    /// scans slots to distinguish "self" from "another txn".
     pub fn has_other_transactions(&self, transaction_id: u64) -> bool {
-        let active = self.active_transactions.read().unwrap();
-        for t in active.iter() {
-            if t.id != transaction_id {
-                return true;
-            }
-        }
-        false
+        let watermarks = self.active_registry.watermarks();
+        watermarks.active_count > 1
+            || (watermarks.active_count == 1
+                && !self
+                    .active_registry
+                    .contains_transaction(TxnId::new(transaction_id)))
     }
 
     /// Get the number of active transactions.
     pub fn active_transaction_count(&self) -> usize {
-        self.active_transactions.read().unwrap().len()
+        self.active_registry.watermarks().active_count as usize
     }
 
     /// Get the number of recently committed transactions pending cleanup.
@@ -670,7 +1036,7 @@ impl TransactionManager {
     /// Transactions with commit_id < lowest_active_start can be cleaned up
     /// because no active transaction needs to see their old data.
     pub fn cleanup(&self) {
-        let lowest_start = self.lowest_active_start.load(Ordering::SeqCst);
+        let lowest_start = self.lowest_active_start();
 
         // Create cleanup info for eligible transactions
         let mut cleanup_info = CleanupInfo::new(lowest_start);
@@ -710,6 +1076,40 @@ impl TransactionManager {
     }
 }
 
+fn lag_from_watermark(published_commit_id: u64, watermark: u64, holder_count: u64) -> u64 {
+    if holder_count == 0 || watermark == MAX_TRANSACTION_ID {
+        0
+    } else {
+        published_commit_id.saturating_sub(watermark)
+    }
+}
+
+fn observe_counted_latency(
+    count: &AtomicU64,
+    total: &AtomicU64,
+    peak: &AtomicU64,
+    duration: Duration,
+) {
+    count.fetch_add(1, Ordering::Relaxed);
+    observe_latency(total, peak, duration);
+}
+
+fn observe_latency(total: &AtomicU64, peak: &AtomicU64, duration: Duration) {
+    let micros = duration_micros(duration);
+    total.fetch_add(micros, Ordering::Relaxed);
+    let mut current = peak.load(Ordering::Relaxed);
+    while micros > current {
+        match peak.compare_exchange_weak(current, micros, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
 impl Default for TransactionManager {
     fn default() -> Self {
         Self::new()
@@ -723,6 +1123,13 @@ mod tests {
     fn mark_transaction_changed(txn: &Transaction) {
         let mut buffer = txn.undo_buffer.lock().expect("lock undo buffer");
         buffer.push_insert(1, 0, 1);
+    }
+
+    fn table_resource(tm: &TransactionManager, table_id: u64) -> LockResource {
+        LockResource::Table {
+            namespace: tm.lock_namespace(),
+            table_id: paro_transaction::TableId::new(table_id),
+        }
     }
 
     // ==================== Basic Transaction Tests ====================
@@ -770,6 +1177,89 @@ mod tests {
         // lowest_active_start should be MAX (no active transactions)
         assert_eq!(tm.lowest_active_start(), MAX_TRANSACTION_ID);
         assert_eq!(tm.lowest_active_id(), TRANSACTION_ID_START);
+    }
+
+    #[test]
+    fn committed_summary_registration_tracks_read_and_write_sets() {
+        let tm = TransactionManager::new_for_database_id(7);
+        let read_set =
+            FrozenReadSet::from_dependencies(vec![paro_transaction::ReadDependency::Row {
+                table_id: paro_transaction::TableId::new(10),
+                row_id: 42,
+            }]);
+        tm.register_committed_transaction_summary(
+            CommitTs::new(5),
+            TxnId::new(100),
+            ReadTs::new(3),
+            &[table_resource(&tm, 10)],
+            &read_set,
+        )
+        .unwrap();
+
+        let stats = tm.committed_txn_summaries().stats();
+        assert_eq!(stats.summary_count, 1);
+        assert_eq!(stats.write_dependency_count, 1);
+        assert_eq!(stats.read_dependency_count, 1);
+        assert!(tm.write_conflict_index().has_conflict(
+            ReadTs::new(4),
+            [ConflictWrite::new(table_resource(&tm, 10))]
+        ));
+
+        assert_eq!(
+            tm.advance_conflict_horizon(CommitTs::new(5)),
+            CommitTs::new(5)
+        );
+        assert_eq!(tm.committed_txn_summaries().stats().summary_count, 0);
+        assert_eq!(tm.write_conflict_index().stats().entry_count, 0);
+    }
+
+    #[test]
+    fn ssi_final_fence_rejects_epoch_advanced_after_validation() {
+        let tm = TransactionManager::new_for_database_id(7);
+        let txn_id = TxnId::new(100);
+        let read_ts = ReadTs::new(5);
+        let tracker = tm.serializable_read_tracker(txn_id, read_ts);
+        tracker.record_table_read(paro_transaction::TableId::new(10));
+        let lock = paro_transaction::LockRequest::new(
+            table_resource(&tm, 11),
+            paro_transaction::LockMode::X,
+        );
+        let view = paro_transaction::TransactionView::new(
+            paro_transaction::WriterId::new(100),
+            read_ts,
+            paro_transaction::ReadSnapshot::without_lease(read_ts),
+            IsolationLevel::Serializable,
+            paro_transaction::CommandId::new(0),
+            tracker,
+            paro_transaction::ParticipantStateSet::empty(),
+        );
+        let request = paro_transaction::CommitRequest::new(
+            DatabaseId::new(7),
+            txn_id,
+            view,
+            paro_transaction::CommitAckPolicy::RequiredPublished,
+            paro_transaction::FrozenLockSet::from_locks(vec![lock]),
+            Vec::new(),
+        );
+        let mut sequencing_plan = CommitSequencingPlan::from_commit_plan(request.commit_plan());
+        let outcome = tm
+            .validate_serializable_commit(&sequencing_plan.plan, &sequencing_plan.write_set)
+            .unwrap();
+        sequencing_plan = sequencing_plan
+            .with_validation_epoch(outcome.validation_epoch)
+            .with_ssi_effect_epoch(outcome.ssi_effect_epoch);
+
+        assert!(tm.ssi_final_fence_reason(&sequencing_plan).is_none());
+
+        tm.read_dependency_index().mark_txn_conflict_out(txn_id);
+        assert!(matches!(
+            tm.ssi_final_fence_reason(&sequencing_plan),
+            Some(CommitFenceRejectReason::SsiStateEpochAdvanced {
+                validation_epoch,
+                current_epoch,
+            }) if validation_epoch == outcome.validation_epoch
+                && current_epoch > validation_epoch
+        ));
     }
 
     #[test]
@@ -863,15 +1353,18 @@ mod tests {
         assert_eq!(tm.lowest_active_start(), t1.start_time);
         assert_eq!(tm.lowest_active_id(), t1.id);
 
-        // Commit t1 - now t2 should be lowest by transaction id.
+        // Commit t1 - lifecycle counts update immediately while watermarks
+        // remain conservative until a registry refresh raises them.
         tm.commit_transaction(t1).unwrap();
+        assert_eq!(tm.active_transaction_count(), 2);
         assert_eq!(tm.lowest_active_start(), t2.start_time);
-        assert_eq!(tm.lowest_active_id(), t2.id);
+        assert!(tm.lowest_active_id() <= t2.id);
 
-        // Rollback t2 - now t3 should be lowest by transaction id.
+        // Rollback t2 - count is exact; lowest id can still be stale-low.
         tm.rollback_transaction(t2).unwrap();
+        assert_eq!(tm.active_transaction_count(), 1);
         assert_eq!(tm.lowest_active_start(), t3.start_time);
-        assert_eq!(tm.lowest_active_id(), t3.id);
+        assert!(tm.lowest_active_id() <= t3.id);
 
         // Commit t3 - no active transactions
         tm.commit_transaction(t3).unwrap();
@@ -910,6 +1403,24 @@ mod tests {
     }
 
     #[test]
+    fn failed_durable_append_does_not_consume_commit_id() {
+        let tm = TransactionManager::new();
+        tm.sync_commit_id_with(10);
+
+        let err = tm
+            .sequence_commit_id_after_durable_append(|commit_id| {
+                assert_eq!(commit_id, 11);
+                Err(paro_error::internal("injected durable append failure"))
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("injected durable append failure"));
+
+        let txn = tm.begin_transaction().unwrap();
+        let commit_id = tm.commit_transaction(txn).unwrap();
+        assert_eq!(commit_id, 11);
+    }
+
+    #[test]
     fn test_durable_commit_does_not_advance_new_snapshot_frontier() {
         let tm = TransactionManager::new();
 
@@ -920,6 +1431,26 @@ mod tests {
 
         let txn = tm.begin_transaction().unwrap();
         assert_eq!(txn.start_time, 1);
+    }
+
+    #[test]
+    fn test_recovery_admission_blocks_transactions_until_durable_prefix_is_published() {
+        let tm = TransactionManager::new();
+
+        tm.mark_durable_commit(7);
+        tm.block_recovery_admission();
+        assert_eq!(
+            tm.recovery_admission_state(),
+            RecoveryAdmissionState::Blocked
+        );
+        assert!(tm.begin_transaction().is_err());
+        assert_eq!(tm.published_commit_id(), 0);
+
+        tm.complete_recovery_admission(tm.durable_commit_id());
+        assert_eq!(tm.recovery_admission_state(), RecoveryAdmissionState::Open);
+        assert_eq!(tm.durable_commit_id(), 7);
+        assert_eq!(tm.published_commit_id(), 7);
+        assert_eq!(tm.begin_transaction().unwrap().start_time, 8);
     }
 
     #[test]
@@ -954,6 +1485,132 @@ mod tests {
 
         tm.rollback_transaction(t2).unwrap();
         assert_eq!(tm.active_transaction_count(), 0);
+    }
+
+    #[test]
+    fn test_registry_metrics_track_active_read_write_transactions() {
+        let tm = TransactionManager::new();
+        let txn = tm.begin_transaction().unwrap();
+
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.active_txn_count, 1);
+        assert_eq!(metrics.active_rw_txn_count, 0);
+
+        txn.set_read_write();
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.active_txn_count, 1);
+        assert_eq!(metrics.active_rw_txn_count, 1);
+        assert_eq!(metrics.oldest_active_rw_lag_ms, 0);
+
+        tm.commit_transaction(txn).unwrap();
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.active_txn_count, 0);
+        assert_eq!(metrics.active_rw_txn_count, 0);
+    }
+
+    #[test]
+    fn test_read_write_promotion_is_idempotent_for_registry_binding() {
+        let tm = TransactionManager::new();
+        let txn = tm.begin_transaction().unwrap();
+
+        txn.set_read_write();
+        txn.set_read_write();
+
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.active_txn_count, 1);
+        assert_eq!(metrics.active_rw_txn_count, 1);
+
+        tm.rollback_transaction(txn).unwrap();
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.active_txn_count, 0);
+        assert_eq!(metrics.active_rw_txn_count, 0);
+    }
+
+    #[test]
+    fn test_registry_metrics_track_read_snapshot_leases() {
+        let tm = TransactionManager::new();
+        tm.sync_commit_id_with(10);
+        let lease = tm
+            .retention_registry()
+            .lease_read_snapshot(ReadTs::new(4))
+            .unwrap();
+
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.read_snapshot_lease_count, 1);
+        assert_eq!(metrics.retention_watermark_lag_ms, 6);
+
+        drop(lease);
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.read_snapshot_lease_count, 0);
+        assert_eq!(metrics.retention_watermark_lag_ms, 0);
+    }
+
+    #[test]
+    fn test_registry_metrics_track_read_tracking_policy_selection() {
+        let tm = TransactionManager::new();
+
+        tm.record_read_tracking_selection(ReadTrackingPolicy::RangeCritical, true, true);
+        tm.record_read_tracking_selection(ReadTrackingPolicy::AnalyticalScan, false, false);
+
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.read_tracking_hint_count, 1);
+        assert_eq!(metrics.read_tracking_policy_escalation_count, 1);
+        assert_eq!(metrics.read_tracking_range_critical_count, 1);
+        assert_eq!(metrics.read_tracking_analytical_scan_count, 1);
+        assert_eq!(metrics.read_tracking_point_critical_count, 0);
+    }
+
+    #[test]
+    fn safe_snapshot_preferred_falls_back_to_exact_tracker_when_unsafe() {
+        let tm = TransactionManager::new();
+        let _active_rw = tm
+            .active_registry()
+            .register_read_write(TxnId::new(10), ReadTs::new(1), ReadTs::new(1))
+            .unwrap();
+
+        let tracker = tm.read_tracker_for_policy(
+            TxnId::new(11),
+            ReadTs::new(2),
+            ReadTrackingPolicy::SafeSnapshotPreferred,
+        );
+
+        assert_eq!(tracker.policy(), ReadTrackingPolicy::RangeCritical);
+    }
+
+    #[test]
+    fn test_registry_metrics_track_lock_rejections() {
+        let tm = TransactionManager::new();
+        let lock_manager = tm.lock_manager();
+        let resource = LockResource::Table {
+            namespace: tm.lock_namespace(),
+            table_id: paro_transaction::TableId::new(42),
+        };
+        let _owner = lock_manager
+            .lock_one(
+                TxnId::new(10),
+                resource.clone(),
+                paro_transaction::LockMode::X,
+            )
+            .unwrap();
+
+        let _ = lock_manager
+            .lock_one(
+                TxnId::new(11),
+                resource.clone(),
+                paro_transaction::LockMode::X,
+            )
+            .unwrap_err();
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.lock_wait_count, 1);
+        assert_eq!(metrics.lock_wound_wait_abort_count, 0);
+
+        let _ = lock_manager
+            .lock_one(TxnId::new(9), resource, paro_transaction::LockMode::X)
+            .unwrap_err();
+        let metrics = tm.registry_metrics_snapshot();
+        assert_eq!(metrics.lock_wait_count, 1);
+        assert_eq!(metrics.lock_wound_wait_abort_count, 1);
+        assert_eq!(metrics.lock_deadlock_abort_count, 0);
     }
 
     #[test]
@@ -1141,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_transaction_creates_cleanup_info() {
+    fn test_finish_transaction_creates_cleanup_info() {
         let tm = TransactionManager::new();
 
         // Start a blocker to prevent immediate cleanup

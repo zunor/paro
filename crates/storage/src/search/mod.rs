@@ -13,6 +13,7 @@ pub mod artifact;
 pub mod budget;
 pub mod capability;
 pub mod cursor;
+pub mod delta_merge;
 pub mod request;
 pub mod stats;
 pub mod tail;
@@ -29,6 +30,7 @@ pub use cursor::{
     OpenedSearchCursor, PhysicalRowRef, SearchBatchState, SearchCursor, SearchProvider,
     SearchReadSnapshot, SearchRowHandle, TableReadLease, TableReadSnapshot,
 };
+pub use delta_merge::{DeltaMergeBudget, DeltaMergeCost, DeltaMergeQueryShape, SearchDeltaWindow};
 pub use registry::{
     DefinitionMaintenanceReport, SearchBootstrapReport, SearchGenerationCoverage,
     SearchMaintenanceAction, SearchMaintenanceReport,

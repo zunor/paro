@@ -10,6 +10,7 @@ use paro_common::checkpoint::{
     DeferredTaskKey, DeferredTaskKind, DeferredTaskProgress, DeferredTaskScope,
     DerivedProgressBundle, GraphManifestProgressEntry, PrimaryIndexProgressEntry,
 };
+use paro_storage::index::graph::GraphProjectionIndex;
 use paro_storage::meta::TabletMetaManager;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +24,7 @@ impl DerivedProgressWriter {
         view: &CheckpointView,
     ) -> anyhow::Result<DerivedProgressBundle> {
         Ok(DerivedProgressBundle {
-            primary_indexes: Self::primary_indexes(storage)?,
+            primary_indexes: Self::primary_indexes(storage, view.frontier.checkpoint_commit_id)?,
             graph_manifests: Self::graph_manifests(storage)?,
             deferred_tasks: Self::deferred_tasks(catalog, view),
         })
@@ -31,6 +32,7 @@ impl DerivedProgressWriter {
 
     fn primary_indexes(
         storage: &dyn StorageManager,
+        indexed_through_ts: u64,
     ) -> anyhow::Result<Vec<PrimaryIndexProgressEntry>> {
         let Some(metadata_store) = storage.get_metadata_store() else {
             return Ok(Vec::new());
@@ -44,7 +46,11 @@ impl DerivedProgressWriter {
             let Some(tablet_id) = TabletMetaManager::decode_persistent_index_key(&key) else {
                 continue;
             };
-            entries.push(PrimaryIndexProgressEntry { tablet_id, payload });
+            entries.push(PrimaryIndexProgressEntry {
+                tablet_id,
+                indexed_through_ts,
+                payload,
+            });
         }
         entries.sort_by_key(|entry| entry.tablet_id);
         Ok(entries)
@@ -72,9 +78,12 @@ impl DerivedProgressWriter {
             if !manifest_path.exists() {
                 continue;
             }
+            let manifest = GraphProjectionIndex::load_manifest(&dir_entry.path())
+                .map_err(|err| anyhow::anyhow!(err))?;
             entries.push(GraphManifestProgressEntry {
                 graph_name: graph_name.clone(),
                 locator: relative_locator(&root, &manifest_path)?,
+                indexed_through_ts: manifest.indexed_through_ts(),
                 payload: std::fs::read(&manifest_path)?,
             });
         }

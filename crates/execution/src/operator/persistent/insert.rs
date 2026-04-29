@@ -33,6 +33,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_context::dml_table_lock_requests;
 use paro_planner::operator::{InsertOnConflict, InsertOnConflictAction};
 use paro_storage::table::table_handle::InsertOnConflictAction as StorageInsertOnConflictAction;
 
@@ -148,7 +149,7 @@ impl PhysicalInsert {
         &self,
         ctx: &ExecutionContext,
         storage: &Arc<paro_storage::table::table_handle::TableHandle>,
-        txn: Option<std::sync::Arc<paro_storage::transaction::txn::Transaction>>,
+        txn: std::sync::Arc<paro_storage::transaction::txn::Transaction>,
         lstate: &mut InsertLocalSinkState,
     ) -> Result<usize> {
         if lstate.buffered_rows == 0 {
@@ -179,7 +180,7 @@ impl PhysicalInsert {
             dst_row += rows;
         }
 
-        storage.append_with_transaction(&merged, txn)?;
+        storage.append_with_transaction(ctx.transaction_view(), &merged, txn)?;
         lstate.buffered_rows = 0;
         Ok(dst_row)
     }
@@ -361,6 +362,7 @@ impl PhysicalOperator for PhysicalInsert {
             self.table.base.base.name.clone(),
             paro_common::ddl::DdlObjectKind::Table,
         );
+        ctx.session.bind_write_database(&target.database)?;
         if let Some(admission) = ctx.session.txn_admission() {
             let write_class = ctx
                 .session
@@ -372,6 +374,9 @@ impl PhysicalOperator for PhysicalInsert {
                 &target,
                 self.table.base.base.timestamp() == ctx.transaction_id(),
             )?;
+        }
+        if let Some(txn) = ctx.active_transaction() {
+            txn.acquire_lock_requests(dml_table_lock_requests(txn.lock_namespace(), &target))?;
         }
         if let Some(write_guard) = ctx.session.write_guard() {
             write_guard.begin_dml_write()?;
@@ -432,7 +437,11 @@ impl PhysicalOperator for PhysicalInsert {
         // under the dedicated MemTable memory tag.
         let append_chunk = append_chunk.try_deep_copy(ctx.allocator(MemoryTag::MemTable))?;
 
-        let txn = ctx.active_transaction();
+        let txn = ctx.active_transaction().ok_or_else(|| {
+            paro_error::internal(
+                "INSERT reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+            )
+        })?;
         let mut affected_rows = chunk.size();
         if let Some(on_conflict) = &self.on_conflict {
             if lstate.copy_buffering_enabled {
@@ -456,7 +465,12 @@ impl PhysicalOperator for PhysicalInsert {
                 .append_lock
                 .lock()
                 .map_err(|e| paro_error::internal(e.to_string()))?;
-            let affected = storage.insert_on_conflict(&append_chunk, &storage_action, txn)?;
+            let affected = storage.insert_on_conflict(
+                ctx.transaction_view(),
+                &append_chunk,
+                &storage_action,
+                txn.clone(),
+            )?;
             affected_rows = affected;
             gstate
                 .shared_state
@@ -470,7 +484,7 @@ impl PhysicalOperator for PhysicalInsert {
                     .append_lock
                     .lock()
                     .map_err(|e| paro_error::internal(e.to_string()))?;
-                let flushed = self.flush_buffered_chunks(ctx, storage, txn, lstate)?;
+                let flushed = self.flush_buffered_chunks(ctx, storage, txn.clone(), lstate)?;
                 if flushed > 0 {
                     gstate
                         .shared_state
@@ -484,7 +498,7 @@ impl PhysicalOperator for PhysicalInsert {
                 .append_lock
                 .lock()
                 .map_err(|e| paro_error::internal(e.to_string()))?;
-            storage.append_with_transaction(&append_chunk, txn)?;
+            storage.append_with_transaction(ctx.transaction_view(), &append_chunk, txn.clone())?;
 
             // 5. Update global state
             gstate
@@ -493,9 +507,7 @@ impl PhysicalOperator for PhysicalInsert {
                 .fetch_add(chunk.size(), Ordering::SeqCst);
         }
 
-        if let Some(txn) = ctx.active_transaction() {
-            txn.record_graph_insert(self.table.base.base.object_id.raw(), affected_rows);
-        }
+        txn.record_graph_insert(self.table.base.base.object_id.raw(), affected_rows);
 
         Ok(SinkResultType::NeedMoreInput)
     }
@@ -531,7 +543,12 @@ impl PhysicalOperator for PhysicalInsert {
             .append_lock
             .lock()
             .map_err(|e| paro_error::internal(e.to_string()))?;
-        let flushed = self.flush_buffered_chunks(ctx, storage, ctx.active_transaction(), lstate)?;
+        let txn = ctx.active_transaction().ok_or_else(|| {
+            paro_error::internal(
+                "INSERT combine reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+            )
+        })?;
+        let flushed = self.flush_buffered_chunks(ctx, storage, txn, lstate)?;
         if flushed > 0 {
             gstate
                 .shared_state

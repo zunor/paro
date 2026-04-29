@@ -12,7 +12,10 @@ use paro_common::effect::{
     DeletePatchRef, DeletePatchSegment,
 };
 use paro_common::error::Result;
-use paro_common::journal::{CommitRecord, JournalRecord, MaintenanceKind, MaintenanceRecord};
+use paro_common::journal::{
+    CommitRecord, JournalRecord, JournalRecordMetadata, MaintenanceKind, MaintenanceRecord,
+    COMMIT_RECORD_VERSION, MAINTENANCE_RECORD_VERSION,
+};
 use paro_journal::{
     encode_record, ApplyRequest, JournalAppender, JournalAppenderMetricsSnapshot,
     JournalApplyRuntime, JournalCoordinator, JournalSink, TabletApplyPart, WaitMode,
@@ -107,20 +110,24 @@ fn make_delete_patch_record(row_count: usize, artifact_backed: bool) -> JournalR
         make_inline_patch(row_count)
     };
 
+    let storage_ops = vec![paro_common::effect::StorageCommitOp::Tablet(
+        paro_common::effect::TabletApplyOp {
+            tablet_id: 41,
+            mutations: vec![paro_common::effect::TabletMutation::ApplyDeletePatch {
+                patch,
+                deleted_row_count: row_count as u32,
+            }],
+        },
+    )];
+
     JournalRecord::Commit(CommitRecord {
+        record_version: COMMIT_RECORD_VERSION,
+        metadata: JournalRecordMetadata::transaction(&[], &storage_ops, &[], &[]),
         txn_id: 7,
         start_time: 11,
         commit_id: 13,
         catalog_ops: Vec::new(),
-        storage_ops: vec![paro_common::effect::StorageCommitOp::Tablet(
-            paro_common::effect::TabletApplyOp {
-                tablet_id: 41,
-                mutations: vec![paro_common::effect::TabletMutation::ApplyDeletePatch {
-                    patch,
-                    deleted_row_count: row_count as u32,
-                }],
-            },
-        )],
+        storage_ops,
         apply_descriptors: Vec::new(),
         deferred_tasks: Vec::new(),
     })
@@ -145,10 +152,10 @@ fn run_commit_burst(
             if follower_gap_micros != 0 && tid != 0 {
                 thread::sleep(Duration::from_micros(follower_gap_micros));
             }
-            let ctx = coordinator
-                .submit_commit_context(empty_commit_plan(tid as u64 + 1), |_| Ok(()))
-                .unwrap();
-            black_box(ctx.lsn);
+            let commit_id = tid as u64 + 1;
+            let record = JournalRecord::Commit(empty_commit_plan(commit_id).into_record(commit_id));
+            let result = coordinator.append_records(&[record]).unwrap()[0];
+            black_box(result.lsn);
         }));
     }
 
@@ -173,16 +180,14 @@ fn run_mixed_batch(request_count: usize) -> JournalAppenderMetricsSnapshot {
         handles.push(thread::spawn(move || {
             barrier.wait();
             if idx % 2 == 0 {
-                let ctx = coordinator
-                    .submit_commit_context(empty_commit_plan(idx as u64 + 1), |_| Ok(()))
-                    .unwrap();
-                black_box(ctx.lsn);
+                let commit_id = idx as u64 + 1;
+                let record =
+                    JournalRecord::Commit(empty_commit_plan(commit_id).into_record(commit_id));
+                let result = coordinator.append_records(&[record]).unwrap()[0];
+                black_box(result.lsn);
             } else {
                 let ctx = coordinator
-                    .submit_maintenance_context(
-                        empty_maintenance_plan(MaintenanceKind::Compaction),
-                        |_| Ok(()),
-                    )
+                    .submit_maintenance(empty_maintenance_plan(MaintenanceKind::Compaction))
                     .unwrap();
                 black_box(ctx.lsn);
             }
@@ -306,6 +311,8 @@ fn apply_executor_scaling_benchmark(bencher: Bencher, tablet_count: usize) {
 #[allow(dead_code)]
 fn _mixed_record_example() -> MaintenanceRecord {
     MaintenanceRecord {
+        record_version: MAINTENANCE_RECORD_VERSION,
+        metadata: JournalRecordMetadata::maintenance(&[], &[], &[], &[]),
         maintenance_id: 1,
         kind: MaintenanceKind::Compaction,
         catalog_ops: Vec::new(),

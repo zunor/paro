@@ -10,9 +10,9 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
+use paro_journal::wal::wal_entry::WalHeaderMetadata;
+use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_storage::meta::{MetadataStore, TabletMetaManager};
-use paro_storage::wal::wal_entry::WalHeaderMetadata;
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use std::sync::Arc;
 
 /// Suffix for the main WAL file.

@@ -3,19 +3,18 @@
 
 //! WAL entry types and binary encoding for catalog and data operations.
 
-use crate::compaction::plan::types::CumulativePointAction;
-use crate::index::IndexConstraintType;
 use crate::wal::txn_record::TxnRecord;
 use crate::wal::wal_type::WalType;
+use crate::{decode_frame, encode_record};
 #[cfg(test)]
 use paro_common::allocator::default_allocator;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
+use paro_common::effect::CompactionCumulativePointAction;
 use paro_common::error as paro_error;
 use paro_common::error::Result;
 use paro_common::journal::JournalRecord;
 use paro_common::types::LogicalType;
-use paro_journal::{decode_frame, encode_record};
 use std::sync::Arc;
 
 /// Length of database identity bytes stored in WAL header metadata.
@@ -158,7 +157,7 @@ pub enum WalEntry {
         output_rowset_id: u64,
         output_start_version: i64,
         output_end_version: i64,
-        cumulative_point_action: CumulativePointAction,
+        cumulative_point_action: CompactionCumulativePointAction,
         output_rowset_path: String,
         replaced_inputs: Vec<u64>,
     },
@@ -263,6 +262,37 @@ impl WalConstraintType {
             4 => Ok(Self::Check),
             _ => Err(paro_error::serialization_error(format!(
                 "Invalid WAL constraint type: {}",
+                value
+            ))),
+        }
+    }
+}
+
+/// Index constraint type codes serialized in legacy WAL CREATE INDEX entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WalIndexConstraintType {
+    None = 0,
+    Unique = 1,
+    Primary = 2,
+    Foreign = 3,
+}
+
+impl WalIndexConstraintType {
+    #[inline]
+    pub fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub fn from_byte(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Unique),
+            2 => Ok(Self::Primary),
+            3 => Ok(Self::Foreign),
+            _ => Err(paro_error::serialization_error(format!(
+                "Invalid WAL index constraint type: {}",
                 value
             ))),
         }
@@ -395,7 +425,7 @@ pub struct WalIndexInfo {
     pub table_name: String,
     pub index_name: String,
     pub index_type: String,
-    /// Encoded as `IndexConstraintType::to_byte()`
+    /// Encoded as `WalIndexConstraintType`
     pub constraint_type: u8,
     pub column_ids: Vec<u32>,
     pub column_types: Vec<LogicalType>,
@@ -407,7 +437,7 @@ impl WalIndexInfo {
         table_name: String,
         index_name: String,
         index_type: String,
-        constraint_type: IndexConstraintType,
+        constraint_type: WalIndexConstraintType,
         column_ids: Vec<u32>,
         column_types: Vec<LogicalType>,
         fulltext_config: Option<String>,
@@ -423,13 +453,8 @@ impl WalIndexInfo {
         }
     }
 
-    pub fn constraint_type_enum(&self) -> Result<IndexConstraintType> {
-        IndexConstraintType::from_byte(self.constraint_type).ok_or_else(|| {
-            paro_error::serialization_error(format!(
-                "Invalid index constraint type: {}",
-                self.constraint_type
-            ))
-        })
+    pub fn constraint_type_enum(&self) -> Result<WalIndexConstraintType> {
+        WalIndexConstraintType::from_byte(self.constraint_type)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -484,12 +509,7 @@ impl WalIndexInfo {
         }
         let constraint_type = bytes[*offset];
         *offset += 1;
-        IndexConstraintType::from_byte(constraint_type).ok_or_else(|| {
-            paro_error::serialization_error(format!(
-                "Invalid index constraint type: {}",
-                constraint_type
-            ))
-        })?;
+        WalIndexConstraintType::from_byte(constraint_type)?;
 
         if *offset + 4 > bytes.len() {
             return Err(paro_error::serialization_error(
@@ -1696,17 +1716,17 @@ fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
     Ok(value)
 }
 
-fn encode_cumulative_point_action(action: CumulativePointAction) -> u8 {
+fn encode_cumulative_point_action(action: CompactionCumulativePointAction) -> u8 {
     match action {
-        CumulativePointAction::Preserve => 0,
-        CumulativePointAction::AdvanceToOutputEndExclusive => 1,
+        CompactionCumulativePointAction::Preserve => 0,
+        CompactionCumulativePointAction::AdvanceToOutputEndExclusive => 1,
     }
 }
 
-fn decode_cumulative_point_action(value: u8) -> Result<CumulativePointAction> {
+fn decode_cumulative_point_action(value: u8) -> Result<CompactionCumulativePointAction> {
     match value {
-        0 => Ok(CumulativePointAction::Preserve),
-        1 => Ok(CumulativePointAction::AdvanceToOutputEndExclusive),
+        0 => Ok(CompactionCumulativePointAction::Preserve),
+        1 => Ok(CompactionCumulativePointAction::AdvanceToOutputEndExclusive),
         _ => Err(paro_error::serialization_error(format!(
             "Invalid cumulative point action code: {}",
             value
@@ -1786,7 +1806,7 @@ fn read_optional_u32_vec(data: &[u8], offset: &mut usize) -> Result<Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::*;
+    use paro_common::test_utils::*;
 
     #[test]
     fn test_entry_header_roundtrip() {
@@ -1892,11 +1912,8 @@ mod tests {
     fn test_serialized_data_chunk_constant_vector_roundtrip() {
         use paro_common::types::LogicalType;
 
-        let chunk = test_chunk_from_vectors(vec![test_constant_vector::<u32>(
-            LogicalType::UInteger,
-            42,
-            3,
-        )]);
+        let chunk =
+            test_chunk_from_vectors(vec![test_constant::<u32>(LogicalType::UInteger, 42, 3)]);
 
         let serialized = SerializedDataChunk::from_chunk(&chunk).unwrap();
         let recovered = serialized.to_chunk().unwrap();

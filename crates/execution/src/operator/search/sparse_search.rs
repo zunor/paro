@@ -23,6 +23,7 @@ use crate::result_type::SourceResultType;
 use paro_storage::index::PredicateTree;
 use paro_storage::rowset::SparseVector;
 use paro_storage::table::table_handle::TableHandle;
+use paro_transaction::TableId;
 
 #[derive(Debug)]
 pub struct SparseVectorScanBindData {
@@ -109,14 +110,20 @@ impl PhysicalOperator for PhysicalSparseVectorScan {
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
         ctx.check_cancelled()?;
-        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
-        let opened = self.bind_data.table_data.open_sparse_vector_search_cursor(
-            self.bind_data.sparse_column_id,
-            &self.bind_data.query_vector,
-            self.bind_data.k,
-            self.bind_data.predicates.clone(),
-            visible_version,
-        )?;
+        let txn_view = ctx.transaction_view();
+        txn_view
+            .read_tracker()
+            .record_table_read(TableId::new(self.bind_data.table_data.table_id()));
+        let opened = self
+            .bind_data
+            .table_data
+            .open_sparse_vector_search_cursor_for_view(
+                self.bind_data.sparse_column_id,
+                &self.bind_data.query_vector,
+                self.bind_data.k,
+                self.bind_data.predicates.clone(),
+                txn_view,
+            )?;
         let batch_config = build_search_batch_config(self.bind_data.k);
         let budget = build_search_resource_budget(ctx, self.bind_data.k);
         let driver = SearchOperatorDriver::new(

@@ -3,7 +3,11 @@
 
 use paro_common::error as paro_error;
 use paro_common::error::Result;
-use paro_common::journal::{JournalRecord, JOURNAL_FORMAT_VERSION};
+use paro_common::journal::{
+    JournalRecord, COMMIT_RECORD_VERSION, JOURNAL_FORMAT_VERSION,
+    JOURNAL_PARTICIPANT_DESCRIPTOR_VERSION, JOURNAL_RECORD_METADATA_VERSION,
+    MAINTENANCE_RECORD_VERSION,
+};
 
 pub const JOURNAL_FRAME_HEADER_SIZE: usize = 18;
 
@@ -102,16 +106,82 @@ pub fn decode_frame(frame: &[u8]) -> Result<DecodedJournalFrame> {
         )));
     }
 
-    let record = bincode::deserialize(payload)
+    let record: JournalRecord = bincode::deserialize(payload)
         .map_err(|err| paro_error::serialization_error(format!("journal decode: {err}")))?;
+    validate_record_metadata(&record)?;
     Ok(DecodedJournalFrame { header, record })
+}
+
+fn validate_record_metadata(record: &JournalRecord) -> Result<()> {
+    match record {
+        JournalRecord::Commit(record) => {
+            if record.record_version != COMMIT_RECORD_VERSION {
+                return Err(paro_error::serialization_error(format!(
+                    "unsupported journal commit record version {}, expected {}",
+                    record.record_version, COMMIT_RECORD_VERSION
+                )));
+            }
+            if record.metadata.metadata_version != JOURNAL_RECORD_METADATA_VERSION {
+                return Err(paro_error::serialization_error(format!(
+                    "unsupported journal commit metadata version {}, expected {}",
+                    record.metadata.metadata_version, JOURNAL_RECORD_METADATA_VERSION
+                )));
+            }
+            if record.metadata.participant_descriptor_version
+                != JOURNAL_PARTICIPANT_DESCRIPTOR_VERSION
+            {
+                return Err(paro_error::serialization_error(format!(
+                    "unsupported journal participant descriptor version {}, expected {}",
+                    record.metadata.participant_descriptor_version,
+                    JOURNAL_PARTICIPANT_DESCRIPTOR_VERSION
+                )));
+            }
+            if !record.metadata_matches_payload() {
+                return Err(paro_error::serialization_error(
+                    "journal commit metadata does not match record payload",
+                ));
+            }
+        }
+        JournalRecord::Maintenance(record) => {
+            if record.record_version != MAINTENANCE_RECORD_VERSION {
+                return Err(paro_error::serialization_error(format!(
+                    "unsupported journal maintenance record version {}, expected {}",
+                    record.record_version, MAINTENANCE_RECORD_VERSION
+                )));
+            }
+            if record.metadata.metadata_version != JOURNAL_RECORD_METADATA_VERSION {
+                return Err(paro_error::serialization_error(format!(
+                    "unsupported journal maintenance metadata version {}, expected {}",
+                    record.metadata.metadata_version, JOURNAL_RECORD_METADATA_VERSION
+                )));
+            }
+            if record.metadata.participant_descriptor_version
+                != JOURNAL_PARTICIPANT_DESCRIPTOR_VERSION
+            {
+                return Err(paro_error::serialization_error(format!(
+                    "unsupported journal participant descriptor version {}, expected {}",
+                    record.metadata.participant_descriptor_version,
+                    JOURNAL_PARTICIPANT_DESCRIPTOR_VERSION
+                )));
+            }
+            if !record.metadata_matches_payload() {
+                return Err(paro_error::serialization_error(
+                    "journal maintenance metadata does not match record payload",
+                ));
+            }
+        }
+        JournalRecord::CheckpointFence(_) => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::effect::{StorageCommitOp, TabletApplyOp, TabletMutation, VersionSpan};
     use paro_common::journal::{
-        CheckpointFence, JournalRecord, MaintenanceKind, MaintenanceRecord,
+        CheckpointFence, CommitRecord, JournalRecord, JournalRecordMetadata, MaintenanceKind,
+        MaintenanceRecord, COMMIT_RECORD_VERSION, MAINTENANCE_RECORD_VERSION,
     };
 
     #[test]
@@ -139,6 +209,8 @@ mod tests {
     #[test]
     fn maintenance_record_kind_roundtrips_through_journal_frame_codec() {
         let record = JournalRecord::Maintenance(MaintenanceRecord {
+            record_version: MAINTENANCE_RECORD_VERSION,
+            metadata: JournalRecordMetadata::maintenance(&[], &[], &[], &[]),
             maintenance_id: 9,
             kind: MaintenanceKind::MaterializedViewRefresh,
             catalog_ops: Vec::new(),
@@ -150,5 +222,35 @@ mod tests {
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded.header.lsn, 17);
         assert_eq!(decoded.record, record);
+    }
+
+    #[test]
+    fn journal_frame_rejects_stale_record_metadata() {
+        let record = JournalRecord::Commit(CommitRecord {
+            record_version: COMMIT_RECORD_VERSION,
+            metadata: JournalRecordMetadata::transaction(&[], &[], &[], &[]),
+            txn_id: 1,
+            start_time: 1,
+            commit_id: 2,
+            catalog_ops: Vec::new(),
+            storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
+                tablet_id: 41,
+                mutations: vec![TabletMutation::PublishRowset {
+                    rowset_id: 7,
+                    version_span: VersionSpan { start: 2, end: 2 },
+                    rowset_ref: paro_common::effect::ArtifactRef {
+                        namespace: paro_common::effect::ArtifactNamespace::CanonicalRowset,
+                        locator: vec!["rowset_7".to_string()],
+                    },
+                }],
+            })],
+            apply_descriptors: Vec::new(),
+            deferred_tasks: Vec::new(),
+        });
+        let frame = encode_record(&record, 17).unwrap();
+        let err = decode_frame(&frame).expect_err("metadata drift should fail");
+        assert!(err
+            .to_string()
+            .contains("journal commit metadata does not match record payload"));
     }
 }

@@ -17,15 +17,15 @@ pub struct WalLifecycleMetricsSnapshot {
     pub checkpoint_failure_total: u64,
     pub wal_health_check_total: u64,
     pub wal_keep_from: u64,
-    pub recovery_mode: paro_storage::wal::recovery::WalRecoveryMode,
+    pub recovery_mode: paro_journal::wal::recovery::WalRecoveryMode,
     pub main_wal_needs_truncation: bool,
 }
 
-fn wal_recovery_mode_from_metric(value: u64) -> paro_storage::wal::recovery::WalRecoveryMode {
+fn wal_recovery_mode_from_metric(value: u64) -> paro_journal::wal::recovery::WalRecoveryMode {
     match value {
-        1 => paro_storage::wal::recovery::WalRecoveryMode::NoWal,
-        2 => paro_storage::wal::recovery::WalRecoveryMode::MainWalOnly,
-        _ => paro_storage::wal::recovery::WalRecoveryMode::Unknown,
+        1 => paro_journal::wal::recovery::WalRecoveryMode::NoWal,
+        2 => paro_journal::wal::recovery::WalRecoveryMode::MainWalOnly,
+        _ => paro_journal::wal::recovery::WalRecoveryMode::Unknown,
     }
 }
 
@@ -45,7 +45,7 @@ impl WalObservability {
             wal_keep_from: AtomicU64::new(u64::MAX),
             wal_health_check_total: AtomicU64::new(0),
             wal_recovery_mode_metric: AtomicU64::new(
-                paro_storage::wal::recovery::WalRecoveryMode::Unknown.as_metric_value(),
+                paro_journal::wal::recovery::WalRecoveryMode::Unknown.as_metric_value(),
             ),
             main_wal_needs_truncation: AtomicBool::new(false),
             last_recovery_report: RwLock::new(None),
@@ -75,7 +75,7 @@ impl WalObservability {
 
     pub fn update_from_health_check(
         &self,
-        report: &paro_storage::wal::recovery::WalHealthCheckReport,
+        report: &paro_journal::wal::recovery::WalHealthCheckReport,
     ) {
         self.wal_health_check_total.fetch_add(1, Ordering::Relaxed);
         self.wal_recovery_mode_metric
@@ -89,11 +89,11 @@ impl WalObservability {
         storage: Option<&dyn StorageManager>,
         db_name: &str,
         db_path: &str,
-    ) -> anyhow::Result<paro_storage::wal::recovery::WalHealthCheckReport> {
+    ) -> anyhow::Result<paro_journal::wal::recovery::WalHealthCheckReport> {
         let wal_path = storage
             .map(|sm| sm.get_wal_path())
             .unwrap_or_else(|| format!("{}.wal", db_path));
-        let report = paro_storage::wal::recovery::segment_catalog_health_check_read_only(
+        let report = paro_journal::wal::recovery::segment_catalog_health_check_read_only(
             Path::new(&wal_path),
         );
         self.update_from_health_check(&report);
@@ -109,7 +109,7 @@ impl WalObservability {
     }
 
     pub fn refresh_for_path(&self, wal_path: &Path) {
-        let report = paro_storage::wal::recovery::segment_catalog_health_check_read_only(wal_path);
+        let report = paro_journal::wal::recovery::segment_catalog_health_check_read_only(wal_path);
         self.update_from_health_check(&report);
     }
 

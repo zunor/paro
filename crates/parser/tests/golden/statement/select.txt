@@ -56,6 +56,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -309,6 +310,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -378,6 +380,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -449,6 +452,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -527,6 +531,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -605,6 +610,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -683,6 +689,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -794,6 +801,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -953,6 +961,7 @@ Query(
         ],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -1115,6 +1124,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -1277,6 +1287,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -1439,6 +1450,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -1601,6 +1613,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -1763,6 +1776,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -1925,6 +1939,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -2087,6 +2102,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -2179,6 +2195,7 @@ StatementWithSettings {
             order_by: [],
             limit: [],
             offset: None,
+            locking: None,
             ignore_result: false,
         },
     ),
@@ -2370,6 +2387,7 @@ StatementWithSettings {
             order_by: [],
             limit: [],
             offset: None,
+            locking: None,
             ignore_result: false,
         },
     ),
@@ -2533,6 +2551,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -2695,6 +2714,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -2857,6 +2877,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -2926,7 +2947,116 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: true,
+    },
+)
+
+
+---------- Input ----------
+select * from t where id = 1 for update;
+---------- Output ---------
+SELECT * FROM t WHERE id = 1 FOR UPDATE
+---------- AST ------------
+Query(
+    Query {
+        span: Some(
+            0..28,
+        ),
+        with: None,
+        body: Select(
+            SelectStmt {
+                span: Some(
+                    0..28,
+                ),
+                hints: None,
+                distinct: false,
+                top_n: None,
+                select_list: [
+                    StarColumns {
+                        qualified: [
+                            Star(
+                                Some(
+                                    7..8,
+                                ),
+                            ),
+                        ],
+                        column_filter: None,
+                    },
+                ],
+                from: [
+                    Table {
+                        span: Some(
+                            14..15,
+                        ),
+                        database: None,
+                        schema: None,
+                        table: Identifier {
+                            span: Some(
+                                14..15,
+                            ),
+                            name: "t",
+                            quote: None,
+                            ident_type: None,
+                        },
+                        alias: None,
+                        temporal: None,
+                        with_options: None,
+                        pivot: None,
+                        unpivot: None,
+                        sample: None,
+                    },
+                ],
+                selection: Some(
+                    BinaryOp {
+                        span: Some(
+                            25..26,
+                        ),
+                        op: Eq,
+                        left: ColumnRef {
+                            span: Some(
+                                22..24,
+                            ),
+                            column: ColumnRef {
+                                schema: None,
+                                table: None,
+                                column: Name(
+                                    Identifier {
+                                        span: Some(
+                                            22..24,
+                                        ),
+                                        name: "id",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                ),
+                            },
+                        },
+                        right: Literal {
+                            span: Some(
+                                27..28,
+                            ),
+                            value: UInt64(
+                                1,
+                            ),
+                        },
+                    },
+                ),
+                group_by: None,
+                having: None,
+                window_list: None,
+                qualify: None,
+            },
+        ),
+        order_by: [],
+        limit: [],
+        offset: None,
+        locking: Some(
+            QueryLockingClause {
+                mode: Update,
+            },
+        ),
+        ignore_result: false,
     },
 )
 
@@ -3088,6 +3218,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -3198,6 +3329,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -3308,6 +3440,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -3418,6 +3551,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -3528,6 +3662,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -3707,6 +3842,7 @@ Query(
                                 order_by: [],
                                 limit: [],
                                 offset: None,
+                                locking: None,
                                 ignore_result: false,
                             },
                         },
@@ -3721,6 +3857,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -3900,6 +4037,7 @@ Query(
                                 order_by: [],
                                 limit: [],
                                 offset: None,
+                                locking: None,
                                 ignore_result: false,
                             },
                         },
@@ -3914,6 +4052,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4093,6 +4232,7 @@ Query(
                                 order_by: [],
                                 limit: [],
                                 offset: None,
+                                locking: None,
                                 ignore_result: false,
                             },
                         },
@@ -4107,6 +4247,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4284,6 +4425,7 @@ Query(
                                 order_by: [],
                                 limit: [],
                                 offset: None,
+                                locking: None,
                                 ignore_result: false,
                             },
                         },
@@ -4298,6 +4440,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4412,6 +4555,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4541,6 +4685,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4611,6 +4756,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4659,6 +4805,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4707,6 +4854,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4755,6 +4903,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4844,6 +4993,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -4951,6 +5101,7 @@ Query(
                                 order_by: [],
                                 limit: [],
                                 offset: None,
+                                locking: None,
                                 ignore_result: false,
                             },
                         },
@@ -4973,6 +5124,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5122,6 +5274,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5279,6 +5432,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5403,6 +5557,7 @@ Query(
                             order_by: [],
                             limit: [],
                             offset: None,
+                            locking: None,
                             ignore_result: false,
                         },
                         alias: Some(
@@ -5433,6 +5588,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5511,6 +5667,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5587,6 +5744,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5665,6 +5823,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5750,6 +5909,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5833,6 +5993,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -5918,6 +6079,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6005,6 +6167,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6092,6 +6255,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6194,6 +6358,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6298,6 +6463,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6374,6 +6540,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6460,6 +6627,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6519,6 +6687,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6594,6 +6763,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6700,6 +6870,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6868,6 +7039,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -6971,6 +7143,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7042,6 +7215,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7192,6 +7366,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7350,6 +7525,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7506,6 +7682,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7681,6 +7858,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7836,6 +8014,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -7967,6 +8146,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8098,6 +8278,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8237,6 +8418,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8420,6 +8602,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8546,6 +8729,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8672,6 +8856,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8800,6 +8985,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -8928,6 +9114,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -9056,6 +9243,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -9240,6 +9428,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -9537,6 +9726,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )
@@ -9848,6 +10038,7 @@ Query(
                                                     },
                                                 ],
                                                 offset: None,
+                                                locking: None,
                                                 ignore_result: false,
                                             },
                                             alias: None,
@@ -9980,6 +10171,7 @@ Query(
                             order_by: [],
                             limit: [],
                             offset: None,
+                            locking: None,
                             ignore_result: false,
                         },
                     },
@@ -10039,6 +10231,7 @@ Query(
         order_by: [],
         limit: [],
         offset: None,
+        locking: None,
         ignore_result: false,
     },
 )

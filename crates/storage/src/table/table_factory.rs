@@ -7,6 +7,7 @@ use crate::meta::TabletMetaManager;
 use crate::tablet::{KeysType, Tablet, TabletColumn, TabletIdentity, TabletSchema};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use paro_transaction::{DatabaseId, LockNamespace, ShardedLockManager};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock};
@@ -30,6 +31,8 @@ pub struct TableFactory {
     meta_manager: Option<Arc<TabletMetaManager>>,
     storage_root: PathBuf,
     id_allocator: Arc<dyn TabletIdAllocator>,
+    lock_manager: Arc<ShardedLockManager>,
+    lock_namespace: LockNamespace,
 }
 
 impl Default for TableFactory {
@@ -45,6 +48,8 @@ impl TableFactory {
             meta_manager,
             storage_root,
             id_allocator: Arc::new(LocalTabletIdAllocator),
+            lock_manager: Arc::new(ShardedLockManager::default()),
+            lock_namespace: LockNamespace::single_tenant(DatabaseId::new(0)),
         }
     }
 
@@ -55,6 +60,16 @@ impl TableFactory {
 
     pub fn with_id_allocator(mut self, id_allocator: Arc<dyn TabletIdAllocator>) -> Self {
         self.id_allocator = id_allocator;
+        self
+    }
+
+    pub fn with_transaction_locks(
+        mut self,
+        lock_manager: Arc<ShardedLockManager>,
+        lock_namespace: LockNamespace,
+    ) -> Self {
+        self.lock_manager = lock_manager;
+        self.lock_namespace = lock_namespace;
         self
     }
 
@@ -117,7 +132,13 @@ impl TableFactory {
                 "TableFactory::open_from_descriptor requires an explicit TabletMetaManager",
             )
         })?;
-        let tablet = Tablet::open(descriptor.tablet_id, &data_dir, meta_manager)?;
+        let tablet = Tablet::open_with_lock_manager(
+            descriptor.tablet_id,
+            &data_dir,
+            meta_manager,
+            Arc::clone(&self.lock_manager),
+            self.lock_namespace,
+        )?;
 
         validate_descriptor_match(&tablet, descriptor)?;
 
@@ -157,13 +178,15 @@ impl TableFactory {
             identity.tablet_id,
         );
 
-        let tablet = Tablet::new(
+        let tablet = Tablet::new_with_lock_manager(
             identity.tablet_id,
             identity.table_id,
             identity.partition_id,
             schema,
             &data_dir,
             self.meta_manager.clone(),
+            Arc::clone(&self.lock_manager),
+            self.lock_namespace,
         )?;
         tablet.init()?;
         tablet.save_meta()?;

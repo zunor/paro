@@ -50,12 +50,65 @@ pub struct AttachedDatabaseWalMetricsSnapshot {
     pub journal_delete_patch_count: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachedDatabaseTransactionMetricsSnapshot {
+    pub txn_begin_count: u64,
+    pub txn_begin_latency_us_total: u64,
+    pub txn_begin_latency_us_peak: u64,
+    pub txn_commit_count: u64,
+    pub txn_commit_latency_us_total: u64,
+    pub txn_commit_latency_us_peak: u64,
+    pub txn_commit_prepare_latency_us_total: u64,
+    pub txn_commit_prepare_latency_us_peak: u64,
+    pub txn_commit_validate_latency_us_total: u64,
+    pub txn_commit_validate_latency_us_peak: u64,
+    pub group_commit_fence_us_total: u64,
+    pub group_commit_fence_us_peak: u64,
+    pub txn_commit_durable_latency_us_total: u64,
+    pub txn_commit_durable_latency_us_peak: u64,
+    pub commit_required_publish_wait_us_total: u64,
+    pub commit_required_publish_wait_us_peak: u64,
+    pub txn_commit_publish_latency_us_total: u64,
+    pub txn_commit_publish_latency_us_peak: u64,
+    pub commit_ack_mode: String,
+    pub write_conflict_index_size: u64,
+    pub write_conflict_index_fine_entries: u64,
+    pub write_conflict_index_fine_summary_entries: u64,
+    pub write_conflict_index_coarse_entries: u64,
+    pub lock_wait_count: u64,
+    pub lock_wait_duration_us: u64,
+    pub lock_wound_wait_abort_count: u64,
+    pub lock_deadlock_abort_count: u64,
+    pub durable_published_lag_commits: u64,
+    pub durable_published_lag_ms: u64,
+    pub backpressure_throttle_count: u64,
+    pub ssi_validation_abort_count: u64,
+    pub ssi_abort_due_to_coarse_scan_marker: u64,
+    pub read_tracker_record_count: u64,
+    pub read_tracker_coarsened_count: u64,
+    pub read_tracking_hint_count: u64,
+    pub read_tracking_policy_escalation_count: u64,
+    pub read_tracking_point_critical_count: u64,
+    pub read_tracking_range_critical_count: u64,
+    pub read_tracking_analytical_scan_count: u64,
+    pub read_tracking_safe_snapshot_preferred_count: u64,
+    pub derived_index_lag_ts: u64,
+    pub derived_delta_merge_cost: u64,
+    pub commit_participant_count: u64,
+    pub inflight_batch_conflict_reject_count: u64,
+    pub retention_watermark_lag_ms: u64,
+    pub oldest_active_rw_lag_ms: u64,
+    pub read_snapshot_lease_count: u64,
+    pub active_rw_txn_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttachedDatabaseSnapshot {
     pub identity: DatabaseSnapshotIdentity,
     pub catalog: Arc<ParoCatalog>,
     pub tablet_meta: Option<Arc<TabletMetaManager>>,
     pub wal_metrics: AttachedDatabaseWalMetricsSnapshot,
+    pub transaction_metrics: AttachedDatabaseTransactionMetricsSnapshot,
 }
 
 impl AttachedDatabaseSnapshot {
@@ -85,6 +138,10 @@ impl AttachedDatabaseSnapshot {
 
     pub fn wal_metrics(&self) -> &AttachedDatabaseWalMetricsSnapshot {
         &self.wal_metrics
+    }
+
+    pub fn transaction_metrics(&self) -> &AttachedDatabaseTransactionMetricsSnapshot {
+        &self.transaction_metrics
     }
 }
 

@@ -12,6 +12,7 @@ use paro_common::types::LogicalType;
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::{InsertOnConflictAction, TableHandle};
 use paro_storage::tablet::{KeysType, TabletReaderParams};
+use paro_transaction::{ReadTs, TransactionView};
 
 const BENCH_ROWS: i32 = 4_096;
 
@@ -69,6 +70,11 @@ fn collect_row_ids_by_id(table: &TableHandle) -> HashMap<i32, u64> {
     row_ids
 }
 
+fn read_view(table: &TableHandle) -> TransactionView {
+    let visible = u64::try_from(table.max_version()).unwrap_or(0);
+    TransactionView::autocommit(ReadTs::new(visible))
+}
+
 struct DoNothingBenchState {
     table: TableHandle,
     conflict_chunk: Chunk,
@@ -94,10 +100,10 @@ fn pk_insert_on_conflict_do_nothing_all_conflicts() {
     let state = do_nothing_state();
     let affected = state
         .table
-        .insert_on_conflict(
+        .insert_on_conflict_direct(
+            &read_view(&state.table),
             &state.conflict_chunk,
             &InsertOnConflictAction::DoNothing,
-            None,
         )
         .unwrap();
     black_box(affected);
@@ -110,13 +116,13 @@ fn pk_insert_on_conflict_do_update_non_key_columns() {
     let prices: Vec<i32> = ids.iter().map(|id| id * 10 + 7).collect();
     let stocks: Vec<i32> = ids.iter().map(|id| id * 100 + 7).collect();
     let affected = table
-        .insert_on_conflict(
+        .insert_on_conflict_direct(
+            &read_view(&table),
             &build_chunk(&ids, &prices, &stocks),
             &InsertOnConflictAction::DoUpdate {
                 target_columns: vec![2],
                 source_columns: vec![2],
             },
-            None,
         )
         .unwrap();
     black_box(affected);
@@ -129,7 +135,7 @@ fn pk_partial_update_scan_latest_rows() {
     let target_row_ids: Vec<u64> = (0..256).map(|id| row_ids[&(id * 8)]).collect();
     let new_values: Vec<Value> = (0..256).map(|idx| Value::Integer(10_000 + idx)).collect();
     table
-        .update(&target_row_ids, &[2], &[new_values], None)
+        .update_direct(&read_view(&table), &target_row_ids, &[2], &[new_values])
         .unwrap();
 
     let visible_rows: usize = table

@@ -25,13 +25,35 @@ pub struct PreparedStatementSummary {
     pub custom_plans: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorSummary {
     pub name: String,
     pub statement: String,
     pub is_holdable: bool,
     pub is_binary: bool,
     pub is_scrollable: bool,
+    pub snapshot_read_ts: Option<u64>,
+    pub snapshot_pin_duration_us: Option<u64>,
+    pub snapshot_owner_session_id: Option<u64>,
+    pub snapshot_portal_id: Option<String>,
+    pub snapshot_retention_policy: String,
+}
+
+impl Default for CursorSummary {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            statement: String::new(),
+            is_holdable: false,
+            is_binary: false,
+            is_scrollable: false,
+            snapshot_read_ts: None,
+            snapshot_pin_duration_us: None,
+            snapshot_owner_session_id: None,
+            snapshot_portal_id: None,
+            snapshot_retention_policy: "none".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

@@ -14,7 +14,6 @@ use crate::index::fulltext::tokenizer::TokenizerKind;
 use crate::index::hnsw::SearchParams;
 use crate::index::{BoundIndex, Predicate, PredicateResult, PredicateTree};
 use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
-use crate::primary_key::RowID;
 use crate::rowset::{SegmentIterator, SparseVector};
 use crate::search::{
     CoverageState, OpenedSearchCursor, ResourceBudget, SearchBatchConfig, SearchBatchState,
@@ -27,12 +26,10 @@ use crate::tablet::tablet_reader::TabletReaderParams;
 use crate::tablet::{KeysType, TabletColumn, TabletSchema};
 use crate::test_utils::*;
 use crate::transaction::txn::Transaction;
-use crate::wal::wal_entry::WalEntry;
-use crate::wal::wal_reader::WalReader;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_journal::segments::SegmentCatalogStore;
+use paro_transaction::{CommitTs, ReadTs, RetentionLeaseKind, TransactionView};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -86,6 +83,11 @@ fn create_table_from_specs(specs: &[TableColumnSpec]) -> TableHandle {
     TableFactory::default()
         .create_table_from_specs(specs)
         .expect("create table from specs")
+}
+
+fn read_view(table: &TableHandle) -> TransactionView {
+    let visible = u64::try_from(table.max_version()).unwrap_or(0);
+    TransactionView::autocommit(ReadTs::new(visible))
 }
 
 fn open_table_from_descriptor_with_meta_manager(
@@ -643,7 +645,9 @@ fn primary_key_append_and_delete() {
 
     // Delete key 2
     let del_keys = test_chunk_from_vectors(vec![test_i32_vector(&[2])]);
-    let removed = table.delete_by_primary_keys(&del_keys, None).unwrap();
+    let removed = table
+        .delete_by_primary_keys_direct(&read_view(&table), &del_keys)
+        .unwrap();
     assert_eq!(removed, 1);
     assert_eq!(
         table
@@ -656,7 +660,7 @@ fn primary_key_append_and_delete() {
 }
 
 #[test]
-fn row_id_delete_writes_delvec_and_wal() {
+fn row_id_delete_persists_delete_vector() {
     let table = create_table(&[LogicalType::Integer]);
     let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]);
     table.append(&chunk).unwrap();
@@ -667,26 +671,21 @@ fn row_id_delete_writes_delvec_and_wal() {
     reader.prepare().unwrap();
 
     let mut target_row_id = None;
-    let mut target_location = None;
     while let Some(chunk) = reader.get_next_chunk().unwrap() {
         let values = chunk.column(0).unwrap();
         let row_ids = chunk.column(1).unwrap();
         for idx in 0..chunk.size() {
             if values.get_i32(idx) == Some(2) {
-                let raw = row_ids.get_i64(idx).unwrap() as u64;
-                let row_id = RowID::from_raw(raw);
-                let location = table.tablet().decode_row_id(row_id).unwrap();
-                target_row_id = Some(raw);
-                target_location =
-                    Some((location.rowset_id, location.segment_id, location.row_offset));
+                target_row_id = Some(row_ids.get_i64(idx).unwrap() as u64);
             }
         }
     }
 
     let target_row_id = target_row_id.expect("row_id for value=2");
-    let target_location = target_location.expect("decoded row location");
 
-    let deleted = table.delete(&[target_row_id], None).unwrap();
+    let deleted = table
+        .delete_direct(&read_view(&table), &[target_row_id])
+        .unwrap();
     assert_eq!(deleted, 1);
 
     let mut values_after_delete = Vec::new();
@@ -698,33 +697,59 @@ fn row_id_delete_writes_delvec_and_wal() {
     }
     values_after_delete.sort_unstable();
     assert_eq!(values_after_delete, vec![1, 3]);
+}
 
-    let wal_path = table.tablet().data_dir().join("tablet.wal");
-    let catalog_store = SegmentCatalogStore::from_seed_path(&wal_path);
-    let catalog = catalog_store
-        .load()
-        .unwrap()
-        .expect("tablet WAL catalog should exist after row_id delete");
-    let active_segment = catalog
-        .active_segment()
-        .expect("tablet WAL catalog should have an active segment");
-    let mut wal_reader = WalReader::open(
-        &catalog_store
-            .layout()
-            .segment_path(active_segment.segment_id),
-    )
-    .unwrap()
-    .expect("active WAL segment should exist after row_id delete");
-    let mut saw_row_id_delete = false;
-    while let Some(entry) = wal_reader.read_entry().unwrap() {
-        if let WalEntry::RowIdDelete { locations } = entry {
-            if locations.contains(&target_location) {
-                saw_row_id_delete = true;
-                break;
-            }
-        }
-    }
-    assert!(saw_row_id_delete, "expected RowIdDelete WAL entry");
+#[test]
+fn delete_all_uses_transaction_view_read_ts_for_target_discovery() {
+    let table = create_table(&[LogicalType::Integer]);
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]))
+        .unwrap();
+    let view = read_view(&table);
+
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&[4])]))
+        .unwrap();
+
+    let deleted = table.delete_all_direct(&view).unwrap();
+    assert_eq!(deleted, 3);
+
+    let rows = collect_i32_column(&table.scan_chunks().unwrap(), 0);
+    assert_eq!(rows, vec![4]);
+}
+
+#[test]
+fn update_target_discovery_uses_transaction_view_read_ts() {
+    let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
+    table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1]),
+            test_i32_vector(&[10]),
+        ]))
+        .unwrap();
+    let view = read_view(&table);
+
+    table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[2]),
+            test_i32_vector(&[20]),
+        ]))
+        .unwrap();
+    let row_ids = collect_row_ids_by_id(&table);
+
+    let err = table
+        .update_direct(&view, &[row_ids[&2]], &[1], &[vec![Value::Integer(200)]])
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("UPDATE target row not found"),
+        "unexpected error: {err}"
+    );
+
+    let updated = table
+        .update_direct(&view, &[row_ids[&1]], &[1], &[vec![Value::Integer(100)]])
+        .unwrap();
+    assert_eq!(updated, 1);
+    assert_eq!(collect_rows_i32_pair(&table), vec![(1, 100), (2, 20)]);
 }
 
 #[test]
@@ -754,11 +779,11 @@ fn primary_key_update_changes_key_and_row_values() {
     let target_row_id = target_row_id.expect("row_id for id=1");
 
     let updated = table
-        .update(
+        .update_direct(
+            &read_view(&table),
             &[target_row_id],
             &[0, 1],
             &[vec![Value::Integer(3)], vec![Value::Integer(15)]],
-            None,
         )
         .unwrap();
     assert_eq!(updated, 1);
@@ -816,7 +841,12 @@ fn duplicate_key_update_rewrites_row_by_row_id() {
     let target_row_id = target_row_id.expect("row_id for id=2");
 
     let updated = table
-        .update(&[target_row_id], &[1], &[vec![Value::Integer(99)]], None)
+        .update_direct(
+            &read_view(&table),
+            &[target_row_id],
+            &[1],
+            &[vec![Value::Integer(99)]],
+        )
         .unwrap();
     assert_eq!(updated, 1);
 
@@ -846,10 +876,10 @@ fn insert_on_conflict_do_nothing_keeps_existing_primary_key_rows() {
         .unwrap();
 
     let affected = table
-        .insert_on_conflict(
+        .insert_on_conflict_direct(
+            &read_view(&table),
             &test_chunk_from_vectors(vec![test_i32_vector(&[2, 3]), test_i32_vector(&[200, 30])]),
             &InsertOnConflictAction::DoNothing,
-            None,
         )
         .unwrap();
 
@@ -879,7 +909,8 @@ fn insert_on_conflict_do_update_writes_partial_rowset_for_non_key_columns() {
         .unwrap();
 
     let affected = table
-        .insert_on_conflict(
+        .insert_on_conflict_direct(
+            &read_view(&table),
             &test_chunk_from_vectors(vec![
                 test_i32_vector(&[2, 3]),
                 test_i32_vector(&[999, 30]),
@@ -889,7 +920,6 @@ fn insert_on_conflict_do_update_writes_partial_rowset_for_non_key_columns() {
                 target_columns: vec![2],
                 source_columns: vec![2],
             },
-            None,
         )
         .unwrap();
 
@@ -938,7 +968,12 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
 
     let row_ids = collect_row_ids_by_id(&table);
     table
-        .update(&[row_ids[&2]], &[2], &[vec![Value::Integer(222)]], None)
+        .update_direct(
+            &read_view(&table),
+            &[row_ids[&2]],
+            &[2],
+            &[vec![Value::Integer(222)]],
+        )
         .unwrap();
     let row_ids_after = collect_row_ids_by_id(&table);
 
@@ -976,7 +1011,12 @@ fn pk_compaction_materializes_partial_update_chains_into_full_rows() {
 
     let row_ids = collect_row_ids_by_id(&table);
     let updated = table
-        .update(&[row_ids[&2]], &[2], &[vec![Value::Integer(222)]], None)
+        .update_direct(
+            &read_view(&table),
+            &[row_ids[&2]],
+            &[2],
+            &[vec![Value::Integer(222)]],
+        )
         .unwrap();
     assert_eq!(updated, 1);
 
@@ -1047,11 +1087,11 @@ fn partial_update_restart_rebuilds_primary_key_row_visibility() {
 
     let row_ids = collect_row_ids_by_id(&table);
     let updated = table
-        .update(
+        .update_direct(
+            &read_view(&table),
             &[row_ids[&1]],
             &[2],
             &[vec![Value::Varchar("after-restart".to_string())]],
-            None,
         )
         .unwrap();
     assert_eq!(updated, 1);
@@ -1106,11 +1146,11 @@ fn partial_update_restart_with_meta_manager_rebuilds_primary_key_row_visibility(
 
     let row_ids = collect_row_ids_by_id(&table);
     let updated = table
-        .update(
+        .update_direct(
+            &read_view(&table),
             &[row_ids[&1]],
             &[2],
             &[vec![Value::Varchar("after-restart".to_string())]],
-            None,
         )
         .unwrap();
     assert_eq!(updated, 1);
@@ -1165,21 +1205,28 @@ fn delete_update_roundtrip_preserves_latest_rows() {
     let row_ids = collect_row_ids_by_id(&table);
 
     let updated = table
-        .update(&[row_ids[&2]], &[1], &[vec![Value::Integer(200)]], None)
+        .update_direct(
+            &read_view(&table),
+            &[row_ids[&2]],
+            &[1],
+            &[vec![Value::Integer(200)]],
+        )
         .unwrap();
     assert_eq!(updated, 1);
 
-    let deleted = table.delete(&[row_ids[&1]], None).unwrap();
+    let deleted = table
+        .delete_direct(&read_view(&table), &[row_ids[&1]])
+        .unwrap();
     assert_eq!(deleted, 1);
 
     // Re-resolve row_id after DML to avoid stale physical references.
     let row_ids_after = collect_row_ids_by_id(&table);
     let updated_again = table
-        .update(
+        .update_direct(
+            &read_view(&table),
             &[row_ids_after[&3]],
             &[1],
             &[vec![Value::Integer(330)]],
-            None,
         )
         .unwrap();
     assert_eq!(updated_again, 1);
@@ -1199,9 +1246,9 @@ fn vector_search_filters_rows_deleted_by_primary_keys() {
 
     let delete_ids: Vec<i32> = (0..50).collect();
     let removed = table
-        .delete_by_primary_keys(
+        .delete_by_primary_keys_direct(
+            &read_view(&table),
             &test_chunk_from_vectors(vec![test_i32_vector(&delete_ids)]),
-            None,
         )
         .unwrap();
     assert_eq!(removed, 50);
@@ -1261,7 +1308,8 @@ fn vector_search_returns_updated_vector_after_update() {
 
     let row_ids = collect_row_ids_by_id(&table);
     let updated = table
-        .update(
+        .update_direct(
+            &read_view(&table),
             &[row_ids[&1]],
             &[1],
             &[vec![Value::Array(
@@ -1269,7 +1317,6 @@ fn vector_search_returns_updated_vector_after_update() {
                 LogicalType::Float,
                 2,
             )]],
-            None,
         )
         .unwrap();
     assert_eq!(updated, 1);
@@ -1539,13 +1586,13 @@ fn full_table_delete_non_pk_marks_all_rows() {
     let chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]);
     table.append(&chunk).unwrap();
 
-    let deleted = table.delete_all(None).unwrap();
+    let deleted = table.delete_all_direct(&read_view(&table)).unwrap();
     assert_eq!(deleted, 3);
 
     let visible_rows: usize = table.scan_chunks().unwrap().iter().map(|c| c.size()).sum();
     assert_eq!(visible_rows, 0);
 
-    let deleted_again = table.delete_all(None).unwrap();
+    let deleted_again = table.delete_all_direct(&read_view(&table)).unwrap();
     assert_eq!(deleted_again, 0);
 }
 
@@ -1569,7 +1616,7 @@ fn full_table_delete_primary_key_clears_index() {
         3
     );
 
-    let deleted = table.delete_all(None).unwrap();
+    let deleted = table.delete_all_direct(&read_view(&table)).unwrap();
     assert_eq!(deleted, 3);
     assert_eq!(
         table
@@ -1583,7 +1630,7 @@ fn full_table_delete_primary_key_clears_index() {
     let visible_rows: usize = table.scan_chunks().unwrap().iter().map(|c| c.size()).sum();
     assert_eq!(visible_rows, 0);
 
-    let deleted_again = table.delete_all(None).unwrap();
+    let deleted_again = table.delete_all_direct(&read_view(&table)).unwrap();
     assert_eq!(deleted_again, 0);
 }
 
@@ -1601,23 +1648,27 @@ fn transactional_delete_update_commit_applies_in_single_commit() {
 
     let updated_2 = table
         .update(
+            &read_view(&table),
             &[row_ids[&2]],
             &[1],
             &[vec![Value::Integer(200)]],
-            Some(txn.clone()),
+            txn.clone(),
         )
         .unwrap();
     assert_eq!(updated_2, 1);
 
-    let deleted_1 = table.delete(&[row_ids[&1]], Some(txn.clone())).unwrap();
+    let deleted_1 = table
+        .delete(&read_view(&table), &[row_ids[&1]], txn.clone())
+        .unwrap();
     assert_eq!(deleted_1, 1);
 
     let updated_3 = table
         .update(
+            &read_view(&table),
             &[row_ids[&3]],
             &[1],
             &[vec![Value::Integer(300)]],
-            Some(txn.clone()),
+            txn.clone(),
         )
         .unwrap();
     assert_eq!(updated_3, 1);
@@ -1647,15 +1698,18 @@ fn transactional_delete_update_rollback_keeps_storage_unchanged() {
 
     let updated_2 = table
         .update(
+            &read_view(&table),
             &[row_ids[&2]],
             &[1],
             &[vec![Value::Integer(220)]],
-            Some(txn.clone()),
+            txn.clone(),
         )
         .unwrap();
     assert_eq!(updated_2, 1);
 
-    let deleted_1 = table.delete(&[row_ids[&1]], Some(txn.clone())).unwrap();
+    let deleted_1 = table
+        .delete(&read_view(&table), &[row_ids[&1]], txn.clone())
+        .unwrap();
     assert_eq!(deleted_1, 1);
 
     assert_eq!(
@@ -1685,12 +1739,12 @@ fn transactional_concurrent_delete_conflict_on_same_primary_key() {
     let txn2 = Arc::new(Transaction::new(3002, 3002));
 
     let removed = table
-        .delete_by_primary_keys(&key_chunk, Some(txn1.clone()))
+        .delete_by_primary_keys(&read_view(&table), &key_chunk, txn1.clone())
         .unwrap();
     assert_eq!(removed, 1);
 
     let err = table
-        .delete_by_primary_keys(&key_chunk, Some(txn2.clone()))
+        .delete_by_primary_keys(&read_view(&table), &key_chunk, txn2.clone())
         .unwrap_err();
     assert!(
         err.to_string().contains("write-write conflict"),
@@ -1714,10 +1768,11 @@ fn transactional_delete_and_update_conflict_on_same_row() {
     let update_txn = Arc::new(Transaction::new(3101, 3101));
     let updated = table
         .update(
+            &read_view(&table),
             &[row_ids[&1]],
             &[1],
             &[vec![Value::Integer(999)]],
-            Some(update_txn.clone()),
+            update_txn.clone(),
         )
         .unwrap();
     assert_eq!(updated, 1);
@@ -1725,7 +1780,7 @@ fn transactional_delete_and_update_conflict_on_same_row() {
     let delete_txn = Arc::new(Transaction::new(3102, 3102));
     let key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[1])]);
     let err = table
-        .delete_by_primary_keys(&key_chunk, Some(delete_txn.clone()))
+        .delete_by_primary_keys(&read_view(&table), &key_chunk, delete_txn.clone())
         .unwrap_err();
     assert!(
         err.to_string().contains("write-write conflict"),
@@ -1758,7 +1813,7 @@ fn transactional_delete_survives_pk_compaction_relocation() {
     let key_chunk = test_chunk_from_vectors(vec![test_i32_vector(&[2])]);
     let txn = Arc::new(Transaction::new(3201, 3201));
     let removed = table
-        .delete_by_primary_keys(&key_chunk, Some(txn.clone()))
+        .delete_by_primary_keys(&read_view(&table), &key_chunk, txn.clone())
         .unwrap();
     assert_eq!(removed, 1);
     let row_ids_before_compaction = collect_row_ids_by_id(&table);
@@ -2036,7 +2091,11 @@ fn art_declared_index_auto_builds_on_transaction_commit() {
 
     let txn = Arc::new(Transaction::new(9101, 9101));
     table
-        .append_with_transaction(&chunk_with_i32_range(20, 24, 200), Some(txn.clone()))
+        .append_with_transaction(
+            &read_view(&table),
+            &chunk_with_i32_range(20, 24, 200),
+            txn.clone(),
+        )
         .unwrap();
 
     assert!(table
@@ -2200,6 +2259,35 @@ fn fulltext_definition_on_empty_table_installs_empty_queryable_generation() {
         snapshot.maintenance_state.recovery.priority,
         crate::search::MaintenancePriority::Idle
     );
+    assert_eq!(
+        snapshot.indexed_through_ts,
+        u64::try_from(table.max_version()).unwrap_or(0)
+    );
+}
+
+#[test]
+fn search_snapshot_pins_derived_delta_when_generation_lags_read_ts() {
+    let table = create_table(&[LogicalType::Varchar]);
+    let definition_id = register_fulltext_definition(&table, 0, "simple");
+    let target_version = table.max_version().saturating_add(10);
+
+    let snapshot = table
+        .open_search_snapshot(definition_id, table.tablet_id(), target_version)
+        .expect("open lagging search snapshot");
+    let lease_info = snapshot
+        .derived_lag_lease_info()
+        .expect("derived lag lease info")
+        .expect("derived lag lease");
+
+    assert_eq!(lease_info.kind, RetentionLeaseKind::DerivedLag);
+    assert_eq!(
+        lease_info.commit_ts_floor,
+        Some(CommitTs::new(snapshot.generation.indexed_through_ts))
+    );
+    assert_eq!(
+        lease_info.commit_ts_ceiling,
+        Some(CommitTs::new(target_version as u64))
+    );
 }
 
 #[test]
@@ -2239,8 +2327,12 @@ fn search_maintenance_sweep_reports_tombstone_pressure() {
         .unwrap();
 
     let row_ids = collect_row_ids_by_id(&table);
-    table.delete(&[row_ids[&1]], None).unwrap();
-    table.delete(&[row_ids[&2]], None).unwrap();
+    table
+        .delete_direct(&read_view(&table), &[row_ids[&1]])
+        .unwrap();
+    table
+        .delete_direct(&read_view(&table), &[row_ids[&2]])
+        .unwrap();
 
     let report = table.search_maintenance_sweep().unwrap();
     assert!(report.compaction_requested);
@@ -2374,11 +2466,12 @@ fn fulltext_registry_definition_auto_builds_on_transaction_commit() {
     let txn = Arc::new(Transaction::new(9001, 9001));
     table
         .append_with_transaction(
+            &read_view(&table),
             &test_chunk_from_vectors(vec![
                 test_i32_vector(&[10, 11]),
                 test_string_vector(&["vector txn", "noise txn"]),
             ]),
-            Some(txn.clone()),
+            txn.clone(),
         )
         .unwrap();
 
@@ -2451,11 +2544,12 @@ fn sparse_registry_definition_auto_builds_on_transaction_commit() {
     let txn = Arc::new(Transaction::new(9101, 9101));
     table
         .append_with_transaction(
+            &read_view(&table),
             &test_chunk_from_vectors(vec![
                 test_i32_vector(&[10, 11]),
                 test_string_vector(&["{5:1.0}", "{2:0.6,5:0.4}"]),
             ]),
-            Some(txn.clone()),
+            txn.clone(),
         )
         .unwrap();
 
@@ -2576,7 +2670,12 @@ fn fulltext_late_definition_exact_tail_merge_resolves_partial_rows() {
 
     let row_ids = collect_row_ids_by_id(&table);
     table
-        .update(&[row_ids[&1]], &[1], &[vec![Value::Integer(15)]], None)
+        .update_direct(
+            &read_view(&table),
+            &[row_ids[&1]],
+            &[1],
+            &[vec![Value::Integer(15)]],
+        )
         .unwrap();
 
     let partial = table
@@ -2644,7 +2743,12 @@ fn sparse_late_definition_exact_tail_merge_resolves_partial_rows() {
 
     let row_ids = collect_row_ids_by_id(&table);
     table
-        .update(&[row_ids[&1]], &[1], &[vec![Value::Integer(15)]], None)
+        .update_direct(
+            &read_view(&table),
+            &[row_ids[&1]],
+            &[1],
+            &[vec![Value::Integer(15)]],
+        )
         .unwrap();
 
     let partial = table
@@ -2706,14 +2810,16 @@ fn fulltext_update_delete_respect_delete_bitmap() {
 
     let row_ids = collect_row_ids_by_id(&table);
     table
-        .update(
+        .update_direct(
+            &read_view(&table),
             &[row_ids[&2]],
             &[1],
             &[vec![Value::Varchar("noise beta".to_string())]],
-            None,
         )
         .unwrap();
-    table.delete(&[row_ids[&1]], None).unwrap();
+    table
+        .delete_direct(&read_view(&table), &[row_ids[&1]])
+        .unwrap();
 
     let vector_query = FullTextIndex::new_default().parse_query("vector").unwrap();
     let vector_chunks = table.fulltext_filter(1, &vector_query, None, &[0]).unwrap();

@@ -31,6 +31,7 @@ fn test_query_statements() {
         r#"select * from a right anti join b on a.a = b.a;"#,
         r#"select * from a full outer join b on a.a = b.a;"#,
         r#"select * FROM fuse_compat_table ignore_result;"#,
+        r#"select * from t where id = 1 for update;"#,
         r#"select * from a inner join b on a.a = b.a;"#,
         r#"select * from a left outer join b using(a);"#,
         r#"select * from a right outer join b using(a);"#,

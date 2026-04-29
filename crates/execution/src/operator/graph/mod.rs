@@ -16,5 +16,6 @@ pub mod graph_path;
 pub mod graph_project;
 pub mod graph_scan;
 pub mod graph_shortest_path;
+mod own_write;
 pub mod spillable_frontier;
 pub mod spillable_parent_arrays;

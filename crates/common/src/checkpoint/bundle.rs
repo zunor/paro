@@ -117,6 +117,7 @@ pub struct DerivedProgressBundle {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrimaryIndexProgressEntry {
     pub tablet_id: u64,
+    pub indexed_through_ts: u64,
     pub payload: Vec<u8>,
 }
 
@@ -124,5 +125,6 @@ pub struct PrimaryIndexProgressEntry {
 pub struct GraphManifestProgressEntry {
     pub graph_name: String,
     pub locator: String,
+    pub indexed_through_ts: u64,
     pub payload: Vec<u8>,
 }

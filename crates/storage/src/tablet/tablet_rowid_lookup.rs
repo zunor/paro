@@ -47,12 +47,14 @@ impl TabletReader {
                 if let Some(rowset) = self.rowsets.iter().find(|r| r.rowset_id() == rowset_id) {
                     return Ok(rowset.clone());
                 }
-                self.tablet.find_rowset_by_id(rowset_id).ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "Rowset {} not found while resolving row ids",
-                        rowset_id
-                    ))
-                })
+                self.tablet
+                    .find_retained_rowset_by_id(rowset_id)
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Rowset {} not found while resolving row ids",
+                            rowset_id
+                        ))
+                    })
             },
         )
     }

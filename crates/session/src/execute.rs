@@ -25,7 +25,14 @@ use paro_common::types::LogicalType;
 use paro_compiler::{compile_statement, compile_statement_with_parameters};
 use paro_context::{StatementCancellation, StatementOptions, StatementSource};
 use paro_execution::query_executor::executor::Executor;
-use paro_parser::ast::{CopyDirection, CopySource, CopyStmt, CopyTarget, ExecuteStmt, Statement};
+use paro_parser::ast::{
+    CopyDirection, CopySource, CopyStmt, CopyTarget, ExecuteStmt, Expr, Identifier, Literal, Query,
+    SetExpr, SetValues, Settings, Statement, TableReference,
+};
+use paro_transaction::{
+    IsolationLevel, LockMode, LockRequest, LockResource, ReadTrackingPolicy, ReadWritePromotion,
+    TableId,
+};
 use std::time::Instant;
 use tracing::{debug, error};
 
@@ -287,6 +294,45 @@ impl Session {
 
         if require_new_transaction {
             self.begin_transaction_internal()?;
+        }
+        let read_tracking_selection =
+            read_tracking_selection_for_statement(&stmt, self.transaction.isolation_level())?;
+        let read_tracking_policy = read_tracking_selection.policy;
+        if self.transaction.is_read_only() && read_tracking_selection.requires_read_write {
+            let err = paro_error::read_only_transaction();
+            if require_new_transaction {
+                let _ = self.rollback_auto_transaction(Some(&err));
+            }
+            return Err(err);
+        }
+        self.current_database
+            .transaction_manager()
+            .record_read_tracking_selection(
+                read_tracking_selection.policy,
+                read_tracking_selection.had_user_hint,
+                read_tracking_selection.escalated,
+            );
+        let promotion = self
+            .transaction
+            .prepare_statement_read_tracking_for_database_with_access(
+                self.current_database.transaction_manager(),
+                read_tracking_policy,
+                read_tracking_selection.requires_read_write,
+                paro_transaction::DatabaseId::new(self.current_database.id()),
+                self.current_database.name(),
+            )?;
+        if promotion == ReadWritePromotion::MustRestartUserVisible {
+            return Err(paro_error::serialization_failure(
+                "safe snapshot transaction must be restarted before executing a write",
+            ));
+        }
+        if statement_has_for_update(&stmt) {
+            if let Err(err) = self.acquire_select_for_update_locks(&stmt) {
+                if require_new_transaction {
+                    let _ = self.rollback_auto_transaction(Some(&err));
+                }
+                return Err(err);
+            }
         }
 
         let statement_completion = initial_statement_completion(&stmt);
@@ -737,6 +783,453 @@ fn normalize_copy_output_name(name: &str) -> String {
     name.rsplit('.').next().unwrap_or(name).to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadTrackingSelection {
+    policy: ReadTrackingPolicy,
+    had_user_hint: bool,
+    escalated: bool,
+    requires_read_write: bool,
+}
+
+impl ReadTrackingSelection {
+    const fn new(policy: ReadTrackingPolicy, requires_read_write: bool) -> Self {
+        Self {
+            policy,
+            had_user_hint: false,
+            escalated: false,
+            requires_read_write,
+        }
+    }
+
+    const fn with_hint(mut self, policy: ReadTrackingPolicy) -> Self {
+        self.policy = policy;
+        self.had_user_hint = true;
+        self
+    }
+
+    const fn conservative_for_write(mut self) -> Self {
+        self.policy = ReadTrackingPolicy::RangeCritical;
+        self.requires_read_write = true;
+        self.escalated = true;
+        self
+    }
+}
+
+fn read_tracking_selection_for_statement(
+    stmt: &Statement,
+    isolation: IsolationLevel,
+) -> Result<ReadTrackingSelection> {
+    let _is_serializable = isolation == IsolationLevel::Serializable;
+    match stmt {
+        Statement::StatementWithSettings { settings, stmt } => {
+            let mut selection = read_tracking_selection_for_statement(stmt, isolation)?;
+            if let Some(policy) = settings
+                .as_ref()
+                .map(read_tracking_hint_from_settings)
+                .transpose()?
+                .flatten()
+            {
+                selection = selection.with_hint(policy);
+                if selection.requires_read_write && policy != ReadTrackingPolicy::RangeCritical {
+                    selection = selection.conservative_for_write();
+                }
+            }
+            Ok(selection)
+        }
+        _ => Ok(default_read_tracking_selection_for_statement(stmt)),
+    }
+}
+
+fn read_tracking_hint_from_settings(settings: &Settings) -> Result<Option<ReadTrackingPolicy>> {
+    let SetValues::Expr(values) = &settings.values else {
+        return Ok(None);
+    };
+
+    for (identifier, value) in settings.identifiers.iter().zip(values.iter()) {
+        if !is_read_tracking_setting(identifier) {
+            continue;
+        }
+        let value = read_tracking_hint_value(value)?;
+        let Some(policy) = ReadTrackingPolicy::from_user_hint(&value) else {
+            return Err(paro_error::invalid_input(format!(
+                "unsupported read_tracking_policy hint '{}'; expected one of safe_snapshot_preferred, analytical_scan, point_critical, range_critical",
+                value
+            )));
+        };
+        return Ok(Some(policy));
+    }
+
+    Ok(None)
+}
+
+fn is_read_tracking_setting(identifier: &Identifier) -> bool {
+    matches!(
+        identifier
+            .name
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str(),
+        "read_tracking_policy" | "transaction_read_tracking_policy" | "read_tracking"
+    )
+}
+
+fn read_tracking_hint_value(expr: &Expr) -> Result<String> {
+    match expr {
+        Expr::Literal {
+            value: Literal::String(value),
+            ..
+        } => Ok(value.clone()),
+        Expr::ColumnRef { column, .. } => Ok(column.to_string()),
+        Expr::Literal {
+            value: Literal::Boolean(true),
+            ..
+        } => Ok("safe_snapshot_preferred".to_string()),
+        Expr::Literal {
+            value: Literal::Boolean(false),
+            ..
+        } => Ok("analytical_scan".to_string()),
+        other => Err(paro_error::invalid_input(format!(
+            "read_tracking_policy hint must be a string or identifier, got {other}"
+        ))),
+    }
+}
+
+fn default_read_tracking_selection_for_statement(stmt: &Statement) -> ReadTrackingSelection {
+    match stmt {
+        Statement::Query(query) if query_contains_for_update(query) => {
+            ReadTrackingSelection::new(ReadTrackingPolicy::RangeCritical, true)
+        }
+        Statement::Query(_) | Statement::Explain { .. } | Statement::ExplainAnalyze { .. } => {
+            ReadTrackingSelection::new(ReadTrackingPolicy::SafeSnapshotPreferred, false)
+        }
+        Statement::ReportIssue(_)
+        | Statement::VariableShow(_)
+        | Statement::ShowSettings { .. }
+        | Statement::ShowProcessList { .. }
+        | Statement::ShowMetrics { .. }
+        | Statement::ShowEngines { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowUserFunctions { .. }
+        | Statement::ShowTableFunctions { .. }
+        | Statement::ShowIndexes { .. }
+        | Statement::ShowLocks(_)
+        | Statement::ShowVariables { .. }
+        | Statement::SetRole { .. }
+        | Statement::SetSecondaryRoles { .. }
+        | Statement::ShowDatabases(_)
+        | Statement::ShowCreateDatabase(_)
+        | Statement::UseDatabase { .. }
+        | Statement::ConnectTo(_)
+        | Statement::ShowOnlineNodes(_)
+        | Statement::UseWarehouse(_)
+        | Statement::ShowWarehouses(_)
+        | Statement::InspectWarehouse(_)
+        | Statement::ShowWorkloadGroups(_)
+        | Statement::ShowSchemas(_)
+        | Statement::ShowDropSchemas(_)
+        | Statement::ShowCreateSchema(_)
+        | Statement::UseSchema { .. }
+        | Statement::ShowTables(_)
+        | Statement::ShowCreateTable(_)
+        | Statement::DescribeTable(_)
+        | Statement::ShowTablesStatus(_)
+        | Statement::ShowDropTables(_)
+        | Statement::ExistsTable(_)
+        | Statement::ShowStatistics(_)
+        | Statement::ShowCreateDictionary(_)
+        | Statement::ShowDictionaries(_)
+        | Statement::ShowColumns(_)
+        | Statement::ShowViews(_)
+        | Statement::DescribeView(_)
+        | Statement::ShowStreams(_)
+        | Statement::DescribeStream(_)
+        | Statement::ShowVirtualColumns(_)
+        | Statement::ShowUsers { .. }
+        | Statement::DescribeUser { .. }
+        | Statement::ShowRoles { .. }
+        | Statement::ShowGrants { .. }
+        | Statement::ShowObjectPrivileges(_)
+        | Statement::ShowGrantsOfRole(_)
+        | Statement::DescRowAccessPolicy(_)
+        | Statement::ShowTags(_)
+        | Statement::ShowStages { .. }
+        | Statement::DescribeStage { .. }
+        | Statement::ListStage { .. }
+        | Statement::DescribeConnection(_)
+        | Statement::ShowConnections(_)
+        | Statement::ShowFileFormats
+        | Statement::Presign(_)
+        | Statement::DescDatamaskPolicy(_)
+        | Statement::DescNetworkPolicy(_)
+        | Statement::ShowNetworkPolicies
+        | Statement::DescPasswordPolicy(_)
+        | Statement::ShowPasswordPolicies { .. }
+        | Statement::DescribeTask(_)
+        | Statement::ShowTasks(_)
+        | Statement::DescribePipe(_)
+        | Statement::DescribeNotification(_)
+        | Statement::ShowProcedures { .. }
+        | Statement::DescProcedure(_)
+        | Statement::ShowSequences { .. }
+        | Statement::DescSequence { .. }
+        | Statement::SetStmt { .. }
+        | Statement::UnSetStmt { .. }
+        | Statement::SetPriority { .. } => {
+            ReadTrackingSelection::new(ReadTrackingPolicy::SafeSnapshotPreferred, false)
+        }
+        Statement::Copy(copy) if copy.direction == CopyDirection::To => {
+            ReadTrackingSelection::new(ReadTrackingPolicy::SafeSnapshotPreferred, false)
+        }
+        Statement::Copy(copy) if copy.direction == CopyDirection::From => {
+            ReadTrackingSelection::new(ReadTrackingPolicy::RangeCritical, true)
+        }
+        _ => ReadTrackingSelection::new(ReadTrackingPolicy::RangeCritical, true),
+    }
+}
+
+impl Session {
+    fn acquire_select_for_update_locks(&self, stmt: &Statement) -> Result<()> {
+        let active = self.active_transaction().ok_or_else(|| {
+            paro_error::invalid_transaction_state(
+                "SELECT FOR UPDATE requires an active transaction".to_string(),
+            )
+        })?;
+        let mut requests = Vec::new();
+        collect_for_update_lock_requests(self, stmt, &mut requests)?;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        active.acquire_lock_requests(requests)
+    }
+}
+
+fn statement_has_for_update(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::StatementWithSettings { stmt, .. } => statement_has_for_update(stmt),
+        Statement::Query(query) => query_contains_for_update(query),
+        _ => false,
+    }
+}
+
+fn query_contains_for_update(query: &Query) -> bool {
+    query.locking.is_some() || set_expr_contains_for_update(&query.body)
+}
+
+fn set_expr_contains_for_update(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::Select(_) | SetExpr::Values { .. } => false,
+        SetExpr::Query(query) => query_contains_for_update(query),
+        SetExpr::SetOperation(operation) => {
+            set_expr_contains_for_update(&operation.left)
+                || set_expr_contains_for_update(&operation.right)
+        }
+    }
+}
+
+fn collect_for_update_lock_requests(
+    session: &Session,
+    stmt: &Statement,
+    out: &mut Vec<LockRequest>,
+) -> Result<()> {
+    match stmt {
+        Statement::StatementWithSettings { stmt, .. } => {
+            collect_for_update_lock_requests(session, stmt, out)
+        }
+        Statement::Query(query) => collect_query_for_update_locks(session, query, out),
+        _ => Ok(()),
+    }
+}
+
+fn collect_query_for_update_locks(
+    session: &Session,
+    query: &Query,
+    out: &mut Vec<LockRequest>,
+) -> Result<()> {
+    if query.locking.is_some() {
+        collect_set_expr_table_locks(session, &query.body, out)?;
+    }
+    collect_nested_query_locks(session, &query.body, out)
+}
+
+fn collect_nested_query_locks(
+    session: &Session,
+    expr: &SetExpr,
+    out: &mut Vec<LockRequest>,
+) -> Result<()> {
+    match expr {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                collect_nested_table_locks(session, table, out)?;
+            }
+            Ok(())
+        }
+        SetExpr::Query(query) => collect_query_for_update_locks(session, query, out),
+        SetExpr::SetOperation(operation) => {
+            collect_nested_query_locks(session, &operation.left, out)?;
+            collect_nested_query_locks(session, &operation.right, out)
+        }
+        SetExpr::Values { .. } => Ok(()),
+    }
+}
+
+fn collect_set_expr_table_locks(
+    session: &Session,
+    expr: &SetExpr,
+    out: &mut Vec<LockRequest>,
+) -> Result<()> {
+    match expr {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                collect_table_reference_locks(session, table, out)?;
+            }
+            Ok(())
+        }
+        SetExpr::Query(query) => collect_set_expr_table_locks(session, &query.body, out),
+        SetExpr::SetOperation(operation) => {
+            collect_set_expr_table_locks(session, &operation.left, out)?;
+            collect_set_expr_table_locks(session, &operation.right, out)
+        }
+        SetExpr::Values { .. } => Ok(()),
+    }
+}
+
+fn collect_nested_table_locks(
+    session: &Session,
+    table: &TableReference,
+    out: &mut Vec<LockRequest>,
+) -> Result<()> {
+    match table {
+        TableReference::Subquery { subquery, .. } => {
+            collect_query_for_update_locks(session, subquery, out)
+        }
+        TableReference::Join { join, .. } => {
+            collect_nested_table_locks(session, &join.left, out)?;
+            collect_nested_table_locks(session, &join.right, out)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn collect_table_reference_locks(
+    session: &Session,
+    table: &TableReference,
+    out: &mut Vec<LockRequest>,
+) -> Result<()> {
+    match table {
+        TableReference::Table {
+            database,
+            schema,
+            table,
+            ..
+        } => {
+            let table_id =
+                resolve_for_update_table_id(session, database.as_ref(), schema.as_ref(), table)?;
+            let request = LockRequest::new(
+                LockResource::Table {
+                    namespace: session
+                        .current_database
+                        .transaction_manager()
+                        .lock_namespace(),
+                    table_id,
+                },
+                LockMode::X,
+            );
+            if !out
+                .iter()
+                .any(|existing| existing.resource == request.resource)
+            {
+                out.push(request);
+            }
+            Ok(())
+        }
+        TableReference::Subquery { subquery, .. } => {
+            collect_set_expr_table_locks(session, &subquery.body, out)
+        }
+        TableReference::Join { join, .. } => {
+            collect_table_reference_locks(session, &join.left, out)?;
+            collect_table_reference_locks(session, &join.right, out)
+        }
+        TableReference::TableFunction { .. }
+        | TableReference::Location { .. }
+        | TableReference::GraphTable { .. } => Err(paro_error::not_supported(
+            "SELECT FOR UPDATE only supports base tables and subqueries",
+        )),
+    }
+}
+
+fn resolve_for_update_table_id(
+    session: &Session,
+    database: Option<&Identifier>,
+    schema: Option<&Identifier>,
+    table: &Identifier,
+) -> Result<TableId> {
+    let catalog_txn = session.catalog_txn_view();
+    let table_name = table.name.clone();
+    let entry = match (database, schema) {
+        (Some(database), Some(schema)) => {
+            if !database
+                .name
+                .eq_ignore_ascii_case(session.current_database.name())
+            {
+                return Err(paro_error::not_implemented(format!(
+                    "SELECT FOR UPDATE cross-database lock: {}.{}",
+                    database.name, schema.name
+                )));
+            }
+            session
+                .current_database
+                .catalog()
+                .get_table(&catalog_txn, &schema.name, &table_name)?
+        }
+        (None, Some(schema)) => {
+            session
+                .current_database
+                .catalog()
+                .get_table(&catalog_txn, &schema.name, &table_name)?
+        }
+        (None, None) => {
+            let mut found = None;
+            for search_entry in session.search_path().get() {
+                let catalog_name = if search_entry.catalog.is_empty() {
+                    session.current_database.name()
+                } else {
+                    search_entry.catalog.as_str()
+                };
+                if !catalog_name.eq_ignore_ascii_case(session.current_database.name()) {
+                    continue;
+                }
+                if let Ok(entry) = session.current_database.catalog().get_table(
+                    &catalog_txn,
+                    &search_entry.schema,
+                    &table_name,
+                ) {
+                    found = Some(entry);
+                    break;
+                }
+            }
+            found.ok_or_else(|| paro_error::table_not_found(&table_name))?
+        }
+        (Some(_), None) => {
+            return Err(paro_error::catalog(
+                "Invalid table reference: database provided without schema",
+            ))
+        }
+    };
+
+    let table = entry
+        .as_table()
+        .ok_or_else(|| paro_error::wrong_object_type("table", &table_name))?;
+    if let Some(descriptor) = table.get_storage_descriptor() {
+        return Ok(TableId::new(descriptor.table_id));
+    }
+    let storage = table.get_storage().ok_or_else(|| {
+        paro_error::internal(format!(
+            "SELECT FOR UPDATE target {table_name} has no storage"
+        ))
+    })?;
+    Ok(TableId::new(storage.table_id()))
+}
+
 fn validate_copy_from_options(copy_stmt: &CopyStmt) -> Result<()> {
     let options = paro_function::copy::CopyOptions::from_ast(&copy_stmt.options)?;
     match options.format {
@@ -886,6 +1379,49 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tokio_util::bytes::Bytes;
+
+    fn parse_one(sql: &str) -> Statement {
+        paro_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .stmt
+    }
+
+    #[test]
+    fn read_tracking_hint_selects_exact_read_only_policy() {
+        let stmt = parse_one("SETTINGS (read_tracking_policy = 'range_critical') SELECT 1");
+        let selection =
+            read_tracking_selection_for_statement(&stmt, IsolationLevel::Serializable).unwrap();
+
+        assert_eq!(selection.policy, ReadTrackingPolicy::RangeCritical);
+        assert!(selection.had_user_hint);
+        assert!(!selection.escalated);
+        assert!(!selection.requires_read_write);
+    }
+
+    #[test]
+    fn read_tracking_hint_cannot_downgrade_write_statement() {
+        let stmt =
+            parse_one("SETTINGS (read_tracking_policy = 'safe_snapshot_preferred') SELECT * FROM t FOR UPDATE");
+        let selection =
+            read_tracking_selection_for_statement(&stmt, IsolationLevel::Serializable).unwrap();
+
+        assert_eq!(selection.policy, ReadTrackingPolicy::RangeCritical);
+        assert!(selection.had_user_hint);
+        assert!(selection.escalated);
+        assert!(selection.requires_read_write);
+    }
+
+    #[test]
+    fn read_tracking_hint_rejects_unknown_policy() {
+        let stmt = parse_one("SETTINGS (read_tracking_policy = 'fast') SELECT 1");
+        let err = read_tracking_selection_for_statement(&stmt, IsolationLevel::Serializable)
+            .expect_err("unknown hint must fail");
+
+        assert!(err.message().contains("unsupported read_tracking_policy"));
+    }
 
     struct TestCopySource {
         chunks: Vec<Bytes>,

@@ -25,10 +25,24 @@ pub struct TransactionStmt {
 impl Display for TransactionStmt {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
-            TransactionKind::Begin => write!(f, "BEGIN"),
-            TransactionKind::Start => write!(f, "START TRANSACTION"),
+            TransactionKind::Begin(options) => {
+                write!(f, "BEGIN")?;
+                options.write_suffix(f)
+            }
+            TransactionKind::Start(options) => {
+                write!(f, "START TRANSACTION")?;
+                options.write_suffix(f)
+            }
             TransactionKind::Commit => write!(f, "COMMIT"),
             TransactionKind::Rollback => write!(f, "ROLLBACK"),
+            TransactionKind::SetTransaction(options) => {
+                write!(f, "SET TRANSACTION")?;
+                options.write_suffix(f)
+            }
+            TransactionKind::SetSessionCharacteristics(options) => {
+                write!(f, "SET SESSION CHARACTERISTICS AS TRANSACTION")?;
+                options.write_suffix(f)
+            }
             TransactionKind::Savepoint(name) => write!(f, "SAVEPOINT {name}"),
             TransactionKind::ReleaseSavepoint(name) => write!(f, "RELEASE SAVEPOINT {name}"),
             TransactionKind::RollbackToSavepoint(name) => {
@@ -43,16 +57,74 @@ impl Display for TransactionStmt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum TransactionKind {
-    Begin,
-    Start,
+    Begin(TransactionOptions),
+    Start(TransactionOptions),
     Commit,
     Rollback,
+    SetTransaction(TransactionOptions),
+    SetSessionCharacteristics(TransactionOptions),
     Savepoint(Identifier),
     ReleaseSavepoint(Identifier),
     RollbackToSavepoint(Identifier),
     PrepareTransaction(String),
     CommitPrepared(String),
     RollbackPrepared(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Drive, DriveMut)]
+pub struct TransactionOptions {
+    pub isolation_level: Option<TransactionIsolationLevel>,
+    pub read_mode: Option<TransactionReadMode>,
+}
+
+impl TransactionOptions {
+    pub fn is_empty(self) -> bool {
+        self.isolation_level.is_none() && self.read_mode.is_none()
+    }
+
+    fn write_suffix(self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(isolation_level) = self.isolation_level {
+            write!(f, " ISOLATION LEVEL {isolation_level}")?;
+        }
+        if let Some(read_mode) = self.read_mode {
+            write!(f, " {read_mode}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Drive, DriveMut)]
+pub enum TransactionIsolationLevel {
+    Serializable,
+    Snapshot,
+}
+
+impl Display for TransactionIsolationLevel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionIsolationLevel::Serializable => write!(f, "SERIALIZABLE"),
+            TransactionIsolationLevel::Snapshot => write!(f, "SNAPSHOT"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Drive, DriveMut)]
+pub enum TransactionReadMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl Display for TransactionReadMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionReadMode::ReadOnly => write!(f, "READ ONLY"),
+            TransactionReadMode::ReadWrite => write!(f, "READ WRITE"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Drive, DriveMut)]

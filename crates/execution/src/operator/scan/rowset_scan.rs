@@ -24,13 +24,19 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{MemoryAccountingClass, MemoryReleaseHandle};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_storage::buffer::{PageCache, Prefetcher};
 use paro_storage::compression::ParallelDecompressor;
-use paro_storage::index::PredicateTree;
+use paro_storage::index::{Predicate, PredicateTree};
+use paro_storage::primary_key::{primary_key_hash, PrimaryKeySerializer};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
-use paro_storage::table::table_handle::TableHandle;
-use paro_storage::tablet::{ColumnProjection, TabletReader, TabletReaderParams};
+use paro_storage::table::{table_handle::TableHandle, StorageSnapshot};
+use paro_storage::tablet::{ColumnProjection, KeysType, TabletReader, TabletReaderParams};
+use paro_storage::transaction::overlay_reader::OverlayDeleteVectorMap;
+use paro_transaction::TableId;
+
+const MAX_EXACT_PRIMARY_KEY_READ_KEYS: usize = 1024;
 
 #[derive(Debug)]
 pub struct RowsetScanBindData {
@@ -153,6 +159,151 @@ impl PhysicalRowsetScan {
     }
 }
 
+fn primary_key_read_hash_ranges(
+    table: &TableHandle,
+    predicate_tree: Option<&PredicateTree>,
+) -> Result<Option<Vec<(u64, u64)>>> {
+    let Some(predicate_tree) = predicate_tree else {
+        return Ok(None);
+    };
+    let Some(schema) = table.tablet().schema() else {
+        return Ok(None);
+    };
+    if schema.keys_type() != KeysType::PrimaryKeys {
+        return Ok(None);
+    }
+
+    let key_column_ids = schema
+        .key_columns()
+        .iter()
+        .map(|column| column.id)
+        .collect::<Vec<_>>();
+    let Some(keys) = exact_primary_key_values(predicate_tree, &key_column_ids) else {
+        return Ok(None);
+    };
+
+    let serializer = PrimaryKeySerializer::from_schema_ref(&schema)?;
+    let mut ranges = Vec::with_capacity(keys.len());
+    for values in keys {
+        let key = serializer.encode_values(&values)?;
+        let key_hash = primary_key_hash(&key);
+        ranges.push((key_hash, key_hash));
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    Ok(Some(ranges))
+}
+
+fn exact_primary_key_values(
+    predicate_tree: &PredicateTree,
+    key_column_ids: &[u32],
+) -> Option<Vec<Vec<Value>>> {
+    if key_column_ids.is_empty() {
+        return None;
+    }
+
+    match predicate_tree {
+        PredicateTree::Or(children) => {
+            let mut keys = Vec::new();
+            for child in children {
+                let child_keys = exact_primary_key_values_from_conjunction(child, key_column_ids)?;
+                if keys.len().saturating_add(child_keys.len()) > MAX_EXACT_PRIMARY_KEY_READ_KEYS {
+                    return None;
+                }
+                keys.extend(child_keys);
+            }
+            Some(keys)
+        }
+        other => exact_primary_key_values_from_conjunction(other, key_column_ids),
+    }
+}
+
+fn exact_primary_key_values_from_conjunction(
+    predicate_tree: &PredicateTree,
+    key_column_ids: &[u32],
+) -> Option<Vec<Vec<Value>>> {
+    let mut constraints = vec![None; key_column_ids.len()];
+    if !collect_primary_key_conjunction_constraints(
+        predicate_tree,
+        key_column_ids,
+        &mut constraints,
+    ) {
+        return None;
+    }
+
+    let mut expanded = vec![Vec::with_capacity(key_column_ids.len())];
+    for values in constraints {
+        let values = values?;
+        if values.is_empty() {
+            return Some(Vec::new());
+        }
+        if expanded.len().saturating_mul(values.len()) > MAX_EXACT_PRIMARY_KEY_READ_KEYS {
+            return None;
+        }
+
+        let mut next = Vec::with_capacity(expanded.len() * values.len());
+        for prefix in &expanded {
+            for value in &values {
+                let mut key = prefix.clone();
+                key.push(value.clone());
+                next.push(key);
+            }
+        }
+        expanded = next;
+    }
+    Some(expanded)
+}
+
+fn collect_primary_key_conjunction_constraints(
+    predicate_tree: &PredicateTree,
+    key_column_ids: &[u32],
+    constraints: &mut [Option<Vec<Value>>],
+) -> bool {
+    match predicate_tree {
+        PredicateTree::Leaf(predicate) => {
+            if let Some((key_idx, values)) = predicate_primary_key_values(predicate, key_column_ids)
+            {
+                merge_key_constraint(&mut constraints[key_idx], values);
+            }
+            true
+        }
+        PredicateTree::And(children) => children.iter().all(|child| {
+            collect_primary_key_conjunction_constraints(child, key_column_ids, constraints)
+        }),
+        PredicateTree::Or(_) => false,
+    }
+}
+
+fn predicate_primary_key_values(
+    predicate: &Predicate,
+    key_column_ids: &[u32],
+) -> Option<(usize, Vec<Value>)> {
+    let (column_id, values) = match predicate {
+        Predicate::Eq { column_id, value } => (*column_id, vec![value.clone()]),
+        Predicate::In { column_id, values } => (*column_id, values.clone()),
+        _ => return None,
+    };
+    key_column_ids
+        .iter()
+        .position(|candidate| *candidate == column_id)
+        .map(|key_idx| (key_idx, values))
+}
+
+fn merge_key_constraint(slot: &mut Option<Vec<Value>>, values: Vec<Value>) {
+    let values = values.into_iter().fold(Vec::new(), |mut deduped, value| {
+        if !deduped.contains(&value) {
+            deduped.push(value);
+        }
+        deduped
+    });
+
+    if let Some(existing) = slot {
+        existing.retain(|value| values.contains(value));
+    } else {
+        *slot = Some(values);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RowsetScanLocalState {
     reader: Option<TabletReader>,
@@ -180,7 +331,9 @@ impl RowsetScanLocalState {
 
 #[derive(Debug)]
 struct RowsetScanGlobalState {
+    storage_snapshot: StorageSnapshot,
     segments: Vec<(RowsetSharedPtr, SegmentSharedPtr)>,
+    overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
     total_rows: u64,
     rows_scanned: AtomicU64,
     next_segment: AtomicUsize,
@@ -300,7 +453,7 @@ impl PhysicalOperator for PhysicalRowsetScan {
         ctx: &ExecutionContext,
         _sink_state: Option<&dyn crate::operator::state::GlobalSinkState>,
     ) -> Result<Box<dyn GlobalSourceState>> {
-        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let txn_view = ctx.transaction_view();
         let batch_size = TabletReaderParams::default().batch_size;
         let column_projection =
             if self.bind_data.column_ids.is_empty() && self.bind_data.emit_row_id {
@@ -341,10 +494,39 @@ impl PhysicalOperator for PhysicalRowsetScan {
         let segment_options = SegmentOptions::default()
             .with_page_cache(page_cache)
             .with_parallel_decompressor(decompressor);
-        let segments = self
+        let storage_snapshot = self
             .bind_data
             .table_data
-            .collect_segments_with_options(visible_version, segment_options.clone())?;
+            .storage_snapshot(txn_view.read_ts(), txn_view.read_snapshot().lease())?;
+        let materialized_snapshot = storage_snapshot.materialize()?;
+        let table_id = TableId::new(self.bind_data.table_data.table_id());
+        if let Some(key_ranges) = primary_key_read_hash_ranges(
+            &self.bind_data.table_data,
+            self.bind_data.predicate_tree.as_ref(),
+        )? {
+            txn_view
+                .read_tracker()
+                .record_key_ranges(table_id, key_ranges);
+        } else {
+            txn_view.read_tracker().record_tablet_read(
+                table_id,
+                storage_snapshot.tablet_id(),
+                storage_snapshot.read_ts(),
+                materialized_snapshot.layout_epoch_snapshot,
+                materialized_snapshot.rowsets.len(),
+            );
+        }
+        let mut segments = storage_snapshot.segments_with_options(segment_options.clone())?;
+        let overlay = paro_storage::transaction::overlay_reader::TxnOverlayReader::for_tablet(
+            &self.bind_data.table_data.tablet(),
+            txn_view,
+        )?;
+        let overlay_delete_vectors = overlay
+            .as_ref()
+            .and_then(|overlay| overlay.delete_vectors());
+        if let Some(overlay) = &overlay {
+            segments.extend(overlay.segments_with_options(segment_options.clone())?);
+        }
         let total_rows = segments.iter().fold(0u64, |acc, (_, segment)| {
             acc.saturating_add(segment.num_rows())
         });
@@ -368,7 +550,9 @@ impl PhysicalOperator for PhysicalRowsetScan {
         }
 
         Ok(Box::new(RowsetScanGlobalState {
+            storage_snapshot,
             segments,
+            overlay_delete_vectors,
             total_rows,
             rows_scanned: AtomicU64::new(0),
             next_segment: AtomicUsize::new(0),
@@ -430,12 +614,11 @@ impl PhysicalOperator for PhysicalRowsetScan {
                 lstate.current_segment_total_rows = segment.num_rows();
                 lstate.current_segment_output_rows = 0;
 
-                let visible_version =
-                    i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
-                let mut params = TabletReaderParams::with_version(visible_version)
-                    .with_projection(gstate.column_projection.clone())
-                    .with_segment(segment.segment_id())
-                    .with_emit_row_id(self.bind_data.emit_row_id);
+                let mut params =
+                    TabletReaderParams::with_version(gstate.storage_snapshot.visible_version())
+                        .with_projection(gstate.column_projection.clone())
+                        .with_segment(segment.segment_id())
+                        .with_emit_row_id(self.bind_data.emit_row_id);
                 if let Some(opts) = &gstate.segment_options {
                     params = params.with_segment_options(opts.clone());
                 }
@@ -447,6 +630,9 @@ impl PhysicalOperator for PhysicalRowsetScan {
                 }
                 if let Some(tree) = &gstate.predicate_tree {
                     params = params.with_predicates(tree.clone());
+                }
+                if let Some(delete_vectors) = &gstate.overlay_delete_vectors {
+                    params = params.with_overlay_delete_vectors(delete_vectors.clone());
                 }
                 if let Some(plan) = &gstate.late_materialize_plan {
                     if plan.enabled && !runtime_budget.externalize {
@@ -474,8 +660,7 @@ impl PhysicalOperator for PhysicalRowsetScan {
                     .bind_data
                     .table_data
                     .create_reader_with_allocator(params, scan_allocator)?;
-                // Manually prepare with only the required rowset to restrict reading to this segment
-                reader.prepare_with_rowsets(vec![rowset.clone()])?;
+                reader.prepare_with_pinned_rowsets(vec![rowset.clone()])?;
                 lstate.reader = Some(reader);
             }
 
@@ -553,5 +738,54 @@ mod tests {
         let progress = progress_from_rows(25, 100);
         assert_eq!(progress.percentage, 0.25);
         assert_eq!(progress.rows_scanned, 25);
+    }
+
+    #[test]
+    fn exact_primary_key_values_extracts_single_point() {
+        let predicate = PredicateTree::Leaf(Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(7),
+        });
+
+        assert_eq!(
+            exact_primary_key_values(&predicate, &[0]),
+            Some(vec![vec![Value::Integer(7)]])
+        );
+    }
+
+    #[test]
+    fn exact_primary_key_values_extracts_composite_in_product() {
+        let predicate = PredicateTree::And(vec![
+            PredicateTree::Leaf(Predicate::In {
+                column_id: 0,
+                values: vec![Value::Integer(1), Value::Integer(2)],
+            }),
+            PredicateTree::Leaf(Predicate::Eq {
+                column_id: 1,
+                value: Value::Varchar("a".to_string()),
+            }),
+            PredicateTree::Leaf(Predicate::Gt {
+                column_id: 2,
+                value: Value::Integer(10),
+            }),
+        ]);
+
+        assert_eq!(
+            exact_primary_key_values(&predicate, &[0, 1]),
+            Some(vec![
+                vec![Value::Integer(1), Value::Varchar("a".to_string())],
+                vec![Value::Integer(2), Value::Varchar("a".to_string())],
+            ])
+        );
+    }
+
+    #[test]
+    fn exact_primary_key_values_rejects_partial_key() {
+        let predicate = PredicateTree::Leaf(Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(7),
+        });
+
+        assert_eq!(exact_primary_key_values(&predicate, &[0, 1]), None);
     }
 }

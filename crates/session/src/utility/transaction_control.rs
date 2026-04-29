@@ -3,9 +3,37 @@
 
 use crate::completion::StatementCompletion;
 use crate::result::sink::ResultSink;
+use crate::utility::settings::isolation_level_to_setting_value;
 use crate::Session;
 use paro_common::error::{self as paro_error, Result};
-use paro_parser::ast::TransactionKind;
+use paro_common::runtime_value::Value;
+use paro_parser::ast::{
+    TransactionIsolationLevel, TransactionKind, TransactionOptions, TransactionReadMode,
+};
+use paro_transaction::IsolationLevel;
+
+fn isolation_level_from_ast(level: TransactionIsolationLevel) -> IsolationLevel {
+    match level {
+        TransactionIsolationLevel::Serializable => IsolationLevel::Serializable,
+        TransactionIsolationLevel::Snapshot => IsolationLevel::Snapshot,
+    }
+}
+
+fn read_only_from_ast(mode: TransactionReadMode) -> bool {
+    match mode {
+        TransactionReadMode::ReadOnly => true,
+        TransactionReadMode::ReadWrite => false,
+    }
+}
+
+fn transaction_characteristics(
+    options: TransactionOptions,
+) -> (Option<IsolationLevel>, Option<bool>) {
+    (
+        options.isolation_level.map(isolation_level_from_ast),
+        options.read_mode.map(read_only_from_ast),
+    )
+}
 
 pub(crate) async fn execute_transaction_control<S: ResultSink>(
     session: &mut Session,
@@ -13,12 +41,14 @@ pub(crate) async fn execute_transaction_control<S: ResultSink>(
     sink: &mut S,
 ) -> Result<()> {
     let completion = match kind {
-        TransactionKind::Begin => {
-            session.begin_explicit_transaction()?;
+        TransactionKind::Begin(options) => {
+            let (isolation_level, read_only) = transaction_characteristics(*options);
+            session.begin_explicit_transaction_with_characteristics(isolation_level, read_only)?;
             StatementCompletion::Begin
         }
-        TransactionKind::Start => {
-            session.begin_explicit_transaction()?;
+        TransactionKind::Start(options) => {
+            let (isolation_level, read_only) = transaction_characteristics(*options);
+            session.begin_explicit_transaction_with_characteristics(isolation_level, read_only)?;
             StatementCompletion::StartTransaction
         }
         TransactionKind::Commit => {
@@ -29,13 +59,31 @@ pub(crate) async fn execute_transaction_control<S: ResultSink>(
             session.rollback_transaction()?;
             StatementCompletion::Rollback
         }
+        TransactionKind::SetTransaction(options) => {
+            let (isolation_level, read_only) = transaction_characteristics(*options);
+            session.set_transaction_characteristics(isolation_level, read_only)?;
+            StatementCompletion::Set
+        }
+        TransactionKind::SetSessionCharacteristics(options) => {
+            let (isolation_level, read_only) = transaction_characteristics(*options);
+            if let Some(isolation_level) = isolation_level {
+                session.set_session_setting(
+                    "default_transaction_isolation",
+                    Value::Varchar(isolation_level_to_setting_value(isolation_level).to_string()),
+                )?;
+            }
+            if let Some(read_only) = read_only {
+                session.set_default_transaction_read_only(read_only);
+            }
+            StatementCompletion::Set
+        }
         TransactionKind::Savepoint(name) => {
             if !session.is_in_explicit_block() {
                 return Err(paro_error::invalid_transaction_state(
                     "SAVEPOINT can only be used in transaction blocks".to_string(),
                 ));
             }
-            let storage_mark = session.transaction.active_transaction()?.mark_savepoint()?;
+            let storage_mark = session.transaction.mark_savepoint()?;
             let portal_mark = session.current_portal_mark();
             session
                 .transaction

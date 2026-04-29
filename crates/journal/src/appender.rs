@@ -511,25 +511,32 @@ mod tests {
     fn appender_metrics_track_batch_bytes_and_inline_patch_ratio() {
         let sink = Arc::new(RecordingSink::default());
         let appender = JournalAppender::new(sink);
+        let storage_ops = vec![StorageCommitOp::Tablet(TabletApplyOp {
+            tablet_id: 41,
+            mutations: vec![TabletMutation::ApplyDeletePatch {
+                patch: DeletePatchRef::Inline(DeletePatchInline {
+                    encoding: paro_common::effect::DeletePatchEncoding::GroupedRowOffsetDeltaV1,
+                    row_count: 0,
+                    groups: Vec::new(),
+                }),
+                deleted_row_count: 0,
+            }],
+        })];
 
         appender
             .append_record(&JournalRecord::Commit(paro_common::journal::CommitRecord {
+                record_version: paro_common::journal::COMMIT_RECORD_VERSION,
+                metadata: paro_common::journal::JournalRecordMetadata::transaction(
+                    &[],
+                    &storage_ops,
+                    &[],
+                    &[],
+                ),
                 txn_id: 7,
                 start_time: 11,
                 commit_id: 13,
                 catalog_ops: Vec::new(),
-                storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
-                    tablet_id: 41,
-                    mutations: vec![TabletMutation::ApplyDeletePatch {
-                        patch: DeletePatchRef::Inline(DeletePatchInline {
-                            encoding:
-                                paro_common::effect::DeletePatchEncoding::GroupedRowOffsetDeltaV1,
-                            row_count: 0,
-                            groups: Vec::new(),
-                        }),
-                        deleted_row_count: 0,
-                    }],
-                })],
+                storage_ops,
                 apply_descriptors: Vec::new(),
                 deferred_tasks: Vec::new(),
             }))

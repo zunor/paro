@@ -116,6 +116,7 @@ impl PhysicalOperator for CreatePropertyGraph {
                 GraphState::Ready,
                 schema_fingerprint.clone(),
             )
+            .with_indexed_through_ts(ctx.session.txn.transaction.visible_version())
             .with_statistics(graph_stats);
             index.save_with_manifest(&graph_dir, manifest.clone())?;
             let _ = (index, manifest);

@@ -5,6 +5,7 @@ use crate::buffer::Prefetcher;
 use crate::index::PredicateTree;
 use crate::rowset::segment::SegmentOptions;
 use crate::tablet::{ColumnId, TabletRef};
+use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
 use paro_common::allocator::Allocator;
 use paro_common::error::Result;
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ pub struct TabletReaderParams {
     pub segment_options: Option<SegmentOptions>,
     pub prefetcher: Option<Arc<Prefetcher>>,
     pub emit_row_id: bool,
+    pub overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +87,7 @@ impl Default for TabletReaderParams {
             segment_options: None,
             prefetcher: None,
             emit_row_id: false,
+            overlay_delete_vectors: None,
         }
     }
 }
@@ -142,6 +145,14 @@ impl TabletReaderParams {
 
     pub fn with_emit_row_id(mut self, emit_row_id: bool) -> Self {
         self.emit_row_id = emit_row_id;
+        self
+    }
+
+    pub fn with_overlay_delete_vectors(
+        mut self,
+        delete_vectors: Arc<OverlayDeleteVectorMap>,
+    ) -> Self {
+        self.overlay_delete_vectors = Some(delete_vectors);
         self
     }
 }

@@ -1,6 +1,7 @@
 [meta]
 name = "memory"
 description = "Memory observability workload for operator profiles, tag deltas, and spill metrics"
+run_order = 10
 
 [params]
 order_rows = 10000

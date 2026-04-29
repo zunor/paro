@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use divan::Bencher;
 use paro_storage::primary_key::{
-    ImmutableIndexReader, ImmutableIndexWriter, PersistentIndex, RowID,
+    ImmutableIndexReader, ImmutableIndexWriter, PersistentIndex, PrimaryIndexVersion, RowID,
 };
 use tempfile::TempDir;
 
@@ -44,8 +44,12 @@ impl BenchState {
         let entries: Vec<_> = (0..ENTRY_COUNT)
             .map(|i| (make_key(i), RowID::new(1, i)))
             .collect();
+        let immutable_entries: Vec<_> = entries
+            .iter()
+            .map(|(key, row_id)| (key.clone(), PrimaryIndexVersion::live(*row_id, 1)))
+            .collect();
         ImmutableIndexWriter::default()
-            .write_entries(&immutable_path, &entries)
+            .write_entries(&immutable_path, &immutable_entries)
             .unwrap();
 
         let mut persistent = PersistentIndex::new(&persistent_dir).unwrap();

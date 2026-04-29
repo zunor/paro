@@ -7,7 +7,9 @@ use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::BundleKind;
 use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
 use paro_common::effect::{ApplyDescriptor, StagedArtifactDescriptor, StagingArtifactId};
-use paro_common::journal::{CommitRecord, JournalRecord};
+use paro_common::journal::{
+    CommitRecord, JournalRecord, JournalRecordMetadata, COMMIT_RECORD_VERSION,
+};
 use paro_common::types::LogicalType;
 use paro_instance::checkpoint::manifest_store::testing::arm_manifest_rename_failure_for_path_on_nth_call;
 use paro_instance::checkpoint::{manifest_store::ManifestStore, CheckpointRecovery};
@@ -22,6 +24,11 @@ use paro_instance::{
 };
 use paro_journal::segments::SegmentCatalogStore;
 use paro_journal::segments::DEFAULT_SEGMENT_ROTATION_BYTES;
+use paro_journal::wal::test_support::{
+    write_flushed_create_schema_txn, write_flushed_create_schema_txn_with_lsn,
+};
+use paro_journal::wal::wal_entry::{WalEntry, WalHeaderMetadata};
+use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_storage::buffer::StandardBufferManager;
 use paro_storage::meta::metadata_store::testing::{
     arm_metadata_parent_sync_failure_for_path_on_nth_call,
@@ -30,11 +37,6 @@ use paro_storage::meta::metadata_store::testing::{
 use paro_storage::meta::{FileMetadataStore, MetadataStore};
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::TableHandle;
-use paro_storage::wal::test_support::{
-    write_flushed_create_schema_txn, write_flushed_create_schema_txn_with_lsn,
-};
-use paro_storage::wal::wal_entry::{WalEntry, WalHeaderMetadata};
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -255,7 +257,7 @@ fn open_loaded_storage(path: &str) -> DatabaseStorage {
 }
 
 fn write_flushed_missing_graph_publish_record(
-    writer: &paro_storage::wal::wal_writer::WalWriter,
+    writer: &paro_journal::wal::wal_writer::WalWriter,
     lsn: u64,
     commit_id: u64,
     graph_name: &str,
@@ -263,38 +265,41 @@ fn write_flushed_missing_graph_publish_record(
     let staging_root = std::env::temp_dir()
         .join("paro-missing-staged-artifact")
         .join(graph_name);
+    let apply_descriptors = vec![ApplyDescriptor::PublishStagedArtifact(
+        StagedArtifactDescriptor::PropertyGraphBuild {
+            object: DdlObjectKey::new(
+                "postgres",
+                Some("public"),
+                graph_name,
+                DdlObjectKind::PropertyGraph,
+            ),
+            staging: StagingArtifactId::new(
+                lsn,
+                vec![
+                    staging_root
+                        .parent()
+                        .expect("staging root parent")
+                        .to_string_lossy()
+                        .to_string(),
+                    staging_root
+                        .file_name()
+                        .expect("staging root leaf")
+                        .to_string_lossy()
+                        .to_string(),
+                ],
+            ),
+            schema_fingerprint: "fp:missing".to_string(),
+        },
+    )];
     let record = CommitRecord {
+        record_version: COMMIT_RECORD_VERSION,
+        metadata: JournalRecordMetadata::transaction(&[], &[], &apply_descriptors, &[]),
         txn_id: lsn,
         start_time: 0,
         commit_id,
         catalog_ops: Vec::new(),
         storage_ops: Vec::new(),
-        apply_descriptors: vec![ApplyDescriptor::PublishStagedArtifact(
-            StagedArtifactDescriptor::PropertyGraphBuild {
-                object: DdlObjectKey::new(
-                    "postgres",
-                    Some("public"),
-                    graph_name,
-                    DdlObjectKind::PropertyGraph,
-                ),
-                staging: StagingArtifactId::new(
-                    lsn,
-                    vec![
-                        staging_root
-                            .parent()
-                            .expect("staging root parent")
-                            .to_string_lossy()
-                            .to_string(),
-                        staging_root
-                            .file_name()
-                            .expect("staging root leaf")
-                            .to_string_lossy()
-                            .to_string(),
-                    ],
-                ),
-                schema_fingerprint: "fp:missing".to_string(),
-            },
-        )],
+        apply_descriptors,
         deferred_tasks: Vec::new(),
     };
     let entry = WalEntry::JournalRecord {

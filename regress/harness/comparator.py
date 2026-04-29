@@ -20,6 +20,7 @@ from .executor import QueryOutput
 
 _DIRECTIVE_RE = re.compile(r"^\s*--\s*@(query|statement|copy)(?:\s+(.*?))?\s*$", re.IGNORECASE)
 _NORMALIZE_DIRECTIVE_RE = re.compile(r"^\s*--\s*@normalize\s+(.+?)\s*$", re.IGNORECASE)
+_SESSION_LABEL_RE = re.compile(r"^\s*--\s+session:\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*$")
 _APPROX_RE = re.compile(r"^approx\(\s*([^)]+)\s*\)$", re.IGNORECASE)
 _HASH_LINE_RE = re.compile(r"^\s*(\d+)\s+values\s+hashing\s+to\s+([0-9a-f]{32})\s*$", re.IGNORECASE)
 _RESERVED_TOKENS = {"NULL", "(empty)"}
@@ -57,6 +58,7 @@ class ResultBlock:
     rows: list[list[Any]]
     raw_result_lines: list[str]
     normalizers: tuple[str, ...] = ()
+    session_name: str | None = None
 
 
 @dataclass
@@ -89,7 +91,17 @@ def parse_result_text(text: str, source: str = "<memory>") -> list[ResultBlock]:
         epsilon: float | None = None
         copy_direction: str | None = None
         normalizers: tuple[str, ...] = ()
+        session_name: str | None = None
         directive_lines: list[str] = []
+
+        session_label = _parse_session_label_optional(lines[idx])
+        if session_label is not None:
+            session_name = session_label
+            idx += 1
+            if idx >= len(lines):
+                raise ResultParseError(
+                    f"{source}:{line_no}: session label is missing a result block."
+                )
 
         while idx < len(lines):
             query_or_statement = _parse_directive_line_optional(lines[idx])
@@ -169,6 +181,7 @@ def parse_result_text(text: str, source: str = "<memory>") -> list[ResultBlock]:
                 rows=rows,
                 raw_result_lines=raw_result_lines,
                 normalizers=normalizers,
+                session_name=session_name,
             )
         )
 
@@ -252,6 +265,13 @@ def _parse_normalize_directive_optional(
     return _parse_normalize_arg(match.group(1), source, line_no)
 
 
+def _parse_session_label_optional(line: str) -> str | None:
+    match = _SESSION_LABEL_RE.match(line)
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def _parse_normalize_arg(arg: str, source: str, line_no: int) -> tuple[str, ...]:
     profiles = [part.strip().lower() for part in arg.split(",")]
     if not profiles or any(not profile for profile in profiles):
@@ -262,9 +282,11 @@ def _parse_normalize_arg(arg: str, source: str, line_no: int) -> tuple[str, ...]
 
 
 def _is_block_directive_line(line: str) -> bool:
-    return _parse_directive_line_optional(line) is not None or _NORMALIZE_DIRECTIVE_RE.match(
-        line
-    ) is not None
+    return (
+        _parse_directive_line_optional(line) is not None
+        or _NORMALIZE_DIRECTIVE_RE.match(line) is not None
+        or _SESSION_LABEL_RE.match(line) is not None
+    )
 
 _QUERY_START_RE = re.compile(
     r"^\s*(SELECT|WITH|VALUES|SHOW|DESCRIBE|EXPLAIN|CALL)", re.IGNORECASE
@@ -289,6 +311,8 @@ def build_transcript(query_outputs: Sequence[QueryOutput], *, precision: int = 6
                 directive = render_query_directive(output.mode, output.epsilon)
 
         block_lines = []
+        if output.session_name:
+            block_lines.append(f"-- session: {output.session_name}")
         if directive:
             block_lines.append(directive)
         if output.normalizers:
@@ -369,6 +393,26 @@ def compare_result_file(
             raise ResultMismatch(msg, sql=first_exc.sql, line_no=first_exc.line_no, 
                                expected=first_exc.expected, actual=first_exc.actual)
         raise ResultMismatch(msg)
+
+
+def compare_output_to_result_block(
+    expected: ResultBlock,
+    output: QueryOutput,
+    *,
+    precision: int = 6,
+) -> str | None:
+    """Compare one output against one expected transcript block."""
+    actual_text = build_transcript([output], precision=precision)
+    actual_blocks = parse_result_text(actual_text, source="<wait_expect actual>")
+    if len(actual_blocks) != 1:
+        return (
+            f"wait_expect produced {len(actual_blocks)} actual blocks; "
+            "expected exactly one."
+        )
+    mismatch = _compare_one_block(expected.index, expected, actual_blocks[0])
+    if mismatch is None:
+        return None
+    return str(mismatch)
 
 
 def render_query_directive(mode: str | None, epsilon: float | None) -> str:
@@ -453,6 +497,19 @@ def _compare_one_block(index: int, expected: ResultBlock, actual: ResultBlock) -
             (
                 "copy direction mismatch: expected "
                 f"{expected.copy_direction}, actual {actual.copy_direction}"
+            ),
+            expected.raw_result_lines,
+            actual.raw_result_lines,
+            line_no=expected.line_no,
+        )
+
+    if expected.session_name != actual.session_name:
+        return _format_block_message(
+            index,
+            expected.sql,
+            (
+                "session mismatch: expected "
+                f"{expected.session_name or 'default'}, actual {actual.session_name or 'default'}"
             ),
             expected.raw_result_lines,
             actual.raw_result_lines,

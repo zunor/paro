@@ -31,7 +31,7 @@ impl TableHandle {
         &self,
         version: i64,
     ) -> Result<Vec<(RowsetSharedPtr, SegmentSharedPtr)>> {
-        let _snapshot = TabletReadGuard::pin(&self.tablet(), version);
+        let _snapshot = TabletReadGuard::pin(&self.tablet(), version)?;
         let rowsets = self.tablet().capture_consistent_rowsets(version)?;
         let mut segments = Vec::new();
         for rowset in rowsets {
@@ -45,7 +45,7 @@ impl TableHandle {
 
     /// Count all visible segments at the given version.
     pub fn visible_segment_count(&self, version: i64) -> Result<usize> {
-        let _snapshot = TabletReadGuard::pin(&self.tablet(), version);
+        let _snapshot = TabletReadGuard::pin(&self.tablet(), version)?;
         let rowsets = self.tablet().capture_consistent_rowsets(version)?;
         let mut total = 0usize;
         for rowset in rowsets {
@@ -61,7 +61,7 @@ impl TableHandle {
         version: i64,
         options: SegmentOptions,
     ) -> Result<Vec<(RowsetSharedPtr, SegmentSharedPtr)>> {
-        let _snapshot = TabletReadGuard::pin(&self.tablet(), version);
+        let _snapshot = TabletReadGuard::pin(&self.tablet(), version)?;
         let rowsets = self.tablet().capture_consistent_rowsets(version)?;
         let mut segments = Vec::new();
         for rowset in rowsets {

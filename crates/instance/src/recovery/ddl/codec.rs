@@ -6,8 +6,8 @@ use paro_catalog::entry::CatalogObjectId;
 use paro_catalog::entry::{Constraint, DependencyList};
 use paro_common::ddl::{DdlDependencyRef, DdlStorageDescriptor};
 use paro_common::error as paro_error;
+use paro_journal::wal::wal_entry::{TableConstraintInfo, WalConstraintType};
 use paro_storage::table::storage_descriptor::TableStorageDescriptor;
-use paro_storage::wal::wal_entry::{TableConstraintInfo, WalConstraintType};
 
 impl<'a> CatalogReplayHandler<'a> {
     pub(in crate::recovery) fn dependency_list_from_payload(

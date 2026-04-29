@@ -7,6 +7,7 @@ mod index_set;
 pub(crate) mod runtime_indexes;
 pub mod segment_reorderer;
 pub mod storage_descriptor;
+mod storage_snapshot;
 pub mod table_factory;
 pub mod table_handle;
 mod table_indexes;
@@ -15,3 +16,5 @@ mod table_read;
 mod table_search_query;
 mod table_statistics;
 mod table_write;
+
+pub use storage_snapshot::StorageSnapshot;

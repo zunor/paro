@@ -22,6 +22,7 @@ use std::path::PathBuf;
 pub struct ScannedGraphInputs {
     pub vertex_inputs: Vec<VertexBuildInput>,
     pub edge_inputs: Vec<EdgeBuildInput>,
+    pub indexed_through_ts: u64,
 }
 
 pub fn graph_data_dir(db_path: &str, graph_name: &str) -> PathBuf {
@@ -60,6 +61,7 @@ pub fn scan_graph_inputs_with_catalog(
     pg_info: &CreatePropertyGraphInfo,
 ) -> Result<ScannedGraphInputs> {
     let mut vertex_inputs = Vec::with_capacity(pg_info.vertex_tables.len());
+    let mut indexed_through_ts = 0u64;
     for vt in &pg_info.vertex_tables {
         let table_entry = catalog.get_table(txn, &pg_info.schema, &vt.table_name)?;
         let table = match table_entry.as_ref() {
@@ -72,9 +74,11 @@ pub fn scan_graph_inputs_with_catalog(
             paro_error::internal(format!("Vertex table \"{}\" has no storage", vt.table_name))
         })?;
 
+        let visible_version = storage.max_version();
+        indexed_through_ts = indexed_through_ts.max(visible_version.max(0) as u64);
         let (projected_columns, key_positions) =
             prepare_projected_columns(&[vt.key_column_ids.as_slice()]);
-        let params = TabletReaderParams::with_version(storage.max_version())
+        let params = TabletReaderParams::with_version(visible_version)
             .with_columns(projected_columns)
             .with_emit_row_id(true);
         let mut reader = storage.create_reader(params)?;
@@ -120,11 +124,13 @@ pub fn scan_graph_inputs_with_catalog(
             paro_error::internal(format!("Edge table \"{}\" has no storage", et.table_name))
         })?;
 
+        let visible_version = storage.max_version();
+        indexed_through_ts = indexed_through_ts.max(visible_version.max(0) as u64);
         let (projected_columns, key_positions) = prepare_projected_columns(&[
             et.source_key_column_ids.as_slice(),
             et.destination_key_column_ids.as_slice(),
         ]);
-        let params = TabletReaderParams::with_version(storage.max_version())
+        let params = TabletReaderParams::with_version(visible_version)
             .with_columns(projected_columns)
             .with_emit_row_id(true);
         let mut reader = storage.create_reader(params)?;
@@ -184,6 +190,7 @@ pub fn scan_graph_inputs_with_catalog(
     Ok(ScannedGraphInputs {
         vertex_inputs,
         edge_inputs,
+        indexed_through_ts,
     })
 }
 

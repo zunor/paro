@@ -73,6 +73,7 @@ application_name	session-app	Name of the application connected to this session
 copy_buffer_size	8192	Rows buffered before COPY flushes staged chunks
 copy_flush_threads	1	Worker count used for COPY buffered flush
 default_table_cardinality	1000	Fallback table cardinality for the optimizer
+default_transaction_isolation	serializable	Default isolation level for new transactions
 force_external	false	Force spill-capable operators onto external paths
 max_temp_directory_size	unlimited	Maximum size of the temporary spill directory
 memory_limit	1073741824	Maximum memory available to the current session

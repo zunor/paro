@@ -1,0 +1,78 @@
+CREATE TABLE txn_e2e_write_conflict (
+    id INT PRIMARY KEY,
+    value INT
+);
+CREATE TABLE
+
+INSERT INTO txn_e2e_write_conflict VALUES (1, 10);
+INSERT 0 1
+
+-- session: stale
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+BEGIN
+
+-- session: fresh
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+BEGIN
+
+-- session: stale
+SELECT id, value
+FROM txn_e2e_write_conflict
+WHERE id = 1;
+id	value
+1	10
+
+-- session: fresh
+UPDATE txn_e2e_write_conflict SET value = 20 WHERE id = 1;
+UPDATE 1
+
+-- session: fresh
+COMMIT;
+COMMIT
+
+-- session: stale
+UPDATE txn_e2e_write_conflict SET value = 30 WHERE id = 1;
+UPDATE 1
+
+-- session: stale
+-- @normalize transaction_ids
+COMMIT;
+ERROR: serializable validation failed: DangerousStructure { txn_id: TxnId(<id>), state: SsiTxnState { rw_conflict_in: true, rw_conflict_out: true, dangerous_structure: true, coarse_scan_marker_conflict: false, ssi_state_epoch: <id> }, committed_write_conflict: Some(CommittedTxnConflict { txn_id: TxnId(<id>), read_ts: ReadTs(<id>), commit_ts: CommitTs(<id>), dependency: KeyRange { table_id: TableId(<id>), start_hash: 16633816624251338498, end_hash: 16633816624251338498 }, write: PrimaryKey { namespace: LockNamespace { tenant_id: <id>, database_id: DatabaseId(<id>) }, table_id: TableId(<id>), tablet_id: <id>, key_hash: 16633816624251338498 } }), committed_read_conflict: Some(CommittedTxnConflict { txn_id: TxnId(<id>), read_ts: ReadTs(<id>), commit_ts: CommitTs(<id>), dependency: Table { table_id: TableId(<id>) }, write: PrimaryKey { namespace: LockNamespace { tenant_id: <id>, database_id: DatabaseId(<id>) }, table_id: TableId(<id>), tablet_id: <id>, key_hash: 16633816624251338498 } }), active_read_conflict: None, coarse_scan_marker_conflict: false } (SQLSTATE=40001)
+
+SELECT id, value
+FROM txn_e2e_write_conflict
+ORDER BY id;
+id	value
+1	20
+
+-- session: locker
+BEGIN;
+BEGIN
+
+-- session: locker
+SELECT id, value
+FROM txn_e2e_write_conflict
+WHERE id = 1
+FOR UPDATE;
+id	value
+1	20
+
+-- session: locker
+COMMIT;
+COMMIT
+
+-- session: blocked
+-- @normalize transaction_ids
+INSERT INTO txn_e2e_write_conflict VALUES (2, 40);
+ERROR: transaction <id> blocked by conflicting locks held by [TxnId(<id>)] (SQLSTATE=XX000)
+
+-- session: blocked
+INSERT INTO txn_e2e_write_conflict VALUES (2, 40);
+INSERT 0 1
+
+SELECT id, value
+FROM txn_e2e_write_conflict
+ORDER BY id;
+id	value
+1	20
+2	40

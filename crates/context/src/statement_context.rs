@@ -5,7 +5,7 @@ use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
     QueryResources, RuntimeLimits, SessionMetadataProvider, StatementAuthContext,
     StatementCancellation, StatementEnvironment, StatementExecutionTracker, StatementOptions,
-    StatementView, TxnAdmissionState, WriteGuard,
+    StatementView, TransactionView, TxnAdmissionState, WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -15,6 +15,7 @@ use paro_common::identity::GraphId;
 use paro_common::runtime_value::Value;
 use paro_external_runtime::host::PythonRuntimeStatus;
 use paro_storage::meta::TabletMetaManager;
+use paro_transaction::DatabaseId;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +96,10 @@ impl StatementContext {
 
     pub fn catalog_txn_view(&self) -> CatalogSnapshot {
         if self.txn.active.is_some() {
-            CatalogSnapshot::writer(self.txn.id, self.txn.start_time)
+            CatalogSnapshot::writer(
+                self.txn.transaction.writer_id().into_raw(),
+                self.txn.transaction.start_time().into_raw(),
+            )
         } else {
             CatalogSnapshot::read_only(u64::MAX)
         }
@@ -169,15 +173,19 @@ impl StatementContext {
     }
 
     pub fn transaction_id(&self) -> u64 {
-        self.txn.id
+        self.txn.transaction.writer_id().into_raw()
     }
 
     pub fn transaction_start_time(&self) -> u64 {
-        self.txn.start_time
+        self.txn.transaction.start_time().into_raw()
     }
 
     pub fn transaction_visible_version(&self) -> u64 {
-        self.txn.visible_version
+        self.txn.transaction.visible_version()
+    }
+
+    pub fn transaction_view(&self) -> &TransactionView {
+        &self.txn.transaction
     }
 
     pub fn active_transaction(&self) -> Option<Arc<paro_storage::transaction::txn::Transaction>> {
@@ -194,6 +202,21 @@ impl StatementContext {
 
     pub fn txn_admission(&self) -> Option<Arc<TxnAdmissionState>> {
         self.txn.admission.clone()
+    }
+
+    pub fn bind_write_database(&self, database_name: &str) -> paro_common::error::Result<()> {
+        let Some(write_guard) = self.write_guard() else {
+            return Ok(());
+        };
+        let database_name = if database_name.is_empty() {
+            self.current_database()
+        } else {
+            database_name
+        };
+        let snapshot = self.database(database_name).ok_or_else(|| {
+            paro_common::error::catalog(format!("Database \"{}\" does not exist", database_name))
+        })?;
+        write_guard.bind_database(DatabaseId::new(snapshot.id()), snapshot.name())
     }
 
     pub fn metadata_provider(&self) -> Option<Arc<TabletMetaManager>> {

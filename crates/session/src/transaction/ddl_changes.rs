@@ -15,12 +15,15 @@ use paro_context::DdlExecutionProfile;
 use paro_storage::index::BoundIndex;
 use paro_storage::table::table_handle::TableHandle;
 
+use super::index_backfill::IndexBackfillPlan;
+
 pub struct IndexPostCommitAction {
     pub entry: Arc<IndexCatalogEntry>,
     pub table: Arc<TableCatalogEntry>,
     pub info: CreateIndexInfo,
     pub built_index: Option<Arc<dyn BoundIndex>>,
     pub coverage: Option<IndexCoverage>,
+    pub(crate) backfill: Option<IndexBackfillPlan>,
 }
 
 pub struct TableDropCleanupAction {

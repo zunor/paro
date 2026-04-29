@@ -5,6 +5,7 @@ mod abort;
 pub(crate) mod block_kind;
 pub mod commit;
 pub(crate) mod ddl_changes;
+pub(crate) mod index_backfill;
 pub mod local_settings;
 mod policy;
 mod post_commit;

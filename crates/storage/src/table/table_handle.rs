@@ -9,8 +9,8 @@ use crate::compaction::compaction_manager::CompactionManager;
 use crate::search::registry::SearchIndexRegistry;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::{Tablet, TabletRef};
-use crate::wal::write_ahead_log::WriteAheadLog;
 use paro_common::types::LogicalType;
+use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_journal::{JournalApplyRuntime, JournalCoordinator};
 use std::sync::{Arc, Weak};
 
@@ -78,6 +78,11 @@ impl TableHandle {
     /// Tablet identifier backing this table.
     pub fn tablet_id(&self) -> u64 {
         self.runtime_tablet.tablet_id()
+    }
+
+    /// Storage table identifier backing this handle.
+    pub fn table_id(&self) -> u64 {
+        self.runtime_tablet.table_id()
     }
 
     /// Clone the runtime tablet handle backing this table.
