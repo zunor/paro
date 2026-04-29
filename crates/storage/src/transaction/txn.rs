@@ -124,9 +124,6 @@ impl Transaction {
     /// * `id` - Unique transaction identifier
     /// * `start_time` - Transaction start timestamp for MVCC
     ///
-    /// ```cpp
-    ///     transaction_t start_time, transaction_t transaction_id, idx_t catalog_version_p)
-    /// ```
     pub fn new(id: u64, start_time: u64) -> Self {
         Self::with_catalog_version(id, start_time, 0)
     }
@@ -526,10 +523,6 @@ impl Transaction {
 
     /// Returns whether this transaction has made any changes.
     ///
-    /// ```cpp
-    ///     return undo_buffer.ChangesMade();
-    /// }
-    /// ```
     pub fn changes_made(&self) -> bool {
         // Check undo buffer
         let undo_changes = match self.undo_buffer.lock() {
@@ -1189,15 +1182,6 @@ impl Transaction {
 
     /// Commit the transaction with the given commit ID.
     ///
-    /// ```cpp
-    ///                                   unique_ptr<StorageCommitState> commit_state) noexcept {
-    ///     this->commit_id = commit_info.commit_id;
-    ///     if (!ChangesMade()) { return ErrorData(); }
-    ///     storage->Commit(commit_state.get());
-    ///     undo_buffer.Commit(iterator_state, commit_info);
-    ///     return ErrorData();
-    /// }
-    /// ```
     ///
     /// # Arguments
     /// * `commit_id` - The commit timestamp to assign
@@ -1246,16 +1230,6 @@ impl Transaction {
 
     /// Rollback the transaction, undoing all changes.
     ///
-    /// ```cpp
-    ///     try {
-    ///         storage->Rollback();
-    ///         undo_buffer.Rollback();
-    ///         return ErrorData();
-    ///     } catch (std::exception &ex) {
-    ///         return ErrorData(ex);
-    ///     }
-    /// }
-    /// ```
     ///
     /// # Returns
     /// * `Ok(())` - Transaction rolled back successfully
@@ -1316,10 +1290,6 @@ impl Transaction {
     /// Called after commit/rollback when the transaction is no longer needed
     /// by any active transaction. This releases resources held by the undo buffer.
     ///
-    /// ```cpp
-    ///     undo_buffer.Cleanup(lowest_start_time);
-    /// }
-    /// ```
     ///
     /// # Arguments
     /// * `lowest_start_time` - The lowest start time among active transactions.
@@ -1339,8 +1309,6 @@ impl Transaction {
     /// Called when inserting rows into a table. Records the row range
     /// Legacy MVCC path; undo entries are no longer recorded.
     ///
-    /// ```cpp
-    /// ```
     ///
     /// # Arguments
     /// * `table_id` - The OID of the table being modified
@@ -1357,9 +1325,6 @@ impl Transaction {
     /// Called when deleting rows from a table. Records the deleted row IDs
     /// Legacy MVCC path; undo entries are no longer recorded.
     ///
-    /// ```cpp
-    ///     idx_t vector_idx, row_t rows[], idx_t count, idx_t base_row)
-    /// ```
     ///
     /// # Arguments
     /// * `table_id` - The OID of the table being modified
@@ -1375,9 +1340,6 @@ impl Transaction {
     /// Called when updating rows in a table. Records the old values
     /// Legacy MVCC path; undo entries are no longer recorded.
     ///
-    /// ```cpp
-    ///     table_t table_id, idx_t entries, row_t rows[])
-    /// ```
     ///
     /// # Arguments
     /// * `table_id` - The OID of the table being modified
@@ -1408,10 +1370,20 @@ mod tests {
 
     static SPILL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn reset_spill_for_test() -> std::sync::MutexGuard<'static, ()> {
+    struct SpillTestGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SpillTestGuard {
+        fn drop(&mut self) {
+            TxnSpillAdmission::global().reset_for_tests();
+        }
+    }
+
+    fn reset_spill_for_test() -> SpillTestGuard {
         let guard = SPILL_TEST_LOCK.lock().expect("lock spill test guard");
         TxnSpillAdmission::global().reset_for_tests();
-        guard
+        SpillTestGuard { _guard: guard }
     }
 
     fn create_table(types: &[LogicalType]) -> TableHandle {
@@ -1985,6 +1957,8 @@ mod tests {
 
     #[test]
     fn test_write_buffer_budget_fails_fast_before_staging_delete() {
+        let _spill_guard = reset_spill_for_test();
+        TxnSpillAdmission::global().set_device_pressure_for_tests(true);
         let table = create_table_with_keys(
             &[LogicalType::Integer, LogicalType::Integer],
             KeysType::PrimaryKeys,
@@ -2014,6 +1988,10 @@ mod tests {
         );
         assert_eq!(txn.write_buffer_mutation_count(), 0);
         assert_eq!(txn.write_buffer_memory_usage_bytes(), 0);
+        assert!(
+            !table.tablet().data_dir().join("txn_staging").exists(),
+            "budget rejection must happen before staging files are created"
+        );
     }
 
     #[test]

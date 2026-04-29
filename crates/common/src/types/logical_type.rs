@@ -534,12 +534,6 @@ impl LogicalType {
         // StringLiteral vs anything else: take the normalized type of the other operand
         //
         // Prefer a common type when either side can be widened safely.
-        // ```cpp
-        // if (left.id() == LogicalTypeId::STRING_LITERAL) {
-        //     result = LogicalType::NormalizeType(right);
-        //     return true;
-        // }
-        // ```
         //
         // This allows STRING_LITERAL to adapt to the other operand's type.
         // For example: `date_col = '2024-01-01'` → compare as DATE, not VARCHAR

@@ -25,9 +25,6 @@ use std::sync::Arc;
 
 /// Size of the undo entry header: UndoFlags (4 bytes) + length (4 bytes).
 ///
-/// ```cpp
-/// constexpr uint32_t UNDO_ENTRY_HEADER_SIZE = sizeof(UndoFlags) + sizeof(uint32_t);
-/// ```
 pub const UNDO_ENTRY_HEADER_SIZE: usize = 8;
 
 /// Default initial block capacity (4KB).
@@ -38,12 +35,6 @@ pub const DEFAULT_BLOCK_SIZE: usize = 262144;
 
 /// Align a value to the given alignment (must be power of 2).
 ///
-/// ```cpp
-/// template <class T>
-/// T AlignValue(T n, T alignment) {
-///     return (n + (alignment - 1)) & ~(alignment - 1);
-/// }
-/// ```
 #[inline]
 pub fn align_value(n: usize, alignment: usize) -> usize {
     debug_assert!(alignment.is_power_of_two());
@@ -56,16 +47,6 @@ pub fn align_value(n: usize, alignment: usize) -> usize {
 
 /// A single memory block in the undo buffer chain.
 ///
-/// ```cpp
-/// struct UndoBufferEntry {
-///     BufferManager &buffer_manager;
-///     shared_ptr<BlockHandle> block;
-///     idx_t position = 0;
-///     idx_t capacity = 0;
-///     unique_ptr<UndoBufferEntry> next;
-///     optional_ptr<UndoBufferEntry> prev;
-/// };
-/// ```
 ///
 /// In Paro, we use a simpler design with raw memory managed by Allocator.
 #[derive(Debug)]
@@ -161,14 +142,6 @@ unsafe impl Send for UndoBufferBlock {}
 
 /// Allocator for undo buffer entries using linked blocks.
 ///
-/// ```cpp
-/// struct UndoBufferAllocator {
-///     mutex lock;
-///     BufferManager &buffer_manager;
-///     unique_ptr<UndoBufferEntry> head;
-///     optional_ptr<UndoBufferEntry> tail;
-/// };
-/// ```
 ///
 /// The allocator maintains a linked list of blocks:
 /// - `head` points to the most recently allocated block (for new allocations)
@@ -215,14 +188,6 @@ impl UndoBufferAllocator {
 
     /// Allocate space for an entry of the given size.
     ///
-    /// ```cpp
-    /// UndoBufferReference UndoBufferAllocator::Allocate(idx_t alloc_len) {
-    ///     if (!head || head->position + alloc_len > head->capacity) {
-    ///         // allocate new block
-    ///     }
-    ///     // allocate from head
-    /// }
-    /// ```
     ///
     /// # Returns
     /// An `UndoBufferReference` pointing to the allocated space.
@@ -367,14 +332,6 @@ impl Drop for UndoBufferAllocator {
 
 /// A reference to an allocated entry in the undo buffer.
 ///
-/// ```cpp
-/// struct UndoBufferReference {
-///     optional_ptr<UndoBufferEntry> entry;
-///     BufferHandle handle;
-///     idx_t position;
-///     data_ptr_t Ptr() { return handle.Ptr() + position; }
-/// };
-/// ```
 ///
 /// This provides a handle to write data into the allocated space.
 #[derive(Debug)]
@@ -447,12 +404,6 @@ unsafe impl Send for UndoBufferReference {}
 
 /// A lightweight pointer to an entry in the undo buffer (for iteration).
 ///
-/// ```cpp
-/// struct UndoBufferPointer {
-///     UndoBufferEntry *entry;
-///     idx_t position;
-/// };
-/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct UndoBufferPointer {
     /// Index of the block containing this entry
@@ -473,15 +424,6 @@ impl UndoBufferPointer {
 
 /// State for iterating over undo buffer entries.
 ///
-/// ```cpp
-/// struct IteratorState {
-///     BufferHandle handle;
-///     optional_ptr<UndoBufferEntry> current;
-///     data_ptr_t start;
-///     data_ptr_t end;
-///     bool started = false;
-/// };
-/// ```
 ///
 /// In Paro, we use block indices instead of raw pointers for safety.
 #[derive(Debug, Clone, Default)]
@@ -509,22 +451,8 @@ impl IteratorState {
     }
 }
 ///
-/// ```cpp
-/// enum class UndoFlags : uint32_t {
-///     EMPTY_ENTRY = 0,
-///     CATALOG_ENTRY = 1,
-///     INSERT_TUPLE = 2,
-///     DELETE_TUPLE = 3,
-///     UPDATE_TUPLE = 4,
-///     SEQUENCE_VALUE = 5,
-///     DATABASE_ATTACH = 6
-/// };
-/// ```
 /// State tracking for active transactions.
 ///
-/// ```cpp
-/// enum class ActiveTransactionState { UNSET, OTHER_TRANSACTIONS, NO_OTHER_TRANSACTIONS };
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActiveTransactionState {
     #[default]
@@ -632,13 +560,6 @@ impl TryFrom<u32> for UndoFlags {
 
 /// Payload data for tuple append (insert) undo operations.
 ///
-/// ```cpp
-/// struct AppendInfo {
-///     table_t table_id;
-///     idx_t start_row;
-///     idx_t count;
-/// };
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoAppendInfo {
     /// Table OID being modified
@@ -651,17 +572,6 @@ pub struct UndoAppendInfo {
 
 /// Payload data for tuple delete undo operations.
 ///
-/// ```cpp
-/// struct DeleteInfo {
-///     RowVersionManager *version_info;
-///     idx_t vector_idx;
-///     table_t table_id;
-///     idx_t count;
-///     idx_t base_row;
-///     bool is_consecutive;
-///     // followed by row identifiers if not consecutive
-/// };
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoDeleteInfo {
     /// Table OID being modified
@@ -678,14 +588,6 @@ pub struct UndoDeleteInfo {
 
 /// Payload data for tuple update undo operations.
 ///
-/// ```cpp
-/// struct UpdateInfo {
-///     table_t table_id;
-///     transaction_t transaction_id;
-///     // ... row identifiers
-///     // ... column data and old values
-/// };
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoUpdateInfo {
     /// Table OID being modified
@@ -698,13 +600,6 @@ pub struct UndoUpdateInfo {
 
 /// Payload data for sequence value undo operations.
 ///
-/// ```cpp
-/// struct SequenceValue {
-///     SequenceCatalogEntry *entry;
-///     idx_t usage_count;
-///     int64_t counter;
-/// };
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoSequenceValueInfo {
     /// Sequence OID
@@ -832,12 +727,6 @@ impl UndoEntry {
 
 /// Buffer for storing undo information.
 ///
-/// ```cpp
-/// class UndoBuffer {
-///     UndoBufferAllocator allocator;
-///     ActiveTransactionState active_transaction_state;
-/// };
-/// ```
 ///
 /// The UndoBuffer now uses `UndoBufferAllocator` for memory management:
 /// - High-level API: `push_*` methods for type-safe entry creation
@@ -883,17 +772,6 @@ impl UndoBuffer {
 
     /// Create a raw entry in the undo buffer, returning a writable reference.
     ///
-    /// ```cpp
-    /// UndoBufferReference UndoBuffer::CreateEntry(UndoFlags type, idx_t len) {
-    ///     idx_t alloc_len = AlignValue<idx_t>(len + UNDO_ENTRY_HEADER_SIZE);
-    ///     auto handle = allocator.Allocate(alloc_len);
-    ///     // write header
-    ///     Store<UndoFlags>(type, data);
-    ///     Store<uint32_t>(len, data + sizeof(UndoFlags));
-    ///     handle.position += UNDO_ENTRY_HEADER_SIZE;
-    ///     return handle;
-    /// }
-    /// ```
     ///
     /// # Arguments
     /// * `entry_type` - The type of undo entry
@@ -938,13 +816,6 @@ impl UndoBuffer {
 
     /// Add an undo entry to the buffer.
     ///
-    /// ```cpp
-    /// UndoBufferReference UndoBuffer::CreateEntry(UndoFlags type, idx_t len) {
-    ///     idx_t alloc_len = AlignValue<idx_t>(len + UNDO_ENTRY_HEADER_SIZE);
-    ///     auto handle = allocator.Allocate(alloc_len);
-    ///     // write header and return reference
-    /// }
-    /// ```
     pub fn push(&mut self, entry: UndoEntry) {
         self.entries.push(entry);
     }
@@ -976,11 +847,6 @@ impl UndoBuffer {
 
     /// Returns true if any changes have been made (entries exist in the buffer).
     ///
-    /// ```cpp
-    /// bool UndoBuffer::ChangesMade() {
-    ///     return allocator.head.get();
-    /// }
-    /// ```
     pub fn changes_made(&self) -> bool {
         !self.entries.is_empty() || self.allocator.has_allocations()
     }
@@ -1034,13 +900,6 @@ impl UndoBuffer {
 
     /// Commit the entries in the buffer.
     ///
-    /// ```cpp
-    /// void UndoBuffer::Commit(UndoBuffer::IteratorState &iterator_state, CommitInfo &info) {
-    ///     IterateEntries(iterator_state, [&](UndoFlags type, data_ptr_t data) {
-    ///         CommitState::CommitEntry(type, data, commit_info);
-    ///     });
-    /// }
-    /// ```
     ///
     /// # Arguments
     /// * `transaction` - The transaction owning this buffer
@@ -1069,15 +928,6 @@ impl UndoBuffer {
 
     /// Rollback the entries in the buffer.
     ///
-    /// ```cpp
-    /// void UndoBuffer::Rollback() {
-    ///     // rollback needs to be performed in reverse
-    ///     RollbackState state(transaction);
-    ///     ReverseIterateEntries([&](UndoFlags type, data_ptr_t data) {
-    ///         state.RollbackEntry(type, data);
-    ///     });
-    /// }
-    /// ```
     ///
     /// Rollback must be performed in reverse order (LIFO) to properly
     /// undo nested operations.
@@ -1103,14 +953,6 @@ impl UndoBuffer {
 
     /// Cleanup committed entries that are no longer needed.
     ///
-    /// ```cpp
-    /// void UndoBuffer::Cleanup(transaction_t lowest_active_transaction) {
-    ///     CleanupState state(transaction, lowest_active_transaction, active_transaction_state);
-    ///     IterateEntries(iterator_state, [&](UndoFlags type, data_ptr_t data) {
-    ///         state.CleanupEntry(type, data);
-    ///     });
-    /// }
-    /// ```
     ///
     /// Cleanup should only be called after:
     /// 1. The transaction has successfully committed
@@ -1149,14 +991,6 @@ impl UndoBuffer {
 
     /// Revert a partial commit up to a given state.
     ///
-    /// ```cpp
-    /// void UndoBuffer::RevertCommit(UndoBuffer::IteratorState &end_state, transaction_t transaction_id) {
-    ///     CommitState state(transaction, transaction_id, active_transaction_state, CommitMode::REVERT_COMMIT);
-    ///     IterateEntries(start_state, end_state, [&](UndoFlags type, data_ptr_t data) {
-    ///         state.RevertCommit(type, data);
-    ///     });
-    /// }
-    /// ```
     ///
     /// Used when a commit fails partway through and needs to be reverted.
     ///
@@ -1184,11 +1018,6 @@ impl UndoBuffer {
 
     /// Get properties of the undo buffer (for checkpoint decisions).
     ///
-    /// ```cpp
-    /// UndoBufferProperties UndoBuffer::GetProperties() {
-    ///     // iterates entries to determine has_updates, has_deletes, etc.
-    /// }
-    /// ```
     pub fn get_properties(&self) -> UndoBufferProperties {
         let mut props = UndoBufferProperties::default();
 
@@ -1223,28 +1052,6 @@ impl UndoBuffer {
     /// Iterate over raw entries in insertion order (tail to head).
     /// Used for Commit operations.
     ///
-    /// ```cpp
-    /// template <class T>
-    /// void UndoBuffer::IterateEntries(UndoBuffer::IteratorState &state, T &&callback) {
-    ///     // iterate in insertion order: start with the tail
-    ///     state.current = allocator.tail.get();
-    ///     state.started = true;
-    ///     while (state.current) {
-    ///         state.handle = allocator.buffer_manager.Pin(state.current->block);
-    ///         state.start = state.handle.Ptr();
-    ///         state.end = state.start + state.current->position;
-    ///         while (state.start < state.end) {
-    ///             UndoFlags type = Load<UndoFlags>(state.start);
-    ///             state.start += sizeof(UndoFlags);
-    ///             uint32_t len = Load<uint32_t>(state.start);
-    ///             state.start += sizeof(uint32_t);
-    ///             callback(type, state.start);
-    ///             state.start += len;
-    ///         }
-    ///         state.current = state.current->prev;
-    ///     }
-    /// }
-    /// ```
     ///
     /// # Arguments
     /// * `callback` - Function called for each entry with (UndoFlags, *const u8 payload)
@@ -1320,33 +1127,6 @@ impl UndoBuffer {
     /// Iterate over raw entries in reverse insertion order (head to tail, entries reversed).
     /// Used for Rollback operations.
     ///
-    /// ```cpp
-    /// template <class T>
-    /// void UndoBuffer::ReverseIterateEntries(T &&callback) {
-    ///     // iterate in reverse insertion order: start with the head
-    ///     auto current = allocator.head.get();
-    ///     while (current) {
-    ///         auto handle = allocator.buffer_manager.Pin(current->block);
-    ///         data_ptr_t start = handle.Ptr();
-    ///         data_ptr_t end = start + current->position;
-    ///         // create a vector with all nodes in this chunk
-    ///         vector<pair<UndoFlags, data_ptr_t>> nodes;
-    ///         while (start < end) {
-    ///             auto type = Load<UndoFlags>(start);
-    ///             start += sizeof(UndoFlags);
-    ///             auto len = Load<uint32_t>(start);
-    ///             start += sizeof(uint32_t);
-    ///             nodes.emplace_back(type, start);
-    ///             start += len;
-    ///         }
-    ///         // iterate over it in reverse order
-    ///         for (idx_t i = nodes.size(); i > 0; i--) {
-    ///             callback(nodes[i - 1].first, nodes[i - 1].second);
-    ///         }
-    ///         current = current->next.get();
-    ///     }
-    /// }
-    /// ```
     ///
     /// # Arguments
     /// * `callback` - Function called for each entry with (UndoFlags, *const u8 payload)
@@ -1403,10 +1183,6 @@ impl UndoBuffer {
 
     /// Iterate over raw entries between two states (for partial commit/revert).
     ///
-    /// ```cpp
-    /// template <class T>
-    /// void UndoBuffer::IterateEntries(IteratorState &state, IteratorState &end_state, T &&callback);
-    /// ```
     ///
     /// # Arguments
     /// * `start_state` - Starting iterator state
@@ -1485,16 +1261,6 @@ impl UndoBuffer {
 
 /// Properties of an undo buffer for checkpoint decisions.
 ///
-/// ```cpp
-/// struct UndoBufferProperties {
-///     idx_t estimated_size = 0;
-///     bool has_updates = false;
-///     bool has_deletes = false;
-///     bool has_index_deletes = false;
-///     bool has_catalog_changes = false;
-///     bool has_dropped_entries = false;
-/// };
-/// ```
 #[derive(Debug, Clone, Default)]
 pub struct UndoBufferProperties {
     /// Estimated memory size of the buffer

@@ -84,6 +84,26 @@ impl PendingMutation {
             Self::RowIdDelete(pending) => 128_u64.saturating_add(pending.locations_memory_bytes()),
         }
     }
+
+    fn minimum_memory_bytes_after_delete_spill(&self) -> u64 {
+        match self {
+            Self::PrimaryDelete(pending) => pending
+                .keys
+                .iter()
+                .fold(128_u64, |acc, key| acc.saturating_add(key.len() as u64))
+                .saturating_add(if pending.locations.is_empty() {
+                    pending.locations_memory_bytes()
+                } else {
+                    StagedDeleteVectorArtifact::minimum_estimated_handle_bytes()
+                }),
+            Self::RowIdDelete(pending) => 128_u64.saturating_add(if pending.locations.is_empty() {
+                pending.locations_memory_bytes()
+            } else {
+                StagedDeleteVectorArtifact::minimum_estimated_handle_bytes()
+            }),
+            Self::Rowset(_) => self.estimated_memory_bytes(),
+        }
+    }
 }
 
 /// Pending rowset + primary key update metadata.
@@ -1113,10 +1133,13 @@ impl TxnWriteBuffer {
         mut mutation: PendingMutation,
         inner: &mut TxnWriteBufferInner,
     ) -> Result<PendingMutation> {
-        let projected = self
-            .estimated_memory_bytes_locked(inner)
-            .saturating_add(mutation.estimated_memory_bytes());
+        let current_memory_bytes = self.estimated_memory_bytes_locked(inner);
+        let projected = current_memory_bytes.saturating_add(mutation.estimated_memory_bytes());
         if self.is_over_budget(projected) {
+            let minimum_projected_after_spill = current_memory_bytes
+                .saturating_add(mutation.minimum_memory_bytes_after_delete_spill());
+            self.ensure_within_budget(minimum_projected_after_spill)?;
+
             let current_spilled_bytes = Self::spilled_bytes_locked(inner);
             match &mut mutation {
                 PendingMutation::PrimaryDelete(pending) if !pending.locations.is_empty() => {
