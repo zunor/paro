@@ -1370,10 +1370,20 @@ mod tests {
 
     static SPILL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn reset_spill_for_test() -> std::sync::MutexGuard<'static, ()> {
+    struct SpillTestGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SpillTestGuard {
+        fn drop(&mut self) {
+            TxnSpillAdmission::global().reset_for_tests();
+        }
+    }
+
+    fn reset_spill_for_test() -> SpillTestGuard {
         let guard = SPILL_TEST_LOCK.lock().expect("lock spill test guard");
         TxnSpillAdmission::global().reset_for_tests();
-        guard
+        SpillTestGuard { _guard: guard }
     }
 
     fn create_table(types: &[LogicalType]) -> TableHandle {
@@ -1947,6 +1957,8 @@ mod tests {
 
     #[test]
     fn test_write_buffer_budget_fails_fast_before_staging_delete() {
+        let _spill_guard = reset_spill_for_test();
+        TxnSpillAdmission::global().set_device_pressure_for_tests(true);
         let table = create_table_with_keys(
             &[LogicalType::Integer, LogicalType::Integer],
             KeysType::PrimaryKeys,
@@ -1976,6 +1988,10 @@ mod tests {
         );
         assert_eq!(txn.write_buffer_mutation_count(), 0);
         assert_eq!(txn.write_buffer_memory_usage_bytes(), 0);
+        assert!(
+            !table.tablet().data_dir().join("txn_staging").exists(),
+            "budget rejection must happen before staging files are created"
+        );
     }
 
     #[test]

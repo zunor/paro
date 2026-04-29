@@ -276,9 +276,16 @@ pub(crate) struct TxnSpillArtifactMeta {
 }
 
 impl TxnSpillArtifactMeta {
+    const MIN_ESTIMATED_HANDLE_BYTES: u64 = 160;
+
+    #[inline]
+    pub(crate) const fn minimum_estimated_handle_bytes() -> u64 {
+        Self::MIN_ESTIMATED_HANDLE_BYTES
+    }
+
     #[inline]
     pub(crate) fn estimated_handle_bytes(&self) -> u64 {
-        160_u64
+        Self::MIN_ESTIMATED_HANDLE_BYTES
             .saturating_add(self.path.to_string_lossy().len() as u64)
             .saturating_add(self.manifest_path.to_string_lossy().len() as u64)
     }
@@ -363,6 +370,11 @@ pub(crate) struct StagedDeleteVectorArtifact {
 }
 
 impl StagedDeleteVectorArtifact {
+    #[inline]
+    pub(crate) const fn minimum_estimated_handle_bytes() -> u64 {
+        TxnSpillArtifactMeta::minimum_estimated_handle_bytes()
+    }
+
     #[inline]
     pub(crate) fn bytes(&self) -> u64 {
         self.meta.bytes
