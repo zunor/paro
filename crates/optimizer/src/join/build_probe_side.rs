@@ -3,7 +3,6 @@
 
 //! Build/probe-side optimizer.
 //!
-//! `build_probe_side_optimizer.cpp`. For Paro we only need enough cost
 //! estimation to keep delim joins and regular comparison joins on the cheaper
 //! build side, while preserving join semantics when children are swapped.
 

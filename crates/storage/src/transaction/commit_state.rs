@@ -9,15 +9,6 @@ use crate::transaction::undo_buffer::{
 
 /// Index removal type for commit and cleanup operations.
 ///
-/// ```cpp
-/// enum class IndexRemovalType {
-///     MAIN_INDEX,           // Remove from main index, insert into deleted_rows_in_use
-///     MAIN_INDEX_ONLY,      // Remove from main index only
-///     REVERT_MAIN_INDEX,    // Revert MAIN_INDEX, append to main and remove from deleted_rows_in_use
-///     REVERT_MAIN_INDEX_ONLY, // Revert MAIN_INDEX_ONLY, append to main index
-///     DELETED_ROWS_IN_USE   // Remove from deleted_rows_in_use (used in cleanup)
-/// };
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexRemovalType {
     /// Remove from main index, insert into deleted_rows_in_use
@@ -34,14 +25,6 @@ pub enum IndexRemovalType {
 
 /// IndexDataRemover handles index cleanup during commit.
 ///
-/// ```cpp
-/// struct IndexDataRemover {
-///     QueryContext context;
-///     IndexRemovalType removal_type;
-///     Chunk chunk;
-///     reference_map_t<table_t, shared_ptr<TableInfo>> verify_indexes;
-/// };
-/// ```
 ///
 /// In Paro, this is a simplified version that tracks pending index deletions.
 /// Full index integration will be added when index support is implemented.
@@ -56,9 +39,6 @@ pub struct IndexDataRemover {
 impl IndexDataRemover {
     /// Create a new IndexDataRemover.
     ///
-    /// ```cpp
-    ///                                    IndexRemovalType removal_type)
-    /// ```
     pub fn new(removal_type: IndexRemovalType) -> Self {
         Self {
             removal_type,
@@ -68,12 +48,6 @@ impl IndexDataRemover {
 
     /// Push a delete operation for index cleanup.
     ///
-    /// ```cpp
-    /// void IndexDataRemover::PushDelete(DeleteInfo &info) {
-    ///     if (!version_table.HasIndexes()) { return; }
-    ///     // collect row_numbers and flush
-    /// }
-    /// ```
     pub fn push_delete(&mut self, table_id: u64, info: &UndoDeleteInfo) {
         // Collect row IDs for index removal
         let row_ids: Vec<u64> = if info.is_consecutive {
@@ -89,9 +63,6 @@ impl IndexDataRemover {
 
     /// Flush pending deletes to indexes.
     ///
-    /// ```cpp
-    /// void IndexDataRemover::Flush(table_t table_id, row_t *row_numbers, idx_t count)
-    /// ```
     ///
     /// Note: Actual index removal will be implemented when index support is added.
     pub fn flush(&mut self) {
@@ -102,13 +73,6 @@ impl IndexDataRemover {
 
     /// Verify index integrity (debug mode).
     ///
-    /// ```cpp
-    /// void IndexDataRemover::Verify() {
-    ///     for (auto &table : verify_indexes) {
-    ///         table.second->VerifyIndexBuffers();
-    ///     }
-    /// }
-    /// ```
     pub fn verify(&self) {
         // TODO: Implement index verification when index support is added
         #[cfg(debug_assertions)]
@@ -125,21 +89,6 @@ impl IndexDataRemover {
 
 /// CommitState handles the commitment of undo entries.
 ///
-/// ```cpp
-/// class CommitState {
-/// public:
-///                          ActiveTransactionState transaction_state, CommitMode commit_mode);
-///     void CommitEntry(UndoFlags type, data_ptr_t data);
-///     void RevertCommit(UndoFlags type, data_ptr_t data);
-///     void Flush();
-///     void Verify();
-/// private:
-///     void CommitEntryDrop(CatalogEntry &entry, data_ptr_t extra_data);
-///     void CommitDelete(DeleteInfo &info);
-///     transaction_t commit_id;
-///     IndexDataRemover index_data_remover;
-/// };
-/// ```
 ///
 pub struct CommitState<'a> {
     /// Reference to the transaction being committed
@@ -157,12 +106,6 @@ pub struct CommitState<'a> {
 impl<'a> CommitState<'a> {
     /// Create a new CommitState.
     ///
-    /// ```cpp
-    ///                          ActiveTransactionState transaction_state, CommitMode commit_mode)
-    ///     : transaction(transaction_p), commit_id(commit_id),
-    ///       index_data_remover(transaction, *transaction.context.lock(),
-    ///                          GetIndexRemovalType(transaction_state, commit_mode)) {}
-    /// ```
     pub fn new(
         transaction: &'a Transaction,
         commit_id: u64,
@@ -181,22 +124,6 @@ impl<'a> CommitState<'a> {
 
     /// Determine the index removal type based on transaction state and commit mode.
     ///
-    /// ```cpp
-    /// IndexRemovalType CommitState::GetIndexRemovalType(ActiveTransactionState transaction_state,
-    ///                                                   CommitMode commit_mode) {
-    ///     if (commit_mode == CommitMode::COMMIT) {
-    ///         if (transaction_state == ActiveTransactionState::NO_OTHER_TRANSACTIONS) {
-    ///             return IndexRemovalType::MAIN_INDEX_ONLY;
-    ///         }
-    ///         return IndexRemovalType::MAIN_INDEX;
-    ///     }
-    ///     // revert the appends to the indexes
-    ///     if (transaction_state == ActiveTransactionState::NO_OTHER_TRANSACTIONS) {
-    ///         return IndexRemovalType::REVERT_MAIN_INDEX_ONLY;
-    ///     }
-    ///     return IndexRemovalType::REVERT_MAIN_INDEX;
-    /// }
-    /// ```
     pub fn get_index_removal_type(
         transaction_state: ActiveTransactionState,
         commit_mode: CommitMode,
@@ -221,16 +148,6 @@ impl<'a> CommitState<'a> {
 
     /// Commit an entry from the undo buffer (raw pointer API).
     ///
-    /// ```cpp
-    /// void CommitState::CommitEntry(UndoFlags type, data_ptr_t data) {
-    ///     switch (type) {
-    ///     case UndoFlags::CATALOG_ENTRY: { ... }
-    ///     case UndoFlags::INSERT_TUPLE: { ... }
-    ///     case UndoFlags::DELETE_TUPLE: { ... }
-    ///     case UndoFlags::UPDATE_TUPLE: { ... }
-    ///     }
-    /// }
-    /// ```
     pub fn commit_entry(&mut self, flags: UndoFlags, data: *const u8) {
         let operation = match self.commit_mode {
             CommitMode::Commit => "commit",
@@ -267,15 +184,6 @@ impl<'a> CommitState<'a> {
 
     /// Commit an insert (append) operation.
     ///
-    /// ```cpp
-    /// case UndoFlags::INSERT_TUPLE: {
-    ///     auto info = reinterpret_cast<AppendInfo *>(data);
-    ///     if (!info->table->IsMainTable()) {
-    ///         throw TransactionException("...");
-    ///     }
-    ///     info->table->CommitAppend(commit_id, info->start_row, info->count);
-    /// }
-    /// ```
     fn commit_insert(&mut self, info: &UndoAppendInfo) {
         // Mark the inserted rows as committed by updating their version info
         // to use commit_id instead of transaction_id.
@@ -287,14 +195,6 @@ impl<'a> CommitState<'a> {
 
     /// Commit a delete operation.
     ///
-    /// ```cpp
-    /// void CommitState::CommitDelete(DeleteInfo &info) {
-    ///     // mark the tuples as committed
-    ///     info.version_info->CommitDelete(info.vector_idx, commit_id, info);
-    ///     // delete from indexes
-    ///     index_data_remover.PushDelete(info);
-    /// }
-    /// ```
     fn commit_delete(&mut self, info: &UndoDeleteInfo) {
         // 1. Mark deleted rows as permanently deleted with commit_id
         // This will be called by the storage layer:
@@ -306,15 +206,6 @@ impl<'a> CommitState<'a> {
 
     /// Commit an update operation.
     ///
-    /// ```cpp
-    /// case UndoFlags::UPDATE_TUPLE: {
-    ///     auto info = reinterpret_cast<UpdateInfo *>(data);
-    ///     if (!info->table->IsMainTable()) {
-    ///         throw TransactionException("...");
-    ///     }
-    ///     info->version_number = commit_id;
-    /// }
-    /// ```
     fn commit_update(&mut self, info: &UndoUpdateInfo) {
         // Set the version number of the update to commit_id,
         // making it visible to other transactions.
@@ -347,11 +238,6 @@ impl<'a> CommitState<'a> {
 
     /// Verify commit integrity (debug mode).
     ///
-    /// ```cpp
-    /// void CommitState::Verify() {
-    ///     index_data_remover.Verify();
-    /// }
-    /// ```
     pub fn verify(&self) {
         self.index_data_remover.verify();
     }

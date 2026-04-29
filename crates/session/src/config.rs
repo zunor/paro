@@ -279,7 +279,6 @@ impl SessionConfig {
     /// # Arguments
     /// * `n` - Number of threads. Must be >= 1.
     ///
-    /// - `ThreadsSetting::SetGlobal()` in `custom_settings.cpp`
     pub fn set_threads(&mut self, n: usize) {
         self.threads = Some(n.max(1));
     }

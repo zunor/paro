@@ -9,25 +9,6 @@
 //! The Planner creates a logical query plan from the parsed SQL statements.
 //! It orchestrates the binding (semantic analysis) and logical plan generation.
 //!
-//! ```cpp
-//! class Planner {
-//! public:
-//!     explicit Planner(ClientContext &context);
-//!
-//!     unique_ptr<LogicalOperator> plan;
-//!     vector<string> names;
-//!     vector<LogicalType> types;
-//!     case_insensitive_map_t<BoundParameterData> parameter_data;
-//!
-//!     shared_ptr<Binder> binder;
-//!     ClientContext &context;
-//!
-//!     StatementProperties properties;
-//!     bound_parameter_map_t value_map;
-//!
-//!     void CreatePlan(unique_ptr<SQLStatement> statement);
-//! };
-//! ```
 
 use crate::binder::ir::statement::BoundStatementKind;
 use crate::binder::Binder;
