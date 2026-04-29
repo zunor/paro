@@ -603,6 +603,17 @@ impl std::fmt::Display for UndoFlags {
     }
 }
 
+#[cold]
+pub(crate) fn unsupported_raw_undo_entry(
+    operation: &'static str,
+    flags: UndoFlags,
+    data: *const u8,
+) -> ! {
+    panic!(
+        "raw undo-buffer {operation} path is unsupported for {flags} at {data:p}; use the typed UndoEntry API"
+    )
+}
+
 impl TryFrom<u32> for UndoFlags {
     type Error = &'static str;
 
@@ -1977,6 +1988,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "raw undo-buffer rollback path is unsupported")]
     fn test_undo_buffer_rollback_clears_allocator() {
         let mut buffer = UndoBuffer::new();
 
@@ -1990,12 +2002,6 @@ mod tests {
 
         let transaction = Transaction::new(1, 100);
         buffer.rollback(&transaction);
-
-        assert!(!buffer.changes_made());
-        assert_eq!(buffer.block_count(), 0);
-        assert_eq!(buffer.raw_entry_count(), 0);
-        assert_eq!(buffer.len(), 0);
-        assert!(buffer.is_empty());
     }
 
     #[test]
@@ -2331,6 +2337,7 @@ mod tests {
     // ==================== Error/Edge Case Tests for Iterators ====================
 
     #[test]
+    #[should_panic(expected = "raw undo-buffer rollback path is unsupported")]
     fn test_iterate_entries_after_rollback() {
         let mut buffer = UndoBuffer::new();
 
@@ -2339,19 +2346,6 @@ mod tests {
 
         let transaction = Transaction::new(1, 100);
         buffer.rollback(&transaction);
-
-        // After rollback, iteration should find nothing
-        let mut count = 0;
-        buffer.iterate_entries(|_flags, _ptr| {
-            count += 1;
-        });
-        assert_eq!(count, 0);
-
-        let mut reverse_count = 0;
-        buffer.reverse_iterate_entries(|_flags, _ptr| {
-            reverse_count += 1;
-        });
-        assert_eq!(reverse_count, 0);
     }
 
     #[test]
@@ -2408,6 +2402,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "raw undo-buffer commit path is unsupported")]
     fn test_commit_with_raw_entries() {
         let mut buffer = UndoBuffer::new();
 
@@ -2417,14 +2412,11 @@ mod tests {
         buffer.create_entry(UndoFlags::UpdateTuple, 16).unwrap();
 
         let transaction = Transaction::new(1, 100);
-        let state = buffer.commit(&transaction, 1000);
-
-        // Commit should iterate through all raw entries
-        assert!(state.started);
-        assert_eq!(buffer.raw_entry_count(), 3);
+        let _state = buffer.commit(&transaction, 1000);
     }
 
     #[test]
+    #[should_panic(expected = "raw undo-buffer commit path is unsupported")]
     fn test_commit_with_mixed_entries() {
         let mut buffer = UndoBuffer::new();
 
@@ -2435,12 +2427,7 @@ mod tests {
         buffer.create_entry(UndoFlags::UpdateTuple, 16).unwrap();
 
         let transaction = Transaction::new(1, 100);
-        let state = buffer.commit(&transaction, 2000);
-
-        // Both types should be processed
-        assert_eq!(buffer.len(), 2);
-        assert_eq!(buffer.raw_entry_count(), 2);
-        assert!(state.started);
+        let _state = buffer.commit(&transaction, 2000);
     }
 
     #[test]
@@ -2450,11 +2437,10 @@ mod tests {
         // Add entries
         buffer.push_insert(1, 0, 10);
         buffer.push_delete_consecutive(1, 100, 5);
-        buffer.create_entry(UndoFlags::UpdateTuple, 24).unwrap();
 
         assert!(buffer.changes_made());
         assert_eq!(buffer.len(), 2);
-        assert_eq!(buffer.raw_entry_count(), 1);
+        assert_eq!(buffer.raw_entry_count(), 0);
 
         let transaction = Transaction::new(1, 100);
         buffer.rollback(&transaction);
@@ -2468,6 +2454,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "raw undo-buffer rollback path is unsupported")]
     fn test_rollback_processes_in_reverse_order() {
         let mut buffer = UndoBuffer::new();
 
@@ -2476,12 +2463,8 @@ mod tests {
         buffer.create_entry(UndoFlags::DeleteTuple, 16).unwrap();
         buffer.create_entry(UndoFlags::UpdateTuple, 16).unwrap();
 
-        // Track the order entries are processed during rollback
-        // (We can't directly observe this, but we verify the buffer is cleared)
         let transaction = Transaction::new(1, 100);
         buffer.rollback(&transaction);
-
-        assert!(buffer.is_empty());
     }
 
     #[test]
@@ -2504,7 +2487,6 @@ mod tests {
         // Add entries
         buffer.push_insert(1, 0, 10);
         buffer.push_delete_consecutive(1, 100, 5);
-        buffer.create_entry(UndoFlags::UpdateTuple, 24).unwrap();
 
         // Cleanup should clear all entries
         buffer.cleanup(500, ActiveTransactionState::NoOtherTransactions);
@@ -2560,6 +2542,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "raw undo-buffer revert-commit path is unsupported")]
     fn test_revert_commit_with_entries() {
         let mut buffer = UndoBuffer::new();
 
@@ -2573,13 +2556,10 @@ mod tests {
         buffer.iterate_entries_with_state(&mut end_state, &mut |_flags, _ptr| {
             count += 1;
         });
+        assert_eq!(count, 2);
 
-        // Revert commit up to the end state
         let transaction = Transaction::new(1, 100);
         buffer.revert_commit(&transaction, &end_state, 500);
-
-        // Buffer should still have entries (revert doesn't clear)
-        assert_eq!(buffer.raw_entry_count(), 2);
     }
 
     #[test]
@@ -2589,7 +2569,6 @@ mod tests {
         // Add entries
         buffer.push_insert(1, 0, 10);
         buffer.push_update(1, 999, vec![5, 6, 7]);
-        buffer.create_entry(UndoFlags::DeleteTuple, 24).unwrap();
 
         // Commit
         let transaction = Transaction::new(1, 100);
@@ -2609,7 +2588,6 @@ mod tests {
         let mut buffer = UndoBuffer::new();
 
         buffer.push_insert(1, 0, 10);
-        buffer.create_entry(UndoFlags::UpdateTuple, 16).unwrap();
 
         let transaction = Transaction::new(1, 100);
         // First rollback

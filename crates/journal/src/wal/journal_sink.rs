@@ -5,8 +5,8 @@
 
 use crate::wal::wal_type::WalType;
 use crate::wal::write_ahead_log::WriteAheadLog;
+use crate::JournalSink;
 use paro_common::error::Result;
-use paro_journal::JournalSink;
 use std::sync::Arc;
 
 pub struct WalJournalSink {

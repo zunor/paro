@@ -21,12 +21,18 @@ use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::RecoverySummary;
 use paro_common::logging::targets;
+use paro_journal::wal::journal_sink::WalJournalSink;
+use paro_journal::wal::write_ahead_log::WriteAheadLog;
+use paro_journal::{
+    JournalAppender, JournalApplyMetricsSnapshot, JournalApplyRuntime, JournalCoordinator,
+    JournalSink,
+};
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::transaction::manager::TransactionManager;
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
+use paro_transaction::{CommitCoordinator, CommitTs, DatabaseId as TransactionDatabaseId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -230,6 +236,10 @@ pub struct DatabaseHandle {
     state: DatabaseState,
     catalog: Arc<ParoCatalog>,
     transaction_manager: Arc<TransactionManager>,
+    commit_coordinator: Arc<CommitCoordinator>,
+    journal_coordinator: Mutex<Option<Arc<JournalCoordinator>>>,
+    journal_apply_runtime: Mutex<Option<Arc<JournalApplyRuntime>>>,
+    journal_next_lsn: AtomicU64,
     buffer_pool: Arc<BufferPool>,
     storage_manager: RwLock<Option<Box<dyn StorageManager>>>,
     compaction: CompactionDriver,
@@ -279,11 +289,18 @@ impl DatabaseHandle {
         initial_state: DbState,
     ) -> Self {
         let catalog = Self::catalog_for_path(&identity.name, &identity.path);
+        let database_id = identity.id;
         Self {
             identity,
             state: DatabaseState::new(initial_state),
             catalog,
-            transaction_manager: Arc::new(TransactionManager::new()),
+            transaction_manager: Arc::new(TransactionManager::new_for_database_id(database_id)),
+            commit_coordinator: Arc::new(CommitCoordinator::new(TransactionDatabaseId::new(
+                database_id,
+            ))),
+            journal_coordinator: Mutex::new(None),
+            journal_apply_runtime: Mutex::new(None),
+            journal_next_lsn: AtomicU64::new(1),
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
             compaction: CompactionDriver::new(buffer_pool),
@@ -480,7 +497,7 @@ impl DatabaseHandle {
     pub fn sync_compaction_tablets(&self) -> anyhow::Result<()> {
         self.compaction
             .sync_tablets(&self.catalog, self.name(), self.db_type())?;
-        self.bind_checkpoint_publish_observers();
+        self.bind_tablet_runtime_services();
         Ok(())
     }
 
@@ -546,6 +563,72 @@ impl DatabaseHandle {
         &self.transaction_manager
     }
 
+    pub fn commit_coordinator(&self) -> &Arc<CommitCoordinator> {
+        &self.commit_coordinator
+    }
+
+    pub fn journal_coordinator(&self) -> Arc<JournalCoordinator> {
+        let runtime = self.journal_apply_runtime();
+        if let Some(coordinator) = self.journal_coordinator.lock().as_ref().cloned() {
+            coordinator.bind_apply_runtime(runtime);
+            return coordinator;
+        }
+
+        let appender = self.wal().map(|wal| {
+            let sink: Arc<dyn JournalSink> = Arc::new(WalJournalSink::new(wal));
+            Arc::new(JournalAppender::new_with_next_lsn(
+                sink,
+                self.journal_next_lsn.load(Ordering::Acquire),
+            ))
+        });
+        let coordinator = Arc::new(JournalCoordinator::new(appender));
+        coordinator.bind_apply_runtime(runtime);
+        coordinator.sync_commit_id_with(self.transaction_manager.durable_commit_id());
+        let mut guard = self.journal_coordinator.lock();
+        if let Some(existing) = guard.as_ref().cloned() {
+            existing.bind_apply_runtime(self.journal_apply_runtime());
+            existing
+        } else {
+            *guard = Some(Arc::clone(&coordinator));
+            coordinator
+        }
+    }
+
+    pub fn journal_apply_runtime(&self) -> Arc<JournalApplyRuntime> {
+        if let Some(runtime) = self.journal_apply_runtime.lock().as_ref().cloned() {
+            return runtime;
+        }
+
+        let runtime = Arc::new(JournalApplyRuntime::new());
+        runtime.sync_commit_frontier_with(self.transaction_manager.durable_commit_id());
+        let mut guard = self.journal_apply_runtime.lock();
+        if let Some(existing) = guard.as_ref().cloned() {
+            existing
+        } else {
+            *guard = Some(Arc::clone(&runtime));
+            runtime
+        }
+    }
+
+    pub fn journal_apply_metrics(&self) -> JournalApplyMetricsSnapshot {
+        self.journal_apply_runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.metrics())
+            .unwrap_or_default()
+    }
+
+    pub fn sync_commit_runtime_with(&self, min_committed_version: u64) {
+        self.commit_coordinator
+            .sync_commit_ts_with(CommitTs::new(min_committed_version));
+        if let Some(runtime) = self.journal_apply_runtime.lock().as_ref().cloned() {
+            runtime.sync_commit_frontier_with(min_committed_version);
+        }
+        if let Some(coordinator) = self.journal_coordinator.lock().as_ref().cloned() {
+            coordinator.sync_commit_id_with(min_committed_version);
+        }
+    }
+
     /// Buffer pool shared with the rest of the instance.
     pub fn buffer_pool(&self) -> &Arc<BufferPool> {
         &self.buffer_pool
@@ -571,6 +654,8 @@ impl DatabaseHandle {
         if let Some(ref mut sm) = *storage {
             sm.initialize().map_err(|e| anyhow::anyhow!(e))?;
         }
+        *self.journal_coordinator.lock() = None;
+        *self.journal_apply_runtime.lock() = None;
 
         tracing::info!(
             target: targets::WAL,
@@ -593,7 +678,7 @@ impl DatabaseHandle {
     /// This inspects the active segment-backed WAL without mutating state.
     pub fn check_wal_health(
         &self,
-    ) -> anyhow::Result<paro_storage::wal::recovery::WalHealthCheckReport> {
+    ) -> anyhow::Result<paro_journal::wal::recovery::WalHealthCheckReport> {
         let storage = self.storage_manager.read();
         self.wal_observability.check_wal_health(
             storage.as_ref().map(|sm| sm.as_ref()),
@@ -761,7 +846,11 @@ impl DatabaseHandle {
     }
 
     pub fn bootstrap_checkpoint_runtime(&self, summary: RecoverySummary) {
+        self.journal_next_lsn
+            .store(summary.max_lsn.saturating_add(1).max(1), Ordering::Release);
         self.checkpoint_coordinator.bootstrap_runtime(summary);
+        *self.journal_coordinator.lock() = None;
+        self.bind_tablet_runtime_services();
     }
 
     pub fn publish_checkpoint_transaction(
@@ -988,8 +1077,10 @@ impl DatabaseHandle {
         &self.checkpoint_coordinator
     }
 
-    fn bind_checkpoint_publish_observers(&self) {
+    fn bind_tablet_runtime_services(&self) {
         let observer = self.checkpoint_coordinator.compaction_publish_observer();
+        let journal = self.journal_coordinator();
+        let apply_runtime = self.journal_apply_runtime();
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
             .catalog
@@ -1011,6 +1102,8 @@ impl DatabaseHandle {
                     storage
                         .tablet()
                         .bind_checkpoint_publish_observer(observer.clone());
+                    storage.bind_journal_coordinator(Some(Arc::clone(&journal)));
+                    storage.bind_journal_apply_runtime(Some(Arc::clone(&apply_runtime)));
                 }
             }
         }

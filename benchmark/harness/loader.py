@@ -40,6 +40,7 @@ class QueryDef:
 class WorkloadDef:
     name: str
     description: str
+    run_order: int
     root: Path
     params: dict[str, Any]
     setup_sql: str
@@ -81,6 +82,7 @@ def load_workloads(
             workload = replace(workload, queries=filtered)
         selected.append(workload)
 
+    selected.sort(key=lambda workload: (workload.run_order, workload.root.name))
     if workload_name and not selected:
         raise ValueError(f"workload not found: {workload_name}")
     return selected
@@ -144,6 +146,7 @@ def load_workload(
 
     name = str(meta.get("name") or workload_root.name)
     description = str(meta.get("description", ""))
+    run_order = _optional_int(meta, "run_order", default=100, manifest_path=manifest_path)
 
     setup_file = _require_str(setup, "file", table_name="setup")
     teardown_file = _require_str(setup, "teardown", table_name="setup")
@@ -223,6 +226,7 @@ def load_workload(
     return WorkloadDef(
         name=name,
         description=description,
+        run_order=run_order,
         root=workload_root,
         params=params,
         setup_sql=setup_sql,
@@ -301,6 +305,19 @@ def _require_str(section: Mapping[str, Any], key: str, *, table_name: str) -> st
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"[{table_name}].{key} must be a non-empty string")
     return value.strip()
+
+
+def _optional_int(
+    section: Mapping[str, Any],
+    key: str,
+    *,
+    default: int,
+    manifest_path: Path,
+) -> int:
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{manifest_path}: [meta].{key} must be an integer")
+    return value
 
 
 def _coerce_plan_tokens(value: Any, manifest_path: Path, query_id: str) -> tuple[str, ...]:

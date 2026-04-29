@@ -16,9 +16,9 @@ use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::RecoverySummary;
 use paro_common::effect::DeferredTask;
 use paro_common::logging::targets;
+use paro_journal::wal::wal_entry::WalHeaderMetadata;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};
-use paro_storage::wal::wal_entry::WalHeaderMetadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -154,11 +154,16 @@ impl DatabaseOpener {
         );
 
         let _compaction_guard = db.compaction().suspend(db.name(), "recovery");
+        db.transaction_manager().block_recovery_admission();
         let inputs = Self::collect_finalize_inputs(db)?;
+        let apply_runtime = db.journal_apply_runtime();
+        apply_runtime.bootstrap_frontiers(Self::journal_recovery_summary(
+            &inputs.checkpoint_base.bootstrap,
+        ));
 
         let (recovery_summary, replayed_deferred_tasks, replayed_wal) =
             if crate::recovery::replay_handler::needs_recovery(&inputs.wal_path) {
-                let replay = Self::replay_wal(db, &inputs)?;
+                let replay = Self::replay_wal(db, &inputs, Some(Arc::clone(&apply_runtime)))?;
                 (replay.summary, replay.replayed_deferred_tasks, true)
             } else {
                 tracing::debug!(
@@ -171,6 +176,7 @@ impl DatabaseOpener {
                 (inputs.checkpoint_base.bootstrap.clone(), Vec::new(), false)
             };
 
+        apply_runtime.bootstrap_frontiers(Self::journal_recovery_summary(&recovery_summary));
         db.bootstrap_checkpoint_runtime(recovery_summary.clone());
         if !replayed_wal {
             CheckpointRecovery::redeliver_deferred_tasks(
@@ -180,7 +186,13 @@ impl DatabaseOpener {
         }
         let report = Self::refresh_recovery_report(db, &inputs.wal_path);
         Self::sweep_checkpoint_artifacts(db, checkpoint)?;
-        Self::reconcile_runtime_state(db, &recovery_summary, checkpoint)?;
+        Self::ensure_recovered_commits_published(&apply_runtime, recovery_summary.max_commit_id)?;
+        let runtime_commit_floor =
+            Self::reconcile_runtime_state(db, &recovery_summary, checkpoint)?;
+        db.sync_commit_runtime_with(runtime_commit_floor);
+        db.transaction_manager()
+            .complete_recovery_admission(runtime_commit_floor);
+        Self::mark_ready(db);
         db.maybe_gc_catalog();
         Ok(FinalizeLoadOutcome {
             consistency: report,
@@ -352,6 +364,7 @@ impl DatabaseOpener {
     fn replay_wal(
         db: &DatabaseHandle,
         inputs: &FinalizeLoadInputs,
+        apply_runtime: Option<Arc<paro_journal::JournalApplyRuntime>>,
     ) -> anyhow::Result<WalReplayOutcome> {
         tracing::info!(
             target: targets::WAL,
@@ -368,6 +381,7 @@ impl DatabaseOpener {
             inputs.checkpoint_base.journal_tail.clone(),
             inputs.wal_header_metadata,
             (inputs.wal_keep_from != u64::MAX).then_some(inputs.wal_keep_from),
+            apply_runtime,
             inputs.checkpoint_base.bootstrap.clone(),
         )?;
 
@@ -418,13 +432,39 @@ impl DatabaseOpener {
         db: &DatabaseHandle,
         recovery_summary: &RecoverySummary,
         checkpoint: CheckpointConfigOptions,
-    ) -> anyhow::Result<()> {
-        Self::sync_transaction_clock(db, recovery_summary.max_commit_id);
+    ) -> anyhow::Result<u64> {
+        let runtime_commit_floor = Self::sync_transaction_clock(db, recovery_summary.max_commit_id);
         db.configure_checkpoint_runtime(checkpoint);
         db.compaction()
             .sync_tablets(db.catalog().as_ref(), db.name(), db.db_type())?;
-        Self::mark_ready(db);
+        Ok(runtime_commit_floor)
+    }
+
+    fn ensure_recovered_commits_published(
+        runtime: &paro_journal::JournalApplyRuntime,
+        durable_commit_id: u64,
+    ) -> anyhow::Result<()> {
+        let frontiers = runtime.frontiers();
+        if frontiers.published_commit_id < durable_commit_id {
+            anyhow::bail!(
+                "recovery apply stopped below durable commit frontier: published={} durable={}",
+                frontiers.published_commit_id,
+                durable_commit_id
+            );
+        }
         Ok(())
+    }
+
+    fn journal_recovery_summary(
+        summary: &RecoverySummary,
+    ) -> paro_common::journal::RecoverySummary {
+        paro_common::journal::RecoverySummary {
+            max_lsn: summary.max_lsn,
+            max_commit_id: summary.max_commit_id,
+            max_maintenance_id: summary.max_maintenance_id,
+            max_catalog_commit_id: summary.max_catalog_commit_id,
+            max_seen_object_id: summary.max_seen_object_id,
+        }
     }
 
     fn mark_ready(db: &DatabaseHandle) {
@@ -457,13 +497,15 @@ impl DatabaseOpener {
                 removed_graph_dirs = report.removed_graph_dirs,
                 removed_staging_entries = report.removed_staging_entries,
                 removed_compaction_dirs = report.removed_compaction_dirs,
+                removed_txn_spill_artifacts = report.removed_txn_spill_artifacts,
+                removed_txn_spill_manifest_dirs = report.removed_txn_spill_manifest_dirs,
                 "Removed orphan checkpoint-related artifacts during startup"
             );
         }
         Ok(())
     }
 
-    fn sync_transaction_clock(db: &DatabaseHandle, recovery_commit_floor: u64) {
+    fn sync_transaction_clock(db: &DatabaseHandle, recovery_commit_floor: u64) -> u64 {
         let txn = CatalogSnapshot::default();
         let mut max_committed_version = 0u64;
 
@@ -495,8 +537,6 @@ impl DatabaseOpener {
         }
 
         let runtime_commit_floor = max_committed_version.max(recovery_commit_floor);
-        db.transaction_manager()
-            .sync_commit_id_with(runtime_commit_floor);
         tracing::debug!(
             target: targets::INSTANCE,
             db = %db.name(),
@@ -506,5 +546,6 @@ impl DatabaseOpener {
             stage = "reconcile",
             "Synchronized transaction clock with recovered storage version"
         );
+        runtime_commit_floor
     }
 }

@@ -150,6 +150,7 @@ pub fn bind_insert(binder: &mut Binder, stmt: InsertStmt) -> Result<BoundStateme
             order_by: vec![],
             limit: vec![],
             offset: None,
+            locking: None,
             ignore_result: false,
         },
         InsertSource::Select { query } => *query,

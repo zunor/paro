@@ -7,18 +7,19 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 
-use crate::metrics::storage_metrics;
+use crate::segments::{ReplayCursor, SegmentCatalogStore};
 use crate::wal::replay_state::{ReplayResult, ReplayState};
 use crate::wal::wal_entry::{WalEntry, WalHeaderMetadata};
 use crate::wal::wal_reader::{ReadEntryResult, WalReader};
 use crate::wal::wal_writer::{WalInitState, WAL_VERSION_NUMBER};
 use crate::wal::write_ahead_log::WriteAheadLog;
-use paro_common::effect::{CatalogTxnOp, PostCommitHookDescriptor, PreparedDataOp};
+use paro_common::effect::{
+    CatalogTxnOp, CompactionCumulativePointAction, PostCommitHookDescriptor, PreparedDataOp,
+};
 use paro_common::error as paro_error;
 use paro_common::error::Result;
 use paro_common::journal::JournalRecord;
 use paro_common::logging::targets;
-use paro_journal::segments::{ReplayCursor, SegmentCatalogStore};
 
 /// Callback trait for applying WAL entries during replay.
 ///
@@ -65,6 +66,7 @@ pub trait ReplayHandler {
     }
 
     /// Compaction publish replace intent (tablet-level publish).
+    #[allow(clippy::too_many_arguments)]
     fn replay_compaction_publish(
         &mut self,
         _tablet_id: u64,
@@ -73,7 +75,7 @@ pub trait ReplayHandler {
         _output_rowset_id: u64,
         _output_start_version: i64,
         _output_end_version: i64,
-        _cumulative_point_action: crate::compaction::plan::types::CumulativePointAction,
+        _cumulative_point_action: CompactionCumulativePointAction,
         _output_rowset_path: &str,
         _replaced_inputs: &[u64],
     ) -> Result<()> {
@@ -526,7 +528,6 @@ impl WalRecovery {
         &self,
         handler: &mut H,
     ) -> Result<(WriteAheadLog, ReplayResult)> {
-        let metrics_before = storage_metrics().snapshot();
         let catalog_store = self.segment_catalog_store();
         tracing::debug!(
             target: targets::WAL,
@@ -551,7 +552,6 @@ impl WalRecovery {
         } else {
             WalRecoveryMode::MainWalOnly
         };
-        storage_metrics().set_wal_recovery_mode(recovery_mode.as_metric_value());
         tracing::info!(
             target: targets::WAL,
             recovery_mode = recovery_mode.as_str(),
@@ -592,21 +592,10 @@ impl WalRecovery {
         };
         let wal = self.create_wal(init_state)?;
 
-        storage_metrics().set_wal_recovery_mode(recovery_mode.as_metric_value());
-        let metrics_after = storage_metrics().snapshot();
         tracing::info!(
             target: targets::WAL,
             recovery_mode = recovery_mode.as_str(),
             entries_replayed = result.entries_replayed,
-            replay_entries_metric_delta = metrics_after
-                .wal_replay_entries
-                .saturating_sub(metrics_before.wal_replay_entries),
-            replay_bytes_metric_delta = metrics_after
-                .wal_replay_bytes
-                .saturating_sub(metrics_before.wal_replay_bytes),
-            truncate_bytes_metric_delta = metrics_after
-                .wal_truncate_bytes
-                .saturating_sub(metrics_before.wal_truncate_bytes),
             last_safe_offset = result.last_successful_offset,
             "WAL recovery finished"
         );
@@ -774,7 +763,6 @@ impl WalRecovery {
         })?;
 
         let truncated_bytes = current_wal_size.saturating_sub(pointers.physical_truncate_offset);
-        storage_metrics().add_wal_truncate_bytes(truncated_bytes);
 
         tracing::info!(
             target: targets::WAL,
@@ -908,7 +896,6 @@ impl WalRecovery {
             )
         };
 
-        storage_metrics().add_wal_replay(entries_replayed, replayed_bytes);
         tracing::info!(
             target: targets::WAL,
             replay_start_offset = replay_start_offset.unwrap_or(0),
@@ -1116,7 +1103,6 @@ impl ReplayHandler for NoOpReplayHandler {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::storage_metrics;
     use crate::wal::test_support::{
         append_open_create_schema_txn, write_flushed_create_schema_txn, write_flushed_rowset_commit,
     };
@@ -1276,7 +1262,7 @@ mod tests {
 
         // A bare seed-path file is a removed legacy layout: recovery must
         // reject it instead of silently opening it as a standalone WAL.
-        std::fs::write(&wal_path, &[]).unwrap();
+        std::fs::write(&wal_path, []).unwrap();
 
         let recovery = WalRecovery::new(&wal_path);
         let mut handler = NoOpReplayHandler;
@@ -1873,34 +1859,5 @@ mod tests {
         assert!(report.main_wal.needs_truncation);
         assert!(report.main_wal.has_unflushed_tail);
         assert!(report.main_wal.entries_scanned > 0);
-    }
-
-    #[test]
-    fn test_recovery_updates_wal_lifecycle_metrics() {
-        storage_metrics().reset_for_tests();
-
-        let dir = tempdir().unwrap();
-        let wal_path = dir.path().join("metrics.wal");
-
-        {
-            let (wal, _active_segment_path) = create_segment_wal(&wal_path);
-            write_flushed_create_schema_txn(wal.writer().as_ref(), "default", "committed", 1, 100)
-                .unwrap();
-            append_open_create_schema_txn(wal.writer().as_ref(), "default", "uncommitted", 2)
-                .unwrap();
-        }
-
-        let recovery = WalRecovery::new(&wal_path).with_auto_truncate(true);
-        let mut handler = RecordingHandler::new();
-        let (_wal, _result) = recovery.recover(&mut handler).unwrap();
-
-        let metrics = storage_metrics().snapshot();
-        assert!(metrics.wal_replay_entries > 0);
-        assert!(metrics.wal_replay_bytes > 0);
-        assert!(metrics.wal_truncate_bytes > 0);
-        assert_eq!(
-            metrics.wal_recovery_mode,
-            WalRecoveryMode::MainWalOnly.as_metric_value()
-        );
     }
 }

@@ -4,23 +4,22 @@
 //! Binary journal codec and batched append queue.
 
 mod appender;
+pub mod apply;
 mod apply_queue;
 mod codec;
 mod coordinator;
 mod publish_frontier;
 pub mod segments;
 mod waiter;
+pub mod wal;
 
 pub use appender::{AppendResult, JournalAppender, JournalAppenderMetricsSnapshot, JournalSink};
-pub use apply_queue::{
-    ApplyRequest, ApplySubmitResult, JournalApplyMetricsSnapshot, JournalApplyRuntime,
-    TabletApplyPart,
+pub use apply::{
+    mutation_identities, mutation_identity_for_tablet, publish_committed_record, ApplyRequest,
+    ApplySubmitResult, JournalApplyMetricsSnapshot, JournalApplyRuntime, MaintenanceApplyHandler,
+    MutationIdentity, MutationKind, TabletApplyPart, VisibilityPublisher, WaitMode,
 };
 pub use codec::{
     decode_frame, encode_record, DecodedJournalFrame, JournalFrameHeader, JOURNAL_FRAME_HEADER_SIZE,
 };
-pub use coordinator::{
-    CommitExecutionContext, JournalCoordinator, JournalFrontierSnapshot,
-    MaintenanceExecutionContext,
-};
-pub use waiter::WaitMode;
+pub use coordinator::{JournalCoordinator, JournalFrontierSnapshot, MaintenanceAppendContext};

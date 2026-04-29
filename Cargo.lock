@@ -1552,6 +1552,7 @@ dependencies = [
  "paro-parser",
  "paro-routine",
  "paro-storage",
+ "paro-transaction",
  "serde",
 ]
 
@@ -1561,6 +1562,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytesize",
+ "crc32c",
  "dirs",
  "figment",
  "humantime-serde",
@@ -1597,6 +1599,7 @@ dependencies = [
  "paro-function",
  "paro-scheduler",
  "paro-storage",
+ "paro-transaction",
  "tokio-util",
 ]
 
@@ -1619,6 +1622,7 @@ dependencies = [
  "paro-routine",
  "paro-scheduler",
  "paro-storage",
+ "paro-transaction",
  "serde_json",
  "tokio-util",
  "tracing",
@@ -1678,6 +1682,7 @@ dependencies = [
  "paro-routine",
  "paro-scheduler",
  "paro-storage",
+ "paro-transaction",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -1696,6 +1701,7 @@ dependencies = [
  "paro-common",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
@@ -1831,6 +1837,7 @@ dependencies = [
  "paro-routine",
  "paro-scheduler",
  "paro-storage",
+ "paro-transaction",
  "serde_json",
  "serial_test",
  "tokio",
@@ -1854,6 +1861,7 @@ dependencies = [
  "paro-common",
  "paro-journal",
  "paro-scheduler",
+ "paro-transaction",
  "rand 0.8.5",
  "rayon",
  "roaring",
@@ -1867,6 +1875,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "paro-transaction"
+version = "0.1.0"
+dependencies = [
+ "divan",
+ "parking_lot",
 ]
 
 [[package]]

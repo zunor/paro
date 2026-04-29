@@ -1,6 +1,7 @@
 [meta]
 name = "row_hash_join_phase0"
 description = "Phase 0 row-store hash join baseline covering short chains, long chains, found flags, and external spill"
+run_order = 20
 
 [params]
 short_rows = 2000

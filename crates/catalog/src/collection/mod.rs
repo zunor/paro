@@ -17,7 +17,7 @@ mod staged_mutation;
 use crate::entry::{CatalogEntryEnum, DependencyList};
 use crate::mvcc::{self, CatalogSnapshot, VersionedEntry};
 use paro_common::error::{self as paro_error, Result};
-use paro_storage::transaction::manager::TRANSACTION_ID_START;
+use paro_transaction::TRANSACTION_ID_START;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

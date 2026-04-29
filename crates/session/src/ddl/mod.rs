@@ -32,6 +32,7 @@ use paro_instance::DatabaseHandle;
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::TableColumnSpec;
 use paro_storage::transaction::txn::Transaction;
+use paro_transaction::{DatabaseId, LockNamespace};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +40,7 @@ use crate::transaction::ddl_changes::{
     CatalogOpBatch, IndexPostCommitAction, PreparedCatalogOp, TableDropCleanupAction,
     TransientCatalogRuntime,
 };
+use crate::transaction::index_backfill::{lease_index_backfill, IndexBackfillPlan};
 
 pub struct SessionDdlBridge {
     db: Arc<DatabaseHandle>,
@@ -56,6 +58,7 @@ struct SessionCreateIndexHandle {
     entry: Option<Arc<IndexCatalogEntry>>,
     catalog: Option<paro_catalog::collection::StagedCatalogMutation>,
     dependencies: Option<DependencyDelta>,
+    backfill: Option<IndexBackfillPlan>,
     skip_build: bool,
 }
 
@@ -91,6 +94,12 @@ impl SessionDdlBridge {
     }
 
     fn record_change(&self, change: PreparedCatalogOp) -> Result<()> {
+        self.active_txn
+            .acquire_lock_requests(change.profile.lock_requests(
+                self.active_txn.lock_namespace(),
+                &change.record.key,
+                &change.dml_targets,
+            ))?;
         self.txn_admission.record_ddl(PendingDdlAdmission {
             object: change.record.key.clone(),
             profile: change.profile,
@@ -102,6 +111,11 @@ impl SessionDdlBridge {
             .map_err(|_| paro_error::internal("ddl state poisoned"))?;
         ddl_state.record(change);
         Ok(())
+    }
+
+    fn begin_object_ddl(&self) -> Result<()> {
+        self.txn_write
+            .begin_object_ddl_in_database(DatabaseId::new(self.db.id()), self.db.name())
     }
 
     fn ddl_constraint(constraint: &Constraint) -> Result<DdlWalConstraint> {
@@ -795,7 +809,7 @@ impl SessionDdlBridge {
 
 impl DdlApplyContext for SessionDdlBridge {
     fn apply_create_table(&self, mut info: CreateTableInfo) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
 
         let pk_cols: HashSet<usize> = info
@@ -825,8 +839,14 @@ impl DdlApplyContext for SessionDdlBridge {
             .db
             .tablet_meta_manager()
             .ok_or_else(|| paro_error::internal("database has no tablet meta manager"))?;
-        let storage =
-            Arc::new(TableFactory::new(Some(tablet_meta)).create_table_from_specs(&specs)?);
+        let storage = Arc::new(
+            TableFactory::new(Some(tablet_meta))
+                .with_transaction_locks(
+                    self.db.transaction_manager().lock_manager(),
+                    LockNamespace::single_tenant(DatabaseId::new(self.db.id())),
+                )
+                .create_table_from_specs(&specs)?,
+        );
 
         let schema_txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&schema_txn, &info.schema)?;
@@ -892,7 +912,7 @@ impl DdlApplyContext for SessionDdlBridge {
     }
 
     fn apply_create_schema(&self, mut info: CreateSchemaInfo) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
         let entry = Arc::new(CatalogEntryEnum::Schema(Arc::new(SchemaEntry::from_info(
             &info,
@@ -941,7 +961,7 @@ impl DdlApplyContext for SessionDdlBridge {
     }
 
     fn apply_create_sequence(&self, mut info: CreateSequenceInfo) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
@@ -993,7 +1013,7 @@ impl DdlApplyContext for SessionDdlBridge {
     }
 
     fn apply_create_view(&self, mut info: CreateViewInfo) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
@@ -1049,7 +1069,7 @@ impl DdlApplyContext for SessionDdlBridge {
     }
 
     fn apply_create_routine(&self, mut info: CreateRoutineInfo) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
         let signature = info.signature();
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
@@ -1126,7 +1146,7 @@ impl DdlApplyContext for SessionDdlBridge {
         info: AlterEntryInfo,
         sql: String,
     ) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &schema_name)?;
         let key = DdlObjectKey::new(
@@ -1319,7 +1339,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 .chain(info.edge_tables.iter().map(|edge| edge.table_oid)),
             "CREATE PROPERTY GRAPH",
         )?;
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
@@ -1450,7 +1470,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 "DROP PROPERTY GRAPH",
             )?;
         }
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         let handle = schema
             .collection(CatalogType::PropertyGraph)
             .expect("property graph collection")
@@ -1500,7 +1520,7 @@ impl DdlApplyContext for SessionDdlBridge {
         name: String,
         info: DropRoutineInfo,
     ) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &schema_name)?;
         let existing_entry = schema.get_routine(self.txn_id, self.start_time, &name);
@@ -1597,7 +1617,7 @@ impl DdlApplyContext for SessionDdlBridge {
     }
 
     fn apply_drop(&self, schema_name: String, info: DropEntryInfo) -> Result<()> {
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let Some(root_ref) = self.lookup_drop_object_ref(&txn, &schema_name, &info)? else {
             return Ok(());
@@ -1619,7 +1639,7 @@ impl DdlApplyContext for SessionDdlBridge {
         table: Arc<TableCatalogEntry>,
     ) -> Result<Box<dyn IndexBuildHandle>> {
         self.reject_if_table_touched(table.as_ref(), "CREATE INDEX")?;
-        self.txn_write.begin_object_ddl()?;
+        self.begin_object_ddl()?;
         info.catalog = self.db.catalog().name().to_string();
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
@@ -1635,6 +1655,7 @@ impl DdlApplyContext for SessionDdlBridge {
                     entry: None,
                     catalog: None,
                     dependencies: None,
+                    backfill: None,
                     skip_build: true,
                 }));
             }
@@ -1672,6 +1693,20 @@ impl DdlApplyContext for SessionDdlBridge {
                 )
             })
             .transpose()?;
+        let current_published_ts = self.db.transaction_manager().published_commit_id();
+        let backfill_read_ts = current_published_ts;
+        let backfill_lease = lease_index_backfill(
+            self.db.transaction_manager().retention_registry(),
+            backfill_read_ts,
+            current_published_ts,
+        )?;
+        let backfill = Some(IndexBackfillPlan::new(
+            table.base.base.object_id.raw(),
+            index_entry.base.base.object_id.raw(),
+            backfill_read_ts,
+            current_published_ts,
+            backfill_lease,
+        ));
 
         Ok(Box::new(SessionCreateIndexHandle {
             info,
@@ -1679,6 +1714,7 @@ impl DdlApplyContext for SessionDdlBridge {
             entry: Some(index_entry),
             catalog: handle,
             dependencies,
+            backfill,
             skip_build: false,
         }))
     }
@@ -1713,6 +1749,19 @@ impl DdlApplyContext for SessionDdlBridge {
             .as_ref()
             .map(|entry| entry.base.base.object_id.raw())
             .ok_or_else(|| paro_error::internal("staged CREATE INDEX entry is missing"))?;
+        if let Some(backfill) = &handle.backfill {
+            let current_published_ts = self.db.transaction_manager().published_commit_id();
+            let report = backfill.tail_committed_records_to(current_published_ts)?;
+            tracing::debug!(
+                target: paro_common::logging::targets::TRANSACTION,
+                index = %handle.info.name,
+                table = %handle.info.table_name,
+                from_ts = report.from_ts,
+                to_ts = report.to_ts,
+                consumed_commits = report.consumed_commits,
+                "CREATE INDEX backfill journal tail advanced before commit publish"
+            );
+        }
 
         self.record_change(PreparedCatalogOp {
             record: DdlChangeRecord {
@@ -1767,6 +1816,7 @@ impl DdlApplyContext for SessionDdlBridge {
                     info: handle.info,
                     built_index,
                     coverage,
+                    backfill: handle.backfill,
                 })
             }),
         })

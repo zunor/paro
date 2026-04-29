@@ -1529,6 +1529,7 @@ mod tests {
                         execution_modes: ExecutionModes::default(),
                         estimated_cost: None,
                         prefer_hint: None,
+                        indexed_through_ts: 0,
                     },
                 },
                 confidence: crate::operator::Confidence::High,

@@ -18,6 +18,7 @@ pub const WAL_READ_BUFFER_SIZE: usize = 4096;
 
 /// Result of reading a WAL entry.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ReadEntryResult {
     /// Successfully read an entry
     Entry(WalEntry),

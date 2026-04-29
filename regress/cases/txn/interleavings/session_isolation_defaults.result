@@ -1,0 +1,54 @@
+-- session: iso_a
+SHOW transaction_isolation;
+transaction_isolation
+serializable
+
+-- session: iso_b
+SHOW transaction_isolation;
+transaction_isolation
+serializable
+
+-- session: iso_a
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT READ ONLY;
+SET
+
+-- session: iso_a
+SHOW transaction_isolation;
+transaction_isolation
+snapshot
+
+-- session: iso_b
+SHOW transaction_isolation;
+transaction_isolation
+serializable
+
+-- session: iso_a
+BEGIN;
+BEGIN
+
+-- session: iso_a
+SHOW transaction_isolation;
+transaction_isolation
+snapshot
+
+-- session: iso_a
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE;
+ERROR: SET TRANSACTION must be called before the first query in a transaction (SQLSTATE=25000)
+
+-- session: iso_a
+SHOW transaction_isolation;
+transaction_isolation
+snapshot
+
+-- session: iso_a
+COMMIT;
+COMMIT
+
+-- session: iso_a
+SHOW transaction_isolation;
+transaction_isolation
+snapshot
+
+-- session: iso_a
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE;
+SET

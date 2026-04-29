@@ -36,7 +36,7 @@ use paro_planner::operator::ExpandDirection;
 use paro_storage::index::graph::vertex_id_map::VertexIdMap;
 use paro_storage::index::graph::{GraphProjectionIndex, GraphReadSnapshot};
 use paro_storage::metrics::storage_metrics;
-use paro_storage::tablet::TabletReaderParams;
+use paro_transaction::TableId;
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::types::ExplainRuntimeStats;
@@ -53,6 +53,7 @@ use super::graph_path::{
     collect_prefix_path, materialize_path_vectors, path_element_list_type, MaterializedPath,
     PathElementRef, PathEmitSpec, PATH_EDGES_OFFSET, PATH_LENGTH_OFFSET, PATH_VERTICES_OFFSET,
 };
+use super::own_write::open_overlay_table_reader;
 use super::spillable_frontier::{SpillableFrontier, SpillableFrontierCursor};
 use super::spillable_parent_arrays::{ParentLookupState, SpillableParentArrays};
 
@@ -1041,7 +1042,7 @@ impl PhysicalGraphShortestPath {
 
         let catalog = ctx.catalog();
         let txn = ctx.catalog_txn_view();
-        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let txn_view = ctx.transaction_view();
 
         let table_entry = catalog.get_table(&txn, schema, table_name)?;
         let table = match table_entry.as_ref() {
@@ -1054,13 +1055,13 @@ impl PhysicalGraphShortestPath {
                 table_name
             ))
         })?;
+        txn_view
+            .read_tracker()
+            .record_table_read(TableId::new(storage.table_id()));
 
         let filter_col_ids = extract_graph_filter_column_ids(filter);
-        let params = TabletReaderParams::with_version(visible_version)
-            .with_columns(filter_col_ids.clone())
-            .with_emit_row_id(true);
-        let mut reader = storage.create_reader(params)?;
-        reader.prepare()?;
+        let mut reader =
+            open_overlay_table_reader(storage, txn_view, filter_col_ids.clone(), true)?;
 
         let remapped_filter = remap_graph_filter_columns(filter, &filter_col_ids);
         let filter_exprs = vec![remapped_filter];
@@ -1847,6 +1848,12 @@ impl PhysicalOperator for PhysicalGraphShortestPath {
                     self.graph_name
                 ))
             })?;
+        let derived_lag_lease = ctx
+            .session
+            .txn
+            .lease_derived_lag_if_needed(snapshot.indexed_through_ts())?;
+        let snapshot = snapshot.with_derived_lag_lease(derived_lag_lease);
+        snapshot.ensure_covers_read_ts(ctx.session.txn.transaction.visible_version())?;
 
         let graph_memory = Self::graph_memory_context(ctx);
         Ok(Box::new(GraphShortestPathState {

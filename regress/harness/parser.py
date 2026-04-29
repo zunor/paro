@@ -21,6 +21,10 @@ _COPY_DIRECTIONS = {"in", "out"}
 _QUERY_START_RE = re.compile(
     r"^\s*(SELECT|WITH|VALUES|SHOW|DESCRIBE|EXPLAIN|CALL)", re.IGNORECASE
 )
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_ASYNC_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)(ms|s)?$", re.IGNORECASE)
+_SESSION_OPTION_KEYS = {"host", "port", "database", "user", "password"}
 
 
 def _is_likely_query(sql: str) -> bool:
@@ -55,6 +59,27 @@ class Block:
     engine: Optional[str] = None
     control_action: Optional[str] = None
     control_args: Tuple[str, ...] = ()
+    session_name: Optional[str] = None
+    session_args: Tuple[str, ...] = ()
+    async_label: Optional[str] = None
+    await_label: Optional[str] = None
+    await_timeout_ms: Optional[int] = None
+    sleep_ms: Optional[int] = None
+    wait_expect_interval_ms: Optional[int] = None
+    wait_expect_timeout_ms: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class _PendingSession:
+    name: str
+    args: Tuple[str, ...] = ()
+    async_label: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _PendingWaitExpect:
+    interval_ms: int
+    timeout_ms: int
 
 
 @dataclass
@@ -78,6 +103,9 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
     blocks: List[Block] = []
     pending_normalizers: Tuple[str, ...] = ()
     pending_fixtures: Tuple[str, ...] = ()
+    pending_session: Optional[_PendingSession] = None
+    pending_wait_expect: Optional[_PendingWaitExpect] = None
+    seen_async_labels: set[str] = set()
 
     idx = 0
     while idx < len(lines):
@@ -104,9 +132,22 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                         fixture_refs=pending_fixtures,
                         query_mode="nosort",
                         normalizers=pending_normalizers,
+                        session_name=_pending_session_name(pending_session),
+                        session_args=_pending_session_args(pending_session),
+                        async_label=_pending_async_label(pending_session),
+                        wait_expect_interval_ms=_pending_wait_interval_ms(
+                            pending_wait_expect
+                        ),
+                        wait_expect_timeout_ms=_pending_wait_timeout_ms(
+                            pending_wait_expect
+                        ),
                     )
                 )
             else:
+                if pending_wait_expect is not None:
+                    raise ParseError(
+                        f"{source}:{idx + 1}: '@wait_expect' can only target a query block."
+                    )
                 blocks.append(
                     Block(
                         kind="statement",
@@ -115,10 +156,15 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                         fixture_refs=pending_fixtures,
                         statement_expect="ok",
                         normalizers=pending_normalizers,
+                        session_name=_pending_session_name(pending_session),
+                        session_args=_pending_session_args(pending_session),
+                        async_label=_pending_async_label(pending_session),
                     )
                 )
             pending_normalizers = ()
             pending_fixtures = ()
+            pending_session = None
+            pending_wait_expect = None
             idx = next_idx
             continue
 
@@ -127,6 +173,7 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
         line_no = idx + 1
 
         if name == "fixture":
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
             pending_fixtures = _append_fixture_ref(
                 pending_fixtures,
                 _parse_fixture_arg(arg, source, line_no),
@@ -135,11 +182,78 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
             continue
 
         if name == "normalize":
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
             pending_normalizers = _parse_normalize_arg(arg, source, line_no)
             idx += 1
             continue
 
+        if name == "session":
+            if pending_session is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: duplicate '@session' before SQL block."
+                )
+            pending_session = _parse_session_arg(arg, source, line_no)
+            if pending_session.async_label is not None:
+                if pending_session.async_label in seen_async_labels:
+                    raise ParseError(
+                        f"{source}:{line_no}: duplicate async label "
+                        f"{pending_session.async_label!r}."
+                    )
+                seen_async_labels.add(pending_session.async_label)
+            idx += 1
+            continue
+
+        if name == "await":
+            if pending_session is not None:
+                raise ParseError(f"{source}:{line_no}: '@session' cannot target '@await'.")
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
+            label, timeout_ms = _parse_await_arg(arg, source, line_no)
+            blocks.append(
+                Block(
+                    kind="await",
+                    line_no=line_no,
+                    sql="",
+                    fixture_refs=pending_fixtures,
+                    await_label=label,
+                    await_timeout_ms=timeout_ms,
+                )
+            )
+            pending_fixtures = ()
+            idx += 1
+            continue
+
+        if name == "sleep":
+            if pending_session is not None:
+                raise ParseError(f"{source}:{line_no}: '@session' cannot target '@sleep'.")
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
+            blocks.append(
+                Block(
+                    kind="sleep",
+                    line_no=line_no,
+                    sql="",
+                    fixture_refs=pending_fixtures,
+                    sleep_ms=_parse_duration_ms(arg, source, line_no, directive="sleep"),
+                )
+            )
+            pending_fixtures = ()
+            idx += 1
+            continue
+
+        if name == "wait_expect":
+            if pending_wait_expect is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: duplicate '@wait_expect' before query block."
+                )
+            pending_wait_expect = _parse_wait_expect_arg(arg, source, line_no)
+            idx += 1
+            continue
+
         if name == "control":
+            if pending_session is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: '@session' cannot target '@control'."
+                )
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
             action, control_args = _parse_control_arg(arg, source, line_no)
             blocks.append(
                 Block(
@@ -156,6 +270,11 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
             continue
 
         if name in {"setup", "teardown"}:
+            if pending_session is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: '@{name}' always runs on the default session."
+                )
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
             sql, next_idx = _consume_sql_statement(lines, idx + 1, source, line_no)
             blocks.append(
                 Block(
@@ -170,6 +289,10 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
             continue
 
         if name == "statement":
+            if pending_wait_expect is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: '@wait_expect' can only target a query block."
+                )
             expect, expected_count, error_pattern = _parse_statement_arg(arg, source, line_no)
             normalizers, statement_start_idx = _consume_trailing_normalize_directives(
                 lines,
@@ -189,10 +312,14 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     expected_count=expected_count,
                     error_pattern=error_pattern,
                     normalizers=normalizers,
+                    session_name=_pending_session_name(pending_session),
+                    session_args=_pending_session_args(pending_session),
+                    async_label=_pending_async_label(pending_session),
                 )
             )
             pending_normalizers = ()
             pending_fixtures = ()
+            pending_session = None
             idx = next_idx
             continue
 
@@ -215,14 +342,29 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     query_mode=mode,
                     epsilon=epsilon,
                     normalizers=normalizers,
+                    session_name=_pending_session_name(pending_session),
+                    session_args=_pending_session_args(pending_session),
+                    async_label=_pending_async_label(pending_session),
+                    wait_expect_interval_ms=_pending_wait_interval_ms(
+                        pending_wait_expect
+                    ),
+                    wait_expect_timeout_ms=_pending_wait_timeout_ms(
+                        pending_wait_expect
+                    ),
                 )
             )
             pending_normalizers = ()
             pending_fixtures = ()
+            pending_session = None
+            pending_wait_expect = None
             idx = next_idx
             continue
 
         if name == "copy":
+            if pending_wait_expect is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: '@wait_expect' can only target a query block."
+                )
             direction = _parse_copy_arg(arg, source, line_no)
             normalizers, copy_start_idx = _consume_trailing_normalize_directives(
                 lines,
@@ -251,14 +393,23 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
                     copy_data_lines=copy_data_lines,
                     copy_fail_message=copy_fail_message,
                     normalizers=normalizers,
+                    session_name=_pending_session_name(pending_session),
+                    session_args=_pending_session_args(pending_session),
+                    async_label=_pending_async_label(pending_session),
                 )
             )
             pending_normalizers = ()
             pending_fixtures = ()
+            pending_session = None
             idx = next_idx
             continue
 
         if name in {"skipif", "onlyif"}:
+            if pending_session is not None:
+                raise ParseError(
+                    f"{source}:{line_no}: '@session' cannot target '@{name}'."
+                )
+            _ensure_no_pending_wait_expect(pending_wait_expect, source, line_no, name)
             engine = arg.strip()
             if not engine:
                 raise ParseError(f"{source}:{line_no}: '@{name}' requires an engine argument.")
@@ -293,6 +444,11 @@ def parse_sql_text(text: str, source: str = "<memory>") -> List[Block]:
             continue
 
         raise ParseError(f"{source}:{line_no}: unsupported directive '@{name}'.")
+
+    if pending_session is not None:
+        raise ParseError(f"{source}: dangling '@session' directive without SQL block.")
+    if pending_wait_expect is not None:
+        raise ParseError(f"{source}: dangling '@wait_expect' directive without query block.")
 
     return blocks
 
@@ -359,6 +515,174 @@ def _parse_control_arg(arg: str, source: str, line_no: int) -> Tuple[str, Tuple[
     if not parts:
         raise ParseError(f"{source}:{line_no}: '@control' requires an action.")
     return parts[0].lower(), tuple(parts[1:])
+
+
+def _parse_await_arg(arg: str, source: str, line_no: int) -> tuple[str, int]:
+    parts = arg.strip().split()
+    if not parts:
+        raise ParseError(f"{source}:{line_no}: '@await' requires an async label.")
+    label = parts[0]
+    if not _ASYNC_LABEL_RE.match(label):
+        raise ParseError(
+            f"{source}:{line_no}: invalid '@await' label {label!r}; "
+            "expected an identifier-like label."
+        )
+
+    timeout_ms: int | None = None
+    seen_keys: set[str] = set()
+    for raw_arg in parts[1:]:
+        if "=" not in raw_arg:
+            raise ParseError(
+                f"{source}:{line_no}: '@await' argument {raw_arg!r} must use key=value syntax."
+            )
+        key, value = raw_arg.split("=", 1)
+        key = key.strip().lower()
+        if key != "timeout":
+            raise ParseError(
+                f"{source}:{line_no}: unsupported '@await' option {key!r}; "
+                "known options: timeout."
+            )
+        if key in seen_keys:
+            raise ParseError(f"{source}:{line_no}: duplicate '@await' option {key!r}.")
+        seen_keys.add(key)
+        timeout_ms = _parse_duration_ms(value, source, line_no, directive="await timeout")
+
+    if timeout_ms is None:
+        raise ParseError(f"{source}:{line_no}: '@await' requires timeout=<duration>.")
+    return label, timeout_ms
+
+
+def _parse_wait_expect_arg(arg: str, source: str, line_no: int) -> _PendingWaitExpect:
+    interval_ms: int | None = None
+    timeout_ms: int | None = None
+    seen_keys: set[str] = set()
+
+    for raw_arg in arg.strip().split():
+        if "=" not in raw_arg:
+            raise ParseError(
+                f"{source}:{line_no}: '@wait_expect' argument {raw_arg!r} "
+                "must use key=value syntax."
+            )
+        key, value = raw_arg.split("=", 1)
+        key = key.strip().lower()
+        if key not in {"interval", "timeout"}:
+            raise ParseError(
+                f"{source}:{line_no}: unsupported '@wait_expect' option {key!r}; "
+                "known options: interval, timeout."
+            )
+        if key in seen_keys:
+            raise ParseError(
+                f"{source}:{line_no}: duplicate '@wait_expect' option {key!r}."
+            )
+        seen_keys.add(key)
+        duration = _parse_duration_ms(value, source, line_no, directive=f"wait_expect {key}")
+        if key == "interval":
+            interval_ms = duration
+        else:
+            timeout_ms = duration
+
+    if interval_ms is None or timeout_ms is None:
+        raise ParseError(
+            f"{source}:{line_no}: '@wait_expect' requires interval=<duration> "
+            "and timeout=<duration>."
+        )
+    return _PendingWaitExpect(interval_ms=interval_ms, timeout_ms=timeout_ms)
+
+
+def _parse_duration_ms(arg: str, source: str, line_no: int, *, directive: str) -> int:
+    payload = arg.strip().lower()
+    match = _DURATION_RE.match(payload)
+    if match is None:
+        raise ParseError(
+            f"{source}:{line_no}: '@{directive}' duration must be like 100ms or 5s."
+        )
+    amount = float(match.group(1))
+    unit = match.group(2) or "ms"
+    multiplier = 1000.0 if unit == "s" else 1.0
+    duration_ms = int(amount * multiplier)
+    if duration_ms <= 0:
+        raise ParseError(f"{source}:{line_no}: '@{directive}' duration must be positive.")
+    return duration_ms
+
+
+def _ensure_no_pending_wait_expect(
+    pending_wait_expect: Optional[_PendingWaitExpect],
+    source: str,
+    line_no: int,
+    directive: str,
+) -> None:
+    if pending_wait_expect is not None:
+        raise ParseError(
+            f"{source}:{line_no}: '@wait_expect' cannot target '@{directive}'."
+        )
+
+
+def _parse_session_arg(arg: str, source: str, line_no: int) -> _PendingSession:
+    parts = arg.strip().split()
+    if not parts:
+        raise ParseError(f"{source}:{line_no}: '@session' requires a session name.")
+
+    name = parts[0]
+    if not _SESSION_NAME_RE.match(name):
+        raise ParseError(
+            f"{source}:{line_no}: invalid '@session' name {name!r}; "
+            "expected an identifier-like label."
+        )
+
+    args: list[str] = []
+    seen_keys: set[str] = set()
+    async_label: str | None = None
+    for raw_arg in parts[1:]:
+        if "=" not in raw_arg:
+            raise ParseError(
+                f"{source}:{line_no}: session argument {raw_arg!r} must use key=value syntax."
+            )
+        key, value = raw_arg.split("=", 1)
+        key = key.strip().lower()
+        if key == "async":
+            if async_label is not None:
+                raise ParseError(f"{source}:{line_no}: duplicate '@session' option 'async'.")
+            if value == "" or not _ASYNC_LABEL_RE.match(value):
+                raise ParseError(
+                    f"{source}:{line_no}: invalid async label {value!r}; "
+                    "expected an identifier-like label."
+                )
+            async_label = value
+            continue
+        if key not in _SESSION_OPTION_KEYS:
+            allowed = ", ".join(sorted(_SESSION_OPTION_KEYS | {"async"}))
+            raise ParseError(
+                f"{source}:{line_no}: unsupported '@session' option {key!r}; "
+                f"known options: {allowed}."
+            )
+        if key in seen_keys:
+            raise ParseError(f"{source}:{line_no}: duplicate '@session' option {key!r}.")
+        if value == "":
+            raise ParseError(f"{source}:{line_no}: '@session' option {key!r} is empty.")
+        seen_keys.add(key)
+        args.append(f"{key}={value}")
+
+    return _PendingSession(name=name, args=tuple(args), async_label=async_label)
+
+
+def _pending_session_name(session: Optional[_PendingSession]) -> Optional[str]:
+    return None if session is None else session.name
+
+
+def _pending_session_args(session: Optional[_PendingSession]) -> Tuple[str, ...]:
+    return () if session is None else session.args
+
+
+def _pending_async_label(session: Optional[_PendingSession]) -> Optional[str]:
+    return None if session is None else session.async_label
+
+
+def _pending_wait_interval_ms(wait: Optional[_PendingWaitExpect]) -> Optional[int]:
+    return None if wait is None else wait.interval_ms
+
+
+def _pending_wait_timeout_ms(wait: Optional[_PendingWaitExpect]) -> Optional[int]:
+    return None if wait is None else wait.timeout_ms
 
 
 def _parse_normalize_arg(arg: str, source: str, line_no: int) -> Tuple[str, ...]:

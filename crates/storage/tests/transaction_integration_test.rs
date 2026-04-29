@@ -6,14 +6,24 @@ use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
 use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::metrics::storage_metrics;
-use paro_storage::primary_key::DeleteVector;
+use paro_storage::primary_key::{DeleteVector, PrimaryKeySerializer};
 use paro_storage::table::table_factory::TableFactory;
-use paro_storage::table::table_handle::TableHandle;
+use paro_storage::table::table_handle::{InsertOnConflictAction, TableHandle};
 use paro_storage::tablet::{
     KeysType, Tablet, TabletColumn, TabletReader, TabletReaderParams, TabletRef, TabletSchema,
 };
 use paro_storage::transaction::manager::TransactionManager;
+use paro_storage::transaction::participant::{
+    StorageCommitParticipant, StorageCommittedRecordApplier,
+};
+use paro_storage::transaction::txn::Transaction;
 use paro_storage::write::DeltaWriter;
+use paro_transaction::{
+    CommandId, CommitAckPolicy, CommitCoordinator, CommitParticipant, CommitRequest,
+    CommitSequencingPlan, CommitTicket, CommitTs, CommittedRecordApplier, DatabaseId,
+    IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTrackerHandle, ReadTs,
+    RequiredPublishOutcome, TransactionView,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -52,6 +62,80 @@ fn read_rows(table: &TableHandle, visible_version: u64) -> usize {
         total += chunk.size();
     }
     total
+}
+
+fn view_for_txn(txn: &Transaction) -> TransactionView {
+    TransactionView::autocommit(ReadTs::new(txn.visible_version()))
+}
+
+fn commit_storage_transaction(manager: &Arc<TransactionManager>, txn: Arc<Transaction>) -> u64 {
+    let database_id = DatabaseId::new(0);
+    let participant = StorageCommitParticipant::new(database_id, Arc::clone(&txn));
+    let read_ts = ReadTs::new(txn.visible_commit_ts().into_raw());
+    let view = TransactionView::new(
+        txn.writer_id(),
+        read_ts,
+        ReadSnapshot::without_lease(read_ts),
+        IsolationLevel::Snapshot,
+        CommandId::new(0),
+        ReadTrackerHandle::noop(),
+        ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]),
+    );
+    let prepared = participant.prepare(&view).unwrap();
+    let descriptor = CommitParticipant::descriptor(&participant, &prepared).unwrap();
+    let request = CommitRequest::new(
+        database_id,
+        txn.txn_id(),
+        view,
+        CommitAckPolicy::RequiredPublished,
+        txn.frozen_lock_set(),
+        vec![descriptor.clone()],
+    );
+    let plan = request.commit_plan();
+    let ctx = request.validation_context();
+    participant.validate(&plan, &ctx).unwrap();
+
+    let coordinator = CommitCoordinator::new(database_id);
+    coordinator.sync_commit_ts_with(CommitTs::new(manager.durable_commit_id()));
+    let sequencing_plan = CommitSequencingPlan::from_commit_plan(plan);
+    let applier = StorageCommittedRecordApplier::new(Arc::clone(manager), Arc::clone(&txn));
+    let ticket = coordinator
+        .execute_transaction(
+            &request,
+            sequencing_plan,
+            |_, _| None,
+            |commit_ts| Ok::<_, paro_common::error::ParoError>(CommitTicket::new(commit_ts, 0, 0)),
+            |ticket| manager.register_committed_write_set(ticket.commit_ts, &[]),
+            |ticket| {
+                let record = request.committed_record(ticket.commit_ts);
+                applier.apply_required(&record, &descriptor)?;
+                Ok(RequiredPublishOutcome::Completed)
+            },
+        )
+        .unwrap();
+    ticket.commit_ts.into_raw()
+}
+
+fn storage_view_for_txn_command(txn: &Transaction, command_id: u32) -> TransactionView {
+    TransactionView::new(
+        txn.writer_id(),
+        txn.read_ts(),
+        ReadSnapshot::without_lease(txn.read_ts()),
+        IsolationLevel::Snapshot,
+        CommandId::new(command_id),
+        ReadTrackerHandle::noop(),
+        ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]),
+    )
+}
+
+fn primary_key_bytes(table: &TableHandle, id: i32) -> Vec<u8> {
+    let schema = table.tablet().schema().unwrap();
+    let serializer = PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
+    serializer
+        .encode_chunk(&chunk_with_pairs(&[id], &[0]))
+        .unwrap()
+        .pop()
+        .unwrap()
 }
 
 fn create_pk_tablet() -> (TabletRef, TempDir) {
@@ -133,21 +217,21 @@ fn read_row_map_from_tablet(tablet: &TabletRef, visible_version: i64) -> BTreeMa
 fn test_transaction_visibility() {
     let types = vec![LogicalType::Integer];
     let table = create_table(&types);
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t1 = tm.begin_transaction().unwrap();
     let t2 = tm.begin_transaction().unwrap();
 
     let chunk = chunk_with_i32(&[1, 2, 3]);
     table
-        .append_with_transaction(&chunk, Some(t1.clone()))
+        .append_with_transaction(&view_for_txn(&t1), &chunk, t1.clone())
         .unwrap();
 
     // Uncommitted rowset should not be visible.
     let count = read_rows(&table, t2.visible_version());
     assert_eq!(count, 0);
 
-    tm.commit_transaction(t1).unwrap();
+    commit_storage_transaction(&tm, t1);
 
     // Snapshot fixed at start_time: still not visible to t2.
     let count = read_rows(&table, t2.visible_version());
@@ -164,12 +248,12 @@ fn test_transaction_visibility() {
 fn test_transaction_rollback_hides_rowset() {
     let types = vec![LogicalType::Integer];
     let table = create_table(&types);
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t1 = tm.begin_transaction().unwrap();
     let chunk = chunk_with_i32(&[10, 20]);
     table
-        .append_with_transaction(&chunk, Some(t1.clone()))
+        .append_with_transaction(&view_for_txn(&t1), &chunk, t1.clone())
         .unwrap();
 
     tm.rollback_transaction(t1).unwrap();
@@ -182,15 +266,17 @@ fn test_transaction_rollback_hides_rowset() {
 #[test]
 fn test_upsert() {
     let (tablet, _tmp) = create_pk_tablet();
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t1 = tm.begin_transaction().unwrap();
     let mut writer = DeltaWriter::open(tablet.clone(), t1.id).unwrap();
     writer
         .write_chunk(&chunk_with_pairs(&[1, 2, 3], &[10, 20, 30]))
         .unwrap();
-    let _rowset1 = writer.commit_in_transaction(t1.clone()).unwrap();
-    tm.commit_transaction(t1).unwrap();
+    let _rowset1 = writer
+        .commit_in_transaction(t1.clone(), view_for_txn(&t1).command_id())
+        .unwrap();
+    commit_storage_transaction(&tm, t1);
     assert_eq!(tablet.snapshot_primary_index_entries().unwrap().len(), 3);
 
     let t2 = tm.begin_transaction().unwrap();
@@ -198,8 +284,10 @@ fn test_upsert() {
     writer2
         .write_chunk(&chunk_with_pairs(&[2, 3, 4], &[200, 300, 400]))
         .unwrap();
-    let _rowset2 = writer2.commit_in_transaction(t2.clone()).unwrap();
-    tm.commit_transaction(t2).unwrap();
+    let _rowset2 = writer2
+        .commit_in_transaction(t2.clone(), view_for_txn(&t2).command_id())
+        .unwrap();
+    commit_storage_transaction(&tm, t2);
 
     // Keys: 1,2,3,4 (3 updated)
     assert_eq!(tablet.snapshot_primary_index_entries().unwrap().len(), 4);
@@ -208,6 +296,143 @@ fn test_upsert() {
         .into_iter()
         .collect();
     assert_eq!(rows, expected);
+}
+
+#[test]
+fn test_primary_key_lookup_respects_read_timestamp() {
+    let table = create_pk_table();
+    table.append(&chunk_with_pairs(&[1], &[10])).unwrap();
+    let key = primary_key_bytes(&table, 1);
+    let v1 = table.max_version() as u64;
+    let first_row_id = table
+        .tablet()
+        .lookup_primary_key_at(&key, v1)
+        .unwrap()
+        .unwrap();
+
+    table.append(&chunk_with_pairs(&[1], &[20])).unwrap();
+    let v2 = table.max_version() as u64;
+    let latest_row_id = table.tablet().lookup_primary_key(&key).unwrap().unwrap();
+
+    assert_ne!(first_row_id, latest_row_id);
+    assert_eq!(
+        table.tablet().lookup_primary_key_at(&key, v1).unwrap(),
+        Some(first_row_id)
+    );
+    assert_eq!(
+        table.tablet().lookup_primary_key_at(&key, v2).unwrap(),
+        Some(latest_row_id)
+    );
+}
+
+#[test]
+fn test_transaction_primary_key_overlay_drives_own_conflict_lookup() {
+    let table = create_pk_table();
+    let txn = Arc::new(Transaction::new(70_001, table.max_version().max(0) as u64));
+
+    let view0 = storage_view_for_txn_command(&txn, 0);
+    table
+        .append_with_transaction(&view0, &chunk_with_pairs(&[1], &[10]), txn.clone())
+        .unwrap();
+    txn.publish_command_boundary(CommandId::new(1));
+
+    let view1 = storage_view_for_txn_command(&txn, 1);
+    let affected = table
+        .insert_on_conflict(
+            &view1,
+            &chunk_with_pairs(&[1], &[20]),
+            &InsertOnConflictAction::DoNothing,
+            txn.clone(),
+        )
+        .unwrap();
+    assert_eq!(affected, 0);
+
+    txn.commit(1).unwrap();
+    let rows = read_row_map_from_tablet(&table.tablet(), table.max_version());
+    assert_eq!(rows, BTreeMap::from([(1, 10)]));
+}
+
+#[test]
+fn test_transaction_delete_sees_own_pending_primary_key_insert() {
+    let table = create_pk_table();
+    let txn = Arc::new(Transaction::new(70_101, table.max_version().max(0) as u64));
+
+    let view0 = storage_view_for_txn_command(&txn, 0);
+    table
+        .append_with_transaction(&view0, &chunk_with_pairs(&[1], &[10]), txn.clone())
+        .unwrap();
+    txn.publish_command_boundary(CommandId::new(1));
+
+    let view1 = storage_view_for_txn_command(&txn, 1);
+    let removed = table
+        .delete_by_primary_keys(&view1, &chunk_with_i32(&[1]), txn.clone())
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    txn.commit(1).unwrap();
+    assert!(read_row_map_from_tablet(&table.tablet(), table.max_version()).is_empty());
+    assert!(table
+        .tablet()
+        .lookup_primary_key(&primary_key_bytes(&table, 1))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn test_transaction_on_conflict_update_reads_own_pending_primary_key_insert() {
+    let table = create_pk_table();
+    let txn = Arc::new(Transaction::new(70_102, table.max_version().max(0) as u64));
+
+    let view0 = storage_view_for_txn_command(&txn, 0);
+    table
+        .append_with_transaction(&view0, &chunk_with_pairs(&[1], &[10]), txn.clone())
+        .unwrap();
+    txn.publish_command_boundary(CommandId::new(1));
+
+    let view1 = storage_view_for_txn_command(&txn, 1);
+    let affected = table
+        .insert_on_conflict(
+            &view1,
+            &chunk_with_pairs(&[1], &[20]),
+            &InsertOnConflictAction::DoUpdate {
+                target_columns: vec![1],
+                source_columns: vec![1],
+            },
+            txn.clone(),
+        )
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    txn.commit(1).unwrap();
+    let rows = read_row_map_from_tablet(&table.tablet(), table.max_version());
+    assert_eq!(rows, BTreeMap::from([(1, 20)]));
+}
+
+#[test]
+fn test_primary_key_commit_validation_rejects_write_after_read_ts() {
+    let table = create_pk_table();
+    let stale_txn = Arc::new(Transaction::new(71_001, table.max_version().max(0) as u64));
+    let winner = Arc::new(Transaction::new(71_002, table.max_version().max(0) as u64));
+
+    let winner_view = storage_view_for_txn_command(&winner, 0);
+    table
+        .append_with_transaction(&winner_view, &chunk_with_pairs(&[1], &[20]), winner.clone())
+        .unwrap();
+    winner.commit(1).unwrap();
+
+    let stale_view = storage_view_for_txn_command(&stale_txn, 0);
+    table
+        .append_with_transaction(
+            &stale_view,
+            &chunk_with_pairs(&[1], &[10]),
+            stale_txn.clone(),
+        )
+        .unwrap();
+    let err = stale_txn.commit(2).unwrap_err();
+    assert!(
+        err.to_string().contains("write-write conflict"),
+        "expected primary-key validation conflict, got: {err}"
+    );
 }
 
 #[test]
@@ -245,19 +470,23 @@ fn test_delete_then_reinsert_same_primary_key_becomes_visible_again() {
 #[test]
 fn test_delete_vector() {
     let (tablet, _tmp) = create_pk_tablet();
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t1 = tm.begin_transaction().unwrap();
     let mut writer = DeltaWriter::open(tablet.clone(), t1.id).unwrap();
     writer.write_chunk(&chunk_with_pairs(&[1], &[10])).unwrap();
-    let rowset1 = writer.commit_in_transaction(t1.clone()).unwrap();
-    tm.commit_transaction(t1).unwrap();
+    let rowset1 = writer
+        .commit_in_transaction(t1.clone(), view_for_txn(&t1).command_id())
+        .unwrap();
+    commit_storage_transaction(&tm, t1);
 
     let t2 = tm.begin_transaction().unwrap();
     let mut writer2 = DeltaWriter::open(tablet.clone(), t2.id).unwrap();
     writer2.write_chunk(&chunk_with_pairs(&[1], &[20])).unwrap();
-    let _rowset2 = writer2.commit_in_transaction(t2.clone()).unwrap();
-    tm.commit_transaction(t2).unwrap();
+    let _rowset2 = writer2
+        .commit_in_transaction(t2.clone(), view_for_txn(&t2).command_id())
+        .unwrap();
+    commit_storage_transaction(&tm, t2);
 
     let committed_rowset1 = tablet.find_rowset_by_id(rowset1.rowset_id()).unwrap();
     let dv = DeleteVector::load_from_dir(committed_rowset1.rowset_path(), 0)
@@ -267,7 +496,7 @@ fn test_delete_vector() {
 }
 
 #[test]
-fn test_wal_recovery_rowset() {
+fn test_restart_reloads_committed_rowset_from_tablet_meta() {
     let (tablet, tmp, manager) = create_managed_pk_tablet();
 
     let mut writer = DeltaWriter::open(tablet.clone(), 1).unwrap();
@@ -310,7 +539,7 @@ fn test_wal_recovery_rowset() {
 }
 
 #[test]
-fn test_wal_recovery_replays_delete_then_reinsert_for_primary_key() {
+fn test_restart_reloads_delete_then_reinsert_for_primary_key() {
     let (tablet, tmp, manager) = create_managed_pk_tablet();
 
     let mut writer = DeltaWriter::open(tablet.clone(), 31).unwrap();
@@ -344,7 +573,7 @@ fn test_wal_recovery_replays_delete_then_reinsert_for_primary_key() {
 #[test]
 fn test_concurrent_read_write_rowset_scan() {
     let table = Arc::new(create_table(&[LogicalType::Integer]));
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t_read = tm.begin_transaction().unwrap();
     let visible = t_read.visible_version();
@@ -354,9 +583,9 @@ fn test_concurrent_read_write_rowset_scan() {
     let t_write = tm.begin_transaction().unwrap();
     let chunk = chunk_with_i32(&[7, 8, 9]);
     table
-        .append_with_transaction(&chunk, Some(t_write.clone()))
+        .append_with_transaction(&view_for_txn(&t_write), &chunk, t_write.clone())
         .unwrap();
-    tm.commit_transaction(t_write).unwrap();
+    commit_storage_transaction(&tm, t_write);
 
     let read_count = handle.join().unwrap();
     assert_eq!(read_count, 0);
@@ -415,20 +644,28 @@ fn test_transaction_memtable_reuse_single_rowset() {
     let metrics_before = storage_metrics().snapshot();
     let table = create_pk_table();
     let tablet = table.tablet();
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t1 = tm.begin_transaction().unwrap();
     table
-        .append_with_transaction(&chunk_with_pairs(&[1], &[10]), Some(t1.clone()))
+        .append_with_transaction(
+            &view_for_txn(&t1),
+            &chunk_with_pairs(&[1], &[10]),
+            t1.clone(),
+        )
         .unwrap();
     table
-        .append_with_transaction(&chunk_with_pairs(&[2], &[20]), Some(t1.clone()))
+        .append_with_transaction(
+            &view_for_txn(&t1),
+            &chunk_with_pairs(&[2], &[20]),
+            t1.clone(),
+        )
         .unwrap();
 
     // Before commit, writes are still transaction-local.
     assert_eq!(tablet.num_rowsets(), 0);
 
-    tm.commit_transaction(t1).unwrap();
+    commit_storage_transaction(&tm, t1);
     assert_eq!(tablet.num_rowsets(), 1);
     assert_eq!(read_rows_from_tablet(&tablet, tablet.max_version()), 2);
 
@@ -445,7 +682,7 @@ fn test_transaction_memtable_flush_on_threshold_then_commit() {
     let metrics_before = storage_metrics().snapshot();
     let table = create_pk_table();
     let tablet = table.tablet();
-    let tm = TransactionManager::new();
+    let tm = Arc::new(TransactionManager::new());
 
     let t1 = tm.begin_transaction().unwrap();
     let rows = 70_000i32;
@@ -453,7 +690,11 @@ fn test_transaction_memtable_flush_on_threshold_then_commit() {
     let vals: Vec<i32> = (0..rows).map(|v| v * 10).collect();
 
     table
-        .append_with_transaction(&chunk_with_pairs(&ids, &vals), Some(t1.clone()))
+        .append_with_transaction(
+            &view_for_txn(&t1),
+            &chunk_with_pairs(&ids, &vals),
+            t1.clone(),
+        )
         .unwrap();
 
     // Threshold flush happens inside writer, but data is still uncommitted.
@@ -464,7 +705,7 @@ fn test_transaction_memtable_flush_on_threshold_then_commit() {
     );
     assert_eq!(tablet.num_rowsets(), 0);
 
-    tm.commit_transaction(t1).unwrap();
+    commit_storage_transaction(&tm, t1);
     assert_eq!(tablet.num_rowsets(), 1);
     assert_eq!(
         read_rows_from_tablet(&tablet, tablet.max_version()),

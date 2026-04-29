@@ -111,6 +111,17 @@ impl TableHandle {
         Ok(())
     }
 
+    pub fn replay_primary_delete_at_version(
+        &self,
+        keys: &[Vec<u8>],
+        delete_version: i64,
+    ) -> Result<()> {
+        self.tablet()
+            .replay_primary_delete_idempotent_at_version(keys.to_vec(), delete_version)?;
+        self.tablet().repair_primary_index_after_replay()?;
+        Ok(())
+    }
+
     pub fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
         self.tablet().replay_compaction_publish(record)?;
         self.restore_runtime_indexes_for_rowset(record.output_rowset_id)?;

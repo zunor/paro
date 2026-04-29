@@ -6,13 +6,16 @@ use crate::effect::{
 };
 use crate::error as paro_error;
 use crate::error::Result;
-use crate::journal::{CommitRecord, MaintenanceKind, MaintenanceRecord};
+use crate::journal::{
+    CommitRecord, JournalRecordMetadata, MaintenanceKind, MaintenanceRecord, COMMIT_RECORD_VERSION,
+    MAINTENANCE_RECORD_VERSION,
+};
 
 /// Admission token captured during prepare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrepareToken {
     pub visible_version: i64,
-    pub rowset_epoch: u64,
+    pub layout_epoch: u64,
     pub schema_epoch: Option<u64>,
 }
 
@@ -43,13 +46,22 @@ pub struct PreparedCommitPlan {
 
 impl PreparedCommitPlan {
     pub fn into_record(self, commit_id: u64) -> CommitRecord {
+        let storage_ops = rewrite_rowset_versions(self.storage_ops, commit_id)
+            .expect("commit_id fits supported rowset version range");
+        let metadata = JournalRecordMetadata::transaction(
+            &self.catalog_ops,
+            &storage_ops,
+            &self.apply_descriptors,
+            &self.deferred_tasks,
+        );
         CommitRecord {
+            record_version: COMMIT_RECORD_VERSION,
+            metadata,
             txn_id: self.txn_id,
             start_time: self.start_time,
             commit_id,
             catalog_ops: self.catalog_ops,
-            storage_ops: rewrite_rowset_versions(self.storage_ops, commit_id)
-                .expect("commit_id fits supported rowset version range"),
+            storage_ops,
             apply_descriptors: self.apply_descriptors,
             deferred_tasks: self.deferred_tasks,
         }
@@ -75,7 +87,15 @@ pub struct PreparedMaintenancePlan {
 
 impl PreparedMaintenancePlan {
     pub fn into_record(self, maintenance_id: u64) -> MaintenanceRecord {
+        let metadata = JournalRecordMetadata::maintenance(
+            &self.catalog_ops,
+            &self.storage_ops,
+            &self.apply_descriptors,
+            &self.deferred_tasks,
+        );
         MaintenanceRecord {
+            record_version: MAINTENANCE_RECORD_VERSION,
+            metadata,
             maintenance_id,
             kind: self.kind,
             catalog_ops: self.catalog_ops,
@@ -166,6 +186,15 @@ mod tests {
         .into_record(42);
 
         let StorageCommitOp::Tablet(tablet) = &record.storage_ops[0];
+        assert_eq!(record.metadata.replay.storage_op_count, 1);
+        assert_eq!(record.metadata.replay.storage_mutation_count, 2);
+        assert_eq!(record.metadata.change.tablet_ids, vec![99]);
+        assert!(record
+            .metadata
+            .change
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_id == 123));
         match &tablet.mutations[0] {
             TabletMutation::PublishRowset { version_span, .. } => {
                 assert_eq!(*version_span, VersionSpan { start: 42, end: 42 });

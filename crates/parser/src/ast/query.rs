@@ -44,6 +44,8 @@ pub struct Query {
     pub limit: Vec<Expr>,
     // `OFFSET` expr
     pub offset: Option<Expr>,
+    // Row-locking clause, e.g. `FOR UPDATE`.
+    pub locking: Option<QueryLockingClause>,
 
     // If ignore the result (not output).
     pub ignore_result: bool,
@@ -76,12 +78,42 @@ impl Display for Query {
             write!(f, " OFFSET {offset}")?;
         }
 
+        if let Some(locking) = &self.locking {
+            write!(f, " {locking}")?;
+        }
+
         if self.ignore_result {
             write!(f, " IGNORE_RESULT")?;
         }
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Drive, DriveMut)]
+pub struct QueryLockingClause {
+    pub mode: QueryLockingMode,
+}
+
+impl QueryLockingClause {
+    pub const fn for_update() -> Self {
+        Self {
+            mode: QueryLockingMode::Update,
+        }
+    }
+}
+
+impl Display for QueryLockingClause {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self.mode {
+            QueryLockingMode::Update => write!(f, "FOR UPDATE"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Drive, DriveMut)]
+pub enum QueryLockingMode {
+    Update,
 }
 
 #[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
@@ -1199,6 +1231,7 @@ impl SetExpr {
                 order_by: vec![],
                 limit: vec![],
                 offset: None,
+                locking: None,
                 ignore_result: false,
             },
         }

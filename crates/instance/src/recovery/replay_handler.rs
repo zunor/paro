@@ -24,14 +24,18 @@ use paro_common::effect::{
 };
 use paro_common::error as paro_error;
 use paro_common::journal::JournalRecord;
+use paro_common::logging::targets;
 use paro_journal::segments::{ReplayCursor, SegmentCatalogStore};
+use paro_journal::wal::recovery::{ReplayHandler, WalRecovery};
+use paro_journal::wal::replay_state::ReplayResult;
+use paro_journal::wal::wal_entry::WalHeaderMetadata;
+use paro_journal::wal::write_ahead_log::WriteAheadLog;
+use paro_journal::{
+    mutation_identity_for_tablet, ApplyRequest, JournalApplyRuntime, TabletApplyPart, WaitMode,
+};
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor;
-use paro_storage::wal::recovery::{ReplayHandler, WalRecovery};
-use paro_storage::wal::replay_state::ReplayResult;
-use paro_storage::wal::wal_entry::WalHeaderMetadata;
-use paro_storage::wal::write_ahead_log::WriteAheadLog;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -56,6 +60,8 @@ pub struct CatalogReplayHandler<'a> {
     pub(super) recovery_summary: RecoverySummary,
     /// Deferred post-commit work recovered from the replayed durable tail.
     pub(super) replayed_deferred_tasks: Vec<DeferredTask>,
+    /// Runtime used to order recovered tablet apply work by journal LSN.
+    apply_runtime: Option<Arc<JournalApplyRuntime>>,
 }
 
 impl<'a> CatalogReplayHandler<'a> {
@@ -84,6 +90,7 @@ impl<'a> CatalogReplayHandler<'a> {
             max_catalog_commit_id: bootstrap.max_catalog_commit_id,
             recovery_summary: bootstrap,
             replayed_deferred_tasks: Vec::new(),
+            apply_runtime: None,
         }
     }
 
@@ -97,6 +104,11 @@ impl<'a> CatalogReplayHandler<'a> {
         tablet_meta_manager: Option<Arc<TabletMetaManager>>,
     ) -> Self {
         self.tablet_meta_manager = tablet_meta_manager;
+        self
+    }
+
+    pub fn with_apply_runtime(mut self, runtime: Option<Arc<JournalApplyRuntime>>) -> Self {
+        self.apply_runtime = runtime;
         self
     }
 
@@ -216,6 +228,13 @@ impl<'a> CatalogReplayHandler<'a> {
                         err
                     ))
                 })
+            }
+            StagedArtifactDescriptor::BulkLoadRowset(_artifact) => {
+                // Bulk-load rowsets are published by the tablet StorageCommitOp so
+                // replay preserves mutation identity and commit ordering. The
+                // descriptor remains in the durable record for CDC/follower
+                // metadata and COPY-specific recovery diagnostics.
+                Ok(())
             }
         }
     }
@@ -353,39 +372,7 @@ impl<'a> CatalogReplayHandler<'a> {
         let Some(storage) = self.table_storage_for_tablet(tablet_id) else {
             return Ok(());
         };
-
-        match mutation {
-            TabletMutation::PublishRowset {
-                rowset_id,
-                version_span,
-                rowset_ref,
-            } => {
-                let rowset_path = rowset_ref.resolve_for_tablet(storage.tablet().data_dir());
-                storage.replay_rowset_commit(
-                    *rowset_id,
-                    version_span.start,
-                    version_span.end,
-                    rowset_path.to_string_lossy().as_ref(),
-                )?;
-            }
-            TabletMutation::ApplyDeletePatch {
-                patch,
-                deleted_row_count: _,
-            } => {
-                let delete_version = commit_visibility.ok_or_else(|| {
-                    paro_error::internal(
-                        "maintenance record cannot carry ApplyDeletePatch without commit visibility",
-                    )
-                })?;
-                let locations = patch.decode_row_refs_for_tablet(storage.tablet().data_dir())?;
-                storage.replay_row_id_delete_at_version(&locations, delete_version)?;
-            }
-            TabletMutation::PublishCompaction { .. } => {
-                storage.apply_compaction_publish(mutation)?;
-            }
-        }
-
-        storage.tablet().note_applied_lsn(lsn)?;
+        apply_recovered_tablet_mutation(&storage, tablet_id, mutation, lsn, commit_visibility)?;
         Ok(())
     }
 
@@ -409,6 +396,75 @@ impl<'a> CatalogReplayHandler<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn apply_storage_ops_with_runtime(
+        &mut self,
+        storage_ops: &[StorageCommitOp],
+        lsn: u64,
+        commit_visibility: Option<i64>,
+    ) -> paro_common::error::Result<()> {
+        let Some(runtime) = self.apply_runtime.as_ref().cloned() else {
+            return self.apply_storage_ops(storage_ops, lsn, commit_visibility);
+        };
+
+        let mut tablet_parts = Vec::new();
+        for op in storage_ops {
+            match op {
+                StorageCommitOp::Tablet(tablet) => {
+                    let Some(storage) = self.table_storage_for_tablet(tablet.tablet_id) else {
+                        continue;
+                    };
+                    if storage.tablet().applied_lsn() >= lsn
+                        && tablet_mutations_are_applied(
+                            &storage,
+                            tablet.tablet_id,
+                            &tablet.mutations,
+                            commit_visibility,
+                        )
+                    {
+                        tracing::debug!(
+                            target: targets::INSTANCE,
+                            tablet_id = tablet.tablet_id,
+                            lsn,
+                            "tablet storage op skipped during recovery runtime because applied_lsn already covers record"
+                        );
+                        continue;
+                    }
+                    let tablet_id = tablet.tablet_id;
+                    let mutations = tablet.mutations.clone();
+                    tablet_parts.push(TabletApplyPart {
+                        tablet_id,
+                        apply: Box::new(move || {
+                            for mutation in &mutations {
+                                apply_recovered_tablet_mutation(
+                                    &storage,
+                                    tablet_id,
+                                    mutation,
+                                    lsn,
+                                    commit_visibility,
+                                )?;
+                            }
+                            Ok(())
+                        }),
+                    });
+                }
+            }
+        }
+
+        runtime.submit(ApplyRequest {
+            lsn: 0,
+            durable_batch_lsn: lsn,
+            commit_id: commit_visibility.map(|commit_id| commit_id as u64),
+            wait_mode: WaitMode::Published,
+            catalog_serial: false,
+            catalog_pre: Box::new(|| Ok(())),
+            tablet_parts,
+            descriptor_phase: Box::new(|| Ok(())),
+            catalog_post: Box::new(|| Ok(())),
+            on_published: Box::new(|| Ok(())),
+        })?;
         Ok(())
     }
 
@@ -584,6 +640,90 @@ impl<'a> CatalogReplayHandler<'a> {
     }
 }
 
+fn tablet_mutations_are_applied(
+    storage: &TableHandle,
+    tablet_id: u64,
+    mutations: &[TabletMutation],
+    commit_visibility: Option<i64>,
+) -> bool {
+    let commit_ts = commit_visibility.unwrap_or_default() as u64;
+    mutations.iter().all(|mutation| {
+        storage
+            .tablet()
+            .has_applied_mutation_identity(mutation_identity_for_tablet(
+                commit_ts, tablet_id, mutation,
+            ))
+    })
+}
+
+fn apply_recovered_tablet_mutation(
+    storage: &TableHandle,
+    tablet_id: u64,
+    mutation: &TabletMutation,
+    lsn: u64,
+    commit_visibility: Option<i64>,
+) -> paro_common::error::Result<()> {
+    let identity = mutation_identity_for_tablet(
+        commit_visibility.unwrap_or_default() as u64,
+        tablet_id,
+        mutation,
+    );
+    if storage.tablet().has_applied_mutation_identity(identity) {
+        tracing::debug!(
+            target: targets::INSTANCE,
+            tablet_id,
+            lsn,
+            mutation_kind = ?identity.mutation_kind,
+            artifact_id = identity.artifact_id,
+            "tablet mutation skipped during recovery because mutation identity was already applied"
+        );
+        return Ok(());
+    }
+
+    match mutation {
+        TabletMutation::PublishRowset {
+            rowset_id,
+            version_span,
+            rowset_ref,
+        } => {
+            let rowset_path = rowset_ref.resolve_for_tablet(storage.tablet().data_dir());
+            storage.replay_rowset_commit(
+                *rowset_id,
+                version_span.start,
+                version_span.end,
+                rowset_path.to_string_lossy().as_ref(),
+            )?;
+        }
+        TabletMutation::ApplyPrimaryDelete { keys } => {
+            let delete_version = commit_visibility.ok_or_else(|| {
+                paro_error::internal(
+                    "maintenance record cannot carry ApplyPrimaryDelete without commit visibility",
+                )
+            })?;
+            storage.replay_primary_delete_at_version(keys, delete_version)?;
+        }
+        TabletMutation::ApplyDeletePatch {
+            patch,
+            deleted_row_count: _,
+        } => {
+            let delete_version = commit_visibility.ok_or_else(|| {
+                paro_error::internal(
+                    "maintenance record cannot carry ApplyDeletePatch without commit visibility",
+                )
+            })?;
+            let locations = patch.decode_row_refs_for_tablet(storage.tablet().data_dir())?;
+            storage.replay_row_id_delete_at_version(&locations, delete_version)?;
+        }
+        TabletMutation::PublishCompaction { .. } => {
+            storage.apply_compaction_publish(mutation)?;
+        }
+    }
+
+    storage.tablet().note_applied_mutation_identity(identity)?;
+    storage.tablet().note_applied_lsn(lsn)?;
+    Ok(())
+}
+
 impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
     fn replay_transaction(
         &mut self,
@@ -654,7 +794,11 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
                     paro_error::invalid_input("commit_id exceeds supported version range")
                 })?;
                 self.replay_catalog_non_drop_ops(&record.catalog_ops, record.commit_id)?;
-                self.apply_storage_ops(&record.storage_ops, lsn, Some(commit_visibility))?;
+                self.apply_storage_ops_with_runtime(
+                    &record.storage_ops,
+                    lsn,
+                    Some(commit_visibility),
+                )?;
                 self.apply_descriptors(&record.apply_descriptors, record.commit_id)?;
                 self.replay_catalog_drop_ops(&record.catalog_ops, record.commit_id)?;
                 self.record_replayed_deferred_tasks(&record.deferred_tasks);
@@ -667,7 +811,7 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
                 );
             }
             JournalRecord::Maintenance(record) => {
-                self.apply_storage_ops(&record.storage_ops, lsn, None)?;
+                self.apply_storage_ops_with_runtime(&record.storage_ops, lsn, None)?;
                 self.apply_descriptors(&record.apply_descriptors, 0)?;
                 self.record_replayed_deferred_tasks(&record.deferred_tasks);
                 self.observe_journal_record(
@@ -734,6 +878,7 @@ pub(crate) fn recover_database_with_bootstrap(
         None,
         None,
         None,
+        None,
         bootstrap,
     )
 }
@@ -762,11 +907,13 @@ pub fn recover_database_with_checkpoint(
         journal_tail,
         wal_header_metadata,
         wal_keep_from,
+        None,
         RecoverySummary::default(),
     )?;
     Ok((outcome.wal, outcome.replay_result, outcome.summary))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recover_database_with_checkpoint_bootstrap(
     wal_path: &Path,
     catalog: &Arc<ParoCatalog>,
@@ -774,10 +921,11 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
     journal_tail: Option<JournalTailRef>,
     wal_header_metadata: Option<WalHeaderMetadata>,
     wal_keep_from: Option<u64>,
+    apply_runtime: Option<Arc<JournalApplyRuntime>>,
     bootstrap: RecoverySummary,
 ) -> paro_common::error::Result<RecoveryReplayOutcome> {
     let catalog_store = SegmentCatalogStore::from_seed_path(wal_path);
-    let mut handler = CatalogReplayHandler::new_with_bootstrap(catalog, 0, u64::MAX, bootstrap)
+    let handler = CatalogReplayHandler::new_with_bootstrap(catalog, 0, u64::MAX, bootstrap)
         .with_database_root(
             wal_path
                 .parent()
@@ -785,6 +933,7 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
                 .to_path_buf(),
         )
         .with_tablet_meta_manager(tablet_meta_manager);
+    let mut handler = handler.with_apply_runtime(apply_runtime);
 
     let replay_cursor = if let Some(journal_tail) = journal_tail {
         ReplayCursor::from_catalog(
@@ -824,9 +973,9 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
     let recovered_wal = WriteAheadLog::with_state_and_start_lsn(
         wal_path,
         if replay_result.all_succeeded {
-            paro_storage::wal::wal_writer::WalInitState::Uninitialized
+            paro_journal::wal::wal_writer::WalInitState::Uninitialized
         } else {
-            paro_storage::wal::wal_writer::WalInitState::UninitializedRequiresTruncate
+            paro_journal::wal::wal_writer::WalInitState::UninitializedRequiresTruncate
         },
         wal_header_metadata.unwrap_or_default(),
         summary.max_lsn.saturating_add(1),
@@ -886,13 +1035,13 @@ mod tests {
     };
     use paro_common::effect::{CatalogTxnOp, PreparedDataOp, RowsetLocator};
     use paro_common::types::LogicalType;
+    use paro_journal::wal::wal_entry::{ColumnInfo, WalEntry};
+    use paro_journal::wal::wal_type::WalType;
+    use paro_journal::wal::wal_writer::WalWriter;
+    use paro_journal::wal::write_ahead_log::WriteAheadLog;
     use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
-    use paro_storage::wal::wal_entry::{ColumnInfo, WalEntry};
-    use paro_storage::wal::wal_type::WalType;
-    use paro_storage::wal::wal_writer::WalWriter;
-    use paro_storage::wal::write_ahead_log::WriteAheadLog;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1716,7 +1865,7 @@ mod tests {
             let wal = WriteAheadLog::new(&wal_path).unwrap();
             let write_state = wal.begin_write();
             let writer = write_state.wal();
-            paro_storage::wal::test_support::write_flushed_create_schema_txn_with_object_id(
+            paro_journal::wal::test_support::write_flushed_create_schema_txn_with_object_id(
                 writer.as_ref(),
                 "test",
                 "test_schema",
@@ -2175,7 +2324,7 @@ mod tests {
         let wal = WriteAheadLog::new(&content_path).unwrap();
         let write_state = wal.begin_write();
         let writer = write_state.wal();
-        paro_storage::wal::test_support::write_flushed_create_schema_txn(
+        paro_journal::wal::test_support::write_flushed_create_schema_txn(
             writer.as_ref(),
             "test",
             "content_schema",

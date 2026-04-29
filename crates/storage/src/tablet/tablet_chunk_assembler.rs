@@ -98,6 +98,11 @@ impl TabletReader {
                 continue;
             }
 
+            if let Some(vector) = self.schema_fill_vector(rowset_id, idx, rows)? {
+                read_vectors.push(vector);
+                continue;
+            }
+
             if let Some(base_rowids) = self.load_base_rowids(rowset_id, segment_id, rowids)? {
                 let resolved = self.get_by_rowids_internal(&base_rowids, &[*col_id], 1)?;
                 let resolved_vector = resolved.column(0).ok_or_else(|| {
@@ -157,7 +162,7 @@ impl TabletReader {
             .iter()
             .find(|rowset| rowset.rowset_id() == rowset_id)
             .cloned()
-            .or_else(|| self.tablet.find_rowset_by_id(rowset_id))
+            .or_else(|| self.tablet.find_retained_rowset_by_id(rowset_id))
             .ok_or_else(|| {
                 paro_error::internal(format!(
                     "rowset {} not found while resolving partial scan rows",

@@ -10,6 +10,7 @@ should-implement-trait = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-transaction = { workspace = true }
 paro-parser = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }

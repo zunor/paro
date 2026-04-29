@@ -238,6 +238,108 @@ SELECT current_user();
     assert blocks[1].kind == "query"
 
 
+def test_parse_session_directive_applies_to_next_auto_block() -> None:
+    sql = """
+-- @session s1 user=alice database=analytics
+BEGIN;
+
+-- @session s1
+SELECT 1;
+"""
+
+    blocks = parse_sql_text(sql)
+    assert len(blocks) == 2
+    assert blocks[0].kind == "statement"
+    assert blocks[0].session_name == "s1"
+    assert blocks[0].session_args == ("user=alice", "database=analytics")
+    assert blocks[1].kind == "query"
+    assert blocks[1].session_name == "s1"
+    assert blocks[1].session_args == ()
+
+
+def test_parse_session_directive_combines_with_query_directive() -> None:
+    sql = """
+-- @session reader
+-- @query rowsort
+SELECT v FROM t;
+"""
+
+    blocks = parse_sql_text(sql)
+    assert len(blocks) == 1
+    assert blocks[0].kind == "query"
+    assert blocks[0].query_mode == "rowsort"
+    assert blocks[0].session_name == "reader"
+
+
+def test_parse_session_async_directive() -> None:
+    sql = """
+-- @session writer async=blocked user=alice
+INSERT INTO t VALUES (1);
+
+-- @await blocked timeout=5s
+"""
+
+    blocks = parse_sql_text(sql)
+    assert len(blocks) == 2
+    assert blocks[0].kind == "statement"
+    assert blocks[0].session_name == "writer"
+    assert blocks[0].session_args == ("user=alice",)
+    assert blocks[0].async_label == "blocked"
+    assert blocks[1].kind == "await"
+    assert blocks[1].await_label == "blocked"
+    assert blocks[1].await_timeout_ms == 5000
+
+
+def test_parse_sleep_and_wait_expect_directives() -> None:
+    sql = """
+-- @sleep 25ms
+
+-- @wait_expect interval=10ms timeout=2s
+SELECT v FROM t;
+"""
+
+    blocks = parse_sql_text(sql)
+    assert len(blocks) == 2
+    assert blocks[0].kind == "sleep"
+    assert blocks[0].sleep_ms == 25
+    assert blocks[1].kind == "query"
+    assert blocks[1].wait_expect_interval_ms == 10
+    assert blocks[1].wait_expect_timeout_ms == 2000
+
+
+def test_parse_wait_expect_rejects_statement_target() -> None:
+    sql = """
+-- @wait_expect interval=10ms timeout=1s
+INSERT INTO t VALUES (1);
+"""
+
+    with pytest.raises(ParseError, match="can only target a query"):
+        parse_sql_text(sql)
+
+
+def test_parse_duplicate_async_label_raises() -> None:
+    sql = """
+-- @session s1 async=work
+SELECT 1;
+
+-- @session s2 async=work
+SELECT 2;
+"""
+
+    with pytest.raises(ParseError, match="duplicate async label"):
+        parse_sql_text(sql)
+
+
+def test_parse_session_rejects_setup_target() -> None:
+    sql = """
+-- @session s1
+-- @setup
+CREATE TABLE t(v INT);
+"""
+    with pytest.raises(ParseError, match="always runs on the default session"):
+        parse_sql_text(sql)
+
+
 def test_parse_fixture_directive_applies_to_next_sql_block() -> None:
     sql = """
 -- @fixture python_udf/modules/basic_math

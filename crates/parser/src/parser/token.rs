@@ -1483,10 +1483,20 @@ pub enum TokenKind {
     INDEXES,
     #[token("ADDRESS", ignore(ascii_case))]
     ADDRESS,
+    #[token("CHARACTERISTICS", ignore(ascii_case))]
+    CHARACTERISTICS,
+    #[token("ISOLATION", ignore(ascii_case))]
+    ISOLATION,
+    #[token("LEVEL", ignore(ascii_case))]
+    LEVEL,
+    #[token("ONLY", ignore(ascii_case))]
+    ONLY,
     #[token("OWNERSHIP", ignore(ascii_case))]
     OWNERSHIP,
     #[token("READ", ignore(ascii_case))]
     READ,
+    #[token("SERIALIZABLE", ignore(ascii_case))]
+    SERIALIZABLE,
     #[token("WRITE", ignore(ascii_case))]
     WRITE,
     #[token("UDF", ignore(ascii_case))]

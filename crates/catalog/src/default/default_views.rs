@@ -658,6 +658,11 @@ pub static PG_CATALOG_VIEWS: &[DefaultView] = &[
             "is_holdable",
             "is_binary",
             "is_scrollable",
+            "snapshot_read_ts",
+            "snapshot_pin_duration_us",
+            "snapshot_owner_session_id",
+            "snapshot_portal_id",
+            "snapshot_retention_policy",
         ],
         column_types: &[
             LogicalType::Varchar,
@@ -665,6 +670,11 @@ pub static PG_CATALOG_VIEWS: &[DefaultView] = &[
             LogicalType::Boolean,
             LogicalType::Boolean,
             LogicalType::Boolean,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
         ],
     },
 ];

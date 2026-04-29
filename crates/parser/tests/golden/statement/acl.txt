@@ -2271,6 +2271,7 @@ CreateRowAccessPolicy(
                         order_by: [],
                         limit: [],
                         offset: None,
+                        locking: None,
                         ignore_result: false,
                     },
                 },

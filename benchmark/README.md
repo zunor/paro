@@ -92,6 +92,16 @@ You can also run via root-level proxy targets:
 make bench WORKLOAD=graph
 ```
 
+## Workload Order
+
+Full runs sort workloads by `[meta].run_order` and then by directory name.
+The default order is `100`. Workloads that intentionally shrink global
+`memory_limit` for spill coverage should use a lower value so they run before
+memory-heavy cache-warming workloads.
+
+Suite manifests keep their explicit `[[include]]` order. Keep tight-memory
+workloads early there as well.
+
 ## Baseline Workflow
 
 Current project policy:

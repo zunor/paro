@@ -43,10 +43,6 @@ pub(crate) fn test_i64_vector(values: &[i64]) -> Vector {
     paro_common::test_utils::test_i64_vector(values)
 }
 
-pub(crate) fn test_f64_vector(values: &[f64]) -> Vector {
-    paro_common::test_utils::test_f64_vector(values)
-}
-
 pub(crate) fn test_string_vector(values: &[&str]) -> Vector {
     paro_common::test_utils::test_string_vector(values)
 }

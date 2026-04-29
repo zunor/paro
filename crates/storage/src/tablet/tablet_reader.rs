@@ -12,8 +12,9 @@
 //! - Supports column projection and predicate pushdown
 //! - Returns Chunks for pipeline execution
 
+use super::schema_adapter::{build_reader_schema_adapters, RowsetSchemaAdapter};
 pub use super::tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
-use super::tablet_runtime::{TabletReadGuard, TabletRef};
+use super::tablet_runtime::{TabletReadGuard, TabletRef, TabletSnapshotMaterialization};
 use super::tablet_schema::TabletSchemaRef;
 use crate::primary_key::DeleteVector;
 use crate::rowset::segment::SegmentIterator;
@@ -23,6 +24,8 @@ use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use paro_common::vector::Vector;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::index::collect_predicate_columns;
@@ -92,6 +95,13 @@ impl RowsetCursor {
                 seg.segment_id(),
                 params.version,
             )?;
+            let delete_vector = merge_overlay_delete_vector(
+                delete_vector,
+                params
+                    .overlay_delete_vectors
+                    .as_ref()
+                    .and_then(|overlay| overlay.get(&(rowset.rowset_id(), seg.segment_id()))),
+            );
 
             let use_late_materialize = params.late_materialize && params.predicate_tree.is_some();
             let predicate_columns = if use_late_materialize {
@@ -122,7 +132,7 @@ impl RowsetCursor {
                     params.prefetcher.clone(),
                 )?
             };
-            if iter.num_columns() == 0 && !params.emit_row_id {
+            if iter.num_columns() == 0 && !params.emit_row_id && projection.is_empty() {
                 continue;
             };
             segment_iters.push(iter);
@@ -145,6 +155,20 @@ impl RowsetCursor {
 
     fn is_finished(&self) -> bool {
         self.current_seg_idx >= self.segment_iters.len()
+    }
+}
+
+fn merge_overlay_delete_vector(
+    base: Option<DeleteVector>,
+    overlay: Option<&DeleteVector>,
+) -> Option<DeleteVector> {
+    match (base, overlay) {
+        (Some(mut base), Some(overlay)) => {
+            base.extend(overlay.iter());
+            Some(base)
+        }
+        (None, Some(overlay)) => Some(overlay.clone()),
+        (base, None) => base,
     }
 }
 
@@ -203,6 +227,9 @@ pub struct TabletReader {
     /// Output column mapping (output idx -> read idx)
     pub(super) output_to_read: Vec<usize>,
 
+    /// Prepare-stage rowset schema adapters keyed by rowset id.
+    schema_adapters: HashMap<u64, RowsetSchemaAdapter>,
+
     /// Reader state
     state: ReaderState,
 
@@ -217,6 +244,10 @@ pub struct TabletReader {
 
     /// Snapshot guard pinned for the full reader lifetime.
     snapshot_guard: Option<TabletReadGuard>,
+
+    /// Layout lease for readers that materialize rowsets without an outer
+    /// StorageSnapshot.
+    snapshot_materialization: Option<TabletSnapshotMaterialization>,
 }
 
 impl std::fmt::Debug for TabletReader {
@@ -229,6 +260,7 @@ impl std::fmt::Debug for TabletReader {
             .field("read_types", &self.read_types)
             .field("projection", &self.projection)
             .field("output_to_read", &self.output_to_read)
+            .field("schema_adapters", &self.schema_adapters.len())
             .field("state", &self.state)
             .field("current_cursor", &self.current_cursor)
             .field("is_prepared", &self.is_prepared)
@@ -327,11 +359,13 @@ impl TabletReader {
             read_types,
             projection,
             output_to_read: column_projection.output_to_read().to_vec(),
+            schema_adapters: HashMap::new(),
             state: ReaderState::new(),
             current_cursor: None,
             is_prepared: false,
             allocator,
             snapshot_guard: None,
+            snapshot_materialization: None,
         })
     }
 
@@ -344,17 +378,15 @@ impl TabletReader {
             return Ok(());
         }
 
-        let snapshot_guard = TabletReadGuard::pin(&self.tablet, self.params.version);
+        let snapshot_guard = TabletReadGuard::pin(&self.tablet, self.params.version)?;
 
-        // Capture consistent rowsets at the specified version
-        self.rowsets = self
+        let materialization = self
             .tablet
-            .capture_consistent_rowsets(self.params.version)?;
-
-        // Sort rowsets by version for ordered reading
-        self.rowsets.sort_by_key(|a| a.version());
+            .materialize_storage_snapshot(self.params.version)?;
+        self.install_rowsets(materialization.rowsets.clone())?;
 
         self.snapshot_guard = Some(snapshot_guard);
+        self.snapshot_materialization = Some(materialization);
         self.is_prepared = true;
         Ok(())
     }
@@ -362,11 +394,14 @@ impl TabletReader {
     /// Prepare the reader with a specific list of Rowsets.
     pub fn prepare_with_rowsets(&mut self, rowsets: Vec<RowsetSharedPtr>) -> Result<()> {
         if self.snapshot_guard.is_none() {
-            self.snapshot_guard = Some(TabletReadGuard::pin(&self.tablet, self.params.version));
+            self.snapshot_guard = Some(TabletReadGuard::pin(&self.tablet, self.params.version)?);
         }
-        self.rowsets = rowsets;
-        // Keep rowsets sorted by version for consistency with standard prepare
-        self.rowsets.sort_by_key(|a| a.version());
+        self.prepare_with_pinned_rowsets(rowsets)
+    }
+
+    /// Prepare the reader with rowsets protected by an outer storage snapshot.
+    pub fn prepare_with_pinned_rowsets(&mut self, rowsets: Vec<RowsetSharedPtr>) -> Result<()> {
+        self.install_rowsets(rowsets)?;
         self.is_prepared = true;
         Ok(())
     }
@@ -463,10 +498,35 @@ impl TabletReader {
 
     /// Close the reader and release resources
     pub fn close(&mut self) {
-        self.rowsets.clear();
         self.state.is_finished = true;
         self.current_cursor = None;
+        self.rowsets.clear();
+        self.schema_adapters.clear();
+        self.snapshot_materialization = None;
         self.snapshot_guard = None;
+    }
+
+    fn install_rowsets(&mut self, mut rowsets: Vec<RowsetSharedPtr>) -> Result<()> {
+        rowsets.sort_by_key(|rowset| rowset.version());
+        self.schema_adapters =
+            build_reader_schema_adapters(&self.schema, &rowsets, &self.projection)?;
+        self.rowsets = rowsets;
+        Ok(())
+    }
+
+    pub(super) fn schema_fill_vector(
+        &self,
+        rowset_id: u64,
+        read_idx: usize,
+        rows: usize,
+    ) -> Result<Option<Arc<Vector>>> {
+        let Some(adapter) = self.schema_adapters.get(&rowset_id) else {
+            return Ok(None);
+        };
+        adapter
+            .fill_for_read_idx(read_idx)
+            .map(|fill| fill.vector(rows, self.allocator.clone()).map(Arc::new))
+            .transpose()
     }
 
     // ==================== Getters ====================

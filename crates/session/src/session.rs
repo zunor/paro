@@ -28,7 +28,8 @@ use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::version::{pg_compat_server_version, PG_COMPAT_SERVER_VERSION_NUM};
 use paro_context::{
-    AttachedDatabaseDirectory, AttachedDatabaseSnapshot, AttachedDatabaseWalMetricsSnapshot,
+    AttachedDatabaseDirectory, AttachedDatabaseSnapshot,
+    AttachedDatabaseTransactionMetricsSnapshot, AttachedDatabaseWalMetricsSnapshot,
     CompileEnvironmentKey, CursorSummary, DatabaseSnapshotIdentity, EffectiveSettings,
     ExecutionResources, PreparedStatementSummary, QueryResources, RuntimeLimits,
     SessionMetadataRows, StatementCancelReason, StatementCancellation, StatementContext,
@@ -41,7 +42,9 @@ use paro_execution::operator::ddl::refresh_property_graph::{
 use paro_execution::query_executor::executor::Executor;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::metrics::storage_metrics;
+use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const STARTUP_SERVER_ENCODING: &str = "UTF8";
@@ -71,6 +74,11 @@ pub struct Session {
     pub session_metadata: Arc<SharedSessionMetadataState>,
     /// Data for the currently running transaction
     pub transaction: SessionTransaction,
+    /// Highest durable-only async commit from this connection that later reads must observe.
+    async_commit_floor: AtomicU64,
+    /// Session-local commit acknowledgement policy. SQL defaults to required publish;
+    /// tests and future explicit async protocol paths may opt into durable-only.
+    commit_ack_policy: AtomicU64,
     /// Shared execution control separating connection shutdown from statement cancellation.
     execution_control: Arc<SessionExecutionControl>,
     /// The current attached database this session is pointing to
@@ -94,16 +102,29 @@ impl Session {
     }
 
     pub fn transaction_id(&self) -> u64 {
+        self.transaction_writer_id().into_raw()
+    }
+
+    pub fn transaction_writer_id(&self) -> paro_transaction::WriterId {
         self.transaction
             .transaction_id()
-            .map(|id| paro_storage::transaction::manager::TRANSACTION_ID_START + id)
-            .unwrap_or(0)
+            .map(paro_transaction::WriterId::new)
+            .unwrap_or_else(paro_transaction::WriterId::permanent)
+    }
+
+    pub fn transaction_read_ts(&self) -> paro_transaction::ReadTs {
+        self.transaction
+            .start_time()
+            .map(paro_transaction::ReadTs::new)
+            .unwrap_or_else(paro_transaction::ReadTs::no_active_transaction)
+    }
+
+    pub fn transaction_visible_commit_ts(&self) -> paro_transaction::CommitTs {
+        paro_transaction::CommitTs::new(self.transaction_visible_version())
     }
 
     pub fn transaction_start_time(&self) -> u64 {
-        self.transaction
-            .start_time()
-            .unwrap_or(paro_storage::transaction::manager::TRANSACTION_ID_START)
+        self.transaction_read_ts().into_raw()
     }
 
     pub fn transaction_visible_version(&self) -> u64 {
@@ -112,6 +133,42 @@ impl Session {
                 .transaction_manager()
                 .published_commit_id()
         })
+    }
+
+    pub(crate) fn record_async_commit_floor(&self, commit_id: u64) {
+        self.async_commit_floor
+            .fetch_max(commit_id, Ordering::AcqRel);
+    }
+
+    pub(crate) fn commit_ack_policy(&self) -> CommitAckPolicy {
+        match self.commit_ack_policy.load(Ordering::Acquire) {
+            1 => CommitAckPolicy::DurableOnlyAsync,
+            _ => CommitAckPolicy::RequiredPublished,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_commit_ack_policy_for_tests(&self, policy: CommitAckPolicy) {
+        let encoded = match policy {
+            CommitAckPolicy::RequiredPublished => 0,
+            CommitAckPolicy::DurableOnlyAsync => 1,
+        };
+        self.commit_ack_policy.store(encoded, Ordering::Release);
+    }
+
+    pub(crate) fn wait_for_async_commit_floor_published(&self) -> Result<()> {
+        let floor = self.async_commit_floor.load(Ordering::Acquire);
+        if floor == 0 {
+            return Ok(());
+        }
+
+        self.current_database
+            .transaction_manager()
+            .wait_for_published_commit_id_at_least(floor)?;
+        self.async_commit_floor
+            .compare_exchange(floor, 0, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+        Ok(())
     }
 
     pub fn active_transaction(&self) -> Option<Arc<paro_storage::transaction::txn::Transaction>> {
@@ -147,10 +204,20 @@ impl Session {
 
         let mut databases = self.instance.database_registry().get_databases();
         databases.sort_by(|left, right| left.name().cmp(right.name()));
+        let storage_metric_snapshot = storage_metrics().snapshot();
         let databases = databases
             .into_iter()
             .map(|database| {
                 let wal_metrics = database.wal_lifecycle_metrics();
+                let journal_apply_metrics = database.journal_apply_metrics();
+                let manager_metrics = database.transaction_manager().registry_metrics_snapshot();
+                let sequencer_metrics = database.commit_coordinator().metrics_snapshot();
+                let backpressure_metrics = database.commit_coordinator().backpressure_snapshot();
+                let commit_ack_mode = match manager_metrics.txn_commit_ack_mode_last {
+                    1 => "durable_only_async",
+                    _ => "required_published",
+                }
+                .to_string();
                 AttachedDatabaseSnapshot {
                     identity: DatabaseSnapshotIdentity {
                         id: database.id(),
@@ -169,19 +236,24 @@ impl Session {
                         main_wal_needs_truncation: wal_metrics.main_wal_needs_truncation,
                         checkpoint_wal_needs_truncation: false,
                         recovery_wal_needs_truncation: false,
-                        journal_apply_queue_depth: 0,
-                        journal_apply_queue_depth_peak: 0,
-                        journal_apply_active_workers: 0,
-                        journal_apply_active_workers_peak: 0,
-                        journal_apply_mailbox_count: 0,
-                        journal_apply_applied_lag: 0,
-                        journal_apply_published_lag: 0,
-                        journal_apply_durable_wait_count: 0,
-                        journal_apply_durable_wait_micros: 0,
-                        journal_apply_applied_wait_count: 0,
-                        journal_apply_applied_wait_micros: 0,
-                        journal_apply_published_wait_count: 0,
-                        journal_apply_published_wait_micros: 0,
+                        journal_apply_queue_depth: journal_apply_metrics.queue_depth,
+                        journal_apply_queue_depth_peak: journal_apply_metrics.queue_depth_peak,
+                        journal_apply_active_workers: journal_apply_metrics.active_workers,
+                        journal_apply_active_workers_peak: journal_apply_metrics
+                            .active_workers_peak,
+                        journal_apply_mailbox_count: journal_apply_metrics.mailbox_count,
+                        journal_apply_applied_lag: journal_apply_metrics.applied_lag,
+                        journal_apply_published_lag: journal_apply_metrics.published_lag,
+                        journal_apply_durable_wait_count: journal_apply_metrics.durable_wait_count,
+                        journal_apply_durable_wait_micros: journal_apply_metrics
+                            .durable_wait_micros,
+                        journal_apply_applied_wait_count: journal_apply_metrics.applied_wait_count,
+                        journal_apply_applied_wait_micros: journal_apply_metrics
+                            .applied_wait_micros,
+                        journal_apply_published_wait_count: journal_apply_metrics
+                            .published_wait_count,
+                        journal_apply_published_wait_micros: journal_apply_metrics
+                            .published_wait_micros,
                         journal_commit_bytes_total: 0,
                         journal_group_count: 0,
                         journal_group_size_last: 0,
@@ -192,6 +264,76 @@ impl Session {
                         journal_replay_delete_patches_total: 0,
                         journal_inline_delete_patch_count: 0,
                         journal_delete_patch_count: 0,
+                    },
+                    transaction_metrics: AttachedDatabaseTransactionMetricsSnapshot {
+                        txn_begin_count: manager_metrics.txn_begin_count,
+                        txn_begin_latency_us_total: manager_metrics.txn_begin_latency_us_total,
+                        txn_begin_latency_us_peak: manager_metrics.txn_begin_latency_us_peak,
+                        txn_commit_count: manager_metrics.txn_commit_count,
+                        txn_commit_latency_us_total: manager_metrics.txn_commit_latency_us_total,
+                        txn_commit_latency_us_peak: manager_metrics.txn_commit_latency_us_peak,
+                        txn_commit_prepare_latency_us_total: manager_metrics
+                            .txn_commit_prepare_latency_us_total,
+                        txn_commit_prepare_latency_us_peak: manager_metrics
+                            .txn_commit_prepare_latency_us_peak,
+                        txn_commit_validate_latency_us_total: manager_metrics
+                            .txn_commit_validate_latency_us_total,
+                        txn_commit_validate_latency_us_peak: manager_metrics
+                            .txn_commit_validate_latency_us_peak,
+                        group_commit_fence_us_total: sequencer_metrics.fence_duration_us_total,
+                        group_commit_fence_us_peak: sequencer_metrics.fence_duration_us_peak,
+                        txn_commit_durable_latency_us_total: manager_metrics
+                            .txn_commit_durable_latency_us_total,
+                        txn_commit_durable_latency_us_peak: manager_metrics
+                            .txn_commit_durable_latency_us_peak,
+                        commit_required_publish_wait_us_total: manager_metrics
+                            .txn_commit_required_publish_wait_us_total,
+                        commit_required_publish_wait_us_peak: manager_metrics
+                            .txn_commit_required_publish_wait_us_peak,
+                        txn_commit_publish_latency_us_total: manager_metrics
+                            .txn_commit_publish_latency_us_total,
+                        txn_commit_publish_latency_us_peak: manager_metrics
+                            .txn_commit_publish_latency_us_peak,
+                        commit_ack_mode,
+                        write_conflict_index_size: manager_metrics.write_conflict_index_size,
+                        write_conflict_index_fine_entries: manager_metrics
+                            .write_conflict_index_fine_entries,
+                        write_conflict_index_fine_summary_entries: manager_metrics
+                            .write_conflict_index_fine_summary_entries,
+                        write_conflict_index_coarse_entries: manager_metrics
+                            .write_conflict_index_coarse_entries,
+                        lock_wait_count: manager_metrics.lock_wait_count,
+                        lock_wait_duration_us: manager_metrics.lock_wait_duration_us,
+                        lock_wound_wait_abort_count: manager_metrics.lock_wound_wait_abort_count,
+                        lock_deadlock_abort_count: manager_metrics.lock_deadlock_abort_count,
+                        durable_published_lag_commits: backpressure_metrics.durable_published_lag,
+                        durable_published_lag_ms: backpressure_metrics.durable_published_lag_ms,
+                        backpressure_throttle_count: backpressure_metrics.throttle_count,
+                        ssi_validation_abort_count: manager_metrics.ssi_validation_abort_count,
+                        ssi_abort_due_to_coarse_scan_marker: manager_metrics
+                            .ssi_abort_due_to_coarse_scan_marker,
+                        read_tracker_record_count: manager_metrics.read_tracker_record_count,
+                        read_tracker_coarsened_count: manager_metrics.read_tracker_coarsened_count,
+                        read_tracking_hint_count: manager_metrics.read_tracking_hint_count,
+                        read_tracking_policy_escalation_count: manager_metrics
+                            .read_tracking_policy_escalation_count,
+                        read_tracking_point_critical_count: manager_metrics
+                            .read_tracking_point_critical_count,
+                        read_tracking_range_critical_count: manager_metrics
+                            .read_tracking_range_critical_count,
+                        read_tracking_analytical_scan_count: manager_metrics
+                            .read_tracking_analytical_scan_count,
+                        read_tracking_safe_snapshot_preferred_count: manager_metrics
+                            .read_tracking_safe_snapshot_preferred_count,
+                        derived_index_lag_ts: storage_metric_snapshot.derived_index_lag_ts,
+                        derived_delta_merge_cost: storage_metric_snapshot.derived_delta_merge_cost,
+                        commit_participant_count: backpressure_metrics.participant_count as u64,
+                        inflight_batch_conflict_reject_count: sequencer_metrics
+                            .reject_in_batch_write_conflict,
+                        retention_watermark_lag_ms: manager_metrics.retention_watermark_lag_ms,
+                        oldest_active_rw_lag_ms: manager_metrics.oldest_active_rw_lag_ms,
+                        read_snapshot_lease_count: manager_metrics.read_snapshot_lease_count,
+                        active_rw_txn_count: manager_metrics.active_rw_txn_count,
                     },
                 }
             })
@@ -224,12 +366,34 @@ impl Session {
                 auth,
             },
             txn: StatementView {
-                id: self.transaction_id(),
-                start_time: self.transaction_start_time(),
-                visible_version: self.transaction_visible_version(),
+                transaction: paro_context::TransactionView::new(
+                    self.transaction_writer_id(),
+                    self.transaction_read_ts(),
+                    paro_context::ReadSnapshot::new(
+                        paro_transaction::ReadTs::new(self.transaction_visible_version()),
+                        self.current_database
+                            .transaction_manager()
+                            .retention_registry()
+                            .lease_read_snapshot(paro_transaction::ReadTs::new(
+                                self.transaction_visible_version(),
+                            ))
+                            .ok()
+                            .map(Arc::new),
+                    ),
+                    self.transaction.isolation_level(),
+                    paro_transaction::CommandId::new(self.current_command_id()),
+                    self.transaction.read_tracker(),
+                    self.transaction.participant_states(),
+                ),
                 active: self.active_transaction(),
                 write_guard: Some(self.transaction.write_guard()),
                 admission: Some(self.transaction.admission_state()),
+                retention_registry: Some(
+                    self.current_database
+                        .transaction_manager()
+                        .retention_registry()
+                        .clone(),
+                ),
             },
             ddl,
             settings: settings.clone(),
@@ -322,6 +486,8 @@ impl Session {
             auth_policy: SessionAuthPolicy::from_env(),
             session_metadata: Arc::new(SharedSessionMetadataState::default()),
             transaction: SessionTransaction::new(),
+            async_commit_floor: AtomicU64::new(0),
+            commit_ack_policy: AtomicU64::new(0),
             execution_control,
             current_database,
             active_query: None,
@@ -386,6 +552,17 @@ impl Session {
     }
 
     pub fn set_current_database(&mut self, database_name: &str) -> Result<()> {
+        if self.transaction.has_active_transaction()
+            && !self
+                .current_database
+                .name()
+                .eq_ignore_ascii_case(database_name)
+        {
+            return Err(paro_error::invalid_transaction_state(
+                "USE DATABASE cannot change the current database while a transaction is active; use qualified names for cross-database reads"
+                    .to_string(),
+            ));
+        }
         let previous_database = self.current_database.name().to_string();
         let db = self
             .instance
@@ -480,11 +657,14 @@ impl Session {
             .collect::<Vec<_>>();
         prepared_statements.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let mut cursors =
-            self.state
-                .prepared
-                .portals()
-                .map(|entry| CursorSummary {
+        let mut cursors = self
+            .state
+            .prepared
+            .portals()
+            .map(|entry| {
+                let retention = entry.snapshot_retention.as_ref();
+                let owner = retention.and_then(|retention| retention.owner());
+                CursorSummary {
                     name: entry.name.clone(),
                     statement: entry.source_sql.clone(),
                     is_holdable: matches!(
@@ -498,8 +678,21 @@ impl Session {
                         entry.scroll_mode,
                         crate::prepared::portal::ScrollMode::Scroll
                     ),
-                })
-                .collect::<Vec<_>>();
+                    snapshot_read_ts: retention.map(|retention| retention.read_ts().into_raw()),
+                    snapshot_pin_duration_us: retention
+                        .and_then(|retention| retention.pin_duration_us()),
+                    snapshot_owner_session_id: owner
+                        .as_ref()
+                        .and_then(|owner| owner.owner_session_id),
+                    snapshot_portal_id: owner
+                        .as_ref()
+                        .and_then(|owner| owner.portal_id.as_ref().map(ToString::to_string)),
+                    snapshot_retention_policy: retention
+                        .map(|retention| retention.policy().as_str().to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                }
+            })
+            .collect::<Vec<_>>();
         cursors.sort_by(|a, b| a.name.cmp(&b.name));
 
         self.session_metadata.replace(SessionMetadataRows {
@@ -934,16 +1127,45 @@ impl Session {
     ///
     /// Returns an error if a transaction is already active.
     pub fn begin_explicit_transaction(&mut self) -> Result<()> {
+        self.begin_explicit_transaction_with_characteristics(None, None)
+    }
+
+    pub fn begin_explicit_transaction_with_characteristics(
+        &mut self,
+        isolation_level: Option<IsolationLevel>,
+        read_only: Option<bool>,
+    ) -> Result<()> {
         if self.transaction.has_active_transaction() {
             return Err(paro_error::transaction_active());
         }
 
-        self.transaction
-            .begin_explicit_block(self.current_database.transaction_manager())?;
+        self.transaction.begin_explicit_block_with_characteristics(
+            self.current_database.transaction_manager(),
+            DatabaseId::new(self.current_database.id()),
+            self.current_database.name(),
+            isolation_level,
+            read_only,
+        )?;
 
         self.registered_state.notify_transaction_begin();
 
         Ok(())
+    }
+
+    pub fn set_transaction_characteristics(
+        &mut self,
+        isolation_level: Option<IsolationLevel>,
+        read_only: Option<bool>,
+    ) -> Result<()> {
+        self.transaction
+            .set_transaction_characteristics(isolation_level, read_only)?;
+        self.refresh_session_metadata();
+        Ok(())
+    }
+
+    pub fn set_default_transaction_read_only(&mut self, read_only: bool) {
+        self.transaction.set_default_read_only(read_only);
+        self.refresh_session_metadata();
     }
 
     /// Commit the current transaction (for COMMIT command).
@@ -990,7 +1212,11 @@ impl Session {
     pub fn begin_implicit_transaction_block(&mut self) -> Result<()> {
         let started_new = self
             .transaction
-            .begin_implicit_transaction_block(self.current_database.transaction_manager())?;
+            .begin_implicit_transaction_block_for_database(
+                self.current_database.transaction_manager(),
+                DatabaseId::new(self.current_database.id()),
+                self.current_database.name(),
+            )?;
 
         if started_new {
             self.registered_state.notify_transaction_begin();
@@ -1143,8 +1369,13 @@ impl Session {
     ///
     /// This is used by `execute.rs` for automatic transaction management.
     pub(crate) fn begin_transaction_internal(&mut self) -> Result<()> {
-        self.transaction
-            .begin_transaction(self.current_database.transaction_manager())?;
+        self.wait_for_async_commit_floor_published()?;
+        self.transaction.begin_transaction_for_database(
+            self.current_database.transaction_manager(),
+            DatabaseId::new(self.current_database.id()),
+            self.current_database.name(),
+            ReadTrackingPolicy::SafeSnapshotPreferred,
+        )?;
         self.registered_state.notify_transaction_begin();
         Ok(())
     }
@@ -1162,23 +1393,31 @@ impl Session {
         &self,
         hooks: &[PostCommitHookDescriptor],
         commit_id: u64,
-    ) {
+    ) -> Result<()> {
+        let mut first_error = None;
         for hook in hooks {
             match hook {
                 PostCommitHookDescriptor::GraphDmlMaintenance { deltas } => {
-                    self.apply_property_graph_dml_hook_descriptors(deltas, commit_id);
+                    if let Err(error) =
+                        self.apply_property_graph_dml_hook_descriptors(deltas, commit_id)
+                    {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
                 }
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn apply_property_graph_dml_hook_descriptors(
         &self,
         dml_deltas: &[GraphDmlTableDelta],
         commit_id: u64,
-    ) {
+    ) -> Result<()> {
         if dml_deltas.is_empty() {
-            return;
+            return Ok(());
         }
         let catalog = self.current_database.catalog().clone();
         let visible_txn = CatalogSnapshot::read_only(commit_id.saturating_add(1));
@@ -1186,6 +1425,7 @@ impl Session {
 
         let mut graphs_to_stale: HashMap<String, Arc<PropertyGraphCatalogEntry>> = HashMap::new();
         let mut graphs_to_refresh: HashMap<String, Arc<PropertyGraphCatalogEntry>> = HashMap::new();
+        let mut first_error = None;
 
         for delta in dml_deltas {
             let table_oid = delta.table_oid;
@@ -1245,6 +1485,9 @@ impl Session {
                 graph_registry.as_ref(),
                 graph_entry,
             ) {
+                if first_error.is_none() {
+                    first_error = Some(err.clone());
+                }
                 tracing::warn!(
                     target: targets::TRANSACTION,
                     graph = %graph_entry.info.graph_name,
@@ -1275,6 +1518,9 @@ impl Session {
                 graph_entry.clone(),
                 commit_id.saturating_add(1),
             ) {
+                if first_error.is_none() {
+                    first_error = Some(err.clone());
+                }
                 tracing::warn!(
                     target: targets::TRANSACTION,
                     graph = %graph_name,
@@ -1287,6 +1533,9 @@ impl Session {
                     graph_registry.as_ref(),
                     &graph_entry,
                 ) {
+                    if first_error.is_none() {
+                        first_error = Some(stale_err.clone());
+                    }
                     tracing::warn!(
                         target: targets::TRANSACTION,
                         graph = %graph_name,
@@ -1296,6 +1545,7 @@ impl Session {
                 }
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1382,5 +1632,51 @@ mod tests {
                 .unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn transaction_id_uses_storage_allocated_writer_id_without_extra_offset() {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+
+        session.begin_explicit_transaction().unwrap();
+
+        assert_eq!(
+            session.transaction_id(),
+            paro_transaction::TRANSACTION_ID_START
+        );
+        assert_eq!(
+            session.catalog_txn_view().writer_id(),
+            Some(paro_transaction::TRANSACTION_ID_START)
+        );
+
+        let statement = session.freeze_statement_context(
+            StatementOptions::default(),
+            StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+        );
+        assert_eq!(
+            statement.transaction_id(),
+            paro_transaction::TRANSACTION_ID_START
+        );
+        assert_eq!(
+            statement.catalog_txn_view().writer_id(),
+            Some(paro_transaction::TRANSACTION_ID_START)
+        );
+
+        session.rollback_transaction().unwrap();
+    }
+
+    #[test]
+    fn use_database_cannot_move_active_transaction_to_another_database() {
+        let instance = Instance::new_in_memory();
+        instance.create_database("analytics").unwrap();
+        let mut session = Session::new(1, instance);
+
+        session.begin_explicit_transaction().unwrap();
+        let err = session.set_current_database("analytics").unwrap_err();
+
+        assert!(err.to_string().contains("while a transaction is active"));
+        assert_ne!(session.current_database.name(), "analytics");
+        session.rollback_transaction().unwrap();
     }
 }

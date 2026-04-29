@@ -43,6 +43,7 @@ redundant-pattern-matching = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-transaction = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }
 paro-catalog = { workspace = true }

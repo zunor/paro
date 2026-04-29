@@ -10,7 +10,7 @@
 //! - Bulk build helpers for loading from existing rowsets/segments
 
 use crate::metrics::storage_metrics;
-use crate::primary_key::{ComparableEncoder, RowID};
+use crate::primary_key::{ComparableEncoder, RowID, NULL_ROW_ID};
 use crate::tablet::{KeysType, TabletSchema, TabletSchemaRef};
 use parking_lot::{Condvar, Mutex, RwLock};
 use paro_common::chunk::Chunk;
@@ -71,6 +71,55 @@ impl Hash for FixedKey {
 type FixedLenBucket = HashMap<FixedKey, RowID>;
 type VariableLenBucket = HashMap<Box<[u8]>, RowID>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryIndexVersion {
+    pub row_id: RowID,
+    pub commit_ts: u64,
+}
+
+impl PrimaryIndexVersion {
+    #[inline]
+    pub fn live(row_id: RowID, commit_ts: u64) -> Self {
+        Self { row_id, commit_ts }
+    }
+
+    #[inline]
+    pub fn tombstone(commit_ts: u64) -> Self {
+        Self {
+            row_id: RowID::from_raw(NULL_ROW_ID),
+            commit_ts,
+        }
+    }
+
+    #[inline]
+    pub fn is_tombstone(self) -> bool {
+        self.row_id.is_null()
+    }
+
+    #[inline]
+    pub fn visible_row_id(self) -> Option<RowID> {
+        (!self.is_tombstone()).then_some(self.row_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryKeyWriteConflict {
+    pub key: Vec<u8>,
+    pub version: PrimaryIndexVersion,
+}
+
+impl PrimaryKeyWriteConflict {
+    #[inline]
+    pub fn commit_ts(&self) -> u64 {
+        self.version.commit_ts
+    }
+
+    #[inline]
+    pub fn is_tombstone(&self) -> bool {
+        self.version.is_tombstone()
+    }
+}
+
 const fn fixed_bucket_entry_bytes() -> usize {
     size_of::<FixedKey>() + size_of::<RowID>() + HASHMAP_CONTROL_BYTES_PER_BUCKET
 }
@@ -83,9 +132,16 @@ const fn overflow_len_bucket_bytes() -> usize {
     size_of::<usize>() + size_of::<VariableLenBucket>() + HASHMAP_CONTROL_BYTES_PER_BUCKET
 }
 
+const fn history_bucket_entry_bytes() -> usize {
+    size_of::<Box<[u8]>>()
+        + size_of::<Vec<PrimaryIndexVersion>>()
+        + HASHMAP_CONTROL_BYTES_PER_BUCKET
+}
+
 struct PrimaryIndexShard {
     fixed_buckets: Vec<FixedLenBucket>,
     overflow_buckets: HashMap<usize, VariableLenBucket>,
+    histories: HashMap<Box<[u8]>, Vec<PrimaryIndexVersion>>,
     len: usize,
     memory_usage: usize,
 }
@@ -105,6 +161,7 @@ impl PrimaryIndexShard {
         let mut shard = Self {
             fixed_buckets,
             overflow_buckets: HashMap::new(),
+            histories: HashMap::new(),
             len: 0,
             memory_usage: 0,
         };
@@ -117,19 +174,113 @@ impl PrimaryIndexShard {
     }
 
     fn lookup(&self, key: &[u8]) -> Option<RowID> {
-        if key.len() <= INLINE_KEY_MAX_BYTES {
-            self.fixed_buckets[key.len()]
-                .get(&FixedKey::from_slice(key))
-                .copied()
-        } else {
-            self.overflow_buckets
-                .get(&key.len())
-                .and_then(|bucket| bucket.get(key))
-                .copied()
+        self.latest_version(key)
+            .and_then(PrimaryIndexVersion::visible_row_id)
+    }
+
+    fn latest_version(&self, key: &[u8]) -> Option<PrimaryIndexVersion> {
+        self.histories
+            .get(key)
+            .and_then(|chain| chain.last().copied())
+    }
+
+    fn lookup_version_at(&self, key: &[u8], read_ts: u64) -> Option<PrimaryIndexVersion> {
+        self.histories.get(key).and_then(|chain| {
+            let pos = chain.partition_point(|version| version.commit_ts <= read_ts);
+            pos.checked_sub(1).and_then(|idx| chain.get(idx)).copied()
+        })
+    }
+
+    fn first_write_for_key_in_range(
+        &self,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Option<PrimaryKeyWriteConflict> {
+        first_version_in_range(self.histories.get(key)?, read_ts, commit_ts).map(|version| {
+            PrimaryKeyWriteConflict {
+                key: key.to_vec(),
+                version,
+            }
+        })
+    }
+
+    fn first_write_for_key_range_in_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Option<PrimaryKeyWriteConflict> {
+        if read_ts >= commit_ts {
+            return None;
         }
+
+        let mut best = None;
+        for (key, chain) in &self.histories {
+            if !key_in_bounds(key, lower, upper) {
+                continue;
+            }
+            let Some(version) = first_version_in_range(chain, read_ts, commit_ts) else {
+                continue;
+            };
+            select_earlier_conflict(
+                &mut best,
+                PrimaryKeyWriteConflict {
+                    key: key.to_vec(),
+                    version,
+                },
+            );
+        }
+        best
     }
 
     fn insert_or_replace(&mut self, key: Vec<u8>, row_id: RowID) -> (Option<RowID>, isize) {
+        self.insert_or_replace_at(key, row_id, 0)
+    }
+
+    fn insert_or_replace_at(
+        &mut self,
+        key: Vec<u8>,
+        row_id: RowID,
+        commit_ts: u64,
+    ) -> (Option<RowID>, isize) {
+        let old_usage = self.memory_usage;
+        let old = self.insert_or_replace_latest(key.clone(), row_id);
+        let history_delta = self.push_version(key, PrimaryIndexVersion::live(row_id, commit_ts));
+        self.apply_memory_delta(history_delta);
+        let new_usage = self.memory_usage;
+        (old, new_usage as isize - old_usage as isize)
+    }
+
+    fn batch_insert_or_replace_at(
+        &mut self,
+        entries: Vec<(Vec<u8>, RowID)>,
+        commit_ts: u64,
+    ) -> (u64, usize, isize) {
+        let old_usage = self.memory_usage;
+        let mut conflicts = 0u64;
+        let mut processed = 0usize;
+
+        for (key, row_id) in entries {
+            if self.insert_or_replace_latest(key.clone(), row_id).is_some() {
+                conflicts += 1;
+            }
+            let history_delta =
+                self.push_version(key, PrimaryIndexVersion::live(row_id, commit_ts));
+            self.apply_memory_delta(history_delta);
+            processed += 1;
+        }
+
+        let new_usage = self.memory_usage;
+        (
+            conflicts,
+            processed,
+            new_usage as isize - old_usage as isize,
+        )
+    }
+
+    fn insert_or_replace_latest(&mut self, key: Vec<u8>, row_id: RowID) -> Option<RowID> {
         let (old, delta) = if key.len() <= INLINE_KEY_MAX_BYTES {
             let bucket = &mut self.fixed_buckets[key.len()];
             let old_capacity = bucket.capacity();
@@ -160,15 +311,52 @@ impl PrimaryIndexShard {
             self.len += 1;
         }
         self.apply_memory_delta(delta);
-        (old, delta)
+        old
     }
 
-    fn remove(&mut self, key: &[u8]) -> (Option<RowID>, isize) {
+    fn remove_at(&mut self, key: &[u8], commit_ts: u64) -> (Option<RowID>, isize) {
         let old_usage = self.memory_usage;
+        let removed = self.remove_latest(key);
+        let history_delta =
+            self.push_version(key.to_vec(), PrimaryIndexVersion::tombstone(commit_ts));
+        self.apply_memory_delta(history_delta);
+        let new_usage = self.memory_usage;
+        (removed, new_usage as isize - old_usage as isize)
+    }
+
+    fn batch_apply_versions(
+        &mut self,
+        entries: Vec<(Vec<u8>, PrimaryIndexVersion)>,
+    ) -> (usize, isize) {
+        let old_usage = self.memory_usage;
+        let mut processed = 0usize;
+
+        for (key, version) in entries {
+            if version.is_tombstone() {
+                self.remove_latest(&key);
+                let history_delta = self.push_version(key, version);
+                self.apply_memory_delta(history_delta);
+            } else {
+                self.insert_or_replace_latest(key.clone(), version.row_id);
+                let history_delta = self.push_version(key, version);
+                self.apply_memory_delta(history_delta);
+            }
+            processed += 1;
+        }
+
+        let new_usage = self.memory_usage;
+        (processed, new_usage as isize - old_usage as isize)
+    }
+
+    fn remove_latest(&mut self, key: &[u8]) -> Option<RowID> {
         let removed = if key.len() <= INLINE_KEY_MAX_BYTES {
+            let bucket = &mut self.fixed_buckets[key.len()];
+            let old_capacity = bucket.capacity();
+            let removed = bucket.remove(&FixedKey::from_slice(key));
+            let capacity_delta = bucket.capacity() as isize - old_capacity as isize;
             (
-                self.fixed_buckets[key.len()].remove(&FixedKey::from_slice(key)),
-                0,
+                removed,
+                capacity_delta * fixed_bucket_entry_bytes() as isize,
             )
         } else {
             let key_len = key.len();
@@ -176,9 +364,13 @@ impl PrimaryIndexShard {
             let mut delta = 0isize;
             let mut remove_bucket = false;
             let mut bucket_capacity = 0usize;
+            let old_outer_capacity = self.overflow_buckets.capacity();
 
             if let Some(bucket) = self.overflow_buckets.get_mut(&key_len) {
+                let old_inner_capacity = bucket.capacity();
                 removed = bucket.remove(key);
+                let inner_capacity_delta = bucket.capacity() as isize - old_inner_capacity as isize;
+                delta += inner_capacity_delta * overflow_bucket_entry_bytes() as isize;
                 if removed.is_some() {
                     delta -= key_len as isize;
                     if bucket.is_empty() {
@@ -191,17 +383,60 @@ impl PrimaryIndexShard {
             if remove_bucket {
                 self.overflow_buckets.remove(&key_len);
                 delta -= (bucket_capacity * overflow_bucket_entry_bytes()) as isize;
+                let outer_capacity_delta =
+                    self.overflow_buckets.capacity() as isize - old_outer_capacity as isize;
+                delta += outer_capacity_delta * overflow_len_bucket_bytes() as isize;
             }
 
             (removed, delta)
         };
         if removed.0.is_some() {
             self.len = self.len.saturating_sub(1);
-            let new_usage = self.recalculate_memory_usage();
-            self.memory_usage = new_usage;
-            return (removed.0, new_usage as isize - old_usage as isize);
         }
-        removed
+        self.apply_memory_delta(removed.1);
+        removed.0
+    }
+
+    fn push_version(&mut self, key: Vec<u8>, version: PrimaryIndexVersion) -> isize {
+        let key_len = key.len();
+        let old_map_capacity = self.histories.capacity();
+        let old_chain_capacity = self.histories.get(key.as_slice()).map(Vec::capacity);
+        let new_chain_capacity = {
+            let chain = self.histories.entry(key.into_boxed_slice()).or_default();
+            match chain
+                .last()
+                .map(|stored| stored.commit_ts.cmp(&version.commit_ts))
+            {
+                Some(std::cmp::Ordering::Less) | None => chain.push(version),
+                Some(std::cmp::Ordering::Equal) => {
+                    if let Some(last) = chain.last_mut() {
+                        *last = version;
+                    }
+                }
+                Some(std::cmp::Ordering::Greater) => {
+                    match chain.binary_search_by_key(&version.commit_ts, |stored| stored.commit_ts)
+                    {
+                        Ok(pos) => chain[pos] = version,
+                        Err(pos) => chain.insert(pos, version),
+                    }
+                }
+            }
+            chain.capacity()
+        };
+
+        let map_delta = self.histories.capacity() as isize - old_map_capacity as isize;
+        let chain_delta = match old_chain_capacity {
+            Some(old_capacity) => new_chain_capacity as isize - old_capacity as isize,
+            None => new_chain_capacity as isize,
+        };
+        let key_delta = if old_chain_capacity.is_none() {
+            key_len as isize
+        } else {
+            0
+        };
+        map_delta * history_bucket_entry_bytes() as isize
+            + chain_delta * size_of::<PrimaryIndexVersion>() as isize
+            + key_delta
     }
 
     fn clear(&mut self) {
@@ -211,6 +446,8 @@ impl PrimaryIndexShard {
         }
         self.overflow_buckets.clear();
         self.overflow_buckets.shrink_to_fit();
+        self.histories.clear();
+        self.histories.shrink_to_fit();
         self.len = 0;
     }
 
@@ -220,6 +457,12 @@ impl PrimaryIndexShard {
         }
         for bucket in self.overflow_buckets.values() {
             out.extend(bucket.iter().map(|(key, row_id)| (key.to_vec(), *row_id)));
+        }
+    }
+
+    fn snapshot_versions_into(&self, out: &mut Vec<(Vec<u8>, PrimaryIndexVersion)>) {
+        for (key, chain) in &self.histories {
+            out.extend(chain.iter().copied().map(|version| (key.to_vec(), version)));
         }
     }
 
@@ -236,6 +479,12 @@ impl PrimaryIndexShard {
             let key_bytes = bucket.keys().map(|key| key.len()).sum::<usize>();
             total += bucket.capacity() * overflow_bucket_entry_bytes();
             total += key_bytes;
+        }
+
+        total += self.histories.capacity() * history_bucket_entry_bytes();
+        for (key, chain) in &self.histories {
+            total += key.len();
+            total += chain.capacity() * size_of::<PrimaryIndexVersion>();
         }
 
         total
@@ -336,8 +585,14 @@ impl PrimaryIndex {
 
     /// Lookup a key.
     pub fn get(&self, key: &[u8]) -> Option<RowID> {
+        self.latest_version(key)
+            .and_then(PrimaryIndexVersion::visible_row_id)
+    }
+
+    /// Lookup the latest version record for a key, including tombstones.
+    pub fn latest_version(&self, key: &[u8]) -> Option<PrimaryIndexVersion> {
         let shard = self.shard_for(key);
-        let res = self.shards[shard].read().lookup(key);
+        let res = self.shards[shard].read().latest_version(key);
         let m = storage_metrics();
         if res.is_some() {
             m.inc_primary_index_hit();
@@ -345,6 +600,25 @@ impl PrimaryIndex {
             m.inc_primary_index_miss();
         }
         res
+    }
+
+    /// Lookup the newest key version visible at `read_ts`.
+    pub fn get_version_at(&self, key: &[u8], read_ts: u64) -> Option<PrimaryIndexVersion> {
+        let shard = self.shard_for(key);
+        let res = self.shards[shard].read().lookup_version_at(key, read_ts);
+        let m = storage_metrics();
+        if res.is_some() {
+            m.inc_primary_index_hit();
+        } else {
+            m.inc_primary_index_miss();
+        }
+        res
+    }
+
+    /// Lookup a live row id visible at `read_ts`.
+    pub fn get_at(&self, key: &[u8], read_ts: u64) -> Option<RowID> {
+        self.get_version_at(key, read_ts)
+            .and_then(PrimaryIndexVersion::visible_row_id)
     }
 
     /// Lookup a batch of keys in original order.
@@ -382,11 +656,55 @@ impl PrimaryIndex {
         out
     }
 
+    /// Lookup version records in original order, preserving tombstones.
+    pub fn multi_get_versions_at<'a, I>(
+        &self,
+        keys: I,
+        read_ts: u64,
+    ) -> Vec<Option<PrimaryIndexVersion>>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let indexed: Vec<(usize, &'a [u8])> = keys.into_iter().enumerate().collect();
+        if indexed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut buckets: Vec<Vec<(usize, &'a [u8])>> = vec![Vec::new(); self.shards.len()];
+        for (idx, key) in indexed {
+            buckets[self.shard_for(key)].push((idx, key));
+        }
+
+        let mut out = vec![None; buckets.iter().map(|b| b.len()).sum()];
+        let metrics = storage_metrics();
+        for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let guard = self.shards[shard_idx].read();
+            for (idx, key) in bucket {
+                let value = guard.lookup_version_at(key, read_ts);
+                if value.is_some() {
+                    metrics.inc_primary_index_hit();
+                } else {
+                    metrics.inc_primary_index_miss();
+                }
+                out[idx] = value;
+            }
+        }
+        out
+    }
+
     /// Insert or replace a single key.
     pub fn upsert(&self, key: Vec<u8>, location: RowID) -> Option<RowID> {
+        self.upsert_at(key, location, 0)
+    }
+
+    /// Insert or replace a committed key version.
+    pub fn upsert_at(&self, key: Vec<u8>, location: RowID, commit_ts: u64) -> Option<RowID> {
         let shard_idx = self.shard_for(&key);
         let mut guard = self.shards[shard_idx].write();
-        let (old, delta) = guard.insert_or_replace(key, location);
+        let (old, delta) = guard.insert_or_replace_at(key, location, commit_ts);
         self.adjust_memory(delta);
         if old.is_some() {
             storage_metrics().inc_primary_index_conflicts(1);
@@ -396,10 +714,15 @@ impl PrimaryIndex {
 
     /// Remove a key.
     pub fn remove(&self, key: &[u8]) -> Option<RowID> {
+        self.remove_at(key, 0)
+    }
+
+    /// Append a committed tombstone for a key and remove it from latest lookups.
+    pub fn remove_at(&self, key: &[u8], commit_ts: u64) -> Option<RowID> {
         let shard_idx = self.shard_for(key);
         let mut guard = self.shards[shard_idx].write();
-        let (removed, delta) = guard.remove(key);
-        if removed.is_some() {
+        let (removed, delta) = guard.remove_at(key, commit_ts);
+        if delta != 0 {
             self.adjust_memory(delta);
         }
         removed
@@ -407,6 +730,14 @@ impl PrimaryIndex {
 
     /// Batch upsert; returns number of processed items.
     pub fn batch_upsert<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (Vec<u8>, RowID)>,
+    {
+        self.batch_upsert_at(entries, 0)
+    }
+
+    /// Batch upsert at a single commit timestamp.
+    pub fn batch_upsert_at<I>(&self, entries: I, commit_ts: u64) -> usize
     where
         I: IntoIterator<Item = (Vec<u8>, RowID)>,
     {
@@ -424,21 +755,43 @@ impl PrimaryIndex {
                 continue;
             }
             let mut guard = self.shards[shard_idx].write();
-            let mut shard_delta = 0isize;
-            for (k, v) in bucket {
-                let (old, delta) = guard.insert_or_replace(k, v);
-                shard_delta += delta;
-                if old.is_some() {
-                    conflict_count += 1;
-                }
-                processed += 1;
-            }
+            let (conflicts, count, shard_delta) =
+                guard.batch_insert_or_replace_at(bucket, commit_ts);
+            conflict_count += conflicts;
+            processed += count;
             self.adjust_memory(shard_delta);
         }
 
         if conflict_count > 0 {
             storage_metrics().inc_primary_index_conflicts(conflict_count);
         }
+        processed
+    }
+
+    /// Apply already encoded version records.
+    pub fn batch_apply_versions<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (Vec<u8>, PrimaryIndexVersion)>,
+    {
+        let mut buckets: Vec<Vec<(Vec<u8>, PrimaryIndexVersion)>> =
+            vec![Vec::new(); self.shards.len()];
+
+        for (k, v) in entries {
+            let shard = self.shard_for(&k);
+            buckets[shard].push((k, v));
+        }
+
+        let mut processed = 0usize;
+        for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let mut guard = self.shards[shard_idx].write();
+            let (count, shard_delta) = guard.batch_apply_versions(bucket);
+            processed += count;
+            self.adjust_memory(shard_delta);
+        }
+
         processed
     }
 
@@ -557,6 +910,99 @@ impl PrimaryIndex {
         out
     }
 
+    /// Snapshot all committed key versions, including tombstones.
+    pub fn snapshot_versions(&self) -> Vec<(Vec<u8>, PrimaryIndexVersion)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let guard = shard.read();
+            guard.snapshot_versions_into(&mut out);
+        }
+        out
+    }
+
+    /// Returns true if any committed version for `key` is newer than `read_ts`.
+    pub fn has_committed_after(&self, key: &[u8], read_ts: u64) -> bool {
+        self.has_write_in_range(key, read_ts, u64::MAX)
+    }
+
+    /// Returns true if `key` was written in `(read_ts, commit_ts]`.
+    pub fn has_write_in_range(&self, key: &[u8], read_ts: u64, commit_ts: u64) -> bool {
+        self.first_write_in_range(key, read_ts, commit_ts).is_some()
+    }
+
+    /// Returns the earliest committed write for `key` in `(read_ts, commit_ts]`.
+    pub fn first_write_in_range(
+        &self,
+        key: &[u8],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Option<PrimaryKeyWriteConflict> {
+        if read_ts >= commit_ts {
+            return None;
+        }
+        let shard = self.shard_for(key);
+        self.shards[shard]
+            .read()
+            .first_write_for_key_in_range(key, read_ts, commit_ts)
+    }
+
+    /// Returns the earliest committed write for any key in `(read_ts, commit_ts]`.
+    pub fn first_write_for_keys_in_range(
+        &self,
+        keys: &[Vec<u8>],
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Option<PrimaryKeyWriteConflict> {
+        if keys.is_empty() || read_ts >= commit_ts {
+            return None;
+        }
+
+        let mut buckets: Vec<Vec<&[u8]>> = vec![Vec::new(); self.shards.len()];
+        for key in keys {
+            buckets[self.shard_for(key)].push(key.as_slice());
+        }
+
+        let mut best = None;
+        for (shard_idx, keys) in buckets.into_iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let guard = self.shards[shard_idx].read();
+            for key in keys {
+                if let Some(conflict) = guard.first_write_for_key_in_range(key, read_ts, commit_ts)
+                {
+                    select_earlier_conflict(&mut best, conflict);
+                }
+            }
+        }
+        best
+    }
+
+    /// Returns the earliest committed primary-key write in `(read_ts, commit_ts]`
+    /// whose encoded key is within the inclusive byte bounds.
+    pub fn first_key_range_write_in_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read_ts: u64,
+        commit_ts: u64,
+    ) -> Option<PrimaryKeyWriteConflict> {
+        if read_ts >= commit_ts {
+            return None;
+        }
+
+        let mut best = None;
+        for shard in &self.shards {
+            if let Some(conflict) = shard
+                .read()
+                .first_write_for_key_range_in_range(lower, upper, read_ts, commit_ts)
+            {
+                select_earlier_conflict(&mut best, conflict);
+            }
+        }
+        best
+    }
+
     // ------------ internal helpers ------------
 
     fn shard_for(&self, key: &[u8]) -> usize {
@@ -606,6 +1052,42 @@ impl PrimaryIndex {
             self.backpressure_cv
                 .wait_for(&mut guard, BACKPRESSURE_WAIT_SLICE);
         }
+    }
+}
+
+fn first_version_in_range(
+    chain: &[PrimaryIndexVersion],
+    read_ts: u64,
+    commit_ts: u64,
+) -> Option<PrimaryIndexVersion> {
+    if read_ts >= commit_ts {
+        return None;
+    }
+    let pos = chain.partition_point(|version| version.commit_ts <= read_ts);
+    chain
+        .get(pos)
+        .copied()
+        .filter(|version| version.commit_ts <= commit_ts)
+}
+
+fn key_in_bounds(key: &[u8], lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
+    lower.map_or(true, |lower| key >= lower) && upper.map_or(true, |upper| key <= upper)
+}
+
+fn select_earlier_conflict(
+    slot: &mut Option<PrimaryKeyWriteConflict>,
+    candidate: PrimaryKeyWriteConflict,
+) {
+    let should_replace = slot
+        .as_ref()
+        .map(|current| {
+            candidate.version.commit_ts < current.version.commit_ts
+                || (candidate.version.commit_ts == current.version.commit_ts
+                    && candidate.key < current.key)
+        })
+        .unwrap_or(true);
+    if should_replace {
+        *slot = Some(candidate);
     }
 }
 
@@ -802,6 +1284,46 @@ mod tests {
         assert_eq!(got[0], Some(RowID::new(3, 2)));
         assert_eq!(got[1], None);
         assert_eq!(got[2], Some(RowID::new(3, 0)));
+    }
+
+    #[test]
+    fn write_conflict_window_finds_point_and_range_versions() {
+        let idx = PrimaryIndex::with_options(4, 1024 * 1024);
+        idx.upsert_at(b"a".to_vec(), RowID::new(1, 1), 10);
+        idx.upsert_at(b"b".to_vec(), RowID::new(1, 2), 20);
+        idx.remove_at(b"b", 30);
+
+        assert!(!idx.has_write_in_range(b"a", 10, 30));
+        assert!(idx.has_write_in_range(b"a", 9, 10));
+
+        let conflict = idx.first_write_in_range(b"b", 19, 30).unwrap();
+        assert_eq!(conflict.commit_ts(), 20);
+        assert_eq!(conflict.version.row_id, RowID::new(1, 2));
+
+        let range_conflict = idx
+            .first_key_range_write_in_range(Some(b"b"), Some(b"z"), 20, 30)
+            .unwrap();
+        assert_eq!(range_conflict.key, b"b".to_vec());
+        assert!(range_conflict.is_tombstone());
+        assert_eq!(range_conflict.commit_ts(), 30);
+    }
+
+    #[test]
+    fn batch_write_conflict_query_groups_by_shard() {
+        let idx = PrimaryIndex::with_options(8, 1024 * 1024);
+        idx.batch_upsert_at(
+            [
+                (b"k1".to_vec(), RowID::new(1, 1)),
+                (b"k2".to_vec(), RowID::new(1, 2)),
+            ],
+            40,
+        );
+
+        let conflict = idx
+            .first_write_for_keys_in_range(&[b"k0".to_vec(), b"k2".to_vec()], 39, 99)
+            .unwrap();
+        assert_eq!(conflict.key, b"k2".to_vec());
+        assert_eq!(conflict.commit_ts(), 40);
     }
 
     #[test]

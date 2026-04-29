@@ -5,7 +5,12 @@ BEGIN
 ---------- AST ------------
 Transaction(
     TransactionStmt {
-        kind: Begin,
+        kind: Begin(
+            TransactionOptions {
+                isolation_level: None,
+                read_mode: None,
+            },
+        ),
     },
 )
 
@@ -17,7 +22,52 @@ BEGIN
 ---------- AST ------------
 Transaction(
     TransactionStmt {
-        kind: Begin,
+        kind: Begin(
+            TransactionOptions {
+                isolation_level: None,
+                read_mode: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+BEGIN ISOLATION LEVEL SERIALIZABLE
+---------- Output ---------
+BEGIN ISOLATION LEVEL SERIALIZABLE
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Begin(
+            TransactionOptions {
+                isolation_level: Some(
+                    Serializable,
+                ),
+                read_mode: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT READ ONLY
+---------- Output ---------
+BEGIN ISOLATION LEVEL SNAPSHOT READ ONLY
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Begin(
+            TransactionOptions {
+                isolation_level: Some(
+                    Snapshot,
+                ),
+                read_mode: Some(
+                    ReadOnly,
+                ),
+            },
+        ),
     },
 )
 
@@ -29,7 +79,92 @@ START TRANSACTION
 ---------- AST ------------
 Transaction(
     TransactionStmt {
-        kind: Start,
+        kind: Start(
+            TransactionOptions {
+                isolation_level: None,
+                read_mode: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE
+---------- Output ---------
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: Start(
+            TransactionOptions {
+                isolation_level: Some(
+                    Serializable,
+                ),
+                read_mode: Some(
+                    ReadWrite,
+                ),
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT
+---------- Output ---------
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: SetTransaction(
+            TransactionOptions {
+                isolation_level: Some(
+                    Snapshot,
+                ),
+                read_mode: None,
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+SET TRANSACTION READ ONLY
+---------- Output ---------
+SET TRANSACTION READ ONLY
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: SetTransaction(
+            TransactionOptions {
+                isolation_level: None,
+                read_mode: Some(
+                    ReadOnly,
+                ),
+            },
+        ),
+    },
+)
+
+
+---------- Input ----------
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT READ ONLY
+---------- Output ---------
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT READ ONLY
+---------- AST ------------
+Transaction(
+    TransactionStmt {
+        kind: SetSessionCharacteristics(
+            TransactionOptions {
+                isolation_level: Some(
+                    Snapshot,
+                ),
+                read_mode: Some(
+                    ReadOnly,
+                ),
+            },
+        ),
     },
 )
 

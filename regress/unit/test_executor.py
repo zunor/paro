@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+import time
 
 import pytest
 
@@ -20,6 +21,7 @@ class _Step:
     columns: list[str] | None = None
     rows: list[tuple[Any, ...]] | None = None
     error: Exception | None = None
+    delay_seconds: float = 0.0
 
 
 @dataclass
@@ -59,6 +61,8 @@ class _FakeCursor:
         if isinstance(step, _CopyStep):
             raise AssertionError(f"expected COPY for step {step.sql}, got execute({sql})")
         assert step.sql == sql
+        if step.delay_seconds:
+            time.sleep(step.delay_seconds)
         if step.error is not None:
             raise step.error
 
@@ -106,16 +110,22 @@ class _FakeCopy:
 
 
 class _FakeConnection:
-    def __init__(self, steps: list[_Step | _CopyStep]) -> None:
+    def __init__(self, steps: list[_Step | _CopyStep], *, transaction_status: str = "IDLE") -> None:
         self.steps = list(steps)
         self.autocommit = False
         self.rollback_calls = 0
+        self.close_calls = 0
+        self.info = SimpleNamespace(transaction_status=SimpleNamespace(name=transaction_status))
 
     def cursor(self) -> _FakeCursor:
         return _FakeCursor(self)
 
     def rollback(self) -> None:
         self.rollback_calls += 1
+        self.info.transaction_status = SimpleNamespace(name="IDLE")
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def test_setup_failure_skips_main_but_runs_teardown() -> None:
@@ -432,3 +442,225 @@ def test_control_block_uses_handler_and_replaces_connection() -> None:
     result = execute_blocks(conn1, blocks, control_handler=handler)
     assert seen_actions == ["restart"]
     assert result.query_outputs[0].rows == [["1"]]
+
+
+def test_named_sessions_reuse_connections_and_label_outputs() -> None:
+    default = _FakeConnection([])
+    named = _FakeConnection(
+        [
+            _Step("BEGIN;"),
+            _Step("SELECT 1;", columns=["v"], rows=[(1,)]),
+        ]
+    )
+    blocks = [
+        Block(kind="statement", line_no=1, sql="BEGIN;", statement_expect="ok", session_name="s1"),
+        Block(kind="query", line_no=2, sql="SELECT 1;", query_mode="nosort", session_name="s1"),
+    ]
+    opened: list[tuple[str, dict[str, str]]] = []
+
+    def factory(name: str, options: dict[str, str]) -> _FakeConnection:
+        opened.append((name, dict(options)))
+        return named
+
+    result = execute_blocks(default, blocks, session_connection_factory=factory)
+
+    assert opened == [("s1", {})]
+    assert named.autocommit is True
+    assert named.close_calls == 1
+    assert result.query_outputs[0].session_name == "s1"
+    assert result.query_outputs[1].session_name == "s1"
+
+
+def test_named_session_options_must_match_first_open() -> None:
+    default = _FakeConnection([])
+    named = _FakeConnection([_Step("SELECT 1;", columns=["v"], rows=[(1,)])])
+    blocks = [
+        Block(
+            kind="query",
+            line_no=1,
+            sql="SELECT 1;",
+            query_mode="nosort",
+            session_name="s1",
+            session_args=("user=alice",),
+        ),
+        Block(
+            kind="query",
+            line_no=2,
+            sql="SELECT 1;",
+            query_mode="nosort",
+            session_name="s1",
+            session_args=("user=bob",),
+        ),
+    ]
+
+    with pytest.raises(ExecutionError, match="different options"):
+        execute_blocks(default, blocks, session_connection_factory=lambda _name, _options: named)
+
+    assert named.close_calls == 1
+
+
+def test_named_session_open_transaction_fails_case_and_rolls_back() -> None:
+    default = _FakeConnection([])
+    named = _FakeConnection(
+        [_Step("BEGIN;")],
+        transaction_status="INTRANS",
+    )
+    blocks = [
+        Block(kind="statement", line_no=1, sql="BEGIN;", statement_expect="ok", session_name="s1")
+    ]
+
+    with pytest.raises(ExecutionError, match="left an open transaction"):
+        execute_blocks(default, blocks, session_connection_factory=lambda _name, _options: named)
+
+    assert named.rollback_calls == 1
+    assert named.close_calls == 1
+
+
+def test_async_block_output_is_collected_at_await_position() -> None:
+    default = _FakeConnection([_Step("SELECT 'before';", columns=["v"], rows=[("before",)])])
+    writer = _FakeConnection([_Step("INSERT INTO t VALUES (1);", rowcount=1)])
+    blocks = [
+        Block(kind="query", line_no=1, sql="SELECT 'before';", query_mode="nosort"),
+        Block(
+            kind="statement",
+            line_no=2,
+            sql="INSERT INTO t VALUES (1);",
+            statement_expect="ok",
+            session_name="writer",
+            async_label="insert_one",
+        ),
+        Block(
+            kind="await",
+            line_no=3,
+            sql="",
+            await_label="insert_one",
+            await_timeout_ms=1000,
+        ),
+    ]
+
+    result = execute_blocks(
+        default,
+        blocks,
+        session_connection_factory=lambda _name, _options: writer,
+    )
+
+    assert [output.sql for output in result.query_outputs] == [
+        "SELECT 'before';",
+        "INSERT INTO t VALUES (1);",
+    ]
+    assert result.query_outputs[1].session_name == "writer"
+    assert writer.close_calls == 1
+
+
+def test_async_block_must_be_awaited() -> None:
+    default = _FakeConnection([])
+    writer = _FakeConnection([_Step("INSERT INTO t VALUES (1);", rowcount=1)])
+    blocks = [
+        Block(
+            kind="statement",
+            line_no=1,
+            sql="INSERT INTO t VALUES (1);",
+            statement_expect="ok",
+            session_name="writer",
+            async_label="insert_one",
+        )
+    ]
+
+    with pytest.raises(ExecutionError, match="unawaited async"):
+        execute_blocks(
+            default,
+            blocks,
+            session_connection_factory=lambda _name, _options: writer,
+        )
+
+    assert writer.close_calls == 1
+
+
+def test_async_await_timeout_disconnects_session() -> None:
+    default = _FakeConnection([])
+    writer = _FakeConnection(
+        [_Step("SELECT pg_sleep;", columns=["v"], rows=[("late",)], delay_seconds=0.2)]
+    )
+    blocks = [
+        Block(
+            kind="query",
+            line_no=1,
+            sql="SELECT pg_sleep;",
+            query_mode="nosort",
+            session_name="writer",
+            async_label="slow",
+        ),
+        Block(
+            kind="await",
+            line_no=2,
+            sql="",
+            await_label="slow",
+            await_timeout_ms=10,
+        ),
+    ]
+
+    with pytest.raises(ExecutionError, match="timed out"):
+        execute_blocks(
+            default,
+            blocks,
+            session_connection_factory=lambda _name, _options: writer,
+        )
+
+    assert writer.close_calls == 1
+
+
+def test_wait_expect_retries_until_match() -> None:
+    conn = _FakeConnection(
+        [
+            _Step("SELECT ready FROM state;", columns=["ready"], rows=[(False,)]),
+            _Step("SELECT ready FROM state;", columns=["ready"], rows=[(True,)]),
+        ]
+    )
+    blocks = [
+        Block(
+            kind="query",
+            line_no=1,
+            sql="SELECT ready FROM state;",
+            query_mode="nosort",
+            wait_expect_interval_ms=1,
+            wait_expect_timeout_ms=100,
+        )
+    ]
+    calls = 0
+
+    def matcher(_index: int, output: Any) -> str | None:
+        nonlocal calls
+        calls += 1
+        return None if output.rows == [["true"]] else "not ready"
+
+    result = execute_blocks(conn, blocks, wait_expect_matcher=matcher)
+
+    assert calls == 2
+    assert result.query_outputs[0].rows == [["true"]]
+    assert conn.steps == []
+
+
+def test_wait_expect_timeout_reports_last_mismatch() -> None:
+    conn = _FakeConnection(
+        [
+            _Step("SELECT ready FROM state;", columns=["ready"], rows=[(False,)])
+            for _ in range(10)
+        ]
+    )
+    blocks = [
+        Block(
+            kind="query",
+            line_no=1,
+            sql="SELECT ready FROM state;",
+            query_mode="nosort",
+            wait_expect_interval_ms=1,
+            wait_expect_timeout_ms=5,
+        )
+    ]
+
+    with pytest.raises(ExecutionError, match="not ready"):
+        execute_blocks(
+            conn,
+            blocks,
+            wait_expect_matcher=lambda _index, _output: "not ready",
+        )

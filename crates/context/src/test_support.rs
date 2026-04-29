@@ -197,7 +197,9 @@ impl TestStatementContextBuilder {
                 },
             },
             txn: StatementView {
-                visible_version: self.visible_version,
+                transaction: crate::TransactionView::autocommit(paro_transaction::ReadTs::new(
+                    self.visible_version,
+                )),
                 ..StatementView::default()
             },
             ddl: None,
@@ -216,6 +218,8 @@ impl TestStatementContextBuilder {
                     catalog,
                     tablet_meta: None,
                     wal_metrics: crate::AttachedDatabaseWalMetricsSnapshot::default(),
+                    transaction_metrics: crate::AttachedDatabaseTransactionMetricsSnapshot::default(
+                    ),
                 }],
             )),
             limits,

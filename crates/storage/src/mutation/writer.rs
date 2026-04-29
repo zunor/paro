@@ -1,43 +1,55 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::MutationTarget;
 use crate::codec::chunk_encoder;
 use crate::primary_key::RowID;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::table::table_handle::TableHandle;
 use crate::tablet::KeysType;
-use crate::transaction::txn::Transaction;
 use crate::write::DeltaWriter;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_transaction::TransactionView;
 
 pub(crate) fn append(table: &TableHandle, chunk: &Chunk) -> Result<()> {
-    append_with_transaction(table, chunk, None)
+    if chunk.size() == 0 {
+        return Ok(());
+    }
+    append_direct(table, chunk)
 }
 
 pub(crate) fn append_with_transaction(
+    view: &TransactionView,
     table: &TableHandle,
     chunk: &Chunk,
-    txn: Option<Arc<Transaction>>,
+    target: MutationTarget,
 ) -> Result<()> {
     if chunk.size() == 0 {
         return Ok(());
     }
 
-    let tablet = table.tablet();
-    let art_columns = table.declared_art_columns();
-    let search_write_plan = table.search_write_plan()?;
-
-    if let Some(txn) = txn {
+    if let MutationTarget::Transaction(txn) = target {
+        let tablet = table.tablet();
+        let art_columns = table.declared_art_columns();
         if !art_columns.is_empty() {
             txn.register_pending_art_columns(tablet.tablet_id(), art_columns)?;
         }
-        txn.append_to_tablet(tablet, chunk, search_write_plan)?;
+        txn.append_to_tablet(view.command_id(), tablet, chunk, table.search_write_plan()?)?;
         return Ok(());
     }
+
+    append_direct(table, chunk)
+}
+
+fn append_direct(table: &TableHandle, chunk: &Chunk) -> Result<()> {
+    // Storage-local construction path. SQL/frontend writes are guarded in
+    // execution and must arrive with an active transaction.
+    let tablet = table.tablet();
+    let art_columns = table.declared_art_columns();
+    let search_write_plan = table.search_write_plan()?;
 
     let mut writer = DeltaWriter::open_with_allocator_and_search_plan(
         tablet.clone(),
@@ -68,11 +80,12 @@ pub(crate) fn append_with_transaction(
 }
 
 pub(crate) fn append_partial_with_transaction(
+    view: &TransactionView,
     table: &TableHandle,
     chunk: &Chunk,
     partial_column_indices: Vec<usize>,
     base_row_ids: &[u64],
-    txn: Option<Arc<Transaction>>,
+    target: MutationTarget,
 ) -> Result<()> {
     if chunk.size() == 0 {
         return Ok(());
@@ -95,8 +108,8 @@ pub(crate) fn append_partial_with_transaction(
     let base_row_ids: Vec<RowID> = base_row_ids.iter().copied().map(RowID::from_raw).collect();
     writer.write_partial_chunk(chunk, &base_row_ids)?;
 
-    if let Some(txn) = txn {
-        writer.commit_in_transaction(txn)?;
+    if let MutationTarget::Transaction(txn) = target {
+        writer.commit_in_transaction(txn, view.command_id())?;
         return Ok(());
     }
 

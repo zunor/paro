@@ -82,6 +82,7 @@ paro-session = { path = "crates/session" }
 paro-server = { path = "crates/server" }
 paro-instance = { path = "crates/instance" }
 paro-journal = { path = "crates/journal" }
+paro-transaction = { path = "crates/transaction" }
 
 [profile.dev.package.paro-parser]
 debug = 0

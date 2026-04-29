@@ -21,7 +21,14 @@ import traceback
 import tomllib
 from typing import Any, Iterable, Mapping, List
 
-from harness.comparator import ResultMismatch, ResultParseError, build_transcript, compare_result_file
+from harness.comparator import (
+    ResultMismatch,
+    ResultParseError,
+    build_transcript,
+    compare_output_to_result_block,
+    compare_result_file,
+    parse_result_file,
+)
 from harness.executor import ExecutionError, execute_blocks
 from harness.parser import ParseError, parse_sql_file
 
@@ -449,6 +456,11 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
         blocks = parse_sql_file(case_path)
         blocks = _prepare_case_blocks(case_path, blocks, config)
         stats.total = len([b for b in blocks if b.kind in ("query", "statement")]) # Simplified count
+        result_path = case_path.with_suffix(".result")
+        wait_expect_matcher = _build_wait_expect_matcher(
+            result_path,
+            precision=config.float_precision,
+        ) if not config.update and result_path.exists() else None
 
         execution = execute_blocks(
             conn,
@@ -458,6 +470,11 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
             control_handler=lambda active_conn, block: _handle_control_block(
                 active_conn, block, config
             ),
+            session_connection_factory=lambda _session_name, options: _open_session_connection(
+                config,
+                options,
+            ),
+            wait_expect_matcher=wait_expect_matcher,
         )
 
         if execution.skipped_due_to_setup_error:
@@ -470,7 +487,6 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
                 detail=execution.setup_error or "setup failed",
             ), stats
 
-        result_path = case_path.with_suffix(".result")
         transcript = build_transcript(
             execution.query_outputs,
             precision=config.float_precision,
@@ -529,6 +545,31 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
             detail=str(exc),
             error_info=error_info
         ), stats
+
+
+def _build_wait_expect_matcher(
+    result_path: Path,
+    *,
+    precision: int,
+):
+    expected_blocks = parse_result_file(result_path)
+
+    def match_output(output_index: int, output: Any) -> str | None:
+        if output_index < 1 or output_index > len(expected_blocks):
+            return (
+                f"wait_expect output block {output_index} has no baseline block "
+                f"in {result_path}"
+            )
+        mismatch = compare_output_to_result_block(
+            expected_blocks[output_index - 1],
+            output,
+            precision=precision,
+        )
+        if mismatch is None:
+            return None
+        return str(mismatch)
+
+    return match_output
 
 
 def _prepare_case_blocks(case_path: Path, blocks: List[Any], config: RunnerConfig) -> List[Any]:
@@ -795,6 +836,22 @@ def _reconnect(conn: Any, config: RunnerConfig, *, options: Mapping[str, str]) -
         database=options.get("database", current.database),
         user=options.get("user", current.user),
         password=options.get("password", current.password),
+    )
+    return _open_connection(config, target)
+
+
+def _open_session_connection(config: RunnerConfig, options: Mapping[str, str]) -> Any:
+    unknown = set(options) - {"host", "port", "database", "user", "password"}
+    if unknown:
+        rendered = ", ".join(sorted(unknown))
+        raise ExecutionError(f"unsupported session connection option(s): {rendered}")
+
+    target = ConnectionTarget(
+        host=options.get("host", config.host),
+        port=_parse_control_port(options.get("port", str(config.port))),
+        database=options.get("database", config.database),
+        user=options.get("user", config.user),
+        password=options.get("password", config.password),
     )
     return _open_connection(config, target)
 

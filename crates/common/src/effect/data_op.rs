@@ -167,6 +167,9 @@ pub enum TabletMutation {
         version_span: VersionSpan,
         rowset_ref: ArtifactRef,
     },
+    ApplyPrimaryDelete {
+        keys: Vec<Vec<u8>>,
+    },
     ApplyDeletePatch {
         patch: DeletePatchRef,
         deleted_row_count: u32,
@@ -191,7 +194,18 @@ impl TabletMutation {
             Self::PublishCompaction {
                 output_rowset_id, ..
             } => Some(*output_rowset_id),
-            Self::ApplyDeletePatch { .. } => None,
+            Self::ApplyPrimaryDelete { .. } | Self::ApplyDeletePatch { .. } => None,
+        }
+    }
+
+    pub fn stable_artifact_id(&self) -> u64 {
+        match self {
+            Self::PublishRowset { rowset_id, .. } => *rowset_id,
+            Self::PublishCompaction {
+                output_rowset_id, ..
+            } => *output_rowset_id,
+            Self::ApplyPrimaryDelete { keys } => stable_hash_keys(keys),
+            Self::ApplyDeletePatch { patch, .. } => stable_hash_delete_patch(patch),
         }
     }
 }
@@ -241,6 +255,95 @@ pub struct DeletePatchInline {
     pub encoding: DeletePatchEncoding,
     pub row_count: u32,
     pub groups: Vec<DeletePatchGroup>,
+}
+
+fn stable_hash_keys(keys: &[Vec<u8>]) -> u64 {
+    let mut hash = StableHasher::new(0x504b_4445_4c45_5445);
+    hash.write_u64(keys.len() as u64);
+    for key in keys {
+        hash.write_bytes(key);
+    }
+    hash.finish()
+}
+
+fn stable_hash_delete_patch(patch: &DeletePatchRef) -> u64 {
+    let mut hash = StableHasher::new(0x4450_4154_4348_5631);
+    match patch {
+        DeletePatchRef::Inline(inline) => {
+            hash.write_u8(0);
+            hash.write_u8(match inline.encoding {
+                DeletePatchEncoding::GroupedRowOffsetDeltaV1 => 1,
+            });
+            hash.write_u32(inline.row_count);
+            hash.write_u64(inline.groups.len() as u64);
+            for group in &inline.groups {
+                hash.write_u64(group.rowset_id);
+                hash.write_u64(group.segments.len() as u64);
+                for segment in &group.segments {
+                    hash.write_u32(segment.segment_id);
+                    hash.write_u64(segment.row_offsets_delta.len() as u64);
+                    for delta in &segment.row_offsets_delta {
+                        hash.write_u32(*delta);
+                    }
+                }
+            }
+        }
+        DeletePatchRef::Artifact(reference) => {
+            hash.write_u8(1);
+            hash.write_u8(match reference.namespace {
+                ArtifactNamespace::CanonicalRowset => 1,
+                ArtifactNamespace::Staged => 2,
+                ArtifactNamespace::DeletePatch => 3,
+            });
+            hash.write_u64(reference.locator.len() as u64);
+            for component in &reference.locator {
+                hash.write_bytes(component.as_bytes());
+            }
+        }
+    }
+    hash.finish()
+}
+
+struct StableHasher {
+    state: u64,
+}
+
+impl StableHasher {
+    const FNV_PRIME: u64 = 0x1000_0000_01b3;
+
+    fn new(seed: u64) -> Self {
+        Self {
+            state: 0xcbf2_9ce4_8422_2325 ^ seed,
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.state ^= value as u64;
+        self.state = self.state.wrapping_mul(Self::FNV_PRIME);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_raw_bytes(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write_raw_bytes(&value.to_le_bytes());
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        self.write_raw_bytes(bytes);
+    }
+
+    fn write_raw_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u8(byte);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.state
+    }
 }
 
 impl DeletePatchInline {

@@ -11,7 +11,9 @@ use paro_common::ddl::{
 };
 use paro_common::effect::CatalogTxnOp;
 use paro_common::error::Result;
-use paro_common::journal::{CommitRecord, JournalRecord};
+use paro_common::journal::{
+    CommitRecord, JournalRecord, JournalRecordMetadata, COMMIT_RECORD_VERSION,
+};
 
 /// Writes one committed `CREATE SCHEMA` journal record, then one `WalFlush`.
 pub fn write_flushed_create_schema_txn(
@@ -84,24 +86,27 @@ pub fn write_flushed_create_schema_txn_with_lsn_and_object_id(
     commit_id: u64,
     lsn: u64,
 ) -> Result<()> {
+    let catalog_ops = vec![CatalogTxnOp {
+        change: DdlChangeRecord {
+            key: DdlObjectKey::new(
+                catalog_name,
+                None::<String>,
+                schema_name,
+                DdlObjectKind::Schema,
+            ),
+            change: DdlChange::CreateSchema(CreateSchemaPayload {
+                object_id,
+                if_not_exists: false,
+            }),
+        },
+    }];
     let record = CommitRecord {
+        record_version: COMMIT_RECORD_VERSION,
+        metadata: JournalRecordMetadata::transaction(&catalog_ops, &[], &[], &[]),
         txn_id,
         start_time: 0,
         commit_id,
-        catalog_ops: vec![CatalogTxnOp {
-            change: DdlChangeRecord {
-                key: DdlObjectKey::new(
-                    catalog_name,
-                    None::<String>,
-                    schema_name,
-                    DdlObjectKind::Schema,
-                ),
-                change: DdlChange::CreateSchema(CreateSchemaPayload {
-                    object_id,
-                    if_not_exists: false,
-                }),
-            },
-        }],
+        catalog_ops,
         storage_ops: vec![],
         apply_descriptors: vec![],
         deferred_tasks: vec![],
@@ -141,24 +146,27 @@ pub fn append_open_create_schema_txn(
     schema_name: &str,
     txn_id: u64,
 ) -> Result<()> {
+    let catalog_ops = vec![CatalogTxnOp {
+        change: DdlChangeRecord {
+            key: DdlObjectKey::new(
+                catalog_name,
+                None::<String>,
+                schema_name,
+                DdlObjectKind::Schema,
+            ),
+            change: DdlChange::CreateSchema(CreateSchemaPayload {
+                object_id: 0,
+                if_not_exists: false,
+            }),
+        },
+    }];
     let record = CommitRecord {
+        record_version: COMMIT_RECORD_VERSION,
+        metadata: JournalRecordMetadata::transaction(&catalog_ops, &[], &[], &[]),
         txn_id,
         start_time: 0,
         commit_id: txn_id,
-        catalog_ops: vec![CatalogTxnOp {
-            change: DdlChangeRecord {
-                key: DdlObjectKey::new(
-                    catalog_name,
-                    None::<String>,
-                    schema_name,
-                    DdlObjectKind::Schema,
-                ),
-                change: DdlChange::CreateSchema(CreateSchemaPayload {
-                    object_id: 0,
-                    if_not_exists: false,
-                }),
-            },
-        }],
+        catalog_ops,
         storage_ops: vec![],
         apply_descriptors: vec![],
         deferred_tasks: vec![],

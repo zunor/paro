@@ -271,7 +271,7 @@ mod tests {
                     input_rowsets: Vec::new(),
                     read_snapshot: ReadSnapshot {
                         visible_version: 0,
-                        rowset_epoch: 0,
+                        layout_epoch: 0,
                         schema_epoch: None,
                     },
                     output_version: Version::singleton(0),

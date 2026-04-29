@@ -31,6 +31,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_transaction::{CommandId, ReadTs};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -71,6 +72,10 @@ pub struct DeltaWriter {
     partial_base_rowids: Vec<RowID>,
     /// Durable search artifacts that should be materialized before publish.
     search_write_plan: SearchWritePlan,
+    /// Transactional read timestamp for committed primary-key visibility.
+    read_ts: Option<ReadTs>,
+    /// Transaction-private primary-key overlay visible when this writer was opened.
+    primary_key_overlay: HashMap<Vec<u8>, Option<RowID>>,
 }
 
 impl std::fmt::Debug for DeltaWriter {
@@ -110,7 +115,15 @@ impl DeltaWriter {
         txn_id: u64,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
-        Self::open_internal(tablet, txn_id, allocator, None, SearchWritePlan::default())
+        Self::open_internal(
+            tablet,
+            txn_id,
+            allocator,
+            None,
+            SearchWritePlan::default(),
+            None,
+            HashMap::new(),
+        )
     }
 
     pub(crate) fn open_with_allocator_and_search_plan(
@@ -119,7 +132,34 @@ impl DeltaWriter {
         allocator: Arc<dyn Allocator>,
         search_write_plan: SearchWritePlan,
     ) -> Result<Self> {
-        Self::open_internal(tablet, txn_id, allocator, None, search_write_plan)
+        Self::open_internal(
+            tablet,
+            txn_id,
+            allocator,
+            None,
+            search_write_plan,
+            None,
+            HashMap::new(),
+        )
+    }
+
+    pub(crate) fn open_transactional_with_allocator_and_search_plan(
+        tablet: TabletRef,
+        txn_id: u64,
+        read_ts: ReadTs,
+        allocator: Arc<dyn Allocator>,
+        search_write_plan: SearchWritePlan,
+        primary_key_overlay: HashMap<Vec<u8>, Option<RowID>>,
+    ) -> Result<Self> {
+        Self::open_internal(
+            tablet,
+            txn_id,
+            allocator,
+            None,
+            search_write_plan,
+            Some(read_ts),
+            primary_key_overlay,
+        )
     }
 
     pub fn open_partial_with_allocator(
@@ -134,6 +174,8 @@ impl DeltaWriter {
             allocator,
             Some(partial_update_columns),
             SearchWritePlan::default(),
+            None,
+            HashMap::new(),
         )
     }
 
@@ -143,6 +185,8 @@ impl DeltaWriter {
         allocator: Arc<dyn Allocator>,
         partial_update_columns: Option<Vec<usize>>,
         search_write_plan: SearchWritePlan,
+        read_ts: Option<ReadTs>,
+        primary_key_overlay: HashMap<Vec<u8>, Option<RowID>>,
     ) -> Result<Self> {
         // Tablet must be runnable and have schema.
         let state = tablet.state();
@@ -234,6 +278,8 @@ impl DeltaWriter {
             partial_base_rowids_by_key: HashMap::new(),
             partial_base_rowids: Vec::new(),
             search_write_plan,
+            read_ts,
+            primary_key_overlay,
         })
     }
 
@@ -436,9 +482,14 @@ impl DeltaWriter {
     }
 
     /// Commit: finalize rowset and register it with the transaction (deferred publish).
-    pub fn commit_in_transaction(self, txn: Arc<Transaction>) -> Result<RowsetSharedPtr> {
+    pub fn commit_in_transaction(
+        self,
+        txn: Arc<Transaction>,
+        command_id: CommandId,
+    ) -> Result<RowsetSharedPtr> {
         let (tablet, rowset, primary_update) = self.finalize_for_transaction()?;
-        if let Err(err) = txn.add_pending_rowset(tablet, rowset.clone(), primary_update) {
+        if let Err(err) = txn.add_pending_rowset(command_id, tablet, rowset.clone(), primary_update)
+        {
             let _ = std::fs::remove_dir_all(rowset.rowset_path());
             return Err(err);
         }
@@ -795,7 +846,7 @@ impl DeltaWriter {
             let old = if let Some(base_rowids) = partial_base_rowids.as_ref() {
                 Some(base_rowids[row_idx])
             } else {
-                self.tablet.lookup_primary_key(key)?
+                self.lookup_visible_primary_key(key)?
             };
             prior_locs.push(old);
         }
@@ -889,6 +940,16 @@ impl DeltaWriter {
         entry.mark_deleted(loc.row_offset);
         Ok(())
     }
+
+    fn lookup_visible_primary_key(&self, key: &[u8]) -> Result<Option<RowID>> {
+        if let Some(row_id) = self.primary_key_overlay.get(key) {
+            return Ok(*row_id);
+        }
+        if let Some(read_ts) = self.read_ts {
+            return self.tablet.lookup_primary_key_at(key, read_ts.into_raw());
+        }
+        self.tablet.lookup_primary_key(key)
+    }
 }
 
 #[cfg(test)]
@@ -899,7 +960,6 @@ mod tests {
         Tablet,
     };
     use crate::test_utils::*;
-    use crate::wal::write_ahead_log::WriteAheadLog;
     use paro_common::types::LogicalType;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -988,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_writer_delete_keys_writes_wal_and_delvec() {
+    fn delta_writer_delete_keys_persists_delete_vector() {
         let (tablet, tmp) = create_test_tablet();
         // Seed data
         let mut writer = DeltaWriter::open(tablet.clone(), 10).unwrap();
@@ -1010,10 +1070,6 @@ mod tests {
             .unwrap();
         assert_eq!(dv.cardinality(), 4);
         assert!(dv.is_deleted(0));
-
-        // WAL recorded
-        let wal_path = tablet.data_dir().join("tablet.wal");
-        assert!(WriteAheadLog::exists_for_seed(&wal_path));
 
         drop(tmp);
     }

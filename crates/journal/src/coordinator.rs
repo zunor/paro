@@ -2,32 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::appender::{AppendResult, JournalAppender};
-use crate::apply_queue::JournalApplyRuntime;
-use paro_common::durability::{PreparedCommitPlan, PreparedMaintenancePlan};
+use crate::apply::JournalApplyRuntime;
+use paro_common::durability::PreparedMaintenancePlan;
 use paro_common::error as paro_error;
-use paro_common::error::{ParoError, Result};
-use paro_common::journal::{CommitRecord, JournalRecord, MaintenanceRecord};
+use paro_common::error::Result;
+use paro_common::journal::{JournalRecord, MaintenanceRecord};
 use paro_common::logging::targets;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::thread;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitExecutionContext {
-    pub commit_id: u64,
-    pub lsn: u64,
-    pub durable_batch_lsn: u64,
-    pub durable_batch_size: u64,
-    pub durable_batch_bytes: u64,
-    pub sync_latency_micros: u64,
-    pub record: CommitRecord,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaintenanceExecutionContext {
+pub struct MaintenanceAppendContext {
     pub maintenance_id: u64,
     pub lsn: u64,
     pub durable_batch_lsn: u64,
@@ -61,81 +45,26 @@ impl std::fmt::Debug for JournalCoordinator {
 struct JournalCoordinatorInner {
     appender: Option<Arc<JournalAppender>>,
     apply_runtime: Mutex<Option<Arc<JournalApplyRuntime>>>,
-    next_commit_id: AtomicU64,
-    next_maintenance_id: AtomicU64,
+    next_maintenance_id: Mutex<u64>,
     state: Mutex<CoordinatorState>,
-    wake_worker: Condvar,
 }
 
 #[derive(Default)]
 struct CoordinatorState {
-    queue: VecDeque<PendingRequest>,
     fallback_frontiers: JournalFrontierSnapshot,
-    poisoned: Option<ParoError>,
     shutdown: bool,
-}
-
-enum PendingRequest {
-    Commit(PendingCommitRequest),
-    Maintenance(PendingMaintenanceRequest),
-}
-
-type CommitValidator = Box<dyn FnOnce(&PreparedCommitPlan) -> Result<()> + Send + 'static>;
-type CommitFinish =
-    Box<dyn FnOnce(std::result::Result<CommitExecutionContext, ParoError>) -> Result<bool> + Send>;
-type MaintenanceValidator =
-    Box<dyn FnOnce(&PreparedMaintenancePlan) -> Result<()> + Send + 'static>;
-type MaintenanceFinish = Box<
-    dyn FnOnce(std::result::Result<MaintenanceExecutionContext, ParoError>) -> Result<bool> + Send,
->;
-
-struct PendingCommitRequest {
-    plan: PreparedCommitPlan,
-    validate: Option<CommitValidator>,
-    finish: Option<CommitFinish>,
-    queued_at: Instant,
-}
-
-struct PendingMaintenanceRequest {
-    plan: PreparedMaintenancePlan,
-    validate: Option<MaintenanceValidator>,
-    finish: Option<MaintenanceFinish>,
-    queued_at: Instant,
-}
-
-enum AcceptedRequest {
-    Commit {
-        commit_id: u64,
-        record: CommitRecord,
-        finish: CommitFinish,
-        queued_at: Instant,
-    },
-    Maintenance {
-        maintenance_id: u64,
-        record: MaintenanceRecord,
-        finish: MaintenanceFinish,
-        queued_at: Instant,
-    },
 }
 
 impl JournalCoordinator {
     pub fn new(appender: Option<Arc<JournalAppender>>) -> Self {
-        let inner = Arc::new(JournalCoordinatorInner {
-            appender,
-            apply_runtime: Mutex::new(None),
-            next_commit_id: AtomicU64::new(1),
-            next_maintenance_id: AtomicU64::new(1),
-            state: Mutex::new(CoordinatorState::default()),
-            wake_worker: Condvar::new(),
-        });
-
-        let worker_inner = Arc::downgrade(&inner);
-        thread::Builder::new()
-            .name("paro-journal-coordinator".to_string())
-            .spawn(move || run_worker(worker_inner))
-            .expect("spawn journal coordinator worker");
-
-        Self { inner }
+        Self {
+            inner: Arc::new(JournalCoordinatorInner {
+                appender,
+                apply_runtime: Mutex::new(None),
+                next_maintenance_id: Mutex::new(1),
+                state: Mutex::new(CoordinatorState::default()),
+            }),
+        }
     }
 
     pub fn bind_apply_runtime(&self, runtime: Arc<JournalApplyRuntime>) {
@@ -153,9 +82,6 @@ impl JournalCoordinator {
     }
 
     pub fn sync_commit_id_with(&self, min_committed_version: u64) {
-        let next = min_committed_version.saturating_add(1);
-        bump_atomic_min(&self.inner.next_commit_id, next);
-
         if let Some(runtime) = self.inner.apply_runtime.lock().unwrap().as_ref() {
             runtime.sync_commit_frontier_with(min_committed_version);
             return;
@@ -173,181 +99,96 @@ impl JournalCoordinator {
     }
 
     pub fn sync_maintenance_id_with(&self, min_maintenance_id: u64) {
-        let next = min_maintenance_id.saturating_add(1);
-        bump_atomic_min(&self.inner.next_maintenance_id, next);
-    }
-
-    pub fn submit_commit<R, V, A>(
-        &self,
-        plan: PreparedCommitPlan,
-        validate: V,
-        apply: A,
-    ) -> Result<R>
-    where
-        R: Send + 'static,
-        V: FnOnce(&PreparedCommitPlan) -> Result<()> + Send + 'static,
-        A: FnOnce(CommitExecutionContext) -> Result<R> + Send + 'static,
-    {
-        let (tx, rx) = sync_channel(1);
-        let finish = Box::new(
-            move |result: std::result::Result<CommitExecutionContext, ParoError>| -> Result<bool> {
-                match result {
-                    Ok(ctx) => {
-                        let apply_result = apply(ctx);
-                        let coordinator_result =
-                            apply_result.as_ref().map(|_| true).map_err(Clone::clone);
-                        let _ = tx.send(apply_result);
-                        coordinator_result
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Err(err.clone()));
-                        Err(err)
-                    }
-                }
-            },
+        bump_mutex_min(
+            &self.inner.next_maintenance_id,
+            min_maintenance_id.saturating_add(1),
         );
-
-        self.enqueue(PendingRequest::Commit(PendingCommitRequest {
-            plan,
-            validate: Some(Box::new(validate)),
-            finish: Some(finish),
-            queued_at: Instant::now(),
-        }))?;
-
-        rx.recv().map_err(|_| {
-            paro_error::internal("journal coordinator worker exited before commit response")
-        })?
     }
 
-    pub fn submit_commit_context<V>(
-        &self,
-        plan: PreparedCommitPlan,
-        validate: V,
-    ) -> Result<CommitExecutionContext>
-    where
-        V: FnOnce(&PreparedCommitPlan) -> Result<()> + Send + 'static,
-    {
-        let (tx, rx) = sync_channel(1);
-        let finish = Box::new(
-            move |result: std::result::Result<CommitExecutionContext, ParoError>| -> Result<bool> {
-                match result {
-                    Ok(ctx) => {
-                        let _ = tx.send(Ok(ctx));
-                        Ok(false)
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Err(err.clone()));
-                        Err(err)
-                    }
-                }
-            },
-        );
-
-        self.enqueue(PendingRequest::Commit(PendingCommitRequest {
-            plan,
-            validate: Some(Box::new(validate)),
-            finish: Some(finish),
-            queued_at: Instant::now(),
-        }))?;
-
-        rx.recv().map_err(|_| {
-            paro_error::internal("journal coordinator worker exited before commit context response")
-        })?
-    }
-
-    pub fn submit_maintenance<R, V, A>(
-        &self,
-        plan: PreparedMaintenancePlan,
-        validate: V,
-        apply: A,
-    ) -> Result<R>
-    where
-        R: Send + 'static,
-        V: FnOnce(&PreparedMaintenancePlan) -> Result<()> + Send + 'static,
-        A: FnOnce(MaintenanceExecutionContext) -> Result<R> + Send + 'static,
-    {
-        let (tx, rx) = sync_channel(1);
-        let finish = Box::new(
-            move |result: std::result::Result<MaintenanceExecutionContext, ParoError>| -> Result<bool> {
-                match result {
-                    Ok(ctx) => {
-                        let apply_result = apply(ctx);
-                        let coordinator_result =
-                            apply_result.as_ref().map(|_| true).map_err(Clone::clone);
-                        let _ = tx.send(apply_result);
-                        coordinator_result
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Err(err.clone()));
-                        Err(err)
-                    }
-                }
-            },
-        );
-
-        self.enqueue(PendingRequest::Maintenance(PendingMaintenanceRequest {
-            plan,
-            validate: Some(Box::new(validate)),
-            finish: Some(finish),
-            queued_at: Instant::now(),
-        }))?;
-
-        rx.recv().map_err(|_| {
-            paro_error::internal("journal coordinator worker exited before maintenance response")
-        })?
-    }
-
-    pub fn submit_maintenance_context<V>(
-        &self,
-        plan: PreparedMaintenancePlan,
-        validate: V,
-    ) -> Result<MaintenanceExecutionContext>
-    where
-        V: FnOnce(&PreparedMaintenancePlan) -> Result<()> + Send + 'static,
-    {
-        let (tx, rx) = sync_channel(1);
-        let finish = Box::new(
-            move |result: std::result::Result<MaintenanceExecutionContext, ParoError>| -> Result<bool> {
-                match result {
-                    Ok(ctx) => {
-                        let _ = tx.send(Ok(ctx));
-                        Ok(false)
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Err(err.clone()));
-                        Err(err)
-                    }
-                }
-            },
-        );
-
-        self.enqueue(PendingRequest::Maintenance(PendingMaintenanceRequest {
-            plan,
-            validate: Some(Box::new(validate)),
-            finish: Some(finish),
-            queued_at: Instant::now(),
-        }))?;
-
-        rx.recv().map_err(|_| {
-            paro_error::internal(
-                "journal coordinator worker exited before maintenance context response",
-            )
-        })?
-    }
-
-    fn enqueue(&self, request: PendingRequest) -> Result<()> {
-        let mut state = self.inner.state.lock().unwrap();
-        if let Some(err) = state.poisoned.clone() {
-            return Err(err);
+    pub fn append_records(&self, records: &[JournalRecord]) -> Result<Vec<AppendResult>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
         }
+        self.ensure_open()?;
+
+        let results = match self.inner.appender.as_ref() {
+            Some(appender) => appender.append_records(records)?,
+            None => vec![
+                AppendResult {
+                    lsn: 0,
+                    durable_batch_lsn: 0,
+                    durable_batch_size: records.len() as u64,
+                    durable_batch_bytes: 0,
+                    sync_latency_micros: 0,
+                };
+                records.len()
+            ],
+        };
+
+        if let Some(last) = results.last().copied() {
+            let last_commit_id = records
+                .iter()
+                .filter_map(|record| match record {
+                    JournalRecord::Commit(record) => Some(record.commit_id),
+                    JournalRecord::Maintenance(_) | JournalRecord::CheckpointFence(_) => None,
+                })
+                .next_back()
+                .unwrap_or(0);
+            update_durable_frontier(&self.inner, last.durable_batch_lsn, last_commit_id);
+            tracing::info!(
+                target: targets::WAL,
+                first_lsn = results.first().map(|result| result.lsn).unwrap_or(0),
+                durable_batch_lsn = last.durable_batch_lsn,
+                group_size = last.durable_batch_size,
+                batch_bytes = last.durable_batch_bytes,
+                sync_latency_micros = last.sync_latency_micros,
+                commit_records = records
+                    .iter()
+                    .filter(|record| matches!(record, JournalRecord::Commit(_)))
+                    .count(),
+                maintenance_records = records
+                    .iter()
+                    .filter(|record| matches!(record, JournalRecord::Maintenance(_)))
+                    .count(),
+                "Durable journal records appended"
+            );
+        }
+        Ok(results)
+    }
+
+    pub fn submit_maintenance(
+        &self,
+        plan: PreparedMaintenancePlan,
+    ) -> Result<MaintenanceAppendContext> {
+        self.ensure_open()?;
+
+        let mut next_maintenance_id = self.inner.next_maintenance_id.lock().unwrap();
+        let maintenance_id = *next_maintenance_id;
+        let record = plan.into_record(maintenance_id);
+        let results = self.append_records(&[JournalRecord::Maintenance(record.clone())])?;
+        let result = results.first().copied().ok_or_else(|| {
+            paro_error::internal("journal coordinator returned no append result for maintenance")
+        })?;
+        *next_maintenance_id = maintenance_id.saturating_add(1);
+
+        Ok(MaintenanceAppendContext {
+            maintenance_id,
+            lsn: result.lsn,
+            durable_batch_lsn: result.durable_batch_lsn,
+            durable_batch_size: result.durable_batch_size,
+            durable_batch_bytes: result.durable_batch_bytes,
+            sync_latency_micros: result.sync_latency_micros,
+            record,
+        })
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        let state = self.inner.state.lock().unwrap();
         if state.shutdown {
             return Err(paro_error::internal(
-                "journal coordinator is shutting down and cannot accept new work",
+                "journal coordinator is shutting down and cannot append records",
             ));
         }
-        state.queue.push_back(request);
-        drop(state);
-        self.inner.wake_worker.notify_one();
         Ok(())
     }
 }
@@ -363,253 +204,7 @@ impl Clone for JournalCoordinator {
 impl Drop for JournalCoordinator {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
-            let mut state = self.inner.state.lock().unwrap();
-            state.shutdown = true;
-            self.inner.wake_worker.notify_all();
-        }
-    }
-}
-
-fn run_worker(inner: Weak<JournalCoordinatorInner>) {
-    loop {
-        let Some(inner) = inner.upgrade() else {
-            return;
-        };
-        let (batch, poison) = {
-            let mut state = inner.state.lock().unwrap();
-            while state.queue.is_empty() && !state.shutdown {
-                state = inner.wake_worker.wait(state).unwrap();
-            }
-
-            if state.queue.is_empty() && state.shutdown {
-                return;
-            }
-
-            let mut batch = Vec::with_capacity(state.queue.len());
-            while let Some(next) = state.queue.pop_front() {
-                batch.push(next);
-            }
-            (batch, state.poisoned.clone())
-        };
-
-        if let Some(err) = poison {
-            reject_batch(batch, err);
-            continue;
-        }
-
-        process_mixed_batch(&inner, batch);
-    }
-}
-
-fn process_mixed_batch(inner: &Arc<JournalCoordinatorInner>, batch: Vec<PendingRequest>) {
-    let mut accepted = Vec::new();
-    let batch_started_at = Instant::now();
-
-    for request in batch {
-        match request {
-            PendingRequest::Commit(mut request) => {
-                let Some(validate) = request.validate.take() else {
-                    continue;
-                };
-                let Some(finish) = request.finish.take() else {
-                    continue;
-                };
-                match validate(&request.plan) {
-                    Ok(()) => {
-                        let commit_id = inner.next_commit_id.fetch_add(1, Ordering::SeqCst);
-                        accepted.push(AcceptedRequest::Commit {
-                            commit_id,
-                            record: request.plan.into_record(commit_id),
-                            finish,
-                            queued_at: request.queued_at,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = finish(Err(err));
-                    }
-                }
-            }
-            PendingRequest::Maintenance(mut request) => {
-                let Some(validate) = request.validate.take() else {
-                    continue;
-                };
-                let Some(finish) = request.finish.take() else {
-                    continue;
-                };
-                match validate(&request.plan) {
-                    Ok(()) => {
-                        let maintenance_id =
-                            inner.next_maintenance_id.fetch_add(1, Ordering::SeqCst);
-                        accepted.push(AcceptedRequest::Maintenance {
-                            maintenance_id,
-                            record: request.plan.into_record(maintenance_id),
-                            finish,
-                            queued_at: request.queued_at,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = finish(Err(err));
-                    }
-                }
-            }
-        }
-    }
-
-    if accepted.is_empty() {
-        return;
-    }
-
-    let records: Vec<JournalRecord> = accepted
-        .iter()
-        .map(|request| match request {
-            AcceptedRequest::Commit { record, .. } => JournalRecord::Commit(record.clone()),
-            AcceptedRequest::Maintenance { record, .. } => {
-                JournalRecord::Maintenance(record.clone())
-            }
-        })
-        .collect();
-
-    let append_results = match inner.appender.as_ref() {
-        Some(appender) => appender.append_records(&records),
-        None => Ok(vec![
-            AppendResult {
-                lsn: 0,
-                durable_batch_lsn: 0,
-                durable_batch_size: accepted.len() as u64,
-                durable_batch_bytes: 0,
-                sync_latency_micros: 0,
-            };
-            accepted.len()
-        ]),
-    };
-
-    match append_results {
-        Ok(results) => {
-            let batch_wait_micros = accepted
-                .iter()
-                .map(|request| match request {
-                    AcceptedRequest::Commit { queued_at, .. }
-                    | AcceptedRequest::Maintenance { queued_at, .. } => batch_started_at
-                        .saturating_duration_since(*queued_at)
-                        .as_micros()
-                        .min(u64::MAX as u128)
-                        as u64,
-                })
-                .max()
-                .unwrap_or(0);
-            if let Some(last) = results.last().copied() {
-                let last_commit_id = accepted
-                    .iter()
-                    .filter_map(|request| match request {
-                        AcceptedRequest::Commit { commit_id, .. } => Some(*commit_id),
-                        AcceptedRequest::Maintenance { .. } => None,
-                    })
-                    .next_back()
-                    .unwrap_or(0);
-                update_durable_frontier(inner, last.durable_batch_lsn, last_commit_id);
-                tracing::info!(
-                    target: targets::WAL,
-                    first_lsn = results.first().map(|result| result.lsn).unwrap_or(0),
-                    durable_batch_lsn = last.durable_batch_lsn,
-                    group_size = last.durable_batch_size,
-                    batch_bytes = last.durable_batch_bytes,
-                    sync_latency_micros = last.sync_latency_micros,
-                    batch_wait_micros = batch_wait_micros,
-                    commit_records = accepted
-                        .iter()
-                        .filter(|request| matches!(request, AcceptedRequest::Commit { .. }))
-                        .count(),
-                    maintenance_records = accepted
-                        .iter()
-                        .filter(|request| matches!(request, AcceptedRequest::Maintenance { .. }))
-                        .count(),
-                    "Durable journal batch appended"
-                );
-            }
-
-            for (request, append_result) in accepted.into_iter().zip(results.into_iter()) {
-                match request {
-                    AcceptedRequest::Commit {
-                        commit_id,
-                        record,
-                        finish,
-                        ..
-                    } => {
-                        let context = CommitExecutionContext {
-                            commit_id,
-                            lsn: append_result.lsn,
-                            durable_batch_lsn: append_result.durable_batch_lsn,
-                            durable_batch_size: append_result.durable_batch_size,
-                            durable_batch_bytes: append_result.durable_batch_bytes,
-                            sync_latency_micros: append_result.sync_latency_micros,
-                            record,
-                        };
-                        match finish(Ok(context)) {
-                            Ok(true) => {
-                                update_published_frontier(inner, append_result.lsn, commit_id)
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                poison_coordinator(inner, err);
-                                return;
-                            }
-                        }
-                    }
-                    AcceptedRequest::Maintenance {
-                        maintenance_id,
-                        record,
-                        finish,
-                        ..
-                    } => {
-                        let context = MaintenanceExecutionContext {
-                            maintenance_id,
-                            lsn: append_result.lsn,
-                            durable_batch_lsn: append_result.durable_batch_lsn,
-                            durable_batch_size: append_result.durable_batch_size,
-                            durable_batch_bytes: append_result.durable_batch_bytes,
-                            sync_latency_micros: append_result.sync_latency_micros,
-                            record,
-                        };
-                        match finish(Ok(context)) {
-                            Ok(true) => update_published_frontier(inner, append_result.lsn, 0),
-                            Ok(false) => {}
-                            Err(err) => {
-                                poison_coordinator(inner, err);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            for request in accepted {
-                match request {
-                    AcceptedRequest::Commit { finish, .. } => {
-                        let _ = finish(Err(err.clone()));
-                    }
-                    AcceptedRequest::Maintenance { finish, .. } => {
-                        let _ = finish(Err(err.clone()));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn reject_batch(batch: Vec<PendingRequest>, err: ParoError) {
-    for request in batch {
-        match request {
-            PendingRequest::Commit(mut request) => {
-                if let Some(finish) = request.finish.take() {
-                    let _ = finish(Err(err.clone()));
-                }
-            }
-            PendingRequest::Maintenance(mut request) => {
-                if let Some(finish) = request.finish.take() {
-                    let _ = finish(Err(err.clone()));
-                }
-            }
+            self.inner.state.lock().unwrap().shutdown = true;
         }
     }
 }
@@ -635,43 +230,12 @@ fn update_durable_frontier(
         .max(durable_commit_id);
 }
 
-fn update_published_frontier(inner: &Arc<JournalCoordinatorInner>, lsn: u64, commit_id: u64) {
-    if inner.apply_runtime.lock().unwrap().is_some() {
-        return;
+fn bump_mutex_min(mutex: &Mutex<u64>, min_value: u64) -> u64 {
+    let mut guard = mutex.lock().unwrap();
+    if *guard < min_value {
+        *guard = min_value;
     }
-
-    let mut state = inner.state.lock().unwrap();
-    state.fallback_frontiers.applied_lsn = state.fallback_frontiers.applied_lsn.max(lsn);
-    state.fallback_frontiers.published_lsn = state.fallback_frontiers.published_lsn.max(lsn);
-    if commit_id != 0 {
-        state.fallback_frontiers.published_commit_id =
-            state.fallback_frontiers.published_commit_id.max(commit_id);
-    }
-}
-
-fn poison_coordinator(inner: &Arc<JournalCoordinatorInner>, err: ParoError) {
-    let mut state = inner.state.lock().unwrap();
-    if state.poisoned.is_none() {
-        state.poisoned = Some(paro_error::internal(format!(
-            "journal coordinator halted after durable apply failure: {}",
-            err
-        )));
-    }
-}
-
-fn bump_atomic_min(atomic: &AtomicU64, min_value: u64) -> u64 {
-    loop {
-        let current = atomic.load(Ordering::SeqCst);
-        if current >= min_value {
-            return current;
-        }
-        if atomic
-            .compare_exchange(current, min_value, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return min_value;
-        }
-    }
+    *guard
 }
 
 #[cfg(test)]
@@ -680,11 +244,12 @@ mod tests {
     use crate::appender::JournalSink;
     use crate::{ApplyRequest, JournalApplyRuntime, TabletApplyPart, WaitMode};
     use parking_lot::Mutex as ParkingMutex;
+    use paro_common::durability::PreparedCommitPlan;
     use paro_common::journal::MaintenanceKind;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingSink {
@@ -694,6 +259,27 @@ mod tests {
     impl JournalSink for RecordingSink {
         fn append_batch(&self, frames: &[Vec<u8>]) -> Result<()> {
             self.batch_sizes.lock().push(frames.len());
+            Ok(())
+        }
+    }
+
+    struct FailOnceSink {
+        should_fail: AtomicBool,
+    }
+
+    impl FailOnceSink {
+        fn new() -> Self {
+            Self {
+                should_fail: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl JournalSink for FailOnceSink {
+        fn append_batch(&self, _frames: &[Vec<u8>]) -> Result<()> {
+            if self.should_fail.swap(false, Ordering::AcqRel) {
+                return Err(paro_error::internal("injected append failure"));
+            }
             Ok(())
         }
     }
@@ -722,62 +308,53 @@ mod tests {
     }
 
     #[test]
-    fn mixed_batch_shares_single_append_for_commit_and_maintenance() {
+    fn append_records_updates_durable_frontier_without_publish_callbacks() {
         let sink = Arc::new(RecordingSink::default());
         let appender = Arc::new(JournalAppender::new(sink.clone()));
-        let inner = Arc::new(JournalCoordinatorInner {
-            appender: Some(appender),
-            apply_runtime: Mutex::new(None),
-            next_commit_id: AtomicU64::new(1),
-            next_maintenance_id: AtomicU64::new(1),
-            state: Mutex::new(CoordinatorState::default()),
-            wake_worker: Condvar::new(),
-        });
+        let coordinator = JournalCoordinator::new(Some(appender));
+        let record = JournalRecord::Commit(empty_commit_plan(7).into_record(12));
 
-        let (commit_tx, commit_rx) = sync_channel(1);
-        let (maintenance_tx, maintenance_rx) = sync_channel(1);
-        process_mixed_batch(
-            &inner,
-            vec![
-                PendingRequest::Commit(PendingCommitRequest {
-                    plan: empty_commit_plan(7),
-                    validate: Some(Box::new(|_| Ok(()))),
-                    finish: Some(Box::new(move |result| {
-                        commit_tx.send(result).unwrap();
-                        Ok(false)
-                    })),
-                    queued_at: Instant::now(),
-                }),
-                PendingRequest::Maintenance(PendingMaintenanceRequest {
-                    plan: empty_maintenance_plan(),
-                    validate: Some(Box::new(|_| Ok(()))),
-                    finish: Some(Box::new(move |result| {
-                        maintenance_tx.send(result).unwrap();
-                        Ok(false)
-                    })),
-                    queued_at: Instant::now(),
-                }),
-            ],
-        );
+        let results = coordinator.append_records(&[record]).unwrap();
 
-        let commit = commit_rx.recv().unwrap().unwrap();
-        let maintenance = maintenance_rx.recv().unwrap().unwrap();
-        assert_eq!(*sink.batch_sizes.lock(), vec![2]);
-        assert_eq!(commit.commit_id, 1);
-        assert_eq!(maintenance.maintenance_id, 1);
-        assert_eq!(commit.durable_batch_lsn, maintenance.durable_batch_lsn);
-        assert_eq!(commit.lsn, 1);
-        assert_eq!(maintenance.lsn, 2);
+        assert_eq!(*sink.batch_sizes.lock(), vec![1]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lsn, 1);
+        let frontiers = coordinator.frontiers();
+        assert_eq!(frontiers.durable_lsn, 1);
+        assert_eq!(frontiers.durable_commit_id, 12);
+        assert_eq!(frontiers.published_lsn, 0);
+        assert_eq!(frontiers.published_commit_id, 0);
     }
 
     #[test]
-    fn maintenance_id_bootstraps_from_floor() {
-        let coordinator = JournalCoordinator::new(None);
+    fn submit_maintenance_allocates_after_durable_append() {
+        let sink = Arc::new(RecordingSink::default());
+        let appender = Arc::new(JournalAppender::new(sink.clone()));
+        let coordinator = JournalCoordinator::new(Some(appender));
         coordinator.sync_maintenance_id_with(9);
-        let result = coordinator
-            .submit_maintenance_context(empty_maintenance_plan(), |_| Ok(()))
+
+        let ctx = coordinator
+            .submit_maintenance(empty_maintenance_plan())
             .unwrap();
-        assert_eq!(result.maintenance_id, 10);
+
+        assert_eq!(*sink.batch_sizes.lock(), vec![1]);
+        assert_eq!(ctx.maintenance_id, 10);
+        assert_eq!(ctx.record.maintenance_id, 10);
+        assert_eq!(ctx.lsn, 1);
+    }
+
+    #[test]
+    fn append_failure_does_not_consume_maintenance_id() {
+        let appender = Arc::new(JournalAppender::new(Arc::new(FailOnceSink::new())));
+        let coordinator = JournalCoordinator::new(Some(appender));
+        coordinator.sync_maintenance_id_with(9);
+
+        let err = coordinator
+            .submit_maintenance(empty_maintenance_plan())
+            .unwrap_err();
+        assert!(err.to_string().contains("journal appender halted"));
+
+        assert_eq!(*coordinator.inner.next_maintenance_id.lock().unwrap(), 10);
     }
 
     #[test]
@@ -788,11 +365,10 @@ mod tests {
         let runtime = Arc::new(JournalApplyRuntime::new());
         coordinator.bind_apply_runtime(Arc::clone(&runtime));
 
+        let first_record = JournalRecord::Commit(empty_commit_plan(1).into_record(1));
+        let first_append = coordinator.append_records(&[first_record]).unwrap()[0];
         let slow_part_started = Arc::new(AtomicBool::new(false));
         let release_slow_part = Arc::new((StdMutex::new(false), Condvar::new()));
-        let first_ctx = coordinator
-            .submit_commit_context(empty_commit_plan(1), |_| Ok(()))
-            .unwrap();
         let runtime_first = Arc::clone(&runtime);
         let slow_part_started_first = Arc::clone(&slow_part_started);
         let release_slow_part_first = Arc::clone(&release_slow_part);
@@ -800,9 +376,9 @@ mod tests {
         let first = thread::spawn(move || {
             runtime_first
                 .submit(ApplyRequest {
-                    lsn: first_ctx.lsn,
-                    durable_batch_lsn: first_ctx.durable_batch_lsn,
-                    commit_id: Some(first_ctx.commit_id),
+                    lsn: first_append.lsn,
+                    durable_batch_lsn: first_append.durable_batch_lsn,
+                    commit_id: Some(1),
                     wait_mode: WaitMode::Published,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),
@@ -833,12 +409,11 @@ mod tests {
         }
         assert!(slow_part_started.load(Ordering::Acquire));
 
-        let second = coordinator
-            .submit_commit_context(empty_commit_plan(2), |_| Ok(()))
-            .unwrap();
+        let second_record = JournalRecord::Commit(empty_commit_plan(2).into_record(2));
+        let second_append = coordinator.append_records(&[second_record]).unwrap()[0];
         let stalled = coordinator.frontiers();
-        assert_eq!(stalled.durable_lsn, second.lsn);
-        assert_eq!(stalled.durable_commit_id, second.commit_id);
+        assert_eq!(stalled.durable_lsn, second_append.lsn);
+        assert_eq!(stalled.durable_commit_id, 2);
         assert_eq!(stalled.applied_lsn, 0);
         assert_eq!(stalled.published_lsn, 0);
         assert_eq!(stalled.published_commit_id, 0);
@@ -850,9 +425,9 @@ mod tests {
 
         runtime
             .submit(ApplyRequest {
-                lsn: second.lsn,
-                durable_batch_lsn: second.durable_batch_lsn,
-                commit_id: Some(second.commit_id),
+                lsn: second_append.lsn,
+                durable_batch_lsn: second_append.durable_batch_lsn,
+                commit_id: Some(2),
                 wait_mode: WaitMode::Published,
                 catalog_serial: false,
                 catalog_pre: Box::new(|| Ok(())),
@@ -864,8 +439,8 @@ mod tests {
             .unwrap();
 
         let frontiers = coordinator.frontiers();
-        assert_eq!(frontiers.applied_lsn, second.lsn);
-        assert_eq!(frontiers.published_lsn, second.lsn);
-        assert_eq!(frontiers.published_commit_id, second.commit_id);
+        assert_eq!(frontiers.applied_lsn, second_append.lsn);
+        assert_eq!(frontiers.published_lsn, second_append.lsn);
+        assert_eq!(frontiers.published_commit_id, 2);
     }
 }

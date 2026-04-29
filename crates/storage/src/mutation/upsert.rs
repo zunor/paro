@@ -2,22 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
+use super::MutationTarget;
 use crate::mutation::{deleter, updater, writer};
 use crate::primary_key::PrimaryKeySerializer;
 use crate::table::table_handle::{InsertOnConflictAction, TableHandle};
 use crate::tablet::KeysType;
-use crate::transaction::txn::Transaction;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
+use paro_transaction::TransactionView;
 
 pub(crate) fn insert_on_conflict(
+    view: &TransactionView,
     table: &TableHandle,
     chunk: &Chunk,
     action: &InsertOnConflictAction,
-    txn: Option<Arc<Transaction>>,
+    target: MutationTarget,
 ) -> Result<usize> {
     if chunk.size() == 0 {
         return Ok(0);
@@ -38,11 +39,11 @@ pub(crate) fn insert_on_conflict(
     let mut insert_rows = Vec::new();
     let mut conflict_row_ids = Vec::new();
     let mut conflict_input_rows = Vec::new();
-    let existing = tablet.lookup_primary_keys(&encoded_keys)?;
+    let existing = deleter::visible_primary_key_row_ids(view, table, &encoded_keys)?;
 
-    for (row_idx, row_id) in existing.into_iter().enumerate() {
-        if let Some(row_id) = row_id {
-            conflict_row_ids.push(row_id.to_raw());
+    for (row_idx, key) in encoded_keys.iter().enumerate() {
+        if let Some(row_id) = existing.get(key) {
+            conflict_row_ids.push(*row_id);
             conflict_input_rows.push(row_idx as u32);
         } else {
             insert_rows.push(row_idx as u32);
@@ -59,7 +60,7 @@ pub(crate) fn insert_on_conflict(
     match action {
         InsertOnConflictAction::DoNothing => {
             if let Some(insert_chunk) = insert_chunk {
-                writer::append_with_transaction(table, &insert_chunk, txn)?;
+                writer::append_with_transaction(view, table, &insert_chunk, target)?;
             }
         }
         InsertOnConflictAction::DoUpdate {
@@ -75,56 +76,80 @@ pub(crate) fn insert_on_conflict(
                 )?)
             };
 
-            if let Some(txn) = txn {
-                let mut pending_chunks = Vec::new();
-                if let Some(insert_chunk) = insert_chunk {
-                    pending_chunks.push(insert_chunk);
-                }
-
-                if let Some(conflict_chunk) = conflict_chunk {
-                    let values = extract_source_values(
-                        &conflict_chunk,
-                        source_columns,
-                        "ON CONFLICT DO UPDATE",
-                    )?;
-                    let old_rows = updater::collect_rows_by_row_ids(table, &conflict_row_ids)?;
-                    let updated_rows = updater::build_updated_rows_chunk(
-                        table,
-                        &old_rows,
-                        target_columns,
-                        &values,
-                    )?;
-                    let old_key_chunk = build_primary_key_chunk(table, &old_rows)?;
-                    let removed =
-                        deleter::delete_by_primary_keys(table, &old_key_chunk, Some(txn.clone()))?;
-                    if removed != conflict_row_ids.len() {
-                        return Err(paro_error::internal(format!(
-                            "ON CONFLICT DO UPDATE removed {} rows but expected {}",
-                            removed,
-                            conflict_row_ids.len()
-                        )));
+            match target {
+                MutationTarget::Transaction(txn) => {
+                    let mut pending_chunks = Vec::new();
+                    if let Some(insert_chunk) = insert_chunk {
+                        pending_chunks.push(insert_chunk);
                     }
-                    pending_chunks.push(updated_rows);
-                    affected += conflict_row_ids.len();
-                }
 
-                if !pending_chunks.is_empty() {
-                    let combined = concatenate_flat_chunks(&pending_chunks)?;
-                    writer::append_with_transaction(table, &combined, Some(txn))?;
-                }
-            } else {
-                if let Some(insert_chunk) = insert_chunk {
-                    writer::append_with_transaction(table, &insert_chunk, None)?;
-                }
+                    if let Some(conflict_chunk) = conflict_chunk {
+                        let values = extract_source_values(
+                            &conflict_chunk,
+                            source_columns,
+                            "ON CONFLICT DO UPDATE",
+                        )?;
+                        let old_rows =
+                            updater::collect_rows_by_row_ids(view, table, &conflict_row_ids)?;
+                        let updated_rows = updater::build_updated_rows_chunk(
+                            table,
+                            &old_rows,
+                            target_columns,
+                            &values,
+                        )?;
+                        let old_key_chunk = build_primary_key_chunk(table, &old_rows)?;
+                        let removed = deleter::delete_by_primary_keys(
+                            view,
+                            table,
+                            &old_key_chunk,
+                            MutationTarget::Transaction(txn.clone()),
+                        )?;
+                        if removed != conflict_row_ids.len() {
+                            return Err(paro_error::internal(format!(
+                                "ON CONFLICT DO UPDATE removed {} rows but expected {}",
+                                removed,
+                                conflict_row_ids.len()
+                            )));
+                        }
+                        pending_chunks.push(updated_rows);
+                        affected += conflict_row_ids.len();
+                    }
 
-                if let Some(conflict_chunk) = conflict_chunk {
-                    let values = extract_source_values(
-                        &conflict_chunk,
-                        source_columns,
-                        "ON CONFLICT DO UPDATE",
-                    )?;
-                    affected +=
-                        updater::update(table, &conflict_row_ids, target_columns, &values, None)?;
+                    if !pending_chunks.is_empty() {
+                        let combined = concatenate_flat_chunks(&pending_chunks)?;
+                        writer::append_with_transaction(
+                            view,
+                            table,
+                            &combined,
+                            MutationTarget::Transaction(txn),
+                        )?;
+                    }
+                }
+                MutationTarget::Direct => {
+                    if let Some(insert_chunk) = insert_chunk {
+                        writer::append_with_transaction(
+                            view,
+                            table,
+                            &insert_chunk,
+                            MutationTarget::Direct,
+                        )?;
+                    }
+
+                    if let Some(conflict_chunk) = conflict_chunk {
+                        let values = extract_source_values(
+                            &conflict_chunk,
+                            source_columns,
+                            "ON CONFLICT DO UPDATE",
+                        )?;
+                        affected += updater::update(
+                            view,
+                            table,
+                            &conflict_row_ids,
+                            target_columns,
+                            &values,
+                            MutationTarget::Direct,
+                        )?;
+                    }
                 }
             }
         }

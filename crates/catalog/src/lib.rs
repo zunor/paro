@@ -10,3 +10,4 @@ pub mod entry;
 pub mod mvcc;
 pub(crate) mod schema;
 pub mod search_path;
+pub mod transaction;

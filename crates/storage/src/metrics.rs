@@ -51,10 +51,6 @@ pub struct StorageMetricsSnapshot {
     pub decompress_parallel_tasks: u64,
     pub decompress_parallelism_last: u64,
     pub decompress_parallelism_peak: u64,
-    pub wal_replay_entries: u64,
-    pub wal_replay_bytes: u64,
-    pub wal_truncate_bytes: u64,
-    pub wal_recovery_mode: u64,
     pub checkpoint_capture_optimistic_total: u64,
     pub checkpoint_capture_meta_lock_total: u64,
     pub checkpoint_capture_retry_total: u64,
@@ -65,6 +61,13 @@ pub struct StorageMetricsSnapshot {
     pub graph_delta_hits: u64,
     pub graph_rebuild_latency_ns: u64,
     pub graph_rebuild_count: u64,
+    pub derived_index_lag_ts: u64,
+    pub derived_delta_merge_cost: u64,
+    pub txn_spill_bytes: u64,
+    pub txn_spill_artifacts: u64,
+    pub txn_spill_wait_us: u64,
+    pub txn_spill_admission_rejects: u64,
+    pub txn_spill_device_pressure_rejects: u64,
 }
 
 impl StorageMetricsSnapshot {
@@ -122,10 +125,6 @@ pub struct StorageMetrics {
     decompress_parallel_tasks: AtomicU64,
     decompress_parallelism_last: AtomicU64,
     decompress_parallelism_peak: AtomicU64,
-    wal_replay_entries: AtomicU64,
-    wal_replay_bytes: AtomicU64,
-    wal_truncate_bytes: AtomicU64,
-    wal_recovery_mode: AtomicU64,
     checkpoint_capture_optimistic_total: AtomicU64,
     checkpoint_capture_meta_lock_total: AtomicU64,
     checkpoint_capture_retry_total: AtomicU64,
@@ -136,6 +135,13 @@ pub struct StorageMetrics {
     graph_delta_hits: AtomicU64,
     graph_rebuild_latency_ns: AtomicU64,
     graph_rebuild_count: AtomicU64,
+    derived_index_lag_ts: AtomicU64,
+    derived_delta_merge_cost: AtomicU64,
+    txn_spill_bytes: AtomicU64,
+    txn_spill_artifacts: AtomicU64,
+    txn_spill_wait_us: AtomicU64,
+    txn_spill_admission_rejects: AtomicU64,
+    txn_spill_device_pressure_rejects: AtomicU64,
 }
 
 impl StorageMetrics {
@@ -313,31 +319,6 @@ impl StorageMetrics {
             .fetch_max(workers, Ordering::Relaxed);
     }
 
-    /// Record WAL replay progress in entries and bytes.
-    pub fn add_wal_replay(&self, entries: u64, bytes: u64) {
-        if entries > 0 {
-            self.wal_replay_entries
-                .fetch_add(entries, Ordering::Relaxed);
-        }
-        if bytes > 0 {
-            self.wal_replay_bytes.fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-
-    /// Record physically reclaimed WAL bytes due to truncation.
-    pub fn add_wal_truncate_bytes(&self, bytes: u64) {
-        if bytes > 0 {
-            self.wal_truncate_bytes.fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-
-    /// Set the last observed WAL recovery mode as an integer gauge.
-    ///
-    /// Mode values are defined by `wal::recovery::WalRecoveryMode::as_metric_value()`.
-    pub fn set_wal_recovery_mode(&self, mode: u64) {
-        self.wal_recovery_mode.store(mode, Ordering::Relaxed);
-    }
-
     /// Record one checkpoint tablet freeze capture and any optimistic retries
     /// that were invalidated before the final snapshot mode succeeded.
     pub fn record_checkpoint_capture(&self, used_meta_lock: bool, retries: usize) {
@@ -384,6 +365,46 @@ impl StorageMetrics {
         self.graph_rebuild_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the highest commit timestamp whose derived search/graph publish
+    /// still needs retry or catch-up. Core storage/catalog visibility is not
+    /// gated by this gauge.
+    pub fn record_derived_index_lag_ts(&self, commit_ts: u64) {
+        self.derived_index_lag_ts
+            .fetch_max(commit_ts, Ordering::Relaxed);
+    }
+
+    /// Record the highest observed derived-index delta merge cost on read
+    /// paths. The value is the planner's composite latency weight.
+    pub fn record_derived_delta_merge_cost(&self, cost: u64) {
+        self.derived_delta_merge_cost
+            .fetch_max(cost, Ordering::Relaxed);
+    }
+
+    pub fn add_txn_spill_bytes(&self, bytes: u64) {
+        if bytes > 0 {
+            self.txn_spill_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn inc_txn_spill_artifacts(&self) {
+        self.txn_spill_artifacts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_txn_spill_wait_time(&self, duration: std::time::Duration) {
+        self.txn_spill_wait_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn inc_txn_spill_admission_rejects(&self) {
+        self.txn_spill_admission_rejects
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_txn_spill_device_pressure_rejects(&self) {
+        self.txn_spill_device_pressure_rejects
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a consistent snapshot of all metrics.
     pub fn snapshot(&self) -> StorageMetricsSnapshot {
         let mut tag_bytes = [0i64; MEMORY_TAG_COUNT];
@@ -426,10 +447,6 @@ impl StorageMetrics {
             decompress_parallel_tasks: self.decompress_parallel_tasks.load(Ordering::Relaxed),
             decompress_parallelism_last: self.decompress_parallelism_last.load(Ordering::Relaxed),
             decompress_parallelism_peak: self.decompress_parallelism_peak.load(Ordering::Relaxed),
-            wal_replay_entries: self.wal_replay_entries.load(Ordering::Relaxed),
-            wal_replay_bytes: self.wal_replay_bytes.load(Ordering::Relaxed),
-            wal_truncate_bytes: self.wal_truncate_bytes.load(Ordering::Relaxed),
-            wal_recovery_mode: self.wal_recovery_mode.load(Ordering::Relaxed),
             checkpoint_capture_optimistic_total: self
                 .checkpoint_capture_optimistic_total
                 .load(Ordering::Relaxed),
@@ -446,6 +463,15 @@ impl StorageMetrics {
             graph_delta_hits: self.graph_delta_hits.load(Ordering::Relaxed),
             graph_rebuild_latency_ns: self.graph_rebuild_latency_ns.load(Ordering::Relaxed),
             graph_rebuild_count: self.graph_rebuild_count.load(Ordering::Relaxed),
+            derived_index_lag_ts: self.derived_index_lag_ts.load(Ordering::Relaxed),
+            derived_delta_merge_cost: self.derived_delta_merge_cost.load(Ordering::Relaxed),
+            txn_spill_bytes: self.txn_spill_bytes.load(Ordering::Relaxed),
+            txn_spill_artifacts: self.txn_spill_artifacts.load(Ordering::Relaxed),
+            txn_spill_wait_us: self.txn_spill_wait_us.load(Ordering::Relaxed),
+            txn_spill_admission_rejects: self.txn_spill_admission_rejects.load(Ordering::Relaxed),
+            txn_spill_device_pressure_rejects: self
+                .txn_spill_device_pressure_rejects
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -488,10 +514,6 @@ impl StorageMetrics {
         self.decompress_parallel_tasks.store(0, Ordering::Relaxed);
         self.decompress_parallelism_last.store(0, Ordering::Relaxed);
         self.decompress_parallelism_peak.store(0, Ordering::Relaxed);
-        self.wal_replay_entries.store(0, Ordering::Relaxed);
-        self.wal_replay_bytes.store(0, Ordering::Relaxed);
-        self.wal_truncate_bytes.store(0, Ordering::Relaxed);
-        self.wal_recovery_mode.store(0, Ordering::Relaxed);
         self.checkpoint_capture_optimistic_total
             .store(0, Ordering::Relaxed);
         self.checkpoint_capture_meta_lock_total
@@ -505,6 +527,14 @@ impl StorageMetrics {
         self.graph_delta_hits.store(0, Ordering::Relaxed);
         self.graph_rebuild_latency_ns.store(0, Ordering::Relaxed);
         self.graph_rebuild_count.store(0, Ordering::Relaxed);
+        self.derived_index_lag_ts.store(0, Ordering::Relaxed);
+        self.derived_delta_merge_cost.store(0, Ordering::Relaxed);
+        self.txn_spill_bytes.store(0, Ordering::Relaxed);
+        self.txn_spill_artifacts.store(0, Ordering::Relaxed);
+        self.txn_spill_wait_us.store(0, Ordering::Relaxed);
+        self.txn_spill_admission_rejects.store(0, Ordering::Relaxed);
+        self.txn_spill_device_pressure_rejects
+            .store(0, Ordering::Relaxed);
     }
 }
 
@@ -548,9 +578,6 @@ mod tests {
         m.add_delta_writer_commit_time(std::time::Duration::from_nanos(10));
         m.add_delta_writer_flush_time(std::time::Duration::from_nanos(20));
         m.record_parallel_decompress(4, 16);
-        m.add_wal_replay(3, 512);
-        m.add_wal_truncate_bytes(128);
-        m.set_wal_recovery_mode(2);
         m.record_checkpoint_capture(false, 2);
         m.record_checkpoint_capture(true, 1);
         m.add_graph_expand_rows(7);
@@ -559,6 +586,9 @@ mod tests {
         m.record_graph_delta_lookup(true);
         m.record_graph_delta_lookup(false);
         m.add_graph_rebuild_latency(std::time::Duration::from_nanos(80));
+        m.record_derived_index_lag_ts(42);
+        m.record_derived_delta_merge_cost(128);
+        m.record_derived_delta_merge_cost(64);
 
         let snap = m.snapshot();
         assert_eq!(snap.memory_tag_total, 1024);
@@ -584,10 +614,6 @@ mod tests {
         assert_eq!(snap.decompress_parallel_tasks, 16);
         assert_eq!(snap.decompress_parallelism_last, 4);
         assert_eq!(snap.decompress_parallelism_peak, 4);
-        assert_eq!(snap.wal_replay_entries, 3);
-        assert_eq!(snap.wal_replay_bytes, 512);
-        assert_eq!(snap.wal_truncate_bytes, 128);
-        assert_eq!(snap.wal_recovery_mode, 2);
         assert_eq!(snap.checkpoint_capture_optimistic_total, 1);
         assert_eq!(snap.checkpoint_capture_meta_lock_total, 1);
         assert_eq!(snap.checkpoint_capture_retry_total, 3);
@@ -598,6 +624,8 @@ mod tests {
         assert_eq!(snap.graph_delta_hits, 1);
         assert_eq!(snap.graph_rebuild_latency_ns, 80);
         assert_eq!(snap.graph_rebuild_count, 1);
+        assert_eq!(snap.derived_index_lag_ts, 42);
+        assert_eq!(snap.derived_delta_merge_cost, 128);
         assert!((snap.graph_delta_hit_ratio() - 0.5).abs() < f64::EPSILON);
         assert_eq!(snap.graph_rebuild_latency_avg_ns(), 80);
     }

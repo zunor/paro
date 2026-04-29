@@ -4,6 +4,8 @@
 use crate::WriteClass;
 use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
 use paro_common::error::{self as paro_error, Result};
+use paro_transaction::{LockMode, LockNamespace, LockRequest, LockResource, TableId};
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,15 @@ impl DdlExecutionProfile {
             mixed_dml: MixedDmlPolicy::Deny,
         }
     }
+
+    pub fn lock_requests(
+        self,
+        namespace: LockNamespace,
+        object: &DdlObjectKey,
+        dml_targets: &[DdlObjectKey],
+    ) -> Vec<LockRequest> {
+        ddl_lock_requests(namespace, self, object, dml_targets)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +140,172 @@ struct TxnAdmissionInner {
 #[derive(Debug, Default)]
 pub struct TxnAdmissionState {
     inner: Mutex<TxnAdmissionInner>,
+}
+
+pub fn dml_table_lock_requests(
+    namespace: LockNamespace,
+    target: &DdlObjectKey,
+) -> Vec<LockRequest> {
+    vec![
+        LockRequest::new(
+            schema_resource(namespace, target),
+            LockMode::SchemaStability,
+        ),
+        LockRequest::new(table_resource(namespace, target), LockMode::IX),
+    ]
+}
+
+pub fn ddl_lock_requests(
+    namespace: LockNamespace,
+    profile: DdlExecutionProfile,
+    object: &DdlObjectKey,
+    dml_targets: &[DdlObjectKey],
+) -> Vec<LockRequest> {
+    let mut requests = Vec::with_capacity(2 + dml_targets.len() * 2);
+    match profile.catalog {
+        CatalogEffect::CreateOwnedObject => {
+            requests.push(LockRequest::new(
+                schema_resource(namespace, object),
+                LockMode::IX,
+            ));
+            if object.kind == DdlObjectKind::Table {
+                requests.push(LockRequest::new(
+                    table_resource(namespace, object),
+                    LockMode::X,
+                ));
+            } else {
+                requests.push(LockRequest::new(
+                    catalog_object_resource(namespace, object),
+                    LockMode::X,
+                ));
+            }
+        }
+        CatalogEffect::DropOwnedObject | CatalogEffect::CascadeDropContainer => {
+            if object.kind == DdlObjectKind::Schema {
+                requests.push(LockRequest::new(
+                    schema_resource(namespace, object),
+                    LockMode::SchemaModification,
+                ));
+            } else if object.kind == DdlObjectKind::Table {
+                requests.push(LockRequest::new(
+                    table_resource(namespace, object),
+                    LockMode::X,
+                ));
+            } else {
+                requests.push(LockRequest::new(
+                    catalog_object_resource(namespace, object),
+                    LockMode::X,
+                ));
+            }
+        }
+        CatalogEffect::AttachSubobject | CatalogEffect::DetachSubobject => {
+            requests.push(LockRequest::new(
+                catalog_object_resource(namespace, object),
+                LockMode::X,
+            ));
+            for target in dml_targets {
+                requests.push(LockRequest::new(
+                    schema_resource(namespace, target),
+                    LockMode::SchemaStability,
+                ));
+                requests.push(LockRequest::new(
+                    table_resource(namespace, target),
+                    LockMode::SchemaStability,
+                ));
+            }
+        }
+        CatalogEffect::AlterExistingObject => {
+            if object.kind == DdlObjectKind::Table {
+                requests.push(LockRequest::new(
+                    table_resource(namespace, object),
+                    LockMode::X,
+                ));
+            } else if object.kind == DdlObjectKind::Schema {
+                requests.push(LockRequest::new(
+                    schema_resource(namespace, object),
+                    LockMode::SchemaModification,
+                ));
+            } else {
+                requests.push(LockRequest::new(
+                    catalog_object_resource(namespace, object),
+                    LockMode::X,
+                ));
+            }
+        }
+        CatalogEffect::MetadataOnly => {
+            requests.push(LockRequest::new(
+                catalog_object_resource(namespace, object),
+                LockMode::X,
+            ));
+        }
+    }
+
+    match profile.runtime {
+        RuntimeEffect::None => {}
+        RuntimeEffect::AttachIndexState | RuntimeEffect::DetachIndexState => {
+            requests.push(LockRequest::new(
+                runtime_resource(namespace, object, 1),
+                LockMode::X,
+            ));
+        }
+        RuntimeEffect::RegisterGraphRuntime | RuntimeEffect::UnregisterGraphRuntime => {
+            requests.push(LockRequest::new(
+                runtime_resource(namespace, object, 2),
+                LockMode::X,
+            ));
+            for target in dml_targets {
+                requests.push(LockRequest::new(
+                    table_resource(namespace, target),
+                    LockMode::SchemaStability,
+                ));
+            }
+        }
+    }
+
+    requests.sort_by(|left, right| left.resource.cmp(&right.resource));
+    requests.dedup_by(|left, right| {
+        if left.resource == right.resource {
+            left.mode = left.mode.strongest(right.mode);
+            true
+        } else {
+            false
+        }
+    });
+    requests
+}
+
+pub fn schema_resource(namespace: LockNamespace, object: &DdlObjectKey) -> LockResource {
+    LockResource::Schema {
+        namespace,
+        schema_id: hash_schema(object),
+    }
+}
+
+pub fn table_resource(namespace: LockNamespace, object: &DdlObjectKey) -> LockResource {
+    LockResource::Table {
+        namespace,
+        table_id: TableId::new(hash_object_key(object)),
+    }
+}
+
+pub fn catalog_object_resource(namespace: LockNamespace, object: &DdlObjectKey) -> LockResource {
+    LockResource::CatalogObject {
+        namespace,
+        object_kind: object_kind_id(&object.kind),
+        object_id: hash_object_key(object),
+    }
+}
+
+fn runtime_resource(
+    namespace: LockNamespace,
+    object: &DdlObjectKey,
+    runtime_kind: u16,
+) -> LockResource {
+    LockResource::CatalogObject {
+        namespace,
+        object_kind: 10_000 + runtime_kind,
+        object_id: hash_object_key(object),
+    }
 }
 
 impl TxnAdmissionState {
@@ -233,6 +410,51 @@ fn same_object(left: &DdlObjectKey, right: &DdlObjectKey) -> bool {
         && left.name.eq_ignore_ascii_case(&right.name)
 }
 
+fn hash_schema(object: &DdlObjectKey) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    object.database.to_ascii_lowercase().hash(&mut hasher);
+    object
+        .schema
+        .as_deref()
+        .unwrap_or_else(|| {
+            if object.kind == DdlObjectKind::Schema {
+                &object.name
+            } else {
+                "public"
+            }
+        })
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_object_key(object: &DdlObjectKey) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    object.database.to_ascii_lowercase().hash(&mut hasher);
+    object
+        .schema
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    object.name.to_ascii_lowercase().hash(&mut hasher);
+    object_kind_id(&object.kind).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn object_kind_id(kind: &DdlObjectKind) -> u16 {
+    match kind {
+        DdlObjectKind::Schema => 1,
+        DdlObjectKind::Table => 2,
+        DdlObjectKind::View => 3,
+        DdlObjectKind::Index => 4,
+        DdlObjectKind::Sequence => 5,
+        DdlObjectKind::Routine => 6,
+        DdlObjectKind::PropertyGraph => 7,
+        DdlObjectKind::Database => 8,
+    }
+}
+
 fn describe_table(target: &DdlObjectKey) -> String {
     match target.kind {
         DdlObjectKind::Table => {
@@ -260,9 +482,14 @@ fn describe_object(target: &DdlObjectKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_transaction::{DatabaseId, LockNamespace};
 
     fn table(name: &str) -> DdlObjectKey {
         DdlObjectKey::new("main", Some("public"), name, DdlObjectKind::Table)
+    }
+
+    fn ns() -> LockNamespace {
+        LockNamespace::single_tenant(DatabaseId::new(1))
     }
 
     #[test]
@@ -317,5 +544,37 @@ mod tests {
         state
             .admit_table_dml(WriteClass::HasDdl, &table("t2"), false)
             .unwrap();
+    }
+
+    #[test]
+    fn create_table_profile_derives_schema_intent_and_table_x_locks() {
+        let requests = DdlExecutionProfile::create_owned_object().lock_requests(
+            ns(),
+            &table("t1"),
+            &[table("t1")],
+        );
+
+        assert!(requests.iter().any(|request| matches!(
+            request.resource,
+            LockResource::Schema { .. }
+        ) && request.mode == LockMode::IX));
+        assert!(requests.iter().any(|request| request.resource
+            == table_resource(ns(), &table("t1"))
+            && request.mode == LockMode::X));
+    }
+
+    #[test]
+    fn attach_index_profile_derives_table_schema_stability_lock() {
+        let index = DdlObjectKey::new("main", Some("public"), "idx_t1", DdlObjectKind::Index);
+        let requests =
+            DdlExecutionProfile::attach_index_state().lock_requests(ns(), &index, &[table("t1")]);
+
+        assert!(requests.iter().any(|request| request.resource
+            == table_resource(ns(), &table("t1"))
+            && request.mode == LockMode::SchemaStability));
+        assert!(requests.iter().any(|request| matches!(
+            request.resource,
+            LockResource::CatalogObject { .. }
+        ) && request.mode == LockMode::X));
     }
 }

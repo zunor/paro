@@ -95,6 +95,8 @@ pub struct GraphManifest {
     updated_at_epoch_ms: u64,
     #[serde(default)]
     last_rebuild_epoch_ms: u64,
+    #[serde(default)]
+    indexed_through_ts: u64,
     vertices: Vec<VertexFileMeta>,
     edges: Vec<EdgeFileMeta>,
     #[serde(default)]
@@ -541,6 +543,7 @@ impl GraphManifest {
             created_at_epoch_ms: now,
             updated_at_epoch_ms: now,
             last_rebuild_epoch_ms: now,
+            indexed_through_ts: 0,
             vertices: Vec::new(),
             edges: Vec::new(),
             statistics: None,
@@ -579,6 +582,12 @@ impl GraphManifest {
         self
     }
 
+    pub fn with_indexed_through_ts(mut self, indexed_through_ts: u64) -> Self {
+        self.updated_at_epoch_ms = current_time_millis();
+        self.indexed_through_ts = indexed_through_ts;
+        self
+    }
+
     pub fn with_state(mut self, state: GraphState) -> Self {
         self.updated_at_epoch_ms = current_time_millis();
         self.state = state;
@@ -607,6 +616,10 @@ impl GraphManifest {
         } else {
             self.last_rebuild_epoch_ms
         }
+    }
+
+    pub fn indexed_through_ts(&self) -> u64 {
+        self.indexed_through_ts
     }
 
     pub fn statistics(&self) -> Option<&GraphStatistics> {
@@ -846,10 +859,12 @@ mod tests {
             GraphState::Ready,
             "fp:test".to_string(),
         )
+        .with_indexed_through_ts(77)
         .with_statistics(GraphStatistics::from_build_input(&input));
         index.save_with_manifest(temp_dir.path(), manifest).unwrap();
 
         let manifest = GraphProjectionIndex::load_manifest(temp_dir.path()).unwrap();
+        assert_eq!(manifest.indexed_through_ts(), 77);
         let stats = manifest.statistics().expect("statistics should exist");
         assert_eq!(stats.vertex_count("Person"), Some(3));
         assert_eq!(stats.edge_count("WorksAt"), Some(3));

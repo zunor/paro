@@ -12,8 +12,8 @@ use paro_common::ddl::CreateTablePayload;
 use paro_common::error as paro_error;
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
+use paro_journal::wal::wal_entry::{ColumnInfo, TableConstraintInfo, WalConstraintType};
 use paro_storage::table::table_factory::TableFactory;
-use paro_storage::wal::wal_entry::{ColumnInfo, TableConstraintInfo, WalConstraintType};
 use std::sync::Arc;
 
 impl<'a> CatalogReplayHandler<'a> {

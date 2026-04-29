@@ -3,8 +3,8 @@
 
 use crate::transaction::txn::Transaction;
 use crate::transaction::undo_buffer::{
-    ActiveTransactionState, CommitMode, UndoAppendInfo, UndoDeleteInfo, UndoEntry, UndoFlags,
-    UndoPayload, UndoUpdateInfo,
+    unsupported_raw_undo_entry, ActiveTransactionState, CommitMode, UndoAppendInfo, UndoDeleteInfo,
+    UndoEntry, UndoFlags, UndoPayload, UndoUpdateInfo,
 };
 
 /// Index removal type for commit and cleanup operations.
@@ -232,34 +232,11 @@ impl<'a> CommitState<'a> {
     /// }
     /// ```
     pub fn commit_entry(&mut self, flags: UndoFlags, data: *const u8) {
-        if self.commit_mode == CommitMode::RevertCommit {
-            self.revert_commit(flags, data);
-            return;
-        }
-
-        match flags {
-            UndoFlags::InsertTuple => {
-                // auto info = reinterpret_cast<AppendInfo *>(data);
-                // info->table->CommitAppend(commit_id, info->start_row, info->count);
-                //
-                // In Paro, this would update the version info for the inserted rows
-                // to mark them as committed with commit_id.
-            }
-            UndoFlags::DeleteTuple => {
-                // This marks deleted rows as permanently deleted and updates indexes.
-                //
-                // In Paro, we would:
-                // 1. Call version_info.commit_delete(vector_idx, commit_id, info)
-                // 2. Call index_data_remover.push_delete(info)
-            }
-            UndoFlags::UpdateTuple => {
-                // This finalizes the update by setting the version number.
-            }
-            UndoFlags::SequenceValue | UndoFlags::DatabaseAttach | UndoFlags::EmptyEntry => {
-                // No action needed for these types
-            }
-        }
-        let _ = data; // Suppress unused warning until full implementation
+        let operation = match self.commit_mode {
+            CommitMode::Commit => "commit",
+            CommitMode::RevertCommit => "revert-commit",
+        };
+        unsupported_raw_undo_entry(operation, flags, data);
     }
 
     /// Commit a high-level UndoEntry.
@@ -342,36 +319,6 @@ impl<'a> CommitState<'a> {
         // Set the version number of the update to commit_id,
         // making it visible to other transactions.
         let _ = info; // Will be used when storage integration is complete
-    }
-
-    /// Revert a commit for a raw entry (used when commit fails partway).
-    ///
-    /// ```cpp
-    /// void CommitState::RevertCommit(UndoFlags type, data_ptr_t data) {
-    ///     transaction_t transaction_id = commit_id;
-    ///     switch (type) {
-    ///     case UndoFlags::CATALOG_ENTRY: { ... }
-    ///     case UndoFlags::INSERT_TUPLE: { ... }
-    ///     case UndoFlags::DELETE_TUPLE: { ... }
-    ///     case UndoFlags::UPDATE_TUPLE: { ... }
-    ///     }
-    /// }
-    /// ```
-    pub fn revert_commit(&mut self, flags: UndoFlags, data: *const u8) {
-        let _transaction_id = self.commit_id;
-        match flags {
-            UndoFlags::InsertTuple => {
-                // Revert the append
-            }
-            UndoFlags::DeleteTuple => {
-                // Revert delete commit (write transaction_id back)
-            }
-            UndoFlags::UpdateTuple => {
-                // Revert update version number
-            }
-            _ => {}
-        }
-        let _ = data;
     }
 
     /// Revert a commit for a high-level entry.

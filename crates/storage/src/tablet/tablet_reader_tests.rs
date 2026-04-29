@@ -28,6 +28,22 @@ fn create_test_schema() -> TabletSchemaRef {
     Arc::new(TabletSchema::new(1, columns, KeysType::PrimaryKeys).unwrap())
 }
 
+fn create_old_id_only_schema() -> TabletSchemaRef {
+    let columns = vec![TabletColumn::key(0, "id", LogicalType::BigInt)];
+    Arc::new(TabletSchema::with_version(1, 1, columns, KeysType::PrimaryKeys).unwrap())
+}
+
+fn create_schema_with_default_value_column(default_value: i32) -> TabletSchemaRef {
+    let columns = vec![
+        TabletColumn::key(0, "id", LogicalType::BigInt),
+        TabletColumn::new(1, "name", LogicalType::Varchar),
+        TabletColumn::new(2, "value", LogicalType::Integer)
+            .with_nullable(false)
+            .with_default(default_value.to_le_bytes().to_vec()),
+    ];
+    Arc::new(TabletSchema::with_version(1, 2, columns, KeysType::PrimaryKeys).unwrap())
+}
+
 fn create_extended_type_schema() -> TabletSchemaRef {
     let mut columns = vec![
         TabletColumn::new(0, "tiny", LogicalType::TinyInt),
@@ -856,5 +872,95 @@ fn test_tablet_reader_missing_column_projection() {
     assert!(col1.is_null(0));
     assert!(col1.is_null(1));
     assert!(col1.is_null(2));
+    assert!(reader.get_next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn test_tablet_reader_adapts_added_nullable_column_from_old_rowset() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let old_schema = create_old_id_only_schema();
+    let current_schema = create_test_schema();
+    let rowset_dir = base.join("rowset_old_nullable");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment_path = rowset_dir.join("0.dat");
+    let segment =
+        create_segment_with_values_column0_only(&old_schema, 0, &[1, 2, 3], &segment_path);
+
+    let meta = RowsetMetaBuilder::with_id(1, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .schema_hash(11)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(old_schema, meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, current_schema, base, None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let params = TabletReaderParams::with_version(0)
+        .with_columns(vec![2])
+        .with_batch_size(10);
+    let mut reader = TabletReader::new(tablet, params).unwrap();
+    reader.prepare().unwrap();
+
+    let chunk = reader
+        .get_next_chunk()
+        .unwrap()
+        .expect("chunk should exist");
+    assert_eq!(chunk.column_count(), 1);
+    assert_eq!(chunk.len(), 3);
+    let col = &chunk.data[0];
+    assert!(col.is_null(0));
+    assert!(col.is_null(1));
+    assert!(col.is_null(2));
+    assert!(reader.get_next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn test_tablet_reader_adapts_added_default_column_from_old_rowset() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let old_schema = create_old_id_only_schema();
+    let current_schema = create_schema_with_default_value_column(7);
+    let rowset_dir = base.join("rowset_old_default");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment_path = rowset_dir.join("0.dat");
+    let segment =
+        create_segment_with_values_column0_only(&old_schema, 0, &[1, 2, 3], &segment_path);
+
+    let meta = RowsetMetaBuilder::with_id(1, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .schema_hash(11)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(old_schema, meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, current_schema, base, None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let params = TabletReaderParams::with_version(0)
+        .with_columns(vec![2])
+        .with_batch_size(10);
+    let mut reader = TabletReader::new(tablet, params).unwrap();
+    reader.prepare().unwrap();
+
+    let chunk = reader
+        .get_next_chunk()
+        .unwrap()
+        .expect("chunk should exist");
+    assert_eq!(chunk.column_count(), 1);
+    assert_eq!(chunk.len(), 3);
+    let col = &chunk.data[0];
+    assert_eq!(col.get_i32(0), Some(7));
+    assert_eq!(col.get_i32(1), Some(7));
+    assert_eq!(col.get_i32(2), Some(7));
     assert!(reader.get_next_chunk().unwrap().is_none());
 }

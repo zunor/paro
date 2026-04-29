@@ -14,7 +14,8 @@ use paro_parser::ast::Statement;
 
 use super::plan_cache::PlanCacheMode;
 use super::portal::{
-    values_to_text, CursorHoldability, FormatCode, PortalExecutionState, ScrollMode,
+    values_to_text, CursorHoldability, FormatCode, PortalExecutionState, PortalSnapshotRetention,
+    ScrollMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,9 @@ pub struct PreparedStatementEntry {
 #[derive(Debug, Clone)]
 pub enum PortalKind {
     Compiled(Box<CompiledStatement>),
+    Query {
+        parameter_env: TypedParameterEnv,
+    },
     Utility(Box<UtilityCommand>),
     ClientCopy {
         stmt: Box<Statement>,
@@ -73,6 +77,7 @@ pub struct PortalEntry {
     pub result_schema: Vec<ResultColumnDesc>,
     pub kind: PortalKind,
     pub execution_state: PortalExecutionState,
+    pub snapshot_retention: Option<PortalSnapshotRetention>,
     pub completion: Option<StatementCompletion>,
     pub dependency_epoch: u64,
     pub created_generation: u64,
@@ -340,6 +345,7 @@ mod tests {
                 parameter_env: TypedParameterEnv::default(),
             },
             execution_state: PortalExecutionState::Ready,
+            snapshot_retention: None,
             completion: None,
             dependency_epoch: 0,
             created_generation: 0,

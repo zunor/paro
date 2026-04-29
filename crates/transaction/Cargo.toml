@@ -1,0 +1,27 @@
+[package]
+name = "paro-transaction"
+version = { workspace = true }
+edition = { workspace = true }
+
+[features]
+default = ["runtime"]
+types-only = []
+runtime = ["dep:parking_lot"]
+
+[dependencies]
+parking_lot = { workspace = true, optional = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+name = "registry"
+harness = false
+
+[[bench]]
+name = "lock_manager"
+harness = false
+
+[[bench]]
+name = "commit_sequencer"
+harness = false

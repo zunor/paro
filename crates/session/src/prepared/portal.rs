@@ -1,10 +1,13 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::FetchDirection;
+use paro_transaction::{ReadSnapshot, ReadSnapshotLease, ReadSnapshotLeaseOwner, ReadTs};
 
 use crate::result::retained_store::SessionRetainedResultStore;
 
@@ -24,6 +27,91 @@ pub enum ScrollMode {
 pub enum FormatCode {
     Text,
     Binary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalSnapshotRetentionPolicy {
+    Materialized,
+    Pinned,
+    TimeoutMaterialize,
+    RequireClose,
+}
+
+impl PortalSnapshotRetentionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Materialized => "materialized",
+            Self::Pinned => "pinned",
+            Self::TimeoutMaterialize => "timeout_materialize",
+            Self::RequireClose => "require_close",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PortalSnapshotRetention {
+    read_ts: ReadTs,
+    policy: PortalSnapshotRetentionPolicy,
+    lease: Option<Arc<ReadSnapshotLease>>,
+}
+
+impl PortalSnapshotRetention {
+    pub fn materialized(read_ts: ReadTs) -> Self {
+        Self {
+            read_ts,
+            policy: PortalSnapshotRetentionPolicy::Materialized,
+            lease: None,
+        }
+    }
+
+    pub fn pinned(snapshot: &ReadSnapshot, session_id: u64, portal_id: impl AsRef<str>) -> Self {
+        let lease = snapshot.lease();
+        if let Some(lease) = &lease {
+            lease.bind_owner(ReadSnapshotLeaseOwner::for_portal(
+                session_id,
+                portal_id.as_ref(),
+            ));
+        }
+        Self {
+            read_ts: snapshot.read_ts(),
+            policy: if lease.is_some() {
+                PortalSnapshotRetentionPolicy::Pinned
+            } else {
+                PortalSnapshotRetentionPolicy::Materialized
+            },
+            lease,
+        }
+    }
+
+    pub fn with_policy(mut self, policy: PortalSnapshotRetentionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    #[inline]
+    pub fn read_ts(&self) -> ReadTs {
+        self.read_ts
+    }
+
+    #[inline]
+    pub fn policy(&self) -> PortalSnapshotRetentionPolicy {
+        self.policy
+    }
+
+    #[inline]
+    pub fn lease(&self) -> Option<&Arc<ReadSnapshotLease>> {
+        self.lease.as_ref()
+    }
+
+    pub fn pin_duration_us(&self) -> Option<u64> {
+        self.lease
+            .as_ref()
+            .map(|lease| u64::try_from(lease.pinned_duration().as_micros()).unwrap_or(u64::MAX))
+    }
+
+    pub fn owner(&self) -> Option<ReadSnapshotLeaseOwner> {
+        self.lease.as_ref().map(|lease| lease.owner())
+    }
 }
 
 #[derive(Clone)]
@@ -296,5 +384,39 @@ fn relative_range(base: i64, offset: i64, total: i64) -> (i64, i64, i64) {
         (if offset > 0 { total } else { -1 }, 0, 0)
     } else {
         (row, row, row + 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_transaction::RetentionRegistry;
+
+    #[test]
+    fn portal_snapshot_retention_binds_pinned_lease_owner() {
+        let registry = RetentionRegistry::with_capacity(1, 2);
+        let lease = Arc::new(registry.lease_read_snapshot(ReadTs::new(77)).unwrap());
+        let snapshot = ReadSnapshot::new(ReadTs::new(77), Some(lease.clone()));
+
+        let retention = PortalSnapshotRetention::pinned(&snapshot, 42, "portal_a");
+
+        assert_eq!(retention.read_ts(), ReadTs::new(77));
+        assert_eq!(retention.policy(), PortalSnapshotRetentionPolicy::Pinned);
+        assert!(retention.pin_duration_us().is_some());
+        assert_eq!(lease.owner().owner_session_id, Some(42));
+        assert_eq!(lease.owner().portal_id.as_deref(), Some("portal_a"));
+    }
+
+    #[test]
+    fn materialized_portal_snapshot_does_not_pin_retention() {
+        let retention = PortalSnapshotRetention::materialized(ReadTs::new(12));
+
+        assert_eq!(retention.read_ts(), ReadTs::new(12));
+        assert_eq!(
+            retention.policy(),
+            PortalSnapshotRetentionPolicy::Materialized
+        );
+        assert!(retention.lease().is_none());
+        assert_eq!(retention.pin_duration_us(), None);
     }
 }

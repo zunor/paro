@@ -36,7 +36,7 @@ impl UtilityCommand {
         matches!(
             self,
             Self::Transaction(TransactionStmt {
-                kind: TransactionKind::Begin | TransactionKind::Start,
+                kind: TransactionKind::Begin(_) | TransactionKind::Start(_),
             })
         )
     }
@@ -101,7 +101,7 @@ pub fn utility_command_from_statement(stmt: Statement) -> UtilityCommand {
         Statement::CreateDatabase(stmt) => UtilityCommand::CreateDatabase(stmt),
         Statement::DropDatabase(stmt) => UtilityCommand::DropDatabase(stmt),
         Statement::Begin => UtilityCommand::Transaction(TransactionStmt {
-            kind: TransactionKind::Begin,
+            kind: TransactionKind::Begin(Default::default()),
         }),
         Statement::Commit => UtilityCommand::Transaction(TransactionStmt {
             kind: TransactionKind::Commit,
@@ -197,7 +197,7 @@ mod tests {
         match dispatch_statement(parse_stmt("BEGIN")) {
             FrontendRoute::Utility(cmd) => match *cmd {
                 UtilityCommand::Transaction(stmt) => {
-                    assert!(matches!(stmt.kind, TransactionKind::Begin));
+                    assert!(matches!(stmt.kind, TransactionKind::Begin(_)));
                 }
                 other => panic!("unexpected utility command: {other:?}"),
             },

@@ -2,6 +2,18 @@ name = "nightly-full"
 description = "Full nightly benchmark suite covering every checked-in workload"
 
 [[include]]
+workload = "memory"
+
+[[include]]
+workload = "row_hash_join_phase0"
+
+[[include]]
+workload = "row_sort_phase0"
+
+[[include]]
+workload = "spill"
+
+[[include]]
 workload = "agg"
 
 [[include]]
@@ -20,9 +32,6 @@ workload = "fulltext_pg"
 workload = "graph"
 
 [[include]]
-workload = "memory"
-
-[[include]]
 workload = "nested_correlation"
 
 [[include]]
@@ -30,15 +39,6 @@ workload = "order"
 
 [[include]]
 workload = "primary_key_dml"
-
-[[include]]
-workload = "row_hash_join_phase0"
-
-[[include]]
-workload = "row_sort_phase0"
-
-[[include]]
-workload = "spill"
 
 [[include]]
 workload = "vector"

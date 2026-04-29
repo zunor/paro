@@ -3,15 +3,15 @@
 
 //! Segment-backed WAL handle used by transactions and checkpoint coordination.
 
-use crate::compaction::publish::record::CompactionPublishRecord;
+use crate::segments::{
+    should_rotate_after_flush, SegmentCatalog, SegmentCatalogStore, DEFAULT_SEGMENT_ROTATION_BYTES,
+};
 use crate::wal::wal_entry::WalHeaderMetadata;
 use crate::wal::wal_reader::WalReader;
 use crate::wal::wal_write_state::WalWriteState;
 use crate::wal::wal_writer::{WalInitState, WalWriter};
+use paro_common::effect::CompactionCumulativePointAction;
 use paro_common::error::{self as paro_error, Result};
-use paro_journal::segments::{
-    should_rotate_after_flush, SegmentCatalog, SegmentCatalogStore, DEFAULT_SEGMENT_ROTATION_BYTES,
-};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -187,8 +187,30 @@ impl WriteAheadLog {
         )
     }
 
-    pub fn write_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
-        self.active_writer().write_compaction_publish(record)
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_compaction_publish(
+        &self,
+        tablet_id: u64,
+        plan_id: u64,
+        job_id: u64,
+        output_rowset_id: u64,
+        output_start_version: i64,
+        output_end_version: i64,
+        cumulative_point_action: CompactionCumulativePointAction,
+        output_rowset_path: String,
+        replaced_inputs: Vec<u64>,
+    ) -> Result<()> {
+        self.active_writer().write_compaction_publish(
+            tablet_id,
+            plan_id,
+            job_id,
+            output_rowset_id,
+            output_start_version,
+            output_end_version,
+            cumulative_point_action,
+            output_rowset_path,
+            replaced_inputs,
+        )
     }
 
     pub fn truncate(&self, size: u64) -> Result<()> {

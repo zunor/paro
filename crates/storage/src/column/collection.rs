@@ -9,13 +9,13 @@ use crate::buffer::{BlockId, BufferPool, MemoryTag};
 use crate::column::allocator::{
     ChunkManagementState, ColumnDataAllocator, ColumnDataAllocatorType,
 };
-use crate::wal::wal_entry::SerializedDataChunk;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{
     MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle, MemoryResult,
 };
 use paro_common::types::LogicalType;
+use paro_journal::wal::wal_entry::SerializedDataChunk;
 
 #[derive(Debug, Default)]
 pub struct ColumnDataAppendState {

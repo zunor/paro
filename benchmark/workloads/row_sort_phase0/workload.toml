@@ -1,6 +1,7 @@
 [meta]
 name = "row_sort_phase0"
 description = "Phase 0 row-store sort baseline covering fixed-key full sort, variable-key TopN, and external full sort"
+run_order = 30
 
 [params]
 fixed_rows = 50000

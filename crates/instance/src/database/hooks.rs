@@ -10,8 +10,8 @@ use crate::database::handle::DatabaseHandle;
 use crate::lifecycle::startup_report::StartupPolicy;
 use crate::search_registry::register_search_definition;
 use paro_catalog::entry::{
-    graph_schema_fingerprint, CatalogEntryEnum, CreatePropertyGraphInfo, IndexCatalogEntry,
-    IndexType as CatalogIndexType, PropertyGraphCatalogEntry,
+    graph_schema_fingerprint, CatalogEntry, CatalogEntryEnum, CreatePropertyGraphInfo,
+    IndexCatalogEntry, IndexType as CatalogIndexType, PropertyGraphCatalogEntry,
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::chunk::Chunk;
@@ -409,8 +409,15 @@ fn replay_graph_dml_maintenance_task(
 
     let graph_index = ctx.graph_registry.clone();
     let graph_registry = ctx.graph_registry.clone();
+    let source_txn = CatalogSnapshot::read_only(u64::MAX);
     let mut touched = 0usize;
     for graph_entry in graphs_to_stale.values() {
+        let graph_visible_start_time = graph_recovery_visible_start_time(
+            db,
+            &source_txn,
+            &graph_entry.info,
+            visible_start_time,
+        )?;
         mark_property_graph_stale(
             catalog.as_ref(),
             graph_index.as_ref(),
@@ -423,18 +430,24 @@ fn replay_graph_dml_maintenance_task(
             graph_index.clone(),
             graph_registry.clone(),
             Arc::clone(graph_entry),
-            visible_start_time,
+            graph_visible_start_time,
         );
         touched += 1;
     }
 
     for graph_entry in graphs_to_refresh.values() {
+        let graph_visible_start_time = graph_recovery_visible_start_time(
+            db,
+            &source_txn,
+            &graph_entry.info,
+            visible_start_time,
+        )?;
         if let Err(err) = refresh_property_graph_committed(
             catalog.clone(),
             graph_index.clone(),
             graph_registry.clone(),
             Arc::clone(graph_entry),
-            visible_start_time,
+            graph_visible_start_time,
         ) {
             tracing::warn!(
                 target: targets::INSTANCE,
@@ -455,7 +468,7 @@ fn replay_graph_dml_maintenance_task(
                 graph_index.clone(),
                 graph_registry.clone(),
                 Arc::clone(graph_entry),
-                visible_start_time,
+                graph_visible_start_time,
             );
         }
         touched += 1;
@@ -532,13 +545,60 @@ impl RecoveryHook for GraphProjectionRecoveryHook {
             let graph_dir = base_dir.join(&graph_name);
             let runtime_key =
                 GraphId::new(db.name(), &graph.info.schema, &graph_name).runtime_key();
+            let published_commit_id = db.transaction_manager().published_commit_id();
+            let source_max_version = property_graph_source_max_version(db, &txn, &graph.info)?;
+            let graph_valid_through_ts = published_commit_id
+                .max(graph.timestamp())
+                .max(source_max_version.saturating_add(1));
 
             match recover_existing_graph(&graph_dir, &graph_name, &schema_fingerprint)? {
                 ExistingGraphRecovery::Reuse {
                     index,
-                    manifest,
+                    mut manifest,
                     reason,
                 } => {
+                    if manifest.indexed_through_ts() < source_max_version {
+                        let reason = format!(
+                            "manifest indexed through {} but source tables have version {}; rebuilding from catalog",
+                            manifest.indexed_through_ts(),
+                            source_max_version
+                        );
+                        let (index, manifest) = rebuild_graph_projection(
+                            db,
+                            &txn,
+                            &graph.info,
+                            &graph_dir,
+                            &graph_name,
+                            &schema_fingerprint,
+                            graph_valid_through_ts,
+                        )?;
+                        ctx.graph_registry.register_generation(
+                            &runtime_key,
+                            GraphStorageGeneration::from_index(index, manifest, 0),
+                        );
+                        tracing::info!(
+                            target: targets::INSTANCE,
+                            hook = self.name(),
+                            db = %db.name(),
+                            graph = %graph_name,
+                            reason = %reason,
+                            "Graph projection rebuilt during startup"
+                        );
+                        rebuilt_count += 1;
+                        rebuild_reasons.push(format!("{graph_name}: {reason}"));
+                        issues.push(RecoveryHookIssue {
+                            kind: RecoveryHookIssueKind::ManifestMismatch,
+                            object_name: Some(graph_name.clone()),
+                            detail: reason,
+                        });
+                        continue;
+                    }
+
+                    if manifest.indexed_through_ts() < graph_valid_through_ts {
+                        manifest = manifest.with_indexed_through_ts(graph_valid_through_ts);
+                        GraphProjectionIndex::write_manifest(&graph_dir, &manifest)?;
+                    }
+
                     ctx.graph_registry.register_generation(
                         &runtime_key,
                         GraphStorageGeneration::from_index(index, manifest, 0),
@@ -554,19 +614,15 @@ impl RecoveryHook for GraphProjectionRecoveryHook {
                     reused_count += 1;
                 }
                 ExistingGraphRecovery::Rebuild { reason, issue } => {
-                    let index = build_graph_index_from_catalog(db, &txn, &graph.info)?;
-                    if graph_dir.exists() {
-                        let _ = std::fs::remove_dir_all(&graph_dir);
-                    }
-
-                    let graph_stats = GraphStatistics::from_index(&index);
-                    let manifest = GraphManifest::new(
-                        graph_name.clone(),
-                        GraphState::Ready,
-                        schema_fingerprint.clone(),
-                    )
-                    .with_statistics(graph_stats);
-                    index.save_with_manifest(&graph_dir, manifest.clone())?;
+                    let (index, manifest) = rebuild_graph_projection(
+                        db,
+                        &txn,
+                        &graph.info,
+                        &graph_dir,
+                        &graph_name,
+                        &schema_fingerprint,
+                        graph_valid_through_ts,
+                    )?;
                     ctx.graph_registry.register_generation(
                         &runtime_key,
                         GraphStorageGeneration::from_index(index, manifest, 0),
@@ -607,6 +663,32 @@ impl RecoveryHook for GraphProjectionRecoveryHook {
             issues,
         })
     }
+}
+
+fn rebuild_graph_projection(
+    db: &Arc<DatabaseHandle>,
+    txn: &CatalogSnapshot,
+    graph_info: &CreatePropertyGraphInfo,
+    graph_dir: &Path,
+    graph_name: &str,
+    schema_fingerprint: &str,
+    indexed_through_ts: u64,
+) -> anyhow::Result<(GraphProjectionIndex, GraphManifest)> {
+    let index = build_graph_index_from_catalog(db, txn, graph_info)?;
+    if graph_dir.exists() {
+        let _ = std::fs::remove_dir_all(graph_dir);
+    }
+
+    let graph_stats = GraphStatistics::from_index(&index);
+    let manifest = GraphManifest::new(
+        graph_name.to_string(),
+        GraphState::Ready,
+        schema_fingerprint.to_string(),
+    )
+    .with_indexed_through_ts(indexed_through_ts)
+    .with_statistics(graph_stats);
+    index.save_with_manifest(graph_dir, manifest.clone())?;
+    Ok((index, manifest))
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -689,6 +771,49 @@ fn recover_existing_graph(
         manifest,
         reason: "manifest validated; reusing persisted graph projection".to_string(),
     })
+}
+
+fn property_graph_source_max_version(
+    db: &Arc<DatabaseHandle>,
+    txn: &CatalogSnapshot,
+    pg_info: &CreatePropertyGraphInfo,
+) -> paro_common::error::Result<u64> {
+    let mut max_version = 0u64;
+    for table_name in pg_info
+        .vertex_tables
+        .iter()
+        .map(|vertex| vertex.table_name.as_str())
+        .chain(
+            pg_info
+                .edge_tables
+                .iter()
+                .map(|edge| edge.table_name.as_str()),
+        )
+    {
+        let table_entry = db.catalog().get_table(txn, &pg_info.schema, table_name)?;
+        let table = match table_entry.as_ref() {
+            CatalogEntryEnum::Table(table) => table,
+            _ => return Err(paro_error::wrong_object_type("table", table_name)),
+        };
+        let storage = table.get_storage().ok_or_else(|| {
+            paro_error::internal(format!(
+                "Graph source table \"{}\" has no storage",
+                table_name
+            ))
+        })?;
+        max_version = max_version.max(storage.max_version().max(0) as u64);
+    }
+    Ok(max_version)
+}
+
+fn graph_recovery_visible_start_time(
+    db: &Arc<DatabaseHandle>,
+    txn: &CatalogSnapshot,
+    pg_info: &CreatePropertyGraphInfo,
+    base_visible_start_time: u64,
+) -> anyhow::Result<u64> {
+    let source_max_version = property_graph_source_max_version(db, txn, pg_info)?;
+    Ok(base_visible_start_time.max(source_max_version.saturating_add(1)))
 }
 
 fn build_graph_index_from_catalog(

@@ -34,6 +34,8 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_context::dml_table_lock_requests;
+use paro_transaction::TableId;
 
 use crate::execution_context::ExecutionContext;
 use crate::operator::state::{
@@ -139,6 +141,7 @@ mod tests {
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_scheduler::task::InterruptState;
     use paro_storage::table::table_factory::TableFactory;
+    use paro_storage::transaction::txn::Transaction;
     use std::sync::Arc;
 
     fn create_storage(types: &[LogicalType]) -> paro_storage::table::table_handle::TableHandle {
@@ -228,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_sink_full_table_fast_path_deletes_all_rows() {
+    fn delete_sink_full_table_fast_path_stages_all_rows_in_transaction() {
         let storage = Arc::new(create_storage(&[LogicalType::Integer]));
         let input_chunk = Chunk::from_vectors(
             vec![paro_common::test_utils::test_i32_vector_with_allocator(
@@ -253,7 +256,10 @@ mod tests {
         let child = Arc::new(PhysicalDummyScan::new()) as Arc<dyn PhysicalOperator>;
         let op = PhysicalDelete::new(table, 0, child, true);
 
-        let session: Arc<StatementContext> = test_session();
+        let txn = Arc::new(Transaction::new(70_001, 0));
+        let mut session_ctx = (*test_session()).clone();
+        session_ctx.txn.active = Some(txn.clone());
+        let session: Arc<StatementContext> = Arc::new(session_ctx);
         let thread = ThreadContext::single_threaded();
         let ctx = ExecutionContext::new(session, &thread, None);
 
@@ -292,6 +298,7 @@ mod tests {
             .expect("get_data should succeed");
         assert_eq!(source_result, SourceResultType::Finished);
         assert_eq!(out.column(0).unwrap().get_value(0), Value::BigInt(3));
+        assert!(txn.has_pending_storage_work());
 
         let remaining_rows: usize = storage
             .scan_chunks()
@@ -299,7 +306,7 @@ mod tests {
             .iter()
             .map(|chunk| chunk.size())
             .sum();
-        assert_eq!(remaining_rows, 0);
+        assert_eq!(remaining_rows, 3);
     }
 }
 
@@ -431,6 +438,7 @@ impl PhysicalOperator for PhysicalDelete {
             self.table.base.base.name.clone(),
             paro_common::ddl::DdlObjectKind::Table,
         );
+        ctx.session.bind_write_database(&target.database)?;
         if let Some(admission) = ctx.session.txn_admission() {
             let write_class = ctx
                 .session
@@ -443,11 +451,19 @@ impl PhysicalOperator for PhysicalDelete {
                 self.table.base.base.timestamp() == ctx.transaction_id(),
             )?;
         }
+        if let Some(txn) = ctx.active_transaction() {
+            txn.acquire_lock_requests(dml_table_lock_requests(txn.lock_namespace(), &target))?;
+        }
         if let Some(write_guard) = ctx.session.write_guard() {
             write_guard.begin_dml_write()?;
         }
         if let Some(txn) = ctx.active_transaction() {
             txn.record_dml_table(self.table.base.base.object_id.raw())?;
+        }
+        if let Some(storage) = self.table.get_storage() {
+            ctx.transaction_view()
+                .read_tracker()
+                .record_table_read(TableId::new(storage.table_id()));
         }
         Ok(Box::new(DeleteGlobalSinkState::default()))
     }
@@ -476,14 +492,21 @@ impl PhysicalOperator for PhysicalDelete {
             ))
         })?;
 
-        let txn = _ctx.active_transaction();
+        let txn = _ctx.active_transaction().ok_or_else(|| {
+            paro_error::internal(
+                "DELETE reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+            )
+        })?;
         if self.is_full_table_delete {
             if gstate
                 .full_table_delete_executed
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                let deleted = storage.delete_all(txn)?;
+                _ctx.transaction_view()
+                    .read_tracker()
+                    .record_predicate(TableId::new(storage.table_id()), 0);
+                let deleted = storage.delete_all(_ctx.transaction_view(), txn.clone())?;
                 gstate.deleted_count.fetch_add(deleted, Ordering::SeqCst);
             }
             return Ok(SinkResultType::Finished);
@@ -499,7 +522,8 @@ impl PhysicalOperator for PhysicalDelete {
                 key_vectors.push(col.clone());
             }
             let key_chunk = Chunk::from_arc_vectors(key_vectors, chunk.allocator().clone());
-            total_deleted += storage.delete_by_primary_keys(&key_chunk, txn)?;
+            total_deleted +=
+                storage.delete_by_primary_keys(_ctx.transaction_view(), &key_chunk, txn.clone())?;
         } else {
             // Get row_id column
             let row_id_col = chunk
@@ -527,7 +551,7 @@ impl PhysicalOperator for PhysicalDelete {
                 }
             }
 
-            let deleted = storage.delete(&row_ids, txn.clone())?;
+            let deleted = storage.delete(_ctx.transaction_view(), &row_ids, txn.clone())?;
             total_deleted += deleted;
         }
 
@@ -537,9 +561,7 @@ impl PhysicalOperator for PhysicalDelete {
             .fetch_add(total_deleted, Ordering::SeqCst);
 
         if total_deleted > 0 {
-            if let Some(txn) = _ctx.active_transaction() {
-                txn.record_graph_delete(self.table.base.base.object_id.raw(), total_deleted);
-            }
+            txn.record_graph_delete(self.table.base.base.object_id.raw(), total_deleted);
         }
 
         Ok(SinkResultType::NeedMoreInput)

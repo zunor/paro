@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::metrics::storage_metrics;
+use paro_transaction::{DerivedLagLease, RetentionLeaseInfo};
 
 use super::{DeltaAdjacency, GraphManifest, GraphProjectionIndex, GraphStatistics};
 
@@ -140,6 +141,10 @@ impl GraphStorageGeneration {
             }),
         }
     }
+
+    pub fn indexed_through_ts(&self) -> u64 {
+        self.manifest.indexed_through_ts()
+    }
 }
 
 /// Per-graph runtime handle that atomically swaps immutable generations.
@@ -162,6 +167,7 @@ impl GraphRuntimeHandle {
     pub fn snapshot(&self) -> GraphReadSnapshot {
         GraphReadSnapshot {
             generation: self.current_generation(),
+            derived_lag_lease: None,
         }
     }
 
@@ -176,6 +182,7 @@ impl GraphRuntimeHandle {
 #[derive(Debug, Clone)]
 pub struct GraphReadSnapshot {
     generation: Arc<GraphStorageGeneration>,
+    derived_lag_lease: Option<Arc<DerivedLagLease>>,
 }
 
 impl GraphReadSnapshot {
@@ -197,6 +204,37 @@ impl GraphReadSnapshot {
 
     pub fn generation(&self) -> &Arc<GraphStorageGeneration> {
         &self.generation
+    }
+
+    pub fn indexed_through_ts(&self) -> u64 {
+        self.generation.indexed_through_ts()
+    }
+
+    pub fn ensure_covers_read_ts(&self, read_ts: u64) -> paro_common::error::Result<()> {
+        if read_ts <= self.indexed_through_ts() {
+            return Ok(());
+        }
+        Err(paro_common::error::not_supported(format!(
+            "graph generation {} is indexed through {} but query reads at {}; keep graph derived state required or run catch-up maintenance",
+            self.generation_id(),
+            self.indexed_through_ts(),
+            read_ts
+        )))
+    }
+
+    pub fn with_derived_lag_lease(mut self, lease: Option<Arc<DerivedLagLease>>) -> Self {
+        self.derived_lag_lease = lease;
+        self
+    }
+
+    pub fn derived_lag_lease_info(&self) -> paro_common::error::Result<Option<RetentionLeaseInfo>> {
+        self.derived_lag_lease
+            .as_ref()
+            .map(|lease| lease.info())
+            .transpose()
+            .map_err(|err| {
+                paro_common::error::internal(format!("graph derived lag lease info: {err}"))
+            })
     }
 
     pub fn delta_size(&self) -> usize {
@@ -233,6 +271,7 @@ mod tests {
         EdgeBuildInput, GraphBuildInput, GraphState, VertexBuildInput, VertexKey,
     };
     use crate::metrics::storage_metrics;
+    use paro_transaction::{CommitTs, RetentionLeaseKind, RetentionRegistry};
 
     fn build_index() -> GraphProjectionIndex {
         GraphProjectionIndex::build(&GraphBuildInput {
@@ -264,10 +303,12 @@ mod tests {
     fn neighbor_view_uses_base_slices_when_delta_is_empty() {
         let generation = GraphStorageGeneration::from_index(
             build_index(),
-            GraphManifest::new("g".to_string(), GraphState::Ready, "fp:test".to_string()),
+            GraphManifest::new("g".to_string(), GraphState::Ready, "fp:test".to_string())
+                .with_indexed_through_ts(44),
             1,
         );
         let snapshot = GraphRuntimeHandle::new(generation).snapshot();
+        assert_eq!(snapshot.indexed_through_ts(), 44);
         let mut scratch = Vec::new();
 
         let view = snapshot
@@ -283,6 +324,52 @@ mod tests {
             }
             NeighborView::Merged(_) => panic!("expected base neighbor view"),
         }
+    }
+
+    #[test]
+    fn snapshot_holds_derived_lag_lease_for_generation_gap() {
+        let registry = RetentionRegistry::with_capacity(1, 2);
+        let lease = Arc::new(
+            registry
+                .lease_derived_lag_range(CommitTs::new(5), CommitTs::new(9))
+                .unwrap(),
+        );
+        let generation = GraphStorageGeneration::from_index(
+            build_index(),
+            GraphManifest::new("g".to_string(), GraphState::Ready, "fp:test".to_string())
+                .with_indexed_through_ts(5),
+            1,
+        );
+        let snapshot = GraphRuntimeHandle::new(generation)
+            .snapshot()
+            .with_derived_lag_lease(Some(lease));
+
+        let info = snapshot
+            .derived_lag_lease_info()
+            .unwrap()
+            .expect("derived lag lease");
+        assert_eq!(info.kind, RetentionLeaseKind::DerivedLag);
+        assert_eq!(info.commit_ts_floor, Some(CommitTs::new(5)));
+        assert_eq!(info.commit_ts_ceiling, Some(CommitTs::new(9)));
+    }
+
+    #[test]
+    fn snapshot_rejects_unmergeable_committed_delta_gap() {
+        let generation = GraphStorageGeneration::from_index(
+            build_index(),
+            GraphManifest::new("g".to_string(), GraphState::Ready, "fp:test".to_string())
+                .with_indexed_through_ts(5),
+            1,
+        );
+        let snapshot = GraphRuntimeHandle::new(generation).snapshot();
+
+        assert!(snapshot.ensure_covers_read_ts(5).is_ok());
+        let err = snapshot
+            .ensure_covers_read_ts(6)
+            .expect_err("graph storage delta gap is not query-mergeable yet");
+        assert!(err
+            .to_string()
+            .contains("keep graph derived state required"));
     }
 
     #[test]

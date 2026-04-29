@@ -46,6 +46,7 @@ approx-constant = "allow"
 [dependencies]
 paro-common = { workspace = true }
 paro-journal = { workspace = true }
+paro-transaction = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 crossbeam = "0.8"
@@ -87,4 +88,16 @@ harness = false
 
 [[bench]]
 name = "primary_key_dml"
+harness = false
+
+[[bench]]
+name = "transaction_spill"
+harness = false
+
+[[bench]]
+name = "version_info"
+harness = false
+
+[[bench]]
+name = "versioned_rowset_catalog"
 harness = false

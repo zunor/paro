@@ -5,7 +5,7 @@ mod version_chain;
 mod visibility;
 
 use paro_common::error::{self as paro_error, Result};
-use paro_storage::transaction::manager::TRANSACTION_ID_START;
+use paro_transaction::{ReadTs, WriterId, TRANSACTION_ID_START};
 
 pub(crate) use version_chain::VersionedEntry;
 pub(crate) use visibility::{has_conflict, is_committed, is_permanent, is_provisional, is_visible};
@@ -24,11 +24,12 @@ pub const REPLAY_WRITER_ID: u64 = TRANSACTION_ID_START;
 pub struct CatalogSnapshot {
     pub transaction_id: u64,
     pub start_time: u64,
-    writer_id: Option<u64>,
+    writer_id: Option<WriterId>,
 }
 
 impl CatalogSnapshot {
-    pub fn read_only(start_time: u64) -> Self {
+    pub fn read_only(start_time: impl Into<ReadTs>) -> Self {
+        let start_time = start_time.into().into_raw();
         Self {
             transaction_id: PERMANENT_WRITER_ID,
             start_time,
@@ -36,32 +37,35 @@ impl CatalogSnapshot {
         }
     }
 
-    pub fn writer(writer_id: u64, start_time: u64) -> Self {
+    pub fn writer(writer_id: impl Into<WriterId>, start_time: impl Into<ReadTs>) -> Self {
+        let writer_id = writer_id.into();
+        let start_time = start_time.into().into_raw();
         debug_assert!(
-            writer_id >= TRANSACTION_ID_START,
+            writer_id.is_provisional(),
             "CatalogSnapshot::writer requires a provisional writer id"
         );
         Self {
-            transaction_id: writer_id,
+            transaction_id: writer_id.into_raw(),
             start_time,
             writer_id: Some(writer_id),
         }
     }
 
-    pub fn permanent_writer(start_time: u64) -> Self {
+    pub fn permanent_writer(start_time: impl Into<ReadTs>) -> Self {
+        let start_time = start_time.into().into_raw();
         Self {
             transaction_id: PERMANENT_WRITER_ID,
             start_time,
-            writer_id: Some(PERMANENT_WRITER_ID),
+            writer_id: Some(WriterId::permanent()),
         }
     }
 
-    pub fn replay_writer(start_time: u64) -> Self {
-        Self::writer(REPLAY_WRITER_ID, start_time)
+    pub fn replay_writer(start_time: impl Into<ReadTs>) -> Self {
+        Self::writer(WriterId::replay(), start_time)
     }
 
     pub fn writer_id(&self) -> Option<u64> {
-        self.writer_id
+        self.writer_id.map(WriterId::into_raw)
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -69,17 +73,17 @@ impl CatalogSnapshot {
     }
 
     pub fn write_timestamp(&self) -> Result<u64> {
-        self.writer_id.ok_or_else(|| {
+        self.writer_id.map(WriterId::into_raw).ok_or_else(|| {
             paro_error::invalid_transaction_state("catalog mutation requires a writer snapshot")
         })
     }
 
     pub fn can_see(&self, timestamp: u64) -> bool {
-        visibility::is_visible(timestamp, self.writer_id, self.start_time)
+        visibility::is_visible(timestamp, self.writer_id(), self.start_time)
     }
 
     pub fn has_conflict(&self, timestamp: u64) -> bool {
-        visibility::has_conflict(timestamp, self.writer_id, self.start_time)
+        visibility::has_conflict(timestamp, self.writer_id(), self.start_time)
     }
 }
 

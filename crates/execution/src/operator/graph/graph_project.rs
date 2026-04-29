@@ -27,6 +27,7 @@ use paro_common::vector::Vector;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::ColumnBinding;
 use paro_storage::tablet::TabletReaderParams;
+use paro_transaction::TableId;
 
 use crate::execution_context::ExecutionContext;
 use crate::explain::explain_node::format_bound_expression;
@@ -164,7 +165,8 @@ impl PhysicalOperator for PhysicalGraphProject {
         let count = input.size();
         let catalog = ctx.catalog();
         let txn = ctx.catalog_txn_view();
-        let visible_version = i64::try_from(ctx.transaction_visible_version()).unwrap_or(i64::MAX);
+        let txn_view = ctx.transaction_view();
+        let visible_version = txn_view.visible_version_i64();
 
         // Collect required columns per table from expressions and filters.
         let mut required_cols: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -211,6 +213,9 @@ impl PhysicalOperator for PhysicalGraphProject {
             let storage = table.get_storage().ok_or_else(|| {
                 paro_error::internal(format!("Table \"{}\" has no storage", mapping.table_name))
             })?;
+            txn_view
+                .read_tracker()
+                .record_table_read(TableId::new(storage.table_id()));
 
             let num_columns = table.columns.len();
 

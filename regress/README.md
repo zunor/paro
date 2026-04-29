@@ -117,6 +117,10 @@ Directives are SQL comments that control the runner's behaviour.
 | `-- @statement error <pattern>` | Validate that an error matches a specific regex/SQLSTATE. |
 | `-- @normalize <profiles>` | Apply registered text normalizers before comparison. Unknown profiles fail during parse. |
 | `-- @control <action> [key=value …]` | Execute a harness-side control action such as `restart` or `connect` before the next SQL block. |
+| `-- @session <name> [user=...] [database=...] [async=label]` | Execute the next SQL/query/copy block on a named persistent connection; `async` runs it in the background. |
+| `-- @await <label> timeout=<duration>` | Wait for a background block and emit its output at this stable transcript position. |
+| `-- @sleep <duration>` | Sleep briefly to let a known blocking point enqueue. |
+| `-- @wait_expect interval=<duration> timeout=<duration>` | In check mode, repeat the next query until it matches the existing baseline or times out. |
 
 ### Normalize Profiles
 
@@ -131,6 +135,7 @@ product-contract problems. Current registered profiles are:
 | `explain_routine_ids` | Normalize catalog ids embedded in routine labels | `Routine: name[id@generation]`, `Routines: ...` | Stable |
 | `explain_external_runtime` | Normalize volatile external runtime latency fields | `Latency(us): acquire=... queue=... kernel=... encode_decode=...` | Stable |
 | `explain_runtime` | Legacy alias combining operator + summary timing normalization | `actual time=...`, `Planning Time: ...`, `Execution Time: ...` | Transitional |
+| `transaction_ids` | Normalize volatile ids in concurrency error text | `TxnId(...)`, `transaction ...`, table/db/read/commit ids | Stable |
 
 Notes:
 
@@ -166,6 +171,51 @@ Notes:
 - Runtime profiles live under `[runtime_profiles.<name>]` in `regress/config.toml`.
 - Profile-managed environment keys are cleared before each restart, so switching back to `profile=default` returns to a clean runtime state.
 - `connect` preserves the current connection target unless you override fields such as `user`, `database`, `host`, `port`, or `password`.
+
+### Multi-session Transaction Cases
+
+Cases under `cases/txn/interleavings/` may use `@session` to express deterministic
+interleavings with multiple persistent connections:
+
+```sql
+-- @session s1
+BEGIN ISOLATION LEVEL SNAPSHOT;
+
+-- @session s2 user=paro database=postgres
+INSERT INTO t VALUES (2, 'new');
+
+-- @session s1
+SELECT * FROM t ORDER BY id;
+```
+
+Named sessions live for the duration of the case and keep transaction state
+across blocks. Non-default session output is labeled in the transcript with
+`-- session: <name>`. At case end, the harness fails if any session is still in
+an open or failed transaction, then rolls back and closes all named sessions.
+`@setup`, `@teardown`, and `@control` always run on the default session.
+
+Blocking interleavings use `async=<label>` plus `@await`:
+
+```sql
+-- @session s1
+BEGIN;
+
+-- @session s2 async=blocked_update
+UPDATE t SET v = 20 WHERE id = 1;
+
+-- @sleep 100ms
+
+-- @session s1
+COMMIT;
+
+-- @await blocked_update timeout=5s
+```
+
+Background output is written where `@await` appears, which keeps `.result`
+files deterministic. If `@await` times out, the harness disconnects that named
+session and fails the case. `@wait_expect` is reserved for bounded catch-up
+polling; update mode executes the query once because there is no baseline to
+poll against.
 
 ### Python UDF Fixtures
 

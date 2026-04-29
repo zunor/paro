@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::prepared::store::PortalStoreMark;
-use paro_context::WriteClass;
+use paro_context::WriteGuardMark;
 use paro_storage::transaction::txn::StorageSavepointMark;
 
 /// The kind of transaction block currently active.
@@ -19,7 +19,7 @@ pub struct SavepointFrame {
     pub name: String,
     pub settings_journal_mark: usize,
     pub portal_mark: PortalStoreMark,
-    pub write_class_mark: WriteClass,
+    pub write_guard_mark: WriteGuardMark,
     pub ddl_mark: usize,
     pub storage_mark: StorageSavepointMark,
 }

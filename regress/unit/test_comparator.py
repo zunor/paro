@@ -32,6 +32,7 @@ def _query_output(
     copy_fail_message: str | None = None,
     status: str | None = None,
     is_statement: bool = False,
+    session_name: str | None = None,
 ) -> QueryOutput:
     return QueryOutput(
         block_index=1,
@@ -48,6 +49,7 @@ def _query_output(
         copy_fail_message=copy_fail_message,
         status=status,
         is_statement=is_statement,
+        session_name=session_name,
     )
 
 
@@ -95,6 +97,26 @@ def test_parse_transcript_with_normalize_directive() -> None:
     assert len(blocks) == 1
     assert blocks[0].mode == "rowsort"
     assert blocks[0].normalizers == ("explain_operator_timing", "explain_runtime_bytes")
+
+
+def test_build_and_parse_transcript_with_session_label() -> None:
+    output = _query_output(session_name="s1")
+    transcript = build_transcript([output])
+
+    assert transcript.startswith("-- session: s1\n")
+    blocks = parse_result_text(transcript)
+    assert len(blocks) == 1
+    assert blocks[0].session_name == "s1"
+
+
+def test_compare_session_label_mismatch(tmp_path: Path) -> None:
+    expected = _query_output(session_name="s1")
+    actual = _query_output(session_name="s2")
+    expected_file = tmp_path / "session.result"
+    expected_file.write_text(build_transcript([expected]), encoding="utf-8")
+
+    with pytest.raises(ResultMismatch, match="session mismatch"):
+        compare_result_file(expected_path=expected_file, query_outputs=[actual], write_actual=False)
 
 
 def test_compare_exact_mismatch_writes_actual(tmp_path: Path) -> None:

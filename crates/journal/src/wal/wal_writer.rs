@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::compaction::publish::record::CompactionPublishRecord;
 use crate::wal::checksum::compute_wal_checksum;
-use crate::wal::wal_entry::WalHeaderMetadata;
+use crate::wal::wal_entry::{WalEntry, WalHeaderMetadata};
 use crate::wal::wal_type::WalType;
+use paro_common::effect::CompactionCumulativePointAction;
 use paro_common::error::{self as paro_error, Result};
 pub const WAL_BUFFER_SIZE: usize = 4096;
 
@@ -327,18 +327,30 @@ impl WalWriter {
         self.write_entry(WalType::RowsetCommit, &data)
     }
 
-    /// Write a CompactionPublish entry.
-    pub fn write_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
-        let entry = crate::wal::wal_entry::WalEntry::CompactionPublish {
-            tablet_id: record.tablet_id,
-            plan_id: record.plan_id.0,
-            job_id: record.job_id.0,
-            output_rowset_id: record.output_rowset_id,
-            output_start_version: record.output_version.start,
-            output_end_version: record.output_version.end,
-            cumulative_point_action: record.cumulative_point_action,
-            output_rowset_path: record.output_rowset_path.clone(),
-            replaced_inputs: record.replaced_inputs.clone(),
+    /// Write a legacy CompactionPublish entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_compaction_publish(
+        &self,
+        tablet_id: u64,
+        plan_id: u64,
+        job_id: u64,
+        output_rowset_id: u64,
+        output_start_version: i64,
+        output_end_version: i64,
+        cumulative_point_action: CompactionCumulativePointAction,
+        output_rowset_path: String,
+        replaced_inputs: Vec<u64>,
+    ) -> Result<()> {
+        let entry = WalEntry::CompactionPublish {
+            tablet_id,
+            plan_id,
+            job_id,
+            output_rowset_id,
+            output_start_version,
+            output_end_version,
+            cumulative_point_action,
+            output_rowset_path,
+            replaced_inputs,
         };
         self.write_entry(WalType::CompactionPublish, &entry.serialize_data())
     }

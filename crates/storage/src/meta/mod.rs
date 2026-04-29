@@ -13,4 +13,4 @@ pub use metadata_store::testing;
 pub use metadata_store::{FileMetadataStore, MetadataOp, MetadataStore};
 pub use schema_map::{GlobalSchemaMap, SchemaKey};
 pub use storage_config::{StorageConfig, StorageConfigBuilder, DEFAULT_SORT_PARTITION_SIZE};
-pub use tablet_meta_manager::{TabletMetaManager, WalRowsetCommit};
+pub use tablet_meta_manager::TabletMetaManager;

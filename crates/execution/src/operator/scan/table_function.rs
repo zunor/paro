@@ -574,6 +574,7 @@ fn populate_system_table_function_data(
         "paro_optimizers" => populate_paro_optimizers(global_state),
         "paro_storage_info" => populate_paro_storage_info(global_state, ctx),
         "paro_wal_metrics" => populate_paro_wal_metrics(global_state, ctx),
+        "paro_transaction_metrics" => populate_paro_transaction_metrics(global_state, ctx),
         "paro_property_graphs" => populate_paro_property_graphs(global_state, ctx),
         "paro_graph_statistics" => populate_paro_graph_statistics(global_state, ctx),
         _ => {} // Not a system table function, no data to inject
@@ -840,6 +841,11 @@ fn populate_paro_pg_cursors(
                     is_holdable: row.is_holdable,
                     is_binary: row.is_binary,
                     is_scrollable: row.is_scrollable,
+                    snapshot_read_ts: row.snapshot_read_ts,
+                    snapshot_pin_duration_us: row.snapshot_pin_duration_us,
+                    snapshot_owner_session_id: row.snapshot_owner_session_id,
+                    snapshot_portal_id: row.snapshot_portal_id,
+                    snapshot_retention_policy: row.snapshot_retention_policy,
                 })
                 .collect(),
         );
@@ -1499,6 +1505,125 @@ fn populate_paro_wal_metrics(
     }
 
     populate_wal_metric_data(state, entries);
+}
+
+fn populate_paro_transaction_metrics(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &ExecutionContext,
+) {
+    use paro_function::table::system::paro_transaction_metrics::{
+        populate_transaction_metric_data, ParoTransactionMetricsGlobalState, TransactionMetricData,
+    };
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoTransactionMetricsGlobalState>()
+    else {
+        return;
+    };
+
+    let mut entries = Vec::new();
+    for db in ctx.session.databases.iter() {
+        let metrics = db.transaction_metrics();
+        entries.push(TransactionMetricData {
+            database_oid: db.identity.id,
+            database_name: db.identity.name.clone(),
+            txn_begin_count: u64_to_i64(metrics.txn_begin_count),
+            txn_begin_latency_us_total: u64_to_i64(metrics.txn_begin_latency_us_total),
+            txn_begin_latency_us_peak: u64_to_i64(metrics.txn_begin_latency_us_peak),
+            txn_commit_count: u64_to_i64(metrics.txn_commit_count),
+            txn_commit_latency_us_total: u64_to_i64(metrics.txn_commit_latency_us_total),
+            txn_commit_latency_us_peak: u64_to_i64(metrics.txn_commit_latency_us_peak),
+            txn_commit_prepare_latency_us_total: u64_to_i64(
+                metrics.txn_commit_prepare_latency_us_total,
+            ),
+            txn_commit_prepare_latency_us_peak: u64_to_i64(
+                metrics.txn_commit_prepare_latency_us_peak,
+            ),
+            txn_commit_validate_latency_us_total: u64_to_i64(
+                metrics.txn_commit_validate_latency_us_total,
+            ),
+            txn_commit_validate_latency_us_peak: u64_to_i64(
+                metrics.txn_commit_validate_latency_us_peak,
+            ),
+            group_commit_fence_us_total: u64_to_i64(metrics.group_commit_fence_us_total),
+            group_commit_fence_us_peak: u64_to_i64(metrics.group_commit_fence_us_peak),
+            txn_commit_durable_latency_us_total: u64_to_i64(
+                metrics.txn_commit_durable_latency_us_total,
+            ),
+            txn_commit_durable_latency_us_peak: u64_to_i64(
+                metrics.txn_commit_durable_latency_us_peak,
+            ),
+            commit_required_publish_wait_us_total: u64_to_i64(
+                metrics.commit_required_publish_wait_us_total,
+            ),
+            commit_required_publish_wait_us_peak: u64_to_i64(
+                metrics.commit_required_publish_wait_us_peak,
+            ),
+            txn_commit_publish_latency_us_total: u64_to_i64(
+                metrics.txn_commit_publish_latency_us_total,
+            ),
+            txn_commit_publish_latency_us_peak: u64_to_i64(
+                metrics.txn_commit_publish_latency_us_peak,
+            ),
+            commit_ack_mode: metrics.commit_ack_mode.clone(),
+            write_conflict_index_size: u64_to_i64(metrics.write_conflict_index_size),
+            write_conflict_index_fine_entries: u64_to_i64(
+                metrics.write_conflict_index_fine_entries,
+            ),
+            write_conflict_index_fine_summary_entries: u64_to_i64(
+                metrics.write_conflict_index_fine_summary_entries,
+            ),
+            write_conflict_index_coarse_entries: u64_to_i64(
+                metrics.write_conflict_index_coarse_entries,
+            ),
+            lock_wait_count: u64_to_i64(metrics.lock_wait_count),
+            lock_wait_duration_us: u64_to_i64(metrics.lock_wait_duration_us),
+            lock_wound_wait_abort_count: u64_to_i64(metrics.lock_wound_wait_abort_count),
+            lock_deadlock_abort_count: u64_to_i64(metrics.lock_deadlock_abort_count),
+            durable_published_lag_commits: u64_to_i64(metrics.durable_published_lag_commits),
+            durable_published_lag_ms: u64_to_i64(metrics.durable_published_lag_ms),
+            backpressure_throttle_count: u64_to_i64(metrics.backpressure_throttle_count),
+            ssi_validation_abort_count: u64_to_i64(metrics.ssi_validation_abort_count),
+            ssi_abort_due_to_coarse_scan_marker: u64_to_i64(
+                metrics.ssi_abort_due_to_coarse_scan_marker,
+            ),
+            read_tracker_record_count: u64_to_i64(metrics.read_tracker_record_count),
+            read_tracker_coarsened_count: u64_to_i64(metrics.read_tracker_coarsened_count),
+            read_tracking_hint_count: u64_to_i64(metrics.read_tracking_hint_count),
+            read_tracking_policy_escalation_count: u64_to_i64(
+                metrics.read_tracking_policy_escalation_count,
+            ),
+            read_tracking_point_critical_count: u64_to_i64(
+                metrics.read_tracking_point_critical_count,
+            ),
+            read_tracking_range_critical_count: u64_to_i64(
+                metrics.read_tracking_range_critical_count,
+            ),
+            read_tracking_analytical_scan_count: u64_to_i64(
+                metrics.read_tracking_analytical_scan_count,
+            ),
+            read_tracking_safe_snapshot_preferred_count: u64_to_i64(
+                metrics.read_tracking_safe_snapshot_preferred_count,
+            ),
+            derived_index_lag_ts: u64_to_i64(metrics.derived_index_lag_ts),
+            derived_delta_merge_cost: u64_to_i64(metrics.derived_delta_merge_cost),
+            commit_participant_count: u64_to_i64(metrics.commit_participant_count),
+            inflight_batch_conflict_reject_count: u64_to_i64(
+                metrics.inflight_batch_conflict_reject_count,
+            ),
+            retention_watermark_lag_ms: u64_to_i64(metrics.retention_watermark_lag_ms),
+            oldest_active_rw_lag_ms: u64_to_i64(metrics.oldest_active_rw_lag_ms),
+            read_snapshot_lease_count: u64_to_i64(metrics.read_snapshot_lease_count),
+            active_rw_txn_count: u64_to_i64(metrics.active_rw_txn_count),
+        });
+    }
+
+    populate_transaction_metric_data(state, entries);
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 /// Populate paro_property_graphs() with data from Catalog and GraphProjectionIndexManager.

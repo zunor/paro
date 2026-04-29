@@ -37,6 +37,11 @@ use super::write_path::{
 
 const SCHEMA_SEED_BIT: u64 = 1 << 63;
 
+#[inline]
+fn indexed_through_ts(visible_version: i64) -> u64 {
+    visible_version.max(0) as u64
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchDefinitionOrigin {
     Catalog,
@@ -73,6 +78,7 @@ impl SearchDefinitionState {
             generation_id: manifest.root.generation_id,
             build_epoch: manifest.root.build_epoch,
             build_snapshot_version: manifest.root.build_snapshot_version,
+            indexed_through_ts: manifest.root.indexed_through_ts,
             coverage: manifest.root.coverage.clone(),
             manifest_location: manifest_location(&manifest.root_path),
             generation_stats: manifest.root.generation_stats.clone(),
@@ -264,6 +270,7 @@ struct RowsetSearchSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchGenerationCoverage {
     pub visible_version: i64,
+    pub indexed_through_ts: u64,
     pub visible_segment_count: usize,
     pub indexed_segment_count: usize,
     pub coverage: CoverageState,
@@ -439,6 +446,7 @@ impl SearchIndexRegistry {
             generation_id: generation.generation_id,
             build_epoch: generation.build_epoch,
             build_snapshot_version: generation.build_snapshot_version,
+            indexed_through_ts: generation.indexed_through_ts,
             coverage: generation.coverage.clone(),
             generation_stats: generation.generation_stats.clone(),
             maintenance_state: state
@@ -481,6 +489,7 @@ impl SearchIndexRegistry {
         };
         Ok(Some(SearchGenerationCoverage {
             visible_version: generation.build_snapshot_version,
+            indexed_through_ts: generation.indexed_through_ts,
             visible_segment_count: indexed_segment_count + tail_pending.coverage_segments(),
             indexed_segment_count,
             coverage: generation.coverage.clone(),
@@ -850,6 +859,7 @@ impl SearchIndexRegistry {
             generation_id,
             build_epoch,
             build_snapshot_version: snapshot.visible_version,
+            indexed_through_ts: indexed_through_ts(snapshot.visible_version),
             config_fingerprint: state.definition.config_fingerprint,
             coverage: snapshot.coverage.clone(),
             generation_stats: snapshot.generation_stats.clone(),
@@ -950,6 +960,7 @@ impl SearchIndexRegistry {
         root.root_version = root.root_version.saturating_add(1);
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = self.tablet.max_version();
+        root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
         root.tail_pending_entries.extend(added_tail_entries);
         root.generation_stats.merge_assign(&delta_generation_stats);
         let tail_pending = TailPendingSet {

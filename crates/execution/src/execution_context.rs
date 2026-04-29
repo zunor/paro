@@ -7,7 +7,7 @@ use crate::pipeline::pipeline::Pipeline;
 use crate::thread_context::ThreadContext;
 use paro_common::allocator::{Allocator, ArenaAllocator, BufferAllocator, MemoryTag};
 use paro_common::error::Result;
-use paro_context::StatementContext;
+use paro_context::{StatementContext, TransactionView};
 use paro_scheduler::task::InterruptState;
 use std::sync::Arc;
 
@@ -200,10 +200,10 @@ impl<'a> ExecutionContext<'a> {
         self.session.transaction_start_time()
     }
 
-    /// Get the transaction visible version (MVCC snapshot).
+    /// Get the statement transaction view.
     #[inline]
-    pub fn transaction_visible_version(&self) -> u64 {
-        self.session.transaction_visible_version()
+    pub fn transaction_view(&self) -> &TransactionView {
+        self.session.transaction_view()
     }
 
     /// Get the active transaction handle if present.

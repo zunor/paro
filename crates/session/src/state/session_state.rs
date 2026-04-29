@@ -279,6 +279,7 @@ mod tests {
                 parameter_env: crate::prepared::typed_parameters::TypedParameterEnv::default(),
             },
             execution_state: PortalExecutionState::Ready,
+            snapshot_retention: None,
             completion: None,
             dependency_epoch: 0,
             created_generation: 0,

@@ -522,6 +522,7 @@ fn build_select_query(name: paro_parser::ast::TableRef, columns: Option<Vec<Iden
         order_by: vec![],
         limit: vec![],
         offset: None,
+        locking: None,
         ignore_result: false,
     }
 }

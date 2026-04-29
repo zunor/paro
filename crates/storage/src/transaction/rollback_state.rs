@@ -5,8 +5,8 @@
 
 use crate::transaction::txn::Transaction;
 use crate::transaction::undo_buffer::{
-    UndoAppendInfo, UndoDeleteInfo, UndoEntry, UndoFlags, UndoPayload, UndoSequenceValueInfo,
-    UndoUpdateInfo,
+    unsupported_raw_undo_entry, UndoAppendInfo, UndoDeleteInfo, UndoEntry, UndoFlags, UndoPayload,
+    UndoSequenceValueInfo, UndoUpdateInfo,
 };
 
 pub struct RollbackState<'a> {
@@ -20,15 +20,8 @@ impl<'a> RollbackState<'a> {
     }
 
     /// Rollback entry points used by the raw-pointer path in `UndoBuffer`.
-    pub fn rollback_entry(&mut self, flags: UndoFlags, _data: *const u8) {
-        match flags {
-            UndoFlags::InsertTuple
-            | UndoFlags::DeleteTuple
-            | UndoFlags::UpdateTuple
-            | UndoFlags::DatabaseAttach
-            | UndoFlags::SequenceValue
-            | UndoFlags::EmptyEntry => {}
-        }
+    pub fn rollback_entry(&mut self, flags: UndoFlags, data: *const u8) {
+        unsupported_raw_undo_entry("rollback", flags, data);
     }
 
     pub fn rollback_high_level_entry(&mut self, entry: &UndoEntry) {
@@ -68,11 +61,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rollback_entry_dispatch_is_a_noop_for_placeholder_paths() {
+    fn test_rollback_high_level_entries_are_supported() {
         let txn = Transaction::new(1, 100);
         let mut state = RollbackState::new(&txn);
 
-        state.rollback_entry(UndoFlags::EmptyEntry, std::ptr::null());
         state.rollback_high_level_entry(&UndoEntry {
             flags: UndoFlags::EmptyEntry,
             payload: UndoPayload::Empty,
@@ -88,5 +80,13 @@ mod tests {
         state.rollback_high_level_entry(&UndoEntry::delete_consecutive(42, 100, 3));
         state.rollback_high_level_entry(&UndoEntry::update(42, 1, vec![5, 6, 7]));
         state.rollback_high_level_entry(&UndoEntry::sequence_value(10, 5, 42));
+    }
+
+    #[test]
+    #[should_panic(expected = "raw undo-buffer rollback path is unsupported")]
+    fn test_rollback_entry_rejects_raw_path() {
+        let txn = Transaction::new(1, 100);
+        let mut state = RollbackState::new(&txn);
+        state.rollback_entry(UndoFlags::DeleteTuple, std::ptr::null());
     }
 }

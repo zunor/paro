@@ -14,10 +14,13 @@ fn custom(name: &str) -> StatementCompletion {
 pub fn infer_statement_completion(stmt: &Statement, rows: usize) -> StatementCompletion {
     match stmt {
         Statement::Transaction(stmt) => match &stmt.kind {
-            TransactionKind::Begin => StatementCompletion::Begin,
-            TransactionKind::Start => StatementCompletion::StartTransaction,
+            TransactionKind::Begin(_) => StatementCompletion::Begin,
+            TransactionKind::Start(_) => StatementCompletion::StartTransaction,
             TransactionKind::Commit => StatementCompletion::Commit,
             TransactionKind::Rollback => StatementCompletion::Rollback,
+            TransactionKind::SetTransaction(_) | TransactionKind::SetSessionCharacteristics(_) => {
+                StatementCompletion::Set
+            }
             TransactionKind::Savepoint(_) => StatementCompletion::Savepoint,
             TransactionKind::ReleaseSavepoint(_) => StatementCompletion::Release,
             TransactionKind::RollbackToSavepoint(_) => StatementCompletion::RollbackTo,

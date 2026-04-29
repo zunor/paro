@@ -8,6 +8,7 @@ use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::{ArtifactRootsBundle, CheckpointArtifactRef};
 use paro_storage::meta::TabletMetaManager;
+use paro_storage::transaction::spill::cleanup_stale_spill_artifacts_under;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,8 @@ pub struct ArtifactGcReport {
     pub removed_graph_dirs: usize,
     pub removed_staging_entries: usize,
     pub removed_compaction_dirs: usize,
+    pub removed_txn_spill_artifacts: usize,
+    pub removed_txn_spill_manifest_dirs: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,25 @@ impl ArtifactGc {
 
         if mode == ArtifactSweepMode::Startup {
             if let Some(tablet_meta_manager) = tablet_meta_manager {
+                if remaining_budget > 0 {
+                    if let Some(data_root) = tablet_meta_manager.data_root_dir() {
+                        if data_root.starts_with(&root) {
+                            let spill_report = cleanup_stale_spill_artifacts_under(
+                                data_root,
+                                batch_size.min(remaining_budget),
+                            )?;
+                            report.removed_txn_spill_artifacts = spill_report.removed_artifacts;
+                            report.removed_txn_spill_manifest_dirs =
+                                spill_report.removed_manifest_dirs;
+                            let removed_spill_entries = spill_report
+                                .removed_artifacts
+                                .saturating_add(spill_report.removed_manifest_dirs);
+                            remaining_budget =
+                                remaining_budget.saturating_sub(removed_spill_entries);
+                        }
+                    }
+                }
+
                 report.removed_compaction_dirs = Self::sweep_compaction_roots(
                     &tablet_meta_manager,
                     &root,
@@ -280,9 +302,9 @@ mod tests {
         DatabaseSize, MetadataBlockInfo, SingleFileStorageCommitState, StorageCommitState,
     };
     use paro_catalog::database_catalog::ParoCatalog;
+    use paro_journal::wal::wal_entry::WalHeaderMetadata;
+    use paro_journal::wal::write_ahead_log::WriteAheadLog;
     use paro_storage::meta::{FileMetadataStore, MetadataStore};
-    use paro_storage::wal::wal_entry::WalHeaderMetadata;
-    use paro_storage::wal::write_ahead_log::WriteAheadLog;
     use tempfile::tempdir;
 
     #[derive(Debug)]
@@ -392,6 +414,7 @@ mod tests {
         let data_root = root.join("data");
         let compaction_root = data_root.join("tablet-1").join("_compaction").join("job-1");
         fs::create_dir_all(&compaction_root).expect("create compaction staging");
+        let (spill_rowset, spill_manifest) = create_staged_spill_rowset(&data_root, 1, 55);
 
         let catalog = ParoCatalog::new("postgres".to_string());
         let meta_store: Arc<dyn MetadataStore> =
@@ -412,6 +435,8 @@ mod tests {
         assert_eq!(report.removed_staging_entries, 1);
         assert_eq!(report.removed_graph_dirs, 1);
         assert_eq!(report.removed_compaction_dirs, 1);
+        assert_eq!(report.removed_txn_spill_artifacts, 1);
+        assert_eq!(report.removed_txn_spill_manifest_dirs, 1);
         assert!(fs::read_dir(root.join(".txn-staging"))
             .expect("read txn staging")
             .next()
@@ -424,6 +449,11 @@ mod tests {
             .expect("read compaction root")
             .next()
             .is_none());
+        assert!(!spill_rowset.exists());
+        assert!(!spill_manifest
+            .parent()
+            .expect("spill manifest parent")
+            .exists());
     }
 
     #[test]
@@ -450,6 +480,35 @@ mod tests {
         assert!(
             root.join("graph").join("orphan_graph").exists(),
             "graph orphan should remain once delete budget is exhausted"
+        );
+    }
+
+    #[test]
+    fn sweep_startup_orphans_prioritizes_txn_spill_over_compaction_when_budget_is_tight() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path();
+        let data_root = root.join("data");
+        let compaction_root = data_root.join("tablet-1").join("_compaction").join("job-1");
+        fs::create_dir_all(&compaction_root).expect("create compaction staging");
+        let (spill_rowset, _spill_manifest) = create_staged_spill_rowset(&data_root, 1, 55);
+
+        let catalog = ParoCatalog::new("postgres".to_string());
+        let meta_store: Arc<dyn MetadataStore> =
+            Arc::new(FileMetadataStore::new(root.join("meta")).expect("metadata store"));
+        let tablet_meta_manager = Arc::new(TabletMetaManager::with_store_and_data_root(
+            meta_store, &data_root,
+        ));
+        let storage = TestStorageManager::new(root.display().to_string());
+
+        let report =
+            ArtifactGc::sweep_startup_orphans(&catalog, &storage, Some(tablet_meta_manager), 1, 1)
+                .expect("startup sweep");
+        assert_eq!(report.removed_txn_spill_artifacts, 1);
+        assert_eq!(report.removed_compaction_dirs, 0);
+        assert!(!spill_rowset.exists());
+        assert!(
+            compaction_root.exists(),
+            "compaction cleanup should wait once startup spill consumes the tight budget"
         );
     }
 
@@ -488,6 +547,44 @@ mod tests {
             live_rowset.exists(),
             "artifact GC must not delete canonical tablet data during orphan cleanup"
         );
+    }
+
+    fn create_staged_spill_rowset(
+        data_root: &Path,
+        tablet_id: u64,
+        rowset_id: u64,
+    ) -> (PathBuf, PathBuf) {
+        let tablet_dir = data_root.join(format!("tablet-{tablet_id}"));
+        let spill_rowset = tablet_dir
+            .join("rowsets")
+            .join(format!("rowset_{rowset_id}"));
+        fs::create_dir_all(&spill_rowset).expect("create spill rowset");
+        fs::write(spill_rowset.join("segment.dat"), b"orphan rowset").expect("write rowset");
+        let spill_manifest = tablet_dir
+            .join("txn_staging")
+            .join("database=7")
+            .join("txn=42")
+            .join("storage")
+            .join("manifest.jsonl");
+        fs::create_dir_all(spill_manifest.parent().expect("spill manifest parent"))
+            .expect("create spill manifest dir");
+        let spill_record = serde_json::json!({
+            "record_version": 1,
+            "artifact_id": 0,
+            "sequence": 0,
+            "kind": "rowset",
+            "state": "staged",
+            "database_id": 7,
+            "txn_id": 42,
+            "tablet_id": tablet_id,
+            "command_id": 0,
+            "rowset_id": rowset_id,
+            "path": spill_rowset.display().to_string(),
+            "row_count": 1,
+            "bytes": 1
+        });
+        fs::write(&spill_manifest, format!("{spill_record}\n")).expect("write spill manifest");
+        (spill_rowset, spill_manifest)
     }
 
     #[test]

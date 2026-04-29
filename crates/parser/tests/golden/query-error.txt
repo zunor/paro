@@ -103,6 +103,6 @@ error:
   --> SQL:1:10
   |
 1 | select 1 1
-  |          ^ unexpected `1`, expecting <Ident>, <LiteralString>, `IDENTIFIER`, `AS`, `,`, `FROM`, `WHERE`, `GROUP`, `HAVING`, `WINDOW`, `QUALIFY`, `(`, `WITH`, `UNION`, `EXCEPT`, `INTERSECT`, `SELECT`, `VALUES`, `ORDER`, `LIMIT`, `OFFSET`, or `IGNORE_RESULT`
+  |          ^ unexpected `1`, expecting <Ident>, <LiteralString>, `IDENTIFIER`, `AS`, `,`, `FROM`, `WHERE`, `GROUP`, `HAVING`, `WINDOW`, `QUALIFY`, `(`, `WITH`, `UNION`, `EXCEPT`, `INTERSECT`, `SELECT`, `VALUES`, `ORDER`, `LIMIT`, `OFFSET`, `FOR`, or `IGNORE_RESULT`
 
 
