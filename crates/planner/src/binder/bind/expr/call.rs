@@ -16,16 +16,19 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_external::routine::bound::BoundRoutineCallMeta;
+use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+use paro_external::routine::identity::RoutineCallIdentity;
+use paro_external::routine::spec::{
+    RoutineFamily, RoutineNullPolicy, RoutineReturn, RoutineSemantics, RoutineSideEffects,
+    RoutineStability,
+};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_function::scalar::{
     ExpressionState, FunctionNullHandling, FunctionSideEffects, FunctionStability, ScalarBindInput,
     ScalarFunction,
 };
 use paro_parser::ast::{Expr, OrderByExpr};
-use paro_routine::{
-    BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineFamily,
-    RoutineNullPolicy, RoutineReturn, RoutineSemantics, RoutineSideEffects, RoutineStability,
-};
 
 enum ResolvedScalarCallable {
     Native(std::sync::Arc<CatalogEntryEnum>),

@@ -9,7 +9,7 @@ use crate::{
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::search_path::CatalogSearchEntry;
 use paro_common::identity::DatabaseType;
-use paro_external_runtime::host::PythonRuntimeProvider;
+use paro_external::runtime::host::PythonRuntimeProvider;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferPool, StandardBufferManager};

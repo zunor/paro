@@ -13,7 +13,7 @@ use paro_catalog::search_path::CatalogSearchEntry;
 use paro_common::allocator::{Allocator, BufferAllocator, MemoryTag};
 use paro_common::identity::GraphId;
 use paro_common::runtime_value::Value;
-use paro_external_runtime::host::PythonRuntimeStatus;
+use paro_external::runtime::host::PythonRuntimeStatus;
 use paro_storage::meta::TabletMetaManager;
 use paro_transaction::DatabaseId;
 use std::sync::Arc;

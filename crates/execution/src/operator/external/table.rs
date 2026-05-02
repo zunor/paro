@@ -697,11 +697,12 @@ mod tests {
     use paro_common::runtime_value::Value;
 
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-    use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
-    use paro_routine::{
-        RoutineCallIdentity, RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects,
-        RoutineStability, RowSemantics,
+    use paro_external::routine::identity::RoutineCallIdentity;
+    use paro_external::routine::spec::{
+        RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
+        RowSemantics,
     };
+    use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
     use std::sync::Arc;
 
     fn test_ctx() -> ExecutionContext<'static> {

@@ -18,8 +18,7 @@ paro-catalog = { workspace = true }
 paro-storage = { workspace = true }
 paro-transaction = { workspace = true }
 paro-function = { workspace = true }
-paro-routine = { workspace = true }
-paro-external-runtime = { workspace = true }
+paro-external = { workspace = true }
 paro-parser = { workspace = true }
 paro-execution = { workspace = true }
 

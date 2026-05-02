@@ -9,9 +9,10 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
+use paro_external::routine::identity::RoutineCallIdentity;
+use paro_external::routine::spec::RoutineSemantics;
+use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
 use paro_planner::operator::external_project::ExternalProjectExpression;
-use paro_routine::{RoutineCallIdentity, RoutineSemantics};
 
 use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
@@ -287,16 +288,18 @@ mod tests {
     use paro_common::types::LogicalType;
 
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-    use paro_external_runtime::host::{
+    use paro_external::routine::bound::BoundRoutineCallMeta;
+    use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+    use paro_external::routine::identity::RoutineCallIdentity;
+    use paro_external::routine::spec::{
+        RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
+    };
+    use paro_external::runtime::host::{
         ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult,
     };
     use paro_function::scalar::ScalarFunction;
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
     use paro_planner::operator::external_project::ExternalProjectExpression;
-    use paro_routine::{
-        BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity,
-        RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
-    };
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -360,7 +363,7 @@ mod tests {
             )
             .with_routine_meta(BoundRoutineCallMeta {
                 identity: RoutineCallIdentity::Catalog {
-                    routine_id: paro_routine::RoutineId::from_raw(42),
+                    routine_id: paro_external::routine::spec::RoutineId::from_raw(42),
                     generation: 3,
                 },
                 semantics: semantics.clone(),
@@ -378,7 +381,7 @@ mod tests {
             expression: expr,
             routine_meta: BoundRoutineCallMeta {
                 identity: RoutineCallIdentity::Catalog {
-                    routine_id: paro_routine::RoutineId::from_raw(42),
+                    routine_id: paro_external::routine::spec::RoutineId::from_raw(42),
                     generation: 3,
                 },
                 semantics,

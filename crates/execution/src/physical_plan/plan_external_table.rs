@@ -99,6 +99,13 @@ mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_external::routine::bound::BoundRoutineCallMeta;
+    use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+    use paro_external::routine::identity::RoutineCallIdentity;
+    use paro_external::routine::spec::{
+        RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
+        RowSemantics,
+    };
     use paro_function::scalar::ScalarFunction;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
@@ -107,10 +114,6 @@ mod tests {
         ExpressionGet, LogicalOperator,
     };
     use paro_planner::plan::LogicalPlan;
-    use paro_routine::{
-        BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineId,
-        RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
-    };
     use std::sync::Arc;
 
     fn test_session() -> Arc<StatementContext> {

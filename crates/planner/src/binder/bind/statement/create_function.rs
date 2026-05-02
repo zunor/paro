@@ -9,16 +9,17 @@ use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
 use paro_catalog::entry::{CreateRoutineInfo, OnCreateConflict};
 use paro_common::error::{self as paro_error, Result};
+use paro_external::routine::capability::{CapabilityProfile, CapabilityProfilePreset};
+use paro_external::routine::env::{DeclaredEnvSpec, PackageRequirement, PythonRuntimeSelector};
+use paro_external::routine::permission::{PermissionSpec, RoutineSecurityMode};
+use paro_external::routine::spec::{
+    PythonEntrypointRef, PythonImplementationRef, RoutineArgument, RoutineExecutionContract,
+    RoutineFamily, RoutineImplementationRef, RoutineNullPolicy, RoutineOwner, RoutineReturn,
+    RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics, ScalarRoutineContract,
+    SourceBlobRef, TableRoutineContract,
+};
 use paro_parser::ast::{
     CreateFunctionStmt, CreateOption, FunctionReturn, FunctionSecurity, FunctionVolatility,
-};
-use paro_routine::{
-    CapabilityProfile, CapabilityProfilePreset, DeclaredEnvSpec, PackageRequirement,
-    PermissionSpec, PythonEntrypointRef, PythonImplementationRef, PythonRuntimeSelector,
-    RoutineArgument, RoutineExecutionContract, RoutineFamily, RoutineImplementationRef,
-    RoutineNullPolicy, RoutineOwner, RoutineReturn, RoutineSecurityMode, RoutineSemantics,
-    RoutineSideEffects, RoutineStability, RowSemantics, ScalarRoutineContract, SourceBlobRef,
-    TableRoutineContract,
 };
 
 #[derive(Debug, Clone)]
@@ -170,7 +171,7 @@ pub fn bind_create_function(
                 columns
                     .iter()
                     .map(|column| {
-                        Ok(paro_routine::RoutineTableColumn {
+                        Ok(paro_external::routine::spec::RoutineTableColumn {
                             name: column.name.name.clone(),
                             data_type: bind_logical_type(&column.data_type)?,
                         })
@@ -231,7 +232,7 @@ pub fn bind_create_function(
         imports: stmt
             .imports
             .iter()
-            .map(|path| paro_routine::ImportRef {
+            .map(|path| paro_external::routine::env::ImportRef {
                 uri: path.clone(),
                 expected_digest: None,
                 expected_size: None,
@@ -283,7 +284,7 @@ mod tests {
     use super::*;
     use crate::binder::test_utils::test_binder;
     use paro_context::test_support::TestStatementContextBuilder;
-    use paro_external_runtime::host::{
+    use paro_external::runtime::host::{
         ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult,
     };
     use paro_parser::{ast::Statement, parse_one};

@@ -33,11 +33,13 @@ mod tests {
     use super::*;
     use paro_catalog::entry::{CreateRoutineInfo, OnCreateConflict};
     use paro_common::types::LogicalType;
-    use paro_routine::{
-        CapabilityProfile, DeclaredEnvSpec, PermissionSpec, PythonEntrypointRef,
-        PythonImplementationRef, PythonRuntimeSelector, RoutineArgument, RoutineExecutionContract,
+    use paro_external::routine::capability::CapabilityProfile;
+    use paro_external::routine::env::{DeclaredEnvSpec, PythonRuntimeSelector};
+    use paro_external::routine::permission::{PermissionSpec, RoutineSecurityMode};
+    use paro_external::routine::spec::{
+        PythonEntrypointRef, PythonImplementationRef, RoutineArgument, RoutineExecutionContract,
         RoutineFamily, RoutineImplementationRef, RoutineNullPolicy, RoutineOwner, RoutineReturn,
-        RoutineSecurityMode, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
+        RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
         ScalarRoutineContract, SourceBlobRef,
     };
 

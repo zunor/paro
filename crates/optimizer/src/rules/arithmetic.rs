@@ -13,9 +13,9 @@
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{ConstantExpression, Expression};
 use paro_planner::operator::LogicalOperator;
-use paro_routine::BuiltinIntrinsicId;
 
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};

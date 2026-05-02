@@ -5,7 +5,7 @@ use crate::database::opener::DatabaseOpenContext;
 use crate::file_system::DatabaseFileSystem;
 use crate::{BootConfig, Instance};
 use paro_execution::memory_runtime::{MemoryArbitrator, SystemReserve};
-use paro_external_runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
+use paro_external::runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};

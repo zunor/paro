@@ -20,26 +20,31 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_context::StatementContext;
-use paro_external_abi::{
-    AbiLogicalType, BufferLease, ColumnBatchLease, ColumnDescriptor, ColumnEncoding, ColumnLayout,
-    ColumnPopulationMode, LeaseOwnership, LeaseState, OffsetWidth,
+use paro_external::abi::descriptor::ColumnDescriptor;
+use paro_external::abi::encoding::{ColumnEncoding, ColumnPopulationMode};
+use paro_external::abi::layout::{BufferLease, ColumnLayout, OffsetWidth};
+use paro_external::abi::lease::{ColumnBatchLease, LeaseOwnership, LeaseState};
+use paro_external::abi::types::AbiLogicalType;
+use paro_external::routine::artifact::{
+    ArtifactCapabilities, ArtifactValidationState, RuntimeContract, TransportKind,
 };
-use paro_external_runtime::artifact::resolve::{ArtifactResolver, ResolveInputs};
-use paro_external_runtime::artifact::validate::ArtifactValidator;
-use paro_external_runtime::backend::selector::{
+use paro_external::routine::bound::BoundRoutineCallMeta;
+use paro_external::routine::env::DeclaredEnvSpec;
+use paro_external::routine::spec::{
+    PythonEntrypointRef, PythonImplementationRef, RoutineImplementationRef, RoutineReturn,
+    RoutineSpec,
+};
+use paro_external::runtime::artifact::resolve::{ArtifactResolver, ResolveInputs};
+use paro_external::runtime::artifact::validate::ArtifactValidator;
+use paro_external::runtime::backend::selector::{
     BackendAvailability, BackendKind, BackendSelection, BackendSelector,
 };
-use paro_external_runtime::control::header::CONTROL_HEADER_SIZE;
-use paro_external_runtime::control::header::{ControlHeader, ControlMessageKind};
-use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
-use paro_external_runtime::protocol::messages::PythonExceptionPayload;
+use paro_external::runtime::control::header::CONTROL_HEADER_SIZE;
+use paro_external::runtime::control::header::{ControlHeader, ControlMessageKind};
+use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
+use paro_external::runtime::protocol::messages::PythonExceptionPayload;
 use paro_planner::expression::Expression;
 use paro_planner::operator::external_project::ExternalProjectExpression;
-use paro_routine::{
-    ArtifactCapabilities, ArtifactValidationState, BoundRoutineCallMeta, DeclaredEnvSpec,
-    PythonEntrypointRef, PythonImplementationRef, RoutineImplementationRef, RoutineReturn,
-    RoutineSpec, RuntimeContract, TransportKind,
-};
 use serde_json::{json, Value as JsonValue};
 
 use crate::execution_context::ExecutionContext;
@@ -189,7 +194,7 @@ struct PreparedRuntimeBinding {
     selection: BackendSelection,
     capability_profile_label: Option<String>,
     compiled_kernel_kind: Option<String>,
-    subinterpreter_policy: Option<paro_routine::SubInterpreterPolicy>,
+    subinterpreter_policy: Option<paro_external::routine::capability::SubInterpreterPolicy>,
 }
 
 impl PreparedRuntimeBinding {
@@ -443,7 +448,7 @@ fn bind_runtime(
     let selector = BackendSelector;
     let selection = selector
         .select(
-            paro_routine::BackendSelectionInput {
+            paro_external::routine::artifact::BackendSelectionInput {
                 capability_profile: spec.permissions.capability_profile.clone(),
                 artifact_capabilities: artifact.capabilities.clone(),
                 runtime_contract: runtime_contract(),
@@ -498,11 +503,11 @@ fn python_subinterpreter_supported() -> bool {
 }
 
 fn compiled_kernel_requirement_error(
-    profile: &paro_routine::CapabilityProfile,
+    profile: &paro_external::routine::capability::CapabilityProfile,
     capabilities: &ArtifactCapabilities,
 ) -> Option<String> {
     if profile.trusted_backend_preference()
-        != paro_routine::TrustedBackendPreference::CompiledKernel
+        != paro_external::routine::artifact::TrustedBackendPreference::CompiledKernel
     {
         return None;
     }
@@ -543,14 +548,14 @@ fn derive_artifact_capabilities(
             supports_arrow_py_capsule_protocol: true,
             supports_kernel_fusion: matches!(
                 spec.semantics.row_semantics,
-                paro_routine::RowSemantics::RowPreserving
+                paro_external::routine::spec::RowSemantics::RowPreserving
             ) && spec.semantics.side_effects
-                == paro_routine::RoutineSideEffects::None,
+                == paro_external::routine::spec::RoutineSideEffects::None,
             supports_restricted_wasm_backend: spec
                 .permissions
                 .capability_profile
                 .native_extension_policy
-                == paro_routine::CapabilityPolicy::Deny
+                == paro_external::routine::capability::CapabilityPolicy::Deny
                 && spec.environment.packages.is_empty()
                 && !lower.contains("subprocess")
                 && !lower.contains("socket")
@@ -566,7 +571,7 @@ fn derive_artifact_capabilities(
                 .permissions
                 .capability_profile
                 .native_extension_policy
-                != paro_routine::CapabilityPolicy::Deny
+                != paro_external::routine::capability::CapabilityPolicy::Deny
                 || spec.environment.packages.is_empty(),
             requires_gpu: lower.contains("cuda") || lower.contains("gpu"),
         },
@@ -803,15 +808,15 @@ impl PythonProcessTableKernel {
                 base: PreparedRoutineBase {
                     descriptor: ExternalRoutineDescriptor {
                         label: "__unbound__".to_string(),
-                        identity: paro_routine::RoutineCallIdentity::Catalog {
-                            routine_id: paro_routine::RoutineId::from_raw(0),
+                        identity: paro_external::routine::identity::RoutineCallIdentity::Catalog {
+                            routine_id: paro_external::routine::spec::RoutineId::from_raw(0),
                             generation: 0,
                         },
-                        semantics: paro_routine::RoutineSemantics {
-                            stability: paro_routine::RoutineStability::Volatile,
-                            null_policy: paro_routine::RoutineNullPolicy::CalledOnNullInput,
-                            side_effects: paro_routine::RoutineSideEffects::HasSideEffects,
-                            row_semantics: paro_routine::RowSemantics::RelationExpanding,
+                        semantics: paro_external::routine::spec::RoutineSemantics {
+                            stability: paro_external::routine::spec::RoutineStability::Volatile,
+                            null_policy: paro_external::routine::spec::RoutineNullPolicy::CalledOnNullInput,
+                            side_effects: paro_external::routine::spec::RoutineSideEffects::HasSideEffects,
+                            row_semantics: paro_external::routine::spec::RowSemantics::RelationExpanding,
                             may_block: true,
                         },
                     },
@@ -827,12 +832,12 @@ impl PythonProcessTableKernel {
                         selection: BackendSelection {
                             backend: BackendKind::Process,
                             isolation:
-                                paro_external_runtime::backend::selector::IsolationLevel::Process,
+                                paro_external::runtime::backend::selector::IsolationLevel::Process,
                             transport: TransportKind::LocalShm,
                             sandbox_runtime: None,
-                            input: paro_routine::BackendSelectionInput {
+                            input: paro_external::routine::artifact::BackendSelectionInput {
                                 capability_profile:
-                                    paro_routine::CapabilityProfile::process_default(),
+                                    paro_external::routine::capability::CapabilityProfile::process_default(),
                                 artifact_capabilities: ArtifactCapabilities {
                                     supports_process_backend: true,
                                     supports_subinterpreter_backend: false,
@@ -852,9 +857,9 @@ impl PythonProcessTableKernel {
                                     requires_gpu: false,
                                 },
                                 runtime_contract: runtime_contract(),
-                                minimum_isolation: paro_routine::MinimumIsolation::Process,
+                                minimum_isolation: paro_external::routine::artifact::MinimumIsolation::Process,
                                 trusted_backend_preference:
-                                    paro_routine::TrustedBackendPreference::Automatic,
+                                    paro_external::routine::artifact::TrustedBackendPreference::Automatic,
                             },
                         },
                         capability_profile_label: None,
@@ -891,7 +896,7 @@ impl TableBridgeKernel for PythonProcessTableKernel {
             submission.input,
             if matches!(
                 self.prepared.base.descriptor.semantics.row_semantics,
-                paro_routine::RowSemantics::RowPreserving
+                paro_external::routine::spec::RowSemantics::RowPreserving
             ) {
                 Some(submission.input.size())
             } else {
@@ -2041,16 +2046,16 @@ fn logical_type_to_abi(logical_type: &LogicalType) -> Option<AbiLogicalType> {
     }
 }
 
-fn scalar_value_to_runtime(value: &paro_external_abi::ScalarValueRef) -> Result<Value> {
+fn scalar_value_to_runtime(value: &paro_external::abi::layout::ScalarValueRef) -> Result<Value> {
     match value {
-        paro_external_abi::ScalarValueRef::Null => Ok(Value::Null(LogicalType::Unknown)),
-        paro_external_abi::ScalarValueRef::Boolean(v) => Ok(Value::Boolean(*v)),
-        paro_external_abi::ScalarValueRef::Int32(v) => Ok(Value::Integer(*v)),
-        paro_external_abi::ScalarValueRef::Int64(v) => Ok(Value::BigInt(*v)),
-        paro_external_abi::ScalarValueRef::UInt32(v) => Ok(Value::UInteger(*v)),
-        paro_external_abi::ScalarValueRef::UInt64(v) => Ok(Value::UBigInt(*v)),
-        paro_external_abi::ScalarValueRef::Utf8(v) => Ok(Value::Varchar(v.clone())),
-        paro_external_abi::ScalarValueRef::Binary(v) => Ok(Value::Blob(v.clone())),
+        paro_external::abi::layout::ScalarValueRef::Null => Ok(Value::Null(LogicalType::Unknown)),
+        paro_external::abi::layout::ScalarValueRef::Boolean(v) => Ok(Value::Boolean(*v)),
+        paro_external::abi::layout::ScalarValueRef::Int32(v) => Ok(Value::Integer(*v)),
+        paro_external::abi::layout::ScalarValueRef::Int64(v) => Ok(Value::BigInt(*v)),
+        paro_external::abi::layout::ScalarValueRef::UInt32(v) => Ok(Value::UInteger(*v)),
+        paro_external::abi::layout::ScalarValueRef::UInt64(v) => Ok(Value::UBigInt(*v)),
+        paro_external::abi::layout::ScalarValueRef::Utf8(v) => Ok(Value::Varchar(v.clone())),
+        paro_external::abi::layout::ScalarValueRef::Binary(v) => Ok(Value::Blob(v.clone())),
         other => Err(paro_error::contract_violation(format!(
             "constant output is not implemented for {other:?}"
         ))),
@@ -2179,23 +2184,28 @@ mod tests {
     use paro_common::types::LogicalType;
 
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-    use paro_external_abi::{
-        AbiLogicalType, BufferLease, ColumnDescriptor, ColumnEncoding, ColumnLayout,
-        ColumnPopulationMode, LeaseOwnership, LeaseState, OffsetWidth,
+    use paro_external::abi::descriptor::ColumnDescriptor;
+    use paro_external::abi::encoding::{ColumnEncoding, ColumnPopulationMode};
+    use paro_external::abi::layout::{BufferLease, ColumnLayout, OffsetWidth};
+    use paro_external::abi::lease::{LeaseOwnership, LeaseState};
+    use paro_external::abi::types::AbiLogicalType;
+    use paro_external::routine::bound::BoundRoutineCallMeta;
+    use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+    use paro_external::routine::capability::{CapabilityProfile, CapabilityProfilePreset};
+    use paro_external::routine::env::{DeclaredEnvSpec, ImportRef, PythonRuntimeSelector};
+    use paro_external::routine::identity::RoutineCallIdentity;
+    use paro_external::routine::permission::{PermissionSpec, RoutineSecurityMode};
+    use paro_external::routine::spec::{
+        PythonEntrypointRef, PythonImplementationRef, RoutineArgument, RoutineExecutionContract,
+        RoutineFamily, RoutineIdentity, RoutineImplementationRef, RoutineNullPolicy, RoutineOwner,
+        RoutineReturn, RoutineSemantics, RoutineSideEffects, RoutineSpec, RoutineStability,
+        RoutineTableColumn, RowSemantics, ScalarRoutineContract, SourceBlobRef,
+        TableRoutineContract,
     };
-    use paro_external_runtime::host::ExternalRuntimeHost;
+    use paro_external::runtime::host::ExternalRuntimeHost;
     use paro_function::scalar::ScalarFunction;
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
     use paro_planner::operator::external_project::ExternalProjectExpression;
-    use paro_routine::{
-        BoundRoutineCallMeta, CapabilityProfile, CapabilityProfilePreset, DeclaredEnvSpec,
-        ExecutionBoundary, ImportRef, PermissionSpec, PlacementClass, PythonEntrypointRef,
-        PythonImplementationRef, PythonRuntimeSelector, RoutineArgument, RoutineCallIdentity,
-        RoutineExecutionContract, RoutineFamily, RoutineIdentity, RoutineImplementationRef,
-        RoutineNullPolicy, RoutineOwner, RoutineReturn, RoutineSecurityMode, RoutineSemantics,
-        RoutineSideEffects, RoutineSpec, RoutineStability, RoutineTableColumn, RowSemantics,
-        ScalarRoutineContract, SourceBlobRef, TableRoutineContract,
-    };
     use std::fs;
     use std::sync::Arc;
 
@@ -2228,7 +2238,7 @@ mod tests {
     ) -> RoutineSpec {
         RoutineSpec {
             identity: RoutineIdentity {
-                id: paro_routine::RoutineId::from_raw(77),
+                id: paro_external::routine::spec::RoutineId::from_raw(77),
                 generation: 3,
             },
             name: name.to_string(),
@@ -2287,7 +2297,7 @@ mod tests {
     fn table_spec(name: &str, inline_source: &str) -> RoutineSpec {
         RoutineSpec {
             identity: RoutineIdentity {
-                id: paro_routine::RoutineId::from_raw(88),
+                id: paro_external::routine::spec::RoutineId::from_raw(88),
                 generation: 5,
             },
             name: name.to_string(),
@@ -2427,7 +2437,7 @@ mod tests {
     }
 
     fn response_payload(row_count: u32, descriptor: ColumnDescriptor) -> serde_json::Value {
-        let lease = paro_external_abi::ColumnBatchLease {
+        let lease = paro_external::abi::lease::ColumnBatchLease {
             version: 1,
             lease_id: 1,
             row_count,

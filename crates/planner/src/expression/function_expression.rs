@@ -3,12 +3,14 @@
 
 use super::Expression;
 use paro_common::types::LogicalType;
+use paro_external::routine::bound::BoundRoutineCallMeta;
+use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+use paro_external::routine::identity::{
+    BuiltinIntrinsicId, BuiltinSemanticTag, RoutineCallIdentity,
+};
+use paro_external::routine::spec::RowSemantics;
 use paro_function::scalar::{
     BoundScalarFunction, FunctionSideEffects, FunctionStability, ScalarDispatch,
-};
-use paro_routine::{
-    BoundRoutineCallMeta, BuiltinIntrinsicId, BuiltinSemanticTag, ExecutionBoundary,
-    PlacementClass, RoutineCallIdentity, RowSemantics,
 };
 
 #[derive(Debug, Clone)]
@@ -162,19 +164,27 @@ fn infer_builtin_semantic_tags(function: &BoundScalarFunction) -> Vec<BuiltinSem
     tags
 }
 
-fn infer_builtin_semantics(function: &BoundScalarFunction) -> paro_routine::RoutineSemantics {
+fn infer_builtin_semantics(
+    function: &BoundScalarFunction,
+) -> paro_external::routine::spec::RoutineSemantics {
     let stability = match function.stability {
-        FunctionStability::Consistent => paro_routine::RoutineStability::Immutable,
-        FunctionStability::ConsistentWithinQuery => paro_routine::RoutineStability::Stable,
-        FunctionStability::Volatile => paro_routine::RoutineStability::Volatile,
+        FunctionStability::Consistent => paro_external::routine::spec::RoutineStability::Immutable,
+        FunctionStability::ConsistentWithinQuery => {
+            paro_external::routine::spec::RoutineStability::Stable
+        }
+        FunctionStability::Volatile => paro_external::routine::spec::RoutineStability::Volatile,
     };
     let side_effects = match function.side_effects {
-        FunctionSideEffects::NoSideEffects => paro_routine::RoutineSideEffects::None,
-        FunctionSideEffects::HasSideEffects => paro_routine::RoutineSideEffects::HasSideEffects,
+        FunctionSideEffects::NoSideEffects => {
+            paro_external::routine::spec::RoutineSideEffects::None
+        }
+        FunctionSideEffects::HasSideEffects => {
+            paro_external::routine::spec::RoutineSideEffects::HasSideEffects
+        }
     };
-    paro_routine::RoutineSemantics {
+    paro_external::routine::spec::RoutineSemantics {
         stability,
-        null_policy: paro_routine::RoutineNullPolicy::CalledOnNullInput,
+        null_policy: paro_external::routine::spec::RoutineNullPolicy::CalledOnNullInput,
         side_effects,
         row_semantics: RowSemantics::RowPreserving,
         may_block: false,

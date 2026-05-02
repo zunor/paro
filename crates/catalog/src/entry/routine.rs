@@ -7,10 +7,12 @@ use super::catalog_entry::{
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_routine::{
-    resolve_best_match, DeclaredEnvSpec, PermissionSpec, RoutineArgument, RoutineExecutionContract,
-    RoutineFamily, RoutineId, RoutineIdentity, RoutineImplementationRef, RoutineOwner,
-    RoutineReturn, RoutineSemantics, RoutineSignature, RoutineSpec,
+use paro_external::routine::env::DeclaredEnvSpec;
+use paro_external::routine::permission::PermissionSpec;
+use paro_external::routine::spec::{
+    resolve_best_match, RoutineArgument, RoutineExecutionContract, RoutineFamily, RoutineId,
+    RoutineIdentity, RoutineImplementationRef, RoutineOwner, RoutineReturn, RoutineSemantics,
+    RoutineSignature, RoutineSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -359,9 +361,11 @@ impl InCatalogEntry for RoutineCatalogEntry {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_routine::{
-        CapabilityProfile, PackageRequirement, PythonEntrypointRef, PythonImplementationRef,
-        PythonRuntimeSelector, RoutineNullPolicy, RoutineSecurityMode, RoutineSideEffects,
+    use paro_external::routine::capability::CapabilityProfile;
+    use paro_external::routine::env::{PackageRequirement, PythonRuntimeSelector};
+    use paro_external::routine::permission::RoutineSecurityMode;
+    use paro_external::routine::spec::{
+        PythonEntrypointRef, PythonImplementationRef, RoutineNullPolicy, RoutineSideEffects,
         RoutineStability, RowSemantics, ScalarRoutineContract, SourceBlobRef,
     };
 

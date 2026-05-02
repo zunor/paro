@@ -73,10 +73,11 @@ impl ExternalProject {
         self.binding.routines.iter().all(|routine| {
             matches!(
                 routine.semantics.stability,
-                paro_routine::RoutineStability::Immutable | paro_routine::RoutineStability::Stable
+                paro_external::routine::spec::RoutineStability::Immutable
+                    | paro_external::routine::spec::RoutineStability::Stable
             ) && matches!(
                 routine.semantics.side_effects,
-                paro_routine::RoutineSideEffects::None
+                paro_external::routine::spec::RoutineSideEffects::None
             )
         })
     }
@@ -741,15 +742,18 @@ mod tests {
     use paro_common::runtime_value::Value;
 
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-    use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
+    use paro_external::routine::bound::BoundRoutineCallMeta;
+    use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+    use paro_external::routine::identity::RoutineCallIdentity;
+    use paro_external::routine::spec::{
+        RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
+        RowSemantics,
+    };
+    use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
     use paro_function::scalar::ScalarFunction;
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
     use paro_planner::operator::external_project::{
         ExternalCostEstimate, ExternalProjectExpression,
-    };
-    use paro_routine::{
-        BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineId,
-        RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};

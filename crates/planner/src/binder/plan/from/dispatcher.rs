@@ -33,14 +33,16 @@ mod tests {
     use paro_catalog::mvcc::CatalogSnapshot;
     use paro_catalog::search_path::CatalogSearchEntry;
     use paro_common::types::LogicalType;
-    use paro_parser::parse_one;
-    use paro_routine::{
-        CapabilityProfile, DeclaredEnvSpec, PermissionSpec, PythonEntrypointRef,
-        PythonImplementationRef, PythonRuntimeSelector, RoutineArgument, RoutineExecutionContract,
+    use paro_external::routine::capability::CapabilityProfile;
+    use paro_external::routine::env::{DeclaredEnvSpec, PythonRuntimeSelector};
+    use paro_external::routine::permission::{PermissionSpec, RoutineSecurityMode};
+    use paro_external::routine::spec::{
+        PythonEntrypointRef, PythonImplementationRef, RoutineArgument, RoutineExecutionContract,
         RoutineFamily, RoutineImplementationRef, RoutineNullPolicy, RoutineOwner, RoutineReturn,
-        RoutineSecurityMode, RoutineSemantics, RoutineSideEffects, RoutineStability,
-        RoutineTableColumn, RowSemantics, SourceBlobRef, TableRoutineContract,
+        RoutineSemantics, RoutineSideEffects, RoutineStability, RoutineTableColumn, RowSemantics,
+        SourceBlobRef, TableRoutineContract,
     };
+    use paro_parser::parse_one;
     use std::process::Output;
 
     fn contains_dependent_join(plan: &LogicalOperator) -> bool {

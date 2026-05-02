@@ -52,9 +52,7 @@ paro-scheduler = { workspace = true }
 paro-parser = { version = "0.1.0", path = "../parser" }
 paro-planner = { version = "0.1.0", path = "../planner" }
 paro-optimizer = { version = "0.1.0", path = "../optimizer" }
-paro-routine = { workspace = true }
-paro-external-abi = { workspace = true }
-paro-external-runtime = { workspace = true }
+paro-external = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"
 num_cpus = "1.16"

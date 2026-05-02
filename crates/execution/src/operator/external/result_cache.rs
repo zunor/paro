@@ -7,7 +7,7 @@ use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 
 use paro_common::chunk::Chunk;
-use paro_routine::RoutineCallIdentity;
+use paro_external::routine::identity::RoutineCallIdentity;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QueryLocalResultCacheKey {
@@ -153,7 +153,7 @@ mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
 
-    use paro_routine::{BuiltinIntrinsicId, RoutineCallIdentity};
+    use paro_external::routine::identity::{BuiltinIntrinsicId, RoutineCallIdentity};
     use std::sync::Arc;
 
     #[test]

@@ -9,7 +9,7 @@ use paro_catalog::entry::{
 use paro_common::ddl::{CreateRoutinePayload, DropRoutinePayload};
 use paro_common::error as paro_error;
 use paro_common::logging::targets;
-use paro_routine::RoutineSpec;
+use paro_external::routine::spec::RoutineSpec;
 use std::sync::Arc;
 
 impl<'a> CatalogReplayHandler<'a> {

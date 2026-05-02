@@ -4,7 +4,7 @@
 use crate::ExecutionResources;
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
-use paro_external_runtime::host::PythonRuntimeProvider;
+use paro_external::runtime::host::PythonRuntimeProvider;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_storage::index::graph::{
     GraphProjectionIndexManager, GraphReadSnapshot, GraphStatistics, GraphStorageGeneration,
