@@ -25,6 +25,7 @@ mod write_guard;
 pub mod test_support;
 
 pub use attached_databases::{
+    AttachedDatabaseCommitFrontierSnapshot, AttachedDatabaseCommitPoisonSnapshot,
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot,
     AttachedDatabaseTransactionMetricsSnapshot, AttachedDatabaseWalMetricsSnapshot,
     DatabaseSnapshotIdentity,

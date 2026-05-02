@@ -19,6 +19,7 @@ use paro_common::logging::targets;
 use paro_journal::wal::wal_entry::WalHeaderMetadata;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_transaction::CommitDrainWakePool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ pub struct DatabaseOpenContext {
     pub buffer_pool: Arc<BufferPool>,
     pub buffer_manager: Arc<dyn BufferManager>,
     pub scheduler: Arc<TaskScheduler>,
+    pub commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     pub checkpoint: CheckpointConfigOptions,
 }
 
@@ -154,16 +156,24 @@ impl DatabaseOpener {
         );
 
         let _compaction_guard = db.compaction().suspend(db.name(), "recovery");
+        db.block_commit_admission_for_recovery();
         db.transaction_manager().block_recovery_admission();
         let inputs = Self::collect_finalize_inputs(db)?;
         let apply_runtime = db.journal_apply_runtime();
         apply_runtime.bootstrap_frontiers(Self::journal_recovery_summary(
             &inputs.checkpoint_base.bootstrap,
         ));
+        db.sync_commit_runtime_with(inputs.checkpoint_base.bootstrap.max_commit_id);
+        let commit_runtime = db.commit_runtime();
 
         let (recovery_summary, replayed_deferred_tasks, replayed_wal) =
             if crate::recovery::replay_handler::needs_recovery(&inputs.wal_path) {
-                let replay = Self::replay_wal(db, &inputs, Some(Arc::clone(&apply_runtime)))?;
+                let replay = Self::replay_wal(
+                    db,
+                    &inputs,
+                    Some(Arc::clone(&apply_runtime)),
+                    Some(Arc::clone(&commit_runtime)),
+                )?;
                 (replay.summary, replay.replayed_deferred_tasks, true)
             } else {
                 tracing::debug!(
@@ -186,12 +196,14 @@ impl DatabaseOpener {
         }
         let report = Self::refresh_recovery_report(db, &inputs.wal_path);
         Self::sweep_checkpoint_artifacts(db, checkpoint)?;
-        Self::ensure_recovered_commits_published(&apply_runtime, recovery_summary.max_commit_id)?;
+        Self::ensure_recovered_journal_published(&apply_runtime, recovery_summary.max_lsn)?;
         let runtime_commit_floor =
             Self::reconcile_runtime_state(db, &recovery_summary, checkpoint)?;
         db.sync_commit_runtime_with(runtime_commit_floor);
         db.transaction_manager()
             .complete_recovery_admission(runtime_commit_floor);
+        let _ = db.commit_runtime();
+        db.complete_commit_recovery_admission();
         Self::mark_ready(db);
         db.maybe_gc_catalog();
         Ok(FinalizeLoadOutcome {
@@ -227,12 +239,13 @@ impl DatabaseOpener {
             "Opening managed database"
         );
 
-        let db = Arc::new(DatabaseHandle::with_options(
+        let db = Arc::new(DatabaseHandle::with_options_and_commit_drain_wake_pool(
             record.database_id,
             record.name.clone(),
             record.storage_dir.clone(),
             context.buffer_pool.clone(),
             AttachOptions::default(),
+            Arc::clone(&context.commit_drain_wake_pool),
         ));
         db.bind_task_scheduler(context.scheduler.clone());
 
@@ -365,6 +378,7 @@ impl DatabaseOpener {
         db: &DatabaseHandle,
         inputs: &FinalizeLoadInputs,
         apply_runtime: Option<Arc<paro_journal::JournalApplyRuntime>>,
+        commit_runtime: Option<Arc<paro_transaction::CommitRuntime>>,
     ) -> anyhow::Result<WalReplayOutcome> {
         tracing::info!(
             target: targets::WAL,
@@ -382,6 +396,7 @@ impl DatabaseOpener {
             inputs.wal_header_metadata,
             (inputs.wal_keep_from != u64::MAX).then_some(inputs.wal_keep_from),
             apply_runtime,
+            commit_runtime,
             inputs.checkpoint_base.bootstrap.clone(),
         )?;
 
@@ -440,16 +455,16 @@ impl DatabaseOpener {
         Ok(runtime_commit_floor)
     }
 
-    fn ensure_recovered_commits_published(
+    fn ensure_recovered_journal_published(
         runtime: &paro_journal::JournalApplyRuntime,
-        durable_commit_id: u64,
+        durable_lsn: u64,
     ) -> anyhow::Result<()> {
         let frontiers = runtime.frontiers();
-        if frontiers.published_commit_id < durable_commit_id {
+        if frontiers.published_lsn < durable_lsn {
             anyhow::bail!(
-                "recovery apply stopped below durable commit frontier: published={} durable={}",
-                frontiers.published_commit_id,
-                durable_commit_id
+                "recovery apply stopped below durable journal frontier: published_lsn={} durable_lsn={}",
+                frontiers.published_lsn,
+                durable_lsn
             );
         }
         Ok(())

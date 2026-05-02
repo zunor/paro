@@ -220,6 +220,8 @@ impl TestStatementContextBuilder {
                     wal_metrics: crate::AttachedDatabaseWalMetricsSnapshot::default(),
                     transaction_metrics: crate::AttachedDatabaseTransactionMetricsSnapshot::default(
                     ),
+                    commit_frontier: crate::AttachedDatabaseCommitFrontierSnapshot::default(),
+                    commit_poison: crate::AttachedDatabaseCommitPoisonSnapshot::default(),
                 }],
             )),
             limits,

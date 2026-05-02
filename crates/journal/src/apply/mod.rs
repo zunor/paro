@@ -8,7 +8,9 @@ use paro_common::error::Result;
 use paro_common::journal::{CommitRecord, CommittedRecord, MaintenanceRecord};
 
 pub use crate::apply_queue::{
-    ApplyRequest, ApplySubmitResult, JournalApplyMetricsSnapshot, JournalApplyRuntime,
+    ApplyCompletion, ApplyCompletionFallbackAck, ApplyErrorSource, ApplyFatalSink, ApplyPhase,
+    ApplyRequest, ApplyRuntimeError, ApplySubmitResult, JournalApplyError,
+    JournalApplyMetricsSnapshot, JournalApplyRuntime, RecoveryPlaceholderRecordKind,
     TabletApplyPart,
 };
 pub use crate::waiter::WaitMode;

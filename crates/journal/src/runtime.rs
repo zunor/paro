@@ -26,8 +26,6 @@ pub struct JournalFrontierSnapshot {
     pub durable_lsn: u64,
     pub applied_lsn: u64,
     pub published_lsn: u64,
-    pub durable_commit_id: u64,
-    pub published_commit_id: u64,
 }
 
 pub struct JournalCoordinator {
@@ -81,23 +79,6 @@ impl JournalCoordinator {
             .unwrap_or_else(|| self.inner.state.lock().unwrap().fallback_frontiers)
     }
 
-    pub fn sync_commit_id_with(&self, min_committed_version: u64) {
-        if let Some(runtime) = self.inner.apply_runtime.lock().unwrap().as_ref() {
-            runtime.sync_commit_frontier_with(min_committed_version);
-            return;
-        }
-
-        let mut state = self.inner.state.lock().unwrap();
-        state.fallback_frontiers.durable_commit_id = state
-            .fallback_frontiers
-            .durable_commit_id
-            .max(min_committed_version);
-        state.fallback_frontiers.published_commit_id = state
-            .fallback_frontiers
-            .published_commit_id
-            .max(min_committed_version);
-    }
-
     pub fn sync_maintenance_id_with(&self, min_maintenance_id: u64) {
         bump_mutex_min(
             &self.inner.next_maintenance_id,
@@ -126,15 +107,7 @@ impl JournalCoordinator {
         };
 
         if let Some(last) = results.last().copied() {
-            let last_commit_id = records
-                .iter()
-                .filter_map(|record| match record {
-                    JournalRecord::Commit(record) => Some(record.commit_id),
-                    JournalRecord::Maintenance(_) | JournalRecord::CheckpointFence(_) => None,
-                })
-                .next_back()
-                .unwrap_or(0);
-            update_durable_frontier(&self.inner, last.durable_batch_lsn, last_commit_id);
+            update_durable_frontier(&self.inner, last.durable_batch_lsn);
             tracing::info!(
                 target: targets::WAL,
                 first_lsn = results.first().map(|result| result.lsn).unwrap_or(0),
@@ -209,25 +182,14 @@ impl Drop for JournalCoordinator {
     }
 }
 
-fn update_durable_frontier(
-    inner: &Arc<JournalCoordinatorInner>,
-    durable_lsn: u64,
-    durable_commit_id: u64,
-) {
+fn update_durable_frontier(inner: &Arc<JournalCoordinatorInner>, durable_lsn: u64) {
     if let Some(runtime) = inner.apply_runtime.lock().unwrap().as_ref() {
-        runtime.note_durable_append(
-            durable_lsn,
-            (durable_commit_id != 0).then_some(durable_commit_id),
-        );
+        runtime.note_durable_append(durable_lsn);
         return;
     }
 
     let mut state = inner.state.lock().unwrap();
     state.fallback_frontiers.durable_lsn = state.fallback_frontiers.durable_lsn.max(durable_lsn);
-    state.fallback_frontiers.durable_commit_id = state
-        .fallback_frontiers
-        .durable_commit_id
-        .max(durable_commit_id);
 }
 
 fn bump_mutex_min(mutex: &Mutex<u64>, min_value: u64) -> u64 {
@@ -321,9 +283,7 @@ mod tests {
         assert_eq!(results[0].lsn, 1);
         let frontiers = coordinator.frontiers();
         assert_eq!(frontiers.durable_lsn, 1);
-        assert_eq!(frontiers.durable_commit_id, 12);
         assert_eq!(frontiers.published_lsn, 0);
-        assert_eq!(frontiers.published_commit_id, 0);
     }
 
     #[test]
@@ -413,10 +373,8 @@ mod tests {
         let second_append = coordinator.append_records(&[second_record]).unwrap()[0];
         let stalled = coordinator.frontiers();
         assert_eq!(stalled.durable_lsn, second_append.lsn);
-        assert_eq!(stalled.durable_commit_id, 2);
         assert_eq!(stalled.applied_lsn, 0);
         assert_eq!(stalled.published_lsn, 0);
-        assert_eq!(stalled.published_commit_id, 0);
 
         let (lock, wake) = &*release_slow_part;
         *lock.lock().unwrap() = true;
@@ -441,6 +399,5 @@ mod tests {
         let frontiers = coordinator.frontiers();
         assert_eq!(frontiers.applied_lsn, second_append.lsn);
         assert_eq!(frontiers.published_lsn, second_append.lsn);
-        assert_eq!(frontiers.published_commit_id, 2);
     }
 }

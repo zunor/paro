@@ -23,6 +23,8 @@
 //! - `paro_storage_info(table)` - Segment/column storage observability ✅
 //! - `paro_wal_metrics()` - WAL/apply queue observability ✅
 //! - `paro_transaction_metrics()` - Transaction pipeline observability ✅
+//! - `paro_commit_frontiers()` - Commit frontier observability ✅
+//! - `paro_commit_poison()` - Commit poison/admission observability ✅
 //!
 //! ## Dependencies Check
 //! - Catalog: ✅ `paro_catalog`
@@ -30,6 +32,8 @@
 
 mod memory_runtime;
 pub mod paro_columns;
+pub mod paro_commit_frontiers;
+pub mod paro_commit_poison;
 pub mod paro_databases;
 pub mod paro_graph_statistics;
 pub mod paro_indexes;
@@ -51,6 +55,8 @@ pub mod pragma_database_size;
 
 pub use memory_runtime::{get_system_buffer_manager, register_system_buffer_manager};
 pub use paro_columns::create_paro_columns_function_set;
+pub use paro_commit_frontiers::create_paro_commit_frontiers_function_set;
+pub use paro_commit_poison::create_paro_commit_poison_function_set;
 pub use paro_databases::create_paro_databases_function_set;
 pub use paro_graph_statistics::create_paro_graph_statistics_function_set;
 pub use paro_indexes::create_paro_indexes_function_set;

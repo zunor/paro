@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub mod builder;
 pub mod builtin;
 pub mod checkpoint;
+pub mod commit;
 pub mod config;
 pub mod database;
 pub mod file_system;

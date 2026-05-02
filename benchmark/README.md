@@ -80,6 +80,12 @@ Run a named suite directly:
 make -C benchmark run SUITE=pr-smoke
 ```
 
+Run the SQL group commit gate:
+
+```bash
+make bench SUITE=group_commit
+```
+
 Override workload parameters:
 
 ```bash

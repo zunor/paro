@@ -5,11 +5,16 @@ edition = { workspace = true }
 
 [features]
 default = ["runtime"]
+# Long-term scalar-only boundary for crates that need transaction DTOs without
+# runtime-oriented dependencies. Keep this feature buildable before introducing
+# a separate paro-transaction-types crate.
 types-only = []
-runtime = ["dep:parking_lot"]
+runtime = ["dep:parking_lot", "dep:paro-common", "dep:paro-journal"]
 
 [dependencies]
 parking_lot = { workspace = true, optional = true }
+paro-common = { workspace = true, optional = true }
+paro-journal = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan = { workspace = true }

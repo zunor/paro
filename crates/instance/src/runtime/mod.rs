@@ -9,6 +9,7 @@ use paro_external_runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_transaction::{CommitDrainWakePool, CommitDrainWakePoolOptions};
 use std::sync::Arc;
 
 pub mod connection_registry;
@@ -35,6 +36,7 @@ pub struct InstanceRuntime {
     object_cache: Arc<ObjectCache>,
     db_file_system: Arc<DatabaseFileSystem>,
     python_runtime: Arc<ExternalRuntimeHost>,
+    commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     tuning: RuntimeTuning,
 }
 
@@ -76,6 +78,9 @@ impl InstanceRuntime {
             object_cache,
             db_file_system,
             python_runtime,
+            commit_drain_wake_pool: Arc::new(CommitDrainWakePool::new(
+                CommitDrainWakePoolOptions::default(),
+            )),
             tuning,
         }
     }
@@ -136,6 +141,7 @@ impl InstanceRuntime {
             buffer_pool: Arc::clone(&self.buffer_pool),
             buffer_manager: Arc::clone(&self.buffer_manager),
             scheduler: Arc::clone(&self.scheduler),
+            commit_drain_wake_pool: Arc::clone(&self.commit_drain_wake_pool),
             checkpoint,
         }
     }

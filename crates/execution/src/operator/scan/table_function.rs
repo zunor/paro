@@ -575,6 +575,8 @@ fn populate_system_table_function_data(
         "paro_storage_info" => populate_paro_storage_info(global_state, ctx),
         "paro_wal_metrics" => populate_paro_wal_metrics(global_state, ctx),
         "paro_transaction_metrics" => populate_paro_transaction_metrics(global_state, ctx),
+        "paro_commit_frontiers" => populate_paro_commit_frontiers(global_state, ctx),
+        "paro_commit_poison" => populate_paro_commit_poison(global_state, ctx),
         "paro_property_graphs" => populate_paro_property_graphs(global_state, ctx),
         "paro_graph_statistics" => populate_paro_graph_statistics(global_state, ctx),
         _ => {} // Not a system table function, no data to inject
@@ -1620,6 +1622,78 @@ fn populate_paro_transaction_metrics(
     }
 
     populate_transaction_metric_data(state, entries);
+}
+
+fn populate_paro_commit_frontiers(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &ExecutionContext,
+) {
+    use paro_function::table::system::paro_commit_frontiers::{
+        populate_commit_frontier_data, CommitFrontierData, ParoCommitFrontiersGlobalState,
+    };
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoCommitFrontiersGlobalState>()
+    else {
+        return;
+    };
+
+    let mut entries = Vec::new();
+    for db in ctx.session.databases.iter() {
+        let frontier = db.commit_frontier();
+        entries.push(CommitFrontierData {
+            database_oid: db.identity.id,
+            database_name: db.identity.name.clone(),
+            durable_commit_id: frontier.durable_commit_id,
+            published_commit_id: frontier.published_commit_id,
+            durable_commit_bytes: frontier.durable_commit_bytes,
+            published_commit_bytes: frontier.published_commit_bytes,
+            durable_to_published_bytes_lag: frontier.durable_to_published_bytes_lag,
+            stale_bytes_at_poison: frontier.stale_bytes_at_poison,
+            publish_failure_watermark: frontier.publish_failure_watermark,
+            publish_failure_cause: frontier.publish_failure_cause.clone(),
+            wait_count: frontier.wait_count,
+            wait_wake_count: frontier.wait_wake_count,
+            notify_all_count: frontier.notify_all_count,
+            notify_suppressed_count: frontier.notify_suppressed_count,
+            publish_failure_count: frontier.publish_failure_count,
+        });
+    }
+
+    populate_commit_frontier_data(state, entries);
+}
+
+fn populate_paro_commit_poison(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &ExecutionContext,
+) {
+    use paro_function::table::system::paro_commit_poison::{
+        populate_commit_poison_data, CommitPoisonData, ParoCommitPoisonGlobalState,
+    };
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoCommitPoisonGlobalState>()
+    else {
+        return;
+    };
+
+    let mut entries = Vec::new();
+    for db in ctx.session.databases.iter() {
+        let poison = db.commit_poison();
+        entries.push(CommitPoisonData {
+            database_oid: db.identity.id,
+            database_name: db.identity.name.clone(),
+            admission_state: poison.admission_state.clone(),
+            admission_open: poison.admission_open,
+            poisoned: poison.poisoned,
+            poison_cause: poison.poison_cause.clone(),
+            first_blocked_commit_ts: poison.first_blocked_commit_ts,
+        });
+    }
+
+    populate_commit_poison_data(state, entries);
 }
 
 fn u64_to_i64(value: u64) -> i64 {

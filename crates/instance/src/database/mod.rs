@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod closer;
+pub mod commit_health;
 pub mod compaction_driver;
 pub mod handle;
 pub mod hooks;
@@ -24,7 +25,7 @@ pub mod storage;
 pub mod storage_identity;
 pub mod wal_observability;
 
-use crate::database::handle::{AttachOptions, DatabaseHandle};
+use crate::database::handle::{AttachOptions, DatabaseCloseAction, DatabaseHandle};
 use crate::database::hooks::{
     DeferredTaskRecoveryHook, GraphProjectionRecoveryHook, RecoveryHook, RecoveryHookContext,
     RecoveryHookResult,
@@ -358,6 +359,51 @@ impl ManagedDatabaseService {
         Ok(())
     }
 
+    pub fn reopen_after_commit_poison(
+        &self,
+        ctx: &DatabaseDdlContext<'_>,
+        name: &str,
+    ) -> paro_common::error::Result<Arc<DatabaseHandle>> {
+        let catalog = ctx.metadata.load_catalog()?;
+        let record = catalog
+            .find_database_by_name(name)
+            .cloned()
+            .ok_or_else(|| paro_common::error::database_not_found(name))?;
+        if !record.state.allows_runtime_open() {
+            return Err(paro_common::error::cannot_connect_now().detail(format!(
+                "database \"{}\" is in {:?} state",
+                name, record.state
+            )));
+        }
+        let old = self.registry.get_database(name).ok_or_else(|| {
+            paro_common::error::cannot_connect_now()
+                .detail(format!("database \"{}\" is not currently open", name))
+        })?;
+        let old_poison = old.commit_poison_snapshot();
+        if !old_poison.poisoned {
+            return Err(paro_common::error::invalid_transaction_state(format!(
+                "database \"{}\" is not commit-poisoned",
+                name
+            )));
+        }
+
+        old.close(DatabaseCloseAction::TryCheckpoint)
+            .map_err(|error| paro_common::error::internal(error.to_string()))?;
+        let open_result = self
+            .open_managed_database(
+                &record,
+                DatabaseOpenIntent::OpenExisting,
+                &ctx.open_ctx,
+                StartupPolicy::default(),
+                true,
+            )
+            .map_err(|error| error.error)?;
+        self.registry
+            .replace_runtime_database(name, Arc::clone(&open_result.handle))
+            .map_err(|error| paro_common::error::internal(error.to_string()))?;
+        Ok(open_result.handle)
+    }
+
     pub(crate) fn provision_managed_database(
         &self,
         ctx: &DatabaseDdlContext<'_>,
@@ -659,6 +705,15 @@ impl Instance {
         let _ddl_guard = self.lock_ddl(InstanceDdlOwner::RenameDatabase)?;
         self.database_service
             .rename_database(&self.database_ddl_context(), old_name, new_name)
+    }
+
+    pub fn reopen_database_after_commit_poison(
+        &self,
+        name: &str,
+    ) -> paro_common::error::Result<Arc<DatabaseHandle>> {
+        let _ddl_guard = self.lock_ddl(InstanceDdlOwner::ReopenDatabase)?;
+        self.database_service
+            .reopen_after_commit_poison(&self.database_ddl_context(), name)
     }
 
     pub fn database_registry(&self) -> &Arc<DatabaseRegistry> {

@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "timestamp": "2026-05-02T01:43:05+08:00",
+  "git": {
+    "commit": "8952ea88",
+    "branch": "group-commit"
+  },
+  "performance_gate": {
+    "name": "group_commit_queue_phase15",
+    "profile": {
+      "commit_concurrency": 1,
+      "active_database_count": 1,
+      "fsync_mode": "wal_default",
+      "commit_payload_bytes": 64,
+      "write_set_keys": 1,
+      "apply_target": "single local tablet/catalog runtime"
+    },
+    "metrics": [
+      "p50",
+      "p99",
+      "p999",
+      "throughput_per_second"
+    ],
+    "latency_regression_threshold_percent": 25.0,
+    "throughput_min_ratio": 0.75,
+    "absolute_max": {
+      "p50": 100.0,
+      "p99": 180.0,
+      "p999": 220.0
+    },
+    "absolute_min": {
+      "throughput_per_second": 8.0
+    }
+  },
+  "workloads": [
+    {
+      "name": "group_commit",
+      "params": {
+        "active_database_count": 1,
+        "commit_concurrency": 1,
+        "commit_payload_bytes": 64,
+        "fsync_mode": "wal_default",
+        "payload": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "serializable_insert_id": 2000001,
+        "snapshot_insert_id": 1000001,
+        "write_set_keys": 1
+      },
+      "queries": [
+        {
+          "id": "queue_snapshot_insert",
+          "stats": {
+            "p50": 22.39056299731601,
+            "p99": 22.826583997812122,
+            "p999": 22.826583997812122,
+            "throughput_per_second": 44.661672871730445
+          }
+        },
+        {
+          "id": "queue_serializable_insert",
+          "stats": {
+            "p50": 22.13585449499078,
+            "p99": 22.921958996448666,
+            "p999": 22.921958996448666,
+            "throughput_per_second": 45.175577036174246
+          }
+        },
+        {
+          "id": "queue_hot_update",
+          "stats": {
+            "p50": 23.213603999465704,
+            "p99": 23.480999981984496,
+            "p999": 23.480999981984496,
+            "throughput_per_second": 43.078188118614264
+          }
+        },
+        {
+          "id": "commit_frontier_lag",
+          "stats": {
+            "p50": 2.0775629964191467,
+            "p99": 2.1459590061567724,
+            "p999": 2.1459590061567724,
+            "throughput_per_second": 481.3331782110018
+          }
+        },
+        {
+          "id": "transaction_commit_metrics",
+          "stats": {
+            "p50": 2.1633120049955323,
+            "p99": 2.1779160015285015,
+            "p999": 2.1779160015285015,
+            "throughput_per_second": 462.254172163236
+          }
+        }
+      ]
+    }
+  ]
+}

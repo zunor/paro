@@ -880,7 +880,10 @@ mod tests {
     ) -> Result<u64> {
         let frozen = ctx.freeze()?;
         let commit_id = manager.durable_commit_id().saturating_add(1).max(1);
-        frozen.active.commit(commit_id)?;
+        let apply_result = frozen.active.apply_prepared_storage_for_commit(commit_id);
+        frozen.active.release_transaction_locks();
+        apply_result?;
+        frozen.active.finalize_applied_commit(commit_id)?;
         Ok(commit_id)
     }
 

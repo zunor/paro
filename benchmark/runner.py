@@ -62,6 +62,13 @@ class SuiteInclude:
     query_ids: tuple[str, ...] | None
 
 
+@dataclass(frozen=True)
+class RegressionConfig:
+    enabled: bool
+    threshold_percent: float
+    baseline_file: str
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Paro benchmark runner")
 
@@ -397,6 +404,8 @@ def run(argv: list[str] | None = None) -> int:
         print("no workloads selected", file=sys.stderr)
         return 2
 
+    regression = effective_regression_config(config, args)
+
     executor = BenchmarkExecutor(
         connection=config.connection,
         iterations=config.iterations,
@@ -425,16 +434,23 @@ def run(argv: list[str] | None = None) -> int:
     exit_code = 1 if reporter.has_failures(workload_results) else 0
 
     check_path = args.check
-    if check_path is None and config.regression_enabled and config.baseline_file:
-        check_path = Path(config.baseline_file)
+    if check_path is None and regression.enabled and regression.baseline_file:
+        check_path = Path(regression.baseline_file)
+        if not check_path.is_absolute():
+            check_path = (config.root_dir / check_path).resolve()
     if check_path is not None:
         if not check_path.exists():
             print(f"baseline not found: {check_path}", file=sys.stderr)
             return 2
-        entries = reporter.compare_with_baseline(payload, check_path, config.threshold_percent)
-        reporter.print_regression(entries, config.threshold_percent)
-        reporter.append_regression_to_summary(summary_path, entries, config.threshold_percent)
+        entries = reporter.compare_with_baseline(payload, check_path, regression.threshold_percent)
+        reporter.print_regression(entries, regression.threshold_percent)
+        reporter.append_regression_to_summary(summary_path, entries, regression.threshold_percent)
         if reporter.has_regression(entries):
+            exit_code = 1
+        gate_entries = reporter.compare_performance_gates(payload, check_path)
+        reporter.print_performance_gates(gate_entries)
+        reporter.append_performance_gates_to_summary(summary_path, gate_entries)
+        if reporter.has_performance_gate_regression(gate_entries):
             exit_code = 1
 
     if args.bless is not None:
@@ -442,6 +458,34 @@ def run(argv: list[str] | None = None) -> int:
         print(f"baseline updated: {args.bless}")
 
     return exit_code
+
+
+def effective_regression_config(config: RunnerConfig, args: argparse.Namespace) -> RegressionConfig:
+    regression = RegressionConfig(
+        enabled=config.regression_enabled,
+        threshold_percent=config.threshold_percent,
+        baseline_file=config.baseline_file,
+    )
+    if args.suite is None:
+        return regression
+    suite_path = config.suites_dir / f"{args.suite}.toml"
+    if not suite_path.exists():
+        return regression
+    suite_data = _load_toml(suite_path)
+    table = _get_table(suite_data, "regression", required=False)
+    if not table:
+        return regression
+    return RegressionConfig(
+        enabled=_as_bool(table.get("enabled", regression.enabled), field="regression.enabled"),
+        threshold_percent=_as_float(
+            table.get("threshold_percent", regression.threshold_percent),
+            field="regression.threshold_percent",
+        ),
+        baseline_file=_as_str(
+            table.get("baseline_file", regression.baseline_file),
+            field="regression.baseline_file",
+        ),
+    )
 
 
 def _load_toml(path: Path) -> dict[str, Any]:

@@ -102,6 +102,44 @@ pub struct AttachedDatabaseTransactionMetricsSnapshot {
     pub active_rw_txn_count: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachedDatabaseCommitFrontierSnapshot {
+    pub durable_commit_id: u64,
+    pub published_commit_id: u64,
+    pub durable_commit_bytes: u64,
+    pub published_commit_bytes: u64,
+    pub durable_to_published_bytes_lag: Option<u64>,
+    pub stale_bytes_at_poison: Option<u64>,
+    pub publish_failure_watermark: Option<u64>,
+    pub publish_failure_cause: Option<String>,
+    pub wait_count: u64,
+    pub wait_wake_count: u64,
+    pub notify_all_count: u64,
+    pub notify_suppressed_count: u64,
+    pub publish_failure_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedDatabaseCommitPoisonSnapshot {
+    pub admission_state: String,
+    pub admission_open: bool,
+    pub poisoned: bool,
+    pub poison_cause: Option<String>,
+    pub first_blocked_commit_ts: Option<u64>,
+}
+
+impl Default for AttachedDatabaseCommitPoisonSnapshot {
+    fn default() -> Self {
+        Self {
+            admission_state: "open".to_string(),
+            admission_open: true,
+            poisoned: false,
+            poison_cause: None,
+            first_blocked_commit_ts: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AttachedDatabaseSnapshot {
     pub identity: DatabaseSnapshotIdentity,
@@ -109,6 +147,8 @@ pub struct AttachedDatabaseSnapshot {
     pub tablet_meta: Option<Arc<TabletMetaManager>>,
     pub wal_metrics: AttachedDatabaseWalMetricsSnapshot,
     pub transaction_metrics: AttachedDatabaseTransactionMetricsSnapshot,
+    pub commit_frontier: AttachedDatabaseCommitFrontierSnapshot,
+    pub commit_poison: AttachedDatabaseCommitPoisonSnapshot,
 }
 
 impl AttachedDatabaseSnapshot {
@@ -142,6 +182,14 @@ impl AttachedDatabaseSnapshot {
 
     pub fn transaction_metrics(&self) -> &AttachedDatabaseTransactionMetricsSnapshot {
         &self.transaction_metrics
+    }
+
+    pub fn commit_frontier(&self) -> &AttachedDatabaseCommitFrontierSnapshot {
+        &self.commit_frontier
+    }
+
+    pub fn commit_poison(&self) -> &AttachedDatabaseCommitPoisonSnapshot {
+        &self.commit_poison
     }
 }
 

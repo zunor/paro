@@ -8,6 +8,7 @@ use crate::checkpoint::coordinator::{
 };
 use crate::config::CheckpointConfigOptions;
 use crate::database::closer::DatabaseCloser;
+use crate::database::commit_health::CommitHealth;
 use crate::database::compaction_driver::CompactionDriver;
 use crate::database::identity::{DatabaseIdentity, DatabaseType};
 use crate::database::opener::DatabaseOpener;
@@ -21,6 +22,7 @@ use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::RecoverySummary;
 use paro_common::logging::targets;
+use paro_context::{AttachedDatabaseCommitFrontierSnapshot, AttachedDatabaseCommitPoisonSnapshot};
 use paro_journal::wal::journal_sink::WalJournalSink;
 use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_journal::{
@@ -32,7 +34,10 @@ use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::transaction::manager::TransactionManager;
-use paro_transaction::{CommitCoordinator, CommitTs, DatabaseId as TransactionDatabaseId};
+use paro_transaction::{
+    CommitBatchPolicy, CommitDrainWakePool, CommitDrainWakePoolOptions, CommitJournal,
+    CommitRuntime, CommitRuntimeAssembly, CommitTs,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -236,7 +241,9 @@ pub struct DatabaseHandle {
     state: DatabaseState,
     catalog: Arc<ParoCatalog>,
     transaction_manager: Arc<TransactionManager>,
-    commit_coordinator: Arc<CommitCoordinator>,
+    commit_runtime: Mutex<Option<Arc<CommitRuntime>>>,
+    commit_drain_wake_pool: Arc<CommitDrainWakePool>,
+    commit_health: Arc<CommitHealth>,
     journal_coordinator: Mutex<Option<Arc<JournalCoordinator>>>,
     journal_apply_runtime: Mutex<Option<Arc<JournalApplyRuntime>>>,
     journal_next_lsn: AtomicU64,
@@ -287,17 +294,19 @@ impl DatabaseHandle {
         identity: DatabaseIdentity,
         buffer_pool: Arc<BufferPool>,
         initial_state: DbState,
+        commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     ) -> Self {
         let catalog = Self::catalog_for_path(&identity.name, &identity.path);
         let database_id = identity.id;
+        let transaction_manager = Arc::new(TransactionManager::new_for_database_id(database_id));
         Self {
             identity,
             state: DatabaseState::new(initial_state),
             catalog,
-            transaction_manager: Arc::new(TransactionManager::new_for_database_id(database_id)),
-            commit_coordinator: Arc::new(CommitCoordinator::new(TransactionDatabaseId::new(
-                database_id,
-            ))),
+            transaction_manager,
+            commit_runtime: Mutex::new(None),
+            commit_drain_wake_pool,
+            commit_health: Arc::new(CommitHealth::default()),
             journal_coordinator: Mutex::new(None),
             journal_apply_runtime: Mutex::new(None),
             journal_next_lsn: AtomicU64::new(1),
@@ -327,6 +336,9 @@ impl DatabaseHandle {
             ),
             buffer_pool,
             DbState::Opening,
+            Arc::new(CommitDrainWakePool::new(
+                CommitDrainWakePoolOptions::default(),
+            )),
         )
     }
 
@@ -356,6 +368,39 @@ impl DatabaseHandle {
             ),
             buffer_pool,
             DbState::Opening,
+            Arc::new(CommitDrainWakePool::new(
+                CommitDrainWakePoolOptions::default(),
+            )),
+        )
+    }
+
+    pub fn with_options_and_commit_drain_wake_pool(
+        id: u64,
+        name: String,
+        path: String,
+        buffer_pool: Arc<BufferPool>,
+        options: AttachOptions,
+        commit_drain_wake_pool: Arc<CommitDrainWakePool>,
+    ) -> Self {
+        let db_type = match options.access_mode {
+            AccessMode::ReadOnly => DatabaseType::ReadOnly,
+            _ => DatabaseType::ReadWrite,
+        };
+
+        Self::base(
+            DatabaseIdentity::new(
+                id,
+                name,
+                path,
+                db_type,
+                options.recovery_mode,
+                options.visibility,
+                options.is_main_database,
+                options.options,
+            ),
+            buffer_pool,
+            DbState::Opening,
+            commit_drain_wake_pool,
         )
     }
 
@@ -374,6 +419,9 @@ impl DatabaseHandle {
             ),
             buffer_pool,
             DbState::Ready,
+            Arc::new(CommitDrainWakePool::new(
+                CommitDrainWakePoolOptions::default(),
+            )),
         )
     }
 
@@ -392,6 +440,9 @@ impl DatabaseHandle {
             ),
             buffer_pool,
             DbState::Ready,
+            Arc::new(CommitDrainWakePool::new(
+                CommitDrainWakePoolOptions::default(),
+            )),
         )
     }
 
@@ -410,7 +461,7 @@ impl DatabaseHandle {
 
     /// Check if the database is ready for queries.
     pub fn is_ready(&self) -> bool {
-        self.state.is_ready()
+        self.state.is_ready() && self.commit_health.is_open()
     }
 
     /// Get the current state of the database.
@@ -563,8 +614,48 @@ impl DatabaseHandle {
         &self.transaction_manager
     }
 
-    pub fn commit_coordinator(&self) -> &Arc<CommitCoordinator> {
-        &self.commit_coordinator
+    pub fn commit_runtime(&self) -> Arc<CommitRuntime> {
+        if let Some(runtime) = self.commit_runtime.lock().as_ref().cloned() {
+            return runtime;
+        }
+
+        let journal = self.journal_coordinator();
+        let journal_trait: Arc<dyn CommitJournal> = journal;
+        let apply_runtime = self.journal_apply_runtime();
+        let manager = Arc::clone(&self.transaction_manager);
+        let cleanup_manager = Arc::clone(&manager);
+        let commit_health = Arc::clone(&self.commit_health);
+        let runtime_slot: Arc<Mutex<Option<Weak<CommitRuntime>>>> = Arc::new(Mutex::new(None));
+        let wake_handle = self.commit_drain_wake_pool.handle({
+            let runtime_slot = Arc::clone(&runtime_slot);
+            Arc::new(move |_, max_batches| {
+                if let Some(runtime) = runtime_slot.lock().as_ref().and_then(Weak::upgrade) {
+                    runtime.drain_inline_with_batch_budget(max_batches);
+                }
+            })
+        });
+        let runtime = Arc::new(CommitRuntime::new(CommitRuntimeAssembly {
+            journal: journal_trait,
+            apply_runtime,
+            policy: CommitBatchPolicy::default(),
+            sequencer: manager.commit_sequencer(),
+            frontier: manager.commit_frontier(),
+            reservation_factory: manager.commit_finalize_reservation_factory(),
+            final_fence: manager.commit_final_fence(),
+            cleanup_snapshot: Arc::new(move || cleanup_manager.cleanup_backpressure_snapshot()),
+            wake_handle: Some(wake_handle),
+            health_sink: Some(Arc::new(move |poison| {
+                commit_health.mark_poisoned(poison.to_string());
+            })),
+        }));
+        *runtime_slot.lock() = Some(Arc::downgrade(&runtime));
+        let mut guard = self.commit_runtime.lock();
+        if let Some(existing) = guard.as_ref().cloned() {
+            existing
+        } else {
+            *guard = Some(Arc::clone(&runtime));
+            runtime
+        }
     }
 
     pub fn journal_coordinator(&self) -> Arc<JournalCoordinator> {
@@ -583,7 +674,6 @@ impl DatabaseHandle {
         });
         let coordinator = Arc::new(JournalCoordinator::new(appender));
         coordinator.bind_apply_runtime(runtime);
-        coordinator.sync_commit_id_with(self.transaction_manager.durable_commit_id());
         let mut guard = self.journal_coordinator.lock();
         if let Some(existing) = guard.as_ref().cloned() {
             existing.bind_apply_runtime(self.journal_apply_runtime());
@@ -600,7 +690,6 @@ impl DatabaseHandle {
         }
 
         let runtime = Arc::new(JournalApplyRuntime::new());
-        runtime.sync_commit_frontier_with(self.transaction_manager.durable_commit_id());
         let mut guard = self.journal_apply_runtime.lock();
         if let Some(existing) = guard.as_ref().cloned() {
             existing
@@ -618,14 +707,74 @@ impl DatabaseHandle {
             .unwrap_or_default()
     }
 
-    pub fn sync_commit_runtime_with(&self, min_committed_version: u64) {
-        self.commit_coordinator
-            .sync_commit_ts_with(CommitTs::new(min_committed_version));
-        if let Some(runtime) = self.journal_apply_runtime.lock().as_ref().cloned() {
-            runtime.sync_commit_frontier_with(min_committed_version);
+    pub fn commit_frontier_snapshot(&self) -> AttachedDatabaseCommitFrontierSnapshot {
+        let snapshot = self.transaction_manager.commit_frontier().snapshot();
+        AttachedDatabaseCommitFrontierSnapshot {
+            durable_commit_id: snapshot.durable_commit_id.into_raw(),
+            published_commit_id: snapshot.published_commit_id.into_raw(),
+            durable_commit_bytes: snapshot.durable_commit_bytes,
+            published_commit_bytes: snapshot.published_commit_bytes,
+            durable_to_published_bytes_lag: snapshot.durable_to_published_bytes_lag,
+            stale_bytes_at_poison: snapshot.stale_bytes_at_poison,
+            publish_failure_watermark: snapshot
+                .publish_failure_watermark
+                .map(|commit_ts| commit_ts.into_raw()),
+            publish_failure_cause: snapshot
+                .publish_failure
+                .map(|failure| failure.cause.to_string()),
+            wait_count: snapshot.metrics.wait_count,
+            wait_wake_count: snapshot.metrics.wait_wake_count,
+            notify_all_count: snapshot.metrics.notify_all_count,
+            notify_suppressed_count: snapshot.metrics.notify_suppressed_count,
+            publish_failure_count: snapshot.metrics.publish_failure_count,
         }
-        if let Some(coordinator) = self.journal_coordinator.lock().as_ref().cloned() {
-            coordinator.sync_commit_id_with(min_committed_version);
+    }
+
+    pub fn commit_poison_snapshot(&self) -> AttachedDatabaseCommitPoisonSnapshot {
+        let runtime = self.commit_runtime.lock().as_ref().cloned();
+        let runtime_poison = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.poison_snapshot());
+        if let Some(poison) = runtime_poison.as_ref() {
+            self.commit_health.mark_poisoned(poison.to_string());
+        }
+        let frontier = self.transaction_manager.commit_frontier().snapshot();
+        let first_blocked_commit_ts = frontier
+            .publish_failure_watermark
+            .map(|commit_ts| commit_ts.into_raw());
+        let health = self.commit_health.snapshot(
+            runtime.as_ref().map(|runtime| runtime.is_admission_open()),
+            first_blocked_commit_ts,
+        );
+        AttachedDatabaseCommitPoisonSnapshot {
+            admission_state: health.admission_state.as_str().to_string(),
+            admission_open: health.admission_open,
+            poisoned: health.poisoned,
+            poison_cause: health.poison_cause,
+            first_blocked_commit_ts: health.first_blocked_commit_ts,
+        }
+    }
+
+    pub fn commit_health_detail(&self) -> String {
+        self.commit_health.detail()
+    }
+
+    pub fn block_commit_admission_for_recovery(&self) {
+        self.commit_health.block_recovery();
+    }
+
+    pub fn complete_commit_recovery_admission(&self) {
+        self.commit_health.complete_recovery();
+    }
+
+    pub fn sync_commit_runtime_with(&self, min_committed_version: u64) {
+        self.transaction_manager
+            .sync_commit_id_with(min_committed_version);
+        if let Some(runtime) = self.commit_runtime.lock().as_ref().cloned() {
+            runtime.frontier().sync_commit_ids(
+                CommitTs::new(min_committed_version),
+                CommitTs::new(min_committed_version),
+            );
         }
     }
 
@@ -656,6 +805,7 @@ impl DatabaseHandle {
         }
         *self.journal_coordinator.lock() = None;
         *self.journal_apply_runtime.lock() = None;
+        *self.commit_runtime.lock() = None;
 
         tracing::info!(
             target: targets::WAL,
@@ -850,6 +1000,7 @@ impl DatabaseHandle {
             .store(summary.max_lsn.saturating_add(1).max(1), Ordering::Release);
         self.checkpoint_coordinator.bootstrap_runtime(summary);
         *self.journal_coordinator.lock() = None;
+        *self.commit_runtime.lock() = None;
         self.bind_tablet_runtime_services();
     }
 

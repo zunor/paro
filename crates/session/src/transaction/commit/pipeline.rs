@@ -1,13 +1,13 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::ddl_changes::{IndexPostCommitAction, PreparedCatalogOp, TransientCatalogRuntime};
-use super::index_backfill::IndexBackfillPlan;
-use super::session_transaction::FrozenTransaction;
+use super::super::ddl_changes::{PreparedCatalogOp, TransientCatalogRuntime};
+use super::super::post_commit::PostCommitActions;
+use super::super::session_transaction::FrozenTransaction;
+use super::ddl_publish::{build_apply_descriptor_phase, IndexBackfillPublishTask};
+use super::errors::{commit_runtime_error_to_paro, CommitFailure};
+use super::job_builder;
 use crate::session::Session;
-use paro_catalog::entry::{
-    IndexCatalogEntry, IndexCoverage, IndexType as CatalogIndexType, TableCatalogEntry,
-};
 use paro_catalog::transaction::{
     CatalogCommitParticipant, CatalogCommittedRecordApplier, CatalogPreparedChange,
 };
@@ -15,26 +15,24 @@ use paro_common::ddl::DdlChange;
 use paro_common::durability::PreparedCommitPlan;
 use paro_common::effect::{
     ApplyDescriptor, DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor,
+    StorageCommitOp,
 };
-use paro_common::error::{ParoError, Result};
-use paro_common::journal::JournalRecord;
+use paro_common::error::Result;
 use paro_common::logging::targets;
-use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
+use paro_instance::commit::live_publish::{build_required_publish_plan, LivePublishPlanInput};
+use paro_journal::{encoded_size_upper_bound_for_plan, TabletApplyPart};
+use paro_storage::transaction::lifecycle_action;
 use paro_storage::transaction::participant::{
     StorageCommitParticipant, StorageCommittedRecordApplier,
 };
 use paro_storage::transaction::txn::{PreparedStorageCommit, Transaction};
-use paro_storage::{
-    index::BoundIndex,
-    search::{SearchIndexDefinition, SearchIndexKind},
-    table::table_handle::TableHandle,
-};
 use paro_transaction::{
-    AbortReason, CommitAckPolicy, CommitCoordinatorError, CommitParticipant, CommitRequest,
-    CommitSequencingPlan, CommitTicket, CommittedRecordApplier, DatabaseId, ParticipantDescriptor,
-    ParticipantId, ParticipantKind, RequiredPublishOutcome, TransactionView, TxnResourceKey,
+    AbortReason, ApplyTargetDescriptor, CommitFinalizeReservationInput, CommitParticipant,
+    CommitRequest, CommitRuntimeAck, CommitSequencingPlan, CommittedRecordApplier, DatabaseId,
+    ParticipantDescriptor, ParticipantId, ParticipantKind, PreparedCommitJob, PreparedCommitPart,
+    TransactionView, TxnResourceKey, WriteConflictPlacementInput,
 };
-use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,193 +46,11 @@ pub struct CommitOutcome {
     pub post_commit_hooks: Vec<PostCommitHookDescriptor>,
 }
 
-#[derive(Debug)]
-pub struct CommitFailure {
-    pub error: ParoError,
-    pub rollback_succeeded: bool,
-}
-
-#[derive(Clone)]
-struct IndexBackfillPublishTask {
-    entry: Arc<IndexCatalogEntry>,
-    table: Arc<TableCatalogEntry>,
-    info: paro_catalog::entry::CreateIndexInfo,
-    built_index: Option<Arc<dyn BoundIndex>>,
-    coverage: Option<IndexCoverage>,
-    backfill: Option<IndexBackfillPlan>,
-}
-
-impl IndexBackfillPublishTask {
-    fn from_action(action: &IndexPostCommitAction) -> Self {
-        Self {
-            entry: Arc::clone(&action.entry),
-            table: Arc::clone(&action.table),
-            info: action.info.clone(),
-            built_index: action.built_index.clone(),
-            coverage: action.coverage.clone(),
-            backfill: action.backfill.clone(),
-        }
-    }
-
-    fn execute(&self, publish_ts: u64) -> Result<()> {
-        if let Some(backfill) = &self.backfill {
-            let report = backfill.bounded_final_catch_up(
-                publish_ts,
-                self.table.as_ref(),
-                self.entry.as_ref(),
-            )?;
-            tracing::debug!(
-                target: targets::TRANSACTION,
-                index = %self.info.name,
-                table = %self.info.table_name,
-                from_ts = report.from_ts,
-                to_ts = report.to_ts,
-                consumed_commits = report.consumed_commits,
-                "CREATE INDEX bounded final catch-up completed"
-            );
-        }
-
-        let Some(storage) = self.table.get_storage() else {
-            if matches!(
-                self.info.index_type,
-                CatalogIndexType::ART
-                    | CatalogIndexType::HNSW
-                    | CatalogIndexType::Sparse
-                    | CatalogIndexType::FullText
-            ) {
-                return Err(paro_common::error::internal(format!(
-                    "table '{}' has no storage for CREATE INDEX publish",
-                    self.table.base.base.name
-                )));
-            }
-            self.entry.mark_ready_with_coverage(self.coverage.clone());
-            return Ok(());
-        };
-
-        if let Some(built_index) = self.built_index.as_ref() {
-            if storage.has_index(&self.info.name) {
-                let _ = storage.remove_index(&self.info.name);
-            }
-            storage.add_index(Arc::clone(built_index))?;
-        } else if self.info.index_type == CatalogIndexType::ART {
-            let [column_id] = self.info.column_ids.as_slice() else {
-                return Err(paro_common::error::not_supported(
-                    "ART indexes currently require exactly one column",
-                ));
-            };
-            storage.rebuild_art_index(column_id.index)?;
-        }
-
-        Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;
-        let coverage = self.recompute_coverage(storage.as_ref())?;
-        self.entry.mark_ready_with_coverage(coverage);
-        Ok(())
-    }
-
-    fn recompute_coverage(&self, storage: &TableHandle) -> Result<Option<IndexCoverage>> {
-        match self.info.index_type {
-            CatalogIndexType::HNSW | CatalogIndexType::Sparse | CatalogIndexType::FullText => {
-                let definition_id = self.entry.base.base.object_id.raw();
-                let Some(coverage) = storage.search_generation_coverage(definition_id)? else {
-                    return Ok(self.coverage.clone());
-                };
-                Ok(Some(IndexCoverage::from_counts(
-                    coverage.visible_version,
-                    coverage.visible_segment_count,
-                    coverage.indexed_segment_count,
-                )))
-            }
-            _ => Ok(self.coverage.clone()),
-        }
-    }
-
-    fn register_search_definition(storage: &TableHandle, entry: &IndexCatalogEntry) -> Result<()> {
-        let Some(kind) = Self::search_kind(entry.index_type) else {
-            return Ok(());
-        };
-        let definition = SearchIndexDefinition {
-            definition_id: entry.base.base.object_id.raw(),
-            table_id: storage.tablet().table_id(),
-            name: entry.base.base.name.clone(),
-            kind,
-            column_ids: entry
-                .get_column_ids()
-                .iter()
-                .map(|column| column.index)
-                .collect(),
-            expression: Self::search_expression(entry),
-            provider_config: Self::search_provider_config(storage, entry)?,
-            config_fingerprint: 0,
-        };
-        let expression = definition.expression.clone();
-        let provider_config = definition.provider_config.clone();
-        let column_ids = definition.column_ids.clone();
-        let definition = SearchIndexDefinition {
-            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
-                kind,
-                &column_ids,
-                expression.as_deref(),
-                &provider_config,
-            ),
-            ..definition
-        };
-        storage.register_search_definition(definition)
-    }
-
-    fn search_kind(index_type: CatalogIndexType) -> Option<SearchIndexKind> {
-        match index_type {
-            CatalogIndexType::HNSW => Some(SearchIndexKind::Hnsw),
-            CatalogIndexType::Sparse => Some(SearchIndexKind::Sparse),
-            CatalogIndexType::FullText => Some(SearchIndexKind::FullText),
-            _ => None,
-        }
-    }
-
-    fn search_expression(entry: &IndexCatalogEntry) -> Option<String> {
-        if entry.index_type != CatalogIndexType::FullText {
-            return None;
-        }
-        let binding = entry.fulltext_binding()?;
-        Some(format!(
-            "to_tsvector('{}', col_{})",
-            binding.config, binding.column_id.index
-        ))
-    }
-
-    fn search_provider_config(storage: &TableHandle, entry: &IndexCatalogEntry) -> Result<Value> {
-        match entry.index_type {
-            CatalogIndexType::HNSW => {
-                let [column] = entry.get_column_ids() else {
-                    return Err(paro_common::error::not_supported(
-                        "HNSW search definition requires exactly one indexed column",
-                    ));
-                };
-                let schema = storage.tablet().schema().ok_or_else(|| {
-                    paro_common::error::internal("table schema missing for HNSW config")
-                })?;
-                let column = schema.column_by_id(column.index).ok_or_else(|| {
-                    paro_common::error::column_not_found(format!(
-                        "HNSW index column {} not found in schema",
-                        column.index
-                    ))
-                })?;
-                Ok(json!({
-                    "m": column.hnsw_m,
-                    "ef_construct": column.hnsw_ef_construct,
-                    "distance": column.hnsw_distance,
-                }))
-            }
-            CatalogIndexType::Sparse => Ok(json!({})),
-            CatalogIndexType::FullText => {
-                let config = entry
-                    .fulltext_binding()
-                    .map(|binding| binding.config.clone())
-                    .unwrap_or_else(|| "simple".to_string());
-                Ok(json!({ "config": config }))
-            }
-            _ => Ok(json!({})),
-        }
-    }
+struct CatalogPublishPrepare {
+    descriptor: ParticipantDescriptor,
+    catalog_ops: Vec<paro_common::effect::CatalogTxnOp>,
+    applier: Arc<CatalogCommittedRecordApplier>,
+    prepared_bytes: u64,
 }
 
 pub struct CommitPipeline<'a> {
@@ -259,27 +75,13 @@ impl<'a> CommitPipeline<'a> {
         Self::execute_prepared(session, active, ddl_changes, request)
     }
 
-    fn build_commit_request(
+    pub(crate) fn build_commit_request(
         session: &Session,
         active: &Arc<Transaction>,
         ddl_changes: &[PreparedCatalogOp],
         transaction_view: TransactionView,
     ) -> CommitRequest {
-        let database_id = DatabaseId::new(session.current_database.id());
-        let mut participants = active.participant_descriptors();
-        if !ddl_changes.is_empty() {
-            participants.push(CatalogCommitParticipant::participant_descriptor(
-                database_id,
-            ));
-        }
-        CommitRequest::new(
-            database_id,
-            active.txn_id(),
-            transaction_view,
-            session.commit_ack_policy(),
-            active.frozen_lock_set(),
-            participants,
-        )
+        job_builder::build_commit_request(session, active, ddl_changes, transaction_view)
     }
 
     fn execute_prepared(
@@ -390,21 +192,28 @@ impl<'a> CommitPipeline<'a> {
                 }
             };
             prepare_latency += stage_started_at.elapsed();
+            let prepared_bytes = prepared.prepared_bytes() as u64;
             let catalog_ops = prepared.catalog_ops().to_vec();
             let applier = Arc::new(CatalogCommittedRecordApplier::new(
                 database_id,
                 Arc::clone(session.current_database.catalog()),
                 prepared,
             ));
-            Some((descriptor, catalog_ops, applier))
+            Some(CatalogPublishPrepare {
+                descriptor,
+                catalog_ops,
+                applier,
+                prepared_bytes,
+            })
         };
 
         let catalog_ops = catalog_prepare
             .as_ref()
-            .map(|(_, ops, _)| ops.as_slice())
+            .map(|prepare| prepare.catalog_ops.as_slice())
             .unwrap_or(&[]);
 
         let apply_descriptors = Self::collect_apply_descriptors(&ddl_changes);
+        let publish_apply_descriptors = apply_descriptors.clone();
         let durable_deferred_tasks = Self::collect_deferred_tasks(&prepared_storage, &ddl_changes);
         let post_commit_deferred_tasks = Self::post_commit_deferred_tasks(&durable_deferred_tasks);
         let index_publish_tasks = Self::collect_index_backfill_publish_tasks(&ddl_changes);
@@ -421,15 +230,44 @@ impl<'a> CommitPipeline<'a> {
             deferred_tasks: durable_deferred_tasks.clone(),
             tablets: Vec::new(),
         };
+        let estimated_record_bytes = match encoded_size_upper_bound_for_plan(&durable_plan) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Some(prepare) = &catalog_prepare {
+                    let _ = prepare.applier.abort_prepared();
+                }
+                let _ = storage_participant.abort(AbortReason::DurableAppendFailed);
+                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
+                return Err(CommitFailure {
+                    error: paro_common::error::internal(format!(
+                        "commit record size estimate overflow: {error}"
+                    )),
+                    rollback_succeeded,
+                });
+            }
+        };
         let mut sequencing_plan = CommitSequencingPlan::from_commit_plan(request.commit_plan());
+        if let Err(error) =
+            request.validate_single_database(database_id, Some(&sequencing_plan.plan))
+        {
+            if let Some(prepare) = &catalog_prepare {
+                let _ = prepare.applier.abort_prepared();
+            }
+            let _ = storage_participant.abort(AbortReason::ValidationFailed);
+            let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
+            return Err(CommitFailure {
+                error: paro_common::error::invalid_transaction_state(error.to_string()),
+                rollback_succeeded,
+            });
+        }
         let stage_started_at = Instant::now();
         let ssi_outcome = match manager
             .validate_serializable_commit(&sequencing_plan.plan, &sequencing_plan.write_set)
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                if let Some((_, _, applier)) = &catalog_prepare {
-                    let _ = applier.abort_prepared();
+                if let Some(prepare) = &catalog_prepare {
+                    let _ = prepare.applier.abort_prepared();
                 }
                 let _ = storage_participant.abort(AbortReason::ValidationFailed);
                 let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
@@ -442,7 +280,8 @@ impl<'a> CommitPipeline<'a> {
         validate_latency += stage_started_at.elapsed();
         sequencing_plan = sequencing_plan
             .with_validation_epoch(ssi_outcome.validation_epoch)
-            .with_ssi_effect_epoch(ssi_outcome.ssi_effect_epoch);
+            .with_ssi_effect_epoch(ssi_outcome.ssi_effect_epoch)
+            .with_estimated_bytes(estimated_record_bytes as usize);
         manager.record_commit_latency(
             paro_storage::transaction::manager::TransactionLatencyStage::CommitPrepare,
             prepare_latency,
@@ -452,242 +291,160 @@ impl<'a> CommitPipeline<'a> {
             validate_latency,
         );
         let write_set = sequencing_plan.write_set.clone();
-        let coordinator = Arc::clone(session.current_database.commit_coordinator());
-        let journal = session.current_database.journal_coordinator();
-        let frontiers = journal.frontiers();
-        coordinator.sync_backpressure_frontiers(
-            paro_transaction::CommitTs::new(
-                frontiers.durable_commit_id.max(manager.durable_commit_id()),
-            ),
-            paro_transaction::CommitTs::new(
-                frontiers
-                    .published_commit_id
-                    .max(manager.published_commit_id()),
-            ),
+        manager.sync_commit_backpressure_frontiers(
+            paro_transaction::CommitTs::new(manager.durable_commit_id()),
+            paro_transaction::CommitTs::new(manager.published_commit_id()),
         );
+        let backpressure = manager.commit_backpressure_controller();
+        if let Err(error) = backpressure.admit(&sequencing_plan.plan) {
+            if let Some(prepare) = &catalog_prepare {
+                let _ = prepare.applier.abort_prepared();
+            }
+            let _ = storage_participant.abort(AbortReason::Backpressure);
+            let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
+            return Err(CommitFailure {
+                error: paro_common::error::invalid_transaction_state(error.to_string()),
+                rollback_succeeded,
+            });
+        }
         let storage_applier =
             StorageCommittedRecordApplier::new(Arc::clone(&manager), Arc::clone(&active));
         let database = Arc::clone(&session.current_database);
-        let journal_apply_runtime = database.journal_apply_runtime();
         let max_seen_catalog_object_id = Self::max_seen_catalog_object_id(&ddl_changes);
-        let mut published_at = None;
         let ack_policy = request.ack_policy;
-        let final_fence_manager = Arc::clone(&manager);
-        let durable_metrics_manager = Arc::clone(&manager);
-        let publish_metrics_manager = Arc::clone(&manager);
-
-        let ticket = match coordinator.execute_transaction(
-            &request,
+        let has_storage_apply = !prepared_storage.storage_ops.is_empty();
+        let storage_apply_tablet_id = Self::storage_apply_tablet_id(&prepared_storage);
+        let publish_manager = Arc::clone(&manager);
+        let publish_transaction = Arc::clone(&active);
+        let publish_participants: Arc<[ParticipantDescriptor]> =
+            Arc::from(request.participants.clone().into_boxed_slice());
+        let catalog_publish = catalog_prepare
+            .as_ref()
+            .map(|prepare| (prepare.descriptor.clone(), Arc::clone(&prepare.applier)));
+        let has_catalog_publish = catalog_publish.is_some();
+        let catalog_serial = has_catalog_publish;
+        let storage_apply_descriptor = storage_descriptor.clone();
+        let publish_commit_id = Arc::new(AtomicU64::new(0));
+        let request_for_tablets = request.clone();
+        let tablet_parts = if has_storage_apply {
+            let publish_commit_id = Arc::clone(&publish_commit_id);
+            vec![TabletApplyPart {
+                tablet_id: storage_apply_tablet_id,
+                apply: Box::new(move || {
+                    let commit_id = publish_commit_id.load(Ordering::Acquire);
+                    if commit_id == 0 {
+                        return Err(paro_common::error::internal(
+                            "storage apply started before commit id assignment",
+                        ));
+                    }
+                    let committed_record = request_for_tablets
+                        .committed_record(paro_transaction::CommitTs::new(commit_id));
+                    storage_applier.apply_required(&committed_record, &storage_apply_descriptor)?;
+                    Ok(())
+                }),
+            }]
+        } else {
+            Vec::new()
+        };
+        let catalog_post_request = request.clone();
+        let publish_database = Arc::clone(&database);
+        let catalog_post = Box::new(move |commit_id| {
+            let committed_record =
+                catalog_post_request.committed_record(paro_transaction::CommitTs::new(commit_id));
+            if let Some((catalog_descriptor, catalog_applier)) = catalog_publish {
+                catalog_applier.apply_required(&committed_record, &catalog_descriptor)?;
+            }
+            for task in index_publish_tasks {
+                task.execute(commit_id)?;
+            }
+            let catalog_commit_id = if has_catalog_publish { commit_id } else { 0 };
+            let (_summary, journal_lsn) = publish_database.publish_checkpoint_transaction(
+                commit_id,
+                catalog_commit_id,
+                max_seen_catalog_object_id,
+            );
+            if let Some(wal) = publish_database.wal() {
+                if let Err(error) = wal.note_flushed_lsn(journal_lsn) {
+                    tracing::warn!(
+                        target: targets::WAL,
+                        db = %publish_database.name(),
+                        lsn = journal_lsn,
+                        error = %error,
+                        "failed to advance journal segment catalog after transaction flush"
+                    );
+                }
+            }
+            Ok(())
+        });
+        let descriptor_phase = build_apply_descriptor_phase(
+            Arc::clone(&session.instance),
+            Arc::clone(&database),
+            publish_apply_descriptors,
+        );
+        let publish_plan = build_required_publish_plan(LivePublishPlanInput {
+            post_apply_finalize: lifecycle_action::post_apply_finalize_plan(
+                Arc::clone(&publish_manager),
+                Arc::clone(&publish_transaction),
+            ),
+            frontier: publish_manager.commit_frontier(),
+            backpressure: Some(backpressure),
+            participants: publish_participants,
+            apply_targets: Arc::<[ApplyTargetDescriptor]>::from([]),
+            catalog_serial,
+            catalog_pre: Box::new(|| Ok(())),
+            on_commit_id_assigned: Box::new(move |commit_id| {
+                publish_commit_id.store(commit_id, Ordering::Release);
+            }),
+            tablet_parts,
+            descriptor_phase,
+            catalog_post,
+        });
+        let retained_bytes = prepared_storage_part.prepared_bytes() as u64
+            + catalog_prepare
+                .as_ref()
+                .map(|prepare| prepare.prepared_bytes)
+                .unwrap_or(0);
+        let job = PreparedCommitJob {
             sequencing_plan,
-            move |plan, _in_flight| final_fence_manager.ssi_final_fence_reason(plan),
-            {
-                let durable_plan = durable_plan.clone();
-                move |commit_ts| {
-                    let durable_started_at = Instant::now();
-                    let record = durable_plan.clone().into_record(commit_ts.into_raw());
-                    let results = journal.append_records(&[JournalRecord::Commit(record)])?;
-                    durable_metrics_manager.record_commit_latency(
-                        paro_storage::transaction::manager::TransactionLatencyStage::CommitDurable,
-                        durable_started_at.elapsed(),
-                    );
-                    let first = results.first().copied().ok_or_else(|| {
-                        paro_common::error::internal(
-                            "journal coordinator returned no append result for commit record",
-                        )
-                    })?;
-                    let last = results.last().copied().unwrap_or(first);
-                    Ok(CommitTicket::new(
-                        commit_ts,
-                        first.lsn,
-                        last.durable_batch_lsn,
-                    ))
-                }
+            durable_plan,
+            reservation_input: CommitFinalizeReservationInput {
+                txn_id: request.txn_id,
+                read_ts: request.read_ts,
+                write_set,
+                wci_placement_input: WriteConflictPlacementInput::default(),
+                frozen_read_set: request.frozen_read_set.clone(),
             },
-            |ticket| {
-                manager.register_committed_transaction_summary(
-                    ticket.commit_ts,
-                    request.txn_id,
-                    request.read_ts,
-                    &write_set,
-                    &request.frozen_read_set,
-                )?;
-                Ok(())
-            },
-            |ticket| {
-                let publish_started_at = Instant::now();
-                let commit_id = ticket.commit_ts.into_raw();
-                let committed_record = request.committed_record(ticket.commit_ts);
-                let storage_apply_record = committed_record.clone();
-                let storage_apply_descriptor = storage_descriptor.clone();
-                let storage_apply = storage_applier.clone();
-                let catalog_publish = catalog_prepare.as_ref().map(
-                    |(catalog_descriptor, _, catalog_applier)| {
-                        (catalog_descriptor.clone(), Arc::clone(catalog_applier))
-                    },
-                );
-                let index_publish_tasks = index_publish_tasks.clone();
-                let has_catalog_publish = catalog_publish.is_some();
-                let catalog_serial = has_catalog_publish;
-                let publish_database = Arc::clone(&database);
-                let publish_manager = Arc::clone(&manager);
-                let on_published: Box<dyn FnOnce() -> Result<()> + Send + 'static> =
-                    if ack_policy == CommitAckPolicy::DurableOnlyAsync {
-                        let coordinator = Arc::clone(&coordinator);
-                        let participants = request.participants.clone();
-                        let commit_ts = ticket.commit_ts;
-                        Box::new(move || {
-                            coordinator.mark_required_published(commit_ts, &participants);
-                            Ok(())
-                        })
-                    } else {
-                        Box::new(|| Ok(()))
-                    };
-                let apply_request = ApplyRequest {
-                    lsn: ticket.durable_lsn,
-                    durable_batch_lsn: ticket.durable_batch_lsn,
-                    commit_id: Some(commit_id),
-                    wait_mode: WaitMode::Published,
-                    catalog_serial,
-                    catalog_pre: Box::new(|| Ok(())),
-                    tablet_parts: Vec::<TabletApplyPart>::new(),
-                    descriptor_phase: Box::new(move || {
-                        storage_apply
-                            .apply_required(&storage_apply_record, &storage_apply_descriptor)?;
-                        Ok(())
-                    }),
-                    catalog_post: Box::new(move || {
-                        if let Some((catalog_descriptor, catalog_applier)) = catalog_publish {
-                            catalog_applier.apply_required(&committed_record, &catalog_descriptor)?;
-                        }
-                        for task in index_publish_tasks {
-                            task.execute(commit_id)?;
-                        }
-                        let catalog_commit_id = if has_catalog_publish { commit_id } else { 0 };
-                        let (_summary, journal_lsn) = publish_database
-                            .publish_checkpoint_transaction(
-                                commit_id,
-                                catalog_commit_id,
-                                max_seen_catalog_object_id,
-                            );
-                        if let Some(wal) = publish_database.wal() {
-                            if let Err(error) = wal.note_flushed_lsn(journal_lsn) {
-                                tracing::warn!(
-                                    target: targets::WAL,
-                                    db = %publish_database.name(),
-                                    lsn = journal_lsn,
-                                    error = %error,
-                                    "failed to advance journal segment catalog after transaction flush"
-                                );
-                            }
-                        }
-                        if publish_manager.published_commit_id() < commit_id {
-                            return Err(paro_common::error::internal(format!(
-                                "required publish completed below commit floor: published={} commit={}",
-                                publish_manager.published_commit_id(),
-                                commit_id
-                            )));
-                        }
-                        Ok(())
-                    }),
-                    on_published,
-                };
-                let outcome = if ack_policy == CommitAckPolicy::DurableOnlyAsync {
-                    journal_apply_runtime.submit_async(apply_request)?;
-                    RequiredPublishOutcome::Queued
-                } else {
-                    let observed = journal_apply_runtime.submit_observed(apply_request)?;
-                    publish_metrics_manager.record_commit_latency(
-                        paro_storage::transaction::manager::TransactionLatencyStage::CommitRequiredPublishWait,
-                        std::time::Duration::from_micros(observed.wait_micros),
-                    );
-                    RequiredPublishOutcome::Completed
-                };
-                published_at = Some(Instant::now());
-                publish_metrics_manager.record_commit_latency(
-                    paro_storage::transaction::manager::TransactionLatencyStage::CommitPublish,
-                    publish_started_at.elapsed(),
-                );
-                Ok(outcome)
-            },
-        ) {
-            Ok(ticket) => ticket,
-            Err(CommitCoordinatorError::InvalidRequest { error }) => {
-                if let Some((_, _, applier)) = &catalog_prepare {
-                    let _ = applier.abort_prepared();
-                }
-                let _ = storage_participant.abort(AbortReason::ValidationFailed);
-                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
+            lock_release_plan: lifecycle_action::lock_release_plan(Arc::clone(&active)),
+            pre_publish_release_plan: lifecycle_action::pre_publish_release_plan(
+                Arc::clone(&manager),
+                Arc::clone(&active),
+            ),
+            append_failure_rollback_plan: lifecycle_action::append_failure_rollback_plan(
+                Arc::clone(&active),
+            ),
+            required_publish: publish_plan,
+            deferred_publish: Vec::new(),
+            ack_policy,
+            estimated_record_bytes,
+            retained_bytes,
+            created_at: Instant::now(),
+        };
+        let publish_started_at = Instant::now();
+        let runtime_outcome = match database.commit_runtime().commit_blocking(job) {
+            Ok(outcome) => outcome,
+            Err(error) => {
                 return Err(CommitFailure {
-                    error: paro_common::error::invalid_transaction_state(error.to_string()),
-                    rollback_succeeded,
-                });
-            }
-            Err(CommitCoordinatorError::Backpressure { error }) => {
-                if let Some((_, _, applier)) = &catalog_prepare {
-                    let _ = applier.abort_prepared();
-                }
-                let _ = storage_participant.abort(AbortReason::Backpressure);
-                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
-                return Err(CommitFailure {
-                    error: paro_common::error::invalid_transaction_state(error.to_string()),
-                    rollback_succeeded,
-                });
-            }
-            Err(CommitCoordinatorError::Rejected { rejected, .. }) => {
-                if let Some((_, _, applier)) = &catalog_prepare {
-                    let _ = applier.abort_prepared();
-                }
-                let _ = storage_participant.abort(AbortReason::ValidationFailed);
-                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
-                return Err(CommitFailure {
-                    error: paro_common::error::serialization_failure(format!(
-                        "commit rejected at ordered final fence: {:?}",
-                        rejected.reason
-                    )),
-                    rollback_succeeded,
-                });
-            }
-            Err(CommitCoordinatorError::DurableAppend { error, .. }) => {
-                if let Some((_, _, applier)) = &catalog_prepare {
-                    let _ = applier.abort_prepared();
-                }
-                let _ = storage_participant.abort(AbortReason::DurableAppendFailed);
-                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
-                return Err(CommitFailure {
-                    error,
-                    rollback_succeeded,
-                });
-            }
-            Err(CommitCoordinatorError::MissingTicket { commit_ts }) => {
-                if let Some((_, _, applier)) = &catalog_prepare {
-                    let _ = applier.abort_prepared();
-                }
-                let _ = storage_participant.abort(AbortReason::DurableAppendFailed);
-                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
-                return Err(CommitFailure {
-                    error: paro_common::error::internal(format!(
-                        "commit coordinator accepted commit {} without a durable ticket",
-                        commit_ts
-                    )),
-                    rollback_succeeded,
-                });
-            }
-            Err(CommitCoordinatorError::PostDurable { error, .. }) => {
-                return Err(CommitFailure {
-                    error,
-                    rollback_succeeded: false,
-                });
-            }
-            Err(CommitCoordinatorError::Publish { error, .. }) => {
-                return Err(CommitFailure {
-                    error,
+                    error: commit_runtime_error_to_paro(error),
                     rollback_succeeded: false,
                 });
             }
         };
-
-        let commit_id = ticket.commit_ts.into_raw();
-        if ack_policy == CommitAckPolicy::DurableOnlyAsync {
+        manager.record_commit_latency(
+            paro_storage::transaction::manager::TransactionLatencyStage::CommitPublish,
+            publish_started_at.elapsed(),
+        );
+        let commit_id = runtime_outcome.commit_ts.into_raw();
+        if matches!(runtime_outcome.ack, CommitRuntimeAck::DurableOnly) {
             session.record_async_commit_floor(commit_id);
         }
         let mut post_commit_hooks = prepared_storage.post_commit_hooks;
@@ -704,7 +461,7 @@ impl<'a> CommitPipeline<'a> {
             active_txn: active,
             catalog_ops: ddl_changes,
             deferred_tasks: post_commit_deferred_tasks,
-            published_at: published_at.unwrap_or_else(Instant::now),
+            published_at: Instant::now(),
             post_commit_hooks,
         })
     }
@@ -823,6 +580,17 @@ impl<'a> CommitPipeline<'a> {
             .collect()
     }
 
+    fn storage_apply_tablet_id(prepared_storage: &PreparedStorageCommit) -> u64 {
+        prepared_storage
+            .storage_ops
+            .iter()
+            .map(|op| match op {
+                StorageCommitOp::Tablet(tablet) => tablet.tablet_id,
+            })
+            .next()
+            .unwrap_or(0)
+    }
+
     fn participants_for_durable_tasks(
         database_id: DatabaseId,
         tasks: &[DeferredTask],
@@ -913,7 +681,7 @@ impl Session {
         match pipeline.execute() {
             Ok(outcome) => {
                 self.current_database.schedule_auto_checkpoint_if_needed();
-                super::post_commit::PostCommitActions::execute(self, outcome)?;
+                PostCommitActions::execute(self, outcome)?;
                 Ok(())
             }
             Err(failure) => {
@@ -950,7 +718,9 @@ mod tests {
         CreateSchemaPayload, DdlChange, DdlChangeRecord, DdlObjectKey, DdlObjectKind,
     };
     use paro_context::DdlExecutionProfile;
-    use paro_transaction::{LockMode, LockRequest, LockResource, ParticipantKind, TableId};
+    use paro_transaction::{
+        CommitAckPolicy, LockMode, LockRequest, LockResource, ParticipantKind, TableId,
+    };
 
     fn staged_dependency_change(catalog_name: &str) -> PreparedCatalogOp {
         let schema_id = CatalogObjectId::from_raw(90_001);

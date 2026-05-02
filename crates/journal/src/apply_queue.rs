@@ -1,13 +1,15 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::coordinator::JournalFrontierSnapshot;
 use crate::publish_frontier::{ApplyFrontier, PublishFrontier};
+use crate::runtime::JournalFrontierSnapshot;
 use crate::waiter::WaitMode;
 use paro_common::error as paro_error;
 use paro_common::error::{ParoError, Result};
 use paro_common::journal::RecoverySummary;
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
@@ -15,6 +17,182 @@ use std::time::Instant;
 
 type ApplyWork = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
 type PublishedHook = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
+
+pub type ApplyCompletion =
+    Box<dyn FnOnce(std::result::Result<(), JournalApplyError>) + Send + 'static>;
+pub type ApplyCompletionFallbackAck = Box<dyn FnOnce(&JournalApplyError) + Send + 'static>;
+pub type ApplyFatalSink = Box<dyn FnOnce(&JournalApplyError) + Send + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApplyPhase {
+    Runtime,
+    CatalogPre,
+    TabletParts,
+    Descriptor,
+    CatalogPost,
+    Published,
+    Completion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApplyErrorSource {
+    ApplyClosure,
+    PublishedHook,
+    WorkerPanic,
+    CompletionCallback,
+    Runtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalApplyError {
+    pub phase: ApplyPhase,
+    pub source: ApplyErrorSource,
+    pub lsn: u64,
+    pub commit_id: Option<u64>,
+    pub error_code: u32,
+    pub message: Arc<str>,
+}
+
+impl JournalApplyError {
+    pub fn apply_failed(
+        phase: ApplyPhase,
+        source: ApplyErrorSource,
+        lsn: u64,
+        commit_id: Option<u64>,
+        err: &ParoError,
+    ) -> Self {
+        Self::new(phase, source, lsn, commit_id, err.to_string())
+    }
+
+    pub fn worker_panic(
+        phase: ApplyPhase,
+        lsn: u64,
+        commit_id: Option<u64>,
+        panic: Box<dyn Any + Send + 'static>,
+    ) -> Self {
+        Self::new(
+            phase,
+            ApplyErrorSource::WorkerPanic,
+            lsn,
+            commit_id,
+            panic_payload_message(panic),
+        )
+    }
+
+    pub fn completion_panic(
+        lsn: u64,
+        commit_id: Option<u64>,
+        panic: Box<dyn Any + Send + 'static>,
+    ) -> Self {
+        Self::new(
+            ApplyPhase::Completion,
+            ApplyErrorSource::CompletionCallback,
+            lsn,
+            commit_id,
+            panic_payload_message(panic),
+        )
+    }
+
+    pub fn runtime_unavailable(
+        lsn: u64,
+        commit_id: Option<u64>,
+        message: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::new(
+            ApplyPhase::Runtime,
+            ApplyErrorSource::Runtime,
+            lsn,
+            commit_id,
+            message,
+        )
+    }
+
+    pub fn new(
+        phase: ApplyPhase,
+        source: ApplyErrorSource,
+        lsn: u64,
+        commit_id: Option<u64>,
+        message: impl Into<Arc<str>>,
+    ) -> Self {
+        let error_code = apply_error_code(phase, source);
+        Self {
+            phase,
+            source,
+            lsn,
+            commit_id,
+            error_code,
+            message: message.into(),
+        }
+    }
+
+    pub fn to_paro_error(&self) -> ParoError {
+        paro_error::internal(self.to_string())
+    }
+}
+
+impl std::fmt::Display for JournalApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "journal apply {:?}/{:?} failed at lsn {} commit_id {:?}: {}",
+            self.phase, self.source, self.lsn, self.commit_id, self.message
+        )
+    }
+}
+
+impl std::error::Error for JournalApplyError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyRuntimeError {
+    RuntimeUnavailable { message: Arc<str> },
+    Fatal { message: Arc<str> },
+}
+
+impl ApplyRuntimeError {
+    fn runtime_unavailable(message: impl Into<Arc<str>>) -> Self {
+        Self::RuntimeUnavailable {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ApplyRuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuntimeUnavailable { message } => {
+                write!(f, "journal apply runtime unavailable: {message}")
+            }
+            Self::Fatal { message } => write!(f, "journal apply runtime fatal: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ApplyRuntimeError {}
+
+#[derive(Clone, Default)]
+struct SharedApplyFailure {
+    inner: Arc<Mutex<Option<JournalApplyError>>>,
+}
+
+impl SharedApplyFailure {
+    fn record(&self, error: JournalApplyError) {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(error);
+        }
+    }
+
+    fn take_or_runtime(
+        &self,
+        lsn: u64,
+        commit_id: Option<u64>,
+        err: &ParoError,
+    ) -> JournalApplyError {
+        self.inner.lock().unwrap().clone().unwrap_or_else(|| {
+            JournalApplyError::runtime_unavailable(lsn, commit_id, err.to_string())
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JournalApplyMetricsSnapshot {
@@ -36,6 +214,23 @@ pub struct JournalApplyMetricsSnapshot {
     pub applied_wait_micros: u64,
     pub published_wait_count: u64,
     pub published_wait_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecoveryPlaceholderRecordKind {
+    Maintenance,
+    CheckpointFence,
+    Other,
+}
+
+impl std::fmt::Display for RecoveryPlaceholderRecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Maintenance => write!(f, "maintenance"),
+            Self::CheckpointFence => write!(f, "checkpoint_fence"),
+            Self::Other => write!(f, "other"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -118,6 +313,10 @@ impl JournalApplyRuntime {
         self.inner.metrics_snapshot()
     }
 
+    pub fn next_dispatch_lsn(&self) -> u64 {
+        self.inner.state.lock().unwrap().next_dispatch_lsn
+    }
+
     pub fn bootstrap_frontiers(&self, summary: RecoverySummary) {
         let mut state = self.inner.state.lock().unwrap();
         state.next_dispatch_lsn = summary.max_lsn.saturating_add(1).max(1);
@@ -125,28 +324,30 @@ impl JournalApplyRuntime {
         state.frontiers.durable_lsn = summary.max_lsn;
         state.frontiers.applied_lsn = summary.max_lsn;
         state.frontiers.published_lsn = summary.max_lsn;
-        state.frontiers.durable_commit_id = summary.max_commit_id;
-        state.frontiers.published_commit_id = summary.max_commit_id;
         state.apply_frontier.bootstrap(summary.max_lsn);
         state.publish_frontier.bootstrap(summary.max_lsn);
     }
 
-    pub fn sync_commit_frontier_with(&self, min_committed_version: u64) {
-        let mut state = self.inner.state.lock().unwrap();
-        state.frontiers.durable_commit_id =
-            state.frontiers.durable_commit_id.max(min_committed_version);
-        state.frontiers.published_commit_id = state
-            .frontiers
-            .published_commit_id
-            .max(min_committed_version);
-    }
-
-    pub fn note_durable_append(&self, durable_lsn: u64, commit_id: Option<u64>) {
+    pub fn note_durable_append(&self, durable_lsn: u64) {
         let mut state = self.inner.state.lock().unwrap();
         state.frontiers.durable_lsn = state.frontiers.durable_lsn.max(durable_lsn);
-        if let Some(commit_id) = commit_id {
-            state.frontiers.durable_commit_id = state.frontiers.durable_commit_id.max(commit_id);
-        }
+    }
+
+    pub fn advance_dispatch_past_placeholder(
+        &self,
+        lsn: u64,
+        record_kind: RecoveryPlaceholderRecordKind,
+    ) -> Result<()> {
+        self.inner
+            .advance_dispatch_past_placeholder(lsn, record_kind)
+    }
+
+    pub fn advance_dispatch_gap_before(
+        &self,
+        lsn: u64,
+        record_kind: RecoveryPlaceholderRecordKind,
+    ) -> Result<()> {
+        self.inner.advance_dispatch_gap_before(lsn, record_kind)
     }
 
     pub fn submit<R>(&self, request: ApplyRequest<R>) -> Result<R> {
@@ -154,10 +355,37 @@ impl JournalApplyRuntime {
     }
 
     pub fn submit_async(&self, request: ApplyRequest<()>) -> Result<()> {
-        self.inner.enqueue_async_submit(request)
+        self.inner
+            .enqueue_async_submit(AsyncSubmitWork::Legacy(request))
+    }
+
+    pub fn submit_async_with_completion(
+        &self,
+        mut request: ApplyRequest<()>,
+        on_complete: ApplyCompletion,
+        fallback_ack: ApplyCompletionFallbackAck,
+        fatal_sink: ApplyFatalSink,
+    ) -> std::result::Result<(), ApplyRuntimeError> {
+        request.wait_mode = WaitMode::AsyncCompletion;
+        self.inner
+            .enqueue_async_submit(AsyncSubmitWork::WithCompletion {
+                request,
+                on_complete,
+                fallback_ack,
+                fatal_sink,
+            })
+            .map_err(|err| ApplyRuntimeError::runtime_unavailable(err.to_string()))
     }
 
     pub fn submit_observed<R>(&self, request: ApplyRequest<R>) -> Result<ApplySubmitResult<R>> {
+        self.submit_observed_tracked(request, None)
+    }
+
+    fn submit_observed_tracked<R>(
+        &self,
+        request: ApplyRequest<R>,
+        failure: Option<SharedApplyFailure>,
+    ) -> Result<ApplySubmitResult<R>> {
         let started_at = Instant::now();
         let ApplyRequest {
             lsn,
@@ -178,6 +406,7 @@ impl JournalApplyRuntime {
             commit_id,
             tablet_parts.len(),
             on_published,
+            failure.clone(),
         )?;
 
         let record_wait_metrics = |result: Result<R>| {
@@ -197,12 +426,22 @@ impl JournalApplyRuntime {
             None
         };
 
-        if let Err(err) = catalog_pre() {
+        if let Err(err) = call_apply_work(
+            catalog_pre,
+            ApplyPhase::CatalogPre,
+            ApplyErrorSource::ApplyClosure,
+            lsn,
+            commit_id,
+            failure.as_ref(),
+        ) {
             self.inner.fail_record(&ticket, err.clone());
             return record_wait_metrics(Err(err));
         }
 
-        if let Err(err) = self.inner.enqueue_tablet_parts(&ticket, tablet_parts) {
+        if let Err(err) = self
+            .inner
+            .enqueue_tablet_parts(&ticket, tablet_parts, failure.clone())
+        {
             self.inner.fail_record(&ticket, err.clone());
             return record_wait_metrics(Err(err));
         }
@@ -213,12 +452,26 @@ impl JournalApplyRuntime {
             return record_wait_metrics(Err(err));
         }
 
-        if let Err(err) = descriptor_phase() {
+        if let Err(err) = call_apply_work(
+            descriptor_phase,
+            ApplyPhase::Descriptor,
+            ApplyErrorSource::ApplyClosure,
+            lsn,
+            commit_id,
+            failure.as_ref(),
+        ) {
             self.inner.fail_record(&ticket, err.clone());
             return record_wait_metrics(Err(err));
         }
 
-        let result = match catalog_post() {
+        let result = match call_catalog_post(
+            catalog_post,
+            ApplyPhase::CatalogPost,
+            ApplyErrorSource::ApplyClosure,
+            lsn,
+            commit_id,
+            failure.as_ref(),
+        ) {
             Ok(result) => result,
             Err(err) => {
                 self.inner.fail_record(&ticket, err.clone());
@@ -227,7 +480,7 @@ impl JournalApplyRuntime {
         };
 
         self.inner.mark_applied(&ticket)?;
-        if wait_mode == WaitMode::Published {
+        if matches!(wait_mode, WaitMode::Published | WaitMode::AsyncCompletion) {
             ticket.wait_for_published(&self.inner)?;
         }
 
@@ -331,6 +584,7 @@ impl JournalApplyRuntimeInner {
         commit_id: Option<u64>,
         tablet_parts: usize,
         on_published: PublishedHook,
+        failure: Option<SharedApplyFailure>,
     ) -> Result<Arc<RecordTicket>> {
         let mut state = self.state.lock().unwrap();
         if let Some(err) = state.poisoned.clone() {
@@ -355,11 +609,9 @@ impl JournalApplyRuntimeInner {
             commit_id,
             tablet_parts as u32,
             on_published,
+            failure,
         ));
         state.frontiers.durable_lsn = state.frontiers.durable_lsn.max(durable_batch_lsn);
-        if let Some(commit_id) = commit_id {
-            state.frontiers.durable_commit_id = state.frontiers.durable_commit_id.max(commit_id);
-        }
         state.records.insert(lsn, Arc::clone(&ticket));
         Ok(ticket)
     }
@@ -389,6 +641,7 @@ impl JournalApplyRuntimeInner {
         self: &Arc<Self>,
         ticket: &Arc<RecordTicket>,
         tablet_parts: Vec<TabletApplyPart>,
+        failure: Option<SharedApplyFailure>,
     ) -> Result<()> {
         if tablet_parts.is_empty() {
             ticket.notify_zero_tablet_parts();
@@ -404,13 +657,14 @@ impl JournalApplyRuntimeInner {
                     apply: Some(part.apply),
                     runtime: Arc::downgrade(self),
                     ticket: Arc::clone(ticket),
+                    failure: failure.clone(),
                 },
             )?;
         }
         Ok(())
     }
 
-    fn enqueue_async_submit(&self, request: ApplyRequest<()>) -> Result<()> {
+    fn enqueue_async_submit(&self, request: AsyncSubmitWork) -> Result<()> {
         let mut state = self.async_submit.lock().unwrap();
         if state.shutdown {
             return Err(paro_error::internal(
@@ -423,7 +677,7 @@ impl JournalApplyRuntimeInner {
         Ok(())
     }
 
-    fn dequeue_async_submit(&self) -> Option<ApplyRequest<()>> {
+    fn dequeue_async_submit(&self) -> Option<AsyncSubmitWork> {
         let mut state = self.async_submit.lock().unwrap();
         loop {
             if let Some(request) = state.queue.pop_front() {
@@ -481,6 +735,86 @@ impl JournalApplyRuntimeInner {
         }
     }
 
+    fn advance_dispatch_past_placeholder(
+        &self,
+        lsn: u64,
+        record_kind: RecoveryPlaceholderRecordKind,
+    ) -> Result<()> {
+        if lsn == 0 {
+            return Err(paro_error::internal(format!(
+                "journal recovery placeholder {record_kind} cannot use synthetic lsn 0"
+            )));
+        }
+
+        let (published_waiters, published_lsns) = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(err) = state.poisoned.clone() {
+                return Err(err);
+            }
+            if lsn < state.next_dispatch_lsn {
+                return Ok(());
+            }
+            if lsn != state.next_dispatch_lsn {
+                return Err(paro_error::internal(format!(
+                    "journal recovery placeholder {record_kind} at lsn {lsn} cannot skip next dispatch lsn {}",
+                    state.next_dispatch_lsn
+                )));
+            }
+
+            state.frontiers.durable_lsn = state.frontiers.durable_lsn.max(lsn);
+            state.next_ephemeral_lsn = state.next_ephemeral_lsn.max(lsn.saturating_add(1));
+            state.next_dispatch_lsn = state.next_dispatch_lsn.saturating_add(1);
+            let advanced = advance_publish_frontiers_locked(&mut state, lsn);
+            self.dispatch_wake.notify_all();
+            advanced
+        };
+
+        self.run_published_hooks(published_waiters, published_lsns)
+    }
+
+    fn advance_dispatch_gap_before(
+        &self,
+        lsn: u64,
+        record_kind: RecoveryPlaceholderRecordKind,
+    ) -> Result<()> {
+        if lsn == 0 {
+            return Err(paro_error::internal(format!(
+                "journal recovery gap before {record_kind} cannot target synthetic lsn 0"
+            )));
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if let Some(err) = state.poisoned.clone() {
+            return Err(err);
+        }
+        if lsn <= state.next_dispatch_lsn {
+            return Ok(());
+        }
+
+        if let Some(pending_lsn) = state
+            .records
+            .keys()
+            .copied()
+            .filter(|pending| *pending < lsn)
+            .min()
+        {
+            return Err(paro_error::internal(format!(
+                "journal recovery gap before {record_kind} at lsn {lsn} cannot skip pending record {pending_lsn}"
+            )));
+        }
+
+        let gap_end = lsn.saturating_sub(1);
+        state.frontiers.durable_lsn = state.frontiers.durable_lsn.max(gap_end);
+        state.frontiers.applied_lsn = state.frontiers.applied_lsn.max(gap_end);
+        state.frontiers.published_lsn = state.frontiers.published_lsn.max(gap_end);
+        state.next_ephemeral_lsn = state.next_ephemeral_lsn.max(lsn);
+        state.next_dispatch_lsn = lsn;
+        state.apply_frontier.skip_through(gap_end);
+        state.publish_frontier.skip_through(gap_end);
+        self.dispatch_wake.notify_all();
+        Ok(())
+    }
+
     fn record_wait(&self, mode: WaitMode, latency_micros: u64) {
         match mode {
             WaitMode::Durable => {
@@ -499,7 +833,7 @@ impl JournalApplyRuntimeInner {
                     .applied_wait_micros
                     .fetch_add(latency_micros, Ordering::Relaxed);
             }
-            WaitMode::Published => {
+            WaitMode::Published | WaitMode::AsyncCompletion => {
                 self.metrics
                     .published_wait_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -518,30 +852,17 @@ impl JournalApplyRuntimeInner {
             }
 
             ticket.mark_applied();
-            let mut published_waiters = Vec::new();
-            let mut published_lsns = Vec::new();
-            for applied_lsn in state.apply_frontier.mark_ready(ticket.lsn) {
-                state.frontiers.applied_lsn = applied_lsn;
-                let commit_id = state
-                    .records
-                    .get(&applied_lsn)
-                    .and_then(|record| record.commit_id);
-                for (published_lsn, published_commit_id) in
-                    state.publish_frontier.mark_ready(applied_lsn, commit_id)
-                {
-                    state.frontiers.published_lsn = published_lsn;
-                    if let Some(published_commit_id) = published_commit_id {
-                        state.frontiers.published_commit_id = published_commit_id;
-                    }
-                    if let Some(record) = state.records.remove(&published_lsn) {
-                        published_waiters.push(record);
-                        published_lsns.push(published_lsn);
-                    }
-                }
-            }
-            (published_waiters, published_lsns)
+            advance_publish_frontiers_locked(&mut state, ticket.lsn)
         };
 
+        self.run_published_hooks(published_waiters, published_lsns)
+    }
+
+    fn run_published_hooks(
+        &self,
+        published_waiters: Vec<Arc<RecordTicket>>,
+        published_lsns: Vec<u64>,
+    ) -> Result<()> {
         for (record, published_lsn) in published_waiters.into_iter().zip(published_lsns) {
             if let Err(err) = record.run_published_hook() {
                 self.fail_record(
@@ -699,10 +1020,30 @@ fn normalize_durable_apply_failure(err: &ParoError) -> ParoError {
         ))
 }
 
+fn advance_publish_frontiers_locked(
+    state: &mut ApplyRuntimeState,
+    applied_ready_lsn: u64,
+) -> (Vec<Arc<RecordTicket>>, Vec<u64>) {
+    let mut published_waiters = Vec::new();
+    let mut published_lsns = Vec::new();
+    for applied_lsn in state.apply_frontier.mark_ready(applied_ready_lsn) {
+        state.frontiers.applied_lsn = applied_lsn;
+        for published_lsn in state.publish_frontier.mark_ready(applied_lsn) {
+            state.frontiers.published_lsn = published_lsn;
+            if let Some(record) = state.records.remove(&published_lsn) {
+                published_waiters.push(record);
+                published_lsns.push(published_lsn);
+            }
+        }
+    }
+    (published_waiters, published_lsns)
+}
+
 struct RecordTicket {
     lsn: u64,
     commit_id: Option<u64>,
     on_published: Mutex<Option<PublishedHook>>,
+    failure: Option<SharedApplyFailure>,
     progress: Mutex<RecordProgress>,
     wake: Condvar,
 }
@@ -721,11 +1062,13 @@ impl RecordTicket {
         commit_id: Option<u64>,
         remaining_tablet_parts: u32,
         on_published: PublishedHook,
+        failure: Option<SharedApplyFailure>,
     ) -> Self {
         Self {
             lsn,
             commit_id,
             on_published: Mutex::new(Some(on_published)),
+            failure,
             progress: Mutex::new(RecordProgress {
                 remaining_tablet_parts,
                 part_error: None,
@@ -808,14 +1151,31 @@ impl RecordTicket {
         let Some(hook) = self.on_published.lock().unwrap().take() else {
             return Ok(());
         };
-        hook()
+        call_apply_work(
+            hook,
+            ApplyPhase::Published,
+            ApplyErrorSource::PublishedHook,
+            self.lsn,
+            self.commit_id,
+            self.failure.as_ref(),
+        )
     }
 }
 
 #[derive(Default)]
 struct AsyncSubmitState {
-    queue: VecDeque<ApplyRequest<()>>,
+    queue: VecDeque<AsyncSubmitWork>,
     shutdown: bool,
+}
+
+enum AsyncSubmitWork {
+    Legacy(ApplyRequest<()>),
+    WithCompletion {
+        request: ApplyRequest<()>,
+        on_complete: ApplyCompletion,
+        fallback_ack: ApplyCompletionFallbackAck,
+        fatal_sink: ApplyFatalSink,
+    },
 }
 
 #[derive(Default)]
@@ -835,6 +1195,7 @@ struct TabletApplyWork {
     apply: Option<ApplyWork>,
     runtime: Weak<JournalApplyRuntimeInner>,
     ticket: Arc<RecordTicket>,
+    failure: Option<SharedApplyFailure>,
 }
 
 fn default_apply_worker_count() -> usize {
@@ -859,7 +1220,14 @@ fn run_tablet_worker(runtime: Weak<JournalApplyRuntimeInner>) {
 
         inner.metrics.increment_active_workers();
         let result = match work.apply {
-            Some(apply) => apply(),
+            Some(apply) => call_apply_work(
+                apply,
+                ApplyPhase::TabletParts,
+                ApplyErrorSource::ApplyClosure,
+                work.ticket.lsn,
+                work.ticket.commit_id,
+                work.failure.as_ref(),
+            ),
             None => Ok(()),
         };
         inner.metrics.decrement_active_workers();
@@ -883,19 +1251,160 @@ fn run_async_submit_worker(runtime: Weak<JournalApplyRuntimeInner>) {
         let apply_runtime = JournalApplyRuntime {
             inner: Arc::clone(&inner),
         };
-        if let Err(err) = apply_runtime.submit(request) {
-            tracing::error!(
-                error = %err,
-                "asynchronous journal apply request failed after durable append"
-            );
+        match request {
+            AsyncSubmitWork::Legacy(request) => {
+                if let Err(err) = apply_runtime.submit(request) {
+                    tracing::error!(
+                        error = %err,
+                        "asynchronous journal apply request failed after durable append"
+                    );
+                }
+            }
+            AsyncSubmitWork::WithCompletion {
+                request,
+                on_complete,
+                fallback_ack,
+                fatal_sink,
+            } => {
+                run_async_submit_with_completion(
+                    apply_runtime,
+                    request,
+                    on_complete,
+                    fallback_ack,
+                    fatal_sink,
+                );
+            }
         }
     }
+}
+
+fn run_async_submit_with_completion(
+    apply_runtime: JournalApplyRuntime,
+    request: ApplyRequest<()>,
+    on_complete: ApplyCompletion,
+    fallback_ack: ApplyCompletionFallbackAck,
+    fatal_sink: ApplyFatalSink,
+) {
+    let lsn = request.lsn;
+    let commit_id = request.commit_id;
+    let failure = SharedApplyFailure::default();
+    let submit_result = catch_unwind(AssertUnwindSafe(|| {
+        apply_runtime.submit_observed_tracked(request, Some(failure.clone()))
+    }));
+    let completion_result = match submit_result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(failure.take_or_runtime(lsn, commit_id, &err)),
+        Err(panic) => Err(JournalApplyError::worker_panic(
+            ApplyPhase::Runtime,
+            lsn,
+            commit_id,
+            panic,
+        )),
+    };
+    complete_async_request(
+        completion_result,
+        lsn,
+        commit_id,
+        on_complete,
+        fallback_ack,
+        fatal_sink,
+    );
+}
+
+fn complete_async_request(
+    result: std::result::Result<(), JournalApplyError>,
+    lsn: u64,
+    commit_id: Option<u64>,
+    on_complete: ApplyCompletion,
+    fallback_ack: ApplyCompletionFallbackAck,
+    fatal_sink: ApplyFatalSink,
+) {
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| on_complete(result))) {
+        let completion_error = JournalApplyError::completion_panic(lsn, commit_id, panic);
+        if catch_unwind(AssertUnwindSafe(|| fallback_ack(&completion_error))).is_err() {
+            std::process::abort();
+        }
+        if catch_unwind(AssertUnwindSafe(|| fatal_sink(&completion_error))).is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+fn call_apply_work(
+    work: ApplyWork,
+    phase: ApplyPhase,
+    source: ApplyErrorSource,
+    lsn: u64,
+    commit_id: Option<u64>,
+    failure: Option<&SharedApplyFailure>,
+) -> Result<()> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            if let Some(failure) = failure {
+                failure.record(JournalApplyError::apply_failed(
+                    phase, source, lsn, commit_id, &err,
+                ));
+            }
+            Err(err)
+        }
+        Err(panic) => {
+            let error = JournalApplyError::worker_panic(phase, lsn, commit_id, panic);
+            if let Some(failure) = failure {
+                failure.record(error.clone());
+            }
+            Err(error.to_paro_error())
+        }
+    }
+}
+
+fn call_catalog_post<R>(
+    work: Box<dyn FnOnce() -> Result<R> + Send + 'static>,
+    phase: ApplyPhase,
+    source: ApplyErrorSource,
+    lsn: u64,
+    commit_id: Option<u64>,
+    failure: Option<&SharedApplyFailure>,
+) -> Result<R> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            if let Some(failure) = failure {
+                failure.record(JournalApplyError::apply_failed(
+                    phase, source, lsn, commit_id, &err,
+                ));
+            }
+            Err(err)
+        }
+        Err(panic) => {
+            let error = JournalApplyError::worker_panic(phase, lsn, commit_id, panic);
+            if let Some(failure) = failure {
+                failure.record(error.clone());
+            }
+            Err(error.to_paro_error())
+        }
+    }
+}
+
+const fn apply_error_code(phase: ApplyPhase, source: ApplyErrorSource) -> u32 {
+    ((phase as u32) << 8) | source as u32
+}
+
+fn panic_payload_message(panic: Box<dyn Any + Send + 'static>) -> Arc<str> {
+    if let Some(message) = panic.downcast_ref::<&'static str>() {
+        return Arc::from(*message);
+    }
+    if let Some(message) = panic.downcast_ref::<String>() {
+        return Arc::from(message.as_str());
+    }
+    Arc::from("panic payload is not a string")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
     use std::time::Duration;
@@ -972,7 +1481,23 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), vec![1, 2]);
         let frontiers = runtime.frontiers();
         assert_eq!(frontiers.published_lsn, 2);
-        assert_eq!(frontiers.published_commit_id, 2);
+    }
+
+    #[test]
+    fn recovery_gap_skip_unblocks_sparse_journal_record() {
+        let runtime = JournalApplyRuntime::new();
+        runtime
+            .advance_dispatch_gap_before(3, RecoveryPlaceholderRecordKind::Other)
+            .unwrap();
+
+        runtime
+            .submit(empty_request(3, Some(3), WaitMode::Published, Vec::new()))
+            .unwrap();
+
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.durable_lsn, 3);
+        assert_eq!(frontiers.applied_lsn, 3);
+        assert_eq!(frontiers.published_lsn, 3);
     }
 
     #[test]
@@ -1010,13 +1535,13 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(started.load(Ordering::Acquire));
-        assert_eq!(runtime.frontiers().published_commit_id, 0);
+        assert_eq!(runtime.frontiers().published_lsn, 0);
 
         let (lock, wake) = &*release;
         *lock.lock().unwrap() = true;
         wake.notify_all();
         for _ in 0..50 {
-            if runtime.frontiers().published_commit_id == 1 {
+            if runtime.frontiers().published_lsn == 1 {
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1025,7 +1550,94 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_publish_advances_lsn_without_advancing_commit_frontier() {
+    fn async_completion_runs_after_published_hook() {
+        let runtime = JournalApplyRuntime::new();
+        let published = Arc::new(AtomicBool::new(false));
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let mut request = empty_request(1, Some(10), WaitMode::Published, Vec::new());
+        let published_hook = Arc::clone(&published);
+        request.on_published = Box::new(move || {
+            published_hook.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        runtime
+            .submit_async_with_completion(
+                request,
+                Box::new(move |result| complete_tx.send(result).unwrap()),
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .unwrap();
+
+        let result = complete_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        assert!(published.load(Ordering::Acquire));
+        assert_eq!(runtime.frontiers().published_lsn, 1);
+    }
+
+    #[test]
+    fn async_completion_reports_apply_phase_error() {
+        let runtime = JournalApplyRuntime::new();
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let mut request = empty_request(1, Some(11), WaitMode::Published, Vec::new());
+        request.catalog_pre = Box::new(|| Err(paro_error::internal("catalog pre failed")));
+
+        runtime
+            .submit_async_with_completion(
+                request,
+                Box::new(move |result| complete_tx.send(result).unwrap()),
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .unwrap();
+
+        let error = complete_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.phase, ApplyPhase::CatalogPre);
+        assert_eq!(error.source, ApplyErrorSource::ApplyClosure);
+        assert_eq!(error.lsn, 1);
+        assert_eq!(error.commit_id, Some(11));
+    }
+
+    #[test]
+    fn completion_panic_uses_fallback_ack_and_fatal_sink() {
+        let runtime = JournalApplyRuntime::new();
+        let fallback_seen = Arc::new(AtomicBool::new(false));
+        let fatal_seen = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        runtime
+            .submit_async_with_completion(
+                empty_request(1, Some(12), WaitMode::Published, Vec::new()),
+                Box::new(|_| panic!("completion panic")),
+                {
+                    let fallback_seen = Arc::clone(&fallback_seen);
+                    Box::new(move |error| {
+                        assert_eq!(error.phase, ApplyPhase::Completion);
+                        fallback_seen.store(true, Ordering::Release);
+                    })
+                },
+                {
+                    let fatal_seen = Arc::clone(&fatal_seen);
+                    Box::new(move |error| {
+                        assert_eq!(error.phase, ApplyPhase::Completion);
+                        fatal_seen.store(true, Ordering::Release);
+                        done_tx.send(()).unwrap();
+                    })
+                },
+            )
+            .unwrap();
+
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(fallback_seen.load(Ordering::Acquire));
+        assert!(fatal_seen.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn maintenance_publish_advances_lsn_frontier() {
         let runtime = JournalApplyRuntime::new();
         runtime
             .submit(empty_request(1, Some(7), WaitMode::Published, Vec::new()))
@@ -1037,7 +1649,41 @@ mod tests {
         let frontiers = runtime.frontiers();
         assert_eq!(frontiers.applied_lsn, 2);
         assert_eq!(frontiers.published_lsn, 2);
-        assert_eq!(frontiers.published_commit_id, 7);
+    }
+
+    #[test]
+    fn recovery_placeholder_unblocks_later_commit_lsn() {
+        let runtime = JournalApplyRuntime::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let runtime_commit = runtime.clone();
+        let finished_commit = Arc::clone(&finished);
+        let commit = thread::spawn(move || {
+            runtime_commit
+                .submit(empty_request(2, Some(9), WaitMode::Published, Vec::new()))
+                .unwrap();
+            finished_commit.store(true, Ordering::Release);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!finished.load(Ordering::Acquire));
+        assert_eq!(runtime.frontiers().published_lsn, 0);
+
+        runtime
+            .advance_dispatch_past_placeholder(1, RecoveryPlaceholderRecordKind::Maintenance)
+            .unwrap();
+
+        commit.join().unwrap();
+        let frontiers = runtime.frontiers();
+        assert_eq!(frontiers.published_lsn, 2);
+    }
+
+    #[test]
+    fn recovery_placeholder_rejects_lsn_gap() {
+        let runtime = JournalApplyRuntime::new();
+        let err = runtime
+            .advance_dispatch_past_placeholder(2, RecoveryPlaceholderRecordKind::CheckpointFence)
+            .expect_err("placeholder must not skip an earlier WAL lsn");
+        assert!(err.to_string().contains("cannot skip next dispatch lsn"));
     }
 
     #[test]
@@ -1053,7 +1699,6 @@ mod tests {
         let frontiers = runtime.frontiers();
         assert_eq!(frontiers.applied_lsn, 2);
         assert_eq!(frontiers.published_lsn, 2);
-        assert_eq!(frontiers.published_commit_id, 10);
     }
 
     #[test]
@@ -1072,7 +1717,6 @@ mod tests {
         let frontiers = runtime.frontiers();
         assert_eq!(frontiers.durable_lsn, 8);
         assert_eq!(frontiers.published_lsn, 8);
-        assert_eq!(frontiers.published_commit_id, 5);
     }
 
     #[test]
@@ -1264,10 +1908,8 @@ mod tests {
 
         let stalled = runtime.frontiers();
         assert_eq!(stalled.durable_lsn, 2);
-        assert_eq!(stalled.durable_commit_id, 2);
         assert_eq!(stalled.applied_lsn, 0);
         assert_eq!(stalled.published_lsn, 0);
-        assert_eq!(stalled.published_commit_id, 0);
 
         let (lock, wake) = &*release_slow_part;
         *lock.lock().unwrap() = true;
@@ -1280,7 +1922,6 @@ mod tests {
         let frontiers = runtime.frontiers();
         assert_eq!(frontiers.applied_lsn, 2);
         assert_eq!(frontiers.published_lsn, 2);
-        assert_eq!(frontiers.published_commit_id, 2);
     }
 
     #[test]

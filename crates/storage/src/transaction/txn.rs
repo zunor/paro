@@ -864,6 +864,10 @@ impl Transaction {
         }
     }
 
+    pub fn release_transaction_locks(&self) {
+        drop(self.take_pending_lock_sets());
+    }
+
     fn apply_materialized_writes(
         &self,
         commit_id: u64,
@@ -1140,14 +1144,9 @@ impl Transaction {
     }
 
     fn apply_pending_writes(&self, commit_id: u64) -> Result<()> {
-        let lock_sets = self.take_pending_lock_sets();
         let pending = self.write_buffer.take_mutations()?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
-        let result =
-            self.apply_materialized_writes(commit_id, &primary_deletes, &row_id_deletes, rowsets);
-        drop(lock_sets);
-
-        result
+        self.apply_materialized_writes(commit_id, &primary_deletes, &row_id_deletes, rowsets)
     }
 
     fn commit_prepared_storage(&self, commit_id: u64) -> Result<()> {
@@ -1157,16 +1156,12 @@ impl Transaction {
             return self.apply_pending_writes(commit_id);
         };
 
-        let lock_sets = self.take_pending_lock_sets();
-        let result = self.apply_materialized_writes(
+        self.apply_materialized_writes(
             commit_id,
             &prepared.primary_deletes,
             &prepared.row_id_deletes,
             prepared.rowsets,
-        );
-        drop(lock_sets);
-
-        result
+        )
     }
 
     fn rollback_pending_writes(&self) {
@@ -1180,24 +1175,17 @@ impl Transaction {
         self.write_buffer.rollback_prepared();
     }
 
-    /// Commit the transaction with the given commit ID.
-    ///
-    ///
-    /// # Arguments
-    /// * `commit_id` - The commit timestamp to assign
-    ///
-    /// # Returns
-    /// * `Ok(())` - Transaction committed successfully
-    /// * `Err(paro_error::transaction_aborted)` - Failed to acquire lock (poisoned mutex)
-    ///
-    /// # Note
-    /// This method handles the transaction-level commit. Data changes are already
-    /// persisted via Tablet/Rowset; the undo buffer only tracks catalog-level edits.
-    pub fn commit(&self, commit_id: u64) -> Result<()> {
+    pub fn rollback_prepared_storage_only(&self) {
+        self.abort_prepared_storage();
+    }
+
+    pub fn apply_prepared_storage_for_commit(&self, commit_id: u64) -> Result<()> {
         self.commit_prepared_storage(commit_id)?;
         self.write_buffer.clear_after_commit();
+        Ok(())
+    }
 
-        // Set commit_id
+    pub fn finalize_applied_commit(&self, commit_id: u64) -> Result<()> {
         {
             let mut cid = self
                 .commit_id
@@ -1206,24 +1194,14 @@ impl Transaction {
             *cid = commit_id;
         }
 
-        // If no undo changes were made, we're done (fast path)
-        if !self.undo_changes_made() {
-            self.set_awaiting_cleanup(true);
-            return Ok(());
-        }
-
-        // Commit the undo buffer
-        {
+        if self.undo_changes_made() {
             let buffer = self
                 .undo_buffer
                 .lock()
                 .map_err(|e| paro_error::internal(format!("failed to acquire lock: {}", e)))?;
-            // Commit the undo buffer with the commit_id
-            // This iterates entries and finalizes changes
             buffer.commit(self, commit_id);
         }
 
-        // Mark as awaiting cleanup after successful commit
         self.set_awaiting_cleanup(true);
         Ok(())
     }
@@ -1394,6 +1372,13 @@ mod tests {
         TableFactory::default()
             .create_table_with_keys(types, keys_type)
             .unwrap()
+    }
+
+    fn commit_transaction(txn: &Transaction, commit_id: u64) -> Result<()> {
+        let apply_result = txn.apply_prepared_storage_for_commit(commit_id);
+        txn.release_transaction_locks();
+        apply_result?;
+        txn.finalize_applied_commit(commit_id)
     }
 
     fn collect_rows_i32_pair(table: &TableHandle) -> Vec<(i32, i32)> {
@@ -1619,7 +1604,7 @@ mod tests {
         assert_eq!(txn.get_commit_id(), 0);
         assert!(!txn.is_awaiting_cleanup());
 
-        txn.commit(500).expect("commit should succeed");
+        commit_transaction(&txn, 500).expect("commit should succeed");
 
         assert_eq!(txn.get_commit_id(), 500);
         assert!(txn.is_awaiting_cleanup());
@@ -1685,7 +1670,7 @@ mod tests {
 
         txn.rollback_to_savepoint(&mark)
             .expect("rollback to savepoint");
-        txn.commit(9202).expect("commit txn");
+        commit_transaction(&txn, 9202).expect("commit txn");
 
         assert_eq!(collect_rows_i32_pair(&table), vec![(1, 10), (2, 20)]);
     }
@@ -1842,7 +1827,7 @@ mod tests {
             (48..64).collect::<Vec<_>>()
         );
 
-        txn.commit(9607).expect("commit spilled row-id delete");
+        commit_transaction(&txn, 9607).expect("commit spilled row-id delete");
         assert_eq!(collect_rows_i32(&table), (48..64).collect::<Vec<_>>());
     }
 
@@ -2073,7 +2058,7 @@ mod tests {
                 Arc::clone(&insert_txn),
             )
             .expect("stage transactional insert");
-        insert_txn.commit(9702).expect("commit insert");
+        commit_transaction(&insert_txn, 9702).expect("commit insert");
 
         assert!(
             std::fs::metadata(&wal_path)
@@ -2098,7 +2083,7 @@ mod tests {
                 vec![row_id_location_by_value(&table, 2)],
             )
             .expect("stage row-id delete");
-        delete_txn.commit(9704).expect("commit deletes");
+        commit_transaction(&delete_txn, 9704).expect("commit deletes");
 
         assert!(
             std::fs::metadata(&wal_path)
@@ -2157,7 +2142,7 @@ mod tests {
         // Rollback releases locks; txn2 can stage and commit the delete.
         txn2.add_pending_primary_delete(CommandId::new(0), tablet, vec![key_bytes], vec![location])
             .expect("stage primary delete after rollback");
-        txn2.commit(9202).expect("commit txn2");
+        commit_transaction(&txn2, 9202).expect("commit txn2");
         assert_eq!(collect_rows_i32_pair(&table), vec![(2, 20)]);
     }
 
@@ -2193,7 +2178,7 @@ mod tests {
         // Rollback releases locks; txn2 can stage and commit the delete.
         txn2.add_pending_row_id_delete(CommandId::new(0), tablet, vec![location])
             .expect("stage row-id delete after rollback");
-        txn2.commit(9402).expect("commit txn2");
+        commit_transaction(&txn2, 9402).expect("commit txn2");
         assert_eq!(collect_rows_i32(&table), vec![1, 3]);
     }
 
@@ -2358,11 +2343,11 @@ mod tests {
         // This shouldn't happen in practice, but we should handle it gracefully
         let txn = Transaction::new(1, 100);
 
-        txn.commit(500).expect("first commit should succeed");
+        commit_transaction(&txn, 500).expect("first commit should succeed");
         assert_eq!(txn.get_commit_id(), 500);
 
         // Second commit overwrites (not ideal, but safe)
-        txn.commit(600).expect("second commit should succeed");
+        commit_transaction(&txn, 600).expect("second commit should succeed");
         assert_eq!(txn.get_commit_id(), 600);
     }
 
@@ -2377,7 +2362,7 @@ mod tests {
             let mut buffer = txn.undo_buffer.lock().expect("lock undo buffer");
             buffer.push_insert(1, 0, 1);
         }
-        txn.commit(500).expect("commit should succeed");
+        commit_transaction(&txn, 500).expect("commit should succeed");
 
         // Rollback after commit (unusual but should not panic)
         txn.rollback().expect("rollback should succeed");
@@ -2421,7 +2406,7 @@ mod tests {
         assert!(txn.changes_made());
 
         // Commit should return Ok
-        let result = txn.commit(500);
+        let result = commit_transaction(&txn, 500);
         assert!(result.is_ok());
         assert_eq!(txn.get_commit_id(), 500);
         assert!(txn.is_awaiting_cleanup());
@@ -2434,7 +2419,7 @@ mod tests {
 
         assert!(!txn.changes_made());
 
-        let result = txn.commit(500);
+        let result = commit_transaction(&txn, 500);
         assert!(result.is_ok());
         assert_eq!(txn.get_commit_id(), 500);
         assert!(txn.is_awaiting_cleanup());
@@ -2483,7 +2468,7 @@ mod tests {
         assert!(txn.changes_made());
 
         // Commit
-        let commit_result = txn.commit(500);
+        let commit_result = commit_transaction(&txn, 500);
         assert!(commit_result.is_ok());
         assert_eq!(txn.get_commit_id(), 500);
 

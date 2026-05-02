@@ -28,6 +28,7 @@ use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::version::{pg_compat_server_version, PG_COMPAT_SERVER_VERSION_NUM};
 use paro_context::{
+    AttachedDatabaseCommitFrontierSnapshot, AttachedDatabaseCommitPoisonSnapshot,
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot,
     AttachedDatabaseTransactionMetricsSnapshot, AttachedDatabaseWalMetricsSnapshot,
     CompileEnvironmentKey, CursorSummary, DatabaseSnapshotIdentity, EffectiveSettings,
@@ -76,8 +77,9 @@ pub struct Session {
     pub transaction: SessionTransaction,
     /// Highest durable-only async commit from this connection that later reads must observe.
     async_commit_floor: AtomicU64,
-    /// Session-local commit acknowledgement policy. SQL defaults to required publish;
-    /// tests and future explicit async protocol paths may opt into durable-only.
+    /// Test-only commit acknowledgement override. Production SQL/pgwire commits are
+    /// always required-published until an explicit durable-async protocol is designed.
+    #[cfg(test)]
     commit_ack_policy: AtomicU64,
     /// Shared execution control separating connection shutdown from statement cancellation.
     execution_control: Arc<SessionExecutionControl>,
@@ -141,9 +143,16 @@ impl Session {
     }
 
     pub(crate) fn commit_ack_policy(&self) -> CommitAckPolicy {
-        match self.commit_ack_policy.load(Ordering::Acquire) {
-            1 => CommitAckPolicy::DurableOnlyAsync,
-            _ => CommitAckPolicy::RequiredPublished,
+        #[cfg(test)]
+        {
+            match self.commit_ack_policy.load(Ordering::Acquire) {
+                1 => CommitAckPolicy::DurableOnlyAsync,
+                _ => CommitAckPolicy::RequiredPublished,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            CommitAckPolicy::RequiredPublished
         }
     }
 
@@ -210,9 +219,13 @@ impl Session {
             .map(|database| {
                 let wal_metrics = database.wal_lifecycle_metrics();
                 let journal_apply_metrics = database.journal_apply_metrics();
+                let commit_frontier = database.commit_frontier_snapshot();
+                let commit_poison = database.commit_poison_snapshot();
                 let manager_metrics = database.transaction_manager().registry_metrics_snapshot();
-                let sequencer_metrics = database.commit_coordinator().metrics_snapshot();
-                let backpressure_metrics = database.commit_coordinator().backpressure_snapshot();
+                let sequencer_metrics = database.transaction_manager().commit_sequencer_metrics();
+                let backpressure_metrics = database
+                    .transaction_manager()
+                    .commit_backpressure_snapshot();
                 let commit_ack_mode = match manager_metrics.txn_commit_ack_mode_last {
                     1 => "durable_only_async",
                     _ => "required_published",
@@ -334,6 +347,29 @@ impl Session {
                         oldest_active_rw_lag_ms: manager_metrics.oldest_active_rw_lag_ms,
                         read_snapshot_lease_count: manager_metrics.read_snapshot_lease_count,
                         active_rw_txn_count: manager_metrics.active_rw_txn_count,
+                    },
+                    commit_frontier: AttachedDatabaseCommitFrontierSnapshot {
+                        durable_commit_id: commit_frontier.durable_commit_id,
+                        published_commit_id: commit_frontier.published_commit_id,
+                        durable_commit_bytes: commit_frontier.durable_commit_bytes,
+                        published_commit_bytes: commit_frontier.published_commit_bytes,
+                        durable_to_published_bytes_lag: commit_frontier
+                            .durable_to_published_bytes_lag,
+                        stale_bytes_at_poison: commit_frontier.stale_bytes_at_poison,
+                        publish_failure_watermark: commit_frontier.publish_failure_watermark,
+                        publish_failure_cause: commit_frontier.publish_failure_cause,
+                        wait_count: commit_frontier.wait_count,
+                        wait_wake_count: commit_frontier.wait_wake_count,
+                        notify_all_count: commit_frontier.notify_all_count,
+                        notify_suppressed_count: commit_frontier.notify_suppressed_count,
+                        publish_failure_count: commit_frontier.publish_failure_count,
+                    },
+                    commit_poison: AttachedDatabaseCommitPoisonSnapshot {
+                        admission_state: commit_poison.admission_state,
+                        admission_open: commit_poison.admission_open,
+                        poisoned: commit_poison.poisoned,
+                        poison_cause: commit_poison.poison_cause,
+                        first_blocked_commit_ts: commit_poison.first_blocked_commit_ts,
                     },
                 }
             })
@@ -487,6 +523,7 @@ impl Session {
             session_metadata: Arc::new(SharedSessionMetadataState::default()),
             transaction: SessionTransaction::new(),
             async_commit_floor: AtomicU64::new(0),
+            #[cfg(test)]
             commit_ack_policy: AtomicU64::new(0),
             execution_control,
             current_database,
@@ -571,6 +608,13 @@ impl Session {
             .ok_or_else(|| {
                 paro_error::catalog(format!("Database \"{}\" does not exist", database_name))
             })?;
+        if !db.is_ready() {
+            return Err(paro_error::cannot_connect_now().detail(format!(
+                "database \"{}\" is not ready: {}",
+                database_name,
+                db.commit_health_detail()
+            )));
+        }
         self.current_database = db;
         // Update session state to reflect new database
         self.state.set_current_database(database_name);

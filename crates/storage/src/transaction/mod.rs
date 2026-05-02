@@ -11,6 +11,7 @@ pub mod bulk_load;
 pub mod cleanup_state;
 pub mod commit_state;
 pub mod descriptor_cleanup;
+pub mod lifecycle_action;
 pub mod manager;
 pub mod overlay_reader;
 pub mod participant;

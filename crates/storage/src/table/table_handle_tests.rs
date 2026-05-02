@@ -90,6 +90,13 @@ fn read_view(table: &TableHandle) -> TransactionView {
     TransactionView::autocommit(ReadTs::new(visible))
 }
 
+fn commit_transaction(txn: &Transaction, commit_id: u64) -> paro_common::error::Result<()> {
+    let apply_result = txn.apply_prepared_storage_for_commit(commit_id);
+    txn.release_transaction_locks();
+    apply_result?;
+    txn.finalize_applied_commit(commit_id)
+}
+
 fn open_table_from_descriptor_with_meta_manager(
     types: &[LogicalType],
     descriptor: &TableStorageDescriptor,
@@ -1679,7 +1686,7 @@ fn transactional_delete_update_commit_applies_in_single_commit() {
         vec![(1, 10), (2, 20), (3, 30)]
     );
 
-    txn.commit(2001).unwrap();
+    commit_transaction(&txn, 2001).unwrap();
 
     assert_eq!(collect_rows_i32_pair(&table), vec![(2, 200), (3, 300)]);
 }
@@ -1751,7 +1758,7 @@ fn transactional_concurrent_delete_conflict_on_same_primary_key() {
         "expected write-write conflict, got: {err}"
     );
 
-    txn1.commit(4001).unwrap();
+    commit_transaction(&txn1, 4001).unwrap();
     assert_eq!(collect_rows_i32_pair(&table), vec![(2, 20)]);
 }
 
@@ -1847,7 +1854,7 @@ fn transactional_delete_survives_pk_compaction_relocation() {
         "expected compaction to relocate the staged delete target before commit"
     );
 
-    txn.commit(4201).unwrap();
+    commit_transaction(&txn, 4201).unwrap();
     assert_eq!(
         collect_rows_i32_pair(&table),
         vec![(1, 10), (3, 30), (4, 40)]
@@ -2103,7 +2110,7 @@ fn art_declared_index_auto_builds_on_transaction_commit() {
         .unwrap()
         .is_empty());
 
-    txn.commit(9102).unwrap();
+    commit_transaction(&txn, 9102).unwrap();
 
     let segments = table.collect_segments(table.max_version()).unwrap();
     assert!(!segments.is_empty());
@@ -2483,7 +2490,7 @@ fn fulltext_registry_definition_auto_builds_on_transaction_commit() {
     assert_eq!(cov_before_commit.visible_segment_count, 0);
     assert_eq!(cov_before_commit.indexed_segment_count, 0);
 
-    txn.commit(9002).unwrap();
+    commit_transaction(&txn, 9002).unwrap();
     let cov_after_commit = table
         .search_generation_coverage(definition_id)
         .unwrap()
@@ -2554,7 +2561,7 @@ fn sparse_registry_definition_auto_builds_on_transaction_commit() {
         .unwrap();
 
     assert!(table.sparse_capability(1).is_some());
-    txn.commit(9102).unwrap();
+    commit_transaction(&txn, 9102).unwrap();
     assert!(table.sparse_capability(1).is_some());
 
     for (_, segment) in table.collect_segments(table.max_version()).unwrap() {
