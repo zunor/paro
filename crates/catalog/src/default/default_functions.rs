@@ -355,7 +355,8 @@ impl DefaultTableFunctionGenerator {
             create_repeat_function_set, create_repeat_row_function_set,
         };
         use paro_function::table::system::{
-            create_paro_columns_function_set, create_paro_databases_function_set,
+            create_paro_columns_function_set, create_paro_commit_frontiers_function_set,
+            create_paro_commit_poison_function_set, create_paro_databases_function_set,
             create_paro_graph_statistics_function_set, create_paro_indexes_function_set,
             create_paro_logs_function_set, create_paro_memory_function_set,
             create_paro_optimizers_function_set, create_paro_pg_cursors_function_set,
@@ -388,6 +389,8 @@ impl DefaultTableFunctionGenerator {
             create_paro_memory_function_set(),
             create_paro_optimizers_function_set(),
             create_paro_storage_info_function_set(),
+            create_paro_commit_frontiers_function_set(),
+            create_paro_commit_poison_function_set(),
             create_paro_temporary_files_function_set(),
             create_pragma_database_size_function_set(),
             // Graph system table functions

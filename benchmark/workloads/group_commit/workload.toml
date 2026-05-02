@@ -1,0 +1,49 @@
+[meta]
+name = "group_commit"
+description = "Group commit queue write-path latency, throughput, and observability profile"
+run_order = 40
+
+[params]
+snapshot_insert_id = 1000001
+serializable_insert_id = 2000001
+payload = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+commit_payload_bytes = 64
+write_set_keys = 1
+commit_concurrency = 1
+active_database_count = 1
+fsync_mode = "wal_default"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "queue_snapshot_insert"
+file = "sql/q_snapshot_insert.sql"
+setup = "sql/setup_snapshot.sql"
+teardown = "sql/setup_serializable.sql"
+validate = "none"
+
+[[query]]
+id = "queue_serializable_insert"
+file = "sql/q_serializable_insert.sql"
+setup = "sql/setup_serializable.sql"
+validate = "none"
+
+[[query]]
+id = "queue_hot_update"
+file = "sql/q_hot_update.sql"
+setup = "sql/setup_serializable.sql"
+validate = "none"
+
+[[query]]
+id = "commit_frontier_lag"
+file = "sql/q_commit_frontier_lag.sql"
+validate = "scalar_gte"
+expected = 0
+
+[[query]]
+id = "transaction_commit_metrics"
+file = "sql/q_transaction_commit_metrics.sql"
+validate = "scalar_gte"
+expected = 0

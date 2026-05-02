@@ -19,10 +19,9 @@ use paro_storage::transaction::participant::{
 use paro_storage::transaction::txn::Transaction;
 use paro_storage::write::DeltaWriter;
 use paro_transaction::{
-    CommandId, CommitAckPolicy, CommitCoordinator, CommitParticipant, CommitRequest,
-    CommitSequencingPlan, CommitTicket, CommitTs, CommittedRecordApplier, DatabaseId,
-    IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTrackerHandle, ReadTs,
-    RequiredPublishOutcome, TransactionView,
+    CommandId, CommitAckPolicy, CommitParticipant, CommitRequest, CommittedRecordApplier,
+    DatabaseId, IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTrackerHandle, ReadTs,
+    TransactionView,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
@@ -68,6 +67,13 @@ fn view_for_txn(txn: &Transaction) -> TransactionView {
     TransactionView::autocommit(ReadTs::new(txn.visible_version()))
 }
 
+fn commit_transaction(txn: &Transaction, commit_id: u64) -> paro_common::error::Result<()> {
+    let apply_result = txn.apply_prepared_storage_for_commit(commit_id);
+    txn.release_transaction_locks();
+    apply_result?;
+    txn.finalize_applied_commit(commit_id)
+}
+
 fn commit_storage_transaction(manager: &Arc<TransactionManager>, txn: Arc<Transaction>) -> u64 {
     let database_id = DatabaseId::new(0);
     let participant = StorageCommitParticipant::new(database_id, Arc::clone(&txn));
@@ -95,25 +101,20 @@ fn commit_storage_transaction(manager: &Arc<TransactionManager>, txn: Arc<Transa
     let ctx = request.validation_context();
     participant.validate(&plan, &ctx).unwrap();
 
-    let coordinator = CommitCoordinator::new(database_id);
-    coordinator.sync_commit_ts_with(CommitTs::new(manager.durable_commit_id()));
-    let sequencing_plan = CommitSequencingPlan::from_commit_plan(plan);
     let applier = StorageCommittedRecordApplier::new(Arc::clone(manager), Arc::clone(&txn));
-    let ticket = coordinator
-        .execute_transaction(
-            &request,
-            sequencing_plan,
-            |_, _| None,
-            |commit_ts| Ok::<_, paro_common::error::ParoError>(CommitTicket::new(commit_ts, 0, 0)),
-            |ticket| manager.register_committed_write_set(ticket.commit_ts, &[]),
-            |ticket| {
-                let record = request.committed_record(ticket.commit_ts);
-                applier.apply_required(&record, &descriptor)?;
-                Ok(RequiredPublishOutcome::Completed)
-            },
-        )
+    let commit_ts = manager.commit_sequencer().next_commit_ts();
+    manager
+        .commit_sequencer()
+        .sync_next_commit_ts_with(commit_ts);
+    manager
+        .register_committed_write_set(commit_ts, &[])
         .unwrap();
-    ticket.commit_ts.into_raw()
+    let record = request.committed_record(commit_ts);
+    applier.apply_required(&record, &descriptor).unwrap();
+    manager
+        .commit_frontier()
+        .sync_commit_ids(commit_ts, commit_ts);
+    commit_ts.into_raw()
 }
 
 fn storage_view_for_txn_command(txn: &Transaction, command_id: u32) -> TransactionView {
@@ -347,7 +348,7 @@ fn test_transaction_primary_key_overlay_drives_own_conflict_lookup() {
         .unwrap();
     assert_eq!(affected, 0);
 
-    txn.commit(1).unwrap();
+    commit_transaction(&txn, 1).unwrap();
     let rows = read_row_map_from_tablet(&table.tablet(), table.max_version());
     assert_eq!(rows, BTreeMap::from([(1, 10)]));
 }
@@ -369,7 +370,7 @@ fn test_transaction_delete_sees_own_pending_primary_key_insert() {
         .unwrap();
     assert_eq!(removed, 1);
 
-    txn.commit(1).unwrap();
+    commit_transaction(&txn, 1).unwrap();
     assert!(read_row_map_from_tablet(&table.tablet(), table.max_version()).is_empty());
     assert!(table
         .tablet()
@@ -403,7 +404,7 @@ fn test_transaction_on_conflict_update_reads_own_pending_primary_key_insert() {
         .unwrap();
     assert_eq!(affected, 1);
 
-    txn.commit(1).unwrap();
+    commit_transaction(&txn, 1).unwrap();
     let rows = read_row_map_from_tablet(&table.tablet(), table.max_version());
     assert_eq!(rows, BTreeMap::from([(1, 20)]));
 }
@@ -418,7 +419,7 @@ fn test_primary_key_commit_validation_rejects_write_after_read_ts() {
     table
         .append_with_transaction(&winner_view, &chunk_with_pairs(&[1], &[20]), winner.clone())
         .unwrap();
-    winner.commit(1).unwrap();
+    commit_transaction(&winner, 1).unwrap();
 
     let stale_view = storage_view_for_txn_command(&stale_txn, 0);
     table
@@ -428,7 +429,7 @@ fn test_primary_key_commit_validation_rejects_write_after_read_ts() {
             stale_txn.clone(),
         )
         .unwrap();
-    let err = stale_txn.commit(2).unwrap_err();
+    let err = commit_transaction(&stale_txn, 2).unwrap_err();
     assert!(
         err.to_string().contains("write-write conflict"),
         "expected primary-key validation conflict, got: {err}"

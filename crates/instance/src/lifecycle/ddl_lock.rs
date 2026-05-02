@@ -9,6 +9,7 @@ pub enum InstanceDdlOwner {
     CreateDatabase,
     DropDatabase,
     RenameDatabase,
+    ReopenDatabase,
     Shutdown,
 }
 

@@ -1,0 +1,17 @@
+name = "group_commit"
+description = "SQL group commit queue performance gate"
+
+[regression]
+enabled = true
+threshold_percent = 20
+baseline_file = "baselines/group-commit-macos-arm64.json"
+
+[[include]]
+workload = "group_commit"
+queries = [
+  "queue_snapshot_insert",
+  "queue_serializable_insert",
+  "queue_hot_update",
+  "commit_frontier_lag",
+  "transaction_commit_metrics",
+]

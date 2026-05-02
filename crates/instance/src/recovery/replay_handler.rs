@@ -8,6 +8,9 @@ use super::consistency_report::{
 };
 use super::index_restore::{restore_runtime_art_indexes, restore_search_registry_definitions};
 use crate::checkpoint::runtime::RecordWatermarks;
+use crate::commit::recovery_publish::{
+    build_recovery_required_publish_plan, RecoveryPublishPlanInput,
+};
 use crate::search_registry::{register_search_definition, unregister_search_definition_by_name};
 use paro_catalog::collection::{InstallMode, StagedCatalogMutation};
 use paro_catalog::database_catalog::ParoCatalog;
@@ -31,11 +34,15 @@ use paro_journal::wal::replay_state::ReplayResult;
 use paro_journal::wal::wal_entry::WalHeaderMetadata;
 use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_journal::{
-    mutation_identity_for_tablet, ApplyRequest, JournalApplyRuntime, TabletApplyPart, WaitMode,
+    encoded_journal_record_size_upper_bound, mutation_identity_for_tablet, JournalApplyRuntime,
+    RecoveryPlaceholderRecordKind, TabletApplyPart,
 };
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor;
+use paro_transaction::{
+    CommitDurableBatch, CommitRuntime, CommitTs, RecoveryReplayCommit, RecoveryReplayEvent,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -62,6 +69,8 @@ pub struct CatalogReplayHandler<'a> {
     pub(super) replayed_deferred_tasks: Vec<DeferredTask>,
     /// Runtime used to order recovered tablet apply work by journal LSN.
     apply_runtime: Option<Arc<JournalApplyRuntime>>,
+    /// Commit runtime used to replay recovered commit records through the ordered event stream.
+    commit_runtime: Option<Arc<CommitRuntime>>,
 }
 
 impl<'a> CatalogReplayHandler<'a> {
@@ -91,6 +100,7 @@ impl<'a> CatalogReplayHandler<'a> {
             recovery_summary: bootstrap,
             replayed_deferred_tasks: Vec::new(),
             apply_runtime: None,
+            commit_runtime: None,
         }
     }
 
@@ -109,6 +119,11 @@ impl<'a> CatalogReplayHandler<'a> {
 
     pub fn with_apply_runtime(mut self, runtime: Option<Arc<JournalApplyRuntime>>) -> Self {
         self.apply_runtime = runtime;
+        self
+    }
+
+    pub fn with_commit_runtime(mut self, runtime: Option<Arc<CommitRuntime>>) -> Self {
+        self.commit_runtime = runtime;
         self
     }
 
@@ -362,6 +377,232 @@ impl<'a> CatalogReplayHandler<'a> {
         Ok(())
     }
 
+    fn build_recovery_descriptor_phase(
+        &self,
+        descriptors: Vec<ApplyDescriptor>,
+        commit_id: u64,
+    ) -> Box<dyn FnOnce() -> paro_common::error::Result<()> + Send + 'static> {
+        let catalog = Arc::clone(self.catalog);
+        let transaction = self.transaction;
+        let database_root = self.database_root.clone();
+        let tablet_meta_manager = self.tablet_meta_manager.clone();
+        Box::new(move || {
+            Self::apply_recovery_descriptors(
+                catalog,
+                transaction,
+                database_root,
+                tablet_meta_manager,
+                descriptors,
+                commit_id,
+            )
+        })
+    }
+
+    fn apply_recovery_descriptors(
+        catalog: Arc<ParoCatalog>,
+        transaction: CatalogSnapshot,
+        database_root: PathBuf,
+        tablet_meta_manager: Option<Arc<TabletMetaManager>>,
+        descriptors: Vec<ApplyDescriptor>,
+        commit_id: u64,
+    ) -> paro_common::error::Result<()> {
+        for descriptor in descriptors {
+            match descriptor {
+                ApplyDescriptor::PublishStagedArtifact(artifact) => {
+                    Self::apply_recovery_staged_artifact_descriptor(&database_root, &artifact)?;
+                }
+                ApplyDescriptor::RuntimeTransition(transition) => {
+                    Self::apply_recovery_runtime_transition(
+                        catalog.as_ref(),
+                        &transaction,
+                        &transition,
+                        commit_id,
+                    )?;
+                }
+                ApplyDescriptor::Cleanup(cleanup) => {
+                    run_cleanup_descriptor(&cleanup, tablet_meta_manager.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_recovery_staged_artifact_descriptor(
+        database_root: &Path,
+        descriptor: &StagedArtifactDescriptor,
+    ) -> paro_common::error::Result<()> {
+        match descriptor {
+            StagedArtifactDescriptor::PropertyGraphBuild {
+                object, staging, ..
+            } => {
+                let staging_path = Self::path_from_components(&staging.path_components);
+                let final_path = database_root.join("graph").join(&object.name);
+
+                if !staging_path.exists() {
+                    if final_path.exists() {
+                        return Ok(());
+                    }
+                    return Err(paro_error::internal(format!(
+                        "missing staged property graph artifact during recovery publish: {}",
+                        staging_path.display()
+                    )));
+                }
+
+                if let Some(parent) = final_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|err| {
+                        paro_error::internal(format!(
+                            "recovery create property graph parent dir {}: {}",
+                            parent.display(),
+                            err
+                        ))
+                    })?;
+                }
+
+                if final_path.exists() {
+                    std::fs::remove_dir_all(&final_path).map_err(|err| {
+                        paro_error::internal(format!(
+                            "recovery remove stale property graph dir {}: {}",
+                            final_path.display(),
+                            err
+                        ))
+                    })?;
+                }
+
+                std::fs::rename(&staging_path, &final_path).map_err(|err| {
+                    paro_error::internal(format!(
+                        "recovery publish property graph staging {} -> {}: {}",
+                        staging_path.display(),
+                        final_path.display(),
+                        err
+                    ))
+                })
+            }
+            StagedArtifactDescriptor::BulkLoadRowset(_artifact) => Ok(()),
+        }
+    }
+
+    fn apply_recovery_runtime_transition(
+        catalog: &ParoCatalog,
+        transaction: &CatalogSnapshot,
+        transition: &RuntimeTransitionDescriptor,
+        commit_id: u64,
+    ) -> paro_common::error::Result<()> {
+        match transition {
+            RuntimeTransitionDescriptor::AttachIndexState {
+                index, table_name, ..
+            } => {
+                let Some((storage, entry)) = Self::recovery_table_storage_and_index(
+                    catalog,
+                    transaction,
+                    index,
+                    table_name,
+                )?
+                else {
+                    return Ok(());
+                };
+                register_search_definition(storage.as_ref(), entry.as_ref())
+            }
+            RuntimeTransitionDescriptor::DetachIndexState {
+                index,
+                table_name,
+                index_type,
+                column_ids,
+                ..
+            } => {
+                let Some(storage) =
+                    Self::recovery_table_storage(catalog, transaction, index, table_name)?
+                else {
+                    return Ok(());
+                };
+                let _ = storage.remove_index(&index.name);
+                Self::unmark_declared_runtime_indexes(
+                    storage.as_ref(),
+                    &index.name,
+                    index_type,
+                    column_ids,
+                )
+            }
+            RuntimeTransitionDescriptor::RegisterGraphRuntime { .. }
+            | RuntimeTransitionDescriptor::UnregisterGraphRuntime { .. } => {
+                let _ = commit_id;
+                Ok(())
+            }
+        }
+    }
+
+    fn recovery_table_storage_and_index(
+        catalog: &ParoCatalog,
+        transaction: &CatalogSnapshot,
+        index: &paro_common::ddl::DdlObjectKey,
+        table_name: &str,
+    ) -> paro_common::error::Result<
+        Option<(
+            Arc<TableHandle>,
+            Arc<paro_catalog::entry::IndexCatalogEntry>,
+        )>,
+    > {
+        let schema_name = index.schema.as_deref().ok_or_else(|| {
+            paro_error::serialization_error("runtime transition missing schema name")
+        })?;
+        let schema = match catalog.get_schema(transaction, schema_name) {
+            Ok(schema) => schema,
+            Err(_) => return Ok(None),
+        };
+        let index_entry = schema
+            .get_index(
+                transaction.transaction_id,
+                transaction.start_time,
+                &index.name,
+            )
+            .and_then(|entry| match &*entry {
+                CatalogEntryEnum::Index(index) => Some(index.clone()),
+                _ => None,
+            });
+        let Some(index_entry) = index_entry else {
+            return Ok(None);
+        };
+        let Some(table_entry) = schema.get_table(
+            transaction.transaction_id,
+            transaction.start_time,
+            table_name,
+        ) else {
+            return Ok(None);
+        };
+        let Some(table) = table_entry.as_ref().as_table() else {
+            return Ok(None);
+        };
+        Ok(table
+            .get_storage()
+            .cloned()
+            .map(|storage| (storage, index_entry)))
+    }
+
+    fn recovery_table_storage(
+        catalog: &ParoCatalog,
+        transaction: &CatalogSnapshot,
+        index: &paro_common::ddl::DdlObjectKey,
+        table_name: &str,
+    ) -> paro_common::error::Result<Option<Arc<TableHandle>>> {
+        let schema_name = index.schema.as_deref().ok_or_else(|| {
+            paro_error::serialization_error("runtime transition missing schema name")
+        })?;
+        let schema = match catalog.get_schema(transaction, schema_name) {
+            Ok(schema) => schema,
+            Err(_) => return Ok(None),
+        };
+        let Some(table_entry) = schema.get_table(
+            transaction.transaction_id,
+            transaction.start_time,
+            table_name,
+        ) else {
+            return Ok(None);
+        };
+        let Some(table) = table_entry.as_ref().as_table() else {
+            return Ok(None);
+        };
+        Ok(table.get_storage().cloned())
+    }
+
     fn apply_tablet_mutation(
         &mut self,
         tablet_id: u64,
@@ -399,16 +640,12 @@ impl<'a> CatalogReplayHandler<'a> {
         Ok(())
     }
 
-    fn apply_storage_ops_with_runtime(
+    fn build_recovery_tablet_parts(
         &mut self,
         storage_ops: &[StorageCommitOp],
         lsn: u64,
         commit_visibility: Option<i64>,
-    ) -> paro_common::error::Result<()> {
-        let Some(runtime) = self.apply_runtime.as_ref().cloned() else {
-            return self.apply_storage_ops(storage_ops, lsn, commit_visibility);
-        };
-
+    ) -> paro_common::error::Result<Vec<TabletApplyPart>> {
         let mut tablet_parts = Vec::new();
         for op in storage_ops {
             match op {
@@ -453,18 +690,100 @@ impl<'a> CatalogReplayHandler<'a> {
             }
         }
 
-        runtime.submit(ApplyRequest {
-            lsn: 0,
-            durable_batch_lsn: lsn,
-            commit_id: commit_visibility.map(|commit_id| commit_id as u64),
-            wait_mode: WaitMode::Published,
+        Ok(tablet_parts)
+    }
+
+    fn replay_gap_placeholders_before(&self, lsn: u64) -> paro_common::error::Result<()> {
+        let Some(commit_runtime) = self.commit_runtime.as_ref() else {
+            return Ok(());
+        };
+        let Some(apply_runtime) = self.apply_runtime.as_ref() else {
+            return Ok(());
+        };
+
+        loop {
+            let next = apply_runtime.next_dispatch_lsn();
+            if next >= lsn {
+                return Ok(());
+            }
+            commit_runtime
+                .recovery_replay([RecoveryReplayEvent::Placeholder {
+                    lsn: next,
+                    record_kind: RecoveryPlaceholderRecordKind::Other,
+                }])
+                .map_err(|error| paro_error::internal(error.to_string()))?;
+        }
+    }
+
+    fn replay_placeholder(
+        &self,
+        lsn: u64,
+        record_kind: RecoveryPlaceholderRecordKind,
+    ) -> paro_common::error::Result<()> {
+        if let Some(commit_runtime) = self.commit_runtime.as_ref() {
+            commit_runtime
+                .recovery_replay([RecoveryReplayEvent::Placeholder { lsn, record_kind }])
+                .map_err(|error| paro_error::internal(error.to_string()))?;
+        } else if let Some(runtime) = self.apply_runtime.as_ref() {
+            runtime.advance_dispatch_past_placeholder(lsn, record_kind)?;
+        }
+        Ok(())
+    }
+
+    fn replay_commit_event(
+        &mut self,
+        lsn: u64,
+        record: &paro_common::journal::CommitRecord,
+        commit_visibility: i64,
+    ) -> paro_common::error::Result<()> {
+        let Some(commit_runtime) = self.commit_runtime.as_ref().cloned() else {
+            self.apply_storage_ops(&record.storage_ops, lsn, Some(commit_visibility))?;
+            return self.apply_descriptors(&record.apply_descriptors, record.commit_id);
+        };
+
+        let tablet_parts =
+            self.build_recovery_tablet_parts(&record.storage_ops, lsn, Some(commit_visibility))?;
+        let descriptor_phase = self
+            .build_recovery_descriptor_phase(record.apply_descriptors.clone(), record.commit_id);
+        let record_bytes =
+            encoded_journal_record_size_upper_bound(&JournalRecord::Commit(record.clone()))
+                .map_err(|error| {
+                    paro_error::internal(format!(
+                        "recovery commit record byte estimate overflow at lsn {lsn}: {error}"
+                    ))
+                })?;
+        let commit_ts = CommitTs::new(record.commit_id);
+        let batch = Arc::new(
+            CommitDurableBatch::new(
+                lsn,
+                lsn,
+                1,
+                u64::from(record_bytes),
+                Arc::from([record_bytes]),
+                0,
+                commit_ts,
+                commit_ts,
+            )
+            .map_err(|error| paro_error::internal(error.to_string()))?,
+        );
+        let handle = batch
+            .handle_at(0)
+            .map_err(|error| paro_error::internal(error.to_string()))?;
+        let required_publish = build_recovery_required_publish_plan(RecoveryPublishPlanInput {
+            frontier: Arc::clone(commit_runtime.frontier()),
+            apply_targets: Arc::from([]),
             catalog_serial: false,
             catalog_pre: Box::new(|| Ok(())),
             tablet_parts,
-            descriptor_phase: Box::new(|| Ok(())),
+            descriptor_phase,
             catalog_post: Box::new(|| Ok(())),
-            on_published: Box::new(|| Ok(())),
-        })?;
+        });
+        commit_runtime
+            .recovery_replay([RecoveryReplayEvent::Commit(RecoveryReplayCommit::new(
+                handle,
+                required_publish,
+            ))])
+            .map_err(|error| paro_error::internal(error.to_string()))?;
         Ok(())
     }
 
@@ -786,6 +1105,7 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
         lsn: u64,
         record: &JournalRecord,
     ) -> paro_common::error::Result<()> {
+        self.replay_gap_placeholders_before(lsn)?;
         let before_catalog_commit_id = self.max_catalog_commit_id;
         let before_object_id = self.max_seen_object_id;
         match record {
@@ -794,12 +1114,7 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
                     paro_error::invalid_input("commit_id exceeds supported version range")
                 })?;
                 self.replay_catalog_non_drop_ops(&record.catalog_ops, record.commit_id)?;
-                self.apply_storage_ops_with_runtime(
-                    &record.storage_ops,
-                    lsn,
-                    Some(commit_visibility),
-                )?;
-                self.apply_descriptors(&record.apply_descriptors, record.commit_id)?;
+                self.replay_commit_event(lsn, record, commit_visibility)?;
                 self.replay_catalog_drop_ops(&record.catalog_ops, record.commit_id)?;
                 self.record_replayed_deferred_tasks(&record.deferred_tasks);
                 self.observe_journal_record(
@@ -811,7 +1126,8 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
                 );
             }
             JournalRecord::Maintenance(record) => {
-                self.apply_storage_ops_with_runtime(&record.storage_ops, lsn, None)?;
+                self.apply_storage_ops(&record.storage_ops, lsn, None)?;
+                self.replay_placeholder(lsn, RecoveryPlaceholderRecordKind::Maintenance)?;
                 self.apply_descriptors(&record.apply_descriptors, 0)?;
                 self.record_replayed_deferred_tasks(&record.deferred_tasks);
                 self.observe_journal_record(
@@ -823,6 +1139,7 @@ impl<'a> ReplayHandler for CatalogReplayHandler<'a> {
                 );
             }
             JournalRecord::CheckpointFence(_) => {
+                self.replay_placeholder(lsn, RecoveryPlaceholderRecordKind::CheckpointFence)?;
                 self.observe_journal_record(lsn, 0, 0, before_catalog_commit_id, before_object_id);
             }
         }
@@ -879,6 +1196,7 @@ pub(crate) fn recover_database_with_bootstrap(
         None,
         None,
         None,
+        None,
         bootstrap,
     )
 }
@@ -908,6 +1226,7 @@ pub fn recover_database_with_checkpoint(
         wal_header_metadata,
         wal_keep_from,
         None,
+        None,
         RecoverySummary::default(),
     )?;
     Ok((outcome.wal, outcome.replay_result, outcome.summary))
@@ -922,6 +1241,7 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
     wal_header_metadata: Option<WalHeaderMetadata>,
     wal_keep_from: Option<u64>,
     apply_runtime: Option<Arc<JournalApplyRuntime>>,
+    commit_runtime: Option<Arc<CommitRuntime>>,
     bootstrap: RecoverySummary,
 ) -> paro_common::error::Result<RecoveryReplayOutcome> {
     let catalog_store = SegmentCatalogStore::from_seed_path(wal_path);
@@ -933,7 +1253,9 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
                 .to_path_buf(),
         )
         .with_tablet_meta_manager(tablet_meta_manager);
-    let mut handler = handler.with_apply_runtime(apply_runtime);
+    let mut handler = handler
+        .with_apply_runtime(apply_runtime)
+        .with_commit_runtime(commit_runtime);
 
     let replay_cursor = if let Some(journal_tail) = journal_tail {
         ReplayCursor::from_catalog(

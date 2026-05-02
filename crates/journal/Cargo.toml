@@ -15,6 +15,7 @@ tracing = { workspace = true }
 divan = { workspace = true }
 parking_lot = { workspace = true }
 paro-common = { workspace = true, features = ["test-support"] }
+proptest = { workspace = true }
 tempfile = "3.8"
 
 [[bench]]

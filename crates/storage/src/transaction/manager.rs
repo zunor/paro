@@ -6,16 +6,21 @@
 use crate::transaction::txn::Transaction;
 use paro_common::error::{self as paro_error, Result};
 use paro_transaction::{
-    ActiveTxnRegistry, CommitFenceRejectReason, CommitPlan, CommitSequencingPlan, CommitTs,
+    ActiveTxnRegistry, CleanupBackpressureSnapshot, CommitBackpressureController,
+    CommitBackpressureOptions, CommitBackpressureSnapshot, CommitFenceRejectReason,
+    CommitFinalFence, CommitFinalizeReservation, CommitFinalizeReservationFactory,
+    CommitFinalizeReservationInput, CommitFrontier, CommitPlan, CommitSequencer,
+    CommitSequencerMetrics, CommitSequencerOptions, CommitSequencingPlan, CommitTs,
     CommittedTxnSummary, CommittedTxnSummaryIndex, ConflictWrite, DatabaseId, FrozenReadSet,
     IsolationLevel, LockNamespace, LockResource, ReadDependencyIndex, ReadTrackerHandle,
     ReadTrackingPolicy, ReadTs, RetentionLeaseKind, RetentionRegistry, ShardedLockManager,
-    SsiValidationOutcome, SsiValidator, TxnId, WriteConflictIndex,
+    SsiValidationOutcome, SsiValidator, SummaryReservation, TxnId, WriteConflictIndex,
+    WriteConflictReservation,
 };
 pub use paro_transaction::{MAX_TRANSACTION_ID, TRANSACTION_ID_START};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const RECOVERY_ADMISSION_OPEN: u8 = 0;
@@ -150,25 +155,18 @@ impl RecoveryAdmissionState {
 /// Manages transactions within the database.
 #[derive(Debug)]
 pub struct TransactionManager {
-    /// The next commit version to allocate inside the commit barrier.
-    next_commit_id: AtomicU64,
-
-    /// Serializes provisional commit id use across durable append boundaries.
-    commit_id_sequence_lock: Mutex<()>,
-
     /// The current transaction ID for new transactions.
     /// Starts at TRANSACTION_ID_START (very high) to distinguish from timestamps.
     current_transaction_id: AtomicU64,
 
-    /// Highest durable commit timestamp observed by the runtime.
-    durable_commit_id: AtomicU64,
+    /// Commit-id visibility frontier shared with the commit runtime.
+    commit_frontier: Arc<CommitFrontier>,
 
-    /// Highest published commit timestamp visible to new transactions.
-    published_commit_id: AtomicU64,
+    /// Single commit timestamp owner for this database.
+    commit_sequencer: Arc<CommitSequencer>,
 
-    /// Wakes sessions waiting for an async commit floor to become visible.
-    published_commit_wait_lock: Mutex<()>,
-    published_commit_changed: Condvar,
+    /// Commit publish-lag backpressure shared by session prepare and publish hooks.
+    commit_backpressure: Arc<CommitBackpressureController>,
 
     /// Sharded active transaction registry for hot lifecycle paths.
     active_registry: ActiveTxnRegistry,
@@ -252,14 +250,16 @@ impl TransactionManager {
     pub fn new_for_database(database_id: DatabaseId) -> Self {
         let lock_namespace = LockNamespace::single_tenant(database_id);
         Self {
-            next_commit_id: AtomicU64::new(1),
-            commit_id_sequence_lock: Mutex::new(()),
             // Transaction ID starts very high to distinguish from timestamps
             current_transaction_id: AtomicU64::new(TRANSACTION_ID_START),
-            durable_commit_id: AtomicU64::new(0),
-            published_commit_id: AtomicU64::new(0),
-            published_commit_wait_lock: Mutex::new(()),
-            published_commit_changed: Condvar::new(),
+            commit_frontier: Arc::new(CommitFrontier::new()),
+            commit_sequencer: Arc::new(CommitSequencer::new(
+                CommitTs::new(1),
+                CommitSequencerOptions::default(),
+            )),
+            commit_backpressure: Arc::new(CommitBackpressureController::new(
+                CommitBackpressureOptions::default(),
+            )),
             active_registry: ActiveTxnRegistry::default(),
             retention_registry: RetentionRegistry::default(),
             lock_manager: Arc::new(ShardedLockManager::default()),
@@ -307,14 +307,15 @@ impl TransactionManager {
 
     /// Begin a new transaction.
     ///
-    /// The active registry owns hot-path lifecycle tracking; the manager keeps
-    /// only the cleanup queues and published compatibility atomics.
+    /// The active registry owns hot-path lifecycle tracking. Read snapshots use
+    /// the shared commit frontier owned by the commit runtime.
     pub fn begin_transaction(&self) -> Result<Arc<Transaction>> {
         let started_at = Instant::now();
         self.ensure_recovery_admission_open()?;
         let start_time = self
-            .published_commit_id
-            .load(Ordering::SeqCst)
+            .commit_frontier
+            .published_commit_id()
+            .into_raw()
             .saturating_add(1);
         let id = self.current_transaction_id.fetch_add(1, Ordering::SeqCst);
 
@@ -427,32 +428,26 @@ impl TransactionManager {
 
     #[cfg(test)]
     fn commit_transaction(&self, transaction: Arc<Transaction>) -> Result<u64> {
-        let commit_id = self
-            .sequence_commit_id_after_durable_append(|commit_id| transaction.commit(commit_id))?;
-        self.publish_committed_transaction(transaction, commit_id)?;
-        Ok(commit_id)
+        let commit_id = self.commit_sequencer.next_commit_ts();
+        self.commit_sequencer.sync_next_commit_ts_with(commit_id);
+        self.publish_prepared_transaction_at(transaction, commit_id.into_raw())?;
+        Ok(commit_id.into_raw())
     }
 
     #[cfg(test)]
-    fn sequence_commit_id_after_durable_append(
-        &self,
-        append: impl FnOnce(u64) -> Result<()>,
-    ) -> Result<u64> {
-        let _guard = self.commit_id_sequence_lock.lock().unwrap();
-        let commit_id = self.next_commit_id.load(Ordering::SeqCst);
-        append(commit_id)?;
-        self.mark_durable_commit_locked(commit_id);
-        Ok(commit_id)
-    }
-
-    pub(crate) fn publish_prepared_transaction_at(
+    fn publish_prepared_transaction_at(
         &self,
         transaction: Arc<Transaction>,
         commit_id: u64,
     ) -> Result<()> {
-        transaction.commit(commit_id)?;
-        self.mark_durable_commit(commit_id);
-        self.publish_committed_transaction(transaction, commit_id)
+        self.release_pre_publish_lifecycle(&transaction);
+        transaction.release_transaction_locks();
+        transaction.apply_prepared_storage_for_commit(commit_id)?;
+        transaction.finalize_applied_commit(commit_id)?;
+        let commit_ts = CommitTs::new(commit_id);
+        self.commit_frontier.sync_commit_ids(commit_ts, commit_ts);
+        self.enqueue_finalized_transaction_cleanup(&transaction, transaction.changes_made());
+        Ok(())
     }
 
     pub fn complete_read_only_transaction(&self, transaction: Arc<Transaction>) -> Result<()> {
@@ -462,11 +457,6 @@ impl TransactionManager {
         }
         self.process_cleanup();
         Ok(())
-    }
-
-    fn mark_durable_commit(&self, commit_id: u64) {
-        let _guard = self.commit_id_sequence_lock.lock().unwrap();
-        self.mark_durable_commit_locked(commit_id);
     }
 
     pub fn register_committed_write_set(
@@ -491,6 +481,20 @@ impl TransactionManager {
         write_set: &[LockResource],
         read_set: &FrozenReadSet,
     ) -> Result<()> {
+        self.register_committed_transaction_summary_inner(
+            commit_ts, txn_id, read_ts, write_set, read_set, true,
+        )
+    }
+
+    fn register_committed_transaction_summary_inner(
+        &self,
+        commit_ts: CommitTs,
+        txn_id: TxnId,
+        read_ts: ReadTs,
+        write_set: &[LockResource],
+        read_set: &FrozenReadSet,
+        advance_durable_frontier: bool,
+    ) -> Result<()> {
         if write_set.is_empty() {
             self.committed_txn_summaries
                 .register_commit(CommittedTxnSummary::new(
@@ -506,7 +510,9 @@ impl TransactionManager {
                         commit_ts, error
                     ))
                 })?;
-            self.mark_durable_commit(commit_ts.into_raw());
+            if advance_durable_frontier {
+                self.commit_frontier.sync_durable_commit_id(commit_ts);
+            }
             return Ok(());
         }
         self.write_conflict_index
@@ -531,7 +537,9 @@ impl TransactionManager {
                     commit_ts, error
                 ))
             })?;
-        self.mark_durable_commit(commit_ts.into_raw());
+        if advance_durable_frontier {
+            self.commit_frontier.sync_durable_commit_id(commit_ts);
+        }
         Ok(())
     }
 
@@ -595,27 +603,6 @@ impl TransactionManager {
         horizon
     }
 
-    fn mark_durable_commit_locked(&self, commit_id: u64) {
-        Self::bump_atomic_min(&self.durable_commit_id, commit_id);
-        Self::bump_atomic_min(&self.next_commit_id, commit_id.saturating_add(1));
-    }
-
-    fn publish_committed_transaction(
-        &self,
-        transaction: Arc<Transaction>,
-        commit_id: u64,
-    ) -> Result<()> {
-        Self::bump_atomic_min(&self.published_commit_id, commit_id);
-        self.published_commit_changed.notify_all();
-        let store_transaction = transaction.changes_made();
-        let cleanup_info = self.finish_transaction(&transaction, store_transaction);
-        if cleanup_info.should_schedule() {
-            self.schedule_cleanup(cleanup_info);
-        }
-        self.process_cleanup();
-        Ok(())
-    }
-
     pub fn block_recovery_admission(&self) {
         self.recovery_admission
             .store(RECOVERY_ADMISSION_BLOCKED, Ordering::Release);
@@ -663,9 +650,33 @@ impl TransactionManager {
         transaction: &Arc<Transaction>,
         store_transaction: bool,
     ) -> CleanupInfo {
+        self.release_pre_publish_lifecycle(transaction);
+        self.build_cleanup_info(transaction, store_transaction)
+    }
+
+    pub(crate) fn release_pre_publish_lifecycle(&self, transaction: &Arc<Transaction>) {
         transaction.release_active_registry_handle();
         self.read_dependency_index
             .release_transaction(transaction.txn_id());
+    }
+
+    pub(crate) fn enqueue_finalized_transaction_cleanup(
+        &self,
+        transaction: &Arc<Transaction>,
+        store_transaction: bool,
+    ) {
+        let cleanup_info = self.build_cleanup_info(transaction, store_transaction);
+        if cleanup_info.should_schedule() {
+            self.schedule_cleanup(cleanup_info);
+        }
+        self.process_cleanup();
+    }
+
+    fn build_cleanup_info(
+        &self,
+        transaction: &Arc<Transaction>,
+        store_transaction: bool,
+    ) -> CleanupInfo {
         let lowest_start_time = self.lowest_active_start();
         let mut cleanup_info = CleanupInfo::new(lowest_start_time);
         let commit_id = *transaction.commit_id.lock().unwrap();
@@ -754,33 +765,54 @@ impl TransactionManager {
 
     #[inline]
     pub fn last_commit(&self) -> u64 {
-        self.published_commit_id.load(Ordering::SeqCst)
+        self.published_commit_id()
     }
 
     #[inline]
     pub fn durable_commit_id(&self) -> u64 {
-        self.durable_commit_id.load(Ordering::SeqCst)
+        self.commit_frontier.durable_commit_id().into_raw()
     }
 
     #[inline]
     pub fn published_commit_id(&self) -> u64 {
-        self.published_commit_id.load(Ordering::SeqCst)
+        self.commit_frontier.published_commit_id().into_raw()
     }
 
     pub fn wait_for_published_commit_id_at_least(&self, floor: u64) -> Result<()> {
-        if floor == 0 || self.published_commit_id() >= floor {
-            return Ok(());
-        }
+        self.commit_frontier
+            .wait_for_published_at_least(CommitTs::new(floor))
+            .map_err(|error| paro_error::internal(error.to_string()))
+    }
 
-        let mut guard = self.published_commit_wait_lock.lock().map_err(|error| {
-            paro_error::internal(format!("failed to lock published commit waiter: {error}"))
-        })?;
-        while self.published_commit_id() < floor {
-            guard = self.published_commit_changed.wait(guard).map_err(|error| {
-                paro_error::internal(format!("published commit waiter poisoned: {error}"))
-            })?;
-        }
-        Ok(())
+    #[inline]
+    pub fn commit_frontier(&self) -> Arc<CommitFrontier> {
+        Arc::clone(&self.commit_frontier)
+    }
+
+    #[inline]
+    pub fn commit_sequencer(&self) -> Arc<CommitSequencer> {
+        Arc::clone(&self.commit_sequencer)
+    }
+
+    #[inline]
+    pub fn commit_sequencer_metrics(&self) -> CommitSequencerMetrics {
+        self.commit_sequencer.metrics_snapshot()
+    }
+
+    #[inline]
+    pub fn commit_backpressure_controller(&self) -> Arc<CommitBackpressureController> {
+        Arc::clone(&self.commit_backpressure)
+    }
+
+    #[inline]
+    pub fn commit_backpressure_snapshot(&self) -> CommitBackpressureSnapshot {
+        self.commit_backpressure.snapshot()
+    }
+
+    #[inline]
+    pub fn sync_commit_backpressure_frontiers(&self, durable_ts: CommitTs, published_ts: CommitTs) {
+        self.commit_backpressure
+            .sync_frontiers(durable_ts, published_ts);
     }
 
     #[inline]
@@ -811,6 +843,48 @@ impl TransactionManager {
     #[inline]
     pub fn committed_txn_summaries(&self) -> &CommittedTxnSummaryIndex {
         &self.committed_txn_summaries
+    }
+
+    pub fn commit_finalize_reservation_factory(
+        self: &Arc<Self>,
+    ) -> CommitFinalizeReservationFactory {
+        let manager = Arc::clone(self);
+        Arc::new(
+            move |commit_ts: CommitTs, input: &CommitFinalizeReservationInput| {
+                let registration_manager = Arc::clone(&manager);
+                let input = input.clone();
+                CommitFinalizeReservation::new(
+                    WriteConflictReservation::default(),
+                    SummaryReservation::default(),
+                    move || {
+                        registration_manager
+                            .register_committed_transaction_summary_inner(
+                                commit_ts,
+                                input.txn_id,
+                                input.read_ts,
+                                &input.write_set,
+                                &input.frozen_read_set,
+                                false,
+                            )
+                            .expect("commit finalize reservation registration must be infallible");
+                    },
+                    || {},
+                )
+            },
+        )
+    }
+
+    pub fn commit_final_fence(self: &Arc<Self>) -> CommitFinalFence {
+        let manager = Arc::clone(self);
+        Arc::new(move |plan, _in_flight| manager.ssi_final_fence_reason(plan))
+    }
+
+    pub fn cleanup_backpressure_snapshot(&self) -> CleanupBackpressureSnapshot {
+        CleanupBackpressureSnapshot {
+            depth: self.pending_cleanup_count(),
+            bytes: 0,
+            reserved_slots_available: usize::MAX,
+        }
     }
 
     #[inline]
@@ -972,12 +1046,9 @@ impl TransactionManager {
     /// This is used to ensure `commit_id` stays monotonic and does not overlap with
     /// persisted Tablet versions loaded from disk or recovery.
     pub fn sync_commit_id_with(&self, min_committed_version: u64) {
-        let _guard = self.commit_id_sequence_lock.lock().unwrap();
-        let next = min_committed_version.saturating_add(1);
-        Self::bump_atomic_min(&self.next_commit_id, next);
-        Self::bump_atomic_min(&self.durable_commit_id, min_committed_version);
-        Self::bump_atomic_min(&self.published_commit_id, min_committed_version);
-        self.published_commit_changed.notify_all();
+        let commit_ts = CommitTs::new(min_committed_version);
+        self.commit_sequencer.sync_next_commit_ts_with(commit_ts);
+        self.commit_frontier.sync_commit_ids(commit_ts, commit_ts);
     }
 
     /// Get the minimum start time among all active transactions.
@@ -985,9 +1056,7 @@ impl TransactionManager {
     pub fn get_min_active_start_time(&self) -> u64 {
         let watermarks = self.active_registry.watermarks();
         if watermarks.active_count == 0 {
-            self.published_commit_id
-                .load(Ordering::SeqCst)
-                .saturating_add(1)
+            self.published_commit_id().saturating_add(1)
         } else {
             watermarks.oldest_active_start_ts.into_raw()
         }
@@ -1014,21 +1083,6 @@ impl TransactionManager {
     /// Get the number of recently committed transactions pending cleanup.
     pub fn committed_transaction_count(&self) -> usize {
         self.recently_committed_transactions.read().unwrap().len()
-    }
-
-    fn bump_atomic_min(atomic: &AtomicU64, min_value: u64) -> u64 {
-        loop {
-            let current = atomic.load(Ordering::SeqCst);
-            if current >= min_value {
-                return current;
-            }
-            if atomic
-                .compare_exchange(current, min_value, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return min_value;
-            }
-        }
     }
 
     /// Perform garbage collection on committed transactions.
@@ -1403,17 +1457,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_durable_append_does_not_consume_commit_id() {
+    fn sequencer_sync_does_not_skip_next_commit_id() {
         let tm = TransactionManager::new();
         tm.sync_commit_id_with(10);
-
-        let err = tm
-            .sequence_commit_id_after_durable_append(|commit_id| {
-                assert_eq!(commit_id, 11);
-                Err(paro_error::internal("injected durable append failure"))
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("injected durable append failure"));
 
         let txn = tm.begin_transaction().unwrap();
         let commit_id = tm.commit_transaction(txn).unwrap();
@@ -1424,7 +1470,7 @@ mod tests {
     fn test_durable_commit_does_not_advance_new_snapshot_frontier() {
         let tm = TransactionManager::new();
 
-        tm.mark_durable_commit(7);
+        tm.commit_frontier.sync_durable_commit_id(CommitTs::new(7));
 
         assert_eq!(tm.durable_commit_id(), 7);
         assert_eq!(tm.published_commit_id(), 0);
@@ -1437,7 +1483,7 @@ mod tests {
     fn test_recovery_admission_blocks_transactions_until_durable_prefix_is_published() {
         let tm = TransactionManager::new();
 
-        tm.mark_durable_commit(7);
+        tm.commit_frontier.sync_durable_commit_id(CommitTs::new(7));
         tm.block_recovery_admission();
         assert_eq!(
             tm.recovery_admission_state(),

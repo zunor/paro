@@ -364,6 +364,44 @@ impl DatabaseRegistry {
         Ok(db)
     }
 
+    pub fn replace_runtime_database(
+        &self,
+        name: &str,
+        db: Arc<DatabaseHandle>,
+    ) -> anyhow::Result<Option<Arc<DatabaseHandle>>> {
+        if DatabaseHandle::name_is_reserved(name) {
+            anyhow::bail!(
+                "Attached database name \"{}\" cannot be used because it is a reserved name",
+                name
+            );
+        }
+
+        let _lock = self.databases_lock.lock();
+        let mut dbs = self.databases.write();
+        let lower_name = name.to_lowercase();
+        let old = dbs.get(&lower_name).cloned();
+        if let Some(old_db) = old.as_ref() {
+            self.path_manager.remove_path(old_db.path());
+            self.runtime_names_by_id.write().remove(&old_db.id());
+        }
+        match self
+            .path_manager
+            .insert_path(db.path(), db.name(), OnCreateConflict::Replace)
+        {
+            InsertDatabasePathResult::Success => {}
+            InsertDatabasePathResult::AlreadyExists => {
+                anyhow::bail!("Database with path \"{}\" is already attached", db.path())
+            }
+        }
+        self.install_default_database_if_missing(db.id());
+        self.runtime_names_by_id
+            .write()
+            .insert(db.id(), db.name().to_string());
+        dbs.insert(lower_name, Arc::clone(&db));
+        self.bump_visible_generation();
+        Ok(old)
+    }
+
     /// Finalize attaching a database.
     fn finalize_attach(&self, info: &AttachInfo, db: Arc<DatabaseHandle>) -> anyhow::Result<()> {
         let _lock = self.databases_lock.lock();

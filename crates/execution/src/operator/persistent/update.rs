@@ -116,6 +116,13 @@ mod tests {
         Arc::new(session)
     }
 
+    fn commit_transaction(txn: &Transaction, commit_id: u64) -> paro_common::error::Result<()> {
+        let apply_result = txn.apply_prepared_storage_for_commit(commit_id);
+        txn.release_transaction_locks();
+        apply_result?;
+        txn.finalize_applied_commit(commit_id)
+    }
+
     fn build_update_operator() -> PhysicalUpdate {
         let storage = Arc::new(create_storage(&[LogicalType::Integer]));
         let table = Arc::new(TableCatalogEntry::new(
@@ -313,7 +320,7 @@ mod tests {
             .sink(&ctx, &chunk, &mut input)
             .expect("PRIMARY_KEYS UPDATE should succeed");
         assert_eq!(result, SinkResultType::NeedMoreInput);
-        txn.commit(1).expect("staged UPDATE should commit");
+        commit_transaction(&txn, 1).expect("staged UPDATE should commit");
 
         let mut rows = Vec::new();
         for chunk in storage.scan_chunks().expect("scan rows") {
@@ -648,7 +655,7 @@ impl PhysicalOperator for PhysicalUpdate {
 
         let txn = _ctx.active_transaction().ok_or_else(|| {
             paro_error::internal(
-                "UPDATE reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+                "UPDATE reached storage without an active transaction; frontend DML must enter the commit runtime path",
             )
         })?;
 

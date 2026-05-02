@@ -494,7 +494,7 @@ impl PhysicalOperator for PhysicalDelete {
 
         let txn = _ctx.active_transaction().ok_or_else(|| {
             paro_error::internal(
-                "DELETE reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+                "DELETE reached storage without an active transaction; frontend DML must enter the commit runtime path",
             )
         })?;
         if self.is_full_table_delete {

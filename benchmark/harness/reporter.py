@@ -33,6 +33,17 @@ class RegressionEntry:
     status: str
 
 
+@dataclass(frozen=True)
+class PerformanceGateEntry:
+    workload: str
+    query_id: str
+    metric: str
+    baseline_value: float
+    current_value: float
+    change_percent: float
+    status: str
+
+
 class BenchmarkReporter:
     def __init__(self, root_dir: Path):
         self._root_dir = root_dir
@@ -259,6 +270,92 @@ class BenchmarkReporter:
                 f"({entry.change_percent:+.2f}%)"
             )
 
+    def compare_performance_gates(
+        self,
+        current_payload: dict[str, Any],
+        baseline_path: Path,
+    ) -> list[PerformanceGateEntry]:
+        baseline_payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+        gate = baseline_payload.get("performance_gate")
+        if not isinstance(gate, dict):
+            return []
+
+        metrics = gate.get("metrics", ["p50", "p99", "p999", "throughput_per_second"])
+        if not isinstance(metrics, list):
+            metrics = ["p50", "p99", "p999", "throughput_per_second"]
+        latency_threshold = _gate_float(gate, "latency_regression_threshold_percent", 25.0)
+        qps_min_ratio = _gate_float(gate, "throughput_min_ratio", 0.75)
+        absolute_max = gate.get("absolute_max") if isinstance(gate.get("absolute_max"), dict) else {}
+        absolute_min = gate.get("absolute_min") if isinstance(gate.get("absolute_min"), dict) else {}
+
+        baseline_index = _index_queries(baseline_payload)
+        entries: list[PerformanceGateEntry] = []
+        for workload in current_payload.get("workloads", []):
+            workload_name = str(workload.get("name", ""))
+            params_key = _params_key(workload.get("params", {}))
+            for query in workload.get("queries", []):
+                if query.get("error"):
+                    continue
+                query_id = str(query.get("id", ""))
+                baseline_query = baseline_index.get((workload_name, query_id, params_key))
+                if baseline_query is None:
+                    continue
+                current_stats = query.get("stats") or {}
+                baseline_stats = baseline_query.get("stats") or {}
+                for metric in metrics:
+                    if not isinstance(metric, str):
+                        continue
+                    current_value = current_stats.get(metric)
+                    baseline_value = baseline_stats.get(metric)
+                    if not _is_positive_number(current_value) or not _is_positive_number(baseline_value):
+                        continue
+                    current = float(current_value)
+                    baseline = float(baseline_value)
+                    change = ((current - baseline) / baseline) * 100.0
+                    status = "OK"
+                    if metric == "throughput_per_second":
+                        if current / baseline < qps_min_ratio:
+                            status = "REGRESS"
+                        elif current / baseline > (1.0 / max(qps_min_ratio, 0.001)):
+                            status = "IMPROVE"
+                    elif change > latency_threshold:
+                        status = "REGRESS"
+                    elif change < -latency_threshold:
+                        status = "IMPROVE"
+
+                    max_value = absolute_max.get(metric)
+                    if isinstance(max_value, (int, float)) and current > float(max_value):
+                        status = "REGRESS"
+                    min_value = absolute_min.get(metric)
+                    if isinstance(min_value, (int, float)) and current < float(min_value):
+                        status = "REGRESS"
+
+                    entries.append(
+                        PerformanceGateEntry(
+                            workload=workload_name,
+                            query_id=query_id,
+                            metric=metric,
+                            baseline_value=baseline,
+                            current_value=current,
+                            change_percent=change,
+                            status=status,
+                        )
+                    )
+        entries.sort(key=lambda item: (item.workload, item.query_id, item.metric))
+        return entries
+
+    def print_performance_gates(self, entries: list[PerformanceGateEntry]) -> None:
+        if not entries:
+            return
+        print("Performance gates:")
+        for entry in entries:
+            colored_status = self._status_text(entry.status)
+            print(
+                f"  {entry.workload}.{entry.query_id}.{entry.metric:<24} {colored_status:<10} "
+                f"{entry.baseline_value:.2f} -> {entry.current_value:.2f} "
+                f"({entry.change_percent:+.2f}%)"
+            )
+
     def append_regression_to_summary(
         self,
         summary_path: Path,
@@ -290,11 +387,43 @@ class BenchmarkReporter:
         with summary_path.open("a", encoding="utf-8") as fp:
             fp.write("\n".join(lines) + "\n")
 
+    def append_performance_gates_to_summary(
+        self,
+        summary_path: Path,
+        entries: list[PerformanceGateEntry],
+    ) -> None:
+        if not entries:
+            return
+        lines = [
+            "",
+            "## Performance Gates",
+            "",
+            "| Workload | Query | Metric | Baseline | Current | Change | Status |",
+            "|----------|-------|--------|----------|---------|--------|--------|",
+        ]
+        for entry in entries:
+            lines.append(
+                "| {workload} | {query} | {metric} | {base:.2f} | {curr:.2f} | {change:+.2f}% | {status} |".format(
+                    workload=entry.workload,
+                    query=entry.query_id,
+                    metric=entry.metric,
+                    base=entry.baseline_value,
+                    curr=entry.current_value,
+                    change=entry.change_percent,
+                    status=entry.status,
+                )
+            )
+        with summary_path.open("a", encoding="utf-8") as fp:
+            fp.write("\n".join(lines) + "\n")
+
     def bless_baseline(self, result_path: Path, baseline_path: Path) -> None:
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(result_path, baseline_path)
 
     def has_regression(self, entries: list[RegressionEntry]) -> bool:
+        return any(entry.status == "REGRESS" for entry in entries)
+
+    def has_performance_gate_regression(self, entries: list[PerformanceGateEntry]) -> bool:
         return any(entry.status == "REGRESS" for entry in entries)
 
     def query_status(self, query: QueryExecutionResult) -> str:
@@ -320,17 +449,19 @@ class BenchmarkReporter:
         for workload in payload.get("workloads", []):
             lines.append(f"## {workload.get('name', 'unknown')}")
             lines.append("")
-            lines.append("| Query | Median (ms) | P90 (ms) | Validation | Plan Guard | Explain |")
-            lines.append("|-------|-------------|----------|------------|------------|---------|")
+            lines.append("| Query | P50 (ms) | P99 (ms) | P999 (ms) | QPS | Validation | Plan Guard | Explain |")
+            lines.append("|-------|----------|----------|-----------|-----|------------|------------|---------|")
             for query in workload.get("queries", []):
                 stats = query.get("stats") or {}
-                median = _fmt_num(stats.get("median"))
-                p90 = _fmt_num(stats.get("p90"))
+                p50 = _fmt_num(stats.get("p50"))
+                p99 = _fmt_num(stats.get("p99"))
+                p999 = _fmt_num(stats.get("p999"))
+                qps = _fmt_num(stats.get("throughput_per_second"))
                 validation = (query.get("validation") or {}).get("result", "n/a")
                 plan_guard = (query.get("validation") or {}).get("plan_guard", "n/a")
                 explain = (query.get("explain_profile") or {}).get("status", "SKIP")
                 lines.append(
-                    f"| {query.get('id', '')} | {median} | {p90} | {validation} | {plan_guard} | {explain} |"
+                    f"| {query.get('id', '')} | {p50} | {p99} | {p999} | {qps} | {validation} | {plan_guard} | {explain} |"
                 )
             explain_lines = _render_explain_summary(workload.get("queries", []))
             if explain_lines:
@@ -402,25 +533,46 @@ def _compute_stats(samples: list[float]) -> dict[str, float] | None:
         return None
     sorted_samples = sorted(samples)
     n = len(sorted_samples)
-    p90_idx = max(0, math.ceil(0.9 * n) - 1)
+    mean = float(statistics.mean(sorted_samples))
     if n == 1:
         stddev = 0.0
     else:
         stddev = statistics.stdev(sorted_samples)
+    median = float(statistics.median(sorted_samples))
     return {
         "min": float(sorted_samples[0]),
-        "median": float(statistics.median(sorted_samples)),
-        "mean": float(statistics.mean(sorted_samples)),
-        "p90": float(sorted_samples[p90_idx]),
+        "median": median,
+        "p50": median,
+        "mean": mean,
+        "p90": _percentile(sorted_samples, 0.9),
+        "p99": _percentile(sorted_samples, 0.99),
+        "p999": _percentile(sorted_samples, 0.999),
         "max": float(sorted_samples[-1]),
         "stddev": float(stddev),
+        "throughput_per_second": 1000.0 / mean if mean > 0 else 0.0,
     }
+
+
+def _percentile(sorted_samples: list[float], quantile: float) -> float:
+    index = max(0, math.ceil(quantile * len(sorted_samples)) - 1)
+    return float(sorted_samples[min(index, len(sorted_samples) - 1)])
 
 
 def _fmt_num(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f"{float(value):.2f}"
     return "-"
+
+
+def _is_positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and float(value) > 0
+
+
+def _gate_float(gate: dict[str, Any], key: str, default: float) -> float:
+    value = gate.get(key, default)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
 
 
 def _render_explain_summary(queries: Any) -> list[str]:

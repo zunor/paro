@@ -315,9 +315,10 @@ impl Connection {
                         Some(db) => {
                             if !db.is_ready() {
                                 let err_msg = format!(
-                                    "database \"{}\" is NOT ready (state: {:?})",
+                                    "database \"{}\" is NOT ready (state: {:?}; {})",
                                     db_name,
-                                    db.state()
+                                    db.state(),
+                                    db.commit_health_detail()
                                 );
                                 tracing::warn!(
                                     target: targets::CONNECTION,

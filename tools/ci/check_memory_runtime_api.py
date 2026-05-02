@@ -62,6 +62,8 @@ def main() -> int:
         if rel_path in ALLOWLIST:
             continue
         path = ROOT / rel_path
+        if not path.exists():
+            continue
         for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             for name, pattern in BANNED.items():
                 if pattern.search(line):

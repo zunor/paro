@@ -135,17 +135,13 @@ impl CommitParticipant for StorageCommitParticipant {
 
 #[derive(Debug, Clone)]
 pub struct StorageCommittedRecordApplier {
-    manager: Arc<TransactionManager>,
     transaction: Arc<Transaction>,
 }
 
 impl StorageCommittedRecordApplier {
     #[inline]
-    pub fn new(manager: Arc<TransactionManager>, transaction: Arc<Transaction>) -> Self {
-        Self {
-            manager,
-            transaction,
-        }
+    pub fn new(_manager: Arc<TransactionManager>, transaction: Arc<Transaction>) -> Self {
+        Self { transaction }
     }
 }
 
@@ -185,10 +181,8 @@ impl CommittedRecordApplier for StorageCommittedRecordApplier {
         if self.transaction.is_awaiting_cleanup() {
             return Ok(PublishResult::required(record.commit_ts));
         }
-        self.manager.publish_prepared_transaction_at(
-            Arc::clone(&self.transaction),
-            record.commit_ts.into_raw(),
-        )?;
+        self.transaction
+            .apply_prepared_storage_for_commit(record.commit_ts.into_raw())?;
         Ok(PublishResult::required(record.commit_ts))
     }
 

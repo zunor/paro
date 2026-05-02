@@ -1,0 +1,7 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE;
+
+DROP TABLE IF EXISTS benchmark_group_commit_hot;
+DROP TABLE IF EXISTS benchmark_group_commit_append;

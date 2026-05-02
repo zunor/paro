@@ -439,7 +439,7 @@ impl PhysicalOperator for PhysicalInsert {
 
         let txn = ctx.active_transaction().ok_or_else(|| {
             paro_error::internal(
-                "INSERT reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+                "INSERT reached storage without an active transaction; frontend DML must enter the commit runtime path",
             )
         })?;
         let mut affected_rows = chunk.size();
@@ -545,7 +545,7 @@ impl PhysicalOperator for PhysicalInsert {
             .map_err(|e| paro_error::internal(e.to_string()))?;
         let txn = ctx.active_transaction().ok_or_else(|| {
             paro_error::internal(
-                "INSERT combine reached storage without an active transaction; frontend DML must enter the CommitCoordinator path",
+                "INSERT combine reached storage without an active transaction; frontend DML must enter the commit runtime path",
             )
         })?;
         let flushed = self.flush_buffered_chunks(ctx, storage, txn, lstate)?;

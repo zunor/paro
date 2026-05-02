@@ -5,6 +5,7 @@
 pub enum WaitMode {
     Durable,
     Applied,
+    AsyncCompletion,
     #[default]
     Published,
 }
