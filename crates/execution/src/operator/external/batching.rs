@@ -9,7 +9,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
+use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionBatchPolicy {
@@ -127,7 +127,7 @@ mod tests {
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
     use paro_common::vector::VECTOR_SIZE;
-    use paro_external_runtime::dispatch::policy::ExternalDispatchPolicy;
+    use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
     use std::sync::Arc;
 
     #[test]

@@ -159,8 +159,8 @@ python-udf-setup: ## Install regress dependencies used by Python UDF regress and
 	@$(MAKE) -C regress setup
 
 python-udf-unit: ## Run ABI/runtime Rust tests plus Python worker and SDK unit tests
-	cargo test -p paro-external-abi --test conformance --locked
-	cargo test -p paro-external-runtime --test runtime --locked
+	cargo test -p paro-external --test abi_conformance --locked
+	cargo test -p paro-external --test runtime --locked
 	PYTHONPATH=python/paro_udf/src:runtimes/python-worker/src $(PYTHON3) -m unittest discover -s runtimes/python-worker/tests -p 'test_*.py' -v
 	PYTHONPATH=python/paro_udf/src:runtimes/python-worker/src $(PYTHON3) -m unittest discover -s python/paro_udf/tests -p 'test_*.py' -v
 

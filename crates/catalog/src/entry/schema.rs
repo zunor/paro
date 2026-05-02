@@ -23,7 +23,7 @@ use crate::default::DefaultGenerator;
 use crate::mvcc::CatalogSnapshot;
 use crate::schema::contents::SchemaContents;
 use paro_common::error::{self as paro_error, Result};
-use paro_routine::{RoutineId, RoutineIdentity};
+use paro_external::routine::spec::{RoutineId, RoutineIdentity};
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::tablet::Tablet;
 use std::collections::HashSet;

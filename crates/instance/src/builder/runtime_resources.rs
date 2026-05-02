@@ -8,7 +8,7 @@ use crate::runtime::session_registry::SessionExecutionRegistry;
 use crate::runtime::{InstanceRuntime, InstanceRuntimeResources};
 use crate::{BootConfig, DatabaseFileSystem, InstanceConfig};
 use paro_execution::memory_runtime::{MemoryArbitrator, SystemReserve};
-use paro_external_runtime::host::ExternalRuntimeHost;
+use paro_external::runtime::host::ExternalRuntimeHost;
 use paro_function::register_system_buffer_manager;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, StandardBufferManager};

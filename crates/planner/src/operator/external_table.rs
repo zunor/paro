@@ -4,7 +4,7 @@
 use crate::expression::Expression;
 use crate::plan::LogicalPlan;
 use paro_common::types::LogicalType;
-use paro_routine::BoundRoutineCallMeta;
+use paro_external::routine::bound::BoundRoutineCallMeta;
 
 use super::external_project::ExternalCostEstimate;
 

@@ -4,6 +4,7 @@
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::binder::deep_copy::deep_copy_plan;
 use paro_planner::expression::{Expression, OperatorType};
 use paro_planner::operator::{
@@ -12,7 +13,6 @@ use paro_planner::operator::{
     SearchDecision, SearchScan, TopN,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_routine::BuiltinIntrinsicId;
 use paro_storage::search::{
     FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
     SearchCostEstimate as PlannedSearchCostEstimate, SearchIntent, SearchRequestMode,

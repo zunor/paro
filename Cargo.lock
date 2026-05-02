@@ -1563,9 +1563,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "paro-common",
+ "paro-external",
  "paro-function",
  "paro-parser",
- "paro-routine",
  "paro-storage",
  "paro-transaction",
  "serde",
@@ -1610,7 +1610,7 @@ version = "0.1.0"
 dependencies = [
  "paro-catalog",
  "paro-common",
- "paro-external-runtime",
+ "paro-external",
  "paro-function",
  "paro-scheduler",
  "paro-storage",
@@ -1628,13 +1628,11 @@ dependencies = [
  "paro-catalog",
  "paro-common",
  "paro-context",
- "paro-external-abi",
- "paro-external-runtime",
+ "paro-external",
  "paro-function",
  "paro-optimizer",
  "paro-parser",
  "paro-planner",
- "paro-routine",
  "paro-scheduler",
  "paro-storage",
  "paro-transaction",
@@ -1644,23 +1642,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "paro-external-abi"
+name = "paro-external"
 version = "0.1.0"
 dependencies = [
  "ordered-float",
+ "paro-common",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "paro-external-runtime"
-version = "0.1.0"
-dependencies = [
- "paro-common",
- "paro-external-abi",
- "paro-routine",
- "serde",
  "thiserror 2.0.17",
  "tracing",
 ]
@@ -1690,11 +1678,10 @@ dependencies = [
  "paro-common",
  "paro-context",
  "paro-execution",
- "paro-external-runtime",
+ "paro-external",
  "paro-function",
  "paro-journal",
  "paro-parser",
- "paro-routine",
  "paro-scheduler",
  "paro-storage",
  "paro-transaction",
@@ -1728,10 +1715,10 @@ dependencies = [
  "paro-catalog",
  "paro-common",
  "paro-context",
+ "paro-external",
  "paro-function",
  "paro-parser",
  "paro-planner",
- "paro-routine",
  "paro-storage",
  "tracing",
 ]
@@ -1780,21 +1767,12 @@ dependencies = [
  "paro-catalog",
  "paro-common",
  "paro-context",
- "paro-external-runtime",
+ "paro-external",
  "paro-function",
  "paro-instance",
  "paro-parser",
- "paro-routine",
  "paro-storage",
  "tracing",
-]
-
-[[package]]
-name = "paro-routine"
-version = "0.1.0"
-dependencies = [
- "paro-common",
- "serde",
 ]
 
 [[package]]
@@ -1845,12 +1823,12 @@ dependencies = [
  "paro-compiler",
  "paro-context",
  "paro-execution",
+ "paro-external",
  "paro-function",
  "paro-instance",
  "paro-journal",
  "paro-parser",
  "paro-planner",
- "paro-routine",
  "paro-scheduler",
  "paro-storage",
  "paro-transaction",

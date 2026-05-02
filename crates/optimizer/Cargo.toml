@@ -31,6 +31,9 @@ paro-context = { workspace = true, features = ["test-support"] }
 paro-function = { workspace = true }
 paro-parser = { workspace = true }
 paro-planner = { workspace = true }
-paro-routine = { workspace = true }
+paro-external = { workspace = true }
 paro-storage = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+paro-common = { workspace = true, features = ["test-support"] }

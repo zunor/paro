@@ -23,7 +23,7 @@ paro-parser = { workspace = true }
 paro-planner = { workspace = true }
 paro-execution = { workspace = true }
 paro-function = { workspace = true }
-paro-routine = { workspace = true }
+paro-external = { workspace = true }
 paro-storage = { workspace = true }
 paro-instance = { workspace = true }
 paro-scheduler = { workspace = true }

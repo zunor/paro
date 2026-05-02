@@ -13,10 +13,10 @@
 //!
 //! This normalization helps other rules match patterns more easily.
 
+use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::Expression;
 use paro_planner::expression::{ComparisonExpression, ComparisonType};
 use paro_planner::operator::LogicalOperator;
-use paro_routine::BuiltinIntrinsicId;
 
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};

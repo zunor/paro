@@ -10,8 +10,8 @@ use crate::binder::CorrelatedColumnInfo;
 use crate::expression::Expression;
 use paro_catalog::entry::{PropertyGraphCatalogEntry, TableCatalogEntry};
 use paro_common::types::LogicalType;
+use paro_external::routine::bound::BoundRoutineCallMeta;
 use paro_parser::ast::PathMode;
-use paro_routine::BoundRoutineCallMeta;
 
 use super::query::BoundQuery;
 

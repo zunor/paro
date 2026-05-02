@@ -176,14 +176,16 @@ mod tests {
     use paro_catalog::entry::{CreateRoutineInfo, OnCreateConflict};
     use paro_catalog::mvcc::CatalogSnapshot;
     use paro_catalog::search_path::CatalogSearchEntry;
-    use paro_parser::{ast::Statement, parse_one};
-    use paro_routine::{
-        CapabilityProfile, DeclaredEnvSpec, PermissionSpec, PythonEntrypointRef,
-        PythonImplementationRef, PythonRuntimeSelector, RoutineArgument, RoutineExecutionContract,
+    use paro_external::routine::capability::CapabilityProfile;
+    use paro_external::routine::env::{DeclaredEnvSpec, PythonRuntimeSelector};
+    use paro_external::routine::permission::{PermissionSpec, RoutineSecurityMode};
+    use paro_external::routine::spec::{
+        PythonEntrypointRef, PythonImplementationRef, RoutineArgument, RoutineExecutionContract,
         RoutineFamily, RoutineImplementationRef, RoutineNullPolicy, RoutineOwner, RoutineReturn,
-        RoutineSecurityMode, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
+        RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
         ScalarRoutineContract, SourceBlobRef,
     };
+    use paro_parser::{ast::Statement, parse_one};
 
     fn parse_drop_function(sql: &str) -> DropFunctionStmt {
         match parse_one(sql).expect("statement should parse").stmt {

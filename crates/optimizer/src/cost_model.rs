@@ -5,13 +5,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use paro_common::runtime_value::Value;
+use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonExpression, ComparisonType, ConjunctionType, Expression,
     OperatorType,
 };
 use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::CardinalityEstimate;
-use paro_routine::BuiltinIntrinsicId;
 use paro_storage::statistics::ColumnStatistics;
 
 const MIN_SELECTIVITY: f64 = 0.000_001;

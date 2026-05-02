@@ -1,0 +1,24 @@
+[package]
+name = "paro-external"
+version = { workspace = true }
+edition = { workspace = true }
+
+[features]
+default = ["runtime"]
+runtime = []
+source = []
+test-support = []
+
+[lib]
+name = "paro_external"
+path = "src/lib.rs"
+
+[dependencies]
+paro-common = { workspace = true }
+ordered-float = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

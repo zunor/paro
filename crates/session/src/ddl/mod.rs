@@ -364,7 +364,7 @@ impl SessionDdlBridge {
                         let previous = &overloads[index];
                         overloads[index] = StoredRoutineOverload {
                             spec: info.materialize_spec(
-                                paro_routine::RoutineIdentity {
+                                paro_external::routine::spec::RoutineIdentity {
                                     id: previous.spec.identity.id,
                                     generation: previous.spec.identity.generation + 1,
                                 },

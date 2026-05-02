@@ -12,7 +12,7 @@ paro-transaction = { workspace = true }
 paro-storage = { workspace = true }
 paro-catalog = { workspace = true }
 paro-function = { workspace = true }
-paro-external-runtime = { workspace = true }
+paro-external = { workspace = true }
 paro-scheduler = { workspace = true }
 tokio-util = { workspace = true }
 

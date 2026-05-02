@@ -6,7 +6,7 @@
 //!
 
 use paro_common::types::LogicalType;
-use paro_routine::RoutineCallIdentity;
+use paro_external::routine::identity::RoutineCallIdentity;
 
 use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,

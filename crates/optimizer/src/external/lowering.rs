@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_common::error::{self as paro_error, Result};
+use paro_external::routine::bound::BoundRoutineCallMeta;
+use paro_external::routine::spec::RowSemantics;
 use paro_planner::binder::bind::from::join_utils::{collect_table_bindings, get_expression_side};
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::ir::OrderByNode;
@@ -12,7 +14,6 @@ use paro_planner::operator::{
     LogicalOperator, Order, Projection, TopN, Update, Window,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_routine::{BoundRoutineCallMeta, RowSemantics};
 
 #[derive(Debug)]
 pub struct ExternalRoutineLoweringResult {
@@ -916,6 +917,13 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
+    use paro_external::routine::bound::BoundRoutineCallMeta;
+    use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+    use paro_external::routine::identity::RoutineCallIdentity;
+    use paro_external::routine::spec::{
+        RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
+        RowSemantics,
+    };
     use paro_function::scalar::{ExpressionState, ScalarFunction};
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::OrderByNode;
@@ -927,10 +935,6 @@ mod tests {
         Order, Projection,
     };
     use paro_planner::plan::LogicalPlan;
-    use paro_routine::{
-        BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineId,
-        RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
-    };
 
     use super::{ExternalRoutineLoweringPass, ExternalRoutineLoweringResult};
 

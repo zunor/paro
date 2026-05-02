@@ -13,12 +13,12 @@ use crate::binder::Binder;
 use crate::expression::*;
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType, StoredRoutineOverload};
 use paro_common::error::{self as paro_error, Result};
+use paro_external::routine::bound::BoundRoutineCallMeta;
+use paro_external::routine::boundary::{ExecutionBoundary, PlacementClass};
+use paro_external::routine::identity::RoutineCallIdentity;
+use paro_external::routine::spec::{RoutineFamily, RoutineReturn};
 use paro_function::table::{TableFunction, TableFunctionBindInput};
 use paro_parser::ast::{Expr, Identifier, TableAlias};
-use paro_routine::{
-    BoundRoutineCallMeta, ExecutionBoundary, PlacementClass, RoutineCallIdentity, RoutineFamily,
-    RoutineReturn,
-};
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;

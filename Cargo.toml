@@ -71,9 +71,7 @@ paro-storage = { path = "crates/storage" }
 paro-catalog = { path = "crates/catalog" }
 paro-context = { path = "crates/context" }
 paro-function = { path = "crates/function" }
-paro-routine = { path = "crates/routine" }
-paro-external-abi = { path = "crates/external_abi" }
-paro-external-runtime = { path = "crates/external_runtime" }
+paro-external = { path = "crates/external" }
 paro-planner = { path = "crates/planner" }
 paro-optimizer = { path = "crates/optimizer" }
 paro-execution = { path = "crates/execution" }
