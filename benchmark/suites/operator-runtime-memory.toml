@@ -1,0 +1,14 @@
+name = "operator-runtime-memory"
+description = "Operator runtime large result set memory verification: bounded queue, backpressure, unbounded path limits"
+
+# Fetch-driven bounded path (streaming + breaker DAG)
+[[include]]
+workload = "output_buffering"
+
+# Unbounded path (EXPLAIN ANALYZE, recursive CTE, DML)
+[[include]]
+workload = "output_buffering_unbounded"
+
+# Memory-pressure paths (sort/join/agg under memory limit)
+[[include]]
+workload = "memory"

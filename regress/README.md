@@ -122,6 +122,11 @@ Directives are SQL comments that control the runner's behaviour.
 | `-- @sleep <duration>` | Sleep briefly to let a known blocking point enqueue. |
 | `-- @wait_expect interval=<duration> timeout=<duration>` | In check mode, repeat the next query until it matches the existing baseline or times out. |
 
+SQLSTATE-sensitive cases should assert the exact SQLSTATE in the transcript or
+include `SQLSTATE=<code>` in the `-- @statement error` pattern. Keep `XX000`
+only for internal bugs/assertions; user-facing catalog, data, transaction,
+resource, and external-routine errors should use their semantic SQLSTATE.
+
 ### Normalize Profiles
 
 `@normalize` is intentionally narrow: it exists to mask volatility, not to hide
@@ -136,6 +141,7 @@ product-contract problems. Current registered profiles are:
 | `explain_external_runtime` | Normalize volatile external runtime latency fields | `Latency(us): acquire=... queue=... kernel=... encode_decode=...` | Stable |
 | `explain_runtime` | Legacy alias combining operator + summary timing normalization | `actual time=...`, `Planning Time: ...`, `Execution Time: ...` | Transitional |
 | `transaction_ids` | Normalize volatile ids in concurrency error text | `TxnId(...)`, `transaction ...`, table/db/read/commit ids | Stable |
+| `python_runtime_retry_hint` | Normalize Python runtime degraded retry countdowns | `next automatic Python runtime probe in ... ms` | Stable |
 
 Notes:
 

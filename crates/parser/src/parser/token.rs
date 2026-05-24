@@ -153,6 +153,7 @@ impl<'a> Iterator for Tokenizer<'a> {
 }
 
 #[allow(non_camel_case_types)]
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Logos, EnumIter, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TokenKind {
     #[error]

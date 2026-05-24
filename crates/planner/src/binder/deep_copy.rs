@@ -389,6 +389,7 @@ impl LogicalPlanDeepCopy {
                         right: Box::new(right),
                         conditions: cj.conditions.clone(),
                         mark_index,
+                        mark_null_condition_start: cj.mark_null_condition_start,
                         duplicate_eliminated_columns: cj.duplicate_eliminated_columns.clone(),
                         delim_flipped: cj.delim_flipped,
                         left_projection_map: cj.left_projection_map.clone(),

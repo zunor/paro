@@ -3,7 +3,7 @@
 
 use crate::compaction::compaction_task::CompactionTask;
 use crate::metrics::storage_metrics;
-use crate::tablet::Tablet;
+use crate::tablet::{Tablet, TabletId};
 use parking_lot::Mutex;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_scheduler::task::ProducerToken;
@@ -13,7 +13,7 @@ use paro_scheduler::task::TaskExecutionResult;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{error, info};
@@ -26,6 +26,20 @@ struct ScheduledCompaction {
     tablet: Arc<Tablet>,
     task: Box<dyn CompactionTask>,
     callback: Option<CompactionCallback>,
+}
+
+impl ScheduledCompaction {
+    fn tablet_id(&self) -> TabletId {
+        self.tablet.tablet_id()
+    }
+
+    fn cancel_before_execution(mut self, reason: &str) {
+        self.task.stop();
+        if let Some(callback) = self.callback.take() {
+            let message = format!("compaction canceled before execution: {}", reason);
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(Err(message))));
+        }
+    }
 }
 
 struct SchedulerCompactionTask {
@@ -67,6 +81,7 @@ impl Task for SchedulerCompactionTask {
 }
 
 struct SchedulerCompactionState {
+    scheduler: Arc<TaskScheduler>,
     producer: ProducerToken,
     max_concurrency: usize,
     running: AtomicUsize,
@@ -77,6 +92,7 @@ impl SchedulerCompactionState {
     fn new(scheduler: Arc<TaskScheduler>, max_concurrency: usize) -> Arc<Self> {
         let cap = max_concurrency.max(1);
         Arc::new(Self {
+            scheduler: scheduler.clone(),
             producer: scheduler.create_producer_with_priority(COMPACTION_TASK_PRIORITY),
             max_concurrency: cap,
             running: AtomicUsize::new(0),
@@ -87,6 +103,37 @@ impl SchedulerCompactionState {
     fn submit(self: &Arc<Self>, scheduled: ScheduledCompaction) {
         self.pending.lock().push_back(scheduled);
         self.dispatch_pending();
+    }
+
+    fn cancel_pending_tablet(&self, tablet_id: TabletId, reason: &str) -> usize {
+        let mut cancelled = Vec::new();
+        {
+            let mut pending = self.pending.lock();
+            let mut retained = VecDeque::with_capacity(pending.len());
+            while let Some(scheduled) = pending.pop_front() {
+                if scheduled.tablet_id() == tablet_id {
+                    cancelled.push(scheduled);
+                } else {
+                    retained.push_back(scheduled);
+                }
+            }
+            *pending = retained;
+        }
+
+        let cancelled_count = cancelled.len();
+        for scheduled in cancelled {
+            scheduled.cancel_before_execution(reason);
+        }
+        cancelled_count
+    }
+
+    fn drive_producer(&self, max_tasks: usize) -> usize {
+        if max_tasks == 0 {
+            return 0;
+        }
+        let marker = AtomicBool::new(true);
+        self.scheduler
+            .execute_tasks_for_producer(&self.producer, &marker, max_tasks)
     }
 
     fn on_task_complete(self: &Arc<Self>) {
@@ -174,6 +221,20 @@ impl CompactionExecutor {
             let _permit = sem.acquire().await.unwrap();
             callback(run_compaction_task(tablet, task.as_mut()));
         });
+    }
+
+    pub(crate) fn cancel_pending_tablet(&self, tablet_id: TabletId, reason: &str) -> usize {
+        self.scheduler_state
+            .as_ref()
+            .map(|state| state.cancel_pending_tablet(tablet_id, reason))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn drive_scheduler_for_drain(&self, max_tasks: usize) -> usize {
+        self.scheduler_state
+            .as_ref()
+            .map(|state| state.drive_producer(max_tasks))
+            .unwrap_or(0)
     }
 }
 

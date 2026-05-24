@@ -72,7 +72,7 @@ SET force_external = DEFAULT;
 SET temp_directory = DEFAULT;
 
 SET force_external = true;
--- @statement error force_external requires a temporary directory
+-- @statement error SQLSTATE=53200
 SELECT * FROM GRAPH_TABLE(gw_graph
     MATCH (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
     COLUMNS (b.name AS dst)

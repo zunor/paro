@@ -110,13 +110,7 @@ impl BinaryDictPageBuilder {
             return false;
         }
 
-        // Store first value
-        if self.first_value.is_none() {
-            self.first_value = Some(Bytes::copy_from_slice(s));
-        }
-        self.last_value = Some(Bytes::copy_from_slice(s));
-
-        match self.encoding_type {
+        let added = match self.encoding_type {
             EncodingMode::Dict => {
                 // Try to add to dictionary
                 let code = if let Some(&code) = self.dictionary.get(s) {
@@ -124,9 +118,15 @@ impl BinaryDictPageBuilder {
                 } else {
                     // Check if dictionary is full
                     if self.dict_builder.size() as usize + s.len() + 4 > self.dict_page_size {
-                        // Switch to plain encoding
+                        if self.code_builder.count() > 0 {
+                            return false;
+                        }
                         self.switch_to_plain();
-                        return self.add_slice_plain(s);
+                        let added = self.add_slice_plain(s);
+                        if added {
+                            self.record_value(s);
+                        }
+                        return added;
                     }
 
                     // Add to dictionary
@@ -141,7 +141,20 @@ impl BinaryDictPageBuilder {
                 self.code_builder.add_one(&code_bytes)
             }
             EncodingMode::Plain => self.add_slice_plain(s),
+        };
+
+        if added {
+            self.record_value(s);
         }
+
+        added
+    }
+
+    fn record_value(&mut self, s: &[u8]) {
+        if self.first_value.is_none() {
+            self.first_value = Some(Bytes::copy_from_slice(s));
+        }
+        self.last_value = Some(Bytes::copy_from_slice(s));
     }
 
     fn add_slice_plain(&mut self, s: &[u8]) -> bool {
@@ -155,8 +168,8 @@ impl BinaryDictPageBuilder {
     fn switch_to_plain(&mut self) {
         self.encoding_type = EncodingMode::Plain;
         self.plain_builder = Some(BinaryPlainPageBuilder::new(self.page_size));
-        // Note: We don't copy existing data - this page will use plain encoding
-        // Previous pages already written with dict encoding remain valid
+        // The caller only switches on an empty data page. Earlier pages keep using
+        // the column-level dictionary, and later pages can safely use plain bytes.
     }
 
     /// Finish building the page.
@@ -188,7 +201,7 @@ impl BinaryDictPageBuilder {
 
     /// Get the dictionary page.
     pub fn get_dictionary_page(&mut self) -> Option<Bytes> {
-        if self.encoding_type == EncodingMode::Dict && !self.dictionary.is_empty() {
+        if !self.dictionary.is_empty() {
             self.dict_builder.finish().ok()
         } else {
             None
@@ -584,6 +597,39 @@ mod tests {
         builder.add_slice(b"page1_value1"); // Already in dict
         builder.add_slice(b"page2_new");
         assert_eq!(builder.count(), 2);
+    }
+
+    #[test]
+    fn test_binary_dict_flushes_before_plain_fallback() {
+        let mut builder = BinaryDictPageBuilder::new(256 * 1024).with_dict_page_size(13);
+
+        assert!(builder.add_slice(b"alpha"));
+        assert!(!builder.add_slice(b"bravo"));
+        assert_eq!(builder.count(), 1);
+        assert_eq!(builder.get_last_value().unwrap().as_ref(), b"alpha");
+
+        let dict_encoded_page = builder.finish().unwrap();
+        builder.reset();
+
+        assert!(builder.add_slice(b"bravo"));
+        assert_eq!(builder.count(), 1);
+        assert!(!builder.all_dict_encoded());
+
+        let plain_page = builder.finish().unwrap();
+        let global_dict = builder.get_dictionary_page().unwrap();
+
+        let mut dict_decoder = BinaryDictPageDecoder::new(dict_encoded_page);
+        dict_decoder.set_dict_decoder(global_dict.clone()).unwrap();
+        dict_decoder.init().unwrap();
+        assert!(dict_decoder.is_dict_encoded());
+        let values = dict_decoder.next_batch(1).unwrap();
+        assert_eq!(values[0].as_ref(), b"alpha");
+
+        let mut plain_decoder = BinaryDictPageDecoder::new(plain_page);
+        plain_decoder.init().unwrap();
+        assert!(!plain_decoder.is_dict_encoded());
+        let values = plain_decoder.next_batch(1).unwrap();
+        assert_eq!(values[0].as_ref(), b"bravo");
     }
 
     #[test]

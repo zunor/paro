@@ -118,7 +118,7 @@ impl RetainedChunkVec {
     }
 
     pub fn clone_chunks(&self) -> Vec<Chunk> {
-        self.chunks.iter().cloned().collect()
+        self.chunks.to_vec()
     }
 
     fn retain_chunk_allocations(&mut self, chunk: &Chunk) -> MemoryResult<()> {

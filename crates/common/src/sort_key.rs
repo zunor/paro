@@ -233,10 +233,7 @@ impl SortKeyEncoding {
         self.inline_prefix_len
     }
 
-    pub fn encoded_len(&self, chunk: &Chunk, row_idx: usize, columns: &[usize]) -> Result<usize> {
-        if let Some(fixed_len) = self.fixed_key_len {
-            return Ok(fixed_len);
-        }
+    pub fn validate_columns(&self, chunk: &Chunk, columns: &[usize]) -> Result<()> {
         if columns.len() != self.fields.len() {
             return Err(paro_error::internal(format!(
                 "sort key column count mismatch: {} columns, {} fields",
@@ -244,6 +241,43 @@ impl SortKeyEncoding {
                 self.fields.len()
             )));
         }
+
+        for (&column_idx, field) in columns.iter().zip(self.fields.iter()) {
+            let vector = chunk.column(column_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "sort key column {} out of bounds for chunk with {} columns",
+                    column_idx,
+                    chunk.column_count()
+                ))
+            })?;
+            if vector.logical_type() != &field.logical_type {
+                return Err(paro_error::internal(format!(
+                    "sort key column {column_idx} type mismatch: expected {:?}, got {:?}",
+                    field.logical_type,
+                    vector.logical_type()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn encoded_len(&self, chunk: &Chunk, row_idx: usize, columns: &[usize]) -> Result<usize> {
+        self.validate_columns(chunk, columns)?;
+        self.encoded_len_trusted(chunk, row_idx, columns)
+    }
+
+    pub fn encoded_len_trusted(
+        &self,
+        chunk: &Chunk,
+        row_idx: usize,
+        columns: &[usize],
+    ) -> Result<usize> {
+        if let Some(fixed_len) = self.fixed_key_len {
+            return Ok(fixed_len);
+        }
+
+        debug_assert_eq!(columns.len(), self.fields.len());
 
         let mut len = 0usize;
         for (&column_idx, field) in columns.iter().zip(self.fields.iter()) {
@@ -282,10 +316,22 @@ impl SortKeyEncoding {
         inline_prefix: &mut [u8],
         overflow: &mut [u8],
     ) -> Result<()> {
+        self.validate_columns(chunk, columns)?;
+        self.encode_row_into_parts_trusted(chunk, row_idx, columns, inline_prefix, overflow)
+    }
+
+    pub fn encode_row_into_parts_trusted(
+        &self,
+        chunk: &Chunk,
+        row_idx: usize,
+        columns: &[usize],
+        inline_prefix: &mut [u8],
+        overflow: &mut [u8],
+    ) -> Result<()> {
         let total_len = if let Some(fixed_len) = self.fixed_key_len {
             fixed_len
         } else {
-            self.encoded_len(chunk, row_idx, columns)?
+            self.encoded_len_trusted(chunk, row_idx, columns)?
         };
         let inline_len = total_len.min(self.inline_prefix_len);
         let overflow_len = total_len.saturating_sub(inline_len);
@@ -301,7 +347,7 @@ impl SortKeyEncoding {
         }
 
         let mut writer = SplitKeyWriter::new(inline_prefix, overflow);
-        self.encode_row_with_writer(chunk, row_idx, columns, &mut writer)?;
+        self.encode_row_with_writer_trusted(chunk, row_idx, columns, &mut writer)?;
         writer.finish();
         Ok(())
     }
@@ -319,14 +365,18 @@ impl SortKeyEncoding {
         columns: &[usize],
         out: &mut W,
     ) -> Result<()> {
-        if columns.len() != self.fields.len() {
-            return Err(paro_error::internal(format!(
-                "sort key column count mismatch: {} columns, {} fields",
-                columns.len(),
-                self.fields.len()
-            )));
-        }
+        self.validate_columns(chunk, columns)?;
+        self.encode_row_with_writer_trusted(chunk, row_idx, columns, out)
+    }
 
+    fn encode_row_with_writer_trusted<W: KeyWriter + ?Sized>(
+        &self,
+        chunk: &Chunk,
+        row_idx: usize,
+        columns: &[usize],
+        out: &mut W,
+    ) -> Result<()> {
+        debug_assert_eq!(columns.len(), self.fields.len());
         for (&column_idx, field) in columns.iter().zip(self.fields.iter()) {
             let vector = chunk.column(column_idx).ok_or_else(|| {
                 paro_error::internal(format!(

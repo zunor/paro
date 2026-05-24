@@ -21,9 +21,7 @@ use paro_storage::meta::DEFAULT_SORT_PARTITION_SIZE;
 use paro_storage::row::{RowLayout, RowValidityType};
 
 use crate::execution_context::ExecutionContext;
-use crate::operator::state::{
-    GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState,
-};
+use crate::operator_state::{GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState};
 use crate::result_type::{
     SinkCombineResultType, SinkFinalizeType, SinkResultType, SourceResultType,
 };
@@ -293,8 +291,8 @@ impl Sort {
             gstate.update_local_state(lstate);
         }
 
-        lstate.key_chunk = build_key_chunk(chunk, &self.orders);
-        lstate.payload_chunk = build_payload_chunk(chunk, &self.input_projection_map);
+        build_key_chunk_in_place(chunk, &self.orders, &mut lstate.key_chunk)?;
+        build_payload_chunk_in_place(chunk, &self.input_projection_map, &mut lstate.payload_chunk)?;
 
         if let Some(run_builder) = lstate.run_builder.as_mut() {
             run_builder.sink(&lstate.key_chunk, &lstate.payload_chunk)?;
@@ -763,14 +761,6 @@ impl GlobalSinkState for SortGlobalSinkState {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    fn sink_state_name(&self) -> &str {
-        "SortGlobalSinkState"
-    }
 }
 
 #[derive(Debug)]
@@ -856,10 +846,6 @@ impl GlobalSourceState for SortGlobalSourceState {
         self
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
     fn max_threads(&self) -> usize {
         if self.single_run.is_some() {
             1
@@ -871,26 +857,86 @@ impl GlobalSourceState for SortGlobalSourceState {
     }
 }
 
-fn build_key_chunk(chunk: &Chunk, orders: &[OrderByNode]) -> Chunk {
-    let mut vectors = Vec::with_capacity(orders.len());
-    for order in orders {
-        if let Expression::ColumnRef(col_ref) = &order.expression {
-            if let Some(vector) = chunk.column(col_ref.binding.column_index) {
-                vectors.push(Arc::clone(vector));
-            }
-        } else if let Expression::Reference(reference) = &order.expression {
-            if let Some(vector) = chunk.column(reference.index) {
-                vectors.push(Arc::clone(vector));
-            }
-        }
-    }
-    Chunk::from_arc_vectors(vectors, chunk.allocator().clone())
+pub(crate) fn build_key_chunk_into<'a>(
+    chunk: &'a Chunk,
+    orders: &[OrderByNode],
+    slot: &'a mut Option<Chunk>,
+) -> Result<&'a Chunk> {
+    let output = projected_metadata_chunk(chunk, orders.len(), slot)?;
+    build_key_chunk_in_place(chunk, orders, output)?;
+    Ok(output)
 }
 
-fn build_payload_chunk(chunk: &Chunk, projection_map: &[usize]) -> Chunk {
-    let vectors = projection_map
-        .iter()
-        .filter_map(|&column_idx| chunk.column(column_idx).map(Arc::clone))
-        .collect::<Vec<_>>();
-    Chunk::from_arc_vectors(vectors, chunk.allocator().clone())
+pub(crate) fn build_payload_chunk_into<'a>(
+    chunk: &'a Chunk,
+    projection_map: &[usize],
+    slot: &'a mut Option<Chunk>,
+) -> Result<&'a Chunk> {
+    let output = projected_metadata_chunk(chunk, projection_map.len(), slot)?;
+    build_payload_chunk_in_place(chunk, projection_map, output)?;
+    Ok(output)
+}
+
+pub(crate) fn build_key_chunk_in_place(
+    chunk: &Chunk,
+    orders: &[OrderByNode],
+    output: &mut Chunk,
+) -> Result<()> {
+    output.data.clear();
+    output.data.reserve(orders.len());
+    output.set_capacity(chunk.size().max(1));
+    for order in orders {
+        let column_idx = match &order.expression {
+            Expression::ColumnRef(col_ref) => col_ref.binding.column_index,
+            Expression::Reference(reference) => reference.index,
+            other => {
+                return Err(paro_error::internal(format!(
+                    "sort key expression was not lowered to a column reference: {other:?}"
+                )));
+            }
+        };
+        output
+            .data
+            .push(Arc::clone(chunk.column(column_idx).ok_or_else(|| {
+                paro_error::internal(format!("sort key column out of bounds: {column_idx}"))
+            })?));
+    }
+    output.try_set_cardinality(chunk.size())?;
+    Ok(())
+}
+
+pub(crate) fn build_payload_chunk_in_place(
+    chunk: &Chunk,
+    projection_map: &[usize],
+    output: &mut Chunk,
+) -> Result<()> {
+    output.data.clear();
+    output.data.reserve(projection_map.len());
+    output.set_capacity(chunk.size().max(1));
+    for &column_idx in projection_map {
+        output
+            .data
+            .push(Arc::clone(chunk.column(column_idx).ok_or_else(|| {
+                paro_error::internal(format!("sort payload column out of bounds: {column_idx}"))
+            })?));
+    }
+    output.try_set_cardinality(chunk.size())?;
+    Ok(())
+}
+
+fn projected_metadata_chunk<'a>(
+    input: &'a Chunk,
+    column_count: usize,
+    slot: &'a mut Option<Chunk>,
+) -> Result<&'a mut Chunk> {
+    if slot.is_none() {
+        *slot = Some(Chunk::try_new(input.allocator().clone())?);
+    }
+    let output = slot
+        .as_mut()
+        .expect("sort projected metadata chunk was initialized above");
+    output.data.clear();
+    output.data.reserve(column_count);
+    output.set_capacity(input.size().max(1));
+    Ok(output)
 }

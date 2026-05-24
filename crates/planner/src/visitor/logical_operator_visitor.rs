@@ -70,6 +70,7 @@ pub trait LogicalOperatorVisitor {
             Expression::Constant(e) => self.visit_replace_constant(e),
             Expression::Function(e) => self.visit_replace_function(e),
             Expression::Operator(e) => self.visit_replace_operator(e),
+            Expression::Parameter(_) => None,
             Expression::Reference(e) => self.visit_replace_reference(e),
             Expression::Subquery(e) => self.visit_replace_subquery(e),
             Expression::Window(e) => self.visit_replace_window(e),

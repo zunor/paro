@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::VECTOR_SIZE;
 
 use crate::execution_context::ExecutionContext;
-use crate::operator::state::{GlobalSourceState, LocalSourceState};
+use crate::operator_state::{GlobalSourceState, LocalSourceState};
 use crate::result_type::SourceResultType;
 
 use super::sort::Sort;
@@ -562,10 +562,6 @@ impl SortedRunMergerGlobalState {
 
 impl GlobalSourceState for SortedRunMergerGlobalState {
     fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
 

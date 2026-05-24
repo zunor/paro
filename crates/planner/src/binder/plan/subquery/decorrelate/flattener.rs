@@ -332,6 +332,7 @@ impl DependentJoinFlattener {
 
         let mut mark_join = ComparisonJoin::new(JoinType::Mark, left, right, conditions);
         mark_join.mark_index = Some(mark_index);
+        mark_join.mark_null_condition_start = None;
         mark_join.duplicate_eliminated_columns =
             self.duplicate_eliminated_columns(correlated_columns);
 
@@ -385,6 +386,7 @@ impl DependentJoinFlattener {
 
         let mut conditions =
             self.create_correlated_join_conditions_for_base(correlated_columns, base_binding)?;
+        let payload_condition_start = conditions.len();
         conditions.extend(self.create_any_join_conditions(
             &right,
             comparison_type,
@@ -395,6 +397,7 @@ impl DependentJoinFlattener {
 
         let mut mark_join = ComparisonJoin::new(JoinType::Mark, left, right, conditions);
         mark_join.mark_index = Some(mark_index);
+        mark_join.mark_null_condition_start = Some(payload_condition_start);
         mark_join.duplicate_eliminated_columns =
             self.duplicate_eliminated_columns(correlated_columns);
 
@@ -1000,10 +1003,12 @@ impl DependentJoinFlattener {
             }
             LogicalOperator::ExternalTable(mut table) => {
                 if let Some(child) = table.child.take() {
+                    let original_output_count = table.returned_types.len();
+                    let table_index = table.table_index;
                     let PushDownResult {
                         plan: child,
                         base_binding,
-                        visible_columns,
+                        ..
                     } = self.push_down_dependent_join_internal(binder, *child, lateral_depth)?;
                     let rewriter = RewriteCorrelatedExpressions::new_recursive(
                         base_binding,
@@ -1012,14 +1017,22 @@ impl DependentJoinFlattener {
                     );
                     table.call_expression = rewriter.rewrite_expression(table.call_expression);
                     table.child = Some(Box::new(child));
+                    for (name, return_type) in self.internal_output_names().into_iter().zip(
+                        self.correlated_columns
+                            .iter()
+                            .map(|corr| corr.return_type.clone()),
+                    ) {
+                        table.output_columns.push(name);
+                        table.returned_types.push(return_type);
+                    }
                     Ok(PushDownResult {
                         plan: LogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::ExternalTable(table),
                         },
-                        base_binding,
-                        visible_columns,
+                        base_binding: ColumnBinding::new(table_index, original_output_count),
+                        visible_columns: Self::all_columns_visible(original_output_count),
                     })
                 } else {
                     Ok(PushDownResult {

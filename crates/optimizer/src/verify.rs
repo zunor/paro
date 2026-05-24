@@ -404,7 +404,7 @@ impl Verifier {
                     self.verify_expression(&order.expression)?;
                 }
             }
-            Expression::Constant(_) | Expression::Reference(_) => {}
+            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
         }
         Ok(())
     }

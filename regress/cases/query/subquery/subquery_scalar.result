@@ -98,4 +98,4 @@ o.grp	quota_sum
 NULL	0
 
 SELECT (SELECT v FROM subquery_scalar_multi) AS should_fail;
-ERROR: More than one row returned by a subquery used as an expression (SQLSTATE=XX000)
+ERROR: More than one row returned by a subquery used as an expression (SQLSTATE=42601)

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
 import json
+import subprocess
 import threading
 import time as time_module
 from typing import Any, Mapping
@@ -47,6 +48,9 @@ class QueryExecutionResult:
     explain_profile_detail: str | None = None
     explain_profile_raw_json: str | None = None
     operator_profiles: list[dict[str, Any]] = field(default_factory=list)
+    rss_before_kb: int | None = None
+    rss_after_kb: int | None = None
+    rss_peak_kb: int | None = None
     error: str | None = None
 
 
@@ -73,12 +77,14 @@ class BenchmarkExecutor:
         warmup: int,
         timeout_seconds: int,
         collect_memory: bool,
+        profile_pid: int = 0,
     ):
         self._connection = dict(connection)
         self._iterations = max(int(iterations), 1)
         self._warmup = max(int(warmup), 0)
         self._timeout_seconds = max(int(timeout_seconds), 1)
         self._collect_memory = bool(collect_memory)
+        self._profile_pid = max(int(profile_pid), 0)
 
     def connection_factory(self) -> Any:
         try:
@@ -187,17 +193,34 @@ class BenchmarkExecutor:
                 query_result.memory_before_bytes = _sum_memory_tag_rows(query_result.memory_tags_before)
                 query_result.spill_metrics_before = self._fetch_spill_metrics(conn)
 
+            if self._profile_pid > 0:
+                query_result.rss_before_kb = _read_process_rss_kb(self._profile_pid)
+
             last_rows: list[tuple[Any, ...]] = []
             for _ in range(self._iterations):
+                rss_sampler = RssSampler(self._profile_pid)
+                rss_sampler.start()
                 start = time_module.perf_counter()
-                rows = self._execute_sql(conn, query.sql, fetch=True)
-                query_result.samples_ms.append((time_module.perf_counter() - start) * 1000.0)
+                try:
+                    rows = self._execute_sql(conn, query.sql, fetch=True)
+                finally:
+                    elapsed_ms = (time_module.perf_counter() - start) * 1000.0
+                    rss_sampler.stop()
+                query_result.samples_ms.append(elapsed_ms)
+                if rss_sampler.peak_kb is not None:
+                    query_result.rss_peak_kb = max(
+                        query_result.rss_peak_kb or 0,
+                        rss_sampler.peak_kb,
+                    )
                 last_rows = rows
 
             if self._collect_memory:
                 query_result.memory_tags_after = self._fetch_memory_tag_rows(conn)
                 query_result.memory_after_bytes = _sum_memory_tag_rows(query_result.memory_tags_after)
                 query_result.spill_metrics_after = self._fetch_spill_metrics(conn)
+
+            if self._profile_pid > 0:
+                query_result.rss_after_kb = _read_process_rss_kb(self._profile_pid)
 
             query_result.result_rows = [_normalize_row(row) for row in last_rows]
             outcome = validator.validate_query(query, query_result.result_rows)
@@ -382,6 +405,59 @@ def _sum_memory_tag_rows(rows: list[dict[str, Any]] | None) -> int:
     return total
 
 
+class RssSampler:
+    def __init__(self, pid: int, interval_seconds: float = 0.05):
+        self._pid = max(int(pid), 0)
+        self._interval_seconds = max(float(interval_seconds), 0.01)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.peak_kb: int | None = None
+
+    def start(self) -> None:
+        if self._pid <= 0:
+            return
+        self._record(_read_process_rss_kb(self._pid))
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(0.2)
+        self._record(_read_process_rss_kb(self._pid))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self._record(_read_process_rss_kb(self._pid))
+
+    def _record(self, rss_kb: int | None) -> None:
+        if rss_kb is None:
+            return
+        self.peak_kb = max(self.peak_kb or 0, rss_kb)
+
+
+def _read_process_rss_kb(pid: int) -> int | None:
+    if pid <= 0:
+        return None
+    try:
+        output = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        return None
+    value = output.strip().splitlines()
+    if not value:
+        return None
+    try:
+        rss = int(value[0].strip())
+    except ValueError:
+        return None
+    return rss if rss > 0 else None
+
+
 def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
     try:
         document = json.loads(raw_json)
@@ -389,9 +465,32 @@ def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
         raise ValueError(f"invalid explain JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise ValueError("explain JSON document must be an object")
+    operators = document.get("operators")
+    if isinstance(operators, list):
+        profiles: list[dict[str, Any]] = []
+        for index, operator in enumerate(operators):
+            if not isinstance(operator, dict):
+                continue
+            actual = operator.get("actual")
+            actual_map = actual if isinstance(actual, dict) else {}
+            profiles.append(
+                {
+                    "node_id": _optional_int(operator.get("runtime_id")),
+                    "operator": str(operator.get("operator", "")),
+                    "tree_path": str(index),
+                    "rows": _optional_int(actual_map.get("rows")),
+                    "loops": _optional_int(actual_map.get("loops")),
+                    "startup_time_ms": _optional_float(actual_map.get("startup_time_ms")),
+                    "total_time_ms": _optional_float(actual_map.get("total_time_ms")),
+                    "spilled": _optional_bool(actual_map.get("spilled")),
+                    "reported_memory_bytes": _optional_int(actual_map.get("peak_memory_bytes")),
+                    "temp_storage_bytes": _optional_int(actual_map.get("temp_storage_bytes")),
+                }
+            )
+        return profiles
     plan = document.get("plan")
     if not isinstance(plan, dict):
-        raise ValueError("explain JSON document missing object field 'plan'")
+        raise ValueError("explain JSON document missing 'operators' array or object field 'plan'")
     profiles: list[dict[str, Any]] = []
     _append_operator_profile(plan, profiles, "0")
     return profiles

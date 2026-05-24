@@ -583,7 +583,7 @@ fn collect_bindings_from_expr(expr: &Expression, bindings: &mut HashSet<ColumnBi
         Expression::Window(window) => {
             collect_bindings_from_window_expr(window, bindings);
         }
-        Expression::Constant(_) | Expression::Reference(_) => {}
+        Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
     }
 }
 

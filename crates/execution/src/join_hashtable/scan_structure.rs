@@ -13,7 +13,7 @@ use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use std::sync::Arc;
 
 use crate::join_hashtable::join_hashtable::JoinHashTable;
-use crate::operator::join::join_result_helpers::{
+use crate::operators::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
     construct_semi_join_result,
 };

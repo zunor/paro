@@ -321,7 +321,17 @@ impl LogicalOperator {
             LogicalOperator::ExternalProject(op) => op.returned_types.clone(),
             LogicalOperator::ExternalTable(op) => op.returned_types.clone(),
             LogicalOperator::Limit(op) => op.child.types(),
-            LogicalOperator::Order(op) => op.child.types(),
+            LogicalOperator::Order(op) => {
+                let child_types = op.child.types();
+                if op.projection_map.is_empty() {
+                    child_types
+                } else {
+                    op.projection_map
+                        .iter()
+                        .filter_map(|&idx| child_types.get(idx).cloned())
+                        .collect()
+                }
+            }
             LogicalOperator::TopN(op) => op.child.types(),
             LogicalOperator::CreateTable(_) => vec![],
             LogicalOperator::CreateRoutine(_) => vec![],

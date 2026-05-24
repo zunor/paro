@@ -229,7 +229,10 @@ fn verify_expression(expr: &Expression) -> Result<()> {
                 ),
             ));
         }
-        Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => {}
+        Expression::Constant(_)
+        | Expression::Parameter(_)
+        | Expression::ColumnRef(_)
+        | Expression::Reference(_) => {}
     }
 
     Ok(())

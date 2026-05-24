@@ -64,15 +64,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, sum_true, cnt_y_ge2
   ->  ORDER_BY  (rows=3)
-        Sort Key: ref_1 ASC NULLS LAST
-        ->  PROJECTION  (rows=3)
-              Output: ref_1, sum, count, ref_1
-              ->  HASH_GROUP_BY  (rows=3)
-                    Group Key: col0
-                    Aggregates: SUM(col1) FILTER (WHERE col3), COUNT(col1) FILTER (WHERE (col2 >= 2))
-                    Key Mode: INLINE_KEY_4B
-                    ->  PROJECTION
-                          Output: col0, col1, col3, col1, (col2 >= 2)
-                          ->  PROJECTION  (rows=6)
-                                Output: col0, col1, col2, col3
-                                ->  EXPRESSION_SCAN  (rows=6)
+    Sort Key: #3 ASC NULLS LAST
+    ->  PROJECTION  (rows=3)
+      Output: grp, sum_true, cnt_y_ge2, __paro_hidden_1
+      ->  AGGREGATE  (rows=3)
+        Group Key: #0
+        Aggregates: sum(#1) FILTER (WHERE #3), count(#1) FILTER (WHERE #2 >= 2)
+        Output: aggr_0, aggr_1, aggr_2
+        ->  PROJECTION  (rows=6)
+          Output: grp, x, y, flag
+          ->  VALUES  (rows=6)

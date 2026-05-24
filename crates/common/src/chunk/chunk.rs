@@ -164,6 +164,27 @@ impl Chunk {
         }
     }
 
+    /// Append a column that already has `expected_count` logical rows set.
+    pub fn try_push_column(&mut self, vector: Arc<Vector>, expected_count: usize) -> Result<()> {
+        if vector.len() != expected_count {
+            return Err(paro_error::internal(format!(
+                "chunk column cardinality mismatch: column={}, expected={expected_count}",
+                vector.len()
+            )));
+        }
+        if self.data.is_empty() && self.count == 0 {
+            self.count = expected_count;
+            self.capacity = self.capacity.max(expected_count);
+        } else if self.count != expected_count {
+            return Err(paro_error::internal(format!(
+                "chunk column cardinality mismatch: chunk={}, expected={expected_count}",
+                self.count
+            )));
+        }
+        self.data.push(vector);
+        Ok(())
+    }
+
     // ========== Size and Capacity ==========
 
     /// Get the number of rows (cardinality).

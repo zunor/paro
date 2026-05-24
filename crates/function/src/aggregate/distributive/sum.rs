@@ -48,7 +48,7 @@ macro_rules! define_sum_impl {
                         let state_ptr = *state_ptrs.add(i);
                         let state = state_ptr as *mut State;
 
-                        let val: $input_type = input.get_flat(i);
+                        let val: $input_type = input.get_fixed(i);
                         (*state).value += val as $state_type;
                         (*state).is_null = false;
                     }
@@ -66,7 +66,7 @@ macro_rules! define_sum_impl {
 
                 for i in 0..count {
                     if !input.is_null(i) {
-                        let val: $input_type = input.get_flat(i);
+                        let val: $input_type = input.get_fixed(i);
                         (*state).value += val as $state_type;
                         (*state).is_null = false;
                     }

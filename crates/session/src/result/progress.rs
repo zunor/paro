@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use paro_scheduler::coordinator::EventCoordinator;
-
 // ============================================================================
 // ProgressBarDisplay trait
 // ============================================================================
@@ -357,40 +355,6 @@ impl ProgressBar {
     pub fn is_finished(&self) -> bool {
         self.finished
     }
-
-    /// Updates the progress bar from an EventCoordinator.
-    ///
-    /// events vs total events in the coordinator.
-    ///
-    /// # Arguments
-    /// * `coordinator` - The event coordinator managing pipeline execution
-    ///
-    /// # Progress Calculation
-    /// Progress is calculated as: (completed_events / total_events) * 100
-    ///
-    /// If the coordinator has completed all events, this is treated as
-    /// the final update and the progress bar is finished.
-    pub fn update_from_coordinator(&mut self, coordinator: &EventCoordinator) {
-        if self.finished || !self.supported {
-            return;
-        }
-
-        let total = coordinator.total_count();
-        let completed = coordinator.completed_count();
-
-        // Calculate percentage
-        let percentage = if total > 0 {
-            (completed as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        // Check if execution is complete
-        let is_final = coordinator.is_complete();
-
-        // Update progress
-        self.update(percentage, is_final);
-    }
 }
 
 impl std::fmt::Debug for ProgressBar {
@@ -556,100 +520,5 @@ mod tests {
 
         // Should not update when unsupported
         assert_eq!(display.get_update_count(), 0);
-    }
-
-    // ------------------------------------------------------------------------
-    // Coordinator integration
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_progress_bar_from_coordinator() {
-        use paro_scheduler::event::Event;
-        use paro_scheduler::scheduler::TaskScheduler;
-
-        let display = Arc::new(TestProgressBarDisplay::new());
-        let mut bar = ProgressBar::new(display.clone(), Duration::ZERO);
-
-        // Create coordinator with 4 events
-        let scheduler = Arc::new(TaskScheduler::new());
-        let coordinator = EventCoordinator::new(scheduler);
-
-        let events: Vec<_> = (0..4).map(|_| Event::new()).collect();
-        for event in &events {
-            coordinator.add_event(event.clone());
-        }
-
-        bar.start();
-
-        // Initially 0% (no events completed)
-        bar.update_from_coordinator(&coordinator);
-        assert_eq!(display.get_last_percentage(), 0.0);
-
-        // Complete 2 events (50%)
-        for event in events.iter().take(2) {
-            event.set_tasks(1);
-            event.finish_task();
-        }
-        bar.update_from_coordinator(&coordinator);
-        assert_eq!(display.get_last_percentage(), 50.0);
-
-        // Complete all events (100%)
-        for event in events.iter().skip(2) {
-            event.set_tasks(1);
-            event.finish_task();
-        }
-        bar.update_from_coordinator(&coordinator);
-        assert_eq!(display.get_last_percentage(), 100.0);
-        assert!(bar.is_finished());
-    }
-
-    #[test]
-    fn test_progress_bar_from_coordinator_empty() {
-        use paro_scheduler::scheduler::TaskScheduler;
-
-        let display = Arc::new(TestProgressBarDisplay::new());
-        let mut bar = ProgressBar::new(display.clone(), Duration::ZERO);
-
-        // Create coordinator with no events
-        let scheduler = Arc::new(TaskScheduler::new());
-        let coordinator = EventCoordinator::new(scheduler);
-
-        bar.start();
-        bar.update_from_coordinator(&coordinator);
-
-        // Should handle empty coordinator gracefully
-        assert_eq!(display.get_last_percentage(), 0.0);
-    }
-
-    #[test]
-    fn test_progress_bar_from_coordinator_incremental() {
-        use paro_scheduler::event::Event;
-        use paro_scheduler::scheduler::TaskScheduler;
-
-        let display = Arc::new(TestProgressBarDisplay::new());
-        let mut bar = ProgressBar::new(display.clone(), Duration::ZERO);
-
-        let scheduler = Arc::new(TaskScheduler::new());
-        let coordinator = EventCoordinator::new(scheduler);
-
-        // Add 10 events
-        let events: Vec<_> = (0..10).map(|_| Event::new()).collect();
-        for event in &events {
-            coordinator.add_event(event.clone());
-        }
-
-        bar.start();
-
-        // Complete events one by one
-        for (i, event) in events.iter().enumerate() {
-            event.set_tasks(1);
-            event.finish_task();
-            bar.update_from_coordinator(&coordinator);
-
-            let expected_percentage = ((i + 1) as f64 / 10.0) * 100.0;
-            assert_eq!(display.get_last_percentage(), expected_percentage);
-        }
-
-        assert!(bar.is_finished());
     }
 }

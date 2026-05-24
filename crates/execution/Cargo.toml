@@ -94,3 +94,7 @@ harness = false
 [[bench]]
 name = "complex_type_dispatch"
 harness = false
+
+[[bench]]
+name = "operator_runtime_dispatch"
+harness = false

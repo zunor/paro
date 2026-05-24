@@ -33,20 +33,14 @@ SELECT k1, k2, SUM(v) AS sum_v
 FROM agg_phasee_spill
 GROUP BY k1, k2;
 QUERY PLAN
-PROJECTION  (rows=200000) (actual time=753.637..973.948 rows=28672 loops=16)
-  Output: ref_1, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=200000) (actual time=160.191..974.088 rows=228672 loops=66)
-        Group Key: k1, k2
-        Aggregates: SUM(v)
-        Key Mode: INLINE_KEY_8B
-        Partitioning: RADIX_PARTITIONS=4
-        Spilled: true
-        Peak Memory: 57.6 MB
-        ->  PROJECTION (actual time=160.155..677.277 rows=200000 loops=49)
-              Output: k1, k2, v
-              ->  ROWSET_SCAN on public.agg_phasee_spill (actual time=0.270..679.947 rows=200000 loops=50)
-                    Columns: k1, k2, v
-Execution Time: 294.097 ms
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=50)
+  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=49)
+PIPELINE 1
+  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=28672 loops=15)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=28672 loops=14)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=28672 loops=14)
+Execution Time: <time-ms>
 Rows Returned: 28672
 
 SELECT
@@ -71,20 +65,14 @@ SELECT k1, k2, SUM(v) AS sum_v
 FROM agg_phasee_spill
 GROUP BY k1, k2;
 QUERY PLAN
-PROJECTION  (rows=200000) (actual time=768.157..1003.924 rows=28672 loops=16)
-  Output: ref_1, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=200000) (actual time=146.350..1004.077 rows=228672 loops=66)
-        Group Key: k1, k2
-        Aggregates: SUM(v)
-        Key Mode: INLINE_KEY_8B
-        Partitioning: RADIX_PARTITIONS=4
-        Spilled: true
-        Peak Memory: 57.6 MB
-        ->  PROJECTION (actual time=146.315..691.592 rows=200000 loops=49)
-              Output: k1, k2, v
-              ->  ROWSET_SCAN on public.agg_phasee_spill (actual time=0.317..694.299 rows=200000 loops=50)
-                    Columns: k1, k2, v
-Execution Time: 309.752 ms
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=50)
+  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=49)
+PIPELINE 1
+  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=28672 loops=15)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=28672 loops=14)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=28672 loops=14)
+Execution Time: <time-ms>
 Rows Returned: 28672
 
 SET force_external = false;

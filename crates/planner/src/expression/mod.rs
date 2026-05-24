@@ -19,6 +19,7 @@ mod expression_node;
 mod function_expression;
 mod iterator;
 mod operator_expression;
+mod parameter_expression;
 mod reference_expression;
 mod subquery_expression;
 mod window_expression;
@@ -34,6 +35,7 @@ pub use expression_node::Expression;
 pub use function_expression::FunctionExpression;
 pub use iterator::ExpressionIterator;
 pub use operator_expression::{OperatorExpression, OperatorType};
+pub use parameter_expression::ParameterExpression;
 pub use reference_expression::ReferenceExpression;
 pub use subquery_expression::{SubqueryExpression, SubqueryPlanningState, SubqueryType};
 pub use window_expression::{

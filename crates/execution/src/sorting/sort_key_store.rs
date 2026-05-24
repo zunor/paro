@@ -230,21 +230,39 @@ impl SortKeyStore {
         }
 
         let columns: Vec<usize> = (0..chunk.column_count()).collect();
-        let key_lengths = if let Some(fixed_len) = self.encoding.fixed_key_len() {
-            vec![fixed_len; row_count]
-        } else {
-            let mut key_lengths = Vec::with_capacity(row_count);
-            for row_idx in 0..row_count {
-                let key_len = self.encoding.encoded_len(chunk, row_idx, &columns)?;
-                key_lengths.push(key_len);
-            }
-            key_lengths
-        };
-
+        self.encoding.validate_columns(chunk, &columns)?;
         let encoding = Arc::clone(&self.encoding);
+        if let Some(fixed_len) = self.encoding.fixed_key_len() {
+            for row_idx in 0..row_count {
+                self.append_encoded_key_from_parts(fixed_len, |inline_prefix, overflow| {
+                    encoding.encode_row_into_parts_trusted(
+                        chunk,
+                        row_idx,
+                        &columns,
+                        inline_prefix,
+                        overflow,
+                    )
+                })?;
+            }
+            return Ok(());
+        }
+
+        let mut key_lengths = Vec::with_capacity(row_count);
+        for row_idx in 0..row_count {
+            let key_len = self
+                .encoding
+                .encoded_len_trusted(chunk, row_idx, &columns)?;
+            key_lengths.push(key_len);
+        }
         for (row_idx, &key_len) in key_lengths.iter().enumerate() {
             self.append_encoded_key_from_parts(key_len, |inline_prefix, overflow| {
-                encoding.encode_row_into_parts(chunk, row_idx, &columns, inline_prefix, overflow)
+                encoding.encode_row_into_parts_trusted(
+                    chunk,
+                    row_idx,
+                    &columns,
+                    inline_prefix,
+                    overflow,
+                )
             })?;
         }
 
@@ -1097,6 +1115,29 @@ mod tests {
         let mut cursor = store.cursor_pinned().unwrap();
         assert_eq!(cursor.compare(0, 1).unwrap(), Ordering::Less);
         assert_eq!(cursor.compare(2, 1).unwrap(), Ordering::Greater);
+    }
+
+    #[test]
+    fn encode_batch_rejects_key_type_mismatch() {
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Boolean);
+        values.set_bool(0, true);
+        values.set_count(1);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
+
+        let pool = Arc::new(BufferPool::new(32 * 1024 * 1024));
+        let encoding = Arc::new(
+            SortKeyEncoding::new(
+                vec![LogicalType::Integer],
+                vec![paro_common::sort_key::OrderModifiers::new(true, false)],
+            )
+            .unwrap(),
+        );
+        let mut store = SortKeyStore::new(pool, encoding);
+        let error = store.encode_batch(&chunk).unwrap_err().to_string();
+        assert!(error.contains("sort key column 0 type mismatch"));
     }
 
     #[test]

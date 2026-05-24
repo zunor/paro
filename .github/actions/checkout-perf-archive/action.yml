@@ -1,0 +1,39 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+name: Checkout performance archive
+description: Checkout the external Paro performance archive when configured
+
+inputs:
+  repository:
+    description: Archive repository, for example owner/paro-perf-archive
+    required: true
+  token:
+    description: Optional token for private/write archive access
+    default: ""
+  path:
+    description: Checkout destination
+    default: .ci/paro-perf-archive
+  fetch-depth:
+    description: Checkout depth; write paths need full history for pull/rebase
+    default: "0"
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout performance archive
+      if: inputs.repository != '' && inputs.token != ''
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        token: ${{ inputs.token }}
+        path: ${{ inputs.path }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+
+    - name: Checkout performance archive (public)
+      if: inputs.repository != '' && inputs.token == ''
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        path: ${{ inputs.path }}
+        fetch-depth: ${{ inputs.fetch-depth }}

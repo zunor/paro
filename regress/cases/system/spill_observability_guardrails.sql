@@ -65,7 +65,7 @@ EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 
 SET force_external = true;
 
--- @statement error force_external requires a temporary directory
+-- @statement error SQLSTATE=53200
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 
 SET force_external = DEFAULT;

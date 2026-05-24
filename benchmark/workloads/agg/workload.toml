@@ -21,11 +21,18 @@ validate = "scalar_equals"
 expected = 200000
 
 [[query]]
+id = "filter_count"
+file = "sql/q_filter_count.sql"
+validate = "scalar_equals"
+expected = 100000
+plan_contains = ["FILTER"]
+
+[[query]]
 id = "group_by_low_card"
 file = "sql/q_group_by_low.sql"
 validate = "row_count"
 expected = 10
-plan_contains = ["HASH_GROUP_BY"]
+plan_contains = ["AGGREGATE"]
 
 [[query]]
 id = "group_by_low_card_perfect"

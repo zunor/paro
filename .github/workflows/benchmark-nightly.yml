@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: benchmark-nightly-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,9 +44,23 @@ jobs:
     name: benchmark regression
     needs: build-release
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 100
+    concurrency:
+      group: perf-archive-${{ vars.PARO_PERF_ARCHIVE_REPOSITORY || github.run_id }}-write
+      cancel-in-progress: false
+    env:
+      PARO_BENCH_CARGO_PROFILE: release
+      PARO_BENCH_DATA_DIR_MODE: fresh
+      PARO_PERF_ARCHIVE_DIR: ${{ github.workspace }}/.ci/paro-perf-archive
+      PARO_PERF_ARCHIVE_TOKEN: ${{ secrets.PARO_PERF_ARCHIVE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: benchmark-nightly
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -60,17 +74,53 @@ jobs:
           artifact-name: parod-release
           port: "6432"
           health-timeout: "60"
-      - name: Run benchmark regression check
+      - name: Checkout performance archive
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != ''
+        uses: ./.github/actions/checkout-perf-archive
+        with:
+          repository: ${{ vars.PARO_PERF_ARCHIVE_REPOSITORY }}
+          token: ${{ env.PARO_PERF_ARCHIVE_TOKEN }}
+          path: .ci/paro-perf-archive
+      - name: Run nightly benchmark suite
         env:
           PARO_HOST: ${{ steps.start_parod.outputs.host }}
           PARO_PORT: ${{ steps.start_parod.outputs.port }}
+          PARO_PID: ${{ steps.start_parod.outputs.pid }}
+        run: make -C benchmark run SUITE=nightly-full PID="$PARO_PID"
+      - name: Sync nightly performance archive
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        run: git -C .ci/paro-perf-archive pull --ff-only
+      - name: Append nightly performance archive
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        env:
+          PARO_HOST: ${{ steps.start_parod.outputs.host }}
+          PARO_PORT: ${{ steps.start_parod.outputs.port }}
+          PARO_PID: ${{ steps.start_parod.outputs.pid }}
         run: |
-          if [ -f benchmark/baselines/nightly-linux-amd64.json ]; then
-            make -C benchmark check SUITE=nightly-full BASELINE=baselines/nightly-linux-amd64.json
-          else
-            echo "benchmark/baselines/nightly-linux-amd64.json not found; running nightly suite without regression gate"
-            make -C benchmark run SUITE=nightly-full
-          fi
+          make -C benchmark calibrate \
+            GATE=operator-runtime \
+            PID="$PARO_PID" \
+            RUN_ID="nightly-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-operator-runtime"
+          make -C benchmark calibrate \
+            GATE=divan-dispatch \
+            RUN_ID="nightly-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-divan-dispatch"
+      - name: Rebuild nightly performance archive index
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        run: |
+          for gate in operator-runtime divan-dispatch; do
+            make -C benchmark archive-finalize-calibration \
+              GATE="$gate" \
+              ARCHIVE="$PARO_PERF_ARCHIVE_DIR" \
+              PLATFORM=auto \
+              POLICY_VERSION=auto
+          done
+      - name: Commit nightly performance archive updates
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        uses: ./.github/actions/commit-changes
+        with:
+          path: .ci/paro-perf-archive
+          add-paths: results calibrations manifests
+          message: Archive nightly performance calibration ${{ github.sha }} run=${{ github.run_id }}-${{ github.run_attempt }} gates=operator-runtime,divan-dispatch
       - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,13 +128,8 @@ jobs:
           name: benchmark-nightly-report
           if-no-files-found: warn
           path: |
-            benchmark/report/result.json
-            benchmark/report/summary.md
+            benchmark/report/**
             .ci/parod.log
       - name: Stop parod
         if: always()
-        run: |
-          if [ -f .ci/parod.pid ]; then
-            kill "$(cat .ci/parod.pid)" || true
-            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
-          fi
+        uses: ./.github/actions/cleanup-parod

@@ -12,15 +12,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
 
-const PAROD_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+const DEFAULT_PAROD_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+const MIN_PAROD_WORKER_STACK_SIZE: usize = 1024 * 1024;
 const PAROD_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
     Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(PAROD_WORKER_STACK_SIZE)
+        .thread_stack_size(parod_worker_stack_size())
         .build()?
         .block_on(async_main())
+}
+
+fn parod_worker_stack_size() -> usize {
+    parod_worker_stack_size_from(
+        std::env::var("PARO_WORKER_STACK_SIZE").ok().as_deref(),
+        std::env::var("RUST_MIN_STACK").ok().as_deref(),
+    )
+}
+
+fn parod_worker_stack_size_from(explicit: Option<&str>, rust_min_stack: Option<&str>) -> usize {
+    explicit
+        .or(rust_min_stack)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= MIN_PAROD_WORKER_STACK_SIZE)
+        .unwrap_or(DEFAULT_PAROD_WORKER_STACK_SIZE)
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -103,4 +119,37 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     tokio::signal::ctrl_c()
         .await
         .map_err(|err| anyhow::anyhow!("failed to install Ctrl-C handler: {}", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parod_worker_stack_size_prefers_explicit_env() {
+        assert_eq!(
+            parod_worker_stack_size_from(Some("67108864"), Some("33554432")),
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parod_worker_stack_size_uses_rust_min_stack_fallback() {
+        assert_eq!(
+            parod_worker_stack_size_from(None, Some("33554432")),
+            32 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parod_worker_stack_size_rejects_invalid_or_too_small_values() {
+        assert_eq!(
+            parod_worker_stack_size_from(Some("not-a-number"), Some("33554432")),
+            DEFAULT_PAROD_WORKER_STACK_SIZE
+        );
+        assert_eq!(
+            parod_worker_stack_size_from(Some("4096"), Some("33554432")),
+            DEFAULT_PAROD_WORKER_STACK_SIZE
+        );
+    }
 }

@@ -12,9 +12,9 @@ COPY_TO_FILE  (rows=1)
   File: /tmp/paro_copy_t4_6_explain.csv
   PerThreadOutput: false
   ->  PROJECTION  (rows=3)
-        Output: id, name
-        ->  ROWSET_SCAN on public.dml_copy_explain_src
-              Columns: id, name
+    Output: dml_copy_explain_src.id, dml_copy_explain_src.name
+    ->  ROWSET_SCAN on public.dml_copy_explain_src  (rows=3)
+      Columns: id, name
 
 COPY dml_copy_explain_src
 TO '/tmp/paro_copy_t4_6_explain.csv'
@@ -39,8 +39,8 @@ INSERT  (rows=1)
   Table: dml_copy_explain_dst
   Column Mapping: input#0->id, input#1->name
   ->  FILTER  (rows=30)
-        Filter: (id >= 2)
-        ->  TABLE_FUNCTION_SCAN  (rows=100)
+    Filter: #0 >= 2
+    ->  TABLE_FUNCTION_SCAN  (rows=100)
 
 SELECT COUNT(*) AS copied_rows
 FROM dml_copy_explain_dst;

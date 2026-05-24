@@ -100,8 +100,7 @@ where
         .expect("join large-stack test thread");
 }
 
-#[tokio::test]
-async fn bm25_ranking_is_stable_across_segments() {
+async fn run_bm25_ranking_is_stable_across_segments() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -163,6 +162,14 @@ async fn bm25_ranking_is_stable_across_segments() {
     .await;
 
     assert_eq!(query_i64_col(&sink, 0), vec![1, 100]);
+}
+
+#[test]
+fn bm25_ranking_is_stable_across_segments() {
+    run_async_test_with_large_stack(
+        "fulltext-bm25-ranking",
+        run_bm25_ranking_is_stable_across_segments(),
+    );
 }
 
 async fn run_restart_recovery_keeps_fulltext_index_usable() {
@@ -381,8 +388,7 @@ fn create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
     );
 }
 
-#[tokio::test]
-async fn inserts_after_empty_fulltext_index_still_use_pushdown() {
+async fn run_inserts_after_empty_fulltext_index_still_use_pushdown() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -439,8 +445,15 @@ async fn inserts_after_empty_fulltext_index_still_use_pushdown() {
     assert_eq!(query_i64_col(&sink, 0), vec![1]);
 }
 
-#[tokio::test]
-async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_index_state() {
+#[test]
+fn inserts_after_empty_fulltext_index_still_use_pushdown() {
+    run_async_test_with_large_stack(
+        "fulltext-empty-index-inserts",
+        run_inserts_after_empty_fulltext_index_still_use_pushdown(),
+    );
+}
+
+async fn run_deferred_task_duplicate_redelivery_skips_already_ready_fulltext_index_state() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, Arc::clone(&instance));
     let mut sink = CollectingSink::new();
@@ -495,8 +508,15 @@ async fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_index_s
     assert!(matches!(second, RecoveryHookResult::Skipped { .. }));
 }
 
-#[tokio::test]
-async fn deferred_task_recovery_uses_catalog_fulltext_config_not_task_payload() {
+#[test]
+fn deferred_task_duplicate_redelivery_skips_already_ready_fulltext_index_state() {
+    run_async_test_with_large_stack(
+        "fulltext-redelivery-duplicate",
+        run_deferred_task_duplicate_redelivery_skips_already_ready_fulltext_index_state(),
+    );
+}
+
+async fn run_deferred_task_recovery_uses_catalog_fulltext_config_not_task_payload() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, Arc::clone(&instance));
     let mut sink = CollectingSink::new();
@@ -591,8 +611,15 @@ async fn deferred_task_recovery_uses_catalog_fulltext_config_not_task_payload() 
     assert!(matches!(replayed_again, RecoveryHookResult::Skipped { .. }));
 }
 
-#[tokio::test]
-async fn multilingual_tokenizers_can_be_queried() {
+#[test]
+fn deferred_task_recovery_uses_catalog_fulltext_config_not_task_payload() {
+    run_async_test_with_large_stack(
+        "fulltext-redelivery-config",
+        run_deferred_task_recovery_uses_catalog_fulltext_config_not_task_payload(),
+    );
+}
+
+async fn run_multilingual_tokenizers_can_be_queried() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -668,8 +695,15 @@ async fn multilingual_tokenizers_can_be_queried() {
     assert_eq!(query_i64_col(&sink, 0), vec![10]);
 }
 
-#[tokio::test]
-async fn tsvector_dispatch_works_through_cte_projection() {
+#[test]
+fn multilingual_tokenizers_can_be_queried() {
+    run_async_test_with_large_stack(
+        "fulltext-multilingual-tokenizers",
+        run_multilingual_tokenizers_can_be_queried(),
+    );
+}
+
+async fn run_tsvector_dispatch_works_through_cte_projection() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -705,8 +739,15 @@ async fn tsvector_dispatch_works_through_cte_projection() {
     assert!(sink.total_rows() > 0);
 }
 
-#[tokio::test]
-async fn json_operator_errors_do_not_break_fulltext_dispatch() {
+#[test]
+fn tsvector_dispatch_works_through_cte_projection() {
+    run_async_test_with_large_stack(
+        "fulltext-tsvector-cte",
+        run_tsvector_dispatch_works_through_cte_projection(),
+    );
+}
+
+async fn run_json_operator_errors_do_not_break_fulltext_dispatch() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -739,5 +780,13 @@ async fn json_operator_errors_do_not_break_fulltext_dispatch() {
     assert!(
         err_msg.to_lowercase().contains("json_path_match"),
         "expected JSON @@ fallback error to mention json_path_match, got: {err_msg}"
+    );
+}
+
+#[test]
+fn json_operator_errors_do_not_break_fulltext_dispatch() {
+    run_async_test_with_large_stack(
+        "fulltext-json-dispatch",
+        run_json_operator_errors_do_not_break_fulltext_dispatch(),
     );
 }

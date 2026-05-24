@@ -27,17 +27,14 @@ SET
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
-PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=5)
-  Output: id
-  ->  ORDER_BY  (rows=10000) (actual time=<time-range> rows=20000 loops=9)
-        Sort Key: id DESC NULLS FIRST
-        Sort Method: external merge
-        Spilled: true
-        Peak Memory: <bytes>
-        ->  PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=3)
-              Output: id, id
-              ->  ROWSET_SCAN on public.spill_h_sort (actual time=<time-range> rows=10000 loops=4)
-                    Columns: id
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=4)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=3)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 spilled=true peak_memory_bytes=303095 spilled_bytes=886405)
+PIPELINE 1
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=10000 loops=5)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
 Execution Time: <time-ms>
 Rows Returned: 10000
 
@@ -47,19 +44,13 @@ SELECT k1, k2, SUM(v)
 FROM spill_h_agg
 GROUP BY k1, k2;
 QUERY PLAN
-PROJECTION  (rows=200000) (actual time=<time-range> rows=200000 loops=100)
-  Output: ref_1, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=200000) (actual time=<time-range> rows=400000 loops=150)
-        Group Key: k1, k2
-        Aggregates: SUM(v)
-        Key Mode: INLINE_KEY_8B
-        Partitioning: RADIX_PARTITIONS=4
-        Spilled: true
-        Peak Memory: <bytes>
-        ->  PROJECTION (actual time=<time-range> rows=200000 loops=49)
-              Output: k1, k2, v
-              ->  ROWSET_SCAN on public.spill_h_agg (actual time=<time-range> rows=200000 loops=50)
-                    Columns: k1, k2, v
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=50)
+  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=49)
+PIPELINE 1
+  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=99)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=200000 loops=98)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=200000 loops=98)
 Execution Time: <time-ms>
 Rows Returned: 200000
 
@@ -69,14 +60,14 @@ SET
 EXPLAIN SELECT * FROM spill_h_join_l l SEMI JOIN spill_h_join_r r ON l.id = r.id;
 QUERY PLAN
 PROJECTION  (rows=1000)
-  Output: id
+  Output: l.id
   ->  HASH_JOIN  (rows=200)
-        Join Type: SEMI
-        Join Condition: id = id
-        ->  ROWSET_SCAN on public.spill_h_join_l l
-              Columns: id
-        ->  ROWSET_SCAN on public.spill_h_join_r r
-              Columns: id
+    Join Type: SEMI
+    Join Condition: #0 = #0
+    ->  ROWSET_SCAN on public.spill_h_join_l l
+      Columns: id
+    ->  ROWSET_SCAN on public.spill_h_join_r r
+      Columns: id
 
 SET temp_directory = DEFAULT;
 SET
@@ -84,17 +75,14 @@ SET
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
-PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=5)
-  Output: id
-  ->  ORDER_BY  (rows=10000) (actual time=<time-range> rows=20000 loops=9)
-        Sort Key: id DESC NULLS FIRST
-        Sort Method: quicksort
-        Spilled: false
-        Peak Memory: <bytes>
-        ->  PROJECTION  (rows=10000) (actual time=<time-range> rows=10000 loops=3)
-              Output: id, id
-              ->  ROWSET_SCAN on public.spill_h_sort (actual time=<time-range> rows=10000 loops=4)
-                    Columns: id
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=4)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=3)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 peak_memory_bytes=362135)
+PIPELINE 1
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=10000 loops=5)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
 Execution Time: <time-ms>
 Rows Returned: 10000
 
@@ -102,7 +90,7 @@ SET force_external = true;
 SET
 
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
-ERROR: force_external requires a temporary directory (SET temp_directory) (SQLSTATE=XX000)
+ERROR: force_external sort requires a temporary directory (SQLSTATE=53200)
 
 SET force_external = DEFAULT;
 SET

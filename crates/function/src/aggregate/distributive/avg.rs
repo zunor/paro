@@ -58,7 +58,7 @@ mod avg_i32 {
                 let state_ptr = *state_ptrs.add(i);
                 let state = state_ptr as *mut State;
 
-                let val: i32 = input.get_flat(i);
+                let val: i32 = input.get_fixed(i);
                 (*state).sum += val as f64;
                 (*state).count += 1;
             }
@@ -76,7 +76,7 @@ mod avg_i32 {
 
         for i in 0..count {
             if !input.is_null(i) {
-                let val: i32 = input.get_flat(i);
+                let val: i32 = input.get_fixed(i);
                 (*state).sum += val as f64;
                 (*state).count += 1;
             }
@@ -156,7 +156,7 @@ mod avg_i64 {
                 let state_ptr = *state_ptrs.add(i);
                 let state = state_ptr as *mut State;
 
-                let val: i64 = input.get_flat(i);
+                let val: i64 = input.get_fixed(i);
                 (*state).sum += val as f64;
                 (*state).count += 1;
             }
@@ -174,7 +174,7 @@ mod avg_i64 {
 
         for i in 0..count {
             if !input.is_null(i) {
-                let val: i64 = input.get_flat(i);
+                let val: i64 = input.get_fixed(i);
                 (*state).sum += val as f64;
                 (*state).count += 1;
             }
@@ -254,7 +254,7 @@ mod avg_f64 {
                 let state_ptr = *state_ptrs.add(i);
                 let state = state_ptr as *mut State;
 
-                let val: f64 = input.get_flat(i);
+                let val: f64 = input.get_fixed(i);
                 (*state).sum += val;
                 (*state).count += 1;
             }
@@ -272,7 +272,7 @@ mod avg_f64 {
 
         for i in 0..count {
             if !input.is_null(i) {
-                let val: f64 = input.get_flat(i);
+                let val: f64 = input.get_fixed(i);
                 (*state).sum += val;
                 (*state).count += 1;
             }

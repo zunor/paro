@@ -81,8 +81,7 @@ where
         .expect("join large-stack test thread");
 }
 
-#[tokio::test]
-async fn prepare_execute_deallocate_updates_metadata() {
+async fn run_prepare_execute_deallocate_updates_metadata() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -134,6 +133,14 @@ async fn prepare_execute_deallocate_updates_metadata() {
     )
     .await;
     assert_eq!(query_i64_col(&sink, 0), vec![0]);
+}
+
+#[test]
+fn prepare_execute_deallocate_updates_metadata() {
+    run_async_test_with_large_stack(
+        "prepared-statement-metadata",
+        run_prepare_execute_deallocate_updates_metadata(),
+    );
 }
 
 #[tokio::test]
@@ -433,8 +440,7 @@ async fn cancelled_fetch_keeps_cursor_cleanup_paths_usable() {
     );
 }
 
-#[tokio::test]
-async fn prepared_metadata_catalog_views_survive_restart() {
+async fn run_prepared_metadata_catalog_views_survive_restart() {
     let base_dir = create_unique_test_dir("prepared_statement_runtime", "catalog_views");
 
     {
@@ -497,6 +503,14 @@ async fn prepared_metadata_catalog_views_survive_restart() {
     }
 
     let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+#[test]
+fn prepared_metadata_catalog_views_survive_restart() {
+    run_async_test_with_large_stack(
+        "prepared-statement-catalog-views-restart",
+        run_prepared_metadata_catalog_views_survive_restart(),
+    );
 }
 
 #[tokio::test]

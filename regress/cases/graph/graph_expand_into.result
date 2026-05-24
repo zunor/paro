@@ -72,19 +72,19 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(ei_graph
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: expr_1, expr_2
+  Output: gt.anchor, gt.neighbor
   ->  GRAPH_PROJECT  (rows=1)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=4)
-              Graph: ei_graph
-              Edge Label: Knows
-              Direction: Forward
-              Mode: ExpandInto
-              ->  GRAPH_SCAN  (rows=1)
-                    Graph: ei_graph
-                    Vertex Label: Node
-                    Table: ei_person
-                    Filter: <pushed down>
+    Output: expr_1, expr_2
+    Filter: <pushed down>
+    ->  GRAPH_EXPAND  (rows=1)
+      Graph: ei_graph
+      Edge Label: Knows
+      Direction: Forward
+      ->  GRAPH_SCAN  (rows=1)
+        Graph: ei_graph
+        Vertex Label: Node
+        Table: ei_person
+        Filter: <pushed down>
 
 SELECT * FROM GRAPH_TABLE(ei_graph
     MATCH ANY SHORTEST (a:Node WHERE a.name = 'Carol')-[r:Route]->{1,3}(b:Node WHERE b.name = 'Alice')
@@ -100,21 +100,20 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(ei_graph
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: expr_1, expr_2
+  Output: gt.src, gt.dst
   ->  GRAPH_PROJECT  (rows=3)
-        Output: col_2, col_2
-        ->  GRAPH_SHORTEST_PATH  (rows=12)
-              Graph: ei_graph
-              Edge Label: Route
-              Direction: Forward
-              Path Mode: ANY SHORTEST
-              Search: Bidirectional
-              Hops: {1,3}
-              ->  GRAPH_SCAN  (rows=1)
-                    Graph: ei_graph
-                    Vertex Label: Node
-                    Table: ei_person
-                    Filter: <pushed down>
+    Output: expr_1, expr_2
+    Filter: <pushed down>
+    ->  GRAPH_SHORTEST_PATH  (rows=3)
+      Graph: ei_graph
+      Edge Label: Route
+      Direction: Forward
+      Hops: {1,3}
+      ->  GRAPH_SCAN  (rows=1)
+        Graph: ei_graph
+        Vertex Label: Node
+        Table: ei_person
+        Filter: <pushed down>
 
 DROP PROPERTY GRAPH ei_graph;
 DROP PROPERTY GRAPH

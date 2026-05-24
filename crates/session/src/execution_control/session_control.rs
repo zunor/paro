@@ -74,7 +74,6 @@ impl SessionExecutionControl {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, statement))
         {
-            statement.clear_coordinator();
             active.take();
         }
     }

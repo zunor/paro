@@ -29,9 +29,9 @@ SELECT
 FROM window_spill_test;
 QUERY PLAN
 PROJECTION  (rows=32)
-  Output: part, id, score, ROW_NUMBER() OVER (PARTITION BY part ORDER BY score DESC NULLS FIRST, id ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-  ->  ROWSET_SCAN on public.window_spill_test
-        Columns: part, id, score
+  Output: part, id, score, rn
+  ->  ROWSET_SCAN on public.window_spill_test  (rows=32)
+    Columns: part, id, score
 
 SET force_external = DEFAULT;
 SET
@@ -49,10 +49,11 @@ FROM window_spill_test
 WHERE part IN (1, 2);
 QUERY PLAN
 PROJECTION  (rows=6)
-  Output: part, id, score, ROW_NUMBER() OVER (PARTITION BY part ORDER BY score DESC NULLS FIRST, id ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), RANK() OVER (PARTITION BY part ORDER BY score DESC NULLS FIRST, id ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), LEAD(score, 1, -1) OVER (PARTITION BY part ORDER BY score DESC NULLS FIRST, id ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), LAG(score, 1, -1) OVER (PARTITION BY part ORDER BY score DESC NULLS FIRST, id ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-  ->  ROWSET_SCAN on public.window_spill_test
-        Columns: part, id, score
-        Filter: (part = 1 OR part = 2)
+  Output: part, id, score, rn, rk, lead_score, lag_score
+  ->  FILTER  (rows=6)
+    Filter: #0 = 1 OR #0 = 2
+    ->  ROWSET_SCAN on public.window_spill_test  (rows=32)
+      Columns: part, id, score
 
 CREATE TABLE window_large_partition_test (part INT, id INT, payload VARCHAR);
 CREATE TABLE
@@ -99,6 +100,6 @@ SELECT
 FROM window_large_partition_test;
 QUERY PLAN
 PROJECTION  (rows=69)
-  Output: part, id, ROW_NUMBER() OVER (PARTITION BY part ORDER BY id ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-  ->  ROWSET_SCAN on public.window_large_partition_test
-        Columns: part, id
+  Output: part, id, rn
+  ->  ROWSET_SCAN on public.window_large_partition_test  (rows=69)
+    Columns: part, id

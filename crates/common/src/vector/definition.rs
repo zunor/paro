@@ -663,6 +663,26 @@ impl Vector {
         *ptr.add(idx)
     }
 
+    /// Get a fixed-width value through flat/constant/dictionary encodings.
+    ///
+    /// # Safety
+    /// Caller must ensure T matches the vector's physical fixed-width type.
+    #[inline]
+    pub unsafe fn get_fixed<T: Copy>(&self, idx: usize) -> T {
+        match self.vector_type {
+            VectorType::Flat => self.get_flat(idx),
+            VectorType::Constant => self.get_flat(0),
+            VectorType::Dictionary => {
+                let physical_idx = self.selection.physical_index(idx);
+                self.child
+                    .as_ref()
+                    .expect("dictionary vector missing child")
+                    .get_fixed(physical_idx)
+            }
+            _ => unreachable!("fixed-width read requires flat, constant, or dictionary vector"),
+        }
+    }
+
     /// Set value at index for flat vector.
     ///
     /// # Safety

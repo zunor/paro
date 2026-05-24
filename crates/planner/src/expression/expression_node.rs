@@ -11,7 +11,7 @@ use paro_external::routine::identity::RoutineCallIdentity;
 use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
     ConjunctionExpression, ConstantExpression, FunctionExpression, OperatorExpression,
-    ReferenceExpression, SubqueryExpression, WindowExpression,
+    ParameterExpression, ReferenceExpression, SubqueryExpression, WindowExpression,
 };
 
 /// Expression represents a semantic-aware version of a SQL expression.
@@ -25,6 +25,7 @@ pub enum Expression {
     Case(CaseExpression),
     Comparison(ComparisonExpression),
     Operator(OperatorExpression),
+    Parameter(ParameterExpression),
     Reference(ReferenceExpression),
     Aggregate(AggregateExpression),
     Subquery(SubqueryExpression),
@@ -42,6 +43,7 @@ impl Expression {
             Expression::Case(expr) => expr.return_type(),
             Expression::Comparison(expr) => expr.return_type(),
             Expression::Operator(expr) => expr.return_type.clone(),
+            Expression::Parameter(expr) => expr.return_type(),
             Expression::Reference(expr) => expr.return_type.clone(),
             Expression::Aggregate(expr) => expr.return_type.clone(),
             Expression::Subquery(expr) => expr.return_type(),
@@ -83,6 +85,7 @@ impl Expression {
                 expr.left.contains_external_routine() || expr.right.contains_external_routine()
             }
             Expression::Operator(expr) => expr.children.iter().any(Self::contains_external_routine),
+            Expression::Parameter(_) => false,
             Expression::Aggregate(expr) => {
                 expr.children.iter().any(Self::contains_external_routine)
                     || expr
@@ -159,6 +162,7 @@ impl Expression {
                     .collect();
                 Expression::Operator(expr)
             }
+            Expression::Parameter(_) => self,
             Expression::Aggregate(mut expr) => {
                 expr.children = expr
                     .children
@@ -259,6 +263,7 @@ impl Expression {
                     .collect();
                 Expression::Operator(expr)
             }
+            Expression::Parameter(_) => self,
             Expression::Aggregate(mut expr) => {
                 expr.children = expr
                     .children
@@ -361,6 +366,7 @@ impl Expression {
                     Box::new(expr.result_if_false.extract_aggregates(aggregates, offset));
                 Expression::Case(expr)
             }
+            Expression::Parameter(_) => self,
             _ => self,
         }
     }
@@ -416,6 +422,7 @@ impl Expression {
                         .zip(&b.children)
                         .all(|(ca, cb)| ca.equals(cb))
             }
+            (Expression::Parameter(a), Expression::Parameter(b)) => a.slot == b.slot,
             (Expression::Reference(a), Expression::Reference(b)) => a.index == b.index,
             (Expression::Aggregate(a), Expression::Aggregate(b)) => {
                 a.function.name == b.function.name

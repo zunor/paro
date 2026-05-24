@@ -66,22 +66,22 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(start_graph
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: expr_1, expr_2, expr_3
+  Output: gt.person_name, gt.company_name, gt.city_name
   ->  GRAPH_PROJECT  (rows=1)
-        Output: col_2, col_2, col_2
-        ->  GRAPH_EXPAND  (rows=16)
-              Graph: start_graph
-              Edge Label: WorksAt
-              Direction: Backward
-              ->  GRAPH_EXPAND  (rows=4)
-                    Graph: start_graph
-                    Edge Label: LocatedIn
-                    Direction: Forward
-                    ->  GRAPH_SCAN  (rows=1)
-                          Graph: start_graph
-                          Vertex Label: Company
-                          Table: ssp_company
-                          Filter: <pushed down>
+    Output: expr_1, expr_2, expr_3
+    ->  GRAPH_EXPAND  (rows=1)
+      Graph: start_graph
+      Edge Label: WorksAt
+      Direction: Backward
+      ->  GRAPH_EXPAND  (rows=1)
+        Graph: start_graph
+        Edge Label: LocatedIn
+        Direction: Forward
+        ->  GRAPH_SCAN  (rows=1)
+          Graph: start_graph
+          Vertex Label: Company
+          Table: ssp_company
+          Filter: <pushed down>
 
 SELECT * FROM GRAPH_TABLE(start_graph
     MATCH (p:Person)-[w:WorksAt]->(c:Company WHERE c.name = 'Acme')-[l:LocatedIn]->(city:City)

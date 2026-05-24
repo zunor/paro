@@ -86,14 +86,14 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: g_region, region, sum_sales
   ->  ORDER_BY  (rows=3)
-        Sort Key: grouping_1 ASC NULLS LAST, ref_1 ASC NULLS LAST
+    Sort Key: #0 ASC NULLS LAST, #3 ASC NULLS LAST
+    ->  PROJECTION  (rows=3)
+      Output: g_region, region, sum_sales, __paro_hidden_1
+      ->  AGGREGATE  (rows=3)
+        Group Key: #0
+        Aggregates: sum(#1)
+        Grouping Sets: (0), ()
+        Output: aggr_0, aggr_1, aggr_2
         ->  PROJECTION  (rows=3)
-              Output: grouping_1, ref_1, sum, ref_1
-              ->  HASH_GROUP_BY  (rows=3)
-                    Group Key: col0
-                    Aggregates: SUM(col1)
-                    ->  PROJECTION
-                          Output: col0, col1
-                          ->  PROJECTION  (rows=3)
-                                Output: col0, col1
-                                ->  EXPRESSION_SCAN  (rows=3)
+          Output: region, sales
+          ->  VALUES  (rows=3)

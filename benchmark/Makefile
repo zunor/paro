@@ -16,12 +16,24 @@ WORKLOAD ?=
 FILTER   ?=
 SUITE    ?=
 BASELINE ?=
+POLICY   ?=
 PARAMS   ?=
 PID      ?=
+GATE     ?= operator-runtime
+INCLUDE_SOURCE ?=
+BLESS_RUNS ?=
+POLICY_EVOLUTION ?=
+ARCHIVE ?=
+ARCHIVE_CACHE ?=
+RUN_ID ?=
+PLATFORM ?= auto
+POLICY_VERSION ?= auto
+QUORUM_RETRIES ?=
+AGAINST ?=
 
 .DEFAULT_GOAL := help
 
-.PHONY: setup run check bless ci ping clean clean-venv distclean help
+.PHONY: setup run check bless calibrate bisect archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
 
 setup: ## Create .venv and install benchmark dependencies
 	@$(PYTHON_SYS) -m venv $(VENV_DIR)
@@ -30,38 +42,89 @@ setup: ## Create .venv and install benchmark dependencies
 	@echo "Benchmark dependencies installed in $(VENV_DIR)"
 
 run: ## Run benchmark (WORKLOAD= FILTER= SUITE= PARAMS="k=v a=b")
-	$(RUNNER) \
+	$(RUNNER) run \
 		$(if $(SUITE),--suite $(SUITE)) \
 		$(if $(WORKLOAD),--workload $(WORKLOAD)) \
 		$(if $(FILTER),--filter "$(FILTER)") \
 		$(foreach p,$(PARAMS),--param $(p)) \
 		$(if $(PID),--pid $(PID))
 
-check: ## Run benchmark and compare against baseline (BASELINE=path)
-	@test -n "$(BASELINE)" || (echo "BASELINE is required" && exit 2)
-	$(RUNNER) \
-		$(if $(SUITE),--suite $(SUITE)) \
-		$(if $(WORKLOAD),--workload $(WORKLOAD)) \
-		$(if $(FILTER),--filter "$(FILTER)") \
-		$(foreach p,$(PARAMS),--param $(p)) \
+check: ## Run performance gate (GATE= INCLUDE_SOURCE= BASELINE= PID=)
+	$(RUNNER) gate check \
+		--gate $(GATE) \
+		$(if $(BASELINE),--baseline $(BASELINE)) \
+		$(if $(POLICY),--policy $(POLICY)) \
 		$(if $(PID),--pid $(PID)) \
-		--check $(BASELINE)
+		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
+		$(if $(ARCHIVE),--archive $(ARCHIVE)) \
+		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE)) \
+		$(if $(QUORUM_RETRIES),--quorum-retries $(QUORUM_RETRIES))
 
-bless: ## Update baseline from current run (BASELINE=path)
-	@test -n "$(BASELINE)" || (echo "BASELINE is required" && exit 2)
-	$(RUNNER) \
-		$(if $(SUITE),--suite $(SUITE)) \
-		$(if $(WORKLOAD),--workload $(WORKLOAD)) \
-		$(if $(FILTER),--filter "$(FILTER)") \
-		$(foreach p,$(PARAMS),--param $(p)) \
+bless: ## Update gate baseline (GATE= BASELINE= PID=)
+	$(RUNNER) gate bless \
+		--gate $(GATE) \
+		$(if $(BASELINE),--baseline $(BASELINE)) \
+		$(if $(POLICY),--policy $(POLICY)) \
 		$(if $(PID),--pid $(PID)) \
-		--bless $(BASELINE)
+		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
+		$(if $(BLESS_RUNS),--bless-runs $(BLESS_RUNS)) \
+		$(if $(POLICY_EVOLUTION),--policy-evolution)
+
+calibrate: ## Append clean gate observations to archive (GATE= ARCHIVE= RUN_ID=)
+	$(RUNNER) gate calibrate \
+		--gate $(GATE) \
+		$(if $(BASELINE),--baseline $(BASELINE)) \
+		$(if $(POLICY),--policy $(POLICY)) \
+		$(if $(PID),--pid $(PID)) \
+		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
+		$(if $(ARCHIVE),--archive $(ARCHIVE)) \
+		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE)) \
+		$(if $(RUN_ID),--run-id $(RUN_ID))
+
+bisect: ## Compare this checkout against archived gate result (GATE= AGAINST=<sha> ARCHIVE=)
+	$(RUNNER) gate bisect \
+		--gate $(GATE) \
+		--against $(AGAINST) \
+		$(if $(POLICY),--policy $(POLICY)) \
+		$(if $(PID),--pid $(PID)) \
+		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
+		$(if $(ARCHIVE),--archive $(ARCHIVE)) \
+		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE))
+
+archive-manifest: ## Rebuild archive manifest from listing (ARCHIVE= GATE= PLATFORM= POLICY_VERSION=)
+	$(PYTHON) -m harness.archive.manifest rebuild \
+		--archive $(ARCHIVE) \
+		--gate $(GATE) \
+		--platform $(PLATFORM) \
+		--policy-version $(POLICY_VERSION) \
+		$(if $(POLICY),--policy $(POLICY)) \
+		$(if $(ARCHIVE_CACHE),--cache $(ARCHIVE_CACHE))
+
+archive-recompute-calibration: ## Recompute calibration from archived results (ARCHIVE= GATE= PLATFORM= POLICY=)
+	$(PYTHON) -m harness.archive.calibration recompute \
+		--archive $(ARCHIVE) \
+		--policy $(if $(POLICY),$(POLICY),policies/$(GATE).toml) \
+		--gate $(GATE) \
+		--platform $(PLATFORM) \
+		$(if $(ARCHIVE_CACHE),--cache $(ARCHIVE_CACHE))
+
+archive-finalize-calibration: ## Rebuild manifest, recompute rolling calibration, and rebuild manifest again
+	$(PYTHON) -m harness.archive.finalize \
+		--archive $(ARCHIVE) \
+		--gate $(GATE) \
+		--platform $(PLATFORM) \
+		--policy-version $(POLICY_VERSION) \
+		$(if $(POLICY),--policy $(POLICY)) \
+		$(if $(ARCHIVE_CACHE),--cache $(ARCHIVE_CACHE))
 
 ci: ## Run CI benchmark suite (default: SUITE=pr-smoke)
-	$(RUNNER) \
+	$(RUNNER) run \
 		--suite $(if $(SUITE),$(SUITE),pr-smoke) \
 		$(foreach p,$(PARAMS),--param $(p)) \
 		$(if $(PID),--pid $(PID))
+
+test: ## Run benchmark harness unit tests
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 
 ping: ## Verify Paro connectivity from config.toml
 	@$(PYTHON) -c "\

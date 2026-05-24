@@ -1069,6 +1069,15 @@ mod tests {
         reader.new_iterator().unwrap()
     }
 
+    fn encode_varlen_strings(strings: &[&str]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for value in strings {
+            data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            data.extend_from_slice(value.as_bytes());
+        }
+        data
+    }
+
     #[test]
     fn test_scalar_iterator_basic() {
         let (buffer, meta, ordinal_index) = create_test_column();
@@ -1206,6 +1215,50 @@ mod tests {
         // No more data
         let (count5, _) = iter.next_batch(30).unwrap();
         assert_eq!(count5, 0);
+    }
+
+    #[test]
+    fn test_varchar_iterator_multiple_pages_preserves_input_offset() {
+        let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
+            .with_nullable(false)
+            .with_encoding(EncodingType::Plain)
+            .with_compression(CompressionType::None)
+            .with_page_size(32);
+        let buffer = Cursor::new(Vec::new());
+        let mut writer = ScalarColumnWriter::new(opts, buffer).unwrap();
+
+        let strings = [
+            "page00-aa",
+            "page00-bb",
+            "page00-cc",
+            "page01-dd",
+            "page01-ee",
+            "page01-ff",
+            "page02-gg",
+        ];
+        let data = encode_varlen_strings(&strings);
+        writer.append(&data, None, strings.len() as u32).unwrap();
+
+        let meta = writer.finish().unwrap();
+        let buffer = Cursor::new(writer.into_inner().into_inner());
+        let reader_meta = ColumnReaderMeta::from_writer_meta(&meta, FieldType::Varchar);
+        let mut reader = ColumnReader::create(
+            reader_meta,
+            buffer,
+            ColumnReaderOptions::default(),
+            create_page_reader(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut iter = reader.new_iterator().unwrap();
+
+        let (count, batch) = iter.next_batch(strings.len()).unwrap();
+        assert_eq!(count, strings.len());
+        for (idx, expected) in strings.iter().enumerate() {
+            let value = batch.varlen_row(idx).unwrap().unwrap();
+            assert_eq!(value.as_ref(), expected.as_bytes());
+        }
     }
 
     #[test]

@@ -1,0 +1,65 @@
+[meta]
+name = "fetch_vs_completed"
+description = "Fetch-driven vs completed-output/discarding-profile comparison: latency, throughput, RSS peak"
+run_order = 22
+
+[params]
+rows = 100000
+join_left = 50000
+join_right = 5000
+agg_groups = 500
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+# Fetch-driven path queries (bounded output, streaming/breaker DAG)
+[[query]]
+id = "fetch_scan_filter"
+file = "sql/q_fetch_scan_filter.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fetch_hash_join"
+file = "sql/q_fetch_hash_join.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fetch_sort"
+file = "sql/q_fetch_sort.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fetch_aggregate"
+file = "sql/q_fetch_aggregate.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+# Completed-output path queries (unbounded, control-region or EXPLAIN ANALYZE)
+[[query]]
+id = "completed_explain_scan"
+file = "sql/q_completed_explain_scan.sql"
+validate = "none"
+collect_explain_profile = false
+allow_reexecute = true
+
+[[query]]
+id = "completed_explain_join"
+file = "sql/q_completed_explain_join.sql"
+validate = "none"
+collect_explain_profile = false
+allow_reexecute = true
+
+[[query]]
+id = "completed_recursive_cte"
+file = "sql/q_completed_recursive_cte.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true

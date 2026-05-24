@@ -93,7 +93,7 @@ impl<T> AccountedVec<T> {
         self.consume_capacity(delta)?;
         match self
             .inner
-            .try_reserve_exact(required.saturating_sub(self.inner.capacity()))
+            .try_reserve_exact(required.saturating_sub(self.inner.len()))
         {
             Ok(()) => {
                 let actual_bytes = bytes_for_capacity::<T>(self.inner.capacity());
@@ -257,5 +257,29 @@ impl<T> Deref for AccountedVec<T> {
 impl<T> DerefMut for AccountedVec<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{MemoryDomain, MemoryGrant};
+
+    #[test]
+    fn try_reserve_ensures_len_plus_additional_capacity() {
+        let grant = MemoryGrant::detached(4096, MemoryDomain::Host);
+        let mut values = AccountedVec::new(grant);
+
+        values.try_reserve(4).expect("initial reserve");
+        values.try_resize_with(2, || 7_u64).expect("resize");
+        assert!(values.capacity() >= 4);
+
+        values.try_reserve(8).expect("reserve from partial len");
+        assert!(
+            values.capacity() >= 10,
+            "capacity must cover len + additional, len={}, capacity={}",
+            values.len(),
+            values.capacity()
+        );
     }
 }

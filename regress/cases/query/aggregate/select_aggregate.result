@@ -56,16 +56,14 @@ FROM (
 GROUP BY grp + 10;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: +, sum
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: +(col0, 10)
-        Aggregates: SUM(*(col1, 2)) FILTER (WHERE (col2 >= 2))
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: +(col0, 10), *(col1, 2), (col2 >= 2)
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: g, filtered_sum
+  ->  AGGREGATE  (rows=3)
+    Group Key: +(#0, 10)
+    Aggregates: sum(*(#1, 2)) FILTER (WHERE #2 >= 2)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=6)
+      Output: grp, x, y
+      ->  VALUES  (rows=6)
 
 EXPLAIN SELECT first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST)
 FROM (
@@ -75,14 +73,13 @@ FROM (
 ) AS ordered_values(x, y);
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: first
-  ->  UNGROUPED_AGGREGATE  (rows=1)
-        Aggregates: FIRST(col0) WITHIN GROUP (ORDER BY col1 DESC NULLS LAST)
-        ->  PROJECTION
-              Output: col0, col1
-              ->  PROJECTION  (rows=3)
-                    Output: col0, col1
-                    ->  EXPRESSION_SCAN  (rows=3)
+  Output: first(x) WITHIN GROUP ( ORDER BY y DESC NULLS LAST )
+  ->  AGGREGATE  (rows=1)
+    Aggregates: first(#0) WITHIN GROUP (ORDER BY #1 DESC NULLS LAST)
+    Output: aggr_0
+    ->  PROJECTION  (rows=3)
+      Output: x, y
+      ->  VALUES  (rows=3)
 
 SELECT
     grp,
@@ -145,16 +142,14 @@ FROM (
 GROUP BY grp;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: ref_1, sum, sum, count
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: col0
-        Aggregates: SUM(col1), SUM(DISTINCT col1), COUNT(DISTINCT col2)
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: col0, col1, col1, col2
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: grp, sum_all, sum_distinct_x, count_distinct_y
+  ->  AGGREGATE  (rows=3)
+    Group Key: #0
+    Aggregates: sum(#1), sum(DISTINCT #1), count(DISTINCT #2)
+    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    ->  PROJECTION  (rows=6)
+      Output: grp, x, y
+      ->  VALUES  (rows=6)
 
 EXPLAIN SELECT grp + 10 AS g,
        sum(x) AS sum_x,
@@ -170,16 +165,14 @@ FROM (
 GROUP BY grp + 10;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: +, sum, count
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: +(col0, 10)
-        Aggregates: SUM(col1), COUNT(col1) FILTER (WHERE (col2 >= 2))
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: +(col0, 10), col1, col1, (col2 >= 2)
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: g, sum_x, count_filtered
+  ->  AGGREGATE  (rows=3)
+    Group Key: +(#0, 10)
+    Aggregates: sum(#1), count(#1) FILTER (WHERE #2 >= 2)
+    Output: aggr_0, aggr_1, aggr_2
+    ->  PROJECTION  (rows=6)
+      Output: grp, x, y
+      ->  VALUES  (rows=6)
 
 SELECT sum(x) FILTER (WHERE x > 2) AS sum_x_gt_2
 FROM agg_phase0;
@@ -235,16 +228,14 @@ FROM (
 GROUP BY grp;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: ref_1, sum, sum, count
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: col0
-        Aggregates: SUM(col1) FILTER (WHERE (col2 >= 2)), SUM(col1) FILTER (WHERE (col2 >= 4)), COUNT(col1) FILTER (WHERE (col1 >= 2))
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: col0, col1, (col2 >= 2), col1, (col2 >= 4), col1, (col1 >= 2)
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: grp, sum_y_ge_2, sum_y_ge_4, cnt_x_ge_2
+  ->  AGGREGATE  (rows=3)
+    Group Key: #0
+    Aggregates: sum(#1) FILTER (WHERE #2 >= 2), sum(#1) FILTER (WHERE #2 >= 4), count(#1) FILTER (WHERE #1 >= 2)
+    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    ->  PROJECTION  (rows=6)
+      Output: grp, x, y
+      ->  VALUES  (rows=6)
 
 SELECT
     first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST) AS first_desc,
@@ -295,16 +286,14 @@ FROM (
 GROUP BY grp;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: ref_1, first, last
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: col0
-        Aggregates: FIRST(col1) WITHIN GROUP (ORDER BY col2 DESC NULLS LAST), LAST(col1) WITHIN GROUP (ORDER BY col2 DESC NULLS LAST)
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: col0, col1, col2, col1, col2
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: grp, first_desc, last_desc
+  ->  AGGREGATE  (rows=3)
+    Group Key: #0
+    Aggregates: first(#1) WITHIN GROUP (ORDER BY #2 DESC NULLS LAST), last(#1) WITHIN GROUP (ORDER BY #2 DESC NULLS LAST)
+    Output: aggr_0, aggr_1, aggr_2
+    ->  PROJECTION  (rows=6)
+      Output: grp, x, y
+      ->  VALUES  (rows=6)
 
 SELECT
     GROUPING(grp) AS grp_g,
@@ -370,16 +359,15 @@ FROM (
 GROUP BY GROUPING SETS ((grp), ());
 QUERY PLAN
 PROJECTION  (rows=6)
-  Output: grouping_1, ref_1, sum
-  ->  HASH_GROUP_BY  (rows=6)
-        Group Key: col0
-        Aggregates: SUM(col1)
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: col0, col1
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: grp_g, grp, sum_x
+  ->  AGGREGATE  (rows=6)
+    Group Key: #0
+    Aggregates: sum(#1)
+    Grouping Sets: (0), ()
+    Output: aggr_0, aggr_1, aggr_2
+    ->  PROJECTION  (rows=6)
+      Output: grp, x
+      ->  VALUES  (rows=6)
 
 SELECT
     first_value(x) WITHIN GROUP (ORDER BY y ASC NULLS LAST) AS first_value_asc,
@@ -519,16 +507,14 @@ FROM (
 GROUP BY grp;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: ref_1, string_agg, array_agg, stddev
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: col0
-        Aggregates: STRING_AGG(col3, '|') WITHIN GROUP (ORDER BY col2 DESC NULLS LAST), ARRAY_AGG(col1) FILTER (WHERE (col1 >= 2)), STDDEV(col1)
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: col0, col3, '|', col2, col1, (col1 >= 2), col1
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1, col2, col3
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: grp, labels_desc, xs_ge_2, stddev_x
+  ->  AGGREGATE  (rows=3)
+    Group Key: #0
+    Aggregates: string_agg(#3, '|') WITHIN GROUP (ORDER BY #2 DESC NULLS LAST), array_agg(#1) FILTER (WHERE #1 >= 2), stddev(#1)
+    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    ->  PROJECTION  (rows=6)
+      Output: grp, x, y, label
+      ->  VALUES  (rows=6)
 
 DROP TABLE IF EXISTS agg_phase3;
 DROP TABLE
@@ -579,15 +565,14 @@ FROM (
 GROUP BY g_tiny;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: ref_1, sum
-  ->  PERFECT_HASH_GROUP_BY  (rows=3)
-        Group Key: col0
-        Aggregates: SUM(col1)
-        ->  PROJECTION
-              Output: col0, col1
-              ->  PROJECTION  (rows=8)
-                    Output: col0, col1
-                    ->  EXPRESSION_SCAN  (rows=8)
+  Output: g_tiny, sum_x
+  ->  AGGREGATE  (rows=3)
+    Group Key: #0
+    Aggregates: sum(#1)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=8)
+      Output: g_tiny, x
+      ->  VALUES  (rows=8)
 
 SELECT
     g_tiny,
@@ -623,15 +608,14 @@ FROM (
 GROUP BY g_tiny, h_tiny;
 QUERY PLAN
 PROJECTION  (rows=8)
-  Output: ref_1, ref_2, count_star, sum
-  ->  PERFECT_HASH_GROUP_BY  (rows=8)
-        Group Key: col0, col1
-        Aggregates: COUNT_STAR(*), SUM(col2) FILTER (WHERE col3)
-        ->  PROJECTION
-              Output: col0, col1, col2, col3
-              ->  PROJECTION  (rows=8)
-                    Output: col0, col1, col2, col3
-                    ->  EXPRESSION_SCAN  (rows=8)
+  Output: g_tiny, h_tiny, cnt, sum_flag_true
+  ->  AGGREGATE  (rows=8)
+    Group Key: #0, #1
+    Aggregates: count_star(*), sum(#2) FILTER (WHERE #3)
+    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    ->  PROJECTION  (rows=8)
+      Output: g_tiny, h_tiny, x, flag
+      ->  VALUES  (rows=8)
 
 EXPLAIN SELECT
     g_tiny,
@@ -649,16 +633,14 @@ FROM (
 GROUP BY g_tiny;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: ref_1, count
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: col0
-        Aggregates: COUNT(DISTINCT col1)
-        Key Mode: INLINE_KEY_1B
-        ->  PROJECTION
-              Output: col0, col1
-              ->  PROJECTION  (rows=8)
-                    Output: col0, col1
-                    ->  EXPRESSION_SCAN  (rows=8)
+  Output: g_tiny, cd_x
+  ->  AGGREGATE  (rows=3)
+    Group Key: #0
+    Aggregates: count(DISTINCT #1)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=8)
+      Output: g_tiny, x
+      ->  VALUES  (rows=8)
 
 EXPLAIN SELECT
     g_tiny,
@@ -676,16 +658,15 @@ FROM (
 GROUP BY GROUPING SETS ((g_tiny), ());
 QUERY PLAN
 PROJECTION  (rows=6)
-  Output: ref_1, sum
-  ->  HASH_GROUP_BY  (rows=6)
-        Group Key: col0
-        Aggregates: SUM(col1)
-        Key Mode: INLINE_KEY_1B
-        ->  PROJECTION
-              Output: col0, col1
-              ->  PROJECTION  (rows=8)
-                    Output: col0, col1
-                    ->  EXPRESSION_SCAN  (rows=8)
+  Output: g_tiny, sum_x
+  ->  AGGREGATE  (rows=6)
+    Group Key: #0
+    Aggregates: sum(#1)
+    Grouping Sets: (0), ()
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=8)
+      Output: g_tiny, x
+      ->  VALUES  (rows=8)
 
 SELECT
     (k_int + (tag * 3000000)) AS inline_key,
@@ -722,16 +703,14 @@ FROM (
 GROUP BY (k_int + (tag * 3000000));
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: +, count_star
-  ->  HASH_GROUP_BY  (rows=3)
-        Group Key: +(col0, *(col1, 3000000))
-        Aggregates: COUNT_STAR(*)
-        Key Mode: INLINE_KEY_4B
-        ->  PROJECTION
-              Output: +(col0, *(col1, 3000000))
-              ->  PROJECTION  (rows=6)
-                    Output: col0, col1
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: inline_key, cnt
+  ->  AGGREGATE  (rows=3)
+    Group Key: +(#0, *(#1, 3000000))
+    Aggregates: count_star(*)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=6)
+      Output: k_int, tag
+      ->  VALUES  (rows=6)
 
 EXPLAIN SELECT
     (k_int + (tag * 3000000)) AS k_inline_int,
@@ -747,17 +726,14 @@ FROM (
 GROUP BY (k_int + (tag * 3000000)), k_small, k_tiny;
 QUERY PLAN
 PROJECTION  (rows=4)
-  Output: +, ref_2, ref_3, sum
-  ->  HASH_GROUP_BY  (rows=4)
-        Group Key: +(col0, *(col3, 3000000)), col1, col2
-        Aggregates: SUM(col4)
-        Key Mode: INLINE_KEY_7B
-        Partitioning: RADIX_PARTITIONS=4
-        ->  PROJECTION
-              Output: +(col0, *(col3, 3000000)), col1, col2, col4
-              ->  PROJECTION  (rows=4)
-                    Output: col0, col1, col2, col3, col4
-                    ->  EXPRESSION_SCAN  (rows=4)
+  Output: k_inline_int, k_small, k_tiny, sum_v
+  ->  AGGREGATE  (rows=4)
+    Group Key: +(#0, *(#3, 3000000)), #1, #2
+    Aggregates: sum(#4)
+    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    ->  PROJECTION  (rows=4)
+      Output: k_int, k_small, k_tiny, tag, v
+      ->  VALUES  (rows=4)
 
 EXPLAIN SELECT
     (k_big + (tag::BIGINT * 30000000000::BIGINT)) AS k_big_range,
@@ -772,16 +748,14 @@ FROM (
 GROUP BY (k_big + (tag::BIGINT * 30000000000::BIGINT)), k_int;
 QUERY PLAN
 PROJECTION  (rows=4)
-  Output: +, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=4)
-        Group Key: +(col0, *(CAST(col2 AS BIGINT), 30000000000)), col1
-        Aggregates: SUM(col3)
-        Partitioning: RADIX_PARTITIONS=4
-        ->  PROJECTION
-              Output: +(col0, *(CAST(col2 AS BIGINT), 30000000000)), col1, col3
-              ->  PROJECTION  (rows=4)
-                    Output: col0, col1, col2, col3
-                    ->  EXPRESSION_SCAN  (rows=4)
+  Output: k_big_range, k_int, sum_v
+  ->  AGGREGATE  (rows=4)
+    Group Key: +(#0, *(CAST(#2 AS BIGINT), 30000000000)), #1
+    Aggregates: sum(#3)
+    Output: aggr_0, aggr_1, aggr_2
+    ->  PROJECTION  (rows=4)
+      Output: k_big, k_int, tag, v
+      ->  VALUES  (rows=4)
 
 EXPLAIN SELECT
     k_big,
@@ -796,16 +770,14 @@ FROM (
 GROUP BY k_big, k_int;
 QUERY PLAN
 PROJECTION  (rows=4)
-  Output: ref_1, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=4)
-        Group Key: col0, col1
-        Aggregates: SUM(col2)
-        Partitioning: RADIX_PARTITIONS=4
-        ->  PROJECTION
-              Output: col0, col1, col2
-              ->  PROJECTION  (rows=4)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=4)
+  Output: k_big, k_int, sum_v
+  ->  AGGREGATE  (rows=4)
+    Group Key: #0, #1
+    Aggregates: sum(#2)
+    Output: aggr_0, aggr_1, aggr_2
+    ->  PROJECTION  (rows=4)
+      Output: k_big, k_int, v
+      ->  VALUES  (rows=4)
 
 EXPLAIN SELECT
     k_big,
@@ -820,15 +792,15 @@ FROM (
 GROUP BY GROUPING SETS ((k_big, k_int), ());
 QUERY PLAN
 PROJECTION  (rows=4)
-  Output: ref_1, ref_2, sum
-  ->  HASH_GROUP_BY  (rows=4)
-        Group Key: col0, col1
-        Aggregates: SUM(col2)
-        ->  PROJECTION
-              Output: col0, col1, col2
-              ->  PROJECTION  (rows=4)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=4)
+  Output: k_big, k_int, sum_v
+  ->  AGGREGATE  (rows=4)
+    Group Key: #0, #1
+    Aggregates: sum(#2)
+    Grouping Sets: (0, 1), ()
+    Output: aggr_0, aggr_1, aggr_2
+    ->  PROJECTION  (rows=4)
+      Output: k_big, k_int, v
+      ->  VALUES  (rows=4)
 
 SET threads = 1;
 SET
@@ -906,14 +878,13 @@ FROM (
 ) AS agg_phase41(x);
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: sum, +(sum, 1), +(sum, count_star)
-  ->  UNGROUPED_AGGREGATE  (rows=1)
-        Aggregates: SUM(col0), COUNT_STAR(*)
-        ->  PROJECTION
-              Output: col0
-              ->  PROJECTION  (rows=3)
-                    Output: col0
-                    ->  EXPRESSION_SCAN  (rows=3)
+  Output: s1, s2, s3
+  ->  AGGREGATE  (rows=1)
+    Aggregates: sum(#0), count_star(*)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=3)
+      Output: x
+      ->  VALUES  (rows=3)
 
 EXPLAIN SELECT
     grp,
@@ -934,18 +905,16 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, sx, sx_plus_1, sx_plus_cnt
   ->  ORDER_BY  (rows=3)
-        Sort Key: ref_1 ASC NULLS LAST
-        ->  PROJECTION  (rows=3)
-              Output: ref_1, sum, +(sum, 1), +(sum, count_star), ref_1
-              ->  HASH_GROUP_BY  (rows=3)
-                    Group Key: col0
-                    Aggregates: SUM(col1), COUNT_STAR(*)
-                    Key Mode: INLINE_KEY_4B
-                    ->  PROJECTION
-                          Output: col0, col1
-                          ->  PROJECTION  (rows=6)
-                                Output: col0, col1
-                                ->  EXPRESSION_SCAN  (rows=6)
+    Sort Key: #4 ASC NULLS LAST
+    ->  PROJECTION  (rows=3)
+      Output: grp, sx, sx_plus_1, sx_plus_cnt, __paro_hidden_1
+      ->  AGGREGATE  (rows=3)
+        Group Key: #0
+        Aggregates: sum(#1), count_star(*)
+        Output: aggr_0, aggr_1, aggr_2
+        ->  PROJECTION  (rows=6)
+          Output: grp, x
+          ->  VALUES  (rows=6)
 
 SELECT
     grp,
@@ -966,8 +935,8 @@ EXPLAIN SELECT
 FROM agg_phase0;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: agg_0, agg_1, agg_2
-  ->  EXPRESSION_SCAN  (rows=1)
+  Output: cnt_star, min_x, max_x
+  ->  VALUES  (rows=1)
 
 SELECT
     count(*) AS cnt_star,
@@ -986,8 +955,8 @@ FROM (
 ) AS agg_phase42_proj;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: agg_0, agg_1
-  ->  EXPRESSION_SCAN  (rows=1)
+  Output: min_px, max_px
+  ->  VALUES  (rows=1)
 
 SELECT
     min(px) AS min_px,
@@ -1005,8 +974,8 @@ EXPLAIN SELECT
 FROM agg_phase0;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: agg_0, agg_1
-  ->  EXPRESSION_SCAN  (rows=1)
+  Output: min_y, max_y
+  ->  VALUES  (rows=1)
 
 SELECT
     min(y) AS min_y,
@@ -1026,14 +995,13 @@ FROM (
 ) AS agg_phase42_filter(x);
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: min
-  ->  UNGROUPED_AGGREGATE  (rows=1)
-        Aggregates: MIN(col0) FILTER (WHERE (col0 > 2))
-        ->  PROJECTION
-              Output: col0, (col0 > 2)
-              ->  PROJECTION  (rows=6)
-                    Output: col0
-                    ->  EXPRESSION_SCAN  (rows=6)
+  Output: min_filtered
+  ->  AGGREGATE  (rows=1)
+    Aggregates: min(#0) FILTER (WHERE #0 > 2)
+    Output: aggr_0
+    ->  PROJECTION  (rows=6)
+      Output: x
+      ->  VALUES  (rows=6)
 
 SELECT min(x) FILTER (WHERE x > 2) AS min_filtered
 FROM (

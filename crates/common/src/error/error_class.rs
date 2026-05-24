@@ -43,6 +43,8 @@ pub enum ErrorClass {
     Constraint,
     /// Class 25 - Invalid Transaction State
     Transaction,
+    /// Class 2B - Dependent Privilege Descriptors Still Exist
+    DependentPrivilegeDescriptors,
     /// Class 3D - Invalid Catalog Name
     InvalidCatalogName,
     /// Class 3F - Invalid Schema Name
@@ -80,6 +82,7 @@ impl ErrorClass {
             "22" => Self::Data,
             "23" => Self::Constraint,
             "25" => Self::Transaction,
+            "2B" => Self::DependentPrivilegeDescriptors,
             "3D" => Self::InvalidCatalogName,
             "3F" => Self::InvalidSchemaName,
             "40" => Self::TransactionRollback,
@@ -106,6 +109,7 @@ impl ErrorClass {
             Self::Data => "22",
             Self::Constraint => "23",
             Self::Transaction => "25",
+            Self::DependentPrivilegeDescriptors => "2B",
             Self::InvalidCatalogName => "3D",
             Self::InvalidSchemaName => "3F",
             Self::TransactionRollback => "40",
@@ -132,6 +136,7 @@ impl ErrorClass {
             Self::Data => "Data Exception",
             Self::Constraint => "Integrity Constraint Violation",
             Self::Transaction => "Invalid Transaction State",
+            Self::DependentPrivilegeDescriptors => "Dependent Privilege Descriptors Still Exist",
             Self::InvalidCatalogName => "Invalid Catalog Name",
             Self::InvalidSchemaName => "Invalid Schema Name",
             Self::TransactionRollback => "Transaction Rollback",

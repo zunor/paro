@@ -14,6 +14,7 @@ SELECT py_degraded_probe(1);
 -- @control restart profile=python_worker_crash
 SELECT py_degraded_probe(1);
 
+-- @normalize python_runtime_retry_hint
 SELECT py_degraded_probe(1);
 
 SELECT 6 * 7;

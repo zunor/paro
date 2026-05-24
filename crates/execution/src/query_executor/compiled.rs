@@ -1,11 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
 use paro_common::types::LogicalType;
 
-use crate::operator::PhysicalOperator;
+use crate::pipeline::StatementProgram;
+use crate::runtime::ParameterBindings;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumnDesc {
@@ -24,12 +23,45 @@ impl ResultColumnDesc {
 
 #[derive(Debug, Clone)]
 pub struct CompiledStatement {
-    pub physical_plan: Arc<dyn PhysicalOperator>,
+    pub executable: CompiledExecutable,
     pub result_schema: Vec<ResultColumnDesc>,
     pub parameter_types: Vec<LogicalType>,
+    pub parameter_bindings: ParameterBindings,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledExecutable {
+    Program(StatementProgram),
 }
 
 impl CompiledStatement {
+    pub fn new(
+        program: StatementProgram,
+        result_schema: Vec<ResultColumnDesc>,
+        parameter_types: Vec<LogicalType>,
+    ) -> Self {
+        Self::new_with_bindings(
+            program,
+            result_schema,
+            parameter_types,
+            ParameterBindings::empty(),
+        )
+    }
+
+    pub fn new_with_bindings(
+        program: StatementProgram,
+        result_schema: Vec<ResultColumnDesc>,
+        parameter_types: Vec<LogicalType>,
+        parameter_bindings: ParameterBindings,
+    ) -> Self {
+        Self {
+            executable: CompiledExecutable::Program(program),
+            result_schema,
+            parameter_types,
+            parameter_bindings,
+        }
+    }
+
     #[inline]
     pub fn is_query(&self) -> bool {
         !self.result_schema.is_empty()

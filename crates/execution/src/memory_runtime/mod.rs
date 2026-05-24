@@ -14,7 +14,6 @@ mod operator_account;
 mod operator_scope;
 mod pipeline_retained;
 mod prefetch_lease;
-mod query_output_buffer;
 mod query_pool;
 mod reclaimer;
 mod retained_chunks;
@@ -35,7 +34,6 @@ pub use operator_account::{CacheAligned, ColdCounters, HotCounters, OperatorMemo
 pub use operator_scope::OperatorMemoryScope;
 pub use pipeline_retained::PipelineRetainedMemory;
 pub use prefetch_lease::PrefetchLease;
-pub use query_output_buffer::{OutputAppendResult, QueryOutputBuffer};
 pub use query_pool::QueryMemoryPool;
 pub use reclaimer::{
     BufferPoolReclaimer, GrowOutcome, ReclaimHandle, ReclaimStats, Reclaimer, SpillCost,
@@ -184,47 +182,6 @@ mod tests {
         assert_eq!(lease.inflight_bytes(), 0);
         assert_eq!(account.prefetch_bytes(), 0);
         assert_eq!(pool.prefetch_bytes(), 0);
-    }
-
-    #[test]
-    fn query_output_buffer_refunds_on_pop_and_deduplicates_shared_chunks() {
-        let pool = Arc::new(QueryMemoryPool::new(1024 * 1024));
-        let account = Arc::new(OperatorMemoryAccount::new(pool.clone()));
-        let owner: Arc<dyn MemoryOwner> = account.clone();
-        let memory = MemoryAccountingContext::from_owner(
-            owner,
-            MemoryDomain::Host,
-            MemoryTag::Allocator,
-            MemoryAccountingClass::NonRevocable,
-        );
-        let allocator: Arc<dyn paro_common::allocator::Allocator> =
-            Arc::new(DefaultAllocator::new());
-        let mut buffer = QueryOutputBuffer::new(1024 * 1024, memory, allocator);
-        let shared = Arc::new(paro_common::test_utils::test_i32_vector(&[1, 2, 3, 4]));
-        let chunk = paro_common::test_utils::test_chunk_from_arc_vectors(vec![shared]);
-        let allocation_bytes = chunk.get_allocation_size();
-        assert!(allocation_bytes > 0);
-
-        assert!(matches!(
-            buffer.try_append(chunk.clone()).unwrap(),
-            OutputAppendResult::Success
-        ));
-        assert!(matches!(
-            buffer.try_append(chunk).unwrap(),
-            OutputAppendResult::Success
-        ));
-        assert_eq!(buffer.retained_bytes(), allocation_bytes);
-        assert_eq!(pool.non_revocable_bytes(), allocation_bytes);
-
-        assert!(buffer.scan().is_some());
-        assert_eq!(buffer.retained_bytes(), allocation_bytes);
-        assert!(buffer.scan().is_some());
-        assert_eq!(buffer.retained_bytes(), 0);
-        assert_eq!(pool.non_revocable_bytes(), 0);
-        assert!(pool.metadata_bytes() > 0);
-        drop(buffer);
-        assert_eq!(pool.metadata_bytes(), 0);
-        assert_eq!(pool.issued_bytes(), 0);
     }
 
     #[test]

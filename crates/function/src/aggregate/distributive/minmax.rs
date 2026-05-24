@@ -43,7 +43,7 @@ macro_rules! define_minmax_impl {
                         let state_ptr = *state_ptrs.add(i);
                         let state = state_ptr as *mut State;
 
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if (*state).is_null || compare_op(val, (*state).value) {
                             (*state).value = val;
                             (*state).is_null = false;
@@ -63,7 +63,7 @@ macro_rules! define_minmax_impl {
 
                 for i in 0..count {
                     if !input.is_null(i) {
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if (*state).is_null || compare_op(val, (*state).value) {
                             (*state).value = val;
                             (*state).is_null = false;

@@ -67,15 +67,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, cd_x, sd_y
   ->  ORDER_BY  (rows=3)
-        Sort Key: ref_1 ASC NULLS LAST
-        ->  PROJECTION  (rows=3)
-              Output: ref_1, count, sum, ref_1
-              ->  HASH_GROUP_BY  (rows=3)
-                    Group Key: col0
-                    Aggregates: COUNT(DISTINCT col1), SUM(DISTINCT col2)
-                    Key Mode: INLINE_KEY_4B
-                    ->  PROJECTION
-                          Output: col0, col1, col2
-                          ->  PROJECTION  (rows=6)
-                                Output: col0, col1, col2
-                                ->  EXPRESSION_SCAN  (rows=6)
+    Sort Key: #3 ASC NULLS LAST
+    ->  PROJECTION  (rows=3)
+      Output: grp, cd_x, sd_y, __paro_hidden_1
+      ->  AGGREGATE  (rows=3)
+        Group Key: #0
+        Aggregates: count(DISTINCT #1), sum(DISTINCT #2)
+        Output: aggr_0, aggr_1, aggr_2
+        ->  PROJECTION  (rows=6)
+          Output: grp, x, y
+          ->  VALUES  (rows=6)

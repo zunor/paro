@@ -18,10 +18,10 @@ QUERY PLAN
 PROJECTION  (rows=0)
   Output: id
   ->  ORDER_BY  (rows=0)
-        Sort Key: id ASC NULLS LAST
-        ->  PROJECTION  (rows=0)
-              Output: id, id
-              ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+    Sort Key: #1 ASC NULLS LAST
+    ->  PROJECTION  (rows=0)
+      Output: id, __paro_hidden_1
+      ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
 
 EXPLAIN
 SELECT id
@@ -36,11 +36,11 @@ QUERY PLAN
 PROJECTION  (rows=0)
   Output: id
   ->  TOP_N  (rows=0)
-        Sort Key: TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector')) DESC NULLS FIRST
-        Limit: 5
-        ->  PROJECTION  (rows=0)
-              Output: id, TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector'))
-              ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+    Sort Key: #1 DESC NULLS FIRST
+    Limit: 5
+    ->  PROJECTION  (rows=0)
+      Output: id, __paro_hidden_1
+      ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
 
 SELECT id
 FROM ft_coverage_guard

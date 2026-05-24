@@ -356,7 +356,10 @@ impl ExpressionRewriter {
                 Expression::Subquery(subq)
             }
             // Leaf expressions have no children
-            Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => expr,
+            Expression::Constant(_)
+            | Expression::Parameter(_)
+            | Expression::ColumnRef(_)
+            | Expression::Reference(_) => expr,
         }
     }
 }

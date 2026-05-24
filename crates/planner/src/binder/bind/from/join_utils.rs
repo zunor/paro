@@ -208,7 +208,7 @@ pub fn get_expression_side(
         Expression::ColumnRef(col) => {
             JoinSide::get_side(col.binding.table_index, left_bindings, right_bindings)
         }
-        Expression::Constant(_) => JoinSide::None,
+        Expression::Constant(_) | Expression::Parameter(_) => JoinSide::None,
         Expression::Function(func) => {
             let mut side = JoinSide::None;
             for child in &func.children {

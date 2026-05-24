@@ -286,6 +286,13 @@ pub struct ComparisonJoin {
     pub conditions: Vec<JoinCondition>,
     /// Table index for MARK join results.
     pub mark_index: Option<usize>,
+    /// First condition whose NULL result contributes UNKNOWN to a MARK join.
+    ///
+    /// Correlated MARK joins evaluate correlation predicates before the actual
+    /// ANY/IN payload comparison. NULL in those correlation predicates means
+    /// the RHS row is not part of this outer row's subquery result, while NULL
+    /// in the payload comparison preserves SQL UNKNOWN semantics.
+    pub mark_null_condition_start: Option<usize>,
     /// Columns that are duplicate-eliminated and pushed into the RHS.
     pub duplicate_eliminated_columns: Vec<Expression>,
     /// Whether the delim join has been flipped to de-duplicating the RHS instead.
@@ -317,6 +324,7 @@ impl ComparisonJoin {
             right: Box::new(right),
             conditions,
             mark_index: None,
+            mark_null_condition_start: matches!(join_type, JoinType::Mark).then_some(0),
             duplicate_eliminated_columns: vec![],
             delim_flipped: false,
             left_projection_map: vec![],

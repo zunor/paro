@@ -42,23 +42,22 @@ FROM stats_small AS s
 JOIN stats_big AS b ON s.id = b.id;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: id, payload
+  Output: s.id, b.payload
   Cardinality: [0, 1, 1]
   Output Schema: s.id INTEGER, b.payload VARCHAR
   ->  FILTER  (rows=1)
-        Filter: (id = id)
-        Cardinality: [0, 1, 1]
-        Output Schema: id INTEGER, payload VARCHAR, id INTEGER
-        ->  CROSS_PRODUCT  (rows=5)
-              Join Type: CROSS
-              Cardinality: [5, 5, 5]
-              Output Schema: id INTEGER, payload VARCHAR, id INTEGER
-              ->  ROWSET_SCAN on public.stats_big b
-                    Columns: id, payload
-                    Output Schema: id INTEGER, payload VARCHAR
-              ->  ROWSET_SCAN on public.stats_small s
-                    Columns: id
-                    Output Schema: id INTEGER
+    Filter: #2 = #0
+    Cardinality: [0, 1, 1]
+    Output Schema: id INTEGER, payload VARCHAR, id INTEGER
+    ->  CROSS_PRODUCT  (rows=5)
+      Cardinality: [5, 5, 5]
+      Output Schema: id INTEGER, payload VARCHAR, id INTEGER
+      ->  ROWSET_SCAN on public.stats_big b
+        Columns: id, payload
+        Output Schema: id INTEGER, payload VARCHAR
+      ->  ROWSET_SCAN on public.stats_small s
+        Columns: id
+        Output Schema: id INTEGER
 
 SELECT s.id, b.payload
 FROM stats_small AS s

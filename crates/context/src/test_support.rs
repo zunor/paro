@@ -226,7 +226,6 @@ impl TestStatementContextBuilder {
             )),
             limits,
             cancellation: StatementCancellation::new(CancellationToken::new(), None),
-            execution_tracker: None,
             services: Arc::new(QueryResources {
                 infra: execution_resources,
                 cast_functions: Arc::new(CastFunctionSet::new()),

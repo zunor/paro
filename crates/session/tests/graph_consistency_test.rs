@@ -20,7 +20,7 @@ use graph::graph_runtime_key;
 use instance_persistent::create_persistent_instance;
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::runtime_value::Value;
-use paro_execution::operator::ddl::refresh_property_graph::mark_property_graph_stale;
+use paro_execution::operators::graph::refresh_property_graph::mark_property_graph_stale;
 use paro_instance::DatabaseCloseAction;
 use paro_session::{CollectingSink, Session};
 use paro_storage::index::graph::VertexKey;

@@ -478,8 +478,9 @@ impl FoldableConstantMatcher {
                     && Self::is_foldable(&case.result_if_true)
                     && Self::is_foldable(&case.result_if_false)
             }
-            // Column references, aggregates, subqueries, windows are not foldable
+            // Column references, runtime parameters, aggregates, subqueries, windows are not foldable.
             Expression::ColumnRef(_)
+            | Expression::Parameter(_)
             | Expression::Reference(_)
             | Expression::Aggregate(_)
             | Expression::Subquery(_)

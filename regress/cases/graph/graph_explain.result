@@ -45,17 +45,17 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: expr_1, expr_2
+  Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=3)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=4000)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+    Output: expr_1, expr_2
+    ->  GRAPH_EXPAND  (rows=3)
+      Graph: social_network
+      Edge Label: Knows
+      Direction: Forward
+      ->  GRAPH_SCAN  (rows=3)
+        Graph: social_network
+        Vertex Label: Person
+        Table: person
 
 EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k1:Knows]->(b:Person)-[k2:Knows]->(c:Person)
@@ -63,21 +63,21 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: expr_1, expr_2, expr_3
+  Output: gt.a_name, gt.b_name, gt.c_name
   ->  GRAPH_PROJECT  (rows=3)
-        Output: col_2, col_2, col_2
-        ->  GRAPH_EXPAND  (rows=16000)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              ->  GRAPH_EXPAND  (rows=4000)
-                    Graph: social_network
-                    Edge Label: Knows
-                    Direction: Forward
-                    ->  GRAPH_SCAN  (rows=1000)
-                          Graph: social_network
-                          Vertex Label: Person
-                          Table: person
+    Output: expr_1, expr_2, expr_3
+    ->  GRAPH_EXPAND  (rows=3)
+      Graph: social_network
+      Edge Label: Knows
+      Direction: Forward
+      ->  GRAPH_EXPAND  (rows=3)
+        Graph: social_network
+        Edge Label: Knows
+        Direction: Forward
+        ->  GRAPH_SCAN  (rows=3)
+          Graph: social_network
+          Vertex Label: Person
+          Table: person
 
 EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     MATCH (b:Person)<-[k:Knows]-(a:Person)
@@ -85,17 +85,17 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: expr_1, expr_2
+  Output: gt.src_name, gt.dst_name
   ->  GRAPH_PROJECT  (rows=3)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=4000)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Backward
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+    Output: expr_1, expr_2
+    ->  GRAPH_EXPAND  (rows=3)
+      Graph: social_network
+      Edge Label: Knows
+      Direction: Backward
+      ->  GRAPH_SCAN  (rows=3)
+        Graph: social_network
+        Vertex Label: Person
+        Table: person
 
 EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     MATCH (p:Person)-[w:WorksAt]->(c:Company)
@@ -103,17 +103,17 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: expr_1, expr_2
+  Output: gt.person_name, gt.company_name
   ->  GRAPH_PROJECT  (rows=3)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=4000)
-              Graph: social_network
-              Edge Label: WorksAt
-              Direction: Forward
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+    Output: expr_1, expr_2
+    ->  GRAPH_EXPAND  (rows=3)
+      Graph: social_network
+      Edge Label: WorksAt
+      Direction: Forward
+      ->  GRAPH_SCAN  (rows=3)
+        Graph: social_network
+        Vertex Label: Person
+        Table: person
 
 EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)
@@ -121,18 +121,18 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=9)
-  Output: expr_1, expr_2
+  Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=9)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=12000)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Hops: {1,3}
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+    Output: expr_1, expr_2
+    ->  GRAPH_EXPAND  (rows=9)
+      Graph: social_network
+      Edge Label: Knows
+      Direction: Forward
+      Hops: {1,3}
+      ->  GRAPH_SCAN  (rows=3)
+        Graph: social_network
+        Vertex Label: Person
+        Table: person
 
 EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     MATCH ANY SHORTEST (a:Person)-[k:Knows]->{1,3}(b:Person)
@@ -140,19 +140,18 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=9)
-  Output: expr_1, expr_2
+  Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=9)
-        Output: col_2, col_2
-        ->  GRAPH_SHORTEST_PATH  (rows=12000)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Path Mode: ANY SHORTEST
-              Hops: {1,3}
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+    Output: expr_1, expr_2
+    ->  GRAPH_SHORTEST_PATH  (rows=9)
+      Graph: social_network
+      Edge Label: Knows
+      Direction: Forward
+      Hops: {1,3}
+      ->  GRAPH_SCAN  (rows=3)
+        Graph: social_network
+        Vertex Label: Person
+        Table: person
 
 EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     MATCH ALL SHORTEST (a:Person)-[k:Knows]->{1,3}(b:Person)
@@ -160,19 +159,18 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PROJECTION  (rows=9)
-  Output: expr_1, expr_2
+  Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=9)
-        Output: col_2, col_2
-        ->  GRAPH_SHORTEST_PATH  (rows=12000)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Path Mode: ALL SHORTEST
-              Hops: {1,3}
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+    Output: expr_1, expr_2
+    ->  GRAPH_SHORTEST_PATH  (rows=9)
+      Graph: social_network
+      Edge Label: Knows
+      Direction: Forward
+      Hops: {1,3}
+      ->  GRAPH_SCAN  (rows=3)
+        Graph: social_network
+        Vertex Label: Person
+        Table: person
 
 -- @normalize explain_operator_timing,explain_summary_timing
 EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
@@ -180,20 +178,12 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
 QUERY PLAN
-PROJECTION  (rows=3) (actual time=<time-range> rows=3 loops=1)
-  Output: expr_1, expr_2
-  ->  GRAPH_PROJECT  (rows=3) (actual time=<time-range> rows=3 loops=1)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=4000) (actual time=<time-range> rows=0 loops=1)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Spilled: false
-              Peak Memory: 0 B
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+PIPELINE 0
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
+  TRANSFORM #1 GRAPH_EXPAND (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 3
 
@@ -203,22 +193,12 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
 QUERY PLAN
-PROJECTION  (rows=9) (actual time=<time-range> rows=3 loops=1)
-  Output: expr_1, expr_2
-  ->  GRAPH_PROJECT  (rows=9) (actual time=<time-range> rows=3 loops=1)
-        Output: col_2, col_2
-        ->  GRAPH_SHORTEST_PATH  (rows=12000) (actual time=<time-range> rows=0 loops=1)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Path Mode: ANY SHORTEST
-              Hops: {1,3}
-              Spilled: false
-              Peak Memory: 84 B
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+PIPELINE 0
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
+  TRANSFORM #1 GRAPH_SHORTEST_PATH (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 3
 
@@ -234,21 +214,12 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
 QUERY PLAN
-PROJECTION  (rows=9) (actual time=<time-range> rows=3 loops=1)
-  Output: expr_1, expr_2
-  ->  GRAPH_PROJECT  (rows=9) (actual time=<time-range> rows=3 loops=1)
-        Output: col_2, col_2
-        ->  GRAPH_EXPAND  (rows=12000) (actual time=<time-range> rows=0 loops=1)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Hops: {1,3}
-              Spilled: true
-              Peak Memory: 22 B
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+PIPELINE 0
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
+  TRANSFORM #1 GRAPH_EXPAND (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 3
 
@@ -258,22 +229,12 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     COLUMNS (a.name AS from_name, b.name AS to_name, path_length(p) AS hops)
 ) gt;
 QUERY PLAN
-PROJECTION  (rows=9) (actual time=<time-range> rows=3 loops=1)
-  Output: expr_1, expr_2, expr_3
-  ->  GRAPH_PROJECT  (rows=9) (actual time=<time-range> rows=3 loops=1)
-        Output: col_2, col_2, col_6
-        ->  GRAPH_SHORTEST_PATH  (rows=12000) (actual time=<time-range> rows=0 loops=1)
-              Graph: social_network
-              Edge Label: Knows
-              Direction: Forward
-              Path Mode: ANY SHORTEST
-              Hops: {1,3}
-              Spilled: true
-              Peak Memory: 86 B
-              ->  GRAPH_SCAN  (rows=1000)
-                    Graph: social_network
-                    Vertex Label: Person
-                    Table: person
+PIPELINE 0
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
+  TRANSFORM #1 GRAPH_SHORTEST_PATH (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 3
 
@@ -290,7 +251,7 @@ SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
-ERROR: force_external requires a temporary directory (SET temp_directory) (SQLSTATE=XX000)
+ERROR: force_external graph scan requires a temporary directory (SQLSTATE=53200)
 
 SET force_external = DEFAULT;
 SET

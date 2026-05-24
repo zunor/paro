@@ -4,6 +4,33 @@
 use crate::runtime_value::Value;
 use crate::types::LogicalType;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RuntimeParamId(u32);
+
+impl RuntimeParamId {
+    pub fn new(index: usize) -> Self {
+        assert!(index <= u32::MAX as usize, "runtime parameter id exhausted");
+        Self(index as u32)
+    }
+
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterSlot {
+    pub index: RuntimeParamId,
+    pub ty: LogicalType,
+}
+
+impl ParameterSlot {
+    pub fn new(index: RuntimeParamId, ty: LogicalType) -> Self {
+        Self { index, ty }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundParameter {
     pub value: Value,

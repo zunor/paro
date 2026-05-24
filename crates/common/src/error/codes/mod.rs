@@ -6,6 +6,7 @@
 pub mod connection;
 pub mod constraint;
 pub mod data;
+pub mod dependency;
 pub mod external_routine;
 pub mod feature;
 pub mod internal;

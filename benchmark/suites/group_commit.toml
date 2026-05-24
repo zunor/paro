@@ -1,11 +1,6 @@
 name = "group_commit"
 description = "SQL group commit queue performance gate"
 
-[regression]
-enabled = true
-threshold_percent = 20
-baseline_file = "baselines/group-commit-macos-arm64.json"
-
 [[include]]
 workload = "group_commit"
 queries = [

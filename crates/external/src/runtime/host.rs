@@ -23,6 +23,14 @@ const DEFAULT_REPROBE_MAX: Duration = Duration::from_secs(30);
 const DISABLE_ENV: &str = "PARO_PYTHON_RUNTIME_DISABLED";
 const PYTHON_BIN_ENV: &str = "PARO_PYTHON_BIN";
 const DEFAULT_PYTHON_BIN: &str = "python3";
+const PYTHON_SLOTS_PROBE: &str = "import dataclasses\n@dataclasses.dataclass(slots=True)\nclass _ParoSlotsProbe:\n    value: int\n";
+const PYTHON_AUTO_CANDIDATES: &[&str] = &[
+    "python3.12",
+    "python3.11",
+    "python3.13",
+    "python3.14",
+    DEFAULT_PYTHON_BIN,
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PythonRuntimeStartupPolicy {
@@ -139,9 +147,7 @@ struct CommandPythonRuntimeProbe {
 
 impl Default for CommandPythonRuntimeProbe {
     fn default() -> Self {
-        let python_binary = env::var_os(PYTHON_BIN_ENV)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| OsString::from(DEFAULT_PYTHON_BIN));
+        let python_binary = default_python_binary();
         Self { python_binary }
     }
 }
@@ -156,7 +162,7 @@ impl PythonRuntimeProbe for CommandPythonRuntimeProbe {
 
         match Command::new(&self.python_binary)
             .arg("-c")
-            .arg("import sys; print(sys.executable)")
+            .arg(PYTHON_SLOTS_PROBE)
             .output()
         {
             Ok(output) if output.status.success() => PythonRuntimeProbeResult::ready(),
@@ -184,6 +190,26 @@ impl PythonRuntimeProbe for CommandPythonRuntimeProbe {
             )),
         }
     }
+}
+
+pub fn default_python_binary() -> OsString {
+    if let Some(value) = env::var_os(PYTHON_BIN_ENV).filter(|value| !value.is_empty()) {
+        return value;
+    }
+    PYTHON_AUTO_CANDIDATES
+        .iter()
+        .copied()
+        .find(|candidate| python_supports_required_dataclass_slots(candidate))
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from(DEFAULT_PYTHON_BIN))
+}
+
+fn python_supports_required_dataclass_slots(candidate: &str) -> bool {
+    Command::new(candidate)
+        .arg("-c")
+        .arg(PYTHON_SLOTS_PROBE)
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 #[derive(Debug, Clone)]

@@ -36,12 +36,12 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-        Sort Key: L2_DISTANCE(emb, CAST('[1.0, 1.0, 1.0]' AS FLOAT[3])) ASC NULLS LAST
-        Limit: 2
-        ->  PROJECTION  (rows=4)
-              Output: id, L2_DISTANCE(emb, CAST('[1.0, 1.0, 1.0]' AS FLOAT[3]))
-              ->  ROWSET_SCAN on public.items
-                    Columns: id, emb
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 2
+    ->  PROJECTION  (rows=4)
+      Output: id, __paro_hidden_1
+      ->  ROWSET_SCAN on public.items  (rows=4)
+        Columns: id, emb
 
 SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 id

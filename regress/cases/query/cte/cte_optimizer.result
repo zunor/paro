@@ -5,36 +5,37 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: v
   ->  ORDER_BY  (rows=1)
-        Sort Key: col0 ASC NULLS LAST
-        ->  PROJECTION  (rows=1)
-              Output: col0, col0
-              ->  PROJECTION  (rows=1)
-                    Output: col0
-                    ->  FILTER  (rows=1)
-                          Filter: (col0 > 1)
-                          ->  EXPRESSION_SCAN  (rows=3)
+    Sort Key: #1 ASC NULLS LAST
+    ->  PROJECTION  (rows=1)
+      Output: v, __paro_hidden_1
+      ->  PROJECTION  (rows=1)
+        Output: expr_1
+        ->  FILTER  (rows=1)
+          Filter: #0 > 1
+          ->  VALUES  (rows=3)
 
 EXPLAIN
 WITH nums(v) AS MATERIALIZED (VALUES (1), (2), (3))
 SELECT v FROM nums WHERE v > 1 ORDER BY v;
 QUERY PLAN
-CTE
+MATERIALIZED_CTE
   CTE Name: nums
   Materialization: MATERIALIZED
   Reference Count: 1
   ->  FILTER  (rows=1)
-        Filter: (col0 > 1)
-        ->  EXPRESSION_SCAN  (rows=3)
+    Filter: #0 > 1
+    ->  VALUES  (rows=3)
   ->  PROJECTION
-        Output: v
-        ->  ORDER_BY
-              Sort Key: v ASC NULLS LAST
-              ->  PROJECTION
-                    Output: v, v
-                    ->  FILTER
-                          Filter: (v > 1)
-                          ->  CTE_SCAN
-                                CTE Name: nums
+    Output: v
+    ->  ORDER_BY
+      Sort Key: #1 ASC NULLS LAST
+      ->  PROJECTION
+        Output: v, __paro_hidden_1
+        ->  FILTER
+          Filter: #0 > 1
+          ->  CTE_SCAN
+            CTE Index: 0
+            Table Index: 8
 
 EXPLAIN
 WITH nums(v) AS NOT MATERIALIZED (VALUES (1), (2), (3))
@@ -43,19 +44,17 @@ FROM nums AS a
 CROSS JOIN nums AS b;
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: sum
-  ->  UNGROUPED_AGGREGATE  (rows=1)
-        Aggregates: SUM(+(expr_1, expr_1))
-        ->  PROJECTION
-              Output: +(expr_1, expr_1)
-              ->  CROSS_PRODUCT  (rows=1000000)
-                    Join Type: CROSS
-                    ->  PROJECTION
-                          Output: col0
-                          ->  EXPRESSION_SCAN
-                    ->  PROJECTION
-                          Output: col0
-                          ->  EXPRESSION_SCAN
+  Output: total
+  ->  AGGREGATE  (rows=1)
+    Aggregates: sum(+(#0, #1))
+    Output: aggr_0
+    ->  CROSS_PRODUCT  (rows=1000000)
+      ->  PROJECTION
+        Output: expr_1
+        ->  VALUES
+      ->  PROJECTION
+        Output: expr_1
+        ->  VALUES
 
 WITH nums(v) AS NOT MATERIALIZED (VALUES (1), (2), (3))
 SELECT SUM(a.v + b.v) AS total

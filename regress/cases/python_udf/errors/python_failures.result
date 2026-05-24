@@ -13,7 +13,7 @@ AS $$raise ValueError("boom from worker")$$;
 CREATE FUNCTION
 
 SELECT py_fail(1);
-ERROR: ValueError: boom from worker (SQLSTATE=XX000)
+ERROR: ValueError: boom from worker (SQLSTATE=38001)
 
 CREATE FUNCTION py_bad_contract(a INTEGER) RETURNS INTEGER
 LANGUAGE python
@@ -21,7 +21,7 @@ AS $$return ["oops" for _ in a.materialize_py()]$$;
 CREATE FUNCTION
 
 SELECT py_bad_contract(1);
-ERROR: error: required argument is not an integer (SQLSTATE=XX000)
+ERROR: error: required argument is not an integer (SQLSTATE=39001)
 
 CREATE FUNCTION py_missing_import(a INTEGER) RETURNS INTEGER
 LANGUAGE python

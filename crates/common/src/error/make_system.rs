@@ -32,6 +32,18 @@ pub fn query_canceled() -> ParoError {
     ))
 }
 
+/// Query canceled with a caller-provided message.
+///
+/// Prefer [`query_canceled`] unless a protocol boundary already has a stable
+/// user-facing cancellation reason to preserve.
+pub fn query_canceled_message(message: impl Into<Cow<'static, str>>) -> ParoError {
+    ParoError::new(ErrorData::new(
+        Severity::Error,
+        codes::operator::QUERY_CANCELED,
+        message,
+    ))
+}
+
 /// Statement canceled because statement_timeout fired.
 pub fn statement_timeout() -> ParoError {
     ParoError::new(ErrorData::new(

@@ -105,7 +105,7 @@ SET force_external = DEFAULT;
 SET temp_directory = DEFAULT;
 
 SET force_external = true;
--- @statement error force_external requires a temporary directory
+-- @statement error SQLSTATE=53200
 SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)

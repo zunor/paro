@@ -80,7 +80,7 @@ macro_rules! define_variance_input_impl {
                     }
                     let state_ptr = *state_ptrs.add(i);
                     let state = &mut *(state_ptr as *mut State);
-                    let value: $input_type = input.get_flat(i);
+                    let value: $input_type = input.get_fixed(i);
                     update_variance_state(state, value as f64);
                 }
             }
@@ -98,7 +98,7 @@ macro_rules! define_variance_input_impl {
                     if input.is_null(i) {
                         continue;
                     }
-                    let value: $input_type = input.get_flat(i);
+                    let value: $input_type = input.get_fixed(i);
                     update_variance_state(state, value as f64);
                 }
             }

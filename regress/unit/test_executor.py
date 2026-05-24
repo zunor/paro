@@ -191,6 +191,32 @@ def test_statement_error_matches_pattern_and_rolls_back() -> None:
     assert conn.rollback_calls == 1
 
 
+def test_statement_error_pattern_can_assert_sqlstate() -> None:
+    conn = _FakeConnection(
+        [
+            _Step(
+                "DROP TABLE parent;",
+                error=_FakeDbError(
+                    "cannot drop table because other objects depend on it",
+                    sqlstate="2BP01",
+                ),
+            )
+        ]
+    )
+    blocks = [
+        Block(
+            kind="statement",
+            line_no=1,
+            sql="DROP TABLE parent;",
+            statement_expect="error",
+            error_pattern="SQLSTATE=2BP01",
+        )
+    ]
+
+    execute_blocks(conn, blocks)
+    assert conn.rollback_calls == 1
+
+
 def test_statement_error_mismatch_reports_sqlstate() -> None:
     conn = _FakeConnection(
         [

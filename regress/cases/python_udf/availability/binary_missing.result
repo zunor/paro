@@ -20,7 +20,7 @@ AS $$return [value for value in a.materialize_py()]$$;
 ERROR: Python runtime interpreter is missing for CREATE FUNCTION (SQLSTATE=39P04; DETAIL=Python interpreter '__paro_missing_python__' was not found)
 
 SELECT py_missing_probe(1);
-ERROR: Python runtime interpreter is missing for external routine execution (SQLSTATE=XX000)
+ERROR: Python runtime interpreter is missing for external routine execution (SQLSTATE=39P04; DETAIL=Python interpreter '__paro_missing_python__' was not found)
 
 SELECT py_missing_probe(1);
 py_missing_probe(1)

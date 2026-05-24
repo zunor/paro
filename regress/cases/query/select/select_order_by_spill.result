@@ -82,17 +82,14 @@ id	payload
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM order_spill_test ORDER BY id DESC, k1 ASC;
 QUERY PLAN
-PROJECTION  (rows=128) (actual time=<time-range> rows=128 loops=1)
-  Output: id
-  ->  ORDER_BY  (rows=128) (actual time=<time-range> rows=256 loops=7)
-        Sort Key: id DESC NULLS FIRST, k1 ASC NULLS LAST
-        Sort Method: external merge
-        Spilled: true
-        Peak Memory: <bytes>
-        ->  PROJECTION  (rows=128) (actual time=<time-range> rows=128 loops=5)
-              Output: id, id, k1
-              ->  ROWSET_SCAN on public.order_spill_test (actual time=<time-range> rows=128 loops=6)
-                    Columns: id, k1
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=128 loops=6)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=128 loops=5)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=128 loops=5 spilled=true peak_memory_bytes=263026 spilled_bytes=1312442)
+PIPELINE 1
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=128 loops=2)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=128 loops=1)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=128 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 128
 
@@ -117,17 +114,14 @@ INSERT 0 6
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM order_spill_smallmem_test ORDER BY id ASC, k1 DESC;
 QUERY PLAN
-PROJECTION  (rows=6) (actual time=<time-range> rows=6 loops=1)
-  Output: id
-  ->  ORDER_BY  (rows=6) (actual time=<time-range> rows=12 loops=3)
-        Sort Key: id ASC NULLS LAST, k1 DESC NULLS FIRST
-        Sort Method: external merge
-        Spilled: true
-        Peak Memory: <bytes>
-        ->  PROJECTION  (rows=6) (actual time=<time-range> rows=6 loops=1)
-              Output: id, id, k1
-              ->  ROWSET_SCAN on public.order_spill_smallmem_test (actual time=<time-range> rows=6 loops=2)
-                    Columns: id, k1
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=6 loops=2)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=6 loops=1)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=6 loops=1 spilled=true peak_memory_bytes=262214 spilled_bytes=262214)
+PIPELINE 1
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=6 loops=2)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=6 loops=1)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=6 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 6
 
