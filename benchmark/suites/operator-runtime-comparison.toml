@@ -1,0 +1,14 @@
+name = "operator-runtime-comparison"
+description = "Operator runtime fetch-driven vs completed-output comparison: latency, throughput, RSS peak"
+
+# Fetch-driven bounded path (streaming + breaker DAG)
+[[include]]
+workload = "output_buffering"
+
+# Completed-output path (control-region, EXPLAIN ANALYZE)
+[[include]]
+workload = "output_buffering_unbounded"
+
+# Comparison baseline: same queries under both execution modes
+[[include]]
+workload = "fetch_vs_completed"

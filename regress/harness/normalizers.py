@@ -35,6 +35,7 @@ _TXN_STRUCT_FIELD_RE = re.compile(r"\b(ssi_state_epoch|tenant_id|tablet_id):\s*\
 _REGRESS_PATH_RE = re.compile(
     r"(?<!<repo>)/(?:[^'\"\s)]+/)*regress/(?:report/fixtures|fixtures)/[^'\"\s)]+"
 )
+_PYTHON_RETRY_HINT_RE = re.compile(r"next automatic Python runtime probe in \d+ ms")
 
 
 def normalize_explain_operator_timing(lines: list[str]) -> list[str]:
@@ -147,6 +148,14 @@ def normalize_regress_paths(lines: list[str]) -> list[str]:
     return result
 
 
+def normalize_python_runtime_retry_hint(lines: list[str]) -> list[str]:
+    """Normalize volatile retry countdowns in Python runtime availability errors."""
+    return [
+        _PYTHON_RETRY_HINT_RE.sub("next automatic Python runtime probe in <ms> ms", line)
+        for line in lines
+    ]
+
+
 # stable: normalize per-operator timing volatility.
 # stable: normalize summary timing volatility.
 # stable: normalize runtime byte volatility for spill/memory observability.
@@ -164,6 +173,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "copy_rowcount": normalize_copy_rowcount,
     "transaction_ids": normalize_transaction_ids,
     "regress_paths": normalize_regress_paths,
+    "python_runtime_retry_hint": normalize_python_runtime_retry_hint,
 }
 
 
@@ -200,6 +210,7 @@ __all__ = [
     "normalize_explain_runtime",
     "normalize_explain_runtime_bytes",
     "normalize_explain_summary_timing",
+    "normalize_python_runtime_retry_hint",
     "normalize_regress_paths",
     "normalize_transaction_ids",
     "normalizer_profiles",

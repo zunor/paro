@@ -75,15 +75,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, sum_x
   ->  ORDER_BY  (rows=3)
-        Sort Key: ref_1 ASC NULLS LAST
-        ->  PROJECTION  (rows=3)
-              Output: ref_1, sum, ref_1
-              ->  HASH_GROUP_BY  (rows=3)
-                    Group Key: col0
-                    Aggregates: SUM(col1)
-                    Key Mode: INLINE_KEY_4B
-                    ->  PROJECTION
-                          Output: col0, col1
-                          ->  PROJECTION  (rows=5)
-                                Output: col0, col1
-                                ->  EXPRESSION_SCAN  (rows=5)
+    Sort Key: #2 ASC NULLS LAST
+    ->  PROJECTION  (rows=3)
+      Output: grp, sum_x, __paro_hidden_1
+      ->  AGGREGATE  (rows=3)
+        Group Key: #0
+        Aggregates: sum(#1)
+        Output: aggr_0, aggr_1
+        ->  PROJECTION  (rows=5)
+          Output: grp, x
+          ->  VALUES  (rows=5)

@@ -274,7 +274,7 @@ impl ColumnLifetimeAnalyzer {
                     self.visit_expression(child);
                 }
             }
-            Expression::Constant(_) | Expression::Reference(_) => {}
+            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
         }
     }
 
@@ -407,7 +407,7 @@ impl ColumnLifetimeAnalyzer {
                     Self::extract_column_bindings(child, bindings);
                 }
             }
-            Expression::Constant(_) | Expression::Reference(_) => {}
+            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
         }
     }
 }

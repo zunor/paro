@@ -3216,6 +3216,7 @@ mod tests {
     use crate::test_utils::*;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -3234,6 +3235,14 @@ mod tests {
             store,
             tmp.path(),
         ))
+    }
+
+    fn test_data_dir() -> PathBuf {
+        tempfile::Builder::new()
+            .prefix("paro-tablet-runtime-")
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
@@ -3263,7 +3272,7 @@ mod tests {
     #[test]
     fn test_tablet_new() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test_tablet", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         assert_eq!(tablet.tablet_id(), 1);
         assert_eq!(tablet.table_id(), 100);
@@ -3275,7 +3284,7 @@ mod tests {
     fn create_test_rowset(id: u64, version: Version, tablet_id: u64) -> RowsetSharedPtr {
         let schema = create_test_schema();
         let meta = RowsetMeta::new(id, tablet_id, version);
-        let rowset = crate::rowset::Rowset::create(schema, meta, "/tmp/test").unwrap();
+        let rowset = crate::rowset::Rowset::create(schema, meta, test_data_dir()).unwrap();
         Arc::new(rowset)
     }
 
@@ -3286,7 +3295,7 @@ mod tests {
     #[test]
     fn test_tablet_init() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         assert_eq!(tablet.state(), TabletState::NotReady);
         tablet.init().unwrap();
@@ -3296,7 +3305,7 @@ mod tests {
     #[test]
     fn test_tablet_add_rowset() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         let rowset1 = create_test_rowset(1, Version::singleton(0), 1);
         let rowset2 = create_test_rowset(2, Version::singleton(1), 1);
@@ -3382,7 +3391,7 @@ mod tests {
     #[test]
     fn test_tablet_version_conflict() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         let rowset1 = create_test_rowset(1, Version::new(0, 5), 1);
         let rowset2 = create_test_rowset(2, Version::new(3, 7), 1);
@@ -3395,7 +3404,7 @@ mod tests {
     #[test]
     fn test_tablet_capture_consistent_rowsets() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         tablet
             .add_rowset(create_test_rowset(1, Version::singleton(0), 1))
@@ -3760,7 +3769,7 @@ mod tests {
     fn checkpoint_snapshot_records_optimistic_capture_metrics() {
         storage_metrics().reset_for_tests();
         let schema = create_test_schema();
-        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap());
+        let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap());
 
         tablet
             .add_rowset(create_test_rowset(
@@ -3784,7 +3793,7 @@ mod tests {
     #[test]
     fn test_validate_version_graph_allows_gaps_and_detects_them() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         tablet
             .add_rowset(create_test_rowset(1, Version::singleton(0), 1))
@@ -3816,7 +3825,7 @@ mod tests {
     #[test]
     fn test_tablet_max_continuous_version() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         tablet
             .add_rowset(create_test_rowset(1, Version::singleton(0), 1))
@@ -3835,7 +3844,7 @@ mod tests {
     #[test]
     fn test_validate_version_graph_rejects_overlap() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         {
             let mut rs_map = tablet.rs_version_map.write().unwrap();
@@ -3856,7 +3865,7 @@ mod tests {
     #[test]
     fn test_validate_version_graph_rejects_compaction_overlap() {
         let schema = create_test_schema();
-        let tablet = Tablet::new(1, 100, 1000, schema, "/tmp/test", None).unwrap();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
 
         {
             let mut rs_map = tablet.rs_version_map.write().unwrap();

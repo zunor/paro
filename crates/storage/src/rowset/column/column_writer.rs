@@ -817,7 +817,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         &mut self,
         data: &[u8],
         null_flags: Option<&[u8]>,
-        start_row: usize,
+        input_row_offset: usize,
         count: u32,
         type_size: usize,
     ) {
@@ -829,7 +829,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             return;
         }
         for i in 0..count as usize {
-            let row_idx = start_row + i;
+            let row_idx = input_row_offset + i;
             let is_null = Self::is_null_at(null_flags, row_idx);
             let offset = i * type_size;
             let value = &data[offset..offset + type_size];
@@ -979,7 +979,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         &mut self,
         data: &[u8],
         null_flags: Option<&[u8]>,
-        start_row: usize,
+        input_row_offset: usize,
         count: u32,
         type_size: usize,
     ) -> Result<()> {
@@ -994,7 +994,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         };
 
         for i in 0..count as usize {
-            let row_idx = start_row + i;
+            let row_idx = input_row_offset + i;
             let is_null = Self::is_null_at(null_flags, row_idx);
             let offset = i * type_size;
             if offset + type_size > data.len() {
@@ -1219,6 +1219,7 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
             0
         };
         let mut offset = 0usize;
+        let mut row_offset = 0usize;
         let mut remaining = count;
 
         while remaining > 0 {
@@ -1227,7 +1228,7 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                 self.write_data_page()?;
             }
 
-            let start_row = self.num_rows as usize;
+            let input_row_offset = row_offset;
             // Add values based on type
             let added = if let Some(ts) = type_size {
                 // Fixed-width type
@@ -1261,14 +1262,14 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                     self.update_secondary_indexes_fixed(
                         slice,
                         null_flags,
-                        start_row,
+                        input_row_offset,
                         added,
                         bytes_per_value,
                     );
                     self.update_statistics_fixed(
                         slice,
                         null_flags,
-                        start_row,
+                        input_row_offset,
                         added,
                         bytes_per_value,
                     )?;
@@ -1290,19 +1291,31 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                 added
             } else {
                 // Variable-length type
-                self.add_variable_length_data(&data[offset..], remaining, null_flags, start_row)?
+                let (added, consumed) = self.add_variable_length_data(
+                    &data[offset..],
+                    remaining,
+                    null_flags,
+                    input_row_offset,
+                )?;
+                offset += consumed;
+                added
             };
 
             if added == 0 {
+                if self.page_builder.count() > 0 {
+                    self.write_data_page()?;
+                    continue;
+                }
                 break;
             }
 
             // Process null flags
             if let Some(flags) = null_flags {
-                self.process_null_flags(flags, start_row, added as usize);
+                self.process_null_flags(flags, input_row_offset, added as usize);
             }
 
             self.num_rows += added as u64;
+            row_offset += added as usize;
             remaining -= added;
         }
 
@@ -1401,11 +1414,11 @@ impl<W: DataWriter + 'static> ColumnWriter for ScalarColumnWriter<W> {
 
 impl<W: DataWriter> ScalarColumnWriter<W> {
     /// Process null flags and add to null builder.
-    fn process_null_flags(&mut self, flags: &[u8], start_row: usize, count: usize) {
+    fn process_null_flags(&mut self, flags: &[u8], input_row_offset: usize, count: usize) {
         if let Some(ref mut null_builder) = self.null_builder {
             for i in 0..count {
-                let byte_idx = (start_row + i) / 8;
-                let bit_idx = (start_row + i) % 8;
+                let byte_idx = (input_row_offset + i) / 8;
+                let bit_idx = (input_row_offset + i) % 8;
                 let is_null = if byte_idx < flags.len() {
                     (flags[byte_idx] >> bit_idx) & 1 == 1
                 } else {
@@ -1429,8 +1442,8 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         data: &[u8],
         max_count: u32,
         null_flags: Option<&[u8]>,
-        start_row: usize,
-    ) -> Result<u32> {
+        input_row_offset: usize,
+    ) -> Result<(u32, usize)> {
         let mut offset = 0usize;
         let mut added = 0u32;
         let mut hashes = if self.column_stats.has_distinct_stats() {
@@ -1440,6 +1453,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         };
 
         while added < max_count && offset + 4 <= data.len() {
+            let value_start = offset + 4;
             // Read length prefix
             let len = u32::from_le_bytes([
                 data[offset],
@@ -1447,13 +1461,13 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 data[offset + 2],
                 data[offset + 3],
             ]) as usize;
-            offset += 4;
 
-            if offset + len > data.len() {
+            let value_end = value_start + len;
+            if value_end > data.len() {
                 break;
             }
 
-            let value = &data[offset..offset + len];
+            let value = &data[value_start..value_end];
             let success = match &mut self.page_builder {
                 PageBuilderImpl::BinaryPlain(b) => b.add_slice(value),
                 PageBuilderImpl::BinaryDict(b) => b.add_slice(value),
@@ -1464,17 +1478,17 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 break;
             }
 
-            let row_idx = start_row + added as usize;
+            let row_idx = input_row_offset + added as usize;
             let is_null = Self::is_null_at(null_flags, row_idx);
             self.update_index_value(value, is_null);
             self.update_statistics_value(value, is_null, &mut hashes)?;
 
-            offset += len;
+            offset = value_end;
             added += 1;
         }
 
         self.flush_distinct_hashes(hashes);
-        Ok(added)
+        Ok((added, offset))
     }
 
     /// Write HNSW index to file (optional).

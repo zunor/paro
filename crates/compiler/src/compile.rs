@@ -6,9 +6,12 @@ use paro_common::logging::targets;
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_context::StatementContext;
 use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
+use paro_execution::runtime::{ParameterBindingEpoch, ParameterBindings};
 use paro_parser::ast::{Expr, Statement};
 use paro_parser::{Range, StatementVisitor};
+use paro_planner::operator::{ExplainMode, LogicalOperator};
 use paro_planner::planner::Planner;
+use paro_planner::verify::verify_physical_planner_invariants;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -84,8 +87,86 @@ pub fn compile_statement_with_parameters(
         "Logical plan optimized"
     );
 
-    let generator = paro_execution::physical_plan::generator::PhysicalPlanGenerator::new(ctx);
-    let physical_plan = match generator.plan(&mut optimized_plan) {
+    let executable = if let LogicalOperator::Explain(explain) = &mut optimized_plan.operator {
+        if explain.spec.mode == ExplainMode::Analyze {
+            let target_plan = match generate_typed_physical_plan(ctx.as_ref(), &mut explain.child) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    error!(
+                        target: targets::EXECUTOR,
+                        statement_tag = %statement_tag,
+                        error = %error,
+                        stage = "physical_plan",
+                        "EXPLAIN ANALYZE target physical plan generation failed"
+                    );
+                    return Err(error);
+                }
+            };
+            let target =
+                match paro_execution::pipeline::StatementProgram::from_physical_plan(target_plan) {
+                    Ok(program) => program,
+                    Err(error) => {
+                        error!(
+                            target: targets::EXECUTOR,
+                            statement_tag = %statement_tag,
+                            error = %error,
+                            stage = "runtime_program",
+                            "EXPLAIN ANALYZE target runtime program generation failed"
+                        );
+                        return Err(error);
+                    }
+                };
+            paro_execution::pipeline::StatementProgram::ExplainAnalyze {
+                target: Box::new(target),
+                spec: explain.spec,
+            }
+        } else {
+            compile_regular_statement(ctx.as_ref(), &mut optimized_plan, &statement_tag)?
+        }
+    } else {
+        compile_regular_statement(ctx.as_ref(), &mut optimized_plan, &statement_tag)?
+    };
+    debug!(
+        target: targets::EXECUTOR,
+        statement_tag = %statement_tag,
+        "Runtime program generated"
+    );
+
+    let parameter_types = parameter_env
+        .logical_types()
+        .into_iter()
+        .map(|ty| ty.unwrap_or(paro_common::types::LogicalType::Unknown))
+        .collect::<Vec<_>>();
+    let parameter_bindings =
+        ParameterBindings::from_typed_env(parameter_env, ParameterBindingEpoch::new(1));
+    let compiled = CompiledStatement::new_with_bindings(
+        executable,
+        result_names
+            .into_iter()
+            .zip(result_types)
+            .map(|(name, logical_type)| ResultColumnDesc { name, logical_type })
+            .collect(),
+        parameter_types,
+        parameter_bindings,
+    );
+
+    debug!(
+        target: targets::QUERY,
+        statement_tag = %statement_tag,
+        result_columns = compiled.result_schema.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "Statement compilation pipeline completed"
+    );
+
+    Ok(compiled)
+}
+
+fn compile_regular_statement(
+    ctx: &StatementContext,
+    optimized_plan: &mut paro_planner::plan::LogicalPlan,
+    statement_tag: &str,
+) -> Result<paro_execution::pipeline::StatementProgram> {
+    let arena_plan = match generate_typed_physical_plan(ctx, optimized_plan) {
         Ok(plan) => plan,
         Err(error) => {
             error!(
@@ -98,31 +179,35 @@ pub fn compile_statement_with_parameters(
             return Err(error);
         }
     };
-    debug!(
-        target: targets::EXECUTOR,
-        statement_tag = %statement_tag,
-        "Physical plan generated"
+    match paro_execution::pipeline::StatementProgram::from_physical_plan(arena_plan) {
+        Ok(program) => Ok(program),
+        Err(error) => {
+            error!(
+                target: targets::EXECUTOR,
+                statement_tag = %statement_tag,
+                error = %error,
+                stage = "runtime_program",
+                "Runtime program generation failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+fn generate_typed_physical_plan(
+    ctx: &StatementContext,
+    logical_plan: &mut paro_planner::plan::LogicalPlan,
+) -> Result<paro_execution::physical::PhysicalPlan> {
+    verify_physical_planner_invariants(&logical_plan.operator)?;
+    paro_execution::column_binding_resolver::ColumnBindingResolver::resolve(
+        &mut logical_plan.operator,
+    )?;
+    let mut generator = paro_execution::physical::PhysicalPlanGenerator::new(
+        paro_execution::physical::PlanBuildContext {
+            force_external: ctx.limits.force_external,
+        },
     );
-
-    let compiled = CompiledStatement {
-        physical_plan,
-        result_schema: result_names
-            .into_iter()
-            .zip(result_types)
-            .map(|(name, logical_type)| ResultColumnDesc { name, logical_type })
-            .collect(),
-        parameter_types: Vec::new(),
-    };
-
-    debug!(
-        target: targets::QUERY,
-        statement_tag = %statement_tag,
-        result_columns = compiled.result_schema.len(),
-        elapsed_ms = started_at.elapsed().as_millis(),
-        "Statement compilation pipeline completed"
-    );
-
-    Ok(compiled)
+    generator.generate(logical_plan)
 }
 
 fn build_placeholder_indexes(stmt: &Statement) -> Result<BTreeMap<Range, usize>> {

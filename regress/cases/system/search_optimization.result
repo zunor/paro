@@ -31,16 +31,17 @@ PROJECTION  (rows=0)
   Cardinality: [0, 0, 1]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=0)
-        Sort Key: BM25(content, 'graph database') DESC NULLS FIRST, id ASC NULLS LAST
-        Limit: 2
-        Cardinality: [0, 0, 1]
-        Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
-        ->  PROJECTION  (rows=0)
-              Output: id, BM25(content, 'graph database'), id
-              Cardinality: [0, 0, 1]
-              Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
-              ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
-                    Output Schema: id INTEGER, content VARCHAR
+    Sort Key: #1 DESC NULLS FIRST, #2 ASC NULLS LAST
+    Limit: 2
+    Cardinality: [0, 0, 1]
+    Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
+    ->  PROJECTION  (rows=0)
+      Output: id, __paro_hidden_1, __paro_hidden_2
+      Cardinality: [0, 0, 1]
+      Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
+      ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+        Cardinality: [4, 4, 4]
+        Output Schema: id INTEGER, content VARCHAR
 
 SELECT id
 FROM search_opt_docs
@@ -62,7 +63,8 @@ PROJECTION  (rows=0)
   Cardinality: [0, 0, 1]
   Output Schema: id INTEGER
   ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
-        Output Schema: id INTEGER, category VARCHAR, content VARCHAR
+    Cardinality: [4, 4, 4]
+    Output Schema: id INTEGER, category VARCHAR, content VARCHAR
 
 DROP TABLE search_opt_docs;
 DROP TABLE

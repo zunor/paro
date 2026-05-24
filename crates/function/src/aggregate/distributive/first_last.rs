@@ -70,7 +70,7 @@ macro_rules! define_first_impl {
                         } else {
                             (*state).is_set = true;
                             (*state).is_null = false;
-                            (*state).value = input.get_flat(i);
+                            (*state).value = input.get_fixed(i);
                         }
                     }
                 }
@@ -92,7 +92,7 @@ macro_rules! define_first_impl {
                         } else {
                             (*state).is_set = true;
                             (*state).is_null = false;
-                            (*state).value = input.get_flat(i);
+                            (*state).value = input.get_fixed(i);
                             return; // Early exit for first
                         }
                     }
@@ -180,7 +180,7 @@ macro_rules! define_last_impl {
                     if !input.is_null(i) {
                         (*state).is_set = true;
                         (*state).is_null = false;
-                        (*state).value = input.get_flat(i);
+                        (*state).value = input.get_fixed(i);
                     }
                 }
             }
@@ -198,7 +198,7 @@ macro_rules! define_last_impl {
                     if !input.is_null(i) {
                         (*state).is_set = true;
                         (*state).is_null = false;
-                        (*state).value = input.get_flat(i);
+                        (*state).value = input.get_fixed(i);
                     }
                 }
             }
@@ -561,6 +561,50 @@ mod tests {
 
             assert!(!result.is_null(0));
             assert_eq!(result.get_flat::<i32>(0), 10);
+        }
+    }
+
+    #[test]
+    fn test_first_reads_dictionary_input() {
+        let func_set = get_first_function();
+        let (func, _) = func_set.bind(&[LogicalType::Integer]).unwrap();
+        let mut arena = test_arena();
+
+        let mut state_buf = vec![0u8; func.state_size];
+        let state_ptr = state_buf.as_mut_ptr();
+
+        unsafe {
+            (func.initialize)(state_ptr);
+
+            let base = paro_common::test_utils::test_i32_vector_with_allocator(
+                &[10, 20, 30],
+                paro_common::test_utils::test_allocator(),
+            );
+            let selection = paro_common::vector::SelectionVector::try_from_indices(
+                vec![2, 1],
+                paro_common::test_utils::test_allocator(),
+            )
+            .unwrap();
+            let input = Vector::try_dictionary(Arc::new(base), selection).unwrap();
+
+            if let Some(simple_update) = func.simple_update {
+                let input_data = preserve_input_data(&func, &mut arena);
+                simple_update(&[&input], &input_data, state_ptr, 2);
+            }
+
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Integer);
+            result.set_count(1);
+
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
+            states.set_count(1);
+            let states_ptr = states.flat_data_mut::<*mut u8>();
+            *states_ptr = state_ptr;
+
+            let input_data = preserve_input_data(&func, &mut arena);
+            (func.finalize)(&states, &input_data, &mut result, 1);
+
+            assert!(!result.is_null(0));
+            assert_eq!(result.get_flat::<i32>(0), 30);
         }
     }
 

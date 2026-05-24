@@ -181,6 +181,22 @@ def test_apply_regress_paths_normalizer_rewrites_workspace_specific_fixture_path
     ]
 
 
+def test_apply_python_runtime_retry_hint_normalizer_rewrites_countdown() -> None:
+    lines = [
+        (
+            "ERROR: Python runtime is degraded and unavailable "
+            "(SQLSTATE=39P04; HINT=next automatic Python runtime probe in 999 ms)"
+        )
+    ]
+
+    assert apply_normalizers(lines, ("python_runtime_retry_hint",)) == [
+        (
+            "ERROR: Python runtime is degraded and unavailable "
+            "(SQLSTATE=39P04; HINT=next automatic Python runtime probe in <ms> ms)"
+        )
+    ]
+
+
 def test_normalizers_preserve_structure_and_non_target_fields() -> None:
     lines = [
         "QUERY PLAN",
@@ -221,6 +237,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "copy_rowcount",
         "transaction_ids",
         "regress_paths",
+        "python_runtime_retry_hint",
     )
 
 

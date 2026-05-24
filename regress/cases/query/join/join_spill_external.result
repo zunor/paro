@@ -172,23 +172,20 @@ FROM join_spill_skew_l l
 LEFT JOIN join_spill_skew_r r
   ON l.k = r.k;
 QUERY PLAN
-PROJECTION  (rows=1) (actual time=<time-range> rows=1 loops=1)
-  Output: count
-  ->  UNGROUPED_AGGREGATE  (rows=1) (actual time=<time-range> rows=3001001 loops=1518)
-        Aggregates: COUNT(v)
-        Peak Memory: <bytes>
-        ->  PROJECTION (actual time=<time-range> rows=3001000 loops=1516)
-              Output: v
-              ->  HASH_JOIN  (rows=900000) (actual time=<time-range> rows=3004000 loops=1519)
-                    Join Type: LEFT
-                    Join Condition: k = k
-                    Spilled: true
-                    Peak Memory: <bytes>
-                    Temp Storage: <bytes>
-                    ->  ROWSET_SCAN on public.join_spill_skew_l l (actual time=<time-range> rows=3000 loops=2)
-                          Columns: k
-                    ->  ROWSET_SCAN on public.join_spill_skew_r r (actual time=<time-range> rows=3000 loops=2)
-                          Columns: k, v
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=2)
+  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=3000 loops=1)
+PIPELINE 1
+  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=2)
+  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=0 loops=0)
+  SINK #4 UNGROUPED_AGGREGATE (actual time=<time-range> rows=0 loops=0)
+PIPELINE 2
+  SOURCE #5 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=3001000 loops=1503)
+  SINK #6 UNGROUPED_AGGREGATE (actual time=<time-range> rows=3001000 loops=1502)
+PIPELINE 3
+  SOURCE #7 UNGROUPED_AGGREGATE_EMIT (actual time=<time-range> rows=1 loops=2)
+  TRANSFORM #8 PROJECTION (actual time=<time-range> rows=1 loops=1)
+  SINK #9 CLIENT_RESULT (actual time=<time-range> rows=1 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 1
 

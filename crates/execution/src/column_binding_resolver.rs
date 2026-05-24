@@ -17,16 +17,8 @@ use paro_planner::visitor::LogicalOperatorVisitor;
 /// with ReferenceExpression, where the index is the position in the
 /// current set of column bindings.
 ///
-/// When a `BindingTable` is provided, the resolver will first try to resolve
-/// column bindings using `BindingId` (if present in the expression), then fall back
-/// to using `table_index/column_index` directly.
-///
 /// # Usage
 /// ```ignore
-/// // With BindingTable (recommended)
-/// ColumnBindingResolver::resolve_with_binding_table(&mut plan, &binding_table)?;
-///
-/// // Legacy mode (no BindingTable)
 /// ColumnBindingResolver::resolve(&mut plan)?;
 /// ```
 pub struct ColumnBindingResolver {
@@ -61,7 +53,7 @@ impl ColumnBindingResolver {
         }
     }
 
-    /// Resolve column bindings in a logical plan (legacy mode).
+    /// Resolve column bindings in a logical plan.
     ///
     /// This is the main entry point. After calling this method, all
     /// ColumnRefExpression in the plan will be replaced with

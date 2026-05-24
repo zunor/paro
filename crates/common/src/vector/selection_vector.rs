@@ -79,16 +79,19 @@ impl SelectionVector {
     /// Create constant selection (all zeros) for constant vectors.
     /// All indices point to position 0.
     pub fn try_constant(count: usize, allocator: Arc<dyn Allocator>) -> Result<Self> {
+        Self::try_repeated(0, count, allocator)
+    }
+
+    /// Create a repeated selection where all logical rows point to `index`.
+    pub fn try_repeated(index: usize, count: usize, allocator: Arc<dyn Allocator>) -> Result<Self> {
         let mut sv = Self::try_with_capacity(count, allocator)?;
         sv.count = count;
 
         // SAFETY: We allocated space for `count` u32s.
-        // All values are 0, which is the default for zeroed memory,
-        // but we explicitly set them for clarity.
         unsafe {
             let ptr = sv.buffer.data() as *mut u32;
             for i in 0..count {
-                *ptr.add(i) = 0;
+                *ptr.add(i) = index as u32;
             }
         }
         Ok(sv)
@@ -164,6 +167,12 @@ impl SelectionVector {
     /// Length of selection vector.
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    /// Allocated index capacity.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
     }
 
     pub fn allocation_identity(&self) -> Option<usize> {

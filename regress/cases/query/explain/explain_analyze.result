@@ -1,9 +1,10 @@
 -- @normalize explain_operator_timing,explain_summary_timing
 EXPLAIN ANALYZE SELECT 1;
 QUERY PLAN
-PROJECTION (actual time=<time-range> rows=1 loops=1)
-  Output: 1
-  ->  DUMMY_SCAN (actual time=<time-range> rows=1 loops=2)
+PIPELINE 0
+  SOURCE #0 DUMMY_SCAN (actual time=<time-range> rows=1 loops=2)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=1 loops=1)
+  SINK #2 CLIENT_RESULT (actual time=<time-range> rows=1 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 1
 
@@ -23,18 +24,15 @@ FROM explain_analyze_rt
 WHERE score >= 20
 ORDER BY score DESC;
 QUERY PLAN
-PROJECTION  (rows=1) (actual time=<time-range> rows=2 loops=1)
-  Output: id
-  ->  ORDER_BY  (rows=1) (actual time=<time-range> rows=4 loops=3)
-        Sort Key: score DESC NULLS FIRST
-        Sort Method: quicksort
-        Spilled: false
-        Peak Memory: 0 B
-        ->  PROJECTION  (rows=1) (actual time=<time-range> rows=2 loops=1)
-              Output: id, score
-              ->  ROWSET_SCAN on public.explain_analyze_rt (actual time=<time-range> rows=2 loops=2)
-                    Columns: id, score
-                    Filter: score >= 20
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3 loops=2)
+  TRANSFORM #1 FILTER (actual time=<time-range> rows=2 loops=1)
+  TRANSFORM #2 PROJECTION (actual time=<time-range> rows=2 loops=1)
+  SINK #3 SORT_BUILD (actual time=<time-range> rows=2 loops=1 peak_memory_bytes=262155)
+PIPELINE 1
+  SOURCE #4 SORT_EMIT (actual time=<time-range> rows=2 loops=2)
+  TRANSFORM #5 PROJECTION (actual time=<time-range> rows=2 loops=1)
+  SINK #6 CLIENT_RESULT (actual time=<time-range> rows=2 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 2
 
@@ -47,7 +45,7 @@ WHERE score >= 20
 ORDER BY score DESC
 FORMAT JSON;
 QUERY PLAN
-{\n  "detail": {\n    "memory": true,\n    "summary": true,\n    "timing": true,\n    "verbose": false\n  },\n  "format": "json",\n  "format_version": 1,\n  "mode": "analyze",\n  "plan": {\n    "actual": {\n      "loops": 1,\n      "rows": 2,\n      "startup_time_ms": 0.0,\n      "total_time_ms": 0.0\n    },\n    "children": [\n      {\n        "actual": {\n          "loops": 3,\n          "peak_memory_bytes": 0,\n          "rows": 4,\n          "spilled": false,\n          "startup_time_ms": 0.0,\n          "total_time_ms": 0.0\n        },\n        "children": [\n          {\n            "actual": {\n              "loops": 1,\n              "rows": 2,\n              "startup_time_ms": 0.0,\n              "total_time_ms": 0.0\n            },\n            "children": [\n              {\n                "actual": {\n                  "loops": 2,\n                  "rows": 2,\n                  "startup_time_ms": 0.0,\n                  "total_time_ms": 0.0\n                },\n                "node_id": 2,\n                "operator": "ROWSET_SCAN",\n                "output_names": [\n                  "id",\n                  "score"\n                ],\n                "properties": {\n                  "Columns": [\n                    "id",\n                    "score"\n                  ],\n                  "Filter": "score >= 20"\n                },\n                "relation": "public.explain_analyze_rt"\n              }\n            ],\n            "estimated_cardinality": {\n              "expected": 1,\n              "max": 2,\n              "min": 0\n            },\n            "estimated_rows": 1,\n            "node_id": 3,\n            "operator": "PROJECTION",\n            "output_names": [\n              "id",\n              "score"\n            ],\n            "properties": {\n              "Output": [\n                "id",\n                "score"\n              ]\n            }\n          }\n        ],\n        "estimated_cardinality": {\n          "expected": 1,\n          "max": 2,\n          "min": 0\n        },\n        "estimated_rows": 1,\n        "node_id": 4,\n        "operator": "ORDER_BY",\n        "output_names": [\n          "id"\n        ],\n        "properties": {\n          "Peak Memory": 0,\n          "Sort Key": "score DESC NULLS FIRST",\n          "Sort Method": "quicksort",\n          "Spilled": false\n        }\n      }\n    ],\n    "estimated_cardinality": {\n      "expected": 1,\n      "max": 2,\n      "min": 0\n    },\n    "estimated_rows": 1,\n    "node_id": 5,\n    "operator": "PROJECTION",\n    "output_names": [\n      "id"\n    ],\n    "properties": {\n      "Output": [\n        "id"\n      ]\n    }\n  },\n  "summary": {\n    "Execution Time": "<time-ms>",\n    "Rows Returned": 2\n  }\n}
+{"format_version":1,"mode":"analyze","operators":[{"actual":{"loops":2,"rows":3,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"ROWSET_SCAN","pipeline":0,"role":"source","runtime_id":0},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"FILTER","pipeline":0,"role":"transform","runtime_id":1},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"PROJECTION","pipeline":0,"role":"transform","runtime_id":2},{"actual":{"loops":1,"peak_memory_bytes":262155,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"SORT_BUILD","pipeline":0,"role":"sink","runtime_id":3},{"actual":{"loops":2,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"SORT_EMIT","pipeline":1,"role":"source","runtime_id":4},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"PROJECTION","pipeline":1,"role":"transform","runtime_id":5},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"CLIENT_RESULT","pipeline":1,"role":"sink","runtime_id":6}],"summary":{"Execution Time": "<time-ms>","Rows Returned":2}}
 
 DROP TABLE explain_analyze_rt;
 DROP TABLE
@@ -70,16 +68,14 @@ FROM explain_analyze_topn_rt
 ORDER BY score DESC
 LIMIT 3;
 QUERY PLAN
-PROJECTION  (rows=3) (actual time=<time-range> rows=3 loops=1)
-  Output: id
-  ->  TOP_N  (rows=3) (actual time=<time-range> rows=7003 loops=4)
-        Sort Key: score DESC NULLS FIRST
-        Limit: 3
-        Peak Memory: 16.2 kB
-        ->  PROJECTION  (rows=7000) (actual time=<time-range> rows=7000 loops=2)
-              Output: id, score
-              ->  ROWSET_SCAN on public.explain_analyze_topn_rt (actual time=<time-range> rows=7000 loops=3)
-                    Columns: id, score
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=7000 loops=3)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=7000 loops=2)
+  SINK #2 TOP_N_BUILD (actual time=<time-range> rows=7000 loops=2)
+PIPELINE 1
+  SOURCE #3 TOP_N_EMIT (actual time=<time-range> rows=3 loops=2)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=3 loops=1)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
 Execution Time: <time-ms>
 Rows Returned: 3
 
@@ -96,19 +92,14 @@ FROM explain_analyze_topn_rt
 ORDER BY score DESC
 LIMIT 3;
 QUERY PLAN
-PROJECTION  (rows=3) (actual time=<time-range> rows=<rows> loops=<loops>)
-  Output: id
-  ->  STREAMING_LIMIT (actual time=<time-range> rows=<rows> loops=<loops>)
-        Limit: 3
-        ->  ORDER_BY (actual time=<time-range> rows=<rows> loops=<loops>)
-              Sort Key: score DESC NULLS FIRST
-              Sort Method: external merge
-              Spilled: true
-              Peak Memory: <bytes>
-              ->  PROJECTION  (rows=7000) (actual time=<time-range> rows=<rows> loops=<loops>)
-                    Output: id, score
-                    ->  ROWSET_SCAN on public.explain_analyze_topn_rt (actual time=<time-range> rows=<rows> loops=<loops>)
-                          Columns: id, score
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=<rows> loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>)
+  SINK #2 TOP_N_BUILD (actual time=<time-range> rows=<rows> loops=<loops>)
+PIPELINE 1
+  SOURCE #3 TOP_N_EMIT (actual time=<time-range> rows=<rows> loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=<rows> loops=<loops>)
 Execution Time: <time-ms>
 Rows Returned: 3
 

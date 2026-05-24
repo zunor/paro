@@ -1,0 +1,37 @@
+name = "operator-runtime-gate"
+description = "Operator runtime performance gate: typed runtime, memory, fetch-driven vs completed-output"
+
+# Typed runtime hash-join and aggregate regression gate.
+[[include]]
+workload = "row_hash_join_phase0"
+queries = [
+  "short_chain_left_probe",
+  "long_chain_left_probe",
+  "found_flag_right_anti",
+  "external_spill_left",
+]
+
+[[include]]
+workload = "agg"
+queries = [
+  "count_star",
+  "filter_count",
+  "group_by_low_card",
+  "count_distinct",
+]
+
+# Large result set memory verification (bounded path).
+[[include]]
+workload = "output_buffering"
+
+# Unbounded path (EXPLAIN ANALYZE, recursive CTE, DML).
+[[include]]
+workload = "output_buffering_unbounded"
+
+# Fetch-driven vs completed-output direct comparison.
+[[include]]
+workload = "fetch_vs_completed"
+
+# Memory-pressure paths (sort/join/agg under memory limit).
+[[include]]
+workload = "memory"

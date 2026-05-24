@@ -1,0 +1,22 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+name: Cleanup parod
+description: Stop a parod process started by the start-parod action
+
+inputs:
+  pid-file:
+    description: File containing the parod process id
+    default: .ci/parod.pid
+
+runs:
+  using: composite
+  steps:
+    - name: Stop parod
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.pid-file }}" ]; then
+          pid="$(cat "${{ inputs.pid-file }}")"
+          kill "$pid" || true
+          wait "$pid" 2>/dev/null || true
+        fi

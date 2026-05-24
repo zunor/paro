@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import argparse
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
@@ -42,9 +42,6 @@ class RunnerConfig:
     timeout_seconds: int
     collect_memory: bool
     collect_explain_profile: bool
-    regression_enabled: bool
-    threshold_percent: float
-    baseline_file: str
     output_path: Path
 
     @property
@@ -63,15 +60,48 @@ class SuiteInclude:
 
 
 @dataclass(frozen=True)
-class RegressionConfig:
-    enabled: bool
-    threshold_percent: float
-    baseline_file: str
+class BenchmarkInvocation:
+    config: Path | None = None
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    user: str | None = None
+    password: str | None = None
+    iterations: int | None = None
+    warmup: int | None = None
+    timeout_seconds: int | None = None
+    collect_memory: bool | None = None
+    collect_explain_profile: bool | None = None
+    workload: str | None = None
+    filter: str | None = None
+    suite: str | None = None
+    param: list[str] | None = None
+    output: Path | None = None
+    pid: int = 0
+    query_ids_by_workload: dict[str, tuple[str, ...]] | None = None
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Paro benchmark runner")
+@dataclass(frozen=True)
+class BenchmarkRunResult:
+    payload: dict[str, Any]
+    result_path: Path
+    summary_path: Path
+    failed: bool
 
+
+def parse_args(argv: list[str] | None = None) -> BenchmarkInvocation:
+    parser = _build_run_parser(prog="runner.py run")
+    parsed = parser.parse_args(argv)
+    return _invocation_from_namespace(parsed)
+
+
+def _build_run_parser(*, prog: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description="Run Paro benchmark workloads")
+    _add_run_arguments(parser)
+    return parser
+
+
+def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, help="Path to benchmark config.toml")
 
     parser.add_argument("--host", help="Paro host")
@@ -124,13 +154,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--output", type=Path, help="JSON report path (default: benchmark/report/result.json)")
-    parser.add_argument("--check", type=Path, help="Compare run against baseline JSON")
-    parser.add_argument("--bless", type=Path, help="Write current result as baseline JSON")
-    parser.add_argument("--pid", type=int, default=0, help="Reserved for future peak RSS support")
-    return parser.parse_args(argv)
+    parser.add_argument("--pid", type=int, default=0, help="Sample peak RSS for the given parod pid")
 
 
-def resolve_config(args: argparse.Namespace, *, env: Mapping[str, str] | None = None) -> RunnerConfig:
+def _invocation_from_namespace(args: argparse.Namespace) -> BenchmarkInvocation:
+    values = {
+        field: getattr(args, field)
+        for field in BenchmarkInvocation.__dataclass_fields__
+        if hasattr(args, field)
+    }
+    return BenchmarkInvocation(**values)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Paro benchmark runner")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Run benchmark workloads")
+    _add_run_arguments(run_parser)
+
+    from harness.cli import gate_command
+
+    gate_parser = subparsers.add_parser("gate", help="Run performance gates")
+    gate_command.configure_parser(gate_parser)
+    return parser
+
+
+def resolve_config(args: BenchmarkInvocation, *, env: Mapping[str, str] | None = None) -> RunnerConfig:
     root_dir = Path(__file__).resolve().parent
     environment = os.environ if env is None else env
 
@@ -139,8 +189,6 @@ def resolve_config(args: argparse.Namespace, *, env: Mapping[str, str] | None = 
 
     connection_table = _get_table(config_data, "connection", required=False)
     defaults_table = _get_table(config_data, "defaults", required=False)
-    regression_table = _get_table(config_data, "regression", required=False)
-
     connection = {
         "host": _as_str(connection_table.get("host", "localhost"), field="connection.host"),
         "port": _as_int(connection_table.get("port", 6432), field="connection.port"),
@@ -162,19 +210,6 @@ def resolve_config(args: argparse.Namespace, *, env: Mapping[str, str] | None = 
     collect_explain_profile = _as_bool(
         defaults_table.get("collect_explain_profile", False),
         field="defaults.collect_explain_profile",
-    )
-
-    regression_enabled = _as_bool(
-        regression_table.get("enabled", False),
-        field="regression.enabled",
-    )
-    threshold_percent = _as_float(
-        regression_table.get("threshold_percent", 15),
-        field="regression.threshold_percent",
-    )
-    baseline_file = _as_str(
-        regression_table.get("baseline_file", ""),
-        field="regression.baseline_file",
     )
 
     if "PARO_HOST" in environment:
@@ -201,16 +236,6 @@ def resolve_config(args: argparse.Namespace, *, env: Mapping[str, str] | None = 
             environment["BENCH_COLLECT_EXPLAIN_PROFILE"],
             "BENCH_COLLECT_EXPLAIN_PROFILE",
         )
-    if "BENCH_REGRESSION_ENABLED" in environment:
-        regression_enabled = _parse_bool(
-            environment["BENCH_REGRESSION_ENABLED"],
-            "BENCH_REGRESSION_ENABLED",
-        )
-    if "BENCH_THRESHOLD_PERCENT" in environment:
-        threshold_percent = _parse_env_float(environment["BENCH_THRESHOLD_PERCENT"], "BENCH_THRESHOLD_PERCENT")
-    if "BENCH_BASELINE_FILE" in environment:
-        baseline_file = environment["BENCH_BASELINE_FILE"]
-
     if args.host is not None:
         connection["host"] = args.host
     if args.port is not None:
@@ -252,16 +277,13 @@ def resolve_config(args: argparse.Namespace, *, env: Mapping[str, str] | None = 
         timeout_seconds=timeout_seconds,
         collect_memory=collect_memory,
         collect_explain_profile=collect_explain_profile,
-        regression_enabled=regression_enabled,
-        threshold_percent=threshold_percent,
-        baseline_file=baseline_file,
         output_path=output_path,
     )
 
 
 def parse_param_overrides(raw_params: list[str]) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
-    for raw in raw_params:
+    for raw in raw_params or []:
         if "=" not in raw:
             raise RunnerError(f"invalid --param '{raw}', expected KEY=VALUE")
         key, value = raw.split("=", 1)
@@ -275,17 +297,18 @@ def parse_param_overrides(raw_params: list[str]) -> dict[str, Any]:
 
 def load_selected_workloads(
     config: RunnerConfig,
-    args: argparse.Namespace,
+    args: BenchmarkInvocation,
     param_overrides: Mapping[str, Any],
 ) -> list[WorkloadDef]:
     if args.suite is not None:
         if args.workload is not None or args.filter is not None:
             raise RunnerError("--suite cannot be combined with --workload or --filter")
-        return _load_suite_workloads(
+        workloads = _load_suite_workloads(
             config,
             suite_name=args.suite,
             param_overrides=param_overrides,
         )
+        return _filter_workloads_by_query_ids(workloads, args.query_ids_by_workload)
 
     return load_workloads(
         config.workloads_dir,
@@ -294,6 +317,23 @@ def load_selected_workloads(
         param_overrides=param_overrides,
         default_collect_explain_profile=config.collect_explain_profile,
     )
+
+
+def _filter_workloads_by_query_ids(
+    workloads: list[WorkloadDef],
+    query_ids_by_workload: dict[str, tuple[str, ...]] | None,
+) -> list[WorkloadDef]:
+    if not query_ids_by_workload:
+        return workloads
+    filtered: list[WorkloadDef] = []
+    for workload in workloads:
+        selected = query_ids_by_workload.get(workload.name)
+        if selected is None:
+            selected = query_ids_by_workload.get(workload.root.name)
+        if selected is None:
+            continue
+        filtered.append(select_queries_exact(workload, selected))
+    return filtered
 
 
 def _load_suite_workloads(
@@ -386,7 +426,21 @@ def _materialize_suite_workloads(
 
 
 def run(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = _build_parser()
+    parsed = parser.parse_args(argv)
+    if parsed.command == "gate":
+        from harness.cli import gate_command
+
+        return gate_command.run_parsed(
+            parsed,
+            root_dir=Path(__file__).resolve().parent,
+            runner_module=sys.modules[__name__],
+        )
+
+    args = _invocation_from_namespace(parsed)
     try:
         config = resolve_config(args)
         param_overrides = parse_param_overrides(args.param)
@@ -395,16 +449,22 @@ def run(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        workloads = load_selected_workloads(config, args, param_overrides)
+        result = execute_workloads(config, args, param_overrides)
     except Exception as exc:
-        print(f"failed to load workloads: {exc}", file=sys.stderr)
+        print(f"failed to run benchmark: {exc}", file=sys.stderr)
         return 2
 
+    return 1 if result.failed else 0
+
+
+def execute_workloads(
+    config: RunnerConfig,
+    args: BenchmarkInvocation,
+    param_overrides: Mapping[str, Any],
+) -> BenchmarkRunResult:
+    workloads = load_selected_workloads(config, args, param_overrides)
     if not workloads:
-        print("no workloads selected", file=sys.stderr)
-        return 2
-
-    regression = effective_regression_config(config, args)
+        raise RunnerError("no workloads selected")
 
     executor = BenchmarkExecutor(
         connection=config.connection,
@@ -412,6 +472,7 @@ def run(argv: list[str] | None = None) -> int:
         warmup=config.warmup,
         timeout_seconds=config.timeout_seconds,
         collect_memory=config.collect_memory,
+        profile_pid=args.pid,
     )
     validator = BenchmarkValidator(
         executor.connection_factory,
@@ -431,60 +492,11 @@ def run(argv: list[str] | None = None) -> int:
     result_path, summary_path = reporter.write_reports(payload, config.output_path)
     reporter.print_terminal_summary(workload_results, result_path)
 
-    exit_code = 1 if reporter.has_failures(workload_results) else 0
-
-    check_path = args.check
-    if check_path is None and regression.enabled and regression.baseline_file:
-        check_path = Path(regression.baseline_file)
-        if not check_path.is_absolute():
-            check_path = (config.root_dir / check_path).resolve()
-    if check_path is not None:
-        if not check_path.exists():
-            print(f"baseline not found: {check_path}", file=sys.stderr)
-            return 2
-        entries = reporter.compare_with_baseline(payload, check_path, regression.threshold_percent)
-        reporter.print_regression(entries, regression.threshold_percent)
-        reporter.append_regression_to_summary(summary_path, entries, regression.threshold_percent)
-        if reporter.has_regression(entries):
-            exit_code = 1
-        gate_entries = reporter.compare_performance_gates(payload, check_path)
-        reporter.print_performance_gates(gate_entries)
-        reporter.append_performance_gates_to_summary(summary_path, gate_entries)
-        if reporter.has_performance_gate_regression(gate_entries):
-            exit_code = 1
-
-    if args.bless is not None:
-        reporter.bless_baseline(result_path, args.bless)
-        print(f"baseline updated: {args.bless}")
-
-    return exit_code
-
-
-def effective_regression_config(config: RunnerConfig, args: argparse.Namespace) -> RegressionConfig:
-    regression = RegressionConfig(
-        enabled=config.regression_enabled,
-        threshold_percent=config.threshold_percent,
-        baseline_file=config.baseline_file,
-    )
-    if args.suite is None:
-        return regression
-    suite_path = config.suites_dir / f"{args.suite}.toml"
-    if not suite_path.exists():
-        return regression
-    suite_data = _load_toml(suite_path)
-    table = _get_table(suite_data, "regression", required=False)
-    if not table:
-        return regression
-    return RegressionConfig(
-        enabled=_as_bool(table.get("enabled", regression.enabled), field="regression.enabled"),
-        threshold_percent=_as_float(
-            table.get("threshold_percent", regression.threshold_percent),
-            field="regression.threshold_percent",
-        ),
-        baseline_file=_as_str(
-            table.get("baseline_file", regression.baseline_file),
-            field="regression.baseline_file",
-        ),
+    return BenchmarkRunResult(
+        payload=payload,
+        result_path=result_path,
+        summary_path=summary_path,
+        failed=reporter.has_failures(workload_results),
     )
 
 
@@ -522,14 +534,6 @@ def _as_int(value: Any, *, field: str) -> int:
     raise RunnerError(f"{field} must be an integer")
 
 
-def _as_float(value: Any, *, field: str) -> float:
-    if isinstance(value, bool):
-        raise RunnerError(f"{field} must be numeric")
-    if isinstance(value, (int, float)):
-        return float(value)
-    raise RunnerError(f"{field} must be numeric")
-
-
 def _as_bool(value: Any, *, field: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -556,13 +560,6 @@ def _parse_env_int(text: str, option_name: str) -> int:
         return int(text.strip())
     except ValueError as exc:
         raise RunnerError(f"{option_name} must be an integer") from exc
-
-
-def _parse_env_float(text: str, option_name: str) -> float:
-    try:
-        return float(text.strip())
-    except ValueError as exc:
-        raise RunnerError(f"{option_name} must be numeric") from exc
 
 
 def _parse_param_value(value: str) -> Any:

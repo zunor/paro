@@ -442,7 +442,7 @@ impl ParoCatalog {
         if !blocking_graphs.is_empty() {
             blocking_graphs.sort();
             blocking_graphs.dedup();
-            return Err(paro_error::catalog(format!(
+            return Err(paro_error::dependent_objects_still_exist(format!(
                 "cannot drop table \"{}\": referenced by property graph {}",
                 table_name,
                 blocking_graphs.join(", ")

@@ -29,7 +29,7 @@ SAVEPOINT before_conflict;
 SAVEPOINT
 
 RENAME TABLE alter_regress_conflict_a TO alter_regress_conflict_b;
-ERROR: Could not rename "alter_regress_conflict_a" to "alter_regress_conflict_b": another entry with this name already exists! (SQLSTATE=XX000)
+ERROR: Could not rename "alter_regress_conflict_a" to "alter_regress_conflict_b": another entry with this name already exists! (SQLSTATE=42710)
 
 ROLLBACK TO SAVEPOINT before_conflict;
 ERROR: savepoint "before_conflict" does not exist (SQLSTATE=25000)

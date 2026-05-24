@@ -68,6 +68,11 @@ impl VertexIdMap {
             .unwrap_or(0)
     }
 
+    /// Dense local-id to rowid storage.
+    pub fn local_to_rowids(&self) -> &[u64] {
+        &self.local_to_rowid
+    }
+
     /// Batch lookup rowids by local ids.
     #[inline]
     pub fn batch_local_to_rowid(&self, local_ids: &[u32]) -> Vec<u64> {

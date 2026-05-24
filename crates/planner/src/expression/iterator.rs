@@ -68,7 +68,10 @@ impl ExpressionIterator {
                     f(expr);
                 }
             }
-            Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => {}
+            Expression::Constant(_)
+            | Expression::ColumnRef(_)
+            | Expression::Parameter(_)
+            | Expression::Reference(_) => {}
         }
     }
 
@@ -134,7 +137,10 @@ impl ExpressionIterator {
                     f(expr);
                 }
             }
-            Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => {}
+            Expression::Constant(_)
+            | Expression::ColumnRef(_)
+            | Expression::Parameter(_)
+            | Expression::Reference(_) => {}
         }
     }
 }

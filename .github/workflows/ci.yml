@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -86,6 +86,7 @@ jobs:
               - '.clippy.toml'
               - '.cargo/**'
               - 'tools/ci/check_memory_runtime_api.py'
+              - 'tools/ci/check_policy_evolution.py'
               - 'tools/ci/check_vector_copy_fallible_api.py'
 
   header:
@@ -175,7 +176,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
-      - run: cargo test --workspace --locked
+      - run: RUST_MIN_STACK=33554432 cargo test --workspace --locked
 
   regress_unit:
     name: regress harness unit
@@ -286,11 +287,7 @@ jobs:
             .ci/parod.log
       - name: Stop parod
         if: always()
-        run: |
-          if [ -f .ci/parod.pid ]; then
-            kill "$(cat .ci/parod.pid)" || true
-            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
-          fi
+        uses: ./.github/actions/cleanup-parod
 
   python_udf_regress:
     name: python udf regress (py${{ matrix.python-version }})
@@ -337,11 +334,7 @@ jobs:
             .ci/parod.log
       - name: Stop parod
         if: always()
-        run: |
-          if [ -f .ci/parod.pid ]; then
-            kill "$(cat .ci/parod.pid)" || true
-            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
-          fi
+        uses: ./.github/actions/cleanup-parod
 
   startup_without_python:
     name: startup without python runtime
@@ -383,11 +376,7 @@ jobs:
           path: .ci/parod.log
       - name: Stop parod
         if: always()
-        run: |
-          if [ -f .ci/parod.pid ]; then
-            kill "$(cat .ci/parod.pid)" || true
-            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
-          fi
+        uses: ./.github/actions/cleanup-parod
 
   benchmark:
     name: benchmark
@@ -397,9 +386,23 @@ jobs:
       needs.changes.outputs.benchmark == 'true' ||
       needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
+    concurrency:
+      group: perf-archive-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PARO_PERF_ARCHIVE_REPOSITORY) || github.run_id }}-write
+      cancel-in-progress: false
+    env:
+      PARO_BENCH_CARGO_PROFILE: release
+      PARO_BENCH_DATA_DIR_MODE: fresh
+      PARO_PERF_ARCHIVE_DIR: ${{ github.workspace }}/.ci/paro-perf-archive
+      PARO_PERF_ARCHIVE_TOKEN: ${{ secrets.PARO_PERF_ARCHIVE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: benchmark
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -413,11 +416,61 @@ jobs:
           artifact-name: parod-release
           port: "6432"
           health-timeout: "60"
+      - name: Checkout performance archive
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != ''
+        uses: ./.github/actions/checkout-perf-archive
+        with:
+          repository: ${{ vars.PARO_PERF_ARCHIVE_REPOSITORY }}
+          token: ${{ env.PARO_PERF_ARCHIVE_TOKEN }}
+          path: .ci/paro-perf-archive
       - name: Run benchmark (PR smoke, no baseline)
         env:
           PARO_HOST: ${{ steps.start_parod.outputs.host }}
           PARO_PORT: ${{ steps.start_parod.outputs.port }}
-        run: make -C benchmark ci
+          PARO_PID: ${{ steps.start_parod.outputs.pid }}
+        run: make -C benchmark ci PID="$PARO_PID"
+      - name: Run operator runtime performance gate
+        env:
+          PARO_HOST: ${{ steps.start_parod.outputs.host }}
+          PARO_PORT: ${{ steps.start_parod.outputs.port }}
+          PARO_PID: ${{ steps.start_parod.outputs.pid }}
+        run: make -C benchmark check GATE=operator-runtime PID="$PARO_PID" QUORUM_RETRIES=3
+      - name: Run Divan dispatch performance gate
+        run: make -C benchmark check GATE=divan-dispatch QUORUM_RETRIES=3
+      - name: Sync main performance archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        run: git -C .ci/paro-perf-archive pull --ff-only
+      - name: Append main performance archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        env:
+          PARO_HOST: ${{ steps.start_parod.outputs.host }}
+          PARO_PORT: ${{ steps.start_parod.outputs.port }}
+          PARO_PID: ${{ steps.start_parod.outputs.pid }}
+        run: |
+          make -C benchmark calibrate \
+            GATE=operator-runtime \
+            PID="$PARO_PID" \
+            RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-operator-runtime"
+          make -C benchmark calibrate \
+            GATE=divan-dispatch \
+            RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-divan-dispatch"
+      - name: Rebuild main performance archive index
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        run: |
+          for gate in operator-runtime divan-dispatch; do
+            make -C benchmark archive-finalize-calibration \
+              GATE="$gate" \
+              ARCHIVE="$PARO_PERF_ARCHIVE_DIR" \
+              PLATFORM=auto \
+              POLICY_VERSION=auto
+          done
+      - name: Commit main performance archive updates
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PARO_PERF_ARCHIVE_REPOSITORY != '' && env.PARO_PERF_ARCHIVE_TOKEN != ''
+        uses: ./.github/actions/commit-changes
+        with:
+          path: .ci/paro-perf-archive
+          add-paths: results calibrations manifests
+          message: Archive performance calibration ${{ github.sha }} run=${{ github.run_id }}-${{ github.run_attempt }} gates=operator-runtime,divan-dispatch
       - name: Upload benchmark report
         if: always()
         uses: actions/upload-artifact@v4
@@ -425,16 +478,11 @@ jobs:
           name: benchmark-report
           if-no-files-found: warn
           path: |
-            benchmark/report/result.json
-            benchmark/report/summary.md
+            benchmark/report/**
             .ci/parod.log
       - name: Stop parod
         if: always()
-        run: |
-          if [ -f .ci/parod.pid ]; then
-            kill "$(cat .ci/parod.pid)" || true
-            wait "$(cat .ci/parod.pid)" 2>/dev/null || true
-          fi
+        uses: ./.github/actions/cleanup-parod
 
   ci_gate:
     name: ci-gate

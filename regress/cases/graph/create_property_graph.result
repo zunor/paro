@@ -65,7 +65,7 @@ ORDER BY name;
 ERROR: GRAPH_TABLE COLUMNS currently requires direct variable.property references (SQLSTATE=42601)
 
 DROP TABLE person;
-ERROR: cannot drop table "public.person": property_graph "public.social_network" depends on it (SQLSTATE=XX000)
+ERROR: cannot drop table "public.person": property_graph "public.social_network" depends on it (SQLSTATE=2BP01)
 
 CREATE PROPERTY GRAPH IF NOT EXISTS social_network
 VERTEX TABLES (person)

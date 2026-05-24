@@ -136,6 +136,27 @@ pub fn object_exists(kind: impl AsRef<str>, name: impl AsRef<str>) -> ParoError 
     ))
 }
 
+/// Duplicate catalog object with a caller-provided message.
+///
+/// Prefer [`object_exists`] when the object kind and name are available; this
+/// constructor is only for preserving an existing user-facing catalog message.
+pub fn duplicate_object(message: impl Into<Cow<'static, str>>) -> ParoError {
+    ParoError::new(ErrorData::new(
+        Severity::Error,
+        codes::syntax::DUPLICATE_OBJECT,
+        message,
+    ))
+}
+
+/// A DROP would leave dependent catalog objects behind.
+pub fn dependent_objects_still_exist(message: impl Into<Cow<'static, str>>) -> ParoError {
+    ParoError::new(ErrorData::new(
+        Severity::Error,
+        codes::dependency::DEPENDENT_OBJECTS_STILL_EXIST,
+        message,
+    ))
+}
+
 // ========== Ambiguous references ==========
 
 /// Ambiguous column reference.
@@ -177,4 +198,26 @@ pub fn catalog(message: impl Into<Cow<'static, str>>) -> ParoError {
         codes::syntax::SYNTAX_ERROR,
         message,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::codes;
+
+    #[test]
+    fn duplicate_object_preserves_message_with_duplicate_object_sqlstate() {
+        let err = duplicate_object("custom duplicate object message");
+
+        assert!(err.is(codes::syntax::DUPLICATE_OBJECT));
+        assert_eq!(err.message(), "custom duplicate object message");
+    }
+
+    #[test]
+    fn dependent_objects_uses_postgres_dependency_sqlstate() {
+        let err = dependent_objects_still_exist("dependent object remains");
+
+        assert!(err.is(codes::dependency::DEPENDENT_OBJECTS_STILL_EXIST));
+        assert_eq!(err.sqlstate().as_str(), "2BP01");
+    }
 }

@@ -41,7 +41,7 @@ COPY dml_copy_protocol_dst FROM STDIN WITH (FORMAT csv);
 21,should-not-land-2,abort
 -- @copyfail client abort from regress
 -- @copystatus
-ERROR: COPY from stdin aborted by client: error from Python: _ClientCopyAbort - client abort from regress (SQLSTATE=XX000)
+COPYFAIL: client abort from regress
 
 SELECT COUNT(*) AS copied_rows
 FROM dml_copy_protocol_dst;

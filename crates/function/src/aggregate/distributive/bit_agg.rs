@@ -53,7 +53,7 @@ macro_rules! define_bit_and_impl {
                         let state_ptr = *state_ptrs.add(i);
                         let state = state_ptr as *mut State;
 
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if !(*state).is_set {
                             (*state).value = val;
                             (*state).is_set = true;
@@ -75,7 +75,7 @@ macro_rules! define_bit_and_impl {
 
                 for i in 0..count {
                     if !input.is_null(i) {
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if !(*state).is_set {
                             (*state).value = val;
                             (*state).is_set = true;
@@ -165,7 +165,7 @@ macro_rules! define_bit_or_impl {
                         let state_ptr = *state_ptrs.add(i);
                         let state = state_ptr as *mut State;
 
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if !(*state).is_set {
                             (*state).value = val;
                             (*state).is_set = true;
@@ -187,7 +187,7 @@ macro_rules! define_bit_or_impl {
 
                 for i in 0..count {
                     if !input.is_null(i) {
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if !(*state).is_set {
                             (*state).value = val;
                             (*state).is_set = true;
@@ -277,7 +277,7 @@ macro_rules! define_bit_xor_impl {
                         let state_ptr = *state_ptrs.add(i);
                         let state = state_ptr as *mut State;
 
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if !(*state).is_set {
                             (*state).value = val;
                             (*state).is_set = true;
@@ -299,7 +299,7 @@ macro_rules! define_bit_xor_impl {
 
                 for i in 0..count {
                     if !input.is_null(i) {
-                        let val: $type = input.get_flat(i);
+                        let val: $type = input.get_fixed(i);
                         if !(*state).is_set {
                             (*state).value = val;
                             (*state).is_set = true;

@@ -5,12 +5,15 @@
 //!
 //! The high-level query coordinator lives in `crate::query_executor`.
 
-pub mod build_pipelines;
-pub mod build_state;
-pub mod builder;
-pub mod events;
-pub mod executor;
-pub mod meta_pipeline;
-pub mod pipeline;
-pub mod scheduler;
-pub mod task;
+pub mod graph;
+pub mod handles;
+pub mod lowerer;
+pub mod program;
+pub mod properties;
+
+pub use program::{
+    ControlRegionKind, ControlRegionProgram, ExtensionOperatorFactory, ExtensionSinkSpec,
+    ExtensionSourceSpec, ExtensionTransformSpec, OperatorRuntimeRegistry, PipelineIdMap,
+    PipelineProgram, PipelineProgramBuilder, PipelineProgramIndex, PipelineProgramSet,
+    StatementProgram, UtilityProgram,
+};

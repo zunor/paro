@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use paro_execution::query_executor::executor::Executor;
-use paro_scheduler::coordinator::EventCoordinator;
 
 /// Progress information for a running query.
 ///
@@ -110,7 +109,7 @@ pub struct ActiveQueryContext {
     executor: Option<Executor>,
 }
 
-// Manual Debug implementation because EventCoordinator and Executor don't implement Debug
+// Manual Debug implementation because Executor doesn't implement Debug
 impl std::fmt::Debug for ActiveQueryContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActiveQueryContext")
@@ -220,53 +219,6 @@ impl ActiveQueryContext {
         self.open_result_id = None;
     }
 
-    /// Sets the event coordinator for the currently executing query.
-    ///
-    /// This should be called when query execution starts, to enable
-    /// cancellation and status tracking.
-    ///
-    /// # Arguments
-    /// * `coordinator` - The event coordinator managing pipeline execution
-    pub fn set_coordinator(&mut self, coordinator: Arc<EventCoordinator>) {
-        self.control.set_coordinator(coordinator);
-    }
-
-    /// Returns a reference to the event coordinator, if any.
-    ///
-    /// Returns `None` if no query is currently executing or if the
-    /// coordinator has not been set.
-    pub fn coordinator(&self) -> Option<Arc<EventCoordinator>> {
-        self.control.coordinator()
-    }
-
-    /// Checks if a query is currently executing.
-    ///
-    /// Returns `true` if:
-    /// - A coordinator is set, AND
-    /// - The coordinator has not yet completed all events
-    ///
-    /// Returns `false` if:
-    /// - No coordinator is set, OR
-    /// - The coordinator has completed all events
-    pub fn is_executing(&self) -> bool {
-        self.control
-            .coordinator()
-            .map(|coordinator| !coordinator.is_complete())
-            .unwrap_or(false)
-    }
-
-    /// Clears the coordinator reference.
-    ///
-    /// This should be called when query execution finishes (either
-    /// successfully or with an error).
-    pub fn clear_coordinator(&mut self) {
-        self.control.clear_coordinator();
-    }
-
-    // ========================================================================
-    // ========================================================================
-
-    ///
     /// This should be called when the query begins execution.
     pub fn set_executor(&mut self, executor: Executor) {
         self.executor = Some(executor);
@@ -403,63 +355,6 @@ mod tests {
 
         ctx.clear_open_result();
         assert!(!ctx.has_open_result());
-    }
-
-    // ------------------------------------------------------------------------
-    // Coordinator integration
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_active_query_context_coordinator() {
-        use paro_scheduler::scheduler::TaskScheduler;
-
-        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control());
-
-        // Initially no coordinator
-        assert!(ctx.coordinator().is_none());
-        assert!(!ctx.is_executing());
-
-        // Set coordinator
-        let scheduler = Arc::new(TaskScheduler::new());
-        let coordinator = Arc::new(EventCoordinator::new(scheduler));
-        ctx.set_coordinator(coordinator.clone());
-
-        // Now has coordinator
-        let stored = ctx.coordinator().expect("coordinator should be present");
-        assert!(Arc::ptr_eq(&stored, &coordinator));
-
-        // Clear coordinator
-        ctx.clear_coordinator();
-        assert!(ctx.coordinator().is_none());
-    }
-
-    #[test]
-    fn test_active_query_context_is_executing() {
-        use paro_scheduler::event::Event;
-        use paro_scheduler::scheduler::TaskScheduler;
-
-        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control());
-
-        // Not executing initially
-        assert!(!ctx.is_executing());
-
-        // Set up coordinator with an event
-        let scheduler = Arc::new(TaskScheduler::new());
-        let coordinator = Arc::new(EventCoordinator::new(scheduler));
-        let event = Event::new();
-        coordinator.add_event(event.clone());
-
-        ctx.set_coordinator(coordinator);
-
-        // Now executing (event not complete)
-        assert!(ctx.is_executing());
-
-        // Complete the event
-        event.set_tasks(1);
-        event.finish_task();
-
-        // Still has coordinator but execution is complete
-        assert!(!ctx.is_executing());
     }
 
     #[test]

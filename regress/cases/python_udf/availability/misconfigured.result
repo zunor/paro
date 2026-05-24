@@ -20,8 +20,9 @@ LANGUAGE python
 AS $$return [value for value in a.materialize_py()]$$;
 ERROR: Python runtime is misconfigured for CREATE FUNCTION (SQLSTATE=39P04; DETAIL=failed to bootstrap Python interpreter '<repo>/regress/fixtures/python_udf/bin/python_misconfigured.py': simulated misconfigured python runtime)
 
+-- @normalize regress_paths
 SELECT py_misconfigured_probe(1);
-ERROR: Python runtime is misconfigured for external routine execution (SQLSTATE=XX000)
+ERROR: Python runtime is misconfigured for external routine execution (SQLSTATE=39P04; DETAIL=failed to bootstrap Python interpreter '<repo>/regress/fixtures/python_udf/bin/python_misconfigured.py': simulated misconfigured python runtime)
 
 SELECT py_misconfigured_probe(1);
 py_misconfigured_probe(1)

@@ -141,8 +141,9 @@ fn evaluate_constant(expr: &Expression) -> Option<Value> {
             }
         }
 
-        // Cannot fold column refs, aggregates, subqueries, windows
+        // Cannot fold column refs, runtime parameters, aggregates, subqueries, windows.
         Expression::ColumnRef(_)
+        | Expression::Parameter(_)
         | Expression::Reference(_)
         | Expression::Aggregate(_)
         | Expression::Subquery(_)

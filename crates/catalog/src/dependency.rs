@@ -278,7 +278,7 @@ impl DependencyGraph {
                     .get(&edge.dependent_id)
                     .cloned()
                     .unwrap_or_else(|| unknown_object_ref(edge.dependent_id));
-                return Err(paro_error::catalog(format!(
+                return Err(paro_error::dependent_objects_still_exist(format!(
                     "cannot drop {} \"{}\": {} \"{}\" depends on it",
                     subject.kind.as_str().to_ascii_lowercase(),
                     subject.display_name(),

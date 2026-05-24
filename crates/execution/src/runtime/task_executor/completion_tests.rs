@@ -1,0 +1,469 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+
+#[test]
+fn client_result_sink_backpressure_retains_sink_input_without_clone() {
+    let output = QueryOutputPort::bounded(1);
+    output
+        .try_push(Chunk::try_new(paro_common::test_utils::test_allocator()).unwrap())
+        .assert_written();
+    let query = query_context(output.clone());
+    let spec = PipelineSpec {
+        id: PipelineId::new(0),
+        source: SourceSpec::Values(values_spec(
+            vec![vec![int_constant(7)]],
+            vec![LogicalType::Integer],
+        )),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+    };
+    let runtime = runtime_from_spec(&query, spec);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(12),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let result = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect("first step");
+    let TaskStepResult::Blocked(_) = result else {
+        panic!("client result sink should block on full output port");
+    };
+    assert!(matches!(
+        executor.task.pending,
+        PendingChunkState::SinkInput { .. }
+    ));
+
+    output.pop_front();
+    executor.resume_after_wake().expect("resume");
+    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+
+    let chunk = output.pop_front().expect("resumed sink output");
+    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(7));
+}
+
+#[test]
+fn client_result_sink_repeated_backpressure_writes_pending_chunk_once() {
+    let output = QueryOutputPort::bounded(1);
+    output
+        .try_push(Chunk::try_new(paro_common::test_utils::test_allocator()).unwrap())
+        .assert_written();
+    let query = query_context(output.clone());
+    let spec = PipelineSpec {
+        id: PipelineId::new(0),
+        source: SourceSpec::Values(values_spec(
+            vec![vec![int_constant(7)], vec![int_constant(8)]],
+            vec![LogicalType::Integer],
+        )),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+    };
+    let runtime = runtime_from_spec(&query, spec);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(15),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    assert!(matches!(
+        executor
+            .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+            .expect("first blocked write"),
+        TaskStepResult::Blocked(_)
+    ));
+
+    executor
+        .resume_after_wake()
+        .expect("resume while still full");
+    assert!(matches!(
+        executor
+            .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+            .expect("second blocked write"),
+        TaskStepResult::Blocked(_)
+    ));
+    assert_eq!(output.len(), 1);
+    assert!(matches!(
+        executor.task.pending,
+        PendingChunkState::SinkInput { .. }
+    ));
+
+    output.pop_front().expect("remove filler");
+    executor.resume_after_wake().expect("resume after capacity");
+    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+
+    let chunk = output.pop_front().expect("resumed sink output");
+    assert_eq!(chunk.size(), 2);
+    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(7));
+    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(8));
+    assert!(output.pop_front().is_none());
+}
+
+#[test]
+fn streaming_limit_stop_pipeline_still_runs_completion() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let spec = PipelineSpec {
+        id: PipelineId::new(0),
+        source: SourceSpec::Dummy(DummyScanSpec),
+        transforms: vec![
+            TransformSpec::Project(ProjectSpec {
+                table_index: 0,
+                expressions: vec![int_constant(1)].into_boxed_slice(),
+                output_names: vec!["v".to_string()].into_boxed_slice(),
+            }),
+            TransformSpec::Limit(LimitSpec {
+                limit: Some(int_constant(0)),
+                offset: None,
+                hnsw_ef_hint: None,
+            }),
+        ],
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+    };
+    let runtime = runtime_from_spec(&query, spec);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(13),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+
+    assert_eq!(executor.phase, PipelineTaskPhase::Done);
+    assert!(output.pop_front().is_none());
+}
+
+#[test]
+fn transform_stop_pipeline_flushes_only_downstream_transforms() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output);
+    let spec = PipelineSpec {
+        id: PipelineId::new(0),
+        source: SourceSpec::Dummy(DummyScanSpec),
+        transforms: vec![
+            TransformSpec::Limit(LimitSpec {
+                limit: Some(int_constant(0)),
+                offset: None,
+                hnsw_ef_hint: None,
+            }),
+            TransformSpec::Project(ProjectSpec {
+                table_index: 0,
+                expressions: vec![int_constant(1)].into_boxed_slice(),
+                output_names: vec!["v".to_string()].into_boxed_slice(),
+            }),
+        ],
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+    };
+    let runtime = runtime_from_spec(&query, spec);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(14),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let result = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect("limit stop step");
+
+    assert!(matches!(result, TaskStepResult::Continue));
+    assert_eq!(
+        executor.phase,
+        PipelineTaskPhase::Flushing {
+            transform_idx: 1,
+            resume_idx: 0
+        }
+    );
+}
+
+#[derive(Debug)]
+struct FailingFinishDriver {
+    cancel_reason: Arc<Mutex<Option<CancelReason>>>,
+}
+
+impl ParallelFinishDriver for FailingFinishDriver {
+    fn next_task(&self, _ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
+        Ok(NextFinishTask::Task(FinishTaskId(1)))
+    }
+
+    fn run_task(
+        &self,
+        _task: FinishTaskId,
+        _ctx: &mut OperatorFinishContext,
+    ) -> Result<FinishTaskPoll> {
+        Err(paro_common::error::internal("finish task failed"))
+    }
+
+    fn cancel_group(&self, _ctx: &mut OperatorCleanupContext, reason: CancelReason) -> Result<()> {
+        *self.cancel_reason.lock().expect("cancel reason lock") = Some(reason);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingNextTaskDriver {
+    cancel_reason: Arc<Mutex<Option<CancelReason>>>,
+}
+
+impl ParallelFinishDriver for FailingNextTaskDriver {
+    fn next_task(&self, _ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
+        Err(paro_common::error::internal("next finish task failed"))
+    }
+
+    fn run_task(
+        &self,
+        _task: FinishTaskId,
+        _ctx: &mut OperatorFinishContext,
+    ) -> Result<FinishTaskPoll> {
+        unreachable!("next_task fails before any task can run")
+    }
+
+    fn cancel_group(&self, _ctx: &mut OperatorCleanupContext, reason: CancelReason) -> Result<()> {
+        *self.cancel_reason.lock().expect("cancel reason lock") = Some(reason);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingFinishDriver {
+    reason: BlockReason,
+    source: WakeSource,
+    cancel_reason: Arc<Mutex<Option<CancelReason>>>,
+}
+
+impl ParallelFinishDriver for PendingFinishDriver {
+    fn next_task(&self, _ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
+        Ok(NextFinishTask::Task(FinishTaskId(1)))
+    }
+
+    fn run_task(
+        &self,
+        _task: FinishTaskId,
+        ctx: &mut OperatorFinishContext,
+    ) -> Result<FinishTaskPoll> {
+        Ok(FinishTaskPoll::Pending(
+            Blocker::new(self.reason.clone())
+                .with_wake(ctx.wake.register(self.source, WakeToken(91))),
+        ))
+    }
+
+    fn cancel_group(&self, _ctx: &mut OperatorCleanupContext, reason: CancelReason) -> Result<()> {
+        *self.cancel_reason.lock().expect("cancel reason lock") = Some(reason);
+        Ok(())
+    }
+}
+
+#[test]
+fn finish_task_error_cancels_group_as_operator_error() {
+    let query = query_context(QueryOutputPort::unbounded());
+    let runtime = empty_runtime(&query);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    executor.phase = PipelineTaskPhase::Merging;
+    executor.completion_stage = PipelineCompletionStage::FinishWork;
+
+    let cancel_reason = Arc::new(Mutex::new(None));
+    executor.finish_group = Some(FinishTaskGroup {
+        task_count_hint: 1,
+        driver: Arc::new(FailingFinishDriver {
+            cancel_reason: cancel_reason.clone(),
+        }),
+        memory_class: MemoryClass::Blocking,
+    });
+
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(10),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let err = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect_err("finish task error should propagate");
+
+    assert!(err.to_string().contains("finish task failed"));
+    assert_eq!(
+        *cancel_reason.lock().expect("cancel reason lock"),
+        Some(CancelReason::OperatorError)
+    );
+    assert!(query.errors.root_error_id().is_some());
+}
+
+#[test]
+fn finish_task_discovery_error_cancels_group_as_operator_error() {
+    let query = query_context(QueryOutputPort::unbounded());
+    let runtime = empty_runtime(&query);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    executor.phase = PipelineTaskPhase::Merging;
+    executor.completion_stage = PipelineCompletionStage::FinishWork;
+
+    let cancel_reason = Arc::new(Mutex::new(None));
+    executor.finish_group = Some(FinishTaskGroup {
+        task_count_hint: 1,
+        driver: Arc::new(FailingNextTaskDriver {
+            cancel_reason: cancel_reason.clone(),
+        }),
+        memory_class: MemoryClass::Blocking,
+    });
+
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(16),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let err = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect_err("finish discovery error should propagate");
+
+    assert!(err.to_string().contains("next finish task failed"));
+    assert_eq!(
+        *cancel_reason.lock().expect("cancel reason lock"),
+        Some(CancelReason::OperatorError)
+    );
+    assert!(query.errors.root_error_id().is_some());
+}
+
+#[test]
+fn cancellation_cleans_pending_finish_group_without_recording_operator_error() {
+    let mut query = query_context(QueryOutputPort::unbounded());
+    let statement_token =
+        install_statement_cancellation(&mut query, StatementCancelReason::UserRequest);
+    let runtime = empty_runtime(&query);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    executor.phase = PipelineTaskPhase::Merging;
+    executor.completion_stage = PipelineCompletionStage::FinishWork;
+
+    let cancel_reason = Arc::new(Mutex::new(None));
+    executor.finish_group = Some(FinishTaskGroup {
+        task_count_hint: 1,
+        driver: Arc::new(PendingFinishDriver {
+            reason: BlockReason::ExternalRuntime,
+            source: WakeSource::ExternalRuntime,
+            cancel_reason: cancel_reason.clone(),
+        }),
+        memory_class: MemoryClass::Blocking,
+    });
+
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(17),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let result = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect("finish task should block");
+    let TaskStepResult::Blocked(blocker) = result else {
+        panic!("finish task should be pending");
+    };
+    assert_eq!(blocker.reason, BlockReason::ExternalRuntime);
+    assert_eq!(
+        blocker.wake.expect("external wake").source,
+        WakeSource::ExternalRuntime
+    );
+
+    statement_token.cancel();
+    executor
+        .resume_after_wake()
+        .expect("resume after cancellation");
+    let err = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect_err("cancelled task should stop before more finish work");
+
+    assert!(err.is_query_canceled());
+    assert_eq!(
+        *cancel_reason.lock().expect("cancel reason lock"),
+        Some(CancelReason::UserRequest)
+    );
+    assert!(query.errors.root_error_id().is_none());
+}
+
+#[test]
+fn finish_group_pending_blockers_keep_wake_registration() {
+    for (reason, source) in [
+        (BlockReason::Memory, WakeSource::Memory),
+        (BlockReason::Spill, WakeSource::Spill),
+        (BlockReason::ExternalRuntime, WakeSource::ExternalRuntime),
+    ] {
+        let query = query_context(QueryOutputPort::unbounded());
+        let runtime = empty_runtime(&query);
+        let task = runtime
+            .create_task_state(&query, paro_common::test_utils::test_allocator())
+            .expect("task state");
+        let mut executor = PipelineTaskExecutor::new(runtime, task);
+        executor.phase = PipelineTaskPhase::Merging;
+        executor.completion_stage = PipelineCompletionStage::FinishWork;
+        executor.finish_group = Some(FinishTaskGroup {
+            task_count_hint: 1,
+            driver: Arc::new(PendingFinishDriver {
+                reason: reason.clone(),
+                source,
+                cancel_reason: Arc::new(Mutex::new(None)),
+            }),
+            memory_class: MemoryClass::Blocking,
+        });
+
+        let thread = ThreadContext::single_threaded();
+        let wake = OperatorWakeScope {
+            task_id: PipelineTaskId(18),
+            generation: WakeGeneration(0),
+        };
+        let mut profiler = OperatorProfiler::disabled();
+
+        let result = executor
+            .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+            .expect("finish task should block");
+        let TaskStepResult::Blocked(blocker) = result else {
+            panic!("finish task should be pending");
+        };
+        assert_eq!(blocker.reason, reason);
+        let registration = blocker.wake.expect("wake registration");
+        assert_eq!(registration.task_id, PipelineTaskId(18));
+        assert_eq!(registration.source, source);
+    }
+}

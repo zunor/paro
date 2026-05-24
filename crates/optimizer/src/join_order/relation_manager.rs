@@ -245,7 +245,7 @@ impl RelationManager {
                 bindings.clear();
                 false
             }
-            Expression::Constant(_) => true,
+            Expression::Constant(_) | Expression::Parameter(_) => true,
             Expression::Function(func) => {
                 for child in &func.children {
                     if !self.extract_bindings(child, bindings) {

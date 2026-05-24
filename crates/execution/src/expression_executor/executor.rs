@@ -10,6 +10,7 @@ use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
+use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DictionarySource, SelectionVector, Vector, VectorType};
 use paro_function::scalar::cast::CastExecCtx;
@@ -25,6 +26,8 @@ use paro_planner::expression::{
     OperatorType, ReferenceExpression,
 };
 
+use crate::runtime::{ExpressionEvalInput, ParameterBindings};
+
 use super::comparison::{compile_comparison_dispatch, COMPARISON_EXEC_CTX};
 use super::execution_state::BoundFunctionContext;
 use super::predicate::{
@@ -35,7 +38,8 @@ use super::state::{
     CachedDictionaryInputId, CaseExpressionState, CastExpressionState, ColumnRefExpressionState,
     ComparisonExpressionState, CompiledExpressionState, ConjunctionExpressionState,
     ConstantExpressionState, EvaluatedValue, ExecuteFunctionState, OperatorExpressionState,
-    PreparedInList, ReferenceExpressionState, ValueSlot, WindowExpressionState,
+    ParameterExpressionState, PreparedInList, ReferenceExpressionState, ValueSlot,
+    WindowExpressionState,
 };
 
 #[derive(Debug)]
@@ -109,7 +113,10 @@ impl ExpressionExecutor {
                     "ExpressionExecutor invariant violated: Expression::Subquery must be flattened before execution"
                 );
             }
-            Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => {}
+            Expression::Constant(_)
+            | Expression::Parameter(_)
+            | Expression::ColumnRef(_)
+            | Expression::Reference(_) => {}
         }
     }
 
@@ -192,6 +199,9 @@ impl ExpressionExecutor {
                 scratch: ValueSlot::default(),
             }),
             Expression::Constant(_) => CompiledExpressionState::Constant(ConstantExpressionState),
+            Expression::Parameter(_) => {
+                CompiledExpressionState::Parameter(ParameterExpressionState::default())
+            }
             Expression::ColumnRef(_) => {
                 CompiledExpressionState::ColumnRef(ColumnRefExpressionState)
             }
@@ -221,7 +231,30 @@ impl ExpressionExecutor {
     ) -> Result<()> {
         let expr = &self.program.expressions[expr_idx];
         let state = &mut self.state.states[expr_idx];
-        Self::execute_into_inner(expr, state, input, sel, count, runtime, result)
+        Self::execute_into_inner(expr, state, input, sel, count, runtime, None, result)
+    }
+
+    pub fn execute_into_with_input(
+        &mut self,
+        expr_idx: usize,
+        input: ExpressionEvalInput<'_>,
+        sel: Option<&SelectionVector>,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        result: &mut Vector,
+    ) -> Result<()> {
+        let expr = &self.program.expressions[expr_idx];
+        let state = &mut self.state.states[expr_idx];
+        Self::execute_into_inner(
+            expr,
+            state,
+            input.columns,
+            sel,
+            count,
+            runtime,
+            Some(input.params),
+            result,
+        )
     }
 
     pub fn execute_all_into(
@@ -252,6 +285,44 @@ impl ExpressionExecutor {
         Ok(())
     }
 
+    pub fn execute_all_into_with_input(
+        &mut self,
+        input: ExpressionEvalInput<'_>,
+        runtime: &dyn FunctionExecContext,
+        result: &mut Chunk,
+    ) -> Result<()> {
+        let output_types: Vec<LogicalType> = self
+            .program
+            .expressions
+            .iter()
+            .map(Expression::return_type)
+            .collect();
+        Self::prepare_output_chunk(
+            result,
+            &output_types,
+            input.columns.size(),
+            runtime.allocator(MemoryTag::BaseTable),
+        )?;
+        for expr_idx in 0..self.program.expressions.len() {
+            let column = result.column_mut(expr_idx).ok_or_else(|| {
+                paro_error::internal(format!("Output column {} not found", expr_idx))
+            })?;
+            self.execute_into_with_input(
+                expr_idx,
+                ExpressionEvalInput {
+                    params: input.params,
+                    columns: input.columns,
+                },
+                None,
+                input.columns.size(),
+                runtime,
+                column,
+            )?;
+        }
+        result.set_cardinality(input.columns.size());
+        Ok(())
+    }
+
     pub fn select_into(
         &mut self,
         expr_idx: usize,
@@ -262,7 +333,52 @@ impl ExpressionExecutor {
     ) -> Result<usize> {
         let expr = &self.program.expressions[expr_idx];
         let state = &mut self.state.states[expr_idx];
-        Self::select_expression(expr, state, input, None, count, runtime, sel)
+        Self::select_expression(expr, state, input, None, count, runtime, None, sel)
+    }
+
+    pub fn select_into_with_input(
+        &mut self,
+        expr_idx: usize,
+        input: ExpressionEvalInput<'_>,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        sel: &mut SelectionVector,
+    ) -> Result<usize> {
+        let expr = &self.program.expressions[expr_idx];
+        let state = &mut self.state.states[expr_idx];
+        Self::select_expression(
+            expr,
+            state,
+            input.columns,
+            None,
+            count,
+            runtime,
+            Some(input.params),
+            sel,
+        )
+    }
+
+    pub fn select_into_with_input_and_selection(
+        &mut self,
+        expr_idx: usize,
+        input: ExpressionEvalInput<'_>,
+        input_sel: Option<&SelectionVector>,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        sel: &mut SelectionVector,
+    ) -> Result<usize> {
+        let expr = &self.program.expressions[expr_idx];
+        let state = &mut self.state.states[expr_idx];
+        Self::select_expression(
+            expr,
+            state,
+            input.columns,
+            input_sel,
+            count,
+            runtime,
+            Some(input.params),
+            sel,
+        )
     }
 
     pub fn execute_expression(
@@ -289,29 +405,37 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
         match (expr, state) {
             (Expression::Function(expr), CompiledExpressionState::Function(state)) => {
-                Self::execute_function_into(expr, state, chunk, sel, count, runtime, result)
+                Self::execute_function_into(expr, state, chunk, sel, count, runtime, params, result)
             }
             (Expression::Cast(expr), CompiledExpressionState::Cast(state)) => {
-                Self::execute_cast_into(expr, state, chunk, sel, count, runtime, result)
+                Self::execute_cast_into(expr, state, chunk, sel, count, runtime, params, result)
             }
             (Expression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
-                Self::execute_comparison_into(expr, state, chunk, sel, count, runtime, result)
+                Self::execute_comparison_into(
+                    expr, state, chunk, sel, count, runtime, params, result,
+                )
             }
             (Expression::Conjunction(expr), CompiledExpressionState::Conjunction(state)) => {
-                Self::execute_conjunction_into(expr, state, chunk, sel, count, runtime, result)
+                Self::execute_conjunction_into(
+                    expr, state, chunk, sel, count, runtime, params, result,
+                )
             }
             (Expression::Case(expr), CompiledExpressionState::Case(state)) => {
-                Self::execute_case_into(expr, state, chunk, sel, count, runtime, result)
+                Self::execute_case_into(expr, state, chunk, sel, count, runtime, params, result)
             }
             (Expression::Operator(expr), CompiledExpressionState::Operator(state)) => {
-                Self::execute_operator_into(expr, state, chunk, sel, count, runtime, result)
+                Self::execute_operator_into(expr, state, chunk, sel, count, runtime, params, result)
             }
             (Expression::Constant(expr), CompiledExpressionState::Constant(_)) => {
                 Self::execute_constant_into(expr, count, runtime, result)
+            }
+            (Expression::Parameter(expr), CompiledExpressionState::Parameter(state)) => {
+                Self::execute_parameter_into(&expr.slot, state, count, runtime, params, result)
             }
             (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
                 Self::execute_column_ref_into(expr, chunk, sel, count, result)
@@ -339,25 +463,26 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
         match (expr, state) {
             (Expression::Function(expr), CompiledExpressionState::Function(state)) => {
-                Self::execute_function_value(expr, state, chunk, sel, count, runtime)
+                Self::execute_function_value(expr, state, chunk, sel, count, runtime, params)
             }
             (Expression::Cast(expr), CompiledExpressionState::Cast(state)) => {
-                Self::execute_cast_value(expr, state, chunk, sel, count, runtime)
+                Self::execute_cast_value(expr, state, chunk, sel, count, runtime, params)
             }
             (Expression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
-                Self::execute_comparison_value(expr, state, chunk, sel, count, runtime)
+                Self::execute_comparison_value(expr, state, chunk, sel, count, runtime, params)
             }
             (Expression::Conjunction(expr), CompiledExpressionState::Conjunction(state)) => {
-                Self::execute_conjunction_value(expr, state, chunk, sel, count, runtime)
+                Self::execute_conjunction_value(expr, state, chunk, sel, count, runtime, params)
             }
             (Expression::Case(expr), CompiledExpressionState::Case(state)) => {
-                Self::execute_case_value(expr, state, chunk, sel, count, runtime)
+                Self::execute_case_value(expr, state, chunk, sel, count, runtime, params)
             }
             (Expression::Operator(expr), CompiledExpressionState::Operator(state)) => {
-                Self::execute_operator_value(expr, state, chunk, sel, count, runtime)
+                Self::execute_operator_value(expr, state, chunk, sel, count, runtime, params)
             }
             (Expression::Constant(expr), CompiledExpressionState::Constant(_)) => {
                 Ok(EvaluatedValue::Borrowed(Vector::try_constant_from_value(
@@ -366,6 +491,9 @@ impl ExpressionExecutor {
                     count,
                     runtime.allocator(MemoryTag::BaseTable),
                 )?))
+            }
+            (Expression::Parameter(expr), CompiledExpressionState::Parameter(state)) => {
+                Self::execute_parameter_value(&expr.slot, state, count, runtime, params)
             }
             (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
                 Self::execute_column_ref_value(expr, chunk, sel, count)
@@ -460,6 +588,55 @@ impl ExpressionExecutor {
 
     fn store_value(slot: &mut ValueSlot, value: &EvaluatedValue) {
         slot.set_value(value.as_vector().reference());
+    }
+
+    fn parameter_bindings(params: Option<&ParameterBindings>) -> Result<&ParameterBindings> {
+        params.ok_or_else(|| {
+            paro_error::internal("parameter expression evaluated without ParameterBindings")
+        })
+    }
+
+    fn execute_parameter_into(
+        slot: &ParameterSlot,
+        state: &mut ParameterExpressionState,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
+        result: &mut Vector,
+    ) -> Result<()> {
+        let value = Self::execute_parameter_value(slot, state, count, runtime, params)?;
+        value.write_into(result)?;
+        result.set_len(count);
+        Ok(())
+    }
+
+    fn execute_parameter_value(
+        slot: &ParameterSlot,
+        state: &mut ParameterExpressionState,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
+    ) -> Result<EvaluatedValue> {
+        let params = Self::parameter_bindings(params)?;
+        let bound = params.value_for_slot(slot)?;
+        let needs_refresh = state.cached_epoch != Some(params.epoch())
+            || state
+                .result
+                .as_ref()
+                .is_none_or(|vector| vector.len() != count || vector.logical_type() != &slot.ty);
+        if needs_refresh {
+            state.result.set_value(Vector::try_constant_from_value(
+                slot.ty.clone(),
+                bound.clone(),
+                count,
+                runtime.allocator(MemoryTag::BaseTable),
+            )?);
+            state.cached_epoch = Some(params.epoch());
+        }
+        state
+            .result
+            .evaluated(false)
+            .ok_or_else(|| paro_error::internal("parameter result slot was not initialized"))
     }
 
     fn ensure_function_local_state(
@@ -637,15 +814,16 @@ impl ExpressionExecutor {
         input_sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         output_sel: &mut SelectionVector,
     ) -> Result<usize> {
-        if let Some(selected) =
-            Self::try_direct_select(expr, state, chunk, input_sel, count, runtime, output_sel)?
-        {
+        if let Some(selected) = Self::try_direct_select(
+            expr, state, chunk, input_sel, count, runtime, params, output_sel,
+        )? {
             return Ok(selected);
         }
 
-        let value = Self::execute_value(expr, state, chunk, input_sel, count, runtime)?;
+        let value = Self::execute_value(expr, state, chunk, input_sel, count, runtime, params)?;
         Ok(scan_bool_selection(
             value.as_vector(),
             input_sel,
@@ -661,6 +839,7 @@ impl ExpressionExecutor {
         input_sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         output_sel: &mut SelectionVector,
     ) -> Result<Option<usize>> {
         match (expr, state) {
@@ -675,6 +854,7 @@ impl ExpressionExecutor {
                     input_sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 let right = Self::execute_value(
                     &expr.right,
@@ -683,6 +863,7 @@ impl ExpressionExecutor {
                     input_sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 Self::store_value(&mut state.left_result, &left);
                 Self::store_value(&mut state.right_result, &right);
@@ -720,6 +901,7 @@ impl ExpressionExecutor {
                                 child_input_sel,
                                 current_count,
                                 runtime,
+                                params,
                                 &mut next,
                             )?;
                             std::mem::swap(&mut current, &mut next);
@@ -741,6 +923,7 @@ impl ExpressionExecutor {
                                 input_sel,
                                 count,
                                 runtime,
+                                params,
                                 &mut next,
                             )?;
                             if child_idx == 0 {
@@ -767,6 +950,7 @@ impl ExpressionExecutor {
                             input_sel,
                             count,
                             runtime,
+                            params,
                         )?;
                         Self::store_value(&mut state.child_results[0], &child);
                         Ok(Some(scan_null_selection(
@@ -785,6 +969,7 @@ impl ExpressionExecutor {
                             input_sel,
                             count,
                             runtime,
+                            params,
                         )?;
                         Self::store_value(&mut state.child_results[0], &child);
                         Ok(Some(scan_null_selection(
@@ -803,6 +988,7 @@ impl ExpressionExecutor {
                             input_sel,
                             count,
                             runtime,
+                            params,
                         )?;
                         Self::store_value(&mut state.child_results[0], &child);
                         Ok(Some(scan_false_bool_selection(
@@ -850,6 +1036,18 @@ impl ExpressionExecutor {
                     output_sel,
                 )))
             }
+            (Expression::Parameter(expr), CompiledExpressionState::Parameter(state))
+                if expr.return_type() == LogicalType::Boolean =>
+            {
+                let value =
+                    Self::execute_parameter_value(&expr.slot, state, count, runtime, params)?;
+                Ok(Some(scan_bool_selection(
+                    value.as_vector(),
+                    input_sel,
+                    count,
+                    output_sel,
+                )))
+            }
             _ => Ok(None),
         }
     }
@@ -861,6 +1059,7 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
         let allocator = runtime.allocator(MemoryTag::BaseTable);
@@ -887,6 +1086,7 @@ impl ExpressionExecutor {
                 sel,
                 count,
                 runtime,
+                params,
             )?;
             intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
         }
@@ -921,6 +1121,7 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
         let allocator = runtime.allocator(MemoryTag::BaseTable);
         let ExecuteFunctionState {
@@ -947,6 +1148,7 @@ impl ExpressionExecutor {
                 sel,
                 count,
                 runtime,
+                params,
             )?;
             intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
         }
@@ -981,10 +1183,18 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
-        let child_value =
-            Self::execute_value(&expr.child, &mut state.child, chunk, sel, count, runtime)?;
+        let child_value = Self::execute_value(
+            &expr.child,
+            &mut state.child,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
         Self::store_value(&mut state.child_result, &child_value);
 
         if child_value.as_vector().logical_type() == &expr.target_type {
@@ -1016,9 +1226,17 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
-        let child_value =
-            Self::execute_value(&expr.child, &mut state.child, chunk, sel, count, runtime)?;
+        let child_value = Self::execute_value(
+            &expr.child,
+            &mut state.child,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
         Self::store_value(&mut state.child_result, &child_value);
 
         if child_value.as_vector().logical_type() == &expr.target_type {
@@ -1048,10 +1266,27 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
-        let left = Self::execute_value(&expr.left, &mut state.left, chunk, sel, count, runtime)?;
-        let right = Self::execute_value(&expr.right, &mut state.right, chunk, sel, count, runtime)?;
+        let left = Self::execute_value(
+            &expr.left,
+            &mut state.left,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
+        let right = Self::execute_value(
+            &expr.right,
+            &mut state.right,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
         Self::store_value(&mut state.left_result, &left);
         Self::store_value(&mut state.right_result, &right);
         Self::prepare_result_vector(
@@ -1076,9 +1311,26 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
-        let left = Self::execute_value(&expr.left, &mut state.left, chunk, sel, count, runtime)?;
-        let right = Self::execute_value(&expr.right, &mut state.right, chunk, sel, count, runtime)?;
+        let left = Self::execute_value(
+            &expr.left,
+            &mut state.left,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
+        let right = Self::execute_value(
+            &expr.right,
+            &mut state.right,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
         Self::store_value(&mut state.left_result, &left);
         Self::store_value(&mut state.right_result, &right);
         let result = Self::prepare_slot_result(
@@ -1126,6 +1378,7 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
         if expr.children.is_empty() {
@@ -1138,6 +1391,7 @@ impl ExpressionExecutor {
             sel,
             count,
             runtime,
+            params,
         )?;
         if expr.children.len() == 1 {
             first.write_into(result)?;
@@ -1155,6 +1409,7 @@ impl ExpressionExecutor {
                 sel,
                 count,
                 runtime,
+                params,
             )?;
             let target_slot = if child_idx % 2 == 1 {
                 &mut state.ping
@@ -1188,6 +1443,7 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
         if expr.children.is_empty() {
             return Err(paro_error::internal("Conjunction without children"));
@@ -1199,6 +1455,7 @@ impl ExpressionExecutor {
             sel,
             count,
             runtime,
+            params,
         )?;
         if expr.children.len() == 1 {
             return Ok(first);
@@ -1215,6 +1472,7 @@ impl ExpressionExecutor {
                 sel,
                 count,
                 runtime,
+                params,
             )?;
             let target_slot = if child_idx % 2 == 1 {
                 &mut state.ping
@@ -1251,9 +1509,18 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
-        let check = Self::execute_value(&expr.check, &mut state.check, chunk, sel, count, runtime)?;
+        let check = Self::execute_value(
+            &expr.check,
+            &mut state.check,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
         let if_true = Self::execute_value(
             &expr.result_if_true,
             &mut state.result_if_true,
@@ -1261,6 +1528,7 @@ impl ExpressionExecutor {
             sel,
             count,
             runtime,
+            params,
         )?;
         let if_false = Self::execute_value(
             &expr.result_if_false,
@@ -1269,6 +1537,7 @@ impl ExpressionExecutor {
             sel,
             count,
             runtime,
+            params,
         )?;
         Self::store_value(&mut state.check_result, &check);
         Self::store_value(&mut state.true_result, &if_true);
@@ -1291,8 +1560,17 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
-        let check = Self::execute_value(&expr.check, &mut state.check, chunk, sel, count, runtime)?;
+        let check = Self::execute_value(
+            &expr.check,
+            &mut state.check,
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+        )?;
         let if_true = Self::execute_value(
             &expr.result_if_true,
             &mut state.result_if_true,
@@ -1300,6 +1578,7 @@ impl ExpressionExecutor {
             sel,
             count,
             runtime,
+            params,
         )?;
         let if_false = Self::execute_value(
             &expr.result_if_false,
@@ -1308,6 +1587,7 @@ impl ExpressionExecutor {
             sel,
             count,
             runtime,
+            params,
         )?;
         Self::store_value(&mut state.check_result, &check);
         Self::store_value(&mut state.true_result, &if_true);
@@ -1334,9 +1614,10 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
         result: &mut Vector,
     ) -> Result<()> {
-        let value = Self::execute_operator_value(expr, state, chunk, sel, count, runtime)?;
+        let value = Self::execute_operator_value(expr, state, chunk, sel, count, runtime, params)?;
         value.write_into(result)?;
         result.set_len(count);
         Ok(())
@@ -1349,6 +1630,7 @@ impl ExpressionExecutor {
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
         match expr.operator_type {
             OperatorType::Not => {
@@ -1359,6 +1641,7 @@ impl ExpressionExecutor {
                     sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 Self::store_value(&mut state.child_results[0], &child);
                 let result = Self::prepare_slot_result(
@@ -1387,6 +1670,7 @@ impl ExpressionExecutor {
                     sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 Self::store_value(&mut state.child_results[0], &child);
                 let result = Self::prepare_slot_result(
@@ -1450,6 +1734,7 @@ impl ExpressionExecutor {
                         child_input_sel,
                         unresolved_count,
                         runtime,
+                        params,
                     )?;
                     Self::store_value(&mut state.child_results[child_idx], &child);
 
@@ -1480,6 +1765,7 @@ impl ExpressionExecutor {
                     sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 Self::store_value(&mut state.child_results[0], &lhs);
 
@@ -1548,6 +1834,7 @@ impl ExpressionExecutor {
                                 sel,
                                 count,
                                 runtime,
+                                params,
                             )?;
                             Self::store_value(&mut state.child_results[rhs_idx], &rhs);
                             (eq_dispatch.compare)(
@@ -1594,6 +1881,7 @@ impl ExpressionExecutor {
                         sel,
                         count,
                         runtime,
+                        params,
                     )?;
                     Self::store_value(&mut state.child_results[child_idx], &child);
                     for row in 0..count {
@@ -1636,6 +1924,7 @@ impl ExpressionExecutor {
                         sel,
                         count,
                         runtime,
+                        params,
                     )?;
                     Self::store_value(&mut state.child_results[child_idx], &child);
                     let child_vec = Arc::make_mut(&mut children[child_idx]);
@@ -1666,6 +1955,7 @@ impl ExpressionExecutor {
                     sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 let row_count = Self::execute_value(
                     &expr.children[1],
@@ -1674,6 +1964,7 @@ impl ExpressionExecutor {
                     sel,
                     count,
                     runtime,
+                    params,
                 )?;
                 Self::store_value(&mut state.child_results[0], &value);
                 Self::store_value(&mut state.child_results[1], &row_count);
@@ -1878,7 +2169,9 @@ mod tests {
 
     use super::*;
     use crate::execution_context::ExecutionContext;
+    use crate::runtime::ParameterBindingEpoch;
     use crate::thread_context::ThreadContext;
+    use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
     use paro_common::vector::{DictionaryInfo, DictionarySource, VectorType};
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_function::scalar::cast::{numeric_casts, BoundCastInfo};
@@ -1890,8 +2183,8 @@ mod tests {
     use paro_planner::expression::{
         CastExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
         ConjunctionExpression, ConjunctionType, ConstantExpression, FunctionExpression,
-        OperatorExpression, OperatorType, ReferenceExpression, SubqueryExpression,
-        SubqueryPlanningState, SubqueryType,
+        OperatorExpression, OperatorType, ParameterExpression, ReferenceExpression,
+        SubqueryExpression, SubqueryPlanningState, SubqueryType,
     };
     use paro_planner::operator::ColumnBinding;
     use paro_planner::operator::{ExpressionGet, LogicalOperator};
@@ -2008,6 +2301,29 @@ mod tests {
             Value::Integer(value),
             LogicalType::Integer,
         ))
+    }
+
+    fn parameter_i32(index: usize) -> Expression {
+        Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
+            RuntimeParamId::new(index),
+            LogicalType::Integer,
+        )))
+    }
+
+    fn parameter_bool(index: usize) -> Expression {
+        Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
+            RuntimeParamId::new(index),
+            LogicalType::Boolean,
+        )))
+    }
+
+    fn parameter_bindings(
+        values: Vec<Value>,
+        types: Vec<LogicalType>,
+        epoch: u64,
+    ) -> ParameterBindings {
+        ParameterBindings::new(values, types, ParameterBindingEpoch::new(epoch))
+            .expect("test parameter bindings should be valid")
     }
 
     fn reference_i32(index: usize) -> Expression {
@@ -2436,6 +2752,107 @@ mod tests {
             }
             other => panic!("expected comparison state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parameter_expression_reads_epoch_scoped_bindings() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let expr = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            reference_i32(0),
+            parameter_i32(0),
+        ));
+        let mut executor = ExpressionExecutor::new(&expr);
+        let input = integer_chunk(&[1, 3, 5]);
+        let first_bindings =
+            parameter_bindings(vec![Value::Integer(2)], vec![LogicalType::Integer], 1);
+        let second_bindings =
+            parameter_bindings(vec![Value::Integer(4)], vec![LogicalType::Integer], 2);
+        let mut first =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, input.size());
+        let mut second =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, input.size());
+
+        executor
+            .execute_into_with_input(
+                0,
+                ExpressionEvalInput {
+                    params: &first_bindings,
+                    columns: &input,
+                },
+                None,
+                input.size(),
+                &runtime,
+                &mut first,
+            )
+            .expect("parameter comparison should execute");
+        executor
+            .execute_into_with_input(
+                0,
+                ExpressionEvalInput {
+                    params: &second_bindings,
+                    columns: &input,
+                },
+                None,
+                input.size(),
+                &runtime,
+                &mut second,
+            )
+            .expect("parameter comparison should refresh when epoch changes");
+
+        assert_eq!(first.get_bool(0), Some(false));
+        assert_eq!(first.get_bool(1), Some(true));
+        assert_eq!(first.get_bool(2), Some(true));
+        assert_eq!(second.get_bool(0), Some(false));
+        assert_eq!(second.get_bool(1), Some(false));
+        assert_eq!(second.get_bool(2), Some(true));
+    }
+
+    #[test]
+    fn boolean_parameter_select_uses_direct_selection_path() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let expr = parameter_bool(0);
+        let mut executor = ExpressionExecutor::new(&expr);
+        let mut input = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+        input.set_cardinality(3);
+        let true_bindings =
+            parameter_bindings(vec![Value::Boolean(true)], vec![LogicalType::Boolean], 1);
+        let false_bindings =
+            parameter_bindings(vec![Value::Boolean(false)], vec![LogicalType::Boolean], 2);
+        let mut selection = paro_common::test_utils::test_selection_with_capacity(input.size());
+
+        let selected = executor
+            .select_into_with_input(
+                0,
+                ExpressionEvalInput {
+                    params: &true_bindings,
+                    columns: &input,
+                },
+                input.size(),
+                &runtime,
+                &mut selection,
+            )
+            .expect("true parameter select should execute");
+        assert_eq!(selected, 3);
+        assert_eq!(selection.as_slice(), &[0, 1, 2]);
+
+        let selected = executor
+            .select_into_with_input(
+                0,
+                ExpressionEvalInput {
+                    params: &false_bindings,
+                    columns: &input,
+                },
+                input.size(),
+                &runtime,
+                &mut selection,
+            )
+            .expect("false parameter select should execute");
+        assert_eq!(selected, 0);
+        assert!(selection.as_slice().is_empty());
     }
 
     #[test]
@@ -3107,6 +3524,31 @@ mod tests {
         assert_eq!(first_output_ptr, second_output_ptr);
         assert_eq!(output.get_value(0, 0), Some(Value::Integer(5)));
         assert_eq!(output.get_value(0, 1), Some(Value::Integer(6)));
+    }
+
+    #[test]
+    fn execute_all_into_preserves_projection_schema_for_empty_physical_input() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let expressions = [
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Varchar)),
+        ];
+        let mut executor = ExpressionExecutor::with_expressions(&expressions);
+        let input = paro_common::test_utils::test_empty_chunk(&[]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        executor
+            .execute_all_into(&input, &runtime, &mut output)
+            .expect("empty projection should preserve logical output schema");
+
+        assert_eq!(output.size(), 0);
+        assert_eq!(output.column_count(), 2);
+        assert_eq!(
+            output.types(),
+            vec![LogicalType::Integer, LogicalType::Varchar]
+        );
     }
 
     #[test]

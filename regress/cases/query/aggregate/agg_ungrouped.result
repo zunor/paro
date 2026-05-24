@@ -45,14 +45,13 @@ FROM (
 ) AS agg_u_values(x);
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: count_star, sum
-  ->  UNGROUPED_AGGREGATE  (rows=1)
-        Aggregates: COUNT_STAR(*), SUM(col0)
-        ->  PROJECTION
-              Output: col0
-              ->  PROJECTION  (rows=4)
-                    Output: col0
-                    ->  EXPRESSION_SCAN  (rows=4)
+  Output: cnt_star, sum_x
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*), sum(#0)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=4)
+      Output: x
+      ->  VALUES  (rows=4)
 
 SELECT
     count(*) AS cnt_star,

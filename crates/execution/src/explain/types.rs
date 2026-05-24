@@ -96,6 +96,43 @@ pub struct ExplainActualStats {
     pub runtime: ExplainRuntimeStats,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplainControlRegionStats {
+    RecursiveCte(ExplainRecursiveCteStats),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainRecursiveCteStats {
+    pub region_id: usize,
+    pub iterations: usize,
+    pub termination: ExplainRecursiveCteTermination,
+    pub iteration_stats: Vec<ExplainRecursiveCteIterationStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainRecursiveCteTermination {
+    EmptyDelta,
+    MaxIterations,
+    Cancelled,
+}
+
+impl ExplainRecursiveCteTermination {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyDelta => "empty_delta",
+            Self::MaxIterations => "max_iterations",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplainRecursiveCteIterationStats {
+    pub iteration: usize,
+    pub delta_rows: u64,
+    pub working_rows: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum ExplainValue {
     String(String),
@@ -413,10 +450,15 @@ impl ExplainNode {
         if !self.properties.is_empty() {
             let mut properties = Map::new();
             for property in &self.properties {
+                if !spec.detail.verbose && property.label == "Output Schema" {
+                    continue;
+                }
                 let (label, value) = property.to_json_entry();
                 properties.insert(label, value);
             }
-            object.insert("properties".to_string(), JsonValue::Object(properties));
+            if !properties.is_empty() {
+                object.insert("properties".to_string(), JsonValue::Object(properties));
+            }
         }
         if !self.children.is_empty() {
             object.insert(

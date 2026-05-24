@@ -1,0 +1,39 @@
+WITH RECURSIVE root_counter(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM root_counter WHERE n < 4
+)
+SELECT n FROM root_counter;
+n
+1
+2
+3
+4
+
+WITH RECURSIVE embedded_counter(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM embedded_counter WHERE n < 6
+)
+SELECT n FROM embedded_counter ORDER BY n DESC LIMIT 3;
+n
+6
+5
+4
+
+SELECT
+  o.id,
+  EXISTS(
+    SELECT 1
+    FROM control_region_lookup AS l
+    WHERE l.grp = o.grp
+      AND l.quota >= o.amt
+  ) AS has_quota
+FROM control_region_outer AS o
+ORDER BY o.id;
+o.id	has_quota
+1	true
+2	false
+3	true
+4	false
+5	false

@@ -825,16 +825,36 @@ impl JoinHashTable {
         count: usize,
         hashes: &mut [u64],
     ) {
-        use std::hash::{Hash, Hasher};
         for i in 0..count {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
             let row_idx = sel.get(i);
-            for (col_idx, _col_type) in self.equality_types.iter().enumerate() {
-                let val = keys.data[col_idx].get_value(row_idx);
-                val.hash(&mut hasher);
-            }
-            hashes[i] = hasher.finish();
+            hashes[i] = self.compute_key_hash_at(keys, row_idx);
         }
+    }
+
+    /// Compute hash values with the same key hashing path used by probe().
+    pub fn compute_key_hashes(
+        &self,
+        keys: &paro_common::chunk::Chunk,
+        hashes: &mut paro_common::vector::Vector,
+    ) -> Result<()> {
+        hashes.try_set_count(keys.size())?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for idx in 0..keys.size() {
+            hashes.set_u64(idx, self.compute_key_hash_at(keys, idx));
+        }
+        Ok(())
+    }
+
+    fn compute_key_hash_at(&self, keys: &paro_common::chunk::Chunk, row_idx: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (col_idx, _col_type) in self.equality_types.iter().enumerate() {
+            let val = keys.data[col_idx].get_value(row_idx);
+            val.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     /// Reset the hash table for reuse.
@@ -886,12 +906,15 @@ impl FullOuterScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::allocator::MemoryTag;
+    use paro_common::memory::{MemoryDomain, MemoryOwner};
     use paro_common::vector::VECTOR_SIZE;
     use paro_planner::expression::{ConstantExpression, Expression};
     use paro_storage::buffer::BufferPool;
     use std::hash::{Hash, Hasher};
 
     use crate::join_hashtable::ht_entry::HtEntry;
+    use crate::memory_runtime::QueryMemoryPool;
 
     fn create_test_buffer_pool() -> Arc<BufferPool> {
         BufferPool::new_arc(64 * 1024 * 1024) // 64MB
@@ -939,6 +962,34 @@ mod tests {
         }
         chunk.set_cardinality(values.len());
         chunk
+    }
+
+    #[test]
+    fn join_hash_table_build_store_respects_query_quota() {
+        let pool = Arc::new(QueryMemoryPool::new(1));
+        let owner: Arc<dyn MemoryOwner> = pool;
+        let memory = MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        );
+        let table = JoinHashTable::new_with_memory(
+            create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
+            vec![equality_condition()],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            JoinHashTableConfig::default(),
+            memory,
+        );
+        let keys = chunk_from_optional_i32(&[Some(1), Some(2)]);
+        let payload = chunk_from_optional_i32(&[Some(10), Some(20)]);
+
+        let err = table
+            .build(&keys, &payload)
+            .expect_err("tiny query quota must reject hash join build storage");
+        assert!(err.to_string().contains("quota"));
     }
 
     fn hash_integer(value: i32) -> u64 {

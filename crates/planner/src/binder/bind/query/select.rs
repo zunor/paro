@@ -541,7 +541,7 @@ impl Binder {
                     .collect();
                 Expression::Window(window)
             }
-            Expression::Constant(_) | Expression::ColumnRef(_) => expr,
+            Expression::Constant(_) | Expression::Parameter(_) | Expression::ColumnRef(_) => expr,
         }
     }
 

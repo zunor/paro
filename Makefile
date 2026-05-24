@@ -1,7 +1,7 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-setup bench-clean bench-ping python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
+.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark perf-gate perf-gate-sql perf-gate-divan perf-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
 
 # Build the project
 build:
@@ -15,9 +15,11 @@ release:
 run:
 	RUST_BACKTRACE=1 RUST_LOG=info cargo run -p paro-server --bin parod -- --listen $(PARO_HOST):$(PARO_PORT)
 
+RUST_TEST_MIN_STACK ?= 33554432
+
 # Run all tests
 test:
-	cargo test --workspace --locked
+	RUST_MIN_STACK=$(RUST_TEST_MIN_STACK) cargo test --workspace --locked
 
 # Check compilation without building
 check:
@@ -94,7 +96,7 @@ ci-local: ## Run the full CI pipeline locally (static → build → test → reg
 	@echo "══════ [1/6] build (release) ══════"
 	cargo build --release -p paro-server --bin parod --locked
 	@echo "══════ [2/6] unit tests ══════"
-	cargo test --workspace --locked
+	RUST_MIN_STACK=$(RUST_TEST_MIN_STACK) cargo test --workspace --locked
 	@echo "══════ [3/6] regress harness unit ══════"
 	$(MAKE) -C regress unit
 	@echo "══════ [4/6] python runtime startup smoke ══════"
@@ -243,23 +245,77 @@ bench: ## Run benchmark (WORKLOAD= FILTER= SUITE= PARAMS= PID=)
 bench-ci: ## Run benchmark CI suite (default PARO_HOST/PARO_PORT = 127.0.0.1:6432)
 	@PARO_HOST=$(PARO_HOST) PARO_PORT=$(PARO_PORT) $(MAKE) -C benchmark ci
 
-bench-check: ## Compare benchmark against baseline (BASELINE=path)
+bench-check: ## Run benchmark performance gate (GATE= INCLUDE_SOURCE= BASELINE= POLICY= PID= ARCHIVE=)
 	@$(MAKE) -C benchmark check \
+		$(if $(GATE),GATE=$(GATE)) \
 		$(if $(BASELINE),BASELINE=$(abspath $(BASELINE))) \
-		$(if $(SUITE),SUITE=$(SUITE)) \
-		$(if $(WORKLOAD),WORKLOAD=$(WORKLOAD)) \
-		$(if $(FILTER),FILTER=$(FILTER)) \
-		$(if $(PARAMS),PARAMS="$(PARAMS)") \
-		$(if $(PID),PID=$(PID))
+		$(if $(POLICY),POLICY=$(abspath $(POLICY))) \
+		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
+		$(if $(PID),PID=$(PID)) \
+		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
+		$(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
 
-bench-bless: ## Update benchmark baseline (BASELINE=path)
+bench-bless: ## Update benchmark gate baseline (GATE= BASELINE= POLICY= PID= BLESS_RUNS= POLICY_EVOLUTION=1)
 	@$(MAKE) -C benchmark bless \
+		$(if $(GATE),GATE=$(GATE)) \
 		$(if $(BASELINE),BASELINE=$(abspath $(BASELINE))) \
-		$(if $(SUITE),SUITE=$(SUITE)) \
-		$(if $(WORKLOAD),WORKLOAD=$(WORKLOAD)) \
-		$(if $(FILTER),FILTER=$(FILTER)) \
-		$(if $(PARAMS),PARAMS="$(PARAMS)") \
-		$(if $(PID),PID=$(PID))
+		$(if $(POLICY),POLICY=$(abspath $(POLICY))) \
+		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
+		$(if $(PID),PID=$(PID)) \
+		$(if $(BLESS_RUNS),BLESS_RUNS=$(BLESS_RUNS)) \
+		$(if $(POLICY_EVOLUTION),POLICY_EVOLUTION=$(POLICY_EVOLUTION))
+
+bench-calibrate: ## Append benchmark gate observations to archive (GATE= ARCHIVE= RUN_ID=)
+	@$(MAKE) -C benchmark calibrate \
+		$(if $(GATE),GATE=$(GATE)) \
+		$(if $(BASELINE),BASELINE=$(abspath $(BASELINE))) \
+		$(if $(POLICY),POLICY=$(abspath $(POLICY))) \
+		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
+		$(if $(PID),PID=$(PID)) \
+		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
+
+bench-bisect: ## Compare current checkout against archived gate result (GATE= AGAINST= ARCHIVE= PID=)
+	@$(MAKE) -C benchmark bisect \
+		$(if $(GATE),GATE=$(GATE)) \
+		$(if $(AGAINST),AGAINST=$(AGAINST)) \
+		$(if $(POLICY),POLICY=$(abspath $(POLICY))) \
+		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
+		$(if $(PID),PID=$(PID)) \
+		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE)))
+
+bench-archive-manifest: ## Rebuild benchmark archive manifest (ARCHIVE= GATE= PLATFORM= POLICY_VERSION=)
+	@$(MAKE) -C benchmark archive-manifest \
+		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
+		$(if $(GATE),GATE=$(GATE)) \
+		$(if $(PLATFORM),PLATFORM=$(PLATFORM)) \
+		$(if $(POLICY_VERSION),POLICY_VERSION=$(POLICY_VERSION)) \
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE)))
+
+bench-archive-recompute-calibration: ## Recompute benchmark archive calibration (ARCHIVE= GATE= PLATFORM= POLICY=)
+	@$(MAKE) -C benchmark archive-recompute-calibration \
+		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
+		$(if $(GATE),GATE=$(GATE)) \
+		$(if $(PLATFORM),PLATFORM=$(PLATFORM)) \
+		$(if $(POLICY),POLICY=$(abspath $(POLICY))) \
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE)))
+
+bench-archive-finalize-calibration: ## Finalize benchmark archive calibration and manifest (ARCHIVE= GATE= PLATFORM= POLICY=)
+	@$(MAKE) -C benchmark archive-finalize-calibration \
+		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
+		$(if $(GATE),GATE=$(GATE)) \
+		$(if $(PLATFORM),PLATFORM=$(PLATFORM)) \
+		$(if $(POLICY),POLICY=$(abspath $(POLICY))) \
+		$(if $(POLICY_VERSION),POLICY_VERSION=$(POLICY_VERSION)) \
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE)))
+
+bench-test: ## Run benchmark harness unit tests
+	@$(MAKE) -C benchmark test
+
+test-benchmark: bench-test ## Alias for benchmark harness unit tests
 
 bench-setup: ## Install benchmark Python dependencies
 	@$(MAKE) -C benchmark setup
@@ -269,3 +325,16 @@ bench-clean: ## Remove benchmark reports and venv
 
 bench-ping: ## Verify benchmark can connect to Paro
 	@$(MAKE) -C benchmark ping
+
+# ── Operator Runtime Performance Gate ────────────────────────
+perf-gate: ## Run operator runtime performance gate (requires parod running)
+	@$(MAKE) -C benchmark check GATE=operator-runtime $(if $(PID),PID=$(PID)) $(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
+
+perf-gate-sql: ## Run SQL performance gates only (requires parod running)
+	@$(MAKE) -C benchmark check GATE=operator-runtime INCLUDE_SOURCE=operator-runtime-sql $(if $(PID),PID=$(PID)) $(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
+
+perf-gate-divan: ## Run operator runtime Divan dispatch gate
+	@PARO_BENCH_CARGO_PROFILE=release $(MAKE) -C benchmark check GATE=divan-dispatch $(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
+
+perf-gate-bless: ## Bless current operator runtime SQL gate baseline
+	@$(MAKE) -C benchmark bless GATE=operator-runtime $(if $(PID),PID=$(PID))

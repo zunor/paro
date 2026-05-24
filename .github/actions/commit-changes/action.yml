@@ -1,0 +1,55 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+name: Commit changes
+description: Commit selected paths and push with a small rebase retry loop
+
+inputs:
+  path:
+    description: Repository path
+    default: .
+  add-paths:
+    description: Space-separated paths to stage
+    required: true
+  message:
+    description: Commit message
+    required: true
+  branch:
+    description: Optional branch to rebase from before retrying push
+    default: ""
+  user-name:
+    description: Git author name
+    default: paro-perf-bot
+  user-email:
+    description: Git author email
+    default: paro-perf-bot@users.noreply.github.com
+
+runs:
+  using: composite
+  steps:
+    - name: Commit and push
+      shell: bash
+      run: |
+        cd "${{ inputs.path }}"
+        git config user.name "${{ inputs.user-name }}"
+        git config user.email "${{ inputs.user-email }}"
+        read -r -a add_paths <<< "${{ inputs.add-paths }}"
+        git add -- "${add_paths[@]}"
+        if git diff --cached --quiet; then
+          echo "nothing to commit"
+          exit 0
+        fi
+        git commit -m "${{ inputs.message }}"
+        for attempt in 1 2 3; do
+          if git push; then
+            exit 0
+          fi
+          echo "push failed on attempt ${attempt}; rebasing and retrying" >&2
+          if [ -n "${{ inputs.branch }}" ]; then
+            git pull --rebase origin "${{ inputs.branch }}"
+          else
+            git pull --rebase
+          fi
+        done
+        echo "push failed after retries" >&2
+        exit 1

@@ -1,0 +1,48 @@
+[meta]
+name = "output_buffering_unbounded"
+description = "Unbounded output path verification: EXPLAIN ANALYZE, recursive CTE, control-region root"
+run_order = 21
+
+[params]
+scan_rows = 50000
+cte_depth = 100
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "explain_analyze_large_scan"
+file = "sql/q_explain_analyze_large_scan.sql"
+validate = "none"
+collect_explain_profile = false
+allow_reexecute = true
+
+[[query]]
+id = "explain_analyze_join"
+file = "sql/q_explain_analyze_join.sql"
+validate = "none"
+collect_explain_profile = false
+allow_reexecute = true
+
+[[query]]
+id = "recursive_cte_linear"
+file = "sql/q_recursive_cte_linear.sql"
+validate = "row_count"
+expected = 100
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "recursive_cte_tree"
+file = "sql/q_recursive_cte_tree.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "dml_insert_unbounded"
+file = "sql/q_dml_insert_unbounded.sql"
+validate = "none"
+collect_explain_profile = false
+allow_reexecute = true

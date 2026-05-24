@@ -1,0 +1,60 @@
+[meta]
+name = "output_buffering"
+description = "Output buffering memory verification: fetch-driven bounded vs completed-output unbounded"
+run_order = 20
+
+[params]
+scan_rows = 100000
+join_left_rows = 50000
+join_right_rows = 5000
+agg_rows = 100000
+agg_groups = 500
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "streaming_scan_filter"
+file = "sql/q_streaming_scan_filter.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "streaming_limit"
+file = "sql/q_streaming_limit.sql"
+validate = "row_count"
+expected = 1000
+collect_explain_profile = false
+allow_reexecute = true
+
+[[query]]
+id = "hash_join_output"
+file = "sql/q_hash_join_output.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "large_join_limit"
+file = "sql/q_large_join_limit.sql"
+validate = "row_count"
+expected = 500
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "sort_output"
+file = "sql/q_sort_output.sql"
+validate = "none"
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "aggregate_output"
+file = "sql/q_aggregate_output.sql"
+validate = "row_count"
+expected = 500
+collect_explain_profile = true
+allow_reexecute = true

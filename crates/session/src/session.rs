@@ -36,7 +36,7 @@ use paro_context::{
     SessionMetadataRows, StatementCancelReason, StatementCancellation, StatementContext,
     StatementEnvironment, StatementOptions, StatementSource, StatementView,
 };
-use paro_execution::operator::ddl::refresh_property_graph::{
+use paro_execution::operators::graph::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
     schedule_property_graph_background_rebuild,
 };
@@ -441,10 +441,6 @@ impl Session {
             )),
             limits,
             cancellation,
-            execution_tracker: self
-                .execution_control
-                .active_statement()
-                .map(|statement| statement as Arc<dyn paro_context::StatementExecutionTracker>),
             services: Arc::new(QueryResources {
                 infra: Arc::new(ExecutionResources {
                     scheduler: self.instance.get_scheduler().clone(),

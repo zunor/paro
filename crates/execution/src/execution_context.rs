@@ -3,7 +3,7 @@
 
 //! Per-task execution context passed to physical operators.
 
-use crate::pipeline::pipeline::Pipeline;
+use crate::memory_runtime::{OperatorMemoryAccount, QueryMemoryPool};
 use crate::thread_context::ThreadContext;
 use paro_common::allocator::{Allocator, ArenaAllocator, BufferAllocator, MemoryTag};
 use paro_common::error::Result;
@@ -11,12 +11,10 @@ use paro_context::{StatementContext, TransactionView};
 use paro_scheduler::task::InterruptState;
 use std::sync::Arc;
 
-use crate::memory_runtime::{OperatorMemoryAccount, QueryMemoryPool};
-
 /// Execution context for operator execution.
 ///
 /// The context holds shared statement state, the current thread-local state, and
-/// an optional reference to the active pipeline.
+/// an optional query memory pool reference.
 pub struct ExecutionContext<'a> {
     /// The session context (Arc for flexible lifetime management).
     pub session: Arc<StatementContext>,
@@ -24,8 +22,8 @@ pub struct ExecutionContext<'a> {
     /// The thread-local context.
     pub thread: &'a ThreadContext,
 
-    /// Reference to the pipeline (optional).
-    pub pipeline: Option<&'a Pipeline>,
+    /// Query memory pool (optional).
+    query_memory_pool: Option<Arc<QueryMemoryPool>>,
 
     /// Interrupt state used by operators that may block and later resume.
     interrupt_state: InterruptState,
@@ -38,26 +36,26 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// * `session` - Arc to the session context
     /// * `thread` - Reference to the thread context
-    /// * `pipeline` - Optional reference to the pipeline
+    /// * `query_memory_pool` - Optional query memory pool
     pub fn new(
         session: Arc<StatementContext>,
         thread: &'a ThreadContext,
-        pipeline: Option<&'a Pipeline>,
+        query_memory_pool: Option<Arc<QueryMemoryPool>>,
     ) -> Self {
-        Self::with_interrupt_state(session, thread, pipeline, InterruptState::new())
+        Self::with_interrupt_state(session, thread, query_memory_pool, InterruptState::new())
     }
 
     /// Create a new ExecutionContext with an explicit interrupt state.
     pub fn with_interrupt_state(
         session: Arc<StatementContext>,
         thread: &'a ThreadContext,
-        pipeline: Option<&'a Pipeline>,
+        query_memory_pool: Option<Arc<QueryMemoryPool>>,
         interrupt_state: InterruptState,
     ) -> Self {
         Self {
             session,
             thread,
-            pipeline,
+            query_memory_pool,
             interrupt_state,
         }
     }
@@ -71,8 +69,8 @@ impl<'a> ExecutionContext<'a> {
     /// Get the current query memory pool.
     #[inline]
     pub fn query_memory_pool(&self) -> Arc<QueryMemoryPool> {
-        self.pipeline
-            .map(Pipeline::query_memory_pool)
+        self.query_memory_pool
+            .clone()
             .unwrap_or_else(|| Arc::new(QueryMemoryPool::unbounded()))
     }
 

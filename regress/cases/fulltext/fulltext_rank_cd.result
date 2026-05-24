@@ -42,11 +42,11 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  TOP_N  (rows=1)
-        Sort Key: TS_RANK_CD(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'alpha beta')) DESC NULLS FIRST, id ASC NULLS LAST
-        Limit: 2
-        ->  PROJECTION  (rows=1)
-              Output: id, TS_RANK_CD(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'alpha beta')), id
-              ->  FULLTEXT_SCAN on public.ft_t024_rank_cd  (rows=5)
+    Sort Key: #1 DESC NULLS FIRST, #2 ASC NULLS LAST
+    Limit: 2
+    ->  PROJECTION  (rows=1)
+      Output: id, __paro_hidden_1, __paro_hidden_2
+      ->  FULLTEXT_SCAN on public.ft_t024_rank_cd  (rows=5)
 
 DROP INDEX IF EXISTS idx_ft_t024_rank_cd_fts;
 DROP INDEX

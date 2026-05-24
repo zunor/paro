@@ -245,7 +245,7 @@ COPY 1
 COPY dml_copy_from_ndjson_alias
 FROM '/tmp/paro_copy_from_bad_ndjson.txt'
 WITH (FORMAT ndjson);
-ERROR: Invalid NDJSON record at row 1: expected a JSON object (SQLSTATE=XX000)
+ERROR: Invalid NDJSON record at row 1: expected a JSON object (SQLSTATE=22023)
 
 COPY (
   SELECT 'abc' AS id, 'bad' AS name
@@ -255,7 +255,7 @@ COPY 1
 COPY dml_copy_from_ndjson_alias
 FROM '/tmp/paro_copy_from_bad_ndjson_type.json'
 WITH (FORMAT ndjson);
-ERROR: invalid input syntax for type read_ndjson row 1: "invalid integer value: abc" (SQLSTATE=XX000)
+ERROR: invalid input syntax for type read_ndjson row 1: "invalid integer value: abc" (SQLSTATE=22P02)
 
 COPY (
   SELECT id
@@ -265,7 +265,7 @@ COPY (
 COPY 5
 
 COPY dml_copy_from_text FROM '/tmp/paro_copy_from_bad_columns.csv' WITH (FORMAT csv);
-ERROR: invalid input syntax for type CSV row has incorrect column count: "expected 2, got 1 at row 1" (SQLSTATE=XX000)
+ERROR: invalid input syntax for type CSV row has incorrect column count: "expected 2, got 1 at row 1" (SQLSTATE=22P02)
 
 COPY (
   SELECT 'abc' AS id, 'bad' AS name
@@ -273,7 +273,7 @@ COPY (
 COPY 1
 
 COPY dml_copy_from_text FROM '/tmp/paro_copy_from_type_mismatch.csv' WITH (FORMAT csv);
-ERROR: invalid input syntax for type BIGINT: "abc" (SQLSTATE=XX000)
+ERROR: invalid input syntax for type BIGINT: "abc" (SQLSTATE=22P02)
 
 COPY dml_copy_from_text FROM '/tmp/paro_copy_from_missing.csv' WITH (FORMAT csv);
 ERROR: Failed to open CSV file '/tmp/paro_copy_from_missing.csv': No such file or directory (os error 2) (SQLSTATE=58030)

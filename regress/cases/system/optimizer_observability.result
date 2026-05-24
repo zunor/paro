@@ -57,16 +57,17 @@ PROJECTION  (rows=0)
   Cardinality: [0, 0, 1]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=0)
-        Sort Key: BM25(title, 'graph') DESC NULLS FIRST, id ASC NULLS LAST
-        Limit: 2
-        Cardinality: [0, 0, 1]
-        Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
-        ->  PROJECTION  (rows=0)
-              Output: id, BM25(title, 'graph'), id
-              Cardinality: [0, 0, 1]
-              Output Schema: id INTEGER, col_2 FLOAT, col_3 INTEGER
-              ->  FULLTEXT_SCAN on public.obs_docs  (rows=3)
-                    Output Schema: id INTEGER, title VARCHAR
+    Sort Key: #1 DESC NULLS FIRST, #2 ASC NULLS LAST
+    Limit: 2
+    Cardinality: [0, 0, 1]
+    Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
+    ->  PROJECTION  (rows=0)
+      Output: id, __paro_hidden_1, __paro_hidden_2
+      Cardinality: [0, 0, 1]
+      Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
+      ->  FULLTEXT_SCAN on public.obs_docs  (rows=3)
+        Cardinality: [3, 3, 3]
+        Output Schema: id INTEGER, title VARCHAR
 
 DROP TABLE obs_docs;
 DROP TABLE

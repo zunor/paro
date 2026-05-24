@@ -1,47 +1,26 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reporting and baseline comparison."""
+"""Benchmark reporting."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 import platform
-import shutil
 import statistics
 import subprocess
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .executor import QueryExecutionResult, WorkloadExecutionResult
-from .validator import STRONG_VALIDATE_MODES
+from .performance_gate import GateOutcome
 
-
-@dataclass(frozen=True)
-class RegressionEntry:
-    workload: str
-    query_id: str
-    params: dict[str, Any]
-    baseline_median: float
-    current_median: float
-    change_percent: float
-    status: str
-
-
-@dataclass(frozen=True)
-class PerformanceGateEntry:
-    workload: str
-    query_id: str
-    metric: str
-    baseline_value: float
-    current_value: float
-    change_percent: float
-    status: str
+if TYPE_CHECKING:
+    from .archive.calibration import ArchiveHealth
 
 
 class BenchmarkReporter:
@@ -60,7 +39,7 @@ class BenchmarkReporter:
         collect_explain_profile: bool,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "git": self._collect_git_info(),
             "system": self._collect_system_info(),
@@ -90,6 +69,17 @@ class BenchmarkReporter:
                         "after_bytes": query.memory_after_bytes,
                         "delta_bytes": query.memory_after_bytes - query.memory_before_bytes,
                     }
+                rss = None
+                if (
+                    query.rss_before_kb is not None
+                    or query.rss_after_kb is not None
+                    or query.rss_peak_kb is not None
+                ):
+                    rss = {
+                        "before_kb": query.rss_before_kb,
+                        "after_kb": query.rss_after_kb,
+                        "peak_kb": query.rss_peak_kb,
+                    }
                 memory_tags = _build_memory_tags_payload(query)
                 spill_metrics = _build_spill_metrics_payload(query)
                 query_entry: dict[str, Any] = {
@@ -98,6 +88,7 @@ class BenchmarkReporter:
                     "samples_ms": query.samples_ms,
                     "stats": stats,
                     "memory": memory,
+                    "rss": rss,
                     "memory_tags": memory_tags,
                     "spill_metrics": spill_metrics,
                     "validation": {
@@ -198,233 +189,90 @@ class BenchmarkReporter:
                     return True
         return False
 
-    def compare_with_baseline(
-        self,
-        current_payload: dict[str, Any],
-        baseline_path: Path,
-        threshold_percent: float,
-    ) -> list[RegressionEntry]:
-        baseline_payload = json.loads(baseline_path.read_text(encoding="utf-8"))
-        baseline_index = _index_queries(baseline_payload)
-        entries: list[RegressionEntry] = []
-
-        for workload in current_payload.get("workloads", []):
-            workload_name = str(workload.get("name", ""))
-            params = workload.get("params", {})
-            params_key = _params_key(params)
-            for query in workload.get("queries", []):
-                validate_mode = str(query.get("validate_mode", "none"))
-                if validate_mode not in STRONG_VALIDATE_MODES:
-                    continue
-                validation = query.get("validation", {})
-                if validation.get("result") != "PASS":
-                    continue
-                stats = query.get("stats") or {}
-                current_median = stats.get("median")
-                if not isinstance(current_median, (int, float)):
-                    continue
-
-                query_id = str(query.get("id", ""))
-                key = (workload_name, query_id, params_key)
-                baseline_query = baseline_index.get(key)
-                if baseline_query is None:
-                    continue
-                baseline_stats = baseline_query.get("stats") or {}
-                baseline_median = baseline_stats.get("median")
-                if not isinstance(baseline_median, (int, float)) or baseline_median <= 0:
-                    continue
-
-                change = ((current_median - baseline_median) / baseline_median) * 100.0
-                if change > threshold_percent:
-                    status = "REGRESS"
-                elif change < -threshold_percent:
-                    status = "IMPROVE"
-                else:
-                    status = "OK"
-
-                entries.append(
-                    RegressionEntry(
-                        workload=workload_name,
-                        query_id=query_id,
-                        params=params if isinstance(params, dict) else {},
-                        baseline_median=float(baseline_median),
-                        current_median=float(current_median),
-                        change_percent=float(change),
-                        status=status,
-                    )
-                )
-
-        entries.sort(key=lambda item: (item.workload, item.query_id))
-        return entries
-
-    def print_regression(self, entries: list[RegressionEntry], threshold_percent: float) -> None:
-        if not entries:
-            print("Regression: no comparable queries found in baseline")
+    def print_gate_outcome(self, outcome: GateOutcome) -> None:
+        if not outcome.entries and outcome.archive_health is None:
             return
-        print(f"Regression threshold: ±{threshold_percent:.2f}%")
-        for entry in entries:
+        print(f"Performance gate: {outcome.gate}")
+        if outcome.archive_health is not None:
+            self._print_archive_health(outcome.archive_health)
+        for entry in outcome.entries:
             colored_status = self._status_text(entry.status)
-            print(
-                f"  {entry.workload}.{entry.query_id:<20} {colored_status:<10} "
-                f"{entry.baseline_median:.2f}ms -> {entry.current_median:.2f}ms "
-                f"({entry.change_percent:+.2f}%)"
-            )
-
-    def compare_performance_gates(
-        self,
-        current_payload: dict[str, Any],
-        baseline_path: Path,
-    ) -> list[PerformanceGateEntry]:
-        baseline_payload = json.loads(baseline_path.read_text(encoding="utf-8"))
-        gate = baseline_payload.get("performance_gate")
-        if not isinstance(gate, dict):
-            return []
-
-        metrics = gate.get("metrics", ["p50", "p99", "p999", "throughput_per_second"])
-        if not isinstance(metrics, list):
-            metrics = ["p50", "p99", "p999", "throughput_per_second"]
-        latency_threshold = _gate_float(gate, "latency_regression_threshold_percent", 25.0)
-        qps_min_ratio = _gate_float(gate, "throughput_min_ratio", 0.75)
-        absolute_max = gate.get("absolute_max") if isinstance(gate.get("absolute_max"), dict) else {}
-        absolute_min = gate.get("absolute_min") if isinstance(gate.get("absolute_min"), dict) else {}
-
-        baseline_index = _index_queries(baseline_payload)
-        entries: list[PerformanceGateEntry] = []
-        for workload in current_payload.get("workloads", []):
-            workload_name = str(workload.get("name", ""))
-            params_key = _params_key(workload.get("params", {}))
-            for query in workload.get("queries", []):
-                if query.get("error"):
-                    continue
-                query_id = str(query.get("id", ""))
-                baseline_query = baseline_index.get((workload_name, query_id, params_key))
-                if baseline_query is None:
-                    continue
-                current_stats = query.get("stats") or {}
-                baseline_stats = baseline_query.get("stats") or {}
-                for metric in metrics:
-                    if not isinstance(metric, str):
-                        continue
-                    current_value = current_stats.get(metric)
-                    baseline_value = baseline_stats.get(metric)
-                    if not _is_positive_number(current_value) or not _is_positive_number(baseline_value):
-                        continue
-                    current = float(current_value)
-                    baseline = float(baseline_value)
-                    change = ((current - baseline) / baseline) * 100.0
-                    status = "OK"
-                    if metric == "throughput_per_second":
-                        if current / baseline < qps_min_ratio:
-                            status = "REGRESS"
-                        elif current / baseline > (1.0 / max(qps_min_ratio, 0.001)):
-                            status = "IMPROVE"
-                    elif change > latency_threshold:
-                        status = "REGRESS"
-                    elif change < -latency_threshold:
-                        status = "IMPROVE"
-
-                    max_value = absolute_max.get(metric)
-                    if isinstance(max_value, (int, float)) and current > float(max_value):
-                        status = "REGRESS"
-                    min_value = absolute_min.get(metric)
-                    if isinstance(min_value, (int, float)) and current < float(min_value):
-                        status = "REGRESS"
-
-                    entries.append(
-                        PerformanceGateEntry(
-                            workload=workload_name,
-                            query_id=query_id,
-                            metric=metric,
-                            baseline_value=baseline,
-                            current_value=current,
-                            change_percent=change,
-                            status=status,
-                        )
-                    )
-        entries.sort(key=lambda item: (item.workload, item.query_id, item.metric))
-        return entries
-
-    def print_performance_gates(self, entries: list[PerformanceGateEntry]) -> None:
-        if not entries:
-            return
-        print("Performance gates:")
-        for entry in entries:
-            colored_status = self._status_text(entry.status)
+            change = "-" if entry.change_percent is None else f"{entry.change_percent:+.2f}%"
+            detail = f" ({entry.detail})" if entry.detail else ""
             print(
                 f"  {entry.workload}.{entry.query_id}.{entry.metric:<24} {colored_status:<10} "
-                f"{entry.baseline_value:.2f} -> {entry.current_value:.2f} "
-                f"({entry.change_percent:+.2f}%)"
+                f"{_fmt_num(entry.baseline_value)} -> {_fmt_num(entry.current_value)} "
+                f"({change}){detail}"
             )
 
-    def append_regression_to_summary(
+    def append_gate_outcome_to_summary(
         self,
         summary_path: Path,
-        entries: list[RegressionEntry],
-        threshold_percent: float,
+        outcome: GateOutcome,
     ) -> None:
-        if not entries:
+        if not outcome.entries and outcome.archive_health is None:
             return
         lines = [
             "",
-            "## Regression Compare",
+            f"## Performance Gate: {outcome.gate}",
             "",
-            f"Threshold: ±{threshold_percent:.2f}%",
-            "",
-            "| Workload | Query | Baseline (ms) | Current (ms) | Change | Status |",
-            "|----------|-------|---------------|--------------|--------|--------|",
         ]
-        for entry in entries:
+        if outcome.archive_health is not None:
+            lines.extend(_render_archive_health_markdown(outcome.archive_health))
+        if outcome.entries:
+            lines.extend([
+                "",
+                "| Workload | Query | Kind | Metric | Baseline | Current | Change | Status |",
+                "|----------|-------|------|--------|----------|---------|--------|--------|",
+            ])
+        for entry in outcome.entries:
+            change = "-" if entry.change_percent is None else f"{entry.change_percent:+.2f}%"
+            status = entry.status.value
             lines.append(
-                "| {workload} | {query} | {base:.2f} | {curr:.2f} | {change:+.2f}% | {status} |".format(
+                "| {workload} | {query} | {kind} | {metric} | {base} | {curr} | {change} | {status} |".format(
                     workload=entry.workload,
                     query=entry.query_id,
-                    base=entry.baseline_median,
-                    curr=entry.current_median,
-                    change=entry.change_percent,
-                    status=entry.status,
-                )
-            )
-        with summary_path.open("a", encoding="utf-8") as fp:
-            fp.write("\n".join(lines) + "\n")
-
-    def append_performance_gates_to_summary(
-        self,
-        summary_path: Path,
-        entries: list[PerformanceGateEntry],
-    ) -> None:
-        if not entries:
-            return
-        lines = [
-            "",
-            "## Performance Gates",
-            "",
-            "| Workload | Query | Metric | Baseline | Current | Change | Status |",
-            "|----------|-------|--------|----------|---------|--------|--------|",
-        ]
-        for entry in entries:
-            lines.append(
-                "| {workload} | {query} | {metric} | {base:.2f} | {curr:.2f} | {change:+.2f}% | {status} |".format(
-                    workload=entry.workload,
-                    query=entry.query_id,
+                    kind=entry.kind.value,
                     metric=entry.metric,
-                    base=entry.baseline_value,
-                    curr=entry.current_value,
-                    change=entry.change_percent,
-                    status=entry.status,
+                    base=_fmt_num(entry.baseline_value),
+                    curr=_fmt_num(entry.current_value),
+                    change=change,
+                    status=status if entry.detail is None else f"{status}: {entry.detail}",
                 )
             )
         with summary_path.open("a", encoding="utf-8") as fp:
             fp.write("\n".join(lines) + "\n")
 
-    def bless_baseline(self, result_path: Path, baseline_path: Path) -> None:
-        baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(result_path, baseline_path)
+    def write_gate_report(
+        self,
+        *,
+        gate: str,
+        outcomes: list[GateOutcome],
+        archive_health: Any | None = None,
+    ) -> Path:
+        path = self._root_dir / "report" / "gate.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "gate": gate,
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "outcomes": [_gate_outcome_payload(outcome) for outcome in outcomes],
+        }
+        if archive_health is not None:
+            payload["archive"] = _archive_health_payload(archive_health)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return path
 
-    def has_regression(self, entries: list[RegressionEntry]) -> bool:
-        return any(entry.status == "REGRESS" for entry in entries)
-
-    def has_performance_gate_regression(self, entries: list[PerformanceGateEntry]) -> bool:
-        return any(entry.status == "REGRESS" for entry in entries)
+    def _print_archive_health(self, archive_health: "ArchiveHealth") -> None:
+        status = archive_health.status.value
+        suffix = ""
+        if archive_health.degraded:
+            suffix = (
+                f" enforcement:{archive_health.policy_enforcement.value}"
+                f"->{archive_health.effective_enforcement.value}"
+            )
+        cache = " cache:hit" if archive_health.cache_hit else ""
+        print(f"  Archive   {status}{suffix}{cache}  {archive_health.message}")
 
     def query_status(self, query: QueryExecutionResult) -> str:
         if query.error:
@@ -432,6 +280,8 @@ class BenchmarkReporter:
         if query.validation_result != "PASS":
             return "FAIL"
         if query.plan_guard == "FAIL":
+            return "FAIL"
+        if query.explain_profile_status == "ERROR":
             return "FAIL"
         return "PASS"
 
@@ -449,19 +299,24 @@ class BenchmarkReporter:
         for workload in payload.get("workloads", []):
             lines.append(f"## {workload.get('name', 'unknown')}")
             lines.append("")
-            lines.append("| Query | P50 (ms) | P99 (ms) | P999 (ms) | QPS | Validation | Plan Guard | Explain |")
-            lines.append("|-------|----------|----------|-----------|-----|------------|------------|---------|")
+            lines.append(
+                "| Query | P50 (ms) | P99 (ms) | P999 (ms) | QPS | RSS Peak | Validation | Plan Guard | Explain |"
+            )
+            lines.append(
+                "|-------|----------|----------|-----------|-----|----------|------------|------------|---------|"
+            )
             for query in workload.get("queries", []):
                 stats = query.get("stats") or {}
                 p50 = _fmt_num(stats.get("p50"))
                 p99 = _fmt_num(stats.get("p99"))
                 p999 = _fmt_num(stats.get("p999"))
                 qps = _fmt_num(stats.get("throughput_per_second"))
+                rss_peak = _fmt_rss(query.get("rss"))
                 validation = (query.get("validation") or {}).get("result", "n/a")
                 plan_guard = (query.get("validation") or {}).get("plan_guard", "n/a")
                 explain = (query.get("explain_profile") or {}).get("status", "SKIP")
                 lines.append(
-                    f"| {query.get('id', '')} | {p50} | {p99} | {p999} | {qps} | {validation} | {plan_guard} | {explain} |"
+                    f"| {query.get('id', '')} | {p50} | {p99} | {p999} | {qps} | {rss_peak} | {validation} | {plan_guard} | {explain} |"
                 )
             explain_lines = _render_explain_summary(workload.get("queries", []))
             if explain_lines:
@@ -507,6 +362,7 @@ class BenchmarkReporter:
         return status
 
     def _status_text(self, status: str) -> str:
+        status = getattr(status, "value", status)
         if status in {"PASS", "OK"}:
             return self._color(status, "32")
         if status == "IMPROVE":
@@ -564,15 +420,78 @@ def _fmt_num(value: Any) -> str:
     return "-"
 
 
-def _is_positive_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and float(value) > 0
+def _fmt_rss(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    peak_kb = value.get("peak_kb")
+    if not isinstance(peak_kb, int) or isinstance(peak_kb, bool):
+        return "-"
+    return _fmt_bytes(peak_kb * 1024)
 
 
-def _gate_float(gate: dict[str, Any], key: str, default: float) -> float:
-    value = gate.get(key, default)
-    if isinstance(value, (int, float)):
-        return float(value)
-    return default
+def _gate_outcome_payload(outcome: GateOutcome) -> dict[str, Any]:
+    return {
+        "gate": outcome.gate,
+        "enforcement": outcome.enforcement.value,
+        "failed": outcome.failed,
+        "blocking_failed": outcome.blocking_failed,
+        "entries": [
+            {
+                "kind": entry.kind.value,
+                "workload": entry.workload,
+                "query": entry.query_id,
+                "metric": entry.metric,
+                "status": entry.status.value,
+                "baseline_value": entry.baseline_value,
+                "current_value": entry.current_value,
+                "change_percent": entry.change_percent,
+                "p_value": entry.p_value,
+                "holm_alpha": entry.holm_alpha,
+                "noise_floor_abs": entry.noise_floor_abs,
+                "noise_floor_percent": entry.noise_floor_percent,
+                "calibration_samples": entry.calibration_samples,
+                "statistical_power": entry.statistical_power,
+                "detail": entry.detail,
+            }
+            for entry in outcome.entries
+        ],
+    }
+
+
+def _archive_health_payload(archive_health: "ArchiveHealth") -> dict[str, Any]:
+    return {
+        "status": archive_health.status.value,
+        "message": archive_health.message,
+        "policy_enforcement": archive_health.policy_enforcement.value,
+        "effective_enforcement": archive_health.effective_enforcement.value,
+        "manifest_path": archive_health.manifest_path,
+        "calibration_path": archive_health.calibration_path,
+        "cache_hit": archive_health.cache_hit,
+        "clean_observations": archive_health.clean_observations,
+        "required_observations": archive_health.required_observations,
+    }
+
+
+def _render_archive_health_markdown(archive_health: "ArchiveHealth") -> list[str]:
+    lines = [
+        "Archive health:",
+        f"- Status: `{archive_health.status.value}`",
+        f"- Message: {archive_health.message}",
+        (
+            f"- Enforcement: `{archive_health.policy_enforcement.value}`"
+            f" -> `{archive_health.effective_enforcement.value}`"
+        ),
+        f"- Cache hit: `{str(archive_health.cache_hit).lower()}`",
+    ]
+    if archive_health.manifest_path:
+        lines.append(f"- Manifest: `{archive_health.manifest_path}`")
+    if archive_health.calibration_path:
+        lines.append(f"- Calibration: `{archive_health.calibration_path}`")
+    if archive_health.required_observations:
+        lines.append(
+            f"- Observations: `{archive_health.clean_observations}/{archive_health.required_observations}`"
+        )
+    return lines
 
 
 def _render_explain_summary(queries: Any) -> list[str]:
@@ -811,20 +730,3 @@ def _physical_memory_gb() -> float:
         except (OSError, ValueError):
             pass
     return 0.0
-
-
-def _index_queries(payload: dict[str, Any]) -> dict[tuple[str, str, str], dict[str, Any]]:
-    index: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for workload in payload.get("workloads", []):
-        workload_name = str(workload.get("name", ""))
-        params_key = _params_key(workload.get("params", {}))
-        for query in workload.get("queries", []):
-            query_id = str(query.get("id", ""))
-            index[(workload_name, query_id, params_key)] = query
-    return index
-
-
-def _params_key(params: Any) -> str:
-    if isinstance(params, dict):
-        return json.dumps(params, sort_keys=True, ensure_ascii=False)
-    return json.dumps({})

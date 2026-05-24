@@ -84,7 +84,7 @@ SELECT * FROM GRAPH_TABLE(gw_graph
     MATCH (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
     COLUMNS (b.name AS dst)
 ) gt;
-ERROR: force_external requires a temporary directory (SET temp_directory) (SQLSTATE=XX000)
+ERROR: force_external graph scan requires a temporary directory (SQLSTATE=53200)
 
 SET force_external = DEFAULT;
 SET

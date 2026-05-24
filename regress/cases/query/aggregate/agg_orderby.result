@@ -60,11 +60,10 @@ FROM (
 ) AS agg_o_values(x, y, label);
 QUERY PLAN
 PROJECTION  (rows=1)
-  Output: first, string_agg
-  ->  UNGROUPED_AGGREGATE  (rows=1)
-        Aggregates: FIRST(col0) WITHIN GROUP (ORDER BY col1 DESC NULLS LAST), STRING_AGG(col2, '|') WITHIN GROUP (ORDER BY col1 DESC NULLS LAST)
-        ->  PROJECTION
-              Output: col0, col1, col2, '|', col1
-              ->  PROJECTION  (rows=4)
-                    Output: col0, col1, col2
-                    ->  EXPRESSION_SCAN  (rows=4)
+  Output: first_desc, labels_desc
+  ->  AGGREGATE  (rows=1)
+    Aggregates: first(#0) WITHIN GROUP (ORDER BY #1 DESC NULLS LAST), string_agg(#2, '|') WITHIN GROUP (ORDER BY #1 DESC NULLS LAST)
+    Output: aggr_0, aggr_1
+    ->  PROJECTION  (rows=4)
+      Output: x, y, label
+      ->  VALUES  (rows=4)

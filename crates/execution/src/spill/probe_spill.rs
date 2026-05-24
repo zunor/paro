@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use paro_common::allocator::{BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::row::{
@@ -32,6 +33,7 @@ pub struct ProbeSpillLocalState {
 pub struct ProbeSpill {
     buffer_pool: Arc<BufferPool>,
     probe_layout: Arc<RowLayout>,
+    memory: MemoryAccountingContext,
     radix_bits: usize,
     hash_col_idx: usize,
     local_states: Vec<ProbeSpillLocalState>,
@@ -46,6 +48,25 @@ impl ProbeSpill {
         probe_types: Vec<LogicalType>,
         radix_bits: usize,
         hash_col_idx: usize,
+    ) -> Result<Self> {
+        Self::new_with_memory(
+            buffer_pool,
+            probe_types,
+            radix_bits,
+            hash_col_idx,
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+    }
+
+    pub fn new_with_memory(
+        buffer_pool: Arc<BufferPool>,
+        probe_types: Vec<LogicalType>,
+        radix_bits: usize,
+        hash_col_idx: usize,
+        memory: MemoryAccountingContext,
     ) -> Result<Self> {
         if radix_bits == 0 || radix_bits > MAX_RADIX_BITS {
             return Err(paro_error::invalid_input(format!(
@@ -71,6 +92,7 @@ impl ProbeSpill {
                 probe_types,
                 RowValidityType::CanHaveNullValues,
             )),
+            memory,
             radix_bits,
             hash_col_idx,
             local_states: Vec::new(),
@@ -180,10 +202,11 @@ impl ProbeSpill {
             return Ok(None);
         }
 
-        let mut builder = RowStoreBuilder::new(
+        let mut builder = RowStoreBuilder::new_with_memory(
             Arc::clone(&self.buffer_pool),
             Arc::clone(&self.probe_layout),
             MemoryTag::HashTable,
+            self.memory.clone(),
         );
         let replay_allocator = Arc::new(BufferAllocator::new(
             Arc::clone(&self.buffer_pool) as Arc<dyn BufferManager>,
@@ -217,12 +240,13 @@ impl ProbeSpill {
     }
 
     fn new_partition_builder(&self) -> RadixPartitionedRowsBuilder {
-        RadixPartitionedRowsBuilder::new(
+        RadixPartitionedRowsBuilder::new_with_memory(
             Arc::clone(&self.buffer_pool),
             Arc::clone(&self.probe_layout),
             MemoryTag::HashTable,
             self.radix_bits,
             self.hash_col_idx,
+            self.memory.clone(),
         )
         .expect("probe spill builder configuration must stay valid")
     }

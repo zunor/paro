@@ -85,6 +85,8 @@ pub use make_catalog::column_exists;
 pub use make_catalog::column_not_found;
 pub use make_catalog::database_exists;
 pub use make_catalog::database_not_found;
+pub use make_catalog::dependent_objects_still_exist;
+pub use make_catalog::duplicate_object;
 pub use make_catalog::function_not_found;
 pub use make_catalog::object_exists;
 pub use make_catalog::object_not_found;
@@ -149,6 +151,7 @@ pub use make_system::io;
 pub use make_system::io_error;
 pub use make_system::protocol_violation;
 pub use make_system::query_canceled;
+pub use make_system::query_canceled_message;
 pub use make_system::statement_timeout;
 pub use make_system::system_error;
 

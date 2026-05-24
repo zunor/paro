@@ -289,7 +289,7 @@ impl GraphPredicatePushdown {
                     Self::collect_table_indices(child, indices);
                 }
             }
-            Expression::Constant(_) | Expression::Reference(_) => {}
+            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
             Expression::Aggregate(agg) => {
                 for child in &agg.children {
                     Self::collect_table_indices(child, indices);

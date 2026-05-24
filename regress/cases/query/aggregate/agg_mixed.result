@@ -112,21 +112,20 @@ FROM (
 ORDER BY rn;
 QUERY PLAN
 ORDER_BY  (rows=2)
-  Sort Key: ROW_NUMBER() OVER (ORDER BY sum DESC NULLS FIRST, ref_1 ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ASC NULLS LAST
+  Sort Key: #2 ASC NULLS LAST
   ->  PROJECTION  (rows=2)
-        Output: ref_1, sum, ROW_NUMBER() OVER (ORDER BY sum DESC NULLS FIRST, ref_1 ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-        ->  PROJECTION  (rows=2)
-              Output: ref_1, sum
-              ->  PROJECTION  (rows=2)
-                    Output: ref_1, sum
-                    ->  HASH_GROUP_BY  (rows=2)
-                          Group Key: col0
-                          Aggregates: SUM(col1)
-                          ->  PROJECTION
-                                Output: col0, col1
-                                ->  PROJECTION  (rows=4)
-                                      Output: col0, col1
-                                      ->  EXPRESSION_SCAN  (rows=4)
+    Output: category, sum_x, rn
+    ->  PROJECTION  (rows=2)
+      Output: category, sum_x
+      ->  PROJECTION  (rows=2)
+        Output: category, sum_x
+        ->  AGGREGATE  (rows=2)
+          Group Key: #0
+          Aggregates: sum(#1)
+          Output: aggr_0, aggr_1
+          ->  PROJECTION  (rows=4)
+            Output: category, x
+            ->  VALUES  (rows=4)
 
 DROP TABLE IF EXISTS agg_m_dim;
 DROP TABLE

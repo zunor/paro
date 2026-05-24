@@ -880,7 +880,7 @@ impl CatalogCollection {
         if let Some(existing) = map.get_entry(new_name) {
             if let Some(node) = self.visible_node(&existing, transaction_id, start_time) {
                 if !node.is_deleted() {
-                    return Err(paro_error::catalog(format!(
+                    return Err(paro_error::duplicate_object(format!(
                         "Could not rename \"{}\" to \"{}\": another entry with this name already exists!",
                         old_name, new_name
                     )));
@@ -963,7 +963,7 @@ impl CatalogCollection {
             if let Some(existing) = map.get_entry(&new_key) {
                 if let Some(node) = self.visible_node(&existing, transaction_id, start_time) {
                     if !node.is_deleted() {
-                        return Err(paro_error::catalog(format!(
+                        return Err(paro_error::duplicate_object(format!(
                             "Could not rename \"{}\" to \"{}\": another entry with this name already exists!",
                             old_name, new_name
                         )));
@@ -1020,10 +1020,10 @@ impl CatalogCollection {
                         target_set.visible_node(&existing, transaction_id, start_time)
                     {
                         if !node.is_deleted() {
-                            return Err(paro_error::catalog(format!(
-                            "Could not move \"{}\" to \"{}\": another entry with this name already exists!",
-                            old_name, new_name
-                        )));
+                            return Err(paro_error::duplicate_object(format!(
+                                "Could not move \"{}\" to \"{}\": another entry with this name already exists!",
+                                old_name, new_name
+                            )));
                         }
                     }
                 }
@@ -1096,7 +1096,7 @@ impl CatalogCollection {
         if let Some(existing) = map.get_entry(new_name) {
             if let Some(node) = self.visible_node(&existing, transaction_id, start_time) {
                 if !node.is_deleted() {
-                    return Err(paro_error::catalog(format!(
+                    return Err(paro_error::duplicate_object(format!(
                         "Could not rename \"{}\" to \"{}\": another entry with this name already exists!",
                         old_name, new_name
                     )));

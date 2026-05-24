@@ -19,6 +19,7 @@ CREATE FUNCTION py_misconfigured_new(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 AS $$return [value for value in a.materialize_py()]$$;
 
+-- @normalize regress_paths
 SELECT py_misconfigured_probe(1);
 
 -- @control restart profile=default

@@ -120,11 +120,6 @@ pub struct SessionConfig {
     /// When enabled, operators can cache intermediate results.
     pub enable_caching_operators: bool,
 
-    /// The maximum amount of memory to keep buffered in a streaming query result.
-    ///
-    /// Default: 1MB (1_000_000 bytes).
-    pub streaming_buffer_size: usize,
-
     /// The explain output type used when none is specified.
     pub explain_output_type: ExplainOutputType,
 
@@ -191,7 +186,6 @@ impl Default for SessionConfig {
             max_expression_depth: 1000,
             enable_optimizer: true,
             enable_caching_operators: true,
-            streaming_buffer_size: 1_000_000, // 1MB
 
             explain_output_type: ExplainOutputType::default(),
 
@@ -322,7 +316,6 @@ mod tests {
         assert_eq!(config.max_expression_depth, 1000);
         assert!(config.enable_optimizer);
         assert!(config.enable_caching_operators);
-        assert_eq!(config.streaming_buffer_size, 1_000_000);
 
         assert!(!config.query_verification_enabled);
         assert!(!config.verify_parallelism);

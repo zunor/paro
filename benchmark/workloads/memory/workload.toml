@@ -18,7 +18,7 @@ id = "order_by_memory"
 file = "sql/q_order_by_memory.sql"
 validate = "ordered_rows"
 expected = [[1], [2], [3], [4], [5], [6], [7], [8], [9], [10], [11], [12]]
-plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+plan_contains = ["TOP_N"]
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -27,7 +27,7 @@ id = "hash_agg_memory"
 file = "sql/q_hash_agg_memory.sql"
 validate = "scalar_equals"
 expected = 50000
-plan_contains = ["HASH_GROUP_BY"]
+plan_contains = ["AGGREGATE"]
 collect_explain_profile = true
 allow_reexecute = true
 

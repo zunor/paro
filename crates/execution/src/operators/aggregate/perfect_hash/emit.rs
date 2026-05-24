@@ -1,0 +1,88 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+use std::sync::Arc;
+
+use paro_common::chunk::Chunk;
+use paro_common::error::{self as paro_error, Result};
+use paro_common::vector::VECTOR_SIZE;
+
+use crate::operators::output::ensure_source_output;
+use crate::physical::specs::AggregateSpec;
+use crate::runtime::breaker::{AggregateHandle, AggregateRuntimeState, HandleRef};
+use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
+use crate::runtime::source::SourcePoll;
+use crate::runtime::state::{
+    BreakerHandleGlobal, PerfectHashAggregateEmitSourceLocal, SourceGlobal, SourceLocal,
+};
+
+#[derive(Debug, Clone)]
+pub struct PerfectHashAggregateEmitSourceExec {
+    pub handle: HandleRef<AggregateHandle>,
+    pub spec: AggregateSpec,
+}
+
+impl PerfectHashAggregateEmitSourceExec {
+    pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
+        Ok(SourceGlobal::PerfectHashAggregateEmit(Arc::new(
+            BreakerHandleGlobal {
+                handle: ctx.handles.get(self.handle)?,
+            },
+        )))
+    }
+
+    pub(crate) fn create_local(
+        &self,
+        _ctx: &mut PipelineInitContext,
+        _global: &SourceGlobal,
+    ) -> Result<SourceLocal> {
+        Ok(SourceLocal::PerfectHashAggregateEmit(
+            PerfectHashAggregateEmitSourceLocal::default(),
+        ))
+    }
+
+    pub(crate) fn poll_next(
+        &self,
+        ctx: &mut OperatorCallContext,
+        global: &SourceGlobal,
+        local: &mut SourceLocal,
+        output: &mut Chunk,
+    ) -> Result<SourcePoll> {
+        ctx.cancel.check()?;
+        let SourceGlobal::PerfectHashAggregateEmit(global) = global else {
+            return Err(paro_error::internal(
+                "perfect aggregate emit source global state mismatch",
+            ));
+        };
+        if !global.handle.is_finalized() {
+            return Err(paro_error::internal(
+                "perfect aggregate emit source polled before handle was finalized",
+            ));
+        }
+        let SourceLocal::PerfectHashAggregateEmit(local) = local else {
+            return Err(paro_error::internal(
+                "perfect aggregate emit source local state mismatch",
+            ));
+        };
+        if local.table.is_none() {
+            let Some(state) = global.handle.take_state()? else {
+                return Ok(SourcePoll::Finished);
+            };
+            let AggregateRuntimeState::Perfect(state) = state else {
+                return Err(paro_error::internal(
+                    "aggregate handle does not contain perfect aggregate state",
+                ));
+            };
+            local.table = Some(state.table);
+        }
+        ensure_source_output(output, &self.spec.output_types, VECTOR_SIZE)?;
+        let table = local.table.as_mut().ok_or_else(|| {
+            paro_error::internal("perfect aggregate emit source did not load table")
+        })?;
+        if table.scan(&mut local.position, output)? {
+            return Ok(SourcePoll::Output);
+        }
+        output.try_set_cardinality(0)?;
+        Ok(SourcePoll::Finished)
+    }
+}

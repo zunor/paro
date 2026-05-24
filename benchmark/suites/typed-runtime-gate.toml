@@ -1,0 +1,24 @@
+name = "typed-runtime-gate"
+description = "Isolation subset for typed physical runtime hash-join and scan/filter/aggregate regression"
+
+# This suite is intentionally narrower than operator-runtime-gate. The unified
+# gate includes the same queries plus memory and fetch/completed coverage, while
+# this file keeps the typed-runtime isolation path fast and diagnostic.
+
+[[include]]
+workload = "row_hash_join_phase0"
+queries = [
+  "short_chain_left_probe",
+  "long_chain_left_probe",
+  "found_flag_right_anti",
+  "external_spill_left",
+]
+
+[[include]]
+workload = "agg"
+queries = [
+  "count_star",
+  "filter_count",
+  "group_by_low_card",
+  "count_distinct",
+]

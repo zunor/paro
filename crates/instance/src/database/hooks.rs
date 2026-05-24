@@ -20,7 +20,7 @@ use paro_common::error as paro_error;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
-use paro_execution::operator::ddl::refresh_property_graph::{
+use paro_execution::operators::graph::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
     schedule_property_graph_background_rebuild,
 };

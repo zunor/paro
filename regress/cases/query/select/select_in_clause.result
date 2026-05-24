@@ -4,16 +4,16 @@ FROM (VALUES (1), (2), (6)) AS t(id)
 WHERE id IN (1, 2, 3, 4, 5);
 QUERY PLAN
 PROJECTION  (rows=2)
-  Output: col0
+  Output: id
   ->  PROJECTION  (rows=2)
-        Output: col0
-        ->  FILTER  (rows=2)
-              Filter: mark
-              ->  HASH_JOIN
-                    Join Type: MARK
-                    Join Condition: col0 = in_value
-                    ->  EXPRESSION_SCAN  (rows=3)
-                    ->  EXPRESSION_SCAN
+    Output: id
+    ->  FILTER  (rows=2)
+      Filter: #1
+      ->  HASH_JOIN
+        Join Type: MARK
+        Join Condition: #0 = #0
+        ->  VALUES  (rows=3)
+        ->  VALUES
 
 SELECT id
 FROM (VALUES (1), (2), (6)) AS t(id)

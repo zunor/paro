@@ -1815,7 +1815,6 @@ dependencies = [
 name = "paro-session"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "parking_lot",
  "paro-catalog",

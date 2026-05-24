@@ -118,6 +118,7 @@ pub enum CompiledExpressionState {
     Conjunction(ConjunctionExpressionState),
     Case(CaseExpressionState),
     Constant(ConstantExpressionState),
+    Parameter(ParameterExpressionState),
     ColumnRef(ColumnRefExpressionState),
     Operator(OperatorExpressionState),
     Reference(ReferenceExpressionState),
@@ -180,6 +181,12 @@ pub struct CaseExpressionState {
 
 #[derive(Debug)]
 pub struct ConstantExpressionState;
+
+#[derive(Debug, Default)]
+pub struct ParameterExpressionState {
+    pub result: ValueSlot,
+    pub cached_epoch: Option<crate::runtime::ParameterBindingEpoch>,
+}
 
 #[derive(Debug)]
 pub struct ColumnRefExpressionState;

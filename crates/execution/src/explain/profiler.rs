@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use crate::explain::types::{ExplainActualStats, ExplainNodeId};
+use crate::explain::types::{
+    ExplainActualStats, ExplainControlRegionStats, ExplainNodeId, ExplainRuntimeStats,
+};
 
 #[derive(Debug, Clone, Default)]
 struct LocalOperatorStats {
@@ -15,6 +17,7 @@ struct LocalOperatorStats {
     loops: u64,
     startup_time_ms: Option<f64>,
     total_time_ms: Option<f64>,
+    runtime: ExplainRuntimeStats,
 }
 
 impl LocalOperatorStats {
@@ -46,6 +49,11 @@ impl LocalOperatorStats {
             (None, Some(right)) => Some(right),
             (None, None) => None,
         };
+        merge_runtime_stats(&self.runtime, &mut target.runtime);
+    }
+
+    fn record_runtime(&mut self, runtime: ExplainRuntimeStats) {
+        merge_runtime_stats(&runtime, &mut self.runtime);
     }
 }
 
@@ -53,6 +61,13 @@ impl LocalOperatorStats {
 pub struct ExplainProfiler {
     start_time: Instant,
     stats: Mutex<HashMap<ExplainNodeId, ExplainActualStats>>,
+    control_regions: Mutex<Vec<ExplainControlRegionStats>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExplainProfileSnapshot {
+    pub operators: HashMap<ExplainNodeId, ExplainActualStats>,
+    pub control_regions: Vec<ExplainControlRegionStats>,
 }
 
 impl ExplainProfiler {
@@ -60,6 +75,7 @@ impl ExplainProfiler {
         Arc::new(Self {
             start_time: Instant::now(),
             stats: Mutex::new(HashMap::new()),
+            control_regions: Mutex::new(Vec::new()),
         })
     }
 
@@ -75,49 +91,123 @@ impl ExplainProfiler {
         }
     }
 
-    pub fn node_stats(&self, node_id: ExplainNodeId) -> Option<ExplainActualStats> {
-        self.stats.lock().get(&node_id).cloned()
+    pub fn record_control_region(&self, stats: ExplainControlRegionStats) {
+        self.control_regions.lock().push(stats);
+    }
+
+    pub fn snapshot(&self) -> ExplainProfileSnapshot {
+        ExplainProfileSnapshot {
+            operators: self.stats.lock().clone(),
+            control_regions: self.control_regions.lock().clone(),
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct OperatorProfiler {
-    shared: Arc<ExplainProfiler>,
-    active: HashMap<ExplainNodeId, Instant>,
+    shared: Option<Arc<ExplainProfiler>>,
+    active: Option<(ExplainNodeId, Instant)>,
     local: HashMap<ExplainNodeId, LocalOperatorStats>,
 }
 
 impl OperatorProfiler {
     pub fn new(shared: Arc<ExplainProfiler>) -> Self {
         Self {
-            shared,
-            active: HashMap::new(),
+            shared: Some(shared),
+            active: None,
+            local: HashMap::new(),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            shared: None,
+            active: None,
             local: HashMap::new(),
         }
     }
 
     pub fn start_operator(&mut self, node_id: ExplainNodeId) {
-        self.active.insert(node_id, Instant::now());
+        if self.shared.is_none() {
+            return;
+        }
+        self.active = Some((node_id, Instant::now()));
     }
 
     pub fn end_operator(&mut self, node_id: ExplainNodeId, output_rows: u64) {
-        let Some(started_at) = self.active.remove(&node_id) else {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        let Some((active_node_id, started_at)) = self.active.take() else {
+            return;
+        };
+        if active_node_id != node_id {
+            self.active = Some((active_node_id, started_at));
             return;
         };
         let ended_at = Instant::now();
-        let startup_time_ms = self.shared.elapsed_ms(started_at);
-        let total_time_ms = self.shared.elapsed_ms(ended_at);
+        let startup_time_ms = shared.elapsed_ms(started_at);
+        let total_time_ms = shared.elapsed_ms(ended_at);
         self.local
             .entry(node_id)
             .or_default()
             .record(startup_time_ms, total_time_ms, output_rows);
     }
 
+    pub fn cancel_operator(&mut self, node_id: ExplainNodeId) {
+        if self.shared.is_none() {
+            return;
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active_node_id, _)| *active_node_id == node_id)
+        {
+            self.active = None;
+        }
+    }
+
+    pub fn record_runtime(&mut self, node_id: ExplainNodeId, runtime: ExplainRuntimeStats) {
+        if self.shared.is_none() || !runtime.has_any() {
+            return;
+        }
+        self.local
+            .entry(node_id)
+            .or_default()
+            .record_runtime(runtime);
+    }
+
     pub fn flush(&mut self) {
+        let Some(shared) = &self.shared else {
+            return;
+        };
         if self.local.is_empty() {
             return;
         }
-        self.shared.merge(&self.local);
+        shared.merge(&self.local);
         self.local.clear();
+    }
+}
+
+fn merge_runtime_stats(source: &ExplainRuntimeStats, target: &mut ExplainRuntimeStats) {
+    target.spilled = match (target.spilled, source.spilled) {
+        (Some(left), Some(right)) => Some(left || right),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    merge_max(&mut target.peak_memory_bytes, source.peak_memory_bytes);
+    merge_sum(&mut target.spilled_bytes, source.spilled_bytes);
+}
+
+fn merge_max(target: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *target = Some(target.map_or(value, |existing| existing.max(value)));
+    }
+}
+
+fn merge_sum(target: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *target = Some(target.unwrap_or(0).saturating_add(value));
     }
 }

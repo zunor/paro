@@ -13,9 +13,9 @@ FROM join_elim_left AS l
 LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: id, payload
-  ->  ROWSET_SCAN on public.join_elim_left l
-        Columns: id, payload
+  Output: l.id, l.payload
+  ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+    Columns: id, payload
 
 EXPLAIN
 SELECT l.id, r.note
@@ -23,14 +23,14 @@ FROM join_elim_left AS l
 LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: id, note
+  Output: l.id, r.note
   ->  HASH_JOIN  (rows=3)
-        Join Type: LEFT
-        Join Condition: id = id
-        ->  ROWSET_SCAN on public.join_elim_left l
-              Columns: id
-        ->  ROWSET_SCAN on public.join_elim_right_unique r
-              Columns: id, note
+    Join Type: LEFT
+    Join Condition: #0 = #0
+    ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+      Columns: id
+    ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
+      Columns: id, note
 
 SELECT r.id, r.note
 FROM join_elim_left_unique AS l
@@ -46,9 +46,9 @@ FROM join_elim_left_unique AS l
 RIGHT JOIN join_elim_right AS r ON l.id = r.id;
 QUERY PLAN
 PROJECTION  (rows=2)
-  Output: id, note
-  ->  ROWSET_SCAN on public.join_elim_right r
-        Columns: id, note
+  Output: r.id, r.note
+  ->  ROWSET_SCAN on public.join_elim_right r  (rows=2)
+    Columns: id, note
 
 SELECT l.id
 FROM join_elim_left AS l
@@ -66,11 +66,11 @@ FROM join_elim_left AS l
 LEFT JOIN join_elim_right_nonunique AS r ON l.id = r.id;
 QUERY PLAN
 PROJECTION  (rows=3)
-  Output: id
+  Output: l.id
   ->  HASH_JOIN  (rows=3)
-        Join Type: LEFT
-        Join Condition: id = id
-        ->  ROWSET_SCAN on public.join_elim_left l
-              Columns: id
-        ->  ROWSET_SCAN on public.join_elim_right_nonunique r
-              Columns: id
+    Join Type: LEFT
+    Join Condition: #0 = #0
+    ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+      Columns: id
+    ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)
+      Columns: id

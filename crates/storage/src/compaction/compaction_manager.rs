@@ -96,6 +96,8 @@ pub struct CompactionObservability {
 
 pub struct CompactionManager {
     tablets: Arc<Mutex<HashMap<TabletId, Arc<Tablet>>>>,
+    // Accepted compaction work for a tablet, including executor-queued tasks.
+    // Registry/lifecycle drains must keep treating queued work as active.
     running_tablets: Arc<Mutex<HashSet<TabletId>>>,
     draining_tablets: Arc<Mutex<HashSet<TabletId>>>,
     failed_tablets: Arc<Mutex<HashMap<TabletId, String>>>,
@@ -304,11 +306,17 @@ impl CompactionManager {
             .unwrap()
             .get(&tablet_id)
             .cloned();
+        let had_token = token.is_some();
         if let Some(token) = token {
             token.cancel();
+        }
+
+        let cancelled_pending = self.executor.cancel_pending_tablet(tablet_id, reason);
+        if had_token || cancelled_pending > 0 {
             info!(
                 tablet_id,
                 reason = reason,
+                cancelled_pending,
                 "CompactionManager: cancellation requested for tablet compaction"
             );
         }
@@ -330,7 +338,9 @@ impl CompactionManager {
                     reason
                 )));
             }
-            std::thread::sleep(TABLET_DRAIN_POLL_INTERVAL);
+            if self.executor.drive_scheduler_for_drain(1) == 0 {
+                std::thread::sleep(TABLET_DRAIN_POLL_INTERVAL);
+            }
         }
     }
 
@@ -616,8 +626,85 @@ pub(crate) fn allocate_compaction_job_id() -> CompactionJobId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::compaction_task::{CompactionTask, CompactionTaskState};
+    use crate::compaction::plan::types::{
+        CompactionPlanId, CompactionReason, CumulativePointAction, ExecutionLayout, MergeSemantics,
+        ReadSnapshot,
+    };
+    use crate::tablet::Version;
     use crate::tablet::{KeysType, TabletColumn, TabletSchema};
     use paro_common::types::LogicalType;
+    use paro_scheduler::scheduler::TaskScheduler;
+    use std::sync::atomic::{AtomicBool, Ordering as StdAtomicOrdering};
+
+    fn test_plan(tablet_id: TabletId) -> CompactionPlan {
+        CompactionPlan {
+            plan_id: CompactionPlanId(tablet_id),
+            tablet_id,
+            policy_kind: PolicyKind::Cumulative,
+            cumulative_point_action: CumulativePointAction::AdvanceToOutputEndExclusive,
+            execution_layout: ExecutionLayout::Horizontal,
+            merge_semantics: MergeSemantics::Deduplicate,
+            input_rowsets: Vec::new(),
+            read_snapshot: ReadSnapshot {
+                visible_version: 0,
+                layout_epoch: 0,
+                schema_epoch: None,
+            },
+            output_version: Version::singleton(0),
+            output_rowset_id: tablet_id + 10_000,
+            score: 1.0,
+            reason: CompactionReason::CumulativePolicy,
+            pk_delta_guard: None,
+        }
+    }
+
+    struct CancelAwareTask {
+        state: CompactionTaskState,
+        plan: CompactionPlan,
+        cancel_token: CancellationToken,
+        started: Arc<AtomicBool>,
+    }
+
+    impl CancelAwareTask {
+        fn new(
+            tablet_id: TabletId,
+            cancel_token: CancellationToken,
+            started: Arc<AtomicBool>,
+        ) -> Self {
+            Self {
+                state: CompactionTaskState::Init,
+                plan: test_plan(tablet_id),
+                cancel_token,
+                started,
+            }
+        }
+    }
+
+    impl CompactionTask for CancelAwareTask {
+        fn run(&mut self) -> Result<()> {
+            self.state = CompactionTaskState::Running;
+            self.started.store(true, StdAtomicOrdering::SeqCst);
+            if self.cancel_token.is_cancelled() {
+                self.state = CompactionTaskState::Failed;
+                return Err(paro_error::query_canceled());
+            }
+            self.state = CompactionTaskState::Success;
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.cancel_token.cancel();
+        }
+
+        fn state(&self) -> CompactionTaskState {
+            self.state
+        }
+
+        fn context(&self) -> &CompactionPlan {
+            &self.plan
+        }
+    }
 
     fn create_test_tablet(id: TabletId, data_dir: &std::path::Path) -> Arc<Tablet> {
         let mut columns = Vec::new();
@@ -629,6 +716,42 @@ mod tests {
         let tablet = Tablet::new(id, 100, 0, schema, data_dir, None).unwrap();
         tablet.init().unwrap();
         Arc::new(tablet)
+    }
+
+    fn submit_test_task(
+        manager: &CompactionManager,
+        tablet: Arc<Tablet>,
+        token: CancellationToken,
+        started: Arc<AtomicBool>,
+    ) {
+        let tablet_id = tablet.tablet_id();
+        manager.running_tablets.lock().unwrap().insert(tablet_id);
+        manager
+            .cancellation_tokens
+            .lock()
+            .unwrap()
+            .insert(tablet_id, token.clone());
+
+        let running_tablets = manager.running_tablets.clone();
+        let failed_tablets = manager.failed_tablets.clone();
+        let jobs = manager.jobs.clone();
+        let cancellation_tokens = manager.cancellation_tokens.clone();
+        let task = Box::new(CancelAwareTask::new(tablet_id, token, started));
+        manager
+            .executor
+            .submit_with_callback(tablet, task, move |result| {
+                running_tablets.lock().unwrap().remove(&tablet_id);
+                jobs.lock().unwrap().remove(&tablet_id);
+                cancellation_tokens.lock().unwrap().remove(&tablet_id);
+                match result {
+                    Ok(()) => {
+                        failed_tablets.lock().unwrap().remove(&tablet_id);
+                    }
+                    Err(reason) => {
+                        failed_tablets.lock().unwrap().insert(tablet_id, reason);
+                    }
+                }
+            });
     }
 
     #[tokio::test]
@@ -682,5 +805,65 @@ mod tests {
         assert!(manager.is_suspended());
         manager.resume("test");
         assert!(!manager.is_suspended());
+    }
+
+    #[test]
+    fn drain_tablet_drives_scheduler_queued_cancelled_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Arc::new(TaskScheduler::new());
+        let manager = CompactionManager::new_with_scheduler(1, scheduler);
+        let tablet = create_test_tablet(1, dir.path());
+        let token = CancellationToken::new();
+        let started = Arc::new(AtomicBool::new(false));
+
+        submit_test_task(&manager, tablet, token, started.clone());
+
+        manager
+            .drain_tablet(1, "tablet registry sync", Duration::from_secs(1))
+            .unwrap();
+
+        assert!(!manager.running_tablets.lock().unwrap().contains(&1));
+        assert!(manager
+            .cancellation_tokens
+            .lock()
+            .unwrap()
+            .get(&1)
+            .is_none());
+        assert!(started.load(StdAtomicOrdering::SeqCst));
+        assert!(manager.failed_tablets.lock().unwrap()[&1].contains("canceling statement"));
+    }
+
+    #[test]
+    fn drain_tablet_cancels_executor_pending_compaction_without_running_queue_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Arc::new(TaskScheduler::new());
+        let manager = CompactionManager::new_with_scheduler(1, scheduler);
+        let queued_tablet = create_test_tablet(10, dir.path());
+        let pending_tablet = create_test_tablet(11, dir.path());
+        let queued_started = Arc::new(AtomicBool::new(false));
+        let pending_started = Arc::new(AtomicBool::new(false));
+
+        submit_test_task(
+            &manager,
+            queued_tablet,
+            CancellationToken::new(),
+            queued_started.clone(),
+        );
+        submit_test_task(
+            &manager,
+            pending_tablet,
+            CancellationToken::new(),
+            pending_started.clone(),
+        );
+
+        manager
+            .drain_tablet(11, "tablet registry sync", Duration::from_secs(1))
+            .unwrap();
+
+        assert!(!manager.running_tablets.lock().unwrap().contains(&11));
+        assert!(!queued_started.load(StdAtomicOrdering::SeqCst));
+        assert!(!pending_started.load(StdAtomicOrdering::SeqCst));
+        assert!(manager.failed_tablets.lock().unwrap()[&11]
+            .contains("compaction canceled before execution"));
     }
 }

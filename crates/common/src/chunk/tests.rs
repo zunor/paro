@@ -556,6 +556,51 @@ fn test_move_from_preserves_reset_state() {
 }
 
 #[test]
+fn test_clone_referencing_vectors_keeps_scratch_shape_after_clear() {
+    let mut scratch = make_int_string_chunk(&[10, 20], &["ten", "twenty"]);
+    let output = scratch.handoff_referencing_vectors();
+
+    assert_eq!(scratch.size(), 0);
+    assert_eq!(
+        scratch.types(),
+        vec![LogicalType::Integer, LogicalType::Varchar]
+    );
+    assert_eq!(output.size(), 2);
+    assert_eq!(output.column(0).unwrap().get_i32(1), Some(20));
+    assert_eq!(output.column(1).unwrap().get_string(0), Some("ten"));
+
+    let next = make_int_string_chunk(&[30], &["thirty"]);
+    scratch.reference(&next);
+    assert_eq!(scratch.size(), 1);
+    assert_eq!(scratch.column(0).unwrap().get_i32(0), Some(30));
+    assert_eq!(scratch.column(1).unwrap().get_string(0), Some("thirty"));
+}
+
+#[test]
+fn test_take_owned_moves_buffers_without_replacement_allocation() {
+    let allocator = Arc::new(ToggleAllocator::new());
+    let mut source = Chunk::try_initialize(&[LogicalType::Integer], 5, allocator.clone())
+        .expect("test chunk init allocation failed");
+    source.set_cardinality(1);
+    source.column_mut(0).unwrap().set_i32(0, 42);
+
+    allocator.set_fail(true);
+    let mut owned = source.take_owned();
+    allocator.set_fail(false);
+
+    assert_eq!(source.column_count(), 0);
+    assert_eq!(source.size(), 0);
+    assert_eq!(source.capacity(), 0);
+    assert_eq!(owned.size(), 1);
+    assert_eq!(owned.column(0).unwrap().get_i32(0), Some(42));
+
+    owned
+        .try_reset(owned.allocator().clone())
+        .expect("test chunk reset allocation failed");
+    assert_eq!(owned.capacity(), 5);
+}
+
+#[test]
 fn test_split_transfers_reset_state() {
     let types = vec![LogicalType::Integer, LogicalType::Varchar];
     let mut chunk = crate::test_utils::test_chunk_with_capacity(&types, 4);

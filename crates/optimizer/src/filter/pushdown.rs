@@ -102,8 +102,8 @@ impl Filter {
                     Self::extract_bindings_from_expr(child, bindings);
                 }
             }
-            // Constants and references don't have table bindings
-            Expression::Constant(_) | Expression::Reference(_) => {}
+            // Constants, parameters, and references don't have table bindings.
+            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
         }
     }
 }
@@ -963,7 +963,7 @@ fn projection_reference_crosses_execution_boundary(proj: &Projection, expr: &Exp
             .children
             .iter()
             .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
-        Expression::Constant(_) | Expression::Reference(_) => false,
+        Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => false,
     }
 }
 

@@ -21,12 +21,12 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-        Sort Key: L2_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
-        Limit: 3
-        ->  PROJECTION  (rows=5)
-              Output: id, L2_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3]))
-              ->  ROWSET_SCAN on public.vector_topn_case
-                    Columns: id, emb
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 3
+    ->  PROJECTION  (rows=5)
+      Output: id, __paro_hidden_1
+      ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+        Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]', id LIMIT 3;
 id
@@ -39,13 +39,14 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  TOP_N  (rows=1)
-        Sort Key: L1_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
-        Limit: 2
-        ->  PROJECTION  (rows=1)
-              Output: id, L1_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3]))
-              ->  ROWSET_SCAN on public.vector_topn_case
-                    Columns: id, category, emb
-                    Filter: category = 'x'
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 2
+    ->  PROJECTION  (rows=1)
+      Output: id, __paro_hidden_1
+      ->  FILTER  (rows=1)
+        Filter: #1 = 'x'
+        ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+          Columns: id, category, emb
 
 SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]', id LIMIT 2;
 id
@@ -57,12 +58,12 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-        Sort Key: COSINE_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
-        Limit: 3
-        ->  PROJECTION  (rows=5)
-              Output: id, COSINE_DISTANCE(emb, CAST('[1,0,0]' AS FLOAT[3]))
-              ->  ROWSET_SCAN on public.vector_topn_case
-                    Columns: id, emb
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 3
+    ->  PROJECTION  (rows=5)
+      Output: id, __paro_hidden_1
+      ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+        Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]', id LIMIT 3;
 id
@@ -75,12 +76,12 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-        Sort Key: NEG_INNER_PRODUCT(emb, CAST('[1,0,0]' AS FLOAT[3])) ASC NULLS LAST
-        Limit: 3
-        ->  PROJECTION  (rows=5)
-              Output: id, NEG_INNER_PRODUCT(emb, CAST('[1,0,0]' AS FLOAT[3]))
-              ->  ROWSET_SCAN on public.vector_topn_case
-                    Columns: id, emb
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 3
+    ->  PROJECTION  (rows=5)
+      Output: id, __paro_hidden_1
+      ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+        Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]', id LIMIT 3;
 id

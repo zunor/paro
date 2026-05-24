@@ -49,7 +49,7 @@ mod bool_and_impl {
                 let state_ptr = *state_ptrs.add(i);
                 let state = state_ptr as *mut State;
 
-                let val: bool = input.get_flat(i);
+                let val: bool = input.get_fixed(i);
                 (*state).value = (*state).value && val;
                 (*state).is_empty = false;
             }
@@ -67,7 +67,7 @@ mod bool_and_impl {
 
         for i in 0..count {
             if !input.is_null(i) {
-                let val: bool = input.get_flat(i);
+                let val: bool = input.get_fixed(i);
                 (*state).value = (*state).value && val;
                 (*state).is_empty = false;
             }
@@ -149,7 +149,7 @@ mod bool_or_impl {
                 let state_ptr = *state_ptrs.add(i);
                 let state = state_ptr as *mut State;
 
-                let val: bool = input.get_flat(i);
+                let val: bool = input.get_fixed(i);
                 (*state).value = (*state).value || val;
                 (*state).is_empty = false;
             }
@@ -167,7 +167,7 @@ mod bool_or_impl {
 
         for i in 0..count {
             if !input.is_null(i) {
-                let val: bool = input.get_flat(i);
+                let val: bool = input.get_fixed(i);
                 (*state).value = (*state).value || val;
                 (*state).is_empty = false;
             }

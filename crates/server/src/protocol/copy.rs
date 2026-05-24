@@ -516,7 +516,7 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
                     } else {
                         format!("COPY from stdin aborted by client: {}", fail.message)
                     };
-                    return Err(paro_error::internal(message));
+                    return Err(paro_error::query_canceled_message(message));
                 }
                 PgWireFrontendMessage::Flush(_) | PgWireFrontendMessage::Sync(_) => {
                     continue;

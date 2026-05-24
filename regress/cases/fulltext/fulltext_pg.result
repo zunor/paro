@@ -78,11 +78,11 @@ QUERY PLAN
 PROJECTION  (rows=0)
   Output: id
   ->  TOP_N  (rows=0)
-        Sort Key: TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector database')) DESC NULLS FIRST
-        Limit: 2
-        ->  PROJECTION  (rows=0)
-              Output: id, TS_RANK(TO_TSVECTOR('simple', content), PLAINTO_TSQUERY('simple', 'vector database'))
-              ->  FULLTEXT_SCAN on public.ft_docs  (rows=4)
+    Sort Key: #1 DESC NULLS FIRST
+    Limit: 2
+    ->  PROJECTION  (rows=0)
+      Output: id, __paro_hidden_1
+      ->  FULLTEXT_SCAN on public.ft_docs  (rows=4)
 
 CREATE TABLE ft_rank (id INT, content VARCHAR);
 CREATE TABLE

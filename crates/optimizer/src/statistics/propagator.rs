@@ -11,7 +11,9 @@ use paro_context::StatementContext;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
 };
-use paro_planner::operator::{ColumnBinding, Filter, Join, JoinComparisonType, LogicalOperator};
+use paro_planner::operator::{
+    empty_result::EmptyResult, ColumnBinding, Filter, Join, JoinComparisonType, LogicalOperator,
+};
 use paro_planner::plan::LogicalPlan;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StringStats};
 use std::collections::HashMap;
@@ -272,9 +274,9 @@ impl StatisticsPropagator {
                         FilterPropagateResult::FilterAlwaysFalse
                         | FilterPropagateResult::FilterFalseOrNull => {
                             filter.expressions.clear();
-                            filter.child =
-                                Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan));
-                            return LogicalOperator::Filter(filter);
+                            return LogicalOperator::EmptyResult(EmptyResult::new(
+                                LogicalPlan::synthetic(LogicalOperator::Filter(filter)),
+                            ));
                         }
                         _ => {
                             i += 1;
@@ -845,5 +847,57 @@ impl StatisticsPropagator {
 impl Default for StatisticsPropagator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_planner::binder::context::BindContext;
+    use paro_planner::operator::ExpressionGet;
+
+    use super::*;
+
+    fn make_test_session() -> Arc<StatementContext> {
+        TestStatementContextBuilder::minimal().build()
+    }
+
+    #[test]
+    fn false_filter_becomes_schema_preserving_empty_result() {
+        let bind_context = BindContext::new();
+        let child = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                7,
+                vec![vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(7, 0),
+                    LogicalType::Integer,
+                ))]],
+                vec!["quota".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let filter = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Filter(Filter::new(
+                child,
+                vec![Expression::Constant(ConstantExpression::new(
+                    Value::Boolean(false),
+                    LogicalType::Boolean,
+                ))],
+            )),
+        );
+
+        let optimized = StatisticsPropagator::new().propagate(make_test_session(), filter);
+
+        match optimized.operator {
+            LogicalOperator::EmptyResult(empty) => {
+                assert_eq!(empty.get_types(), vec![LogicalType::Integer]);
+                assert_eq!(empty.child.output_names(), vec!["quota".to_string()]);
+            }
+            other => panic!("expected schema-preserving EmptyResult, got {other:?}"),
+        }
     }
 }

@@ -161,12 +161,34 @@ impl Chunk {
         self.capacity = other.capacity;
         self.count = other.count;
         self.allocator = other.allocator.clone();
+
         // Zero-copy sharing of columns via Arc
         for (i, col) in other.data.iter().enumerate() {
             if i < self.data.len() {
                 self.data[i] = Arc::clone(col);
             }
         }
+    }
+
+    pub fn clone_referencing_vectors(&self) -> Self {
+        Self {
+            data: self.data.iter().map(Arc::clone).collect(),
+            count: self.count,
+            capacity: self.capacity,
+            initial_capacity: self.initial_capacity,
+            reset_state: None,
+            allocator: self.allocator.clone(),
+        }
+    }
+
+    pub fn handoff_referencing_vectors(&mut self) -> Self {
+        let handed_off = self.clone_referencing_vectors();
+        self.clear_rows_preserve_storage();
+        handed_off
+    }
+
+    pub fn clear_rows_preserve_storage(&mut self) {
+        self.count = 0;
     }
 
     pub fn reference_columns(&mut self, other: &Self, column_ids: &[usize]) {
@@ -201,6 +223,27 @@ impl Chunk {
         self.reset_state = other.reset_state.take();
         self.data = std::mem::take(&mut other.data);
         other.destroy();
+    }
+
+    /// Move all owned buffers out of this chunk without allocating a replacement chunk.
+    ///
+    /// This is for sinks that unconditionally take ownership of their input. Pending paths that
+    /// may need to restore the chunk should keep using `ChunkLease::take_from_scratch`.
+    pub fn take_owned(&mut self) -> Self {
+        let allocator = self.allocator.clone();
+        let taken = Self {
+            data: std::mem::take(&mut self.data),
+            count: self.count,
+            capacity: self.capacity,
+            initial_capacity: self.initial_capacity,
+            reset_state: self.reset_state.take(),
+            allocator: allocator.clone(),
+        };
+        self.count = 0;
+        self.capacity = 0;
+        self.initial_capacity = 0;
+        self.allocator = allocator;
+        taken
     }
 
     pub fn try_copy_to(&self, other: &mut Self, offset: usize) -> Result<()> {

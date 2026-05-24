@@ -35,7 +35,6 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
         databases: base.databases.clone(),
         limits: base.limits.clone(),
         cancellation: base.cancellation.clone(),
-        execution_tracker: None,
         services: Arc::new(QueryResources {
             infra: base.services.infra.clone(),
             cast_functions: Arc::new(cast_functions),
