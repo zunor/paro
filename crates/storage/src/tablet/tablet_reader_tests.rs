@@ -8,7 +8,8 @@ use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageBuilder;
 use crate::rowset::rowset_meta::{RowsetMetaBuilder, RowsetState};
 use crate::rowset::segment::{
-    ColumnData, Segment, SegmentOptions, SegmentSharedPtr, SegmentWriter, SegmentWriterOptions,
+    ColumnData, Segment, SegmentIterator, SegmentOptions, SegmentSharedPtr, SegmentWriter,
+    SegmentWriterOptions,
 };
 use crate::rowset::CompressionType;
 use crate::rowset::{Rowset, RowsetMeta, RowsetSharedPtr};
@@ -721,6 +722,21 @@ fn test_tablet_reader_duplicate_projection() {
     assert_eq!(col2.get_i32(1), Some(1));
     assert_eq!(col2.get_i32(2), Some(2));
     assert!(reader.get_next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn test_segment_iterator_skips_sequential_rowids_for_plain_scan() {
+    let tmp = TempDir::new().unwrap();
+    let schema = create_test_schema();
+    let segment_path = tmp.path().join("plain_scan.dat");
+    let segment = create_segment_with_values(&schema, 0, &[10, 20, 30, 40], &segment_path);
+
+    let mut iter = SegmentIterator::new_with_delete_vector(&segment, vec![0], None).unwrap();
+    let batch = iter.next_batch_with_rowid_policy(2, false).unwrap();
+
+    assert_eq!(batch.rows, 2);
+    assert!(batch.rowids.is_empty());
+    assert_eq!(batch.columns.len(), 1);
 }
 
 #[test]

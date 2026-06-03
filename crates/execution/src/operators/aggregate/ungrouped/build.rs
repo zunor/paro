@@ -13,7 +13,7 @@ use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::scalar::FunctionExecContext;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::aggregate::aggregate_kernel::{
     update_filtered_states, update_states, AggregatePayload,
 };
@@ -30,7 +30,10 @@ use crate::operators::aggregate::ordered_helpers::{
 };
 use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
-use crate::runtime::breaker::{AggregateHandle, AggregateRuntimeState, HandleRef};
+use crate::runtime::breaker::{
+    AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
+    AggregateRuntimeState, HandleRef,
+};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
 use crate::runtime::state::{
@@ -49,9 +52,23 @@ pub struct UngroupedAggregateSinkExec {
 impl UngroupedAggregateSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        let state =
-            create_ungrouped_runtime_state(&self.spec, ctx.query.allocator(MemoryTag::HashTable))?;
+        let state = create_ungrouped_runtime_state(
+            &self.spec,
+            ctx.query.allocator(MemoryTag::HashTable),
+            ctx.query.session.buffer_pool().clone(),
+            query_modifier_memory(ctx.query),
+        )?;
         handle.initialize(AggregateRuntimeState::Ungrouped(state))?;
+        ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+            AggregateBuildCompactionReclaimer::new(handle.clone()),
+        ));
+        ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+            AggregateFinalizedStateReclaimer::for_query(
+                handle.clone(),
+                ctx.query.session.buffer_pool().clone(),
+                ctx.query.memory.clone(),
+            ),
+        ));
         Ok(SinkGlobal::UngroupedAggregate(Arc::new(
             BreakerHandleGlobal { handle },
         )))
@@ -62,14 +79,22 @@ impl UngroupedAggregateSinkExec {
         ctx: &mut PipelineInitContext,
         _global: &SinkGlobal,
     ) -> Result<SinkLocal> {
-        let state =
-            create_ungrouped_runtime_state(&self.spec, ctx.query.allocator(MemoryTag::HashTable))?;
+        let state = create_ungrouped_runtime_state(
+            &self.spec,
+            ctx.query.allocator(MemoryTag::HashTable),
+            ctx.query.session.buffer_pool().clone(),
+            query_modifier_memory(ctx.query),
+        )?;
         Ok(SinkLocal::UngroupedAggregate(UngroupedAggregateSinkLocal {
             aggregate_objects: Arc::clone(&state.aggregate_objects),
             layout: state.layout.clone(),
             aggregate_inputs: Arc::clone(&state.aggregate_inputs),
-            projection_executor: (!self.spec.projection_exprs.is_empty())
-                .then(|| ExpressionExecutor::with_expressions(&self.spec.projection_exprs)),
+            projection_executor: (!self.spec.projection_exprs.is_empty()).then(|| {
+                ExpressionExecutor::with_expressions_for_session(
+                    &self.spec.projection_exprs,
+                    ctx.query.session.as_ref(),
+                )
+            }),
             payload_chunk: Chunk::try_initialize(
                 &self.spec.payload_types,
                 VECTOR_SIZE,
@@ -115,11 +140,11 @@ impl UngroupedAggregateSinkExec {
                     ctx.query.allocator(MemoryTag::BaseTable),
                 )?;
             }
-            executor.execute_all_into_with_input(
-                ExpressionEvalInput {
+            executor.execute_all_kernel(
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: input,
-                },
+                }),
                 ctx.query,
                 &mut local.payload_chunk,
             )?;
@@ -138,6 +163,7 @@ impl UngroupedAggregateSinkExec {
                 &local.aggregate_objects,
                 payload,
                 &[],
+                ctx.query.session.buffer_pool(),
                 &local.modifier_memory,
                 &mut local.distinct_sets,
             )?;
@@ -277,7 +303,7 @@ impl UngroupedAggregateSinkExec {
 
     pub(crate) fn finish(
         &self,
-        _ctx: &mut OperatorFinishContext,
+        ctx: &mut OperatorFinishContext,
         global: &SinkGlobal,
     ) -> Result<FinishPoll> {
         let SinkGlobal::UngroupedAggregate(global) = global else {
@@ -291,9 +317,10 @@ impl UngroupedAggregateSinkExec {
                     "aggregate handle does not contain ungrouped aggregate state",
                 ));
             };
-            finalize_ordered_ungrouped(&self.spec, global)
+            finalize_ordered_ungrouped(&self.spec, &query_modifier_memory(ctx.query), global)
         })?;
         global.handle.mark_finalized();
+        global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)
     }
 }

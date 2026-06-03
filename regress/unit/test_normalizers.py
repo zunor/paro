@@ -22,6 +22,49 @@ def test_apply_explain_operator_timing_normalizer_rewrites_actual_time() -> None
     ]
 
 
+def test_apply_explain_operator_timing_normalizer_rewrites_runtime_profile() -> None:
+    lines = [
+        (
+            "PROFILE schema_version=1 query_id=42 events=9 parallelism=10 workers=2 "
+            "worker_utilization=0.0992 ready_time_us=7 wait_time_us=8 "
+            "wake_coalesce=3 backpressure=4 runtime_filter_installed=1 "
+            "runtime_filter_no_wait=0"
+        ),
+        (
+            "MEMORY_PROFILE grant_bytes=10 revoked_bytes=11 revocable_bytes=12 "
+            "spill_bytes=13 spill_latency_us=14 yield_latency_us=15 repartition_depth=2"
+        ),
+        (
+            '{"profile":{"parallelism":{"operator_time_ms":1.23,"worker_utilization":0.45,'
+            '"max_threads":10,"observed_workers":2,"ready_time_us":7,"wait_time_us":8,'
+            '"wake_count":9,"wake_coalesce_count":3,"backpressure_count":4}},'
+            '"profile_events":[{"query_id":42,"thread_id":7,"total_threads":10,'
+            '"time":{"duration_ms":0.5,"start_ms":1.0,"end_ms":1.5}}]}'
+        ),
+    ]
+
+    assert apply_normalizers(lines, ("explain_operator_timing",)) == [
+        (
+            "PROFILE schema_version=1 query_id=<id> events=<events> "
+            "parallelism=<threads> workers=<workers> worker_utilization=<ratio> "
+            "ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> "
+            "backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0"
+        ),
+        (
+            "MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> "
+            "revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> "
+            "yield_latency_us=<us> repartition_depth=2"
+        ),
+        (
+            '{"profile":{"parallelism":{"operator_time_ms": 0.0,"worker_utilization": 0.0,'
+            '"max_threads": 0,"observed_workers": 0,"ready_time_us": 0,"wait_time_us": 0,'
+            '"wake_count": 0,"wake_coalesce_count": 0,"backpressure_count": 0}},'
+            '"profile_events":[{"query_id": 0,"thread_id": 0,"total_threads": 0,'
+            '"time":{"duration_ms": 0.0,"start_ms": 0.0,"end_ms": 0.0}}]}'
+        ),
+    ]
+
+
 def test_apply_explain_operator_counters_normalizer_rewrites_rows_and_loops() -> None:
     lines = [
         "FILTER  (actual time=<time-range> rows=14000 loops=7)",
@@ -59,8 +102,13 @@ def test_apply_explain_runtime_bytes_normalizer_rewrites_only_target_fields() ->
         "Peak Memory: 128.0 kB",
         "Temp Storage: 1.0 GB",
         "Total Temp Storage: 512 B",
+        "HASH_AGGREGATE_BUILD (spilled=true spilled_bytes=4687424)",
         "Rows Returned: 2",
-        '{"actual":{"peak_memory_bytes":128,"temp_storage_bytes":512},"summary":{"Total Temp Storage":512}}',
+        (
+            '{"actual":{"peak_memory_bytes":128,"temp_storage_bytes":512},'
+            '"profile":{"memory":{"grant_bytes":1,"revocable_bytes":2,'
+            '"revoked_bytes":3,"spill_bytes":4}},"summary":{"Total Temp Storage":512}}'
+        ),
     ]
 
     assert apply_normalizers(lines, ("explain_runtime_bytes",)) == [
@@ -69,8 +117,13 @@ def test_apply_explain_runtime_bytes_normalizer_rewrites_only_target_fields() ->
         "Peak Memory: <bytes>",
         "Temp Storage: <bytes>",
         "Total Temp Storage: <bytes>",
+        "HASH_AGGREGATE_BUILD (spilled=true spilled_bytes=<bytes>)",
         "Rows Returned: 2",
-        '{"actual":{"peak_memory_bytes": 0,"temp_storage_bytes": 0},"summary":{"Total Temp Storage": 0}}',
+        (
+            '{"actual":{"peak_memory_bytes": 0,"temp_storage_bytes": 0},'
+            '"profile":{"memory":{"grant_bytes": 0,"revocable_bytes": 0,'
+            '"revoked_bytes": 0,"spill_bytes": 0}},"summary":{"Total Temp Storage": 0}}'
+        ),
     ]
 
 

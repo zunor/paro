@@ -8,6 +8,7 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::vector::Vector;
 use paro_function::table::{GlobalTableFunctionState, LocalTableFunctionState};
+use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentSharedPtr};
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::table::StorageSnapshot;
@@ -25,12 +26,24 @@ pub struct RowsetSourceGlobal {
     pub next_segment: AtomicUsize,
     pub column_projection: ColumnProjection,
     pub overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
+    pub predicate: Option<PredicateTree>,
+    pub predicate_columns: Box<[ColumnId]>,
 }
 
 #[derive(Debug, Default)]
 pub struct RowsetSourceLocal {
     pub next_morsel: usize,
+    pub assigned_segment: Option<usize>,
+    pub assigned_segment_consumed: bool,
     pub reader: Option<TabletReader>,
+}
+
+impl RowsetSourceLocal {
+    pub fn assign_segment_morsel(&mut self, segment_idx: usize) {
+        self.assigned_segment = Some(segment_idx);
+        self.assigned_segment_consumed = false;
+        self.next_morsel = segment_idx;
+    }
 }
 
 #[derive(Debug)]
@@ -51,7 +64,17 @@ pub struct ChunkSourceGlobal {
 }
 
 #[derive(Debug, Default)]
-pub struct ChunkSourceLocal;
+pub struct ChunkSourceLocal {
+    pub assigned_chunk: Option<usize>,
+    pub assigned_chunk_consumed: bool,
+}
+
+impl ChunkSourceLocal {
+    pub fn assign_chunk_morsel(&mut self, chunk_idx: usize) {
+        self.assigned_chunk = Some(chunk_idx);
+        self.assigned_chunk_consumed = false;
+    }
+}
 
 #[derive(Debug)]
 pub struct ExpressionSourceGlobal {

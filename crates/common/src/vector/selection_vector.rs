@@ -211,6 +211,14 @@ impl SelectionVector {
         unsafe { std::slice::from_raw_parts(self.buffer.data() as *const u32, self.count) }
     }
 
+    /// Get mutable raw slice of indices.
+    pub fn as_mut_slice(&mut self) -> &mut [u32] {
+        self.try_make_exclusive()
+            .expect("selection vector copy-on-write allocation failed");
+        // SAFETY: buffer contains valid u32 data up to self.count
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.data() as *mut u32, self.count) }
+    }
+
     /// Merge this selection vector with another one.
     /// Resulting selection maps 0..other.count -> physical indices.
     /// new_indices[i] = self.get(other.get(i))

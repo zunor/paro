@@ -229,6 +229,16 @@ impl RadixPartitionedRowsBuilder {
     }
 
     #[inline]
+    pub fn radix_bits(&self) -> usize {
+        self.radix_bits
+    }
+
+    #[inline]
+    pub fn hash_col_idx(&self) -> usize {
+        self.hash_col_idx
+    }
+
+    #[inline]
     pub fn count(&self) -> u64 {
         self.inner.count()
     }

@@ -1,7 +1,65 @@
 name = "operator-runtime-gate"
 description = "Operator runtime performance gate: typed runtime, memory, fetch-driven vs completed-output"
 
+# Baseline coverage is staged until the new query baseline is blessed on every gate platform.
+[[include]]
+workload = "operator_runtime_baseline"
+queries = [
+  "selective_rowset_scan",
+  "count_filter",
+  "integer_hash_join",
+  "string_hash_join",
+  "high_cardinality_aggregate",
+  "large_sort",
+  "forced_external_hash_join",
+  "sort_range_join_full",
+  "sort_range_join_selective",
+  "classic_ie_join_selective",
+]
+staging_until = "2026-06-08"
+
+# Scan-pushdown coverage is staged until the post-pushdown baselines are blessed.
+[[include]]
+workload = "operator_runtime_scan_pushdown"
+queries = [
+  "high_selectivity_eq_pushdown",
+  "high_selectivity_eq_no_pushdown",
+  "low_selectivity_range_pushdown",
+  "null_pushdown",
+  "wide_late_materialize",
+  "topn_scan_order",
+]
+staging_until = "2026-06-08"
+
 # Typed runtime hash-join and aggregate regression gate.
+[[include]]
+workload = "operator_runtime_hash_join"
+queries = [
+  "i64_short_chain_left",
+  "i32_long_chain_left",
+  "null_heavy_equal",
+  "varchar_left",
+  "composite_i64_varchar",
+  "semi_join_typed_key",
+  "anti_join_typed_key",
+  "right_anti_found_flag",
+  "full_join_found_flag",
+  "mark_join_in_subquery",
+]
+staging_until = "2026-06-08"
+
+# Scheduler coverage is staged until parallel baselines are blessed.
+[[include]]
+workload = "operator_runtime_scheduler"
+queries = [
+  "scan_only_parallel",
+  "hash_join_parallel",
+  "aggregate_parallel",
+  "sort_seal_parallel",
+  "scan_join_mixed_parallel",
+]
+staging_until = "2026-06-08"
+
 [[include]]
 workload = "row_hash_join_phase0"
 queries = [

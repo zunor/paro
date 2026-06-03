@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::fmt;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -64,6 +65,34 @@ impl Predicate {
     }
 }
 
+impl fmt::Display for Predicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Predicate::Eq { column_id, value } => write!(f, "col#{column_id} = {value}"),
+            Predicate::NotEq { column_id, value } => write!(f, "col#{column_id} != {value}"),
+            Predicate::Lt { column_id, value } => write!(f, "col#{column_id} < {value}"),
+            Predicate::Le { column_id, value } => write!(f, "col#{column_id} <= {value}"),
+            Predicate::Gt { column_id, value } => write!(f, "col#{column_id} > {value}"),
+            Predicate::Ge { column_id, value } => write!(f, "col#{column_id} >= {value}"),
+            Predicate::In { column_id, values } => {
+                let values = values
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "col#{column_id} IN ({values})")
+            }
+            Predicate::Range {
+                column_id,
+                lower,
+                upper,
+            } => write!(f, "col#{column_id} BETWEEN {lower} AND {upper}"),
+            Predicate::IsNull { column_id } => write!(f, "col#{column_id} IS NULL"),
+            Predicate::IsNotNull { column_id } => write!(f, "col#{column_id} IS NOT NULL"),
+        }
+    }
+}
+
 /// Predicate tree with AND/OR composition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PredicateTree {
@@ -80,6 +109,30 @@ impl PredicateTree {
     pub fn leaf(predicate: Predicate) -> Self {
         PredicateTree::Leaf(predicate)
     }
+}
+
+impl fmt::Display for PredicateTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PredicateTree::Leaf(predicate) => write!(f, "{predicate}"),
+            PredicateTree::And(children) => write_predicate_children(f, children, " AND "),
+            PredicateTree::Or(children) => write_predicate_children(f, children, " OR "),
+        }
+    }
+}
+
+fn write_predicate_children(
+    f: &mut fmt::Formatter<'_>,
+    children: &[PredicateTree],
+    separator: &str,
+) -> fmt::Result {
+    for (idx, child) in children.iter().enumerate() {
+        if idx > 0 {
+            f.write_str(separator)?;
+        }
+        write!(f, "{child}")?;
+    }
+    Ok(())
 }
 
 /// Collect unique column IDs referenced by a predicate tree (in first-seen order).

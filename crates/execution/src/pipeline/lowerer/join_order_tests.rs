@@ -9,15 +9,19 @@ fn projection_above_hash_join_stays_after_probe() {
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
-    assert_eq!(graph.pipelines.len(), 2);
+    assert_eq!(graph.pipelines.len(), 3);
     assert!(matches!(
         graph.pipelines[1].transforms.as_slice(),
         [TransformSpec::HashJoinProbe(_), TransformSpec::Project(_)]
     ));
-    assert!(!graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.source, SourceSpec::HashJoinSpillReplay(_))));
+    assert!(matches!(
+        graph.pipelines[2].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[2].transforms.as_slice(),
+        [TransformSpec::Project(_)]
+    ));
     assert_eq!(graph.pipelines[1].output.names.as_ref(), ["lv"]);
     assert_eq!(
         graph.pipelines[1].output.types.as_ref(),
@@ -31,7 +35,7 @@ fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
-    assert_eq!(graph.pipelines.len(), 3);
+    assert_eq!(graph.pipelines.len(), 4);
     assert!(matches!(
         graph.pipelines[0].sink,
         SinkSpec::HashJoinBuild(_)
@@ -47,11 +51,11 @@ fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
             TransformSpec::HashJoinProbe(_)
         ]
     ));
-    assert!(!graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.source, SourceSpec::HashJoinSpillReplay(_))));
-    assert_eq!(graph.dependencies.len(), 2);
+    assert!(matches!(
+        graph.pipelines[3].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert_eq!(graph.dependencies.len(), 3);
     assert_eq!(
         graph
             .dependencies
@@ -60,10 +64,38 @@ fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
             .count(),
         2
     );
-    assert!(!graph
-        .dependencies
-        .iter()
-        .any(|dependency| dependency.kind == DependencyKind::ProbeBeforeSpillReplay));
+    assert_eq!(
+        graph
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.kind == DependencyKind::ProbeBeforeSpillReplay)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        _ => panic!("expected hash join plan"),
+    };
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    let source =
+        lowerer.attach_hash_join_runtime_filters(source, &[], BreakerHandleId::new(3), &spec);
+
+    let SourceSpec::Rowset(rowset) = source else {
+        panic!("expected rowset source");
+    };
+    assert_eq!(rowset.dynamic_runtime_filters.len(), 1);
+    assert_eq!(
+        rowset.dynamic_runtime_filters[0].handle,
+        BreakerHandleId::new(3)
+    );
+    assert_eq!(rowset.dynamic_runtime_filters[0].build_key_index, 0);
+    assert_eq!(rowset.dynamic_runtime_filters[0].probe_column_id, 0);
 }
 
 #[test]
@@ -125,7 +157,7 @@ fn partitioned_window_lowers_to_build_emit_breaker_pipelines() {
 
 #[test]
 fn rowset_source_properties_keep_morsel_partitioning() {
-    let source = SourceSpec::Rowset(rowset_spec_for_test());
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
     let build = PipelinePropertyAccumulator::start_from_source(&source)
         .close_with_sink(&SinkSpec::ClientResult(ClientResultSpec::default()));
 

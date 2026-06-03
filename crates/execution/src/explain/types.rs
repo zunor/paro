@@ -43,8 +43,25 @@ pub struct ExplainRuntimeStats {
     pub spilled_bytes: Option<u64>,
     pub reclaim_latency_us: Option<u64>,
     pub spill_latency_us: Option<u64>,
-    pub allocator_lock_count: Option<u64>,
+    pub allocator_tracking_event_count: Option<u64>,
     pub selection_materialization_count: Option<u64>,
+    pub scheduler_worker_count: Option<u64>,
+    pub scheduler_morsel_count: Option<u64>,
+    pub scheduler_blocked_count: Option<u64>,
+    pub scheduler_wake_count: Option<u64>,
+    pub scheduler_ready_time_us: Option<u64>,
+    pub scheduler_wait_time_us: Option<u64>,
+    pub scheduler_wake_coalesce_count: Option<u64>,
+    pub output_backpressure_count: Option<u64>,
+    pub runtime_filter_installed_count: Option<u64>,
+    /// Reserved for runtime-filter producers that intentionally let probes run
+    /// without waiting for a late filter. Current rowset runtime filters still
+    /// require the build-side filter to be installed before scan init.
+    pub runtime_filter_no_wait_count: Option<u64>,
+    pub grant_bytes: Option<u64>,
+    pub revoked_bytes: Option<u64>,
+    pub yield_latency_us: Option<u64>,
+    pub repartition_depth: Option<u64>,
     pub peak_rss_bytes: Option<u64>,
     pub output_buffer_bytes: Option<u64>,
     pub session_retained_bytes: Option<u64>,
@@ -66,8 +83,22 @@ impl ExplainRuntimeStats {
             || self.spilled_bytes.is_some()
             || self.reclaim_latency_us.is_some()
             || self.spill_latency_us.is_some()
-            || self.allocator_lock_count.is_some()
+            || self.allocator_tracking_event_count.is_some()
             || self.selection_materialization_count.is_some()
+            || self.scheduler_worker_count.is_some()
+            || self.scheduler_morsel_count.is_some()
+            || self.scheduler_blocked_count.is_some()
+            || self.scheduler_wake_count.is_some()
+            || self.scheduler_ready_time_us.is_some()
+            || self.scheduler_wait_time_us.is_some()
+            || self.scheduler_wake_coalesce_count.is_some()
+            || self.output_backpressure_count.is_some()
+            || self.runtime_filter_installed_count.is_some()
+            || self.runtime_filter_no_wait_count.is_some()
+            || self.grant_bytes.is_some()
+            || self.revoked_bytes.is_some()
+            || self.yield_latency_us.is_some()
+            || self.repartition_depth.is_some()
             || self.peak_rss_bytes.is_some()
             || self.output_buffer_bytes.is_some()
             || self.session_retained_bytes.is_some()
@@ -421,13 +452,83 @@ impl ExplainNode {
                 );
                 insert_optional_u64(
                     &mut actual_object,
-                    "allocator_lock_count",
-                    actual.runtime.allocator_lock_count,
+                    "allocator_tracking_event_count",
+                    actual.runtime.allocator_tracking_event_count,
                 );
                 insert_optional_u64(
                     &mut actual_object,
                     "selection_materialization_count",
                     actual.runtime.selection_materialization_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_worker_count",
+                    actual.runtime.scheduler_worker_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_morsel_count",
+                    actual.runtime.scheduler_morsel_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_blocked_count",
+                    actual.runtime.scheduler_blocked_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_wake_count",
+                    actual.runtime.scheduler_wake_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_ready_time_us",
+                    actual.runtime.scheduler_ready_time_us,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_wait_time_us",
+                    actual.runtime.scheduler_wait_time_us,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "scheduler_wake_coalesce_count",
+                    actual.runtime.scheduler_wake_coalesce_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "output_backpressure_count",
+                    actual.runtime.output_backpressure_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "runtime_filter_installed_count",
+                    actual.runtime.runtime_filter_installed_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "runtime_filter_no_wait_count",
+                    actual.runtime.runtime_filter_no_wait_count,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "grant_bytes",
+                    actual.runtime.grant_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "revoked_bytes",
+                    actual.runtime.revoked_bytes,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "yield_latency_us",
+                    actual.runtime.yield_latency_us,
+                );
+                insert_optional_u64(
+                    &mut actual_object,
+                    "repartition_depth",
+                    actual.runtime.repartition_depth,
                 );
                 insert_optional_u64(
                     &mut actual_object,

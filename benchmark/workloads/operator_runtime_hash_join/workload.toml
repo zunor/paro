@@ -1,0 +1,110 @@
+[meta]
+name = "operator_runtime_hash_join"
+description = "HASH-JOIN typed hash kernel, vectorized probe, and hash join layout benchmark"
+run_order = 21
+
+[params]
+rows = 1000
+long_rows = 512
+long_key_space = 16
+string_rows = 1000
+null_rows = 1000
+memory_limit = "256MB"
+temp_directory = "/tmp/paro_benchmark_operator_runtime_hash_join"
+random_seed = 20260525
+thread_count = 1
+fast_path_expected = "current-single-active-driver"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "i64_short_chain_left"
+file = "sql/q_i64_short_chain_left.sql"
+validate = "scalar_equals"
+expected = 1000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "i32_long_chain_left"
+file = "sql/q_i32_long_chain_left.sql"
+validate = "scalar_equals"
+expected = 16384
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "null_heavy_equal"
+file = "sql/q_null_heavy_equal.sql"
+validate = "scalar_equals"
+expected = 500
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "varchar_left"
+file = "sql/q_varchar_left.sql"
+validate = "scalar_equals"
+expected = 1000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "composite_i64_varchar"
+file = "sql/q_composite_i64_varchar.sql"
+validate = "scalar_equals"
+expected = 1000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "semi_join_typed_key"
+file = "sql/q_semi_join_typed_key.sql"
+validate = "scalar_equals"
+expected = 1000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "anti_join_typed_key"
+file = "sql/q_anti_join_typed_key.sql"
+validate = "scalar_equals"
+expected = 0
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "right_anti_found_flag"
+file = "sql/q_right_anti_found_flag.sql"
+validate = "scalar_equals"
+expected = 1
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "full_join_found_flag"
+file = "sql/q_full_join_found_flag.sql"
+validate = "scalar_equals"
+expected = 1000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "mark_join_in_subquery"
+file = "sql/q_mark_join_in_subquery.sql"
+validate = "scalar_equals"
+expected = 1000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true

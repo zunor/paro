@@ -1,0 +1,190 @@
+DROP TABLE IF EXISTS rowset_pushdown_dim;
+DROP TABLE
+
+DROP TABLE IF EXISTS rowset_pushdown_case;
+DROP TABLE
+
+CREATE TABLE rowset_pushdown_case(
+    id INT,
+    k INT,
+    nullable_k INT,
+    score INT,
+    payload VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO rowset_pushdown_case
+SELECT
+    g,
+    g % 10,
+    CASE WHEN g % 8 = 0 THEN NULL ELSE g % 7 END,
+    65 - g,
+    'payload_' || CAST(g AS VARCHAR)
+FROM generate_series(1, 64) AS t(g);
+INSERT 0 64
+
+CREATE TABLE rowset_pushdown_dim(k INT);
+CREATE TABLE
+
+INSERT INTO rowset_pushdown_dim VALUES (2), (5), (8);
+INSERT 0 3
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
+COUNT(*)
+7
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
+COUNT(*)
+21
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
+COUNT(*)
+20
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
+COUNT(*)
+8
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: COUNT(*) BIGINT
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*)
+    Output: aggr_0
+    Cardinality: [1, 1, 1]
+    Output Schema: aggr_0 BIGINT
+    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+      Columns: k
+      Pushed Predicate: col#1 = 3
+      Cardinality: [3, 6, 10]
+      Output Schema: k INTEGER
+
+EXPLAIN (VERBOSE)
+SELECT payload FROM rowset_pushdown_case WHERE k = 3;
+QUERY PLAN
+PROJECTION  (rows=6)
+  Output: payload
+  Cardinality: [3, 6, 10]
+  Output Schema: payload VARCHAR
+  ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+    Columns: k, payload
+    Pushed Predicate: col#1 = 3
+    Late Materialize: auto
+    Cardinality: [3, 6, 10]
+    Output Schema: k INTEGER, payload VARCHAR
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: COUNT(*) BIGINT
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*)
+    Output: aggr_0
+    Cardinality: [1, 1, 1]
+    Output Schema: aggr_0 BIGINT
+    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+      Columns: k
+      Pushed Predicate: col#1 >= 2 AND col#1 < 5
+      Cardinality: [2, 6, 9]
+      Output Schema: k INTEGER
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: COUNT(*) BIGINT
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*)
+    Output: aggr_0
+    Cardinality: [1, 1, 1]
+    Output Schema: aggr_0 BIGINT
+    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
+      Columns: k
+      Pushed Predicate: col#1 = 1 OR col#1 = 4 OR col#1 = 9
+      Cardinality: [9, 19, 29]
+      Output Schema: k INTEGER
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: COUNT(*) BIGINT
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*)
+    Output: aggr_0
+    Cardinality: [1, 1, 1]
+    Output Schema: aggr_0 BIGINT
+    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+      Columns: nullable_k
+      Pushed Predicate: col#2 IS NULL
+      Cardinality: [3, 6, 10]
+      Output Schema: nullable_k INTEGER
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*)
+FROM rowset_pushdown_case c
+JOIN rowset_pushdown_dim d ON c.k = d.k;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: COUNT(*) BIGINT
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*)
+    Output: aggr_0
+    Cardinality: [1, 1, 1]
+    Output Schema: aggr_0 BIGINT
+    ->  FILTER  (rows=19)
+      Filter: #0 = #1
+      Cardinality: [9, 19, 29]
+      Output Schema: k INTEGER, k INTEGER
+      ->  CROSS_PRODUCT  (rows=192)
+        Cardinality: [192, 192, 192]
+        Output Schema: k INTEGER, k INTEGER
+        ->  ROWSET_SCAN on public.rowset_pushdown_case c
+          Columns: k
+          Pushed Predicate: col#1 >= 2 AND col#1 <= 8
+          Runtime Filter: #0 >= 2 AND #0 <= 8
+          Output Schema: k INTEGER
+        ->  ROWSET_SCAN on public.rowset_pushdown_dim d
+          Columns: k
+          Output Schema: k INTEGER
+
+EXPLAIN (VERBOSE)
+SELECT id FROM rowset_pushdown_case ORDER BY score ASC LIMIT 5;
+QUERY PLAN
+PROJECTION  (rows=5)
+  Output: id
+  Cardinality: [5, 5, 5]
+  Output Schema: id INTEGER
+  ->  TOP_N  (rows=5)
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 5
+    Cardinality: [5, 5, 5]
+    Output Schema: id INTEGER, __paro_hidden_1 INTEGER
+    ->  PROJECTION  (rows=64)
+      Output: id, __paro_hidden_1
+      Cardinality: [64, 64, 64]
+      Output Schema: id INTEGER, __paro_hidden_1 INTEGER
+      ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=64)
+        Columns: id, score
+        Scan Order: col#3 ASC by min LIMIT 5
+        Cardinality: [64, 64, 64]
+        Output Schema: id INTEGER, score INTEGER
+
+DROP TABLE rowset_pushdown_dim;
+DROP TABLE
+
+DROP TABLE rowset_pushdown_case;
+DROP TABLE

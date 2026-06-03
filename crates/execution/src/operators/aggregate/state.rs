@@ -2,26 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use paro_common::allocator::ArenaAllocator;
 use paro_common::chunk::Chunk;
 use paro_common::memory::MemoryAccountingContext;
 use paro_common::vector::{SelectionVector, Vector};
+use paro_storage::row::RowStoreSpillReader;
 
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::memory_runtime::QueryMemoryPool;
+use crate::operators::aggregate::payload_spill::{
+    AggregatePayloadSpillBuffer, AggregateStateSpillBuffer,
+};
 use crate::runtime::breaker::UngroupedAggregateRuntimeState;
 
-use super::accounted_rows::AccountedValueRowSet;
+use super::accounted_rows::DistinctRowSet;
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
 use super::ordered_helpers::OrderedAggregateCollector;
 use super::perfect_aggregate_hashtable::{PerfectAggregateHashTable, PerfectHTScanPosition};
 use super::radix_partitioned_aggregate_hashtable::{AggregateHTScanPosition, AggregateHashTable};
+use super::row_format::AggregateGroupFormat;
 
 #[derive(Debug, Default)]
 pub struct HashAggregateEmitSourceLocal {
     pub tables: Option<Vec<AggregateHashTable>>,
+    pub spilled_outputs: Option<Vec<Option<RowStoreSpillReader<AggregateGroupFormat>>>>,
+    pub spilled_chunk: Option<Chunk>,
     pub positions: Vec<AggregateHTScanPosition>,
     pub grouping_idx: usize,
 }
@@ -73,10 +83,18 @@ pub struct HashAggregateBuildSinkLocal {
     pub grouping_sets: Box<[Box<[usize]>]>,
     pub addresses: Vector,
     pub new_groups: SelectionVector,
-    pub tables: Vec<AggregateHashTable>,
+    pub tables: Arc<Mutex<Vec<AggregateHashTable>>>,
+    pub(crate) local_build_reclaimer_name: Option<String>,
+    pub(crate) local_payload_spill_reclaimer_name: Option<String>,
+    pub(crate) local_state_spill_reclaimer_name: Option<String>,
+    pub(crate) query_memory: Option<Arc<QueryMemoryPool>>,
+    pub(crate) raw_payload_spill_enabled: bool,
+    pub(crate) raw_payload_spill_requested: Arc<AtomicBool>,
+    pub(crate) payload_spill: Option<AggregatePayloadSpillBuffer>,
+    pub(crate) state_spill: Arc<Mutex<Option<AggregateStateSpillBuffer>>>,
     pub(crate) ordered_collectors: Vec<OrderedAggregateCollector>,
     pub(crate) modifier_memory: MemoryAccountingContext,
-    pub(crate) distinct_sets: Vec<Option<AccountedValueRowSet>>,
+    pub(crate) distinct_sets: Vec<Option<DistinctRowSet>>,
 }
 
 #[derive(Debug)]
@@ -92,7 +110,7 @@ pub struct UngroupedAggregateSinkLocal {
     pub arena_allocator: ArenaAllocator,
     pub destroyed: bool,
     pub(crate) modifier_memory: MemoryAccountingContext,
-    pub(crate) distinct_sets: Vec<Option<AccountedValueRowSet>>,
+    pub(crate) distinct_sets: Vec<Option<DistinctRowSet>>,
 }
 
 #[derive(Debug)]
@@ -107,8 +125,42 @@ pub struct PerfectHashAggregateSinkLocal {
 
 impl Drop for HashAggregateBuildSinkLocal {
     fn drop(&mut self) {
-        for table in &mut self.tables {
+        self.unregister_local_reclaimers();
+        for table in self.tables.lock().iter_mut() {
             let _ = table.destroy();
+        }
+    }
+}
+
+impl HashAggregateBuildSinkLocal {
+    pub(crate) fn unregister_local_reclaimers(&mut self) {
+        if let Some(memory) = self.query_memory.as_ref() {
+            if let Some(name) = self.local_build_reclaimer_name.take() {
+                memory.unregister_reclaimer_by_name(&name);
+            }
+            if let Some(name) = self.local_payload_spill_reclaimer_name.take() {
+                memory.unregister_reclaimer_by_name(&name);
+            }
+            if let Some(name) = self.local_state_spill_reclaimer_name.take() {
+                memory.unregister_reclaimer_by_name(&name);
+            }
+        }
+    }
+
+    pub(crate) fn raw_payload_spill_enabled(&self) -> bool {
+        self.raw_payload_spill_enabled || self.raw_payload_spill_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn enable_raw_payload_spill(&mut self) {
+        self.raw_payload_spill_enabled = true;
+        self.raw_payload_spill_requested
+            .store(true, Ordering::Release);
+        self.unregister_local_reclaimers();
+    }
+
+    pub(crate) fn activate_raw_payload_spill_if_requested(&mut self) {
+        if self.raw_payload_spill_requested.load(Ordering::Acquire) {
+            self.enable_raw_payload_spill();
         }
     }
 }

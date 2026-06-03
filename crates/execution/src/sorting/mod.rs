@@ -3,7 +3,7 @@
 
 //! Sorting operators, run storage, and merge helpers.
 
-pub mod sort;
+pub mod sort_descriptor;
 pub mod sort_key_store;
 pub mod sort_projection_column;
 pub mod sorted_run;

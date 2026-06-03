@@ -10,7 +10,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_function::scalar::FunctionExecContext;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::physical::specs::FilterSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{TransformGlobal, TransformLocal};
@@ -39,11 +39,14 @@ impl FilterTransformExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &TransformGlobal,
     ) -> Result<TransformLocal> {
         Ok(TransformLocal::Filter(FilterTransformLocal {
-            executor: Some(ExpressionExecutor::with_expressions(&self.spec.expressions)),
+            executor: Some(ExpressionExecutor::with_expressions_for_session(
+                &self.spec.expressions,
+                ctx.query.session.as_ref(),
+            )),
             projection: self.spec.projection_map.to_vec().into_boxed_slice(),
             output_types: None,
         }))
@@ -94,13 +97,12 @@ impl FilterTransformExec {
         let mut scratch = ctx.scratch.expr();
         let selection =
             scratch.selection(input.size(), ctx.query.allocator(MemoryTag::BaseTable))?;
-        let selected_count = executor.select_into_with_input(
+        let selected_count = executor.select_kernel(
             0,
-            ExpressionEvalInput {
+            VectorKernelInput::from_eval_input(ExpressionEvalInput {
                 params: ctx.query.params.as_ref(),
                 columns: input,
-            },
-            input.size(),
+            }),
             ctx.query,
             selection,
         )?;

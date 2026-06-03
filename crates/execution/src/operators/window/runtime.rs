@@ -626,6 +626,14 @@ fn write_aggregate_results(
         return Ok(());
     }
 
+    if let Some(values) = frame::try_aggregate_partition_fast(chunks, sorted_keys, partition, expr)?
+    {
+        for (row_offset, value) in values.iter().enumerate() {
+            output.set_window_value(expr_idx, partition.start + row_offset, value);
+        }
+        return Ok(());
+    }
+
     for absolute_idx in partition.start..partition.end {
         let value =
             frame::aggregate_window_value(chunks, sorted_keys, partition, expr, absolute_idx)?;

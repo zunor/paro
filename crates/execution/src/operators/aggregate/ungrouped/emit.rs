@@ -11,7 +11,8 @@ use crate::operators::aggregate::aggregate_kernel::finalize_states;
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
-    single_state_addresses, AggregateHandle, AggregateRuntimeState, HandleRef,
+    single_state_addresses, AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer,
+    AggregateHandle, AggregateRuntimeState, HandleRef,
 };
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -72,6 +73,12 @@ impl UngroupedAggregateEmitSourceExec {
             return Ok(SourcePoll::Finished);
         }
         if local.state.is_none() {
+            ctx.query.memory.unregister_reclaimer_by_name(
+                &AggregateBuildCompactionReclaimer::name_for(&global.handle),
+            );
+            ctx.query.memory.unregister_reclaimer_by_name(
+                &AggregateFinalizedStateReclaimer::name_for(&global.handle),
+            );
             let Some(state) = global.handle.take_state()? else {
                 return Ok(SourcePoll::Finished);
             };

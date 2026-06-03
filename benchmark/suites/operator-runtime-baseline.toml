@@ -1,0 +1,5 @@
+name = "operator-runtime-baseline"
+description = "BASELINE focused operator runtime baseline suite"
+
+[[include]]
+workload = "operator_runtime_baseline"

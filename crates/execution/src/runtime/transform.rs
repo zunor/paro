@@ -14,6 +14,7 @@ pub use crate::operators::graph::GraphProjectTransformExec;
 pub use crate::operators::graph::GraphShortestPathTransformExec;
 pub use crate::operators::join::hash::HashJoinProbeTransformExec;
 pub use crate::operators::join::nested_loop::NestedLoopJoinProbeTransformExec;
+pub use crate::operators::join::sort_range::SortRangeJoinProbeTransformExec;
 pub use crate::operators::join::CrossProductProbeTransformExec;
 pub use crate::operators::sort::StreamingTopNTransformExec;
 pub use crate::operators::transform::FilterTransformExec;
@@ -28,6 +29,7 @@ pub enum TransformExec {
     Project(ProjectTransformExec),
     HashJoinProbe(HashJoinProbeTransformExec),
     NestedLoopJoinProbe(NestedLoopJoinProbeTransformExec),
+    SortRangeJoinProbe(SortRangeJoinProbeTransformExec),
     CrossProductProbe(CrossProductProbeTransformExec),
     StreamingLimit(StreamingLimitTransformExec),
     StreamingTopN(StreamingTopNTransformExec),
@@ -48,6 +50,7 @@ impl TransformExec {
             Self::Project(_) => "PROJECTION",
             Self::HashJoinProbe(_) => "HASH_JOIN_PROBE",
             Self::NestedLoopJoinProbe(_) => "NESTED_LOOP_JOIN_PROBE",
+            Self::SortRangeJoinProbe(_) => "SORT_RANGE_JOIN_PROBE",
             Self::CrossProductProbe(_) => "CROSS_PRODUCT_PROBE",
             Self::StreamingLimit(_) => "STREAMING_LIMIT",
             Self::StreamingTopN(_) => "TOP_N",
@@ -69,6 +72,7 @@ impl TransformExec {
             Self::Project(exec) => exec.create_global(ctx),
             Self::HashJoinProbe(exec) => exec.create_global(ctx),
             Self::NestedLoopJoinProbe(exec) => exec.create_global(ctx),
+            Self::SortRangeJoinProbe(exec) => exec.create_global(ctx),
             Self::CrossProductProbe(exec) => exec.create_global(ctx),
             Self::StreamingLimit(exec) => exec.create_global(ctx),
             Self::StreamingTopN(exec) => exec.create_global(ctx),
@@ -94,6 +98,7 @@ impl TransformExec {
             Self::Project(exec) => exec.create_local(ctx, global),
             Self::HashJoinProbe(exec) => exec.create_local(ctx, global),
             Self::NestedLoopJoinProbe(exec) => exec.create_local(ctx, global),
+            Self::SortRangeJoinProbe(exec) => exec.create_local(ctx, global),
             Self::CrossProductProbe(exec) => exec.create_local(ctx, global),
             Self::StreamingLimit(exec) => exec.create_local(ctx, global),
             Self::StreamingTopN(exec) => exec.create_local(ctx, global),
@@ -122,6 +127,7 @@ impl TransformExec {
             Self::Project(exec) => exec.transform(ctx, global, local, input, output),
             Self::HashJoinProbe(exec) => exec.transform(ctx, global, local, input, output),
             Self::NestedLoopJoinProbe(exec) => exec.transform(ctx, global, local, input, output),
+            Self::SortRangeJoinProbe(exec) => exec.transform(ctx, global, local, input, output),
             Self::CrossProductProbe(exec) => exec.transform(ctx, global, local, input, output),
             Self::StreamingLimit(exec) => exec.transform(ctx, global, local, input, output),
             Self::StreamingTopN(exec) => exec.transform(ctx, global, local, input, output),
@@ -149,6 +155,7 @@ impl TransformExec {
             Self::Project(exec) => exec.flush(ctx, global, local, output),
             Self::HashJoinProbe(exec) => exec.flush(ctx, global, local, output),
             Self::NestedLoopJoinProbe(exec) => exec.flush(ctx, global, local, output),
+            Self::SortRangeJoinProbe(exec) => exec.flush(ctx, global, local, output),
             Self::CrossProductProbe(exec) => exec.flush(ctx, global, local, output),
             Self::StreamingLimit(exec) => exec.flush(ctx, global, local, output),
             Self::StreamingTopN(exec) => exec.flush(ctx, global, local, output),
@@ -174,6 +181,7 @@ impl TransformExec {
             Self::Project(exec) => exec.finish_global(ctx, global),
             Self::HashJoinProbe(exec) => exec.finish_global(ctx, global),
             Self::NestedLoopJoinProbe(exec) => exec.finish_global(ctx, global),
+            Self::SortRangeJoinProbe(exec) => exec.finish_global(ctx, global),
             Self::CrossProductProbe(exec) => exec.finish_global(ctx, global),
             Self::StreamingLimit(exec) => exec.finish_global(ctx, global),
             Self::StreamingTopN(exec) => exec.finish_global(ctx, global),

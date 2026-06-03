@@ -5,6 +5,15 @@ description = "Full nightly benchmark suite covering every checked-in workload"
 workload = "memory"
 
 [[include]]
+workload = "operator_runtime_baseline"
+
+[[include]]
+workload = "operator_runtime_scan_pushdown"
+
+[[include]]
+workload = "operator_runtime_mixed"
+
+[[include]]
 workload = "row_hash_join_phase0"
 
 [[include]]

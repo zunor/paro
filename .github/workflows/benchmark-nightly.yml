@@ -51,6 +51,14 @@ jobs:
     env:
       PARO_BENCH_CARGO_PROFILE: release
       PARO_BENCH_DATA_DIR_MODE: fresh
+      PARO_BENCH_THREAD_COUNT: "1"
+      PARO_BENCH_QUERY_MEMORY_CAP: 256MB
+      PARO_BENCH_TEMP_DIRECTORY: /tmp/paro_benchmark_operator_runtime
+      PARO_BENCH_DATA_SCALE: checked-in
+      PARO_BENCH_RANDOM_SEED: "20260525"
+      PARO_BENCH_SINGLE_TASK_FAST_PATH: current-single-active-driver
+      PARO_BENCH_ALLOC_AUDIT: "1"
+      PARO_ALLOC_AUDIT: "1"
       PARO_PERF_ARCHIVE_DIR: ${{ github.workspace }}/.ci/paro-perf-archive
       PARO_PERF_ARCHIVE_TOKEN: ${{ secrets.PARO_PERF_ARCHIVE_TOKEN }}
     steps:

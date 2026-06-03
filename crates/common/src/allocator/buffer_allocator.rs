@@ -6,8 +6,10 @@
 //! This allocator wraps a `BufferManager` so callers can allocate tracked
 //! memory without depending on storage-layer types directly.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 
 #[cfg(debug_assertions)]
@@ -18,7 +20,9 @@ use crate::error::Result;
 /// Number of memory tags (must match MemoryTag enum variants).
 pub const MEMORY_TAG_COUNT: usize = 21;
 
-static ALLOCATOR_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static ALLOCATOR_TRACKING_EVENT_COUNT: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Memory tag for tracking allocation purposes.
 ///
@@ -163,21 +167,49 @@ impl MemoryTag {
     }
 }
 
-/// Number of lock acquisitions taken by `BufferAllocator` tracking maps.
+/// Number of `BufferAllocator` tracking-map events recorded by this thread.
+///
+/// This is disabled unless the process starts with `PARO_ALLOC_AUDIT=1` or
+/// `PARO_BENCH_ALLOC_AUDIT=1`, so production allocator hot paths avoid a
+/// contended global counter.
 #[inline]
-pub fn allocator_lock_count() -> u64 {
-    ALLOCATOR_LOCK_COUNT.load(Ordering::Relaxed)
+pub fn allocator_tracking_event_count() -> u64 {
+    if !allocator_tracking_audit_enabled() {
+        return 0;
+    }
+    ALLOCATOR_TRACKING_EVENT_COUNT.with(Cell::get)
 }
 
-/// Reset allocator lock instrumentation for focused tests and benchmarks.
+/// Reset allocator tracking instrumentation for focused tests and benchmarks.
 #[inline]
-pub fn reset_allocator_lock_count() {
-    ALLOCATOR_LOCK_COUNT.store(0, Ordering::Relaxed);
+pub fn reset_allocator_tracking_event_count() {
+    if allocator_tracking_audit_enabled() {
+        ALLOCATOR_TRACKING_EVENT_COUNT.with(|count| count.set(0));
+    }
 }
 
 #[inline]
-fn record_allocator_lock() {
-    ALLOCATOR_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+pub fn allocator_tracking_audit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("PARO_ALLOC_AUDIT") || env_flag("PARO_BENCH_ALLOC_AUDIT"))
+}
+
+#[inline]
+fn record_allocator_tracking_event() {
+    if allocator_tracking_audit_enabled() {
+        ALLOCATOR_TRACKING_EVENT_COUNT.with(|count| {
+            count.set(count.get().saturating_add(1));
+        });
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl std::fmt::Display for MemoryTag {
@@ -454,13 +486,13 @@ impl BufferAllocator {
 
     /// Get the number of active allocations.
     pub fn allocation_count(&self) -> usize {
-        record_allocator_lock();
+        record_allocator_tracking_event();
         self.allocations.read().unwrap().len()
     }
 
     /// Get the total allocated size.
     pub fn allocated_size(&self) -> usize {
-        record_allocator_lock();
+        record_allocator_tracking_event();
         self.allocations
             .read()
             .unwrap()
@@ -479,7 +511,7 @@ impl Allocator for BufferAllocator {
         let ptr = self.manager.allocate(self.tag, size)?;
 
         // Track the allocation
-        record_allocator_lock();
+        record_allocator_tracking_event();
         let mut allocations = self.allocations.write().unwrap();
         allocations.insert(
             ptr as usize,
@@ -513,7 +545,7 @@ impl Allocator for BufferAllocator {
 
         // Remove from tracking
         let entry = {
-            record_allocator_lock();
+            record_allocator_tracking_event();
             let mut allocations = self.allocations.write().unwrap();
             allocations.remove(&(ptr as usize))
         };
@@ -540,7 +572,7 @@ impl Allocator for BufferAllocator {
 
         // Get the actual old size from tracking
         let actual_old_size = {
-            record_allocator_lock();
+            record_allocator_tracking_event();
             let allocations = self.allocations.read().unwrap();
             allocations
                 .get(&(ptr as usize))
@@ -558,7 +590,7 @@ impl Allocator for BufferAllocator {
 
         // Update tracking
         {
-            record_allocator_lock();
+            record_allocator_tracking_event();
             let mut allocations = self.allocations.write().unwrap();
             allocations.remove(&(ptr as usize));
             allocations.insert(

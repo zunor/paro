@@ -1,0 +1,5 @@
+name = "operator-runtime-scheduler"
+description = "SCHEDULER pipeline scheduler and rowset segment morsel suite"
+
+[[include]]
+workload = "operator_runtime_scheduler"

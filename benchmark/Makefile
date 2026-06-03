@@ -31,6 +31,24 @@ POLICY_VERSION ?= auto
 QUORUM_RETRIES ?=
 AGAINST ?=
 
+PARO_BENCH_THREAD_COUNT ?= 1
+PARO_BENCH_QUERY_MEMORY_CAP ?= 256MB
+PARO_BENCH_TEMP_DIRECTORY ?= /tmp/paro_benchmark_operator_runtime
+PARO_BENCH_DATA_SCALE ?= checked-in
+PARO_BENCH_RANDOM_SEED ?= 20260525
+PARO_BENCH_SINGLE_TASK_FAST_PATH ?= current-single-active-driver
+PARO_BENCH_ALLOC_AUDIT ?= 1
+PARO_ALLOC_AUDIT ?= $(PARO_BENCH_ALLOC_AUDIT)
+
+export PARO_BENCH_THREAD_COUNT
+export PARO_BENCH_QUERY_MEMORY_CAP
+export PARO_BENCH_TEMP_DIRECTORY
+export PARO_BENCH_DATA_SCALE
+export PARO_BENCH_RANDOM_SEED
+export PARO_BENCH_SINGLE_TASK_FAST_PATH
+export PARO_BENCH_ALLOC_AUDIT
+export PARO_ALLOC_AUDIT
+
 .DEFAULT_GOAL := help
 
 .PHONY: setup run check bless calibrate bisect archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help

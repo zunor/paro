@@ -20,7 +20,8 @@ use crate::operators::aggregate::build_helpers::{
 use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
-    AggregateHandle, AggregateRuntimeState, HandleRef, PerfectHashAggregateRuntimeState,
+    AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
+    AggregateRuntimeState, HandleRef, PerfectHashAggregateRuntimeState,
 };
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -47,6 +48,16 @@ impl PerfectHashAggregateSinkExec {
         handle.initialize(AggregateRuntimeState::Perfect(
             PerfectHashAggregateRuntimeState { table },
         ))?;
+        ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+            AggregateBuildCompactionReclaimer::new(handle.clone()),
+        ));
+        ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+            AggregateFinalizedStateReclaimer::for_query(
+                handle.clone(),
+                ctx.query.session.buffer_pool().clone(),
+                ctx.query.memory.clone(),
+            ),
+        ));
         Ok(SinkGlobal::PerfectHashAggregate(Arc::new(
             BreakerHandleGlobal { handle },
         )))
@@ -59,8 +70,12 @@ impl PerfectHashAggregateSinkExec {
     ) -> Result<SinkLocal> {
         Ok(SinkLocal::PerfectHashAggregate(
             PerfectHashAggregateSinkLocal {
-                projection_executor: (!self.spec.projection_exprs.is_empty())
-                    .then(|| ExpressionExecutor::with_expressions(&self.spec.projection_exprs)),
+                projection_executor: (!self.spec.projection_exprs.is_empty()).then(|| {
+                    ExpressionExecutor::with_expressions_for_session(
+                        &self.spec.projection_exprs,
+                        ctx.query.session.as_ref(),
+                    )
+                }),
                 payload_chunk: (!self.spec.projection_exprs.is_empty())
                     .then(|| {
                         Chunk::try_initialize(
@@ -188,6 +203,7 @@ impl PerfectHashAggregateSinkExec {
             ));
         };
         global.handle.mark_finalized();
+        global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)
     }
 }

@@ -195,6 +195,96 @@ fn segment_bitmap_predicate_skips_late_materialize_even_with_explicit_columns() 
 }
 
 #[test]
+fn segment_bitmap_range_predicate_verifies_rows_after_index_pruning() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("bitmap_range_predicate.seg");
+    let schema = create_int_schema();
+
+    let opts = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_bitmap_index_columns(vec![0]);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, opts).unwrap();
+
+    let ids: Vec<i32> = (0..2000).map(|v| v % 1000).collect();
+    let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+    writer
+        .append_chunk(&[
+            ColumnData::new(
+                ids.iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                ids.len() as u32,
+            ),
+            ColumnData::new(
+                values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                values.len() as u32,
+            ),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let segment = Arc::new(
+        Segment::open(
+            0,
+            &file_path,
+            schema,
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    );
+
+    let predicate = PredicateTree::leaf(Predicate::Lt {
+        column_id: 0,
+        value: Value::Integer(900),
+    });
+
+    let mut iter =
+        SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            &segment,
+            vec![1],
+            vec![0],
+            None,
+            Some(predicate),
+            None,
+        )
+        .unwrap();
+
+    assert!(iter.uses_late_materialize());
+    assert!(matches!(iter.evaluated_selection, PredicateResult::Unknown));
+
+    let mut matched_rowids = Vec::new();
+    let mut matched_values = Vec::new();
+    while iter.has_next() {
+        let (rowids, batch) = iter.next_batch(1024).unwrap();
+        if rowids.is_empty() {
+            break;
+        }
+        matched_rowids.extend(rowids);
+        matched_values.extend(
+            batch[0]
+                .1
+                .data
+                .chunks_exact(4)
+                .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap())),
+        );
+    }
+    assert_eq!(matched_rowids.len(), 1800);
+    assert_eq!(matched_rowids.first().copied(), Some(0));
+    assert_eq!(matched_rowids.last().copied(), Some(1899));
+    assert_eq!(matched_values.len(), 1800);
+    assert_eq!(matched_values[0], 0);
+    assert_eq!(matched_values[899], 8990);
+    assert_eq!(matched_values[900], 0);
+    assert_eq!(matched_values[1799], 8990);
+}
+
+#[test]
 fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("runtime_art.seg");

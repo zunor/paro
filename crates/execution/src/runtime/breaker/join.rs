@@ -3,24 +3,37 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::MemoryAccountingContext;
+use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::{JoinCondition, JoinType};
 use paro_storage::buffer::{BufferPool, MemoryTag};
+use paro_storage::index::{ColumnId, Predicate, PredicateTree};
 use paro_storage::row::{
-    RadixPartitionedRows, RadixPartitionedRowsBuilder, RowLayout, RowStore, RowValidityType,
+    RadixPartitionedRows, RadixPartitionedRowsBuilder, ReclaimableRowStore, RowLayout, RowStore,
+    RowValidityType,
 };
 
-use crate::join_hashtable::join_hashtable::{JoinHashTable, JoinHashTableConfig};
+use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
+use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
 use crate::runtime::context::OperatorCleanupContext;
 
 use super::cleanup::{CleanupReason, CleanupState, CleanupStatus, RuntimeCleanup};
 use super::registry::BreakerHandleMetadata;
+
+pub const HASH_JOIN_SPILL_MIN_RADIX_BITS: usize = 1;
+pub const HASH_JOIN_SPILL_MAX_RADIX_BITS: usize = 12;
+pub const HASH_JOIN_SPILL_MIN_TARGET_PARTITION_BYTES: usize = 1024 * 1024;
+pub const HASH_JOIN_SPILL_TARGET_PARTITION_BYTES: usize = 64 * 1024 * 1024;
+
+static NEXT_HASH_JOIN_LOCAL_BUILD_RECLAIMER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JoinBuildId(pub u32);
@@ -33,7 +46,12 @@ pub struct JoinBuildHandle {
     pub completion: CompletionLatch,
     pub stats: JoinBuildStats,
     table: OnceLock<Arc<JoinHashTable>>,
+    runtime_filter_builder: Mutex<Option<JoinRuntimeFilterSketch>>,
+    runtime_filter_sketch: OnceLock<JoinRuntimeFilterSketch>,
     mode: AtomicU8,
+    reclaim_enabled: AtomicBool,
+    spill_in_progress: AtomicBool,
+    spill_radix_bits: OnceLock<usize>,
     external: OnceLock<JoinExternalModeConfig>,
     cleanup: CleanupState,
 }
@@ -47,7 +65,12 @@ impl JoinBuildHandle {
             completion: CompletionLatch::default(),
             stats: JoinBuildStats::default(),
             table: OnceLock::new(),
+            runtime_filter_builder: Mutex::new(None),
+            runtime_filter_sketch: OnceLock::new(),
             mode: AtomicU8::new(JoinBuildMode::InMemory as u8),
+            reclaim_enabled: AtomicBool::new(false),
+            spill_in_progress: AtomicBool::new(false),
+            spill_radix_bits: OnceLock::new(),
             external: OnceLock::new(),
             cleanup: CleanupState::default(),
         }
@@ -91,6 +114,11 @@ impl JoinBuildHandle {
         join_type: JoinType,
         memory: MemoryAccountingContext,
     ) -> Arc<JoinHashTable> {
+        let runtime_filter_key_types = conditions
+            .iter()
+            .map(|condition| condition.right.return_type())
+            .collect::<Vec<_>>();
+        self.initialize_runtime_filter_builder(&runtime_filter_key_types);
         Arc::clone(self.table.get_or_init(|| {
             Arc::new(JoinHashTable::new_with_memory(
                 buffer_pool,
@@ -118,9 +146,146 @@ impl JoinBuildHandle {
 
     pub fn finalize_in_memory(&self) -> Result<()> {
         let table = self.require_table()?;
+        self.publish_runtime_filter_from_builder()?;
         table.finalize()?;
         self.completion.mark_complete();
         Ok(())
+    }
+
+    pub fn initialize_runtime_filter_builder(&self, key_types: &[LogicalType]) {
+        let mut builder = self.runtime_filter_builder.lock();
+        if builder.is_none() {
+            *builder = Some(JoinRuntimeFilterSketch::empty(key_types));
+        }
+    }
+
+    pub fn merge_runtime_filter_sketch(
+        &self,
+        sketch: Option<JoinRuntimeFilterSketch>,
+    ) -> Result<()> {
+        let Some(sketch) = sketch else {
+            return Ok(());
+        };
+        let mut builder = self.runtime_filter_builder.lock();
+        match builder.as_mut() {
+            Some(existing) => existing.merge(&sketch)?,
+            None => *builder = Some(sketch),
+        }
+        Ok(())
+    }
+
+    pub fn publish_runtime_filter_from_builder(&self) -> Result<()> {
+        if self.runtime_filter_sketch.get().is_some() {
+            return Ok(());
+        }
+        let sketch = self
+            .runtime_filter_builder
+            .lock()
+            .clone()
+            .unwrap_or_else(|| JoinRuntimeFilterSketch::empty(&[]));
+        // Idempotent publish: concurrent finalize paths may race, and keeping the first sketch is fine.
+        let _ = self.runtime_filter_sketch.set(sketch);
+        Ok(())
+    }
+
+    pub fn runtime_filter_predicate(
+        &self,
+        build_key_index: usize,
+        probe_column_id: ColumnId,
+    ) -> Option<PredicateTree> {
+        self.runtime_filter_sketch
+            .get()
+            .and_then(|filter| filter.predicate_for_column(build_key_index, probe_column_id))
+    }
+
+    pub fn runtime_filter_ready(&self) -> bool {
+        self.runtime_filter_sketch.get().is_some()
+    }
+
+    pub fn enable_build_reclaim(&self) {
+        if !self.completion.is_complete() && !self.is_external() {
+            self.reclaim_enabled.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn disable_build_reclaim(&self) {
+        self.reclaim_enabled.store(false, Ordering::Release);
+    }
+
+    pub fn build_reclaim_enabled(&self) -> bool {
+        self.reclaim_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn has_build_spill(&self) -> bool {
+        self.spill.has_build_spill()
+    }
+
+    pub fn build_spill_radix_bits(&self, build_bytes: usize, query_memory_cap: usize) -> usize {
+        *self
+            .spill_radix_bits
+            .get_or_init(|| choose_hash_join_radix_bits(build_bytes, query_memory_cap))
+    }
+
+    pub fn spill_build_for_reclaim(
+        &self,
+        target_bytes: usize,
+        query_memory_cap: usize,
+        memory: MemoryAccountingContext,
+    ) -> MemoryResult<ReclaimStats> {
+        if target_bytes == 0 || self.completion.is_complete() || self.is_external() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        if self.spill_in_progress.swap(true, Ordering::AcqRel) {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        struct SpillGuard<'a>(&'a AtomicBool);
+        impl Drop for SpillGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _spill_guard = SpillGuard(&self.spill_in_progress);
+
+        let Some(table) = self.table() else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        let before = table.build_rows_size_in_bytes();
+        if before == 0 && !self.has_build_spill() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+
+        self.publish_runtime_filter_from_builder()
+            .map_err(hash_join_reclaim_error)?;
+        let radix_bits = self.build_spill_radix_bits(before, query_memory_cap);
+        if before > 0 {
+            let mut buffer = JoinBuildSpillBuffer::new(
+                table.buffer_pool().clone(),
+                radix_bits,
+                table.hash_column_index(),
+                table.layout().types().to_vec(),
+                memory,
+            )
+            .map_err(hash_join_reclaim_error)?;
+            table
+                .drain_build_store_spill_chunks(|chunk| buffer.append(chunk))
+                .map_err(hash_join_reclaim_error)?;
+            self.spill
+                .append_build_buffer(buffer)
+                .map_err(hash_join_reclaim_error)?;
+        }
+        let partition_count = self
+            .spill
+            .seal_build_partitions()
+            .map_err(hash_join_reclaim_error)?;
+        self.set_external_mode(JoinExternalModeConfig {
+            radix_bits: radix_bits as u8,
+            build_partitions: JoinPartitionSet { partition_count },
+            probe_partitions: ProbeSpillSet::default(),
+        })
+        .map_err(hash_join_reclaim_error)?;
+        self.completion.mark_complete();
+        self.disable_build_reclaim();
+        Ok(ReclaimStats::new(target_bytes, before, before))
     }
 
     #[inline]
@@ -129,8 +294,527 @@ impl JoinBuildHandle {
     }
 }
 
+fn hash_join_reclaim_error(err: paro_common::error::ParoError) -> MemoryError {
+    MemoryError::reclaim_failed(format!("hash join build spill reclaim failed: {err}"))
+}
+
+#[derive(Debug)]
+pub struct HashJoinBuildSpillReclaimer {
+    name: String,
+    handle: Arc<JoinBuildHandle>,
+    memory: MemoryAccountingContext,
+    query_memory_cap: usize,
+}
+
+impl HashJoinBuildSpillReclaimer {
+    pub fn new(
+        handle: Arc<JoinBuildHandle>,
+        memory: MemoryAccountingContext,
+        query_memory_cap: usize,
+    ) -> Self {
+        Self {
+            name: Self::name_for(handle.as_ref()),
+            handle,
+            memory,
+            query_memory_cap,
+        }
+    }
+
+    pub fn name_for(handle: &JoinBuildHandle) -> String {
+        format!("hash_join_build_spill:{}", handle.metadata().id.index())
+    }
+}
+
+impl Reclaimer for HashJoinBuildSpillReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        if !self.handle.build_reclaim_enabled()
+            || self.handle.completion.is_complete()
+            || self.handle.is_external()
+        {
+            return 0;
+        }
+        self.handle
+            .table()
+            .map_or(0, |table| table.build_rows_size_in_bytes())
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> MemoryResult<ReclaimStats> {
+        if !self.handle.build_reclaim_enabled() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        self.handle.spill_build_for_reclaim(
+            target_bytes,
+            self.query_memory_cap,
+            self.memory.clone(),
+        )
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::Repartition
+    }
+}
+
+#[derive(Debug)]
+pub struct HashJoinLocalBuildSpillReclaimer {
+    name: String,
+    handle: Arc<JoinBuildHandle>,
+    table: Arc<JoinHashTable>,
+    build_spill: Arc<Mutex<Option<JoinBuildSpillBuffer>>>,
+    memory: MemoryAccountingContext,
+    query_memory_cap: usize,
+}
+
+impl HashJoinLocalBuildSpillReclaimer {
+    pub(crate) fn new(
+        handle: Arc<JoinBuildHandle>,
+        local_id: u64,
+        table: Arc<JoinHashTable>,
+        build_spill: Arc<Mutex<Option<JoinBuildSpillBuffer>>>,
+        memory: MemoryAccountingContext,
+        query_memory_cap: usize,
+    ) -> Self {
+        Self {
+            name: Self::name_for(&handle, local_id),
+            handle,
+            table,
+            build_spill,
+            memory,
+            query_memory_cap,
+        }
+    }
+
+    pub fn next_local_id() -> u64 {
+        NEXT_HASH_JOIN_LOCAL_BUILD_RECLAIMER_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn name_for(handle: &JoinBuildHandle, local_id: u64) -> String {
+        format!(
+            "hash_join_local_build_spill:{}:{}",
+            handle.metadata().id.index(),
+            local_id
+        )
+    }
+}
+
+impl Reclaimer for HashJoinLocalBuildSpillReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        if self.handle.completion.is_complete() || self.handle.is_external() {
+            return 0;
+        }
+        self.table.try_build_rows_size_in_bytes().unwrap_or(0)
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> MemoryResult<ReclaimStats> {
+        if target_bytes == 0 || self.handle.completion.is_complete() || self.handle.is_external() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let Some(before) = self.table.try_build_rows_size_in_bytes() else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        if before == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+
+        let radix_bits = self
+            .handle
+            .build_spill_radix_bits(before, self.query_memory_cap);
+        let mut build_spill = self.build_spill.lock();
+        if build_spill.is_none() {
+            *build_spill = Some(
+                JoinBuildSpillBuffer::new(
+                    self.table.buffer_pool().clone(),
+                    radix_bits,
+                    self.table.hash_column_index(),
+                    self.table.layout().types().to_vec(),
+                    self.memory.clone(),
+                )
+                .map_err(hash_join_reclaim_error)?,
+            );
+        }
+        let spill = build_spill
+            .as_mut()
+            .expect("hash join local build spill initialized above");
+        let spill_bytes_before = spill.size_in_bytes();
+        let Some(drained_bytes) = self
+            .table
+            .try_drain_build_store_spill_chunks(|chunk| spill.append(chunk))
+            .map_err(hash_join_reclaim_error)?
+        else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        if drained_bytes == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let spilled_bytes = spill.size_in_bytes().saturating_sub(spill_bytes_before);
+        Ok(ReclaimStats::new(
+            target_bytes,
+            drained_bytes,
+            spilled_bytes,
+        ))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinRuntimeFilterSketch {
+    pub row_count: u64,
+    pub keys: Box<[JoinRuntimeFilterKeySketch]>,
+}
+
+impl JoinRuntimeFilterSketch {
+    pub fn empty(key_types: &[LogicalType]) -> Self {
+        Self {
+            row_count: 0,
+            keys: key_types
+                .iter()
+                .cloned()
+                .map(JoinRuntimeFilterKeySketch::new)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    pub fn add_key_chunk(
+        &mut self,
+        keys: &Chunk,
+        selection: &SelectionVector,
+        selected_count: usize,
+    ) -> Result<()> {
+        if keys.column_count() != self.keys.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter key count mismatch: sketch={}, chunk={}",
+                self.keys.len(),
+                keys.column_count()
+            )));
+        }
+        if selected_count > selection.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter selected count exceeds selection length: selected={selected_count}, selection={}",
+                selection.len()
+            )));
+        }
+        self.row_count += selected_count as u64;
+        let selected_rows = selection.as_slice();
+        for selected in selected_rows.iter().take(selected_count) {
+            let row_idx = *selected as usize;
+            for (key_idx, key) in self.keys.iter_mut().enumerate() {
+                let vector = keys.column(key_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter key column missing")
+                })?;
+                key.add_vector_value(vector, row_idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        if self.keys.len() != other.keys.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter sketch merge key count mismatch: left={}, right={}",
+                self.keys.len(),
+                other.keys.len()
+            )));
+        }
+        self.row_count += other.row_count;
+        for (left, right) in self.keys.iter_mut().zip(other.keys.iter()) {
+            left.merge(right)?;
+        }
+        Ok(())
+    }
+
+    fn predicate_for_column(
+        &self,
+        build_key_index: usize,
+        probe_column_id: ColumnId,
+    ) -> Option<PredicateTree> {
+        self.keys
+            .get(build_key_index)
+            .and_then(|key| key.predicate_for_column(probe_column_id))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinRuntimeFilterKeySketch {
+    pub logical_type: LogicalType,
+    pub non_null_count: u64,
+    pub has_null: bool,
+    comparable: bool,
+    pub min: Option<Value>,
+    pub max: Option<Value>,
+}
+
+impl JoinRuntimeFilterKeySketch {
+    fn new(logical_type: LogicalType) -> Self {
+        Self {
+            logical_type,
+            non_null_count: 0,
+            has_null: false,
+            comparable: true,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn add_vector_value(&mut self, vector: &Vector, row_idx: usize) -> Result<()> {
+        if vector.logical_type() != &self.logical_type {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter key type mismatch: sketch={}, vector={}",
+                self.logical_type,
+                vector.logical_type()
+            )));
+        }
+        if vector.is_null(row_idx) {
+            self.has_null = true;
+            return Ok(());
+        }
+        self.non_null_count += 1;
+        match &self.logical_type {
+            LogicalType::Boolean => {
+                self.add_value(Value::Boolean(vector.get_bool(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter boolean value missing"),
+                )?))
+            }
+            LogicalType::TinyInt => {
+                self.add_value(Value::TinyInt(vector.get_i8(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter tinyint value missing")
+                })?))
+            }
+            LogicalType::SmallInt => {
+                self.add_value(Value::SmallInt(vector.get_i16(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter smallint value missing"),
+                )?))
+            }
+            LogicalType::Integer => {
+                self.add_value(Value::Integer(vector.get_i32(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter integer value missing"),
+                )?))
+            }
+            LogicalType::BigInt => {
+                self.add_value(Value::BigInt(vector.get_i64(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter bigint value missing")
+                })?))
+            }
+            LogicalType::HugeInt => {
+                self.add_value(Value::HugeInt(vector.get_i128(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter hugeint value missing"),
+                )?))
+            }
+            LogicalType::UTinyInt => {
+                self.add_value(Value::UTinyInt(vector.get_u8(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter utinyint value missing"),
+                )?))
+            }
+            LogicalType::USmallInt => {
+                self.add_value(Value::USmallInt(vector.get_u16(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter usmallint value missing"),
+                )?))
+            }
+            LogicalType::UInteger => {
+                self.add_value(Value::UInteger(vector.get_u32(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter uinteger value missing"),
+                )?))
+            }
+            LogicalType::UBigInt => {
+                self.add_value(Value::UBigInt(vector.get_u64(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter ubigint value missing"),
+                )?))
+            }
+            LogicalType::UHugeInt => {
+                self.add_value(Value::UHugeInt(vector.get_u128(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter uhugeint value missing"),
+                )?))
+            }
+            LogicalType::Uuid => {
+                self.add_value(Value::Uuid(vector.get_u128(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter uuid value missing")
+                })?))
+            }
+            LogicalType::Float => {
+                self.add_value(Value::Float(vector.get_f32(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter float value missing")
+                })?))
+            }
+            LogicalType::Double => {
+                self.add_value(Value::Double(vector.get_f64(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter double value missing")
+                })?))
+            }
+            LogicalType::Decimal { precision, scale } => {
+                let value = if *precision <= 18 {
+                    vector.get_i64(row_idx).ok_or_else(|| {
+                        paro_error::internal("hash join runtime filter decimal value missing")
+                    })? as i128
+                } else {
+                    vector.get_i128(row_idx).ok_or_else(|| {
+                        paro_error::internal("hash join runtime filter decimal value missing")
+                    })?
+                };
+                self.add_value(Value::Decimal(value, *precision, *scale));
+            }
+            LogicalType::Date => {
+                self.add_value(Value::Date(vector.get_i32(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter date value missing")
+                })?))
+            }
+            LogicalType::Timestamp => {
+                self.add_value(Value::Timestamp(vector.get_i64(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter timestamp value missing"),
+                )?))
+            }
+            LogicalType::TimestampTz => {
+                self.add_value(Value::TimestampTz(vector.get_i64(row_idx).ok_or_else(
+                    || paro_error::internal("hash join runtime filter timestamptz value missing"),
+                )?))
+            }
+            LogicalType::Time => {
+                self.add_value(Value::Time(vector.get_i64(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter time value missing")
+                })?))
+            }
+            LogicalType::Varchar
+            | LogicalType::VarcharCollation(_)
+            | LogicalType::TsVector
+            | LogicalType::TsQuery
+            | LogicalType::Json
+            | LogicalType::Jsonb => {
+                let value = vector.get_string(row_idx).ok_or_else(|| {
+                    paro_error::internal("hash join runtime filter string value missing")
+                })?;
+                self.add_string_value(value);
+            }
+            _ => {
+                self.comparable = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_value(&mut self, value: Value) {
+        Self::update_extreme(&mut self.min, &value, &mut self.comparable, true);
+        if self.comparable {
+            Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
+        }
+    }
+
+    fn add_string_value(&mut self, value: &str) {
+        Self::update_string_extreme(&mut self.min, value, &mut self.comparable, true);
+        if self.comparable {
+            Self::update_string_extreme(&mut self.max, value, &mut self.comparable, false);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        if self.logical_type != other.logical_type {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter key sketch merge type mismatch: left={}, right={}",
+                self.logical_type, other.logical_type
+            )));
+        }
+        self.has_null |= other.has_null;
+        self.non_null_count += other.non_null_count;
+        if !other.comparable {
+            self.comparable = false;
+            return Ok(());
+        }
+        if let Some(min) = other.min.as_ref() {
+            Self::update_extreme(&mut self.min, min, &mut self.comparable, true);
+        }
+        if self.comparable {
+            if let Some(max) = other.max.as_ref() {
+                Self::update_extreme(&mut self.max, max, &mut self.comparable, false);
+            }
+        }
+        Ok(())
+    }
+
+    fn update_extreme(
+        slot: &mut Option<Value>,
+        value: &Value,
+        comparable: &mut bool,
+        is_min: bool,
+    ) {
+        let Some(current) = slot.as_ref() else {
+            *slot = Some(value.clone());
+            return;
+        };
+        let Some(ordering) = value.partial_cmp(current) else {
+            *comparable = false;
+            return;
+        };
+        let should_replace = if is_min {
+            ordering == std::cmp::Ordering::Less
+        } else {
+            ordering == std::cmp::Ordering::Greater
+        };
+        if should_replace {
+            *slot = Some(value.clone());
+        }
+    }
+
+    fn update_string_extreme(
+        slot: &mut Option<Value>,
+        value: &str,
+        comparable: &mut bool,
+        is_min: bool,
+    ) {
+        let Some(current) = slot.as_ref() else {
+            *slot = Some(Value::Varchar(value.to_owned()));
+            return;
+        };
+        let Value::Varchar(current) = current else {
+            *comparable = false;
+            return;
+        };
+        let should_replace = if is_min {
+            value < current.as_str()
+        } else {
+            value > current.as_str()
+        };
+        if should_replace {
+            *slot = Some(Value::Varchar(value.to_owned()));
+        }
+    }
+
+    fn predicate_for_column(&self, column_id: ColumnId) -> Option<PredicateTree> {
+        if self.non_null_count == 0 || !self.comparable {
+            return None;
+        }
+        let min = self.min.clone()?;
+        let max = self.max.clone()?;
+        min.partial_cmp(&max)?;
+        let predicate = if min == max {
+            Predicate::Eq {
+                column_id,
+                value: min,
+            }
+        } else {
+            Predicate::Range {
+                column_id,
+                lower: min,
+                upper: max,
+            }
+        };
+        Some(PredicateTree::leaf(predicate))
+    }
+}
+
 impl RuntimeCleanup for JoinBuildHandle {
     fn cleanup(&self, ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
+        self.disable_build_reclaim();
+        ctx.query
+            .memory
+            .unregister_reclaimer_by_name(&HashJoinBuildSpillReclaimer::name_for(self));
         self.spill.cleanup(ctx, reason)?;
         self.cleanup.mark(reason);
         Ok(())
@@ -176,15 +860,159 @@ pub struct JoinSpillState {
     probe_partition_count: AtomicUsize,
     replay_partition: AtomicUsize,
     sealed: AtomicBool,
+    build_rows: AtomicU64,
+    build_bytes: AtomicU64,
+    probe_rows: AtomicU64,
+    probe_bytes: AtomicU64,
+    max_partition_bytes: AtomicU64,
+    spill_latency_us: AtomicU64,
+    repartition_depth: AtomicUsize,
     inner: Mutex<JoinSpillInner>,
     cleanup: CleanupState,
+}
+
+#[derive(Debug)]
+pub struct JoinBuildSpillBuffer {
+    builder: RadixPartitionedRowsBuilder,
+    rows: u64,
+    bytes: u64,
+    latency_us: u64,
+}
+
+#[derive(Debug)]
+pub struct JoinProbeSpillBuffer {
+    builder: RadixPartitionedRowsBuilder,
+    rows: u64,
+    bytes: u64,
+    latency_us: u64,
+}
+
+impl JoinBuildSpillBuffer {
+    pub fn new(
+        buffer_pool: Arc<BufferPool>,
+        radix_bits: usize,
+        hash_col_idx: usize,
+        types: Vec<LogicalType>,
+        memory: MemoryAccountingContext,
+    ) -> Result<Self> {
+        Ok(Self {
+            builder: RadixPartitionedRowsBuilder::new_with_memory(
+                buffer_pool,
+                Arc::new(RowLayout::from_types(
+                    types,
+                    RowValidityType::CanHaveNullValues,
+                )),
+                MemoryTag::HashTable,
+                radix_bits,
+                hash_col_idx,
+                memory,
+            )?,
+            rows: 0,
+            bytes: 0,
+            latency_us: 0,
+        })
+    }
+
+    pub fn append(&mut self, chunk: &Chunk) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let started_at = Instant::now();
+        let before_bytes = self.builder.size_in_bytes();
+        self.builder.append(chunk)?;
+        let after_bytes = self.builder.size_in_bytes();
+        self.rows = self.rows.saturating_add(chunk.size() as u64);
+        self.bytes = self
+            .bytes
+            .saturating_add(after_bytes.saturating_sub(before_bytes) as u64);
+        self.latency_us = self
+            .latency_us
+            .saturating_add(started_at.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    pub fn size_in_bytes(&self) -> usize {
+        self.builder.size_in_bytes()
+    }
+
+    fn partition_count(&self) -> usize {
+        self.builder.partition_count()
+    }
+
+    fn into_parts(self) -> (RadixPartitionedRowsBuilder, u64, u64, u64) {
+        (self.builder, self.rows, self.bytes, self.latency_us)
+    }
+}
+
+impl JoinProbeSpillBuffer {
+    pub fn new(
+        buffer_pool: Arc<BufferPool>,
+        radix_bits: usize,
+        hash_col_idx: usize,
+        types: Vec<LogicalType>,
+        memory: MemoryAccountingContext,
+    ) -> Result<Self> {
+        Ok(Self {
+            builder: RadixPartitionedRowsBuilder::new_with_memory(
+                buffer_pool,
+                Arc::new(RowLayout::from_types(
+                    types,
+                    RowValidityType::CanHaveNullValues,
+                )),
+                MemoryTag::HashTable,
+                radix_bits,
+                hash_col_idx,
+                memory,
+            )?,
+            rows: 0,
+            bytes: 0,
+            latency_us: 0,
+        })
+    }
+
+    pub fn append(&mut self, chunk: &Chunk) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let started_at = Instant::now();
+        let before_bytes = self.builder.size_in_bytes();
+        self.builder.append(chunk)?;
+        let after_bytes = self.builder.size_in_bytes();
+        self.rows = self.rows.saturating_add(chunk.size() as u64);
+        self.bytes = self
+            .bytes
+            .saturating_add(after_bytes.saturating_sub(before_bytes) as u64);
+        self.latency_us = self
+            .latency_us
+            .saturating_add(started_at.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    fn partition_count(&self) -> usize {
+        self.builder.partition_count()
+    }
+
+    fn into_parts(self) -> (RadixPartitionedRowsBuilder, u64, u64, u64) {
+        (self.builder, self.rows, self.bytes, self.latency_us)
+    }
 }
 
 impl JoinSpillState {
     pub fn install_build_partitions(&self, build: RadixPartitionedRows) -> Result<()> {
         let partition_count = build.partition_count();
+        let build_rows = build.count();
+        let build_bytes = build.size_in_bytes() as u64;
+        let max_partition_bytes = max_partition_size(&build) as u64;
         let mut inner = self.inner.lock();
-        if inner.build_partitions.is_some() {
+        if inner.build_builder.is_some() || inner.build_partitions.is_some() {
             return Err(paro_error::internal(
                 "hash join build spill partitions already installed",
             ));
@@ -193,18 +1021,50 @@ impl JoinSpillState {
         inner.build_partitions = Some(build);
         self.build_partition_count
             .store(partition_count, Ordering::Release);
+        self.build_rows.store(build_rows, Ordering::Release);
+        self.build_bytes.store(build_bytes, Ordering::Release);
+        self.update_max_partition_bytes(max_partition_bytes);
         Ok(())
     }
 
-    pub fn append_probe_chunk(
-        &self,
-        buffer_pool: Arc<BufferPool>,
-        radix_bits: usize,
-        hash_col_idx: usize,
-        chunk: &Chunk,
-        memory: MemoryAccountingContext,
-    ) -> Result<()> {
-        if chunk.is_empty() {
+    pub fn append_build_buffer(&self, buffer: JoinBuildSpillBuffer) -> Result<()> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        if self.is_sealed() {
+            return Err(paro_error::internal(
+                "cannot append hash join build spill after replay partitions are sealed",
+            ));
+        }
+
+        let partition_count = buffer.partition_count();
+        let (builder, rows, bytes, latency_us) = buffer.into_parts();
+        let incoming_radix_bits = builder.radix_bits();
+        let mut inner = self.inner.lock();
+        if inner.build_partitions.is_some() {
+            return Err(paro_error::internal(
+                "cannot append hash join build spill after build partitions are sealed",
+            ));
+        }
+        let (partition_count, radix_bits) = if let Some(existing) = inner.build_builder.as_mut() {
+            existing.try_absorb(builder)?;
+            (existing.partition_count(), existing.radix_bits())
+        } else {
+            inner.build_builder = Some(builder);
+            (partition_count, incoming_radix_bits)
+        };
+        inner.radix_bits = radix_bits;
+        self.build_rows.fetch_add(rows, Ordering::Relaxed);
+        self.build_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.spill_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
+        self.build_partition_count
+            .store(partition_count, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn append_probe_buffer(&self, buffer: JoinProbeSpillBuffer) -> Result<()> {
+        if buffer.is_empty() {
             return Ok(());
         }
         if self.is_sealed() {
@@ -212,27 +1072,23 @@ impl JoinSpillState {
                 "cannot append hash join probe spill after replay partitions are sealed",
             ));
         }
+
+        let partition_count = buffer.partition_count();
+        let (builder, rows, bytes, latency_us) = buffer.into_parts();
         let mut inner = self.inner.lock();
-        if inner.probe_builder.is_none() {
-            inner.probe_builder = Some(RadixPartitionedRowsBuilder::new_with_memory(
-                buffer_pool,
-                Arc::new(RowLayout::from_types(
-                    chunk.types(),
-                    RowValidityType::CanHaveNullValues,
-                )),
-                MemoryTag::HashTable,
-                radix_bits,
-                hash_col_idx,
-                memory,
-            )?);
-        }
-        let builder = inner
-            .probe_builder
-            .as_mut()
-            .expect("probe spill builder was initialized");
-        builder.append(chunk)?;
+        let partition_count = if let Some(existing) = inner.probe_builder.as_mut() {
+            existing.try_absorb(builder)?;
+            existing.partition_count()
+        } else {
+            inner.probe_builder = Some(builder);
+            partition_count
+        };
+        self.probe_rows.fetch_add(rows, Ordering::Relaxed);
+        self.probe_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.spill_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
         self.probe_partition_count
-            .store(builder.partition_count(), Ordering::Release);
+            .store(partition_count, Ordering::Release);
         Ok(())
     }
 
@@ -256,17 +1112,16 @@ impl JoinSpillState {
                     )
                 })?
                 .partition_count();
-            let Some(probe_len) = inner
+            if let Some(probe_len) = inner
                 .probe_partitions
                 .as_ref()
                 .map(RadixPartitionedRows::partition_count)
-            else {
-                return Ok(None);
-            };
-            if build_len != probe_len {
-                return Err(paro_error::internal(format!(
-                    "hash join spill partition count mismatch during replay: build={build_len}, probe={probe_len}"
-                )));
+            {
+                if build_len != probe_len {
+                    return Err(paro_error::internal(format!(
+                        "hash join spill partition count mismatch during replay: build={build_len}, probe={probe_len}"
+                    )));
+                }
             }
             if partition_idx >= build_len {
                 return Ok(None);
@@ -280,15 +1135,15 @@ impl JoinSpillState {
             let probe_rows = inner
                 .probe_partitions
                 .as_mut()
-                .expect("probe partitions checked above")
-                .take_partition(partition_idx);
-            if probe_rows.is_empty() {
+                .map(|partitions| partitions.take_partition(partition_idx))
+                .filter(|rows| !rows.is_empty());
+            if build_rows.is_empty() && probe_rows.is_none() {
                 continue;
             }
             return Ok(Some(JoinReplayPartition {
                 partition_idx,
-                build_rows,
-                probe_rows,
+                build_rows: build_rows.into_reclaimable(),
+                probe_rows: probe_rows.map(RowStore::into_reclaimable),
             }));
         }
     }
@@ -298,6 +1153,20 @@ impl JoinSpillState {
             self.build_partition_count.load(Ordering::Acquire),
             self.probe_partition_count.load(Ordering::Acquire),
         )
+    }
+
+    pub fn has_build_spill(&self) -> bool {
+        self.build_rows.load(Ordering::Acquire) > 0
+            || self.build_partition_count.load(Ordering::Acquire) > 0
+    }
+
+    pub fn seal_build_partitions(&self) -> Result<usize> {
+        let mut inner = self.inner.lock();
+        self.seal_build_partitions_locked(&mut inner);
+        Ok(inner
+            .build_partitions
+            .as_ref()
+            .map_or(0, RadixPartitionedRows::partition_count))
     }
 
     pub fn seal(&self) {
@@ -312,11 +1181,24 @@ impl JoinSpillState {
         self.cleanup.status()
     }
 
+    pub fn stats(&self) -> JoinSpillStats {
+        JoinSpillStats {
+            build_rows: self.build_rows.load(Ordering::Acquire),
+            build_bytes: self.build_bytes.load(Ordering::Acquire),
+            probe_rows: self.probe_rows.load(Ordering::Acquire),
+            probe_bytes: self.probe_bytes.load(Ordering::Acquire),
+            max_partition_bytes: self.max_partition_bytes.load(Ordering::Acquire),
+            spill_latency_us: self.spill_latency_us.load(Ordering::Acquire),
+            repartition_depth: self.repartition_depth.load(Ordering::Acquire),
+        }
+    }
+
     fn seal_probe_partitions(&self) -> Result<()> {
         if self.is_sealed() {
             return Ok(());
         }
         let mut inner = self.inner.lock();
+        self.seal_build_partitions_locked(&mut inner);
         if inner.probe_partitions.is_none() {
             inner.probe_partitions = inner
                 .probe_builder
@@ -333,11 +1215,88 @@ impl JoinSpillState {
                     )));
                 }
             }
-            self.probe_partition_count
-                .store(probe_partitions.partition_count(), Ordering::Release);
+            self.repartition_oversized_partitions(&mut inner)?;
+            self.probe_partition_count.store(
+                inner
+                    .probe_partitions
+                    .as_ref()
+                    .map_or(0, |p| p.partition_count()),
+                Ordering::Release,
+            );
         }
         self.sealed.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn seal_build_partitions_locked(&self, inner: &mut JoinSpillInner) {
+        if inner.build_partitions.is_none() {
+            inner.build_partitions = inner
+                .build_builder
+                .take()
+                .map(RadixPartitionedRowsBuilder::seal);
+        }
+        if let Some(build_partitions) = inner.build_partitions.as_ref() {
+            let partition_count = build_partitions.partition_count();
+            self.build_partition_count
+                .store(partition_count, Ordering::Release);
+            self.build_rows
+                .store(build_partitions.count(), Ordering::Release);
+            self.build_bytes
+                .store(build_partitions.size_in_bytes() as u64, Ordering::Release);
+            self.update_max_partition_bytes(max_partition_size(build_partitions) as u64);
+        }
+    }
+
+    fn repartition_oversized_partitions(&self, inner: &mut JoinSpillInner) -> Result<()> {
+        loop {
+            let (Some(build), Some(probe)) = (
+                inner.build_partitions.as_ref(),
+                inner.probe_partitions.as_ref(),
+            ) else {
+                return Ok(());
+            };
+            let max_bytes = max_partition_size(build).max(max_partition_size(probe));
+            self.update_max_partition_bytes(max_bytes as u64);
+            if max_bytes <= HASH_JOIN_SPILL_TARGET_PARTITION_BYTES
+                || inner.radix_bits >= HASH_JOIN_SPILL_MAX_RADIX_BITS
+            {
+                return Ok(());
+            }
+            let next_bits = inner
+                .radix_bits
+                .saturating_add(1)
+                .min(HASH_JOIN_SPILL_MAX_RADIX_BITS);
+            let build = inner
+                .build_partitions
+                .take()
+                .expect("build partitions checked above")
+                .into_repartitioned(next_bits)?;
+            let probe = inner
+                .probe_partitions
+                .take()
+                .expect("probe partitions checked above")
+                .into_repartitioned(next_bits)?;
+            inner.radix_bits = next_bits;
+            self.repartition_depth.fetch_add(1, Ordering::Relaxed);
+            self.build_partition_count
+                .store(build.partition_count(), Ordering::Release);
+            self.probe_partition_count
+                .store(probe.partition_count(), Ordering::Release);
+            self.build_bytes
+                .store(build.size_in_bytes() as u64, Ordering::Release);
+            self.probe_bytes
+                .store(probe.size_in_bytes() as u64, Ordering::Release);
+            inner.build_partitions = Some(build);
+            inner.probe_partitions = Some(probe);
+        }
+    }
+
+    fn update_max_partition_bytes(&self, value: u64) {
+        let _ =
+            self.max_partition_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.max(value))
+                });
     }
 }
 
@@ -349,6 +1308,13 @@ impl RuntimeCleanup for JoinSpillState {
         self.probe_partition_count.store(0, Ordering::Release);
         self.replay_partition.store(0, Ordering::Release);
         self.sealed.store(false, Ordering::Release);
+        self.build_rows.store(0, Ordering::Release);
+        self.build_bytes.store(0, Ordering::Release);
+        self.probe_rows.store(0, Ordering::Release);
+        self.probe_bytes.store(0, Ordering::Release);
+        self.max_partition_bytes.store(0, Ordering::Release);
+        self.spill_latency_us.store(0, Ordering::Release);
+        self.repartition_depth.store(0, Ordering::Release);
         self.cleanup.mark(reason);
         Ok(())
     }
@@ -357,6 +1323,7 @@ impl RuntimeCleanup for JoinSpillState {
 #[derive(Debug, Default)]
 struct JoinSpillInner {
     radix_bits: usize,
+    build_builder: Option<RadixPartitionedRowsBuilder>,
     build_partitions: Option<RadixPartitionedRows>,
     probe_builder: Option<RadixPartitionedRowsBuilder>,
     probe_partitions: Option<RadixPartitionedRows>,
@@ -365,8 +1332,47 @@ struct JoinSpillInner {
 #[derive(Debug)]
 pub struct JoinReplayPartition {
     pub partition_idx: usize,
-    pub build_rows: RowStore,
-    pub probe_rows: RowStore,
+    pub build_rows: ReclaimableRowStore,
+    pub probe_rows: Option<ReclaimableRowStore>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JoinSpillStats {
+    pub build_rows: u64,
+    pub build_bytes: u64,
+    pub probe_rows: u64,
+    pub probe_bytes: u64,
+    pub max_partition_bytes: u64,
+    pub spill_latency_us: u64,
+    pub repartition_depth: usize,
+}
+
+pub fn choose_hash_join_radix_bits(build_bytes: usize, query_memory_cap: usize) -> usize {
+    let target = query_memory_cap
+        .checked_div(4)
+        .unwrap_or(HASH_JOIN_SPILL_TARGET_PARTITION_BYTES)
+        .clamp(
+            HASH_JOIN_SPILL_MIN_TARGET_PARTITION_BYTES,
+            HASH_JOIN_SPILL_TARGET_PARTITION_BYTES,
+        );
+    let desired_partitions = build_bytes.div_ceil(target).max(2);
+    desired_partitions
+        .next_power_of_two()
+        .trailing_zeros()
+        .try_into()
+        .unwrap_or(HASH_JOIN_SPILL_MAX_RADIX_BITS)
+        .clamp(
+            HASH_JOIN_SPILL_MIN_RADIX_BITS,
+            HASH_JOIN_SPILL_MAX_RADIX_BITS,
+        )
+}
+
+fn max_partition_size(rows: &RadixPartitionedRows) -> usize {
+    rows.partitions()
+        .iter()
+        .map(RowStore::size_in_bytes)
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default)]
@@ -395,12 +1401,18 @@ mod tests {
     use std::sync::Arc;
 
     use paro_common::chunk::Chunk;
+    use paro_common::memory::MemoryAccountingClass;
+    use paro_common::runtime_value::Value;
     use paro_common::test_utils::{
-        test_allocator, test_chunk_from_vectors, test_vector_with_capacity,
+        test_allocator, test_chunk_from_vectors, test_i32_vector_with_allocator,
+        test_vector_with_capacity,
     };
     use paro_common::types::LogicalType;
     use paro_context::test_support::TestStatementContextBuilder;
+    use paro_planner::expression::{Expression, ReferenceExpression};
+    use paro_planner::operator::join::JoinComparisonType;
     use paro_storage::buffer::{BufferPool, MemoryTag};
+    use paro_storage::index::{Predicate, PredicateTree};
     use paro_storage::row::RowValidityType;
 
     use crate::explain::profiler::OperatorProfiler;
@@ -456,19 +1468,23 @@ mod tests {
     }
 
     fn radix_input() -> Chunk {
-        let mut hashes = test_vector_with_capacity(LogicalType::UBigInt, 4);
-        hashes.set_u64(0, 0);
-        hashes.set_u64(1, 1 << 63);
-        hashes.set_u64(2, 0);
-        hashes.set_u64(3, 1 << 63);
-        hashes.set_count(4);
+        radix_input_with_rows(&[0, 1 << 63, 0, 1 << 63], &[10, 20, 30, 40])
+    }
 
-        let mut payload = test_vector_with_capacity(LogicalType::Integer, 4);
-        payload.set_i32(0, 10);
-        payload.set_i32(1, 20);
-        payload.set_i32(2, 30);
-        payload.set_i32(3, 40);
-        payload.set_count(4);
+    fn radix_input_with_rows(hashes_input: &[u64], payload_input: &[i32]) -> Chunk {
+        assert_eq!(hashes_input.len(), payload_input.len());
+        let count = hashes_input.len();
+        let mut hashes = test_vector_with_capacity(LogicalType::UBigInt, count);
+        for (idx, hash) in hashes_input.iter().copied().enumerate() {
+            hashes.set_u64(idx, hash);
+        }
+        hashes.set_count(count);
+
+        let mut payload = test_vector_with_capacity(LogicalType::Integer, count);
+        for (idx, value) in payload_input.iter().copied().enumerate() {
+            payload.set_i32(idx, value);
+        }
+        payload.set_count(count);
 
         test_chunk_from_vectors(vec![hashes, payload])
     }
@@ -525,25 +1541,237 @@ mod tests {
     }
 
     #[test]
+    fn join_build_finalize_publishes_min_max_runtime_filter() {
+        let allocator = test_allocator();
+        let handle = JoinBuildHandle::new(metadata());
+        let table = handle.initialize_table(
+            Arc::new(BufferPool::new(16 * 1024 * 1024)),
+            allocator.clone(),
+            vec![JoinCondition::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                JoinComparisonType::Equal,
+            )],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        );
+        let keys = Chunk::from_arc_vectors(
+            vec![Arc::new(test_i32_vector_with_allocator(
+                &[10, 20, 30],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(test_i32_vector_with_allocator(
+                &[100, 200, 300],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        table.build(&keys, &payload).expect("build hash table");
+        let selection = SelectionVector::try_incremental(3, allocator.clone()).expect("selection");
+        let mut sketch = JoinRuntimeFilterSketch::empty(&[LogicalType::Integer]);
+        sketch
+            .add_key_chunk(&keys, &selection, 3)
+            .expect("update runtime filter sketch");
+        handle
+            .merge_runtime_filter_sketch(Some(sketch))
+            .expect("merge runtime filter sketch");
+
+        handle.finalize_in_memory().expect("finalize build");
+
+        assert_eq!(
+            handle.runtime_filter_predicate(0, 7).expect("predicate"),
+            PredicateTree::leaf(Predicate::Range {
+                column_id: 7,
+                lower: Value::Integer(10),
+                upper: Value::Integer(30),
+            })
+        );
+    }
+
+    #[test]
+    fn hash_join_build_spill_reclaimer_externalizes_after_finish_enable() {
+        let allocator = test_allocator();
+        let handle = Arc::new(JoinBuildHandle::new(metadata()));
+        let memory = MemoryAccountingContext::detached(
+            paro_common::allocator::MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        );
+        let table = handle.initialize_table(
+            Arc::new(BufferPool::new(16 * 1024 * 1024)),
+            allocator.clone(),
+            vec![JoinCondition::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                JoinComparisonType::Equal,
+            )],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            memory.clone(),
+        );
+        let keys = Chunk::from_arc_vectors(
+            vec![Arc::new(test_i32_vector_with_allocator(
+                &[10, 20, 30, 40],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(test_i32_vector_with_allocator(
+                &[100, 200, 300, 400],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        table.build(&keys, &payload).expect("build hash table");
+        let reclaimer = HashJoinBuildSpillReclaimer::new(handle.clone(), memory, 16 * 1024 * 1024);
+
+        assert_eq!(reclaimer.reclaimable_bytes(), 0);
+        handle.enable_build_reclaim();
+        let before = table.build_rows_size_in_bytes();
+        assert!(before > 0);
+        assert_eq!(reclaimer.reclaimable_bytes(), before);
+
+        let stats = reclaimer.reclaim_sync(1).expect("reclaim hash join build");
+        assert_eq!(stats.requested_bytes, 1);
+        assert_eq!(stats.reclaimed_bytes, before);
+        assert_eq!(stats.spilled_bytes, before);
+        assert!(handle.is_external());
+        assert!(handle.completion.is_complete());
+        assert!(handle.runtime_filter_ready());
+        assert_eq!(table.build_rows_size_in_bytes(), 0);
+        assert_eq!(handle.spill.partition_counts().0, 2);
+        assert_eq!(reclaimer.reclaimable_bytes(), 0);
+    }
+
+    #[test]
+    fn hash_join_local_build_spill_reclaimer_buffers_unmerged_build_rows() {
+        let allocator = test_allocator();
+        let handle = Arc::new(JoinBuildHandle::new(metadata()));
+        let memory = MemoryAccountingContext::detached(
+            paro_common::allocator::MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        );
+        handle.initialize_table(
+            Arc::new(BufferPool::new(16 * 1024 * 1024)),
+            allocator.clone(),
+            vec![JoinCondition::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                JoinComparisonType::Equal,
+            )],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            memory.clone(),
+        );
+        let local_table = Arc::new(JoinHashTable::new_with_memory(
+            Arc::new(BufferPool::new(16 * 1024 * 1024)),
+            allocator.clone(),
+            vec![JoinCondition::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                JoinComparisonType::Equal,
+            )],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            JoinHashTableConfig::default(),
+            memory.clone(),
+        ));
+        let keys = Chunk::from_arc_vectors(
+            vec![Arc::new(test_i32_vector_with_allocator(
+                &[10, 20, 30, 40],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        let payload = Chunk::from_arc_vectors(
+            vec![Arc::new(test_i32_vector_with_allocator(
+                &[100, 200, 300, 400],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        local_table
+            .build(&keys, &payload)
+            .expect("build local hash table");
+        let build_spill = Arc::new(Mutex::new(None));
+        let reclaimer = HashJoinLocalBuildSpillReclaimer::new(
+            handle.clone(),
+            HashJoinLocalBuildSpillReclaimer::next_local_id(),
+            local_table.clone(),
+            build_spill.clone(),
+            memory.clone(),
+            16 * 1024 * 1024,
+        );
+
+        let before = local_table.build_rows_size_in_bytes();
+        assert!(before > 0);
+        assert_eq!(reclaimer.reclaimable_bytes(), before);
+        let stats = reclaimer
+            .reclaim_sync(1)
+            .expect("reclaim local hash join build");
+
+        assert_eq!(stats.requested_bytes, 1);
+        assert_eq!(stats.reclaimed_bytes, before);
+        assert!(stats.spilled_bytes > 0);
+        assert_eq!(local_table.build_rows_size_in_bytes(), 0);
+        assert!(!handle.is_external());
+        assert!(!handle.completion.is_complete());
+
+        let buffer = build_spill.lock().take().expect("local build spill buffer");
+        handle
+            .spill
+            .append_build_buffer(buffer)
+            .expect("append local build spill to handle");
+        assert!(handle.has_build_spill());
+        assert_eq!(handle.spill.partition_counts().0, 2);
+
+        handle
+            .spill_build_for_reclaim(usize::MAX, 16 * 1024 * 1024, memory)
+            .expect("finish external hash join from local spill");
+        assert!(handle.is_external());
+        assert!(handle.completion.is_complete());
+        assert_eq!(handle.spill.partition_counts().0, 2);
+    }
+
+    #[test]
     fn join_spill_cleanup_releases_partitions_and_resets_replay_state() {
         let spill = JoinSpillState::default();
         let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
         spill
             .install_build_partitions(partitioned_rows())
             .expect("install build partitions");
-        spill
-            .append_probe_chunk(
-                pool,
-                1,
-                0,
-                &radix_input(),
-                MemoryAccountingContext::detached(
-                    paro_common::allocator::MemoryTag::HashTable,
-                    paro_common::memory::MemoryAccountingClass::Revocable,
-                ),
-            )
+        let input = radix_input();
+        let mut probe_buffer = JoinProbeSpillBuffer::new(
+            pool,
+            1,
+            0,
+            input.types(),
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                paro_common::memory::MemoryAccountingClass::Revocable,
+            ),
+        )
+        .expect("probe spill buffer");
+        probe_buffer
+            .append(&input)
             .expect("append probe partition chunk");
+        spill
+            .append_probe_buffer(probe_buffer)
+            .expect("append probe partition buffer");
         assert_eq!(spill.partition_counts(), (2, 2));
+        let stats = spill.stats();
+        assert_eq!(stats.build_rows, 4);
+        assert_eq!(stats.probe_rows, 4);
+        assert!(stats.build_bytes > 0);
+        assert!(stats.probe_bytes > 0);
+        assert!(stats.max_partition_bytes > 0);
 
         let first_partition = spill
             .take_next_replay_partition()
@@ -569,5 +1797,169 @@ mod tests {
             .take_next_replay_partition()
             .expect("cleanup should leave replay in an empty state")
             .is_none());
+    }
+
+    #[test]
+    fn join_spill_replay_partitions_use_reclaiming_row_scanners() {
+        let spill = JoinSpillState::default();
+        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
+        spill
+            .install_build_partitions(partitioned_rows())
+            .expect("install build partitions");
+        let input = radix_input();
+        let mut probe_buffer = JoinProbeSpillBuffer::new(
+            pool,
+            1,
+            0,
+            input.types(),
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                paro_common::memory::MemoryAccountingClass::Revocable,
+            ),
+        )
+        .expect("probe spill buffer");
+        probe_buffer
+            .append(&input)
+            .expect("append probe partition chunk");
+        spill
+            .append_probe_buffer(probe_buffer)
+            .expect("append probe partition buffer");
+
+        let partition = spill
+            .take_next_replay_partition()
+            .expect("replay partition")
+            .expect("partition");
+        let mut build_cursor = partition.build_rows.into_reclaiming_scanner();
+        let mut probe_cursor = partition
+            .probe_rows
+            .expect("probe rows")
+            .into_reclaiming_scanner();
+        let expected_build_rows = build_cursor.count() as usize;
+        let expected_probe_rows = probe_cursor.count() as usize;
+        let mut chunk = Chunk::try_new(test_allocator()).expect("scan chunk");
+
+        let mut build_rows = 0usize;
+        loop {
+            let scanned = build_cursor.next_chunk(&mut chunk).expect("scan build");
+            if scanned == 0 {
+                break;
+            }
+            build_rows += scanned;
+        }
+        assert_eq!(build_rows, expected_build_rows);
+        assert!(build_rows > 0);
+
+        let mut probe_rows = 0usize;
+        loop {
+            let scanned = probe_cursor.next_chunk(&mut chunk).expect("scan probe");
+            if scanned == 0 {
+                break;
+            }
+            probe_rows += scanned;
+        }
+        assert_eq!(probe_rows, expected_probe_rows);
+        assert!(probe_rows > 0);
+    }
+
+    #[test]
+    fn join_spill_replay_preserves_build_partition_without_probe_rows() {
+        let spill = JoinSpillState::default();
+        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
+        spill
+            .install_build_partitions(partitioned_rows())
+            .expect("install build partitions");
+        let input = radix_input_with_rows(&[0], &[100]);
+        let mut probe_buffer = JoinProbeSpillBuffer::new(
+            pool,
+            1,
+            0,
+            input.types(),
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                paro_common::memory::MemoryAccountingClass::Revocable,
+            ),
+        )
+        .expect("probe spill buffer");
+        probe_buffer
+            .append(&input)
+            .expect("append one-sided probe partition chunk");
+        spill
+            .append_probe_buffer(probe_buffer)
+            .expect("append probe partition buffer");
+
+        let first = spill
+            .take_next_replay_partition()
+            .expect("first replay partition")
+            .expect("first partition");
+        assert_eq!(first.partition_idx, 0);
+        assert!(first.probe_rows.is_some());
+        let second = spill
+            .take_next_replay_partition()
+            .expect("second replay partition")
+            .expect("second partition");
+        assert_eq!(second.partition_idx, 1);
+        assert!(second.build_rows.count() > 0);
+        assert!(second.probe_rows.is_none());
+    }
+
+    #[test]
+    fn join_spill_replay_preserves_build_partitions_when_probe_never_spilled() {
+        let spill = JoinSpillState::default();
+        spill
+            .install_build_partitions(partitioned_rows())
+            .expect("install build partitions");
+
+        let first = spill
+            .take_next_replay_partition()
+            .expect("first replay partition")
+            .expect("first partition");
+        assert_eq!(first.partition_idx, 0);
+        assert!(first.build_rows.count() > 0);
+        assert!(first.probe_rows.is_none());
+    }
+
+    #[test]
+    fn join_probe_spill_buffers_batch_global_appends() {
+        let spill = JoinSpillState::default();
+        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
+        let memory = MemoryAccountingContext::detached(
+            paro_common::allocator::MemoryTag::HashTable,
+            paro_common::memory::MemoryAccountingClass::Revocable,
+        );
+        let input = radix_input();
+
+        let mut first =
+            JoinProbeSpillBuffer::new(pool.clone(), 1, 0, input.types(), memory.clone())
+                .expect("first probe spill buffer");
+        first.append(&input).expect("append first probe chunk");
+        let mut second = JoinProbeSpillBuffer::new(pool, 1, 0, input.types(), memory)
+            .expect("second probe spill buffer");
+        second.append(&input).expect("append second probe chunk");
+
+        spill
+            .append_probe_buffer(first)
+            .expect("append first probe buffer");
+        spill
+            .append_probe_buffer(second)
+            .expect("append second probe buffer");
+
+        assert_eq!(spill.partition_counts(), (0, 2));
+        let stats = spill.stats();
+        assert_eq!(stats.probe_rows, 8);
+        assert!(stats.probe_bytes > 0);
+    }
+
+    #[test]
+    fn hash_join_radix_bits_scale_with_build_bytes_and_query_cap() {
+        assert_eq!(choose_hash_join_radix_bits(0, 1024 * 1024), 1);
+        assert_eq!(
+            choose_hash_join_radix_bits(2 * 1024 * 1024, 4 * 1024 * 1024),
+            1
+        );
+        assert!(choose_hash_join_radix_bits(256 * 1024 * 1024, 16 * 1024 * 1024) >= 6);
+        assert_eq!(
+            choose_hash_join_radix_bits(usize::MAX / 2, usize::MAX / 2),
+            HASH_JOIN_SPILL_MAX_RADIX_BITS
+        );
     }
 }

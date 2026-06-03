@@ -96,23 +96,35 @@ impl NestedLoopJoinProbeTransformExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &TransformGlobal,
     ) -> Result<TransformLocal> {
         let left_condition_executors = self
             .conditions
             .iter()
-            .map(|c| ExpressionExecutor::new(&c.left))
+            .map(|c| {
+                ExpressionExecutor::with_expressions_for_session(
+                    std::slice::from_ref(&c.left),
+                    ctx.query.session.as_ref(),
+                )
+            })
             .collect();
         let right_condition_executors = self
             .conditions
             .iter()
-            .map(|c| ExpressionExecutor::new(&c.right))
+            .map(|c| {
+                ExpressionExecutor::with_expressions_for_session(
+                    std::slice::from_ref(&c.right),
+                    ctx.query.session.as_ref(),
+                )
+            })
             .collect();
-        let arbitrary_condition_executor = self
-            .arbitrary_condition
-            .as_ref()
-            .map(ExpressionExecutor::new);
+        let arbitrary_condition_executor = self.arbitrary_condition.as_ref().map(|expr| {
+            ExpressionExecutor::with_expressions_for_session(
+                std::slice::from_ref(expr),
+                ctx.query.session.as_ref(),
+            )
+        });
         Ok(TransformLocal::NestedLoopJoinProbe(
             NestedLoopJoinProbeTransformLocal {
                 left_condition_executors,
@@ -668,7 +680,11 @@ enum RowMatch {
 
 // ─── Comparison with proper NULL semantics ───────────────────────────────────
 
-fn compare_with_nulls(comparison: JoinComparisonType, left: &Value, right: &Value) -> Option<bool> {
+pub(crate) fn compare_with_nulls(
+    comparison: JoinComparisonType,
+    left: &Value,
+    right: &Value,
+) -> Option<bool> {
     use std::cmp::Ordering;
 
     match comparison {

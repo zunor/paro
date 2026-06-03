@@ -1,0 +1,5 @@
+name = "operator-runtime-hash-join"
+description = "HASH-JOIN typed hash join kernel and vectorized probe suite"
+
+[[include]]
+workload = "operator_runtime_hash_join"

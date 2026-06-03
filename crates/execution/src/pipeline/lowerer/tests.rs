@@ -243,6 +243,47 @@ fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
     generator.generate(&join).unwrap()
 }
 
+fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let left = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["l1".to_string(), "l2".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let right = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            vec![],
+            vec!["r1".to_string(), "r2".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let conditions = vec![
+        JoinCondition::new(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            JoinComparisonType::LessThan,
+        ),
+        JoinCondition::new(
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+            JoinComparisonType::GreaterThan,
+        ),
+    ];
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(join_type, left, right, conditions)),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&join).unwrap()
+}
+
 fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let left = LogicalPlan::new(
@@ -957,6 +998,9 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
         emit_row_id: false,
         column_types: vec![LogicalType::Integer].into_boxed_slice(),
         table,
+        predicate: None,
+        residual_predicates: Vec::new().into_boxed_slice(),
+        late_materialize: false,
         scan_order: None,
         runtime_filter_expressions: Vec::new().into_boxed_slice(),
     }

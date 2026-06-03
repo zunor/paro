@@ -14,9 +14,9 @@ use crate::physical::specs::UtilitySpec;
 use crate::runtime::context::UtilityContext;
 use crate::runtime::HandleRef;
 use crate::runtime::{
-    AdaptiveSearchSourceExec, ChunkSourceExec, ClientResultSinkExec, CopyToFileSinkExec,
-    CrossProductProbeTransformExec, CteMaterializeSinkExec, CteScanSourceExec, DeleteSinkExec,
-    DelimCaptureSinkExec, DelimScanSourceExec, DummySourceExec, EmptySourceExec,
+    AdaptiveSearchSourceExec, ChunkSourceExec, ClassicIeJoinSourceExec, ClientResultSinkExec,
+    CopyToFileSinkExec, CrossProductProbeTransformExec, CteMaterializeSinkExec, CteScanSourceExec,
+    DeleteSinkExec, DelimCaptureSinkExec, DelimScanSourceExec, DummySourceExec, EmptySourceExec,
     ExpressionSourceExec, ExternalProjectTransformExec, ExternalTableSinkExec,
     ExternalTableSourceExec, FilterTransformExec, FullTextSearchSourceExec,
     GraphExpandTransformExec, GraphProjectTransformExec, GraphScanSourceExec,
@@ -28,11 +28,11 @@ use crate::runtime::{
     PropertyRepairTransformExec, RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec,
     RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
     SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec, SortBuildSinkExec,
-    SortEmitSourceExec, SourceExec, SparseVectorSearchSourceExec, StreamingAggregateTransformExec,
-    StreamingLimitTransformExec, StreamingTopNTransformExec, StreamingWindowTransformExec,
-    TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec, TransformExec,
-    UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec, ValuesSourceExec,
-    VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
+    SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec, SparseVectorSearchSourceExec,
+    StreamingAggregateTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
+    StreamingWindowTransformExec, TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec,
+    TransformExec, UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec,
+    ValuesSourceExec, VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
 };
 use crate::runtime::{ChunkLayout, PipelineScratchLayout, RuntimeOperatorId};
 
@@ -331,7 +331,7 @@ impl OperatorRuntimeRegistry {
     ) -> Result<SourceSlot> {
         let exec = match spec {
             SourceSpec::Rowset(spec) => SourceExec::Rowset(RowsetSourceExec {
-                desc: RowsetSourceDesc::from_plan_spec(spec),
+                desc: RowsetSourceDesc::from_source_spec(spec),
             }),
             SourceSpec::Values(spec) => SourceExec::Values(ValuesSourceExec { spec: spec.clone() }),
             SourceSpec::Dummy(spec) => SourceExec::Dummy(DummySourceExec { spec: spec.clone() }),
@@ -363,6 +363,17 @@ impl OperatorRuntimeRegistry {
             }),
             SourceSpec::Materialized(spec) => SourceExec::Materialized(MaterializedSourceExec {
                 handle: HandleRef::new(spec.handle),
+            }),
+            SourceSpec::ClassicIeJoin(spec) => SourceExec::ClassicIeJoin(ClassicIeJoinSourceExec {
+                left_handle: HandleRef::new(spec.left_handle),
+                right_handle: HandleRef::new(spec.right_handle),
+                join_type: spec.spec.join_type,
+                conditions: spec.spec.conditions.clone(),
+                mark_null_condition_start: spec.spec.mark_null_condition_start,
+                left_projection: spec.spec.left_projection.clone(),
+                right_projection: spec.spec.right_projection.clone(),
+                right_output_types: spec.spec.right_output_types.clone(),
+                output_types: spec.spec.output_types.clone(),
             }),
             SourceSpec::NljUnmatched(spec) => SourceExec::NljUnmatched(NljUnmatchedSourceExec {
                 handle: HandleRef::new(spec.handle),
@@ -474,6 +485,18 @@ impl OperatorRuntimeRegistry {
                     conditions: spec.conditions.clone(),
                     mark_null_condition_start: spec.mark_null_condition_start,
                     arbitrary_condition: spec.arbitrary_condition.clone(),
+                    left_projection: spec.left_projection.clone(),
+                    right_projection: spec.right_projection.clone(),
+                    right_output_types: spec.right_output_types.clone(),
+                    output_types: spec.output_types.clone(),
+                })
+            }
+            TransformSpec::SortRangeJoinProbe(spec) => {
+                TransformExec::SortRangeJoinProbe(SortRangeJoinProbeTransformExec {
+                    handle: HandleRef::new(spec.handle),
+                    join_type: spec.join_type,
+                    conditions: spec.conditions.clone(),
+                    mark_null_condition_start: spec.mark_null_condition_start,
                     left_projection: spec.left_projection.clone(),
                     right_projection: spec.right_projection.clone(),
                     right_output_types: spec.right_output_types.clone(),

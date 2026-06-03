@@ -24,10 +24,11 @@ pub fn build_predicate_tree(
     let mut residual_exprs = Vec::new();
 
     for expr in filters {
-        match build_predicate(expr, get)? {
-            Some(tree) => pushed_trees.push(tree),
-            None => residual_exprs.push(expr.clone()),
+        let (tree, mut residual) = extract_predicate(expr, get)?;
+        if let Some(tree) = tree {
+            pushed_trees.push(tree);
         }
+        residual_exprs.append(&mut residual);
     }
 
     let tree = if pushed_trees.is_empty() {
@@ -39,6 +40,39 @@ pub fn build_predicate_tree(
     };
 
     Ok((tree, residual_exprs))
+}
+
+fn extract_predicate(
+    expr: &Expression,
+    get: &Get,
+) -> Result<(Option<PredicateTree>, Vec<Expression>)> {
+    match expr {
+        Expression::Conjunction(conj) if conj.conjunction_type == ConjunctionType::And => {
+            let mut pushed_trees = Vec::new();
+            let mut residual_exprs = Vec::new();
+
+            for child in &conj.children {
+                let (tree, mut residual) = extract_predicate(child, get)?;
+                if let Some(tree) = tree {
+                    pushed_trees.push(tree);
+                }
+                residual_exprs.append(&mut residual);
+            }
+
+            let tree = if pushed_trees.is_empty() {
+                None
+            } else if pushed_trees.len() == 1 {
+                Some(pushed_trees.remove(0))
+            } else {
+                Some(PredicateTree::And(pushed_trees))
+            };
+            Ok((tree, residual_exprs))
+        }
+        _ => match build_predicate(expr, get)? {
+            Some(tree) => Ok((Some(tree), Vec::new())),
+            None => Ok((None, vec![expr.clone()])),
+        },
+    }
 }
 
 pub fn combine_predicate_trees(

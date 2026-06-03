@@ -9,7 +9,9 @@
 //! after the client consumes a chunk.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use paro_common::allocator::Allocator;
@@ -18,7 +20,7 @@ use paro_context::StatementContext;
 use paro_planner::operator::ExplainSpec;
 
 use crate::explain::analyze_render::render_explain_analyze;
-use crate::explain::profiler::{ExplainProfiler, OperatorProfiler};
+use crate::explain::profiler::{ExplainProfiler, OperatorProfiler, ProfileWorkerContext};
 use crate::memory_runtime::QueryMemoryPool;
 use crate::pipeline::graph::{
     ControlRegion, ControlRegionId, PipelineGraph, PipelineId, PipelineRoot, PipelineSubgraphRoot,
@@ -28,9 +30,9 @@ use crate::pipeline::{PipelineProgramSet, StatementProgram, UtilityProgram};
 use crate::runtime::{
     BlockReason, Blocker, BreakerHandleRegistry, ControlRegionRuntime, ControlRegionRuntimeSet,
     OperatorWakeScope, ParameterBindings, PipelineDependencyGates, PipelineRuntime,
-    PipelineTaskExecutor, PipelineTaskId, PipelineTaskStepContext, QueryOutputPort,
-    QueryRuntimeContext, RecursiveCteGateAction, SharedSinkRuntimeSet, TaskStepResult,
-    UtilityContext, WakeGeneration,
+    PipelineScheduler, PipelineTaskExecutor, PipelineTaskId, PipelineTaskStepContext,
+    QueryOutputPort, QueryRuntimeContext, RecursiveCteGateAction, SharedSinkRuntimeSet,
+    TaskStepResult, UtilityContext, WakeGeneration,
 };
 use crate::thread_context::ThreadContext;
 
@@ -56,6 +58,7 @@ const ROOT_OUTPUT_QUEUE_CHUNKS: usize = 2;
 pub struct ProgramExecution {
     pub query: QueryRuntimeContext,
     pub driver: Option<PipelineExecutionDriver>,
+    pub background: Option<BackgroundExecutionDriver>,
 }
 
 pub fn execute_program(
@@ -78,7 +81,11 @@ pub fn execute_program(
     if let Some(driver) = execution.driver.as_mut() {
         driver.run_to_completion(&execution.query)?;
     }
+    if let Some(background) = execution.background.as_mut() {
+        background.join()?;
+    }
     execution.driver = None;
+    execution.background = None;
     Ok(execution)
 }
 
@@ -117,6 +124,11 @@ fn start_program_with_output(
         {
             streaming_output
         }
+        StatementProgram::Pipeline { graph, .. }
+            if fetch_driven && has_control_region_execution(graph.as_ref()) =>
+        {
+            QueryOutputPort::with_blocking_writes(&streaming_output)
+        }
         _ => completed_output,
     };
     let query = QueryRuntimeContext::new(session, params, memory, output);
@@ -133,6 +145,22 @@ fn start_program_with_output(
             return Ok(ProgramExecution {
                 query,
                 driver: Some(driver),
+                background: None,
+            });
+        }
+        StatementProgram::Pipeline {
+            graph, programs, ..
+        } if fetch_driven && has_control_region_execution(graph.as_ref()) => {
+            let background = BackgroundExecutionDriver::spawn(
+                graph.clone(),
+                programs.clone(),
+                query.clone(),
+                allocator,
+            )?;
+            return Ok(ProgramExecution {
+                query,
+                driver: None,
+                background: Some(background),
             });
         }
         StatementProgram::Pipeline {
@@ -142,7 +170,105 @@ fn start_program_with_output(
     Ok(ProgramExecution {
         query,
         driver: None,
+        background: None,
     })
+}
+
+fn has_control_region_execution(graph: &PipelineGraph) -> bool {
+    matches!(graph.root, PipelineRoot::ControlRegion(_)) || !graph.control_regions.is_empty()
+}
+
+pub struct BackgroundExecutionDriver {
+    state: Arc<BackgroundExecutionState>,
+    output: QueryOutputPort,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct BackgroundExecutionState {
+    result: Mutex<Option<Result<()>>>,
+    cv: Condvar,
+}
+
+impl BackgroundExecutionDriver {
+    fn spawn(
+        graph: Arc<PipelineGraph>,
+        programs: PipelineProgramSet,
+        query: QueryRuntimeContext,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let state = Arc::new(BackgroundExecutionState {
+            result: Mutex::new(None),
+            cv: Condvar::new(),
+        });
+        let worker_state = state.clone();
+        let worker_query = query.clone();
+        let handle = thread::Builder::new()
+            .name("paro-control-region-driver".to_string())
+            .spawn(move || {
+                let result = match panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_pipeline_graph(graph.as_ref(), &programs, &worker_query, allocator)
+                })) {
+                    Ok(result) => result,
+                    Err(_) => Err(paro_error::internal(
+                        "control-region background driver panicked",
+                    )),
+                };
+                worker_query.output.close();
+                worker_state.finish(result);
+            })
+            .map_err(|error| {
+                paro_error::internal(format!(
+                    "failed to spawn control-region background driver: {error}"
+                ))
+            })?;
+        Ok(Self {
+            state,
+            output: query.output.clone(),
+            handle: Some(handle),
+        })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.state
+            .result
+            .lock()
+            .expect("background execution result lock poisoned")
+            .is_some()
+    }
+
+    pub fn join(&mut self) -> Result<()> {
+        self.output.close();
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| paro_error::internal("control-region background driver panicked"))?;
+        }
+        self.state.take_result().unwrap_or(Ok(()))
+    }
+}
+
+impl Drop for BackgroundExecutionDriver {
+    fn drop(&mut self) {
+        self.output.close();
+    }
+}
+
+impl BackgroundExecutionState {
+    fn finish(&self, result: Result<()>) {
+        let mut slot = self
+            .result
+            .lock()
+            .expect("background execution result lock poisoned");
+        *slot = Some(result);
+        self.cv.notify_all();
+    }
+
+    fn take_result(&self) -> Option<Result<()>> {
+        self.result
+            .lock()
+            .expect("background execution result lock poisoned")
+            .take()
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +337,7 @@ fn run_explain_analyze(
     }
     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let rows_returned = target_output.stats().pushed_rows as u64;
+    profiler.record_query_memory_stats(target_query.memory.runtime_stats());
     let lines = render_explain_analyze(target, spec, profiler.as_ref(), elapsed_ms, rows_returned);
     push_explain_lines(&query.output, &lines, allocator)
 }
@@ -228,6 +355,16 @@ fn run_pipeline_graph(
     }
 
     let handles = Arc::new(BreakerHandleRegistry::from_catalog(&graph.handles)?);
+    if PipelineScheduler::should_use_parallel_scheduler(graph, query) {
+        let result = PipelineScheduler::run_to_completion_with_registry(
+            graph,
+            programs,
+            handles.clone(),
+            query,
+            allocator.clone(),
+        );
+        return cleanup_graph_result(result, handles, query, allocator);
+    }
     run_pipeline_graph_with_cleanup(graph, programs, handles, query, allocator)
 }
 
@@ -581,17 +718,27 @@ fn run_runtime(
     let task = runtime.create_task_state(query, allocator)?;
     let task_id = PipelineTaskId(runtime.program.id.index() as u64);
     let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let thread = ThreadContext::single_threaded();
+    let thread = ThreadContext::new(0, query.session.number_of_threads().max(1));
     let wake = OperatorWakeScope {
         task_id,
         generation: WakeGeneration(0),
     };
-    let mut profiler = query
-        .explain_profiler
-        .as_ref()
-        .map_or_else(OperatorProfiler::disabled, |profiler| {
-            OperatorProfiler::new(profiler.clone())
-        });
+    let mut profiler =
+        query
+            .explain_profiler
+            .as_ref()
+            .map_or_else(OperatorProfiler::disabled, |profiler| {
+                OperatorProfiler::new_with_context(
+                    profiler.clone(),
+                    ProfileWorkerContext::new(
+                        Some(task_id.0),
+                        Some(task_id.0),
+                        Some(0),
+                        Some(query.session.number_of_threads().max(1) as u64),
+                        None,
+                    ),
+                )
+            });
     let mut step_ctx = PipelineTaskStepContext {
         query,
         thread: &thread,

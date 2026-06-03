@@ -19,6 +19,9 @@ from .loader import QueryDef, WorkloadDef
 from .validator import BenchmarkValidator
 
 
+VECTOR_SIZE = 2048
+
+
 class QueryTimeoutError(RuntimeError):
     """Raised when query execution exceeds timeout."""
 
@@ -47,6 +50,9 @@ class QueryExecutionResult:
     explain_profile_status: str = "SKIP"
     explain_profile_detail: str | None = None
     explain_profile_raw_json: str | None = None
+    explain_profile_time_ms: float | None = None
+    explain_profile_execution_time_ms: float | None = None
+    explain_profile_overhead_ratio: float | None = None
     operator_profiles: list[dict[str, Any]] = field(default_factory=list)
     rss_before_kb: int | None = None
     rss_after_kb: int | None = None
@@ -103,6 +109,12 @@ class BenchmarkExecutor:
         conn.autocommit = True
         return conn
 
+    def execute_script(self, conn: Any, script: str) -> None:
+        self._execute_script(conn, script)
+
+    def execute_sql(self, conn: Any, sql: str, *, fetch: bool) -> list[tuple[Any, ...]]:
+        return self._execute_sql(conn, sql, fetch=fetch)
+
     def run_workload(
         self,
         workload: WorkloadDef,
@@ -152,6 +164,7 @@ class BenchmarkExecutor:
                     )
                 )
 
+        teardown_conn = None
         try:
             teardown_conn = conn if conn is not None else self.connection_factory()
             self._execute_script(teardown_conn, workload.teardown_sql)
@@ -160,7 +173,7 @@ class BenchmarkExecutor:
             result.teardown_error = _format_error(exc)
         finally:
             _safe_close(conn)
-            if "teardown_conn" in locals() and teardown_conn is not conn:
+            if teardown_conn is not None and teardown_conn is not conn:
                 _safe_close(teardown_conn)
 
         return result
@@ -266,7 +279,23 @@ class BenchmarkExecutor:
             return
 
         try:
+            started_at = time_module.perf_counter()
             raw_json = self._fetch_explain_profile_json(conn, query.sql)
+            query_result.explain_profile_time_ms = (
+                time_module.perf_counter() - started_at
+            ) * 1000.0
+            query_result.explain_profile_execution_time_ms = (
+                _extract_explain_execution_time_ms(raw_json)
+            )
+            primary_median = _median(query_result.samples_ms)
+            if (
+                primary_median is not None
+                and primary_median > 0.0
+                and query_result.explain_profile_execution_time_ms is not None
+            ):
+                query_result.explain_profile_overhead_ratio = (
+                    query_result.explain_profile_execution_time_ms / primary_median
+                )
             query_result.explain_profile_raw_json = raw_json
             query_result.operator_profiles = _flatten_explain_profile(raw_json)
             query_result.explain_profile_status = "PASS"
@@ -405,6 +434,38 @@ def _sum_memory_tag_rows(rows: list[dict[str, Any]] | None) -> int:
     return total
 
 
+def _median(samples: list[float]) -> float | None:
+    if not samples:
+        return None
+    ordered = sorted(float(sample) for sample in samples)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _extract_explain_execution_time_ms(raw_json: str) -> float | None:
+    try:
+        document = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    summary = document.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    execution_time = summary.get("Execution Time")
+    if isinstance(execution_time, (int, float)) and not isinstance(execution_time, bool):
+        return float(execution_time)
+    if not isinstance(execution_time, str):
+        return None
+    first_token = execution_time.strip().split(" ", 1)[0]
+    try:
+        return float(first_token)
+    except ValueError:
+        return None
+
+
 class RssSampler:
     def __init__(self, pid: int, interval_seconds: float = 0.05):
         self._pid = max(int(pid), 0)
@@ -466,6 +527,7 @@ def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
     if not isinstance(document, dict):
         raise ValueError("explain JSON document must be an object")
     operators = document.get("operators")
+    profile_fields = _document_profile_fields(document)
     if isinstance(operators, list):
         profiles: list[dict[str, Any]] = []
         for index, operator in enumerate(operators):
@@ -474,49 +536,113 @@ def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
             actual = operator.get("actual")
             actual_map = actual if isinstance(actual, dict) else {}
             profiles.append(
-                {
-                    "node_id": _optional_int(operator.get("runtime_id")),
-                    "operator": str(operator.get("operator", "")),
-                    "tree_path": str(index),
-                    "rows": _optional_int(actual_map.get("rows")),
-                    "loops": _optional_int(actual_map.get("loops")),
-                    "startup_time_ms": _optional_float(actual_map.get("startup_time_ms")),
-                    "total_time_ms": _optional_float(actual_map.get("total_time_ms")),
-                    "spilled": _optional_bool(actual_map.get("spilled")),
-                    "reported_memory_bytes": _optional_int(actual_map.get("peak_memory_bytes")),
-                    "temp_storage_bytes": _optional_int(actual_map.get("temp_storage_bytes")),
-                }
+                _operator_profile_entry(
+                    node_id=_optional_int(operator.get("runtime_id")),
+                    operator=str(operator.get("operator", "")),
+                    tree_path=str(index),
+                    actual_map=actual_map,
+                    profile_fields=profile_fields,
+                )
             )
         return profiles
     plan = document.get("plan")
     if not isinstance(plan, dict):
         raise ValueError("explain JSON document missing 'operators' array or object field 'plan'")
     profiles: list[dict[str, Any]] = []
-    _append_operator_profile(plan, profiles, "0")
+    _append_operator_profile(plan, profiles, "0", profile_fields)
     return profiles
+
+
+def _document_profile_fields(document: Mapping[str, Any]) -> dict[str, Any]:
+    profile_events = document.get("profile_events")
+    profile_summary = document.get("profile")
+    profile_map = profile_summary if isinstance(profile_summary, dict) else {}
+    parallelism = profile_map.get("parallelism")
+    parallel_map = parallelism if isinstance(parallelism, dict) else {}
+    memory = profile_map.get("memory")
+    memory_map = memory if isinstance(memory, dict) else {}
+    runtime_filters = profile_map.get("runtime_filters")
+    filter_map = runtime_filters if isinstance(runtime_filters, dict) else {}
+    return {
+        "profile_schema_version": _optional_int(document.get("profile_schema_version")),
+        "query_id": _optional_int(document.get("query_id")),
+        "profile_event_count": len(profile_events) if isinstance(profile_events, list) else None,
+        "profile_parallelism": _optional_int(parallel_map.get("max_threads")),
+        "profile_observed_workers": _optional_int(parallel_map.get("observed_workers")),
+        "profile_worker_utilization": _optional_float(parallel_map.get("worker_utilization")),
+        "profile_ready_time_us": _optional_int(parallel_map.get("ready_time_us")),
+        "profile_wait_time_us": _optional_int(parallel_map.get("wait_time_us")),
+        "profile_backpressure_count": _optional_int(parallel_map.get("backpressure_count")),
+        "profile_runtime_filter_installed_count": _optional_int(filter_map.get("installed_count")),
+        "profile_runtime_filter_no_wait_count": _optional_int(
+            filter_map.get("no_wait_fallback_count")
+        ),
+        "profile_grant_bytes": _optional_int(memory_map.get("grant_bytes")),
+        "profile_revoked_bytes": _optional_int(memory_map.get("revoked_bytes")),
+        "profile_spill_bytes": _optional_int(memory_map.get("spill_bytes")),
+        "profile_yield_latency_us": _optional_int(memory_map.get("yield_latency_us")),
+    }
+
+
+def _operator_profile_entry(
+    *,
+    node_id: int | None,
+    operator: str,
+    tree_path: str,
+    actual_map: Mapping[str, Any],
+    profile_fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "node_id": node_id,
+        "operator": operator,
+        "tree_path": tree_path,
+        "rows": _optional_int(actual_map.get("rows")),
+        "loops": _optional_int(actual_map.get("loops")),
+        "startup_time_ms": _optional_float(actual_map.get("startup_time_ms")),
+        "total_time_ms": _optional_float(actual_map.get("total_time_ms")),
+        "spilled": _optional_bool(actual_map.get("spilled")),
+        "reported_memory_bytes": _optional_int(actual_map.get("peak_memory_bytes")),
+        "temp_storage_bytes": _optional_int(actual_map.get("temp_storage_bytes")),
+        "spilled_bytes": _optional_int(actual_map.get("spilled_bytes")),
+        "spill_latency_us": _optional_int(actual_map.get("spill_latency_us")),
+        "scheduler_worker_count": _optional_int(actual_map.get("scheduler_worker_count")),
+        "scheduler_morsel_count": _optional_int(actual_map.get("scheduler_morsel_count")),
+        "scheduler_ready_time_us": _optional_int(actual_map.get("scheduler_ready_time_us")),
+        "scheduler_wait_time_us": _optional_int(actual_map.get("scheduler_wait_time_us")),
+        "output_backpressure_count": _optional_int(
+            actual_map.get("output_backpressure_count")
+        ),
+        "runtime_filter_installed_count": _optional_int(
+            actual_map.get("runtime_filter_installed_count")
+        ),
+        "allocator_tracking_event_count": _optional_int(
+            actual_map.get("allocator_tracking_event_count")
+        ),
+        "allocator_tracking_events_per_chunk": _per_chunk(
+            actual_map.get("allocator_tracking_event_count"),
+            actual_map.get("rows"),
+        ),
+        **profile_fields,
+    }
 
 
 def _append_operator_profile(
     node: Mapping[str, Any],
     profiles: list[dict[str, Any]],
     tree_path: str,
+    profile_fields: Mapping[str, Any],
 ) -> None:
     actual = node.get("actual")
     actual_map = actual if isinstance(actual, dict) else {}
 
     profiles.append(
-        {
-            "node_id": _optional_int(node.get("node_id")),
-            "operator": str(node.get("operator", "")),
-            "tree_path": tree_path,
-            "rows": _optional_int(actual_map.get("rows")),
-            "loops": _optional_int(actual_map.get("loops")),
-            "startup_time_ms": _optional_float(actual_map.get("startup_time_ms")),
-            "total_time_ms": _optional_float(actual_map.get("total_time_ms")),
-            "spilled": _optional_bool(actual_map.get("spilled")),
-            "reported_memory_bytes": _optional_int(actual_map.get("peak_memory_bytes")),
-            "temp_storage_bytes": _optional_int(actual_map.get("temp_storage_bytes")),
-        }
+        _operator_profile_entry(
+            node_id=_optional_int(node.get("node_id")),
+            operator=str(node.get("operator", "")),
+            tree_path=tree_path,
+            actual_map=actual_map,
+            profile_fields=profile_fields,
+        )
     )
 
     children = node.get("children")
@@ -524,7 +650,7 @@ def _append_operator_profile(
         return
     for index, child in enumerate(children):
         if isinstance(child, dict):
-            _append_operator_profile(child, profiles, f"{tree_path}/{index}")
+            _append_operator_profile(child, profiles, f"{tree_path}/{index}", profile_fields)
 
 
 def _optional_int(value: Any) -> int | None:
@@ -549,6 +675,14 @@ def _optional_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     return None
+
+
+def _per_chunk(numerator: Any, rows: Any, chunk_size: int = VECTOR_SIZE) -> float | None:
+    count = _optional_int(numerator)
+    row_count = _optional_int(rows)
+    if count is None or row_count is None or row_count <= 0:
+        return None
+    return (float(count) * float(chunk_size)) / float(row_count)
 
 
 def _normalize_value(value: Any) -> Any:

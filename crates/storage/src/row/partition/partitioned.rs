@@ -213,7 +213,7 @@ mod tests {
         if store.is_empty() {
             return Vec::new();
         }
-        let pinned = store.pin_ordinal_range(0, store.count() as u32).unwrap();
+        let pinned = store.pin_ordinal_range(0, store.count()).unwrap();
         let mut out = test_chunk_with_capacity(&[LogicalType::Integer], store.count() as usize);
         pinned.gather_columns(&[0], &mut out, 0).unwrap();
         (0..store.count() as usize)

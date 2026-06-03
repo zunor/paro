@@ -286,6 +286,65 @@ impl ParallelFinishDriver for PendingFinishDriver {
     }
 }
 
+#[derive(Debug)]
+struct ConcurrentFinishDriver {
+    task_count: usize,
+    issued: std::sync::atomic::AtomicUsize,
+    running: std::sync::atomic::AtomicUsize,
+    max_running: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConcurrentFinishDriver {
+    fn new(
+        task_count: usize,
+        max_running: Arc<std::sync::atomic::AtomicUsize>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            task_count,
+            issued: std::sync::atomic::AtomicUsize::new(0),
+            running: std::sync::atomic::AtomicUsize::new(0),
+            max_running,
+            completed,
+        }
+    }
+}
+
+impl ParallelFinishDriver for ConcurrentFinishDriver {
+    fn next_task(&self, _ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
+        let next = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if next >= self.task_count {
+            return Ok(NextFinishTask::Drained);
+        }
+        Ok(NextFinishTask::Task(FinishTaskId(next as u32)))
+    }
+
+    fn run_task(
+        &self,
+        _task: FinishTaskId,
+        _ctx: &mut OperatorFinishContext,
+    ) -> Result<FinishTaskPoll> {
+        let now = self
+            .running
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let _ = self.max_running.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| Some(current.max(now)),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        self.running
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(FinishTaskPoll::Done)
+    }
+}
+
 #[test]
 fn finish_task_error_cancels_group_as_operator_error() {
     let query = query_context(QueryOutputPort::unbounded());
@@ -323,6 +382,50 @@ fn finish_task_error_cancels_group_as_operator_error() {
         Some(CancelReason::OperatorError)
     );
     assert!(query.errors.root_error_id().is_some());
+}
+
+#[test]
+fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
+    let query = query_context(QueryOutputPort::unbounded());
+    query.session.scheduler().set_threads(4).expect("threads");
+    let runtime = empty_runtime(&query);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    executor.phase = PipelineTaskPhase::Merging;
+    executor.completion_stage = PipelineCompletionStage::FinishWork;
+
+    let max_running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    executor.finish_group = Some(FinishTaskGroup {
+        task_count_hint: 4,
+        driver: Arc::new(ConcurrentFinishDriver::new(
+            4,
+            max_running.clone(),
+            completed.clone(),
+        )),
+        memory_class: MemoryClass::Blocking,
+    });
+
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(19),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+
+    assert_eq!(
+        completed.load(std::sync::atomic::Ordering::Acquire),
+        4,
+        "all finish subtasks should run"
+    );
+    assert!(
+        max_running.load(std::sync::atomic::Ordering::Acquire) > 1,
+        "finish subtasks should overlap on scheduler workers"
+    );
 }
 
 #[test]

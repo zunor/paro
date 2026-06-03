@@ -86,6 +86,7 @@ jobs:
               - '.clippy.toml'
               - '.cargo/**'
               - 'tools/ci/check_memory_runtime_api.py'
+              - 'tools/ci/check_operator_runtime_baseline.py'
               - 'tools/ci/check_policy_evolution.py'
               - 'tools/ci/check_vector_copy_fallible_api.py'
 
@@ -144,6 +145,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 tools/ci/check_memory_runtime_api.py
       - run: python3 tools/ci/check_vector_copy_fallible_api.py
+      - run: python3 tools/ci/check_operator_runtime_baseline.py
 
   clippy:
     name: clippy
@@ -393,6 +395,14 @@ jobs:
     env:
       PARO_BENCH_CARGO_PROFILE: release
       PARO_BENCH_DATA_DIR_MODE: fresh
+      PARO_BENCH_THREAD_COUNT: "1"
+      PARO_BENCH_QUERY_MEMORY_CAP: 256MB
+      PARO_BENCH_TEMP_DIRECTORY: /tmp/paro_benchmark_operator_runtime
+      PARO_BENCH_DATA_SCALE: checked-in
+      PARO_BENCH_RANDOM_SEED: "20260525"
+      PARO_BENCH_SINGLE_TASK_FAST_PATH: current-single-active-driver
+      PARO_BENCH_ALLOC_AUDIT: "1"
+      PARO_ALLOC_AUDIT: "1"
       PARO_PERF_ARCHIVE_DIR: ${{ github.workspace }}/.ci/paro-perf-archive
       PARO_PERF_ARCHIVE_TOKEN: ${{ secrets.PARO_PERF_ARCHIVE_TOKEN }}
     steps:

@@ -235,7 +235,7 @@ def project_measurement_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(query, dict):
                 continue
             projected_query: dict[str, Any] = {"id": query.get("id", "")}
-            for field in ("stats", "rss", "memory", "spill_metrics"):
+            for field in ("stats", "rss", "memory", "spill_metrics", "audit"):
                 value = query.get(field)
                 if isinstance(value, dict) and value:
                     projected_query[field] = copy.deepcopy(value)
@@ -271,7 +271,7 @@ def _aggregate_projected_payloads(payloads: list[dict[str, Any]], *, source_name
                         f"bless run {run_index} is missing {key.label} for source '{source_name}'"
                     )
                 run_queries.append(record.query)
-            for field in ("stats", "rss", "memory", "spill_metrics"):
+            for field in ("stats", "rss", "memory", "spill_metrics", "audit"):
                 merged = _median_numeric_map([run_query.get(field) for run_query in run_queries])
                 if merged:
                     query[field] = merged

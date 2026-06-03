@@ -1,0 +1,5 @@
+name = "operator-runtime-scan-pushdown"
+description = "SCAN-PUSHDOWN rowset predicate pushdown, late materialization, and scan-order suite"
+
+[[include]]
+workload = "operator_runtime_scan_pushdown"

@@ -16,9 +16,12 @@ use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::row::{
-    RadixPartitionedRows, RadixPartitionedRowsBuilder, RadixPartitioning, RowLayout, RowStore,
-    RowStoreBuilder, RowValidityType,
+    RadixPartitionedRows, RadixPartitionedRowsBuilder, RadixPartitioning, RowFormatHandle,
+    RowLayout, RowSpillReader, RowSpillWriter, RowStore, RowStoreSpillReader, RowStoreSpillWriter,
+    RowValidityType,
 };
+
+use crate::operators::join::hash::row_format::HashJoinRowFormat;
 
 const MAX_RADIX_BITS: usize = 12;
 
@@ -32,6 +35,7 @@ pub struct ProbeSpillLocalState {
 #[derive(Debug)]
 pub struct ProbeSpill {
     buffer_pool: Arc<BufferPool>,
+    format: HashJoinRowFormat,
     probe_layout: Arc<RowLayout>,
     memory: MemoryAccountingContext,
     radix_bits: usize,
@@ -73,6 +77,9 @@ impl ProbeSpill {
                 "invalid probe spill radix bits: radix_bits={radix_bits}, allowed=1..={MAX_RADIX_BITS}"
             )));
         }
+        let format = HashJoinRowFormat::probe_spill(probe_types);
+        let format_handle = RowFormatHandle::from_format(&format);
+        let probe_types = format_handle.logical_types();
         if hash_col_idx >= probe_types.len() {
             return Err(paro_error::invalid_input(format!(
                 "probe spill hash column out of bounds: hash_col_idx={hash_col_idx}, column_count={}",
@@ -88,8 +95,9 @@ impl ProbeSpill {
 
         Ok(Self {
             buffer_pool,
+            format,
             probe_layout: Arc::new(RowLayout::from_types(
-                probe_types,
+                probe_types.to_vec(),
                 RowValidityType::CanHaveNullValues,
             )),
             memory,
@@ -202,9 +210,9 @@ impl ProbeSpill {
             return Ok(None);
         }
 
-        let mut builder = RowStoreBuilder::new_with_memory(
+        let mut writer = RowStoreSpillWriter::new(
             Arc::clone(&self.buffer_pool),
-            Arc::clone(&self.probe_layout),
+            self.format.clone(),
             MemoryTag::HashTable,
             self.memory.clone(),
         );
@@ -223,20 +231,20 @@ impl ProbeSpill {
                 continue;
             }
 
-            let mut scanner = partition.scanner();
+            let mut reader = RowStoreSpillReader::new(self.format.clone(), partition);
             loop {
-                let scanned = scanner.next_chunk(&mut replay_chunk)?;
+                let scanned = reader.read_next(&mut replay_chunk)?;
                 if scanned == 0 {
                     break;
                 }
-                builder.append(&replay_chunk)?;
+                writer.append_chunk(&replay_chunk)?;
             }
         }
 
-        if builder.count() == 0 {
+        if writer.count() == 0 {
             return Ok(None);
         }
-        Ok(Some(builder.seal()))
+        Ok(Some(writer.finish()?))
     }
 
     fn new_partition_builder(&self) -> RadixPartitionedRowsBuilder {

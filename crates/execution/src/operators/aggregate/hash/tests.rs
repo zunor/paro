@@ -10,13 +10,16 @@ use paro_common::memory::MemoryAccountingContext;
 use paro_common::memory::MemoryOwner;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::SelectionVector;
 use paro_function::aggregate::distributive::count::get_count_function;
 use paro_planner::expression::Expression;
 use paro_planner::expression::{AggregateExpression, AggregateType, ReferenceExpression};
+use paro_storage::buffer::BufferPool;
+use paro_storage::row::Ordering;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::operators::aggregate::accounted_rows::{
-    aggregate_modifier_memory_context, AccountedValueRow, AccountedValueRowSet,
+    aggregate_modifier_memory_context, DistinctRowSet, DistinctRows,
 };
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::build_helpers::{
@@ -34,9 +37,58 @@ fn modifier_memory(pool: Arc<QueryMemoryPool>) -> MemoryAccountingContext {
     aggregate_modifier_memory_context(owner)
 }
 
-fn accounted_row(values: Vec<Value>) -> AccountedValueRow {
-    let pool = Arc::new(QueryMemoryPool::new(4096));
-    AccountedValueRow::new(&modifier_memory(pool), values).expect("account row")
+fn test_buffer_pool() -> Arc<BufferPool> {
+    Arc::new(BufferPool::new(16 * 1024 * 1024))
+}
+
+fn distinct_set_from_values(
+    row_types: Vec<LogicalType>,
+    rows: Vec<Vec<Value>>,
+    memory: MemoryAccountingContext,
+) -> DistinctRowSet {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut chunk =
+        Chunk::try_initialize(&row_types, rows.len().max(1), allocator.clone()).expect("chunk");
+    chunk.set_cardinality(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (col_idx, value) in row.iter().enumerate() {
+            chunk
+                .column_mut(col_idx)
+                .expect("column")
+                .set_value(row_idx, value);
+        }
+    }
+
+    let mut distinct = DistinctRowSet::new(test_buffer_pool(), row_types, memory);
+    let mut selection =
+        SelectionVector::try_with_capacity(rows.len(), allocator).expect("selection");
+    selection.set_len(rows.len());
+    let mut selected_count = 0usize;
+    let mut scratch = Vec::new();
+    for row_idx in 0..rows.len() {
+        if distinct
+            .try_insert_key_from_chunk(&chunk, row_idx, &mut scratch)
+            .expect("insert key")
+        {
+            selection.set(selected_count, row_idx);
+            selected_count += 1;
+        }
+    }
+    selection.set_len(selected_count);
+    distinct
+        .append_selected_rows(&chunk, &selection, selected_count)
+        .expect("append rows");
+    distinct
+}
+
+fn distinct_rows_from_values(row_types: Vec<LogicalType>, rows: Vec<Vec<Value>>) -> DistinctRows {
+    distinct_set_from_values(
+        row_types,
+        rows,
+        modifier_memory(Arc::new(QueryMemoryPool::new(8 * 1024 * 1024))),
+    )
+    .into_rows()
+    .expect("distinct rows")
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
@@ -145,6 +197,7 @@ fn distinct_modifier_rows_are_query_memory_accounted() {
         std::slice::from_ref(&object),
         &payload,
         &[],
+        &test_buffer_pool(),
         &modifier_memory(pool),
         &mut distinct_sets,
     )
@@ -155,18 +208,22 @@ fn distinct_modifier_rows_are_query_memory_accounted() {
 #[test]
 fn distinct_group_chunk_nulls_missing_grouping_set_keys() {
     let allocator = paro_common::test_utils::test_allocator();
-    let rows = vec![
-        accounted_row(vec![
-            Value::Integer(1),
-            Value::Integer(10),
-            Value::Integer(100),
-        ]),
-        accounted_row(vec![
-            Value::Integer(1),
-            Value::Integer(20),
-            Value::Integer(200),
-        ]),
-    ];
+    let rows = distinct_rows_from_values(
+        vec![
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Integer,
+        ],
+        vec![
+            vec![Value::Integer(1), Value::Integer(10), Value::Integer(100)],
+            vec![Value::Integer(1), Value::Integer(20), Value::Integer(200)],
+        ],
+    );
+    let ordinals = rows.ordinals();
+    let pinned = rows
+        .pin_ordinals(ordinals, Ordering::Sequential)
+        .expect("pin rows");
+    let output_positions = vec![0, 1];
     let mut groups = Chunk::try_initialize(
         &[LogicalType::Integer, LogicalType::Integer],
         rows.len(),
@@ -175,7 +232,8 @@ fn distinct_group_chunk_nulls_missing_grouping_set_keys() {
     .expect("groups");
 
     let present_groups = grouping_set_present_mask(2, &[0], 0).expect("present groups");
-    populate_distinct_group_chunk(&mut groups, &rows, &present_groups, 0).expect("populate groups");
+    populate_distinct_group_chunk(&mut groups, &pinned, &output_positions, &present_groups, 0)
+        .expect("populate groups");
 
     assert_eq!(groups.column(0).unwrap().get_value(0), Value::Integer(1));
     assert_eq!(groups.column(0).unwrap().get_value(1), Value::Integer(1));
@@ -197,32 +255,24 @@ fn grouped_distinct_finalization_deduplicates_after_grouping_set_projection() {
     let mut tables = create_hash_aggregate_tables(
         &spec,
         allocator.clone(),
-        modifier_memory(Arc::new(QueryMemoryPool::new(64 * 1024))),
+        modifier_memory(Arc::new(QueryMemoryPool::new(8 * 1024 * 1024))),
+        1,
     )
     .expect("aggregate tables");
-    let memory = modifier_memory(Arc::new(QueryMemoryPool::new(64 * 1024)));
-    let mut distinct = AccountedValueRowSet::new(memory.clone());
-    distinct
-        .insert(vec![
-            Value::Integer(1),
-            Value::Integer(10),
-            Value::Integer(100),
-        ])
-        .expect("insert first row");
-    distinct
-        .insert(vec![
-            Value::Integer(1),
-            Value::Integer(20),
-            Value::Integer(100),
-        ])
-        .expect("insert duplicate after grouping-set projection");
-    distinct
-        .insert(vec![
-            Value::Integer(1),
-            Value::Integer(20),
-            Value::Integer(200),
-        ])
-        .expect("insert second distinct input");
+    let memory = modifier_memory(Arc::new(QueryMemoryPool::new(8 * 1024 * 1024)));
+    let distinct = distinct_set_from_values(
+        vec![
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Integer,
+        ],
+        vec![
+            vec![Value::Integer(1), Value::Integer(10), Value::Integer(100)],
+            vec![Value::Integer(1), Value::Integer(20), Value::Integer(100)],
+            vec![Value::Integer(1), Value::Integer(20), Value::Integer(200)],
+        ],
+        memory.clone(),
+    );
     let mut distinct_sets = vec![Some(distinct)];
 
     finalize_distinct_into_tables(
@@ -266,6 +316,7 @@ fn hash_aggregate_table_init_respects_query_quota() {
         &spec,
         paro_common::test_utils::test_allocator(),
         modifier_memory(Arc::new(QueryMemoryPool::new(1))),
+        1,
     )
     .expect_err("tiny query quota must reject aggregate hash table metadata");
 

@@ -383,14 +383,14 @@ type SingleFinishTaskFn =
 /// One-shot finish work adapter for sinks whose expensive seal/finalize step is
 /// already internally parallel or externally blocking, but still needs to leave
 /// the synchronous `finish()` tail.
-pub struct SingleTaskFinishDriver {
+pub struct FinishTaskGroupRunner {
     label: &'static str,
     issued: AtomicBool,
     completed: AtomicBool,
     run: Box<SingleFinishTaskFn>,
 }
 
-impl SingleTaskFinishDriver {
+impl FinishTaskGroupRunner {
     pub fn group(
         label: &'static str,
         memory_class: MemoryClass,
@@ -409,9 +409,9 @@ impl SingleTaskFinishDriver {
     }
 }
 
-impl std::fmt::Debug for SingleTaskFinishDriver {
+impl std::fmt::Debug for FinishTaskGroupRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SingleTaskFinishDriver")
+        f.debug_struct("FinishTaskGroupRunner")
             .field("label", &self.label)
             .field("issued", &self.issued.load(Ordering::Acquire))
             .field("completed", &self.completed.load(Ordering::Acquire))
@@ -419,7 +419,7 @@ impl std::fmt::Debug for SingleTaskFinishDriver {
     }
 }
 
-impl ParallelFinishDriver for SingleTaskFinishDriver {
+impl ParallelFinishDriver for FinishTaskGroupRunner {
     fn next_task(&self, _ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
         if self.completed.load(Ordering::Acquire) {
             return Ok(NextFinishTask::Drained);

@@ -20,8 +20,11 @@ use super::{
 
 /// A collection of raw row data.
 ///
-/// This is the main storage structure for intermediate query results
-/// in operators like Hash Join, Hash Aggregate, and Sort.
+/// This is the low-level segmented backing for execution row stores.
+///
+/// Long-term ownership is deliberately narrow: spill/replay, retained varlen
+/// rows, sort runs, and late gather may use it; ordinary high-frequency
+/// columnar pipelines should exchange `Chunk`/`Vector` data directly.
 ///
 /// # Design
 /// - Data is organized into segments, each with its own allocator

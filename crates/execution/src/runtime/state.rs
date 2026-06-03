@@ -39,9 +39,11 @@ pub use crate::operators::graph::state::{
     GraphShortestPathTransformLocal,
 };
 pub use crate::operators::join::state::{
-    CrossProductProbeTransformLocal, HashJoinBuildSinkLocal, HashJoinProbeTransformLocal,
-    HashJoinSpillReplayPartitionLocal, HashJoinSpillReplaySourceLocal,
+    ClassicIeJoinSourceLocal, CrossProductProbeTransformLocal, HashJoinBuildSinkLocal,
+    HashJoinProbeTransformLocal, HashJoinSpillReplayPartitionLocal, HashJoinSpillReplaySourceLocal,
     HashJoinUnmatchedSourceLocal, NestedLoopJoinProbeTransformLocal, NljUnmatchedSourceLocal,
+    SortRangeCandidateRange, SortRangeCandidateSource, SortRangeJoinProbeTransformLocal,
+    SortRangeProbeOffsets,
 };
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
 pub use crate::operators::scan::state::{
@@ -105,6 +107,7 @@ pub enum SourceGlobal {
     Expression(Arc<ExpressionSourceGlobal>),
     TableFunction(Arc<TableFunctionSourceGlobal>),
     Materialized(Arc<MaterializedSourceGlobal>),
+    ClassicIeJoin(Arc<crate::operators::join::sort_range::ClassicIeJoinSourceGlobal>),
     HashJoinSpillReplay(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     HashJoinUnmatched(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     HashAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
@@ -181,7 +184,7 @@ impl SourceGlobal {
         }
     }
 
-    fn variant_name(&self) -> &'static str {
+    pub(crate) fn variant_name(&self) -> &'static str {
         match self {
             Self::Rowset(_) => "Rowset",
             Self::Values(_) => "Values",
@@ -191,6 +194,7 @@ impl SourceGlobal {
             Self::Expression(_) => "Expression",
             Self::TableFunction(_) => "TableFunction",
             Self::Materialized(_) => "Materialized",
+            Self::ClassicIeJoin(_) => "ClassicIeJoin",
             Self::HashJoinSpillReplay(_) => "HashJoinSpillReplay",
             Self::HashJoinUnmatched(_) => "HashJoinUnmatched",
             Self::HashAggregateEmit(_) => "HashAggregateEmit",
@@ -221,6 +225,7 @@ pub enum SourceLocal {
     Expression(ExpressionSourceLocal),
     TableFunction(TableFunctionSourceLocal),
     Materialized(MaterializedSourceLocal),
+    ClassicIeJoin(ClassicIeJoinSourceLocal),
     NljUnmatched(NljUnmatchedSourceLocal),
     HashJoinSpillReplay(HashJoinSpillReplaySourceLocal),
     HashJoinUnmatched(HashJoinUnmatchedSourceLocal),
@@ -249,7 +254,15 @@ impl SourceLocal {
         }
     }
 
-    fn variant_name(&self) -> &'static str {
+    #[inline(always)]
+    pub fn chunk_mut(&mut self) -> Result<&mut ChunkSourceLocal> {
+        match self {
+            Self::Chunk(state) => Ok(state),
+            _ => Err(state_mismatch("SourceLocal::Chunk", self.variant_name())),
+        }
+    }
+
+    pub(crate) fn variant_name(&self) -> &'static str {
         match self {
             Self::Rowset(_) => "Rowset",
             Self::Values(_) => "Values",
@@ -259,6 +272,7 @@ impl SourceLocal {
             Self::Expression(_) => "Expression",
             Self::TableFunction(_) => "TableFunction",
             Self::Materialized(_) => "Materialized",
+            Self::ClassicIeJoin(_) => "ClassicIeJoin",
             Self::NljUnmatched(_) => "NljUnmatched",
             Self::HashJoinSpillReplay(_) => "HashJoinSpillReplay",
             Self::HashJoinUnmatched(_) => "HashJoinUnmatched",
@@ -291,6 +305,7 @@ pub enum TransformGlobal {
     StreamingWindow(Arc<StreamingWindowTransformGlobal>),
     HashJoinProbe(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     NestedLoopJoinProbe(Arc<crate::operators::join::nested_loop::runtime::NljProbeGlobal>),
+    SortRangeJoinProbe(Arc<crate::operators::join::sort_range::SortRangeJoinProbeGlobal>),
     CrossProductProbe(Arc<BreakerHandleGlobal<MaterializedHandle>>),
     ExternalProject(Arc<ExternalProjectTransformGlobal>),
     GraphExpand(Arc<GraphExpandTransformGlobal>),
@@ -310,6 +325,7 @@ pub enum TransformLocal {
     StreamingWindow(StreamingWindowTransformLocal),
     HashJoinProbe(HashJoinProbeTransformLocal),
     NestedLoopJoinProbe(NestedLoopJoinProbeTransformLocal),
+    SortRangeJoinProbe(SortRangeJoinProbeTransformLocal),
     CrossProductProbe(CrossProductProbeTransformLocal),
     ExternalProject(ExternalProjectTransformLocal),
     GraphExpand(GraphExpandTransformLocal),

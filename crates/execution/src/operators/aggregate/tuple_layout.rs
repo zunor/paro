@@ -16,6 +16,7 @@ use paro_common::vector::Vector;
 
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
+use super::row_format::AggregateGroupFormat;
 
 const MIN_ALIGNMENT: usize = 8;
 
@@ -155,6 +156,14 @@ impl VarlenHeap {
         self.data.capacity()
     }
 
+    pub fn spare_capacity(&self) -> usize {
+        self.data.capacity().saturating_sub(self.data.len())
+    }
+
+    pub fn shrink_to_fit_and_refund(&mut self) {
+        self.data.shrink_to_fit_and_refund();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -193,6 +202,7 @@ impl VarlenHeap {
 #[derive(Debug, Clone)]
 pub struct TupleLayout {
     pub group_types: Vec<LogicalType>,
+    row_format: AggregateGroupFormat,
     pub group_offsets: Vec<usize>,
     pub agg_state_offset: usize,
     pub agg_offsets: Vec<usize>,
@@ -228,6 +238,10 @@ impl TupleLayout {
 
         let agg_state_offset = align_to(current_offset, MIN_ALIGNMENT)?;
         let aggregate_state_layout = AggregateStateLayout::new(aggregate_objects)?;
+        let row_format = AggregateGroupFormat::new(
+            group_types.iter().cloned(),
+            aggregate_state_layout.aggregate_count(),
+        );
         let agg_offsets = (0..aggregate_state_layout.aggregate_count())
             .map(|idx| aggregate_state_layout.state_offset(idx))
             .collect::<Vec<_>>();
@@ -245,6 +259,7 @@ impl TupleLayout {
 
         Ok(Self {
             group_types: group_types.to_vec(),
+            row_format,
             group_offsets,
             agg_state_offset,
             agg_offsets,
@@ -256,7 +271,15 @@ impl TupleLayout {
     }
 
     pub fn group_count(&self) -> usize {
-        self.group_types.len()
+        self.row_format.group_width()
+    }
+
+    pub fn row_format(&self) -> &AggregateGroupFormat {
+        &self.row_format
+    }
+
+    pub fn aggregate_count(&self) -> usize {
+        self.row_format.state_count()
     }
 
     pub fn validity_width(&self) -> usize {
@@ -853,6 +876,8 @@ mod tests {
         .expect("layout");
 
         assert_eq!(layout.group_count(), 3);
+        assert_eq!(layout.aggregate_count(), 2);
+        assert_eq!(layout.row_format().state_count(), 2);
         assert_eq!(layout.agg_offsets.len(), 2);
         assert!(layout.agg_state_offset >= layout.group_offsets[2] + 1);
         assert!(layout.hash_offset >= layout.agg_state_offset + 16);

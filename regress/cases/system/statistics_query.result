@@ -54,6 +54,9 @@ PROJECTION  (rows=1)
       Output Schema: id INTEGER, payload VARCHAR, id INTEGER
       ->  ROWSET_SCAN on public.stats_big b
         Columns: id, payload
+        Pushed Predicate: col#0 = 1
+        Late Materialize: auto
+        Runtime Filter: #0 = 1
         Output Schema: id INTEGER, payload VARCHAR
       ->  ROWSET_SCAN on public.stats_small s
         Columns: id

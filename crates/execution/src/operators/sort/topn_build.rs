@@ -12,7 +12,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_function::scalar::FunctionExecContext;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::sort::topn_heap::{TopNBoundaryValue, TopNHeap};
 use crate::physical::properties::{MemoryClass, RequiredProperties};
 use crate::physical::specs::TopNSpec;
@@ -21,7 +21,7 @@ use crate::runtime::context::{
     OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
 };
 use crate::runtime::sink::{
-    FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SingleTaskFinishDriver, SinkPoll,
+    FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
 };
 use crate::runtime::state::{BreakerHandleGlobal, SinkGlobal, SinkLocal, TopNBuildSinkLocal};
 use crate::runtime::ExpressionEvalInput;
@@ -80,7 +80,10 @@ impl TopNBuildSinkExec {
                 topn_memory_context(ctx.query),
             ),
             boundary: global.handle.boundary()?,
-            order_executor: ExpressionExecutor::with_expressions(&order_exprs),
+            order_executor: ExpressionExecutor::with_expressions_for_session(
+                &order_exprs,
+                ctx.query.session.as_ref(),
+            ),
             sort_chunk: Chunk::try_initialize(
                 order_types.as_ref(),
                 VECTOR_SIZE,
@@ -120,11 +123,11 @@ impl TopNBuildSinkExec {
                 .sort_chunk
                 .try_reset(local.sort_chunk.allocator().clone())?;
         }
-        local.order_executor.execute_all_into_with_input(
-            ExpressionEvalInput {
+        local.order_executor.execute_all_kernel(
+            VectorKernelInput::from_eval_input(ExpressionEvalInput {
                 params: ctx.query.params.as_ref(),
                 columns: input,
-            },
+            }),
             ctx.query,
             &mut local.sort_chunk,
         )?;
@@ -175,7 +178,7 @@ impl TopNBuildSinkExec {
             ));
         };
         let handle = global.handle.clone();
-        Ok(FinishWork::Parallel(SingleTaskFinishDriver::group(
+        Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
             "topn_seal",
             MemoryClass::Blocking,
             move |_ctx| handle.seal(),

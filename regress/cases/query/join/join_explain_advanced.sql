@@ -8,10 +8,10 @@ DROP TABLE IF EXISTS join_explain_piecewise_l;
 DROP TABLE IF EXISTS join_explain_piecewise_r;
 
 -- @setup
-DROP TABLE IF EXISTS join_explain_ie_l;
+DROP TABLE IF EXISTS join_explain_sort_range_l;
 
 -- @setup
-DROP TABLE IF EXISTS join_explain_ie_r;
+DROP TABLE IF EXISTS join_explain_sort_range_r;
 
 -- @setup
 DROP TABLE IF EXISTS join_explain_hash_l;
@@ -67,44 +67,44 @@ JOIN join_explain_piecewise_r AS r ON l.id < r.id
 FORMAT JSON;
 
 -- @setup
-CREATE TABLE join_explain_ie_l (x INT);
+CREATE TABLE join_explain_sort_range_l (x INT);
 
 -- @setup
-CREATE TABLE join_explain_ie_r (lo INT, hi INT);
+CREATE TABLE join_explain_sort_range_r (lo INT, hi INT);
 
-INSERT INTO join_explain_ie_l VALUES (2), (5), (9);
+INSERT INTO join_explain_sort_range_l VALUES (2), (5), (9);
 
-INSERT INTO join_explain_ie_r VALUES (1, 3), (4, 6), (7, 10);
+INSERT INTO join_explain_sort_range_r VALUES (1, 3), (4, 6), (7, 10);
 
 EXPLAIN
 SELECT l.x, r.lo, r.hi
-FROM join_explain_ie_l AS l
-JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi;
+FROM join_explain_sort_range_l AS l
+JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;
 
 EXPLAIN (VERBOSE)
 SELECT l.x, r.lo, r.hi
-FROM join_explain_ie_l AS l
-JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi;
+FROM join_explain_sort_range_l AS l
+JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;
 
 -- @query json
 EXPLAIN
 SELECT l.x, r.lo, r.hi
-FROM join_explain_ie_l AS l
-JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi
+FROM join_explain_sort_range_l AS l
+JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi
 FORMAT JSON;
 
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE
 SELECT l.x, r.lo, r.hi
-FROM join_explain_ie_l AS l
-JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi;
+FROM join_explain_sort_range_l AS l
+JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;
 
 -- @query json
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE
 SELECT l.x, r.lo, r.hi
-FROM join_explain_ie_l AS l
-JOIN join_explain_ie_r AS r ON l.x BETWEEN r.lo AND r.hi
+FROM join_explain_sort_range_l AS l
+JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi
 FORMAT JSON;
 
 -- @setup
@@ -202,10 +202,10 @@ DROP TABLE IF EXISTS join_explain_piecewise_l;
 DROP TABLE IF EXISTS join_explain_piecewise_r;
 
 -- @teardown
-DROP TABLE IF EXISTS join_explain_ie_l;
+DROP TABLE IF EXISTS join_explain_sort_range_l;
 
 -- @teardown
-DROP TABLE IF EXISTS join_explain_ie_r;
+DROP TABLE IF EXISTS join_explain_sort_range_r;
 
 -- @teardown
 DROP TABLE IF EXISTS join_explain_hash_l;

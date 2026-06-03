@@ -23,7 +23,9 @@ pub use adapter::{
     MaterializedSourceGlobal, MaterializedSourceLocal,
 };
 pub use aggregate::{
-    single_state_addresses, AggregateHandle, AggregateRuntimeState, HashAggregateRuntimeState,
+    single_state_addresses, AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer,
+    AggregateHandle, AggregateLocalBuildCompactionReclaimer, AggregateLocalPayloadSpillReclaimer,
+    AggregateLocalStateSpillReclaimer, AggregateRuntimeState, HashAggregateRuntimeState,
     PerfectHashAggregateRuntimeState, UngroupedAggregateRuntimeState,
 };
 pub use cleanup::{CleanupReason, CleanupState, CleanupStatus, RuntimeCleanup};
@@ -31,8 +33,10 @@ pub use cte::CteHandle;
 pub use delim::DelimHandle;
 pub use external_table::ExternalTableHandle;
 pub use join::{
-    CompletionLatch, JoinBuildHandle, JoinBuildId, JoinBuildMode, JoinBuildStats,
-    JoinExternalModeConfig, JoinPartitionSet, JoinSpillState, ProbeSpillSet,
+    choose_hash_join_radix_bits, CompletionLatch, HashJoinBuildSpillReclaimer,
+    HashJoinLocalBuildSpillReclaimer, JoinBuildHandle, JoinBuildId, JoinBuildMode,
+    JoinBuildSpillBuffer, JoinBuildStats, JoinExternalModeConfig, JoinPartitionSet,
+    JoinProbeSpillBuffer, JoinRuntimeFilterSketch, JoinSpillState, JoinSpillStats, ProbeSpillSet,
 };
 pub use materialized::{FoundBits, MaterializedHandle};
 pub use recursive::{RecursiveDedupSet, RecursiveTableHandle};
@@ -44,5 +48,7 @@ pub use set_operation::SetOperationHandle;
 pub use shared_sink::{
     SharedSinkCoordinator, SharedSinkMergeEvent, SharedSinkProducerIndex, SharedSinkState,
 };
-pub use sort::{SortHandle, SortSealedState, TopNHandle, TopNRuntimeState};
+pub use sort::{
+    SortHandle, SortPendingRunsReclaimer, SortSealedState, TopNHandle, TopNRuntimeState,
+};
 pub use window::WindowHandle;

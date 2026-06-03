@@ -80,33 +80,28 @@ fn role_files_do_not_reabsorb_domain_helpers() {
 }
 
 #[test]
-fn sorting_state_compat_layer_stays_out_of_typed_runtime() {
+fn old_sorting_state_compat_layer_is_gone() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let lib = read(&manifest, "src/lib.rs");
     assert!(
-        lib.contains("pub(crate) mod operator_state;")
-            && !lib.contains("pub mod operator_state;"),
-        "operator_state must stay crate-private; it is a sorting compatibility layer, not public runtime API"
+        !contains_operator_state_boundary(&lib),
+        "operator_state compatibility module must not re-enter typed runtime"
     );
 
-    let allowed_suffixes = [
-        "src/lib.rs",
-        "src/operator_state.rs",
-        "src/sorting/sort.rs",
-        "src/sorting/sorted_run_merger.rs",
-    ];
     for file in rust_files(manifest.join("src")) {
         let text = fs::read_to_string(&file).expect("read rust source");
-        if !text.contains("operator_state") {
-            continue;
-        }
-        let path = file.to_string_lossy();
         assert!(
-            allowed_suffixes.iter().any(|suffix| path.ends_with(suffix)),
-            "{} imports operator_state outside the sorting compatibility boundary",
+            !contains_operator_state_boundary(&text),
+            "{} reintroduced operator_state compatibility boundary",
             file.display()
         );
     }
+}
+
+fn contains_operator_state_boundary(text: &str) -> bool {
+    text.contains("mod operator_state")
+        || text.contains("crate::operator_state")
+        || text.contains("::operator_state::")
 }
 
 fn read(root: &Path, rel: &str) -> String {

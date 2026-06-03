@@ -7,16 +7,20 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
+use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::operator::join::{JoinCondition, JoinType};
-use paro_storage::row::RowScanState;
 
 use crate::expression_executor::executor::ExpressionExecutor;
-use crate::join_hashtable::join_hashtable::{JoinHashTable, JoinHashTableConfig};
-use crate::operators::join::hash::runtime::{
-    emit_empty_build_probe_result, evaluate_join_keys_into, hash_join_memory_context,
-    join_key_types, probe_input_from_spill_chunk_into, scan_hash_join_results, JoinKeySide,
+use crate::join_hashtable::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};
+use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types, JoinKeySide};
+use crate::operators::join::hash::memory::hash_join_memory_context;
+use crate::operators::join::hash::probe_output::{
+    emit_empty_build_probe_result, scan_hash_join_results,
+};
+use crate::operators::join::hash::spill::probe_input_from_spill_chunk_into;
+use crate::operators::join::join_result_helpers::{
+    construct_right_outer_scan_result, construct_semi_join_result,
 };
 use crate::operators::output::ensure_source_output;
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
@@ -50,7 +54,7 @@ impl HashJoinSpillReplaySourceExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
         Ok(SourceLocal::HashJoinSpillReplay(
@@ -59,7 +63,12 @@ impl HashJoinSpillReplaySourceExec {
                 probe_key_executors: self
                     .conditions
                     .iter()
-                    .map(|condition| ExpressionExecutor::new(&condition.left))
+                    .map(|condition| {
+                        ExpressionExecutor::with_expressions_for_session(
+                            std::slice::from_ref(&condition.left),
+                            ctx.query.session.as_ref(),
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 current: None,
@@ -111,12 +120,22 @@ impl HashJoinSpillReplaySourceExec {
                 continue;
             }
 
-            let scanned = current.probe_rows.scan_with_state(
-                &mut current.probe_scan_state,
-                &mut current.probe_spill_chunk,
-            )?;
-            if scanned == 0 {
+            if current.probe_exhausted {
+                let count = self.scan_current_unmatched(current, output)?;
+                if count > 0 {
+                    return Ok(SourcePoll::Output);
+                }
                 local.current = None;
+                continue;
+            }
+
+            let Some(probe_cursor) = current.probe_cursor.as_mut() else {
+                current.probe_exhausted = true;
+                continue;
+            };
+            let scanned = probe_cursor.next_chunk(&mut current.probe_spill_chunk)?;
+            if scanned == 0 {
+                current.probe_exhausted = true;
                 continue;
             }
             current.probe_spill_chunk.try_set_cardinality(scanned)?;
@@ -129,7 +148,7 @@ impl HashJoinSpillReplaySourceExec {
                 .probe_input
                 .as_ref()
                 .ok_or_else(|| paro_error::internal("hash join replay input chunk missing"))?;
-            if current.hash_table.is_empty() {
+            if current.hash_table.is_empty() && self.join_type != JoinType::Mark {
                 let emitted = emit_empty_build_probe_result(
                     self.join_type,
                     &replay_input,
@@ -185,13 +204,13 @@ impl HashJoinSpillReplaySourceExec {
             JoinHashTableConfig::default(),
             hash_join_memory_context(ctx.query),
         ));
+        hash_table.set_has_null(template.has_null_keys());
 
-        let mut build_scan = RowScanState::default();
+        let partition_idx = partition.partition_idx;
+        let mut build_cursor = partition.build_rows.into_reclaiming_scanner();
         let mut build_chunk = Chunk::try_new(ctx.query.allocator(MemoryTag::BaseTable))?;
         loop {
-            let scanned = partition
-                .build_rows
-                .scan_with_state(&mut build_scan, &mut build_chunk)?;
+            let scanned = build_cursor.next_chunk(&mut build_chunk)?;
             if scanned == 0 {
                 break;
             }
@@ -201,16 +220,21 @@ impl HashJoinSpillReplaySourceExec {
         hash_table.refresh_count_from_data_collection();
         hash_table.finalize()?;
         let scan_structure = hash_table.create_scan_structure()?;
+        let probe_cursor = partition
+            .probe_rows
+            .map(|probe_rows| probe_rows.into_reclaiming_scanner());
+        let probe_exhausted = probe_cursor.is_none();
         Ok(Some(HashJoinSpillReplayPartitionLocal {
-            partition_idx: partition.partition_idx,
+            partition_idx,
             hash_table,
-            probe_rows: partition.probe_rows,
-            probe_scan_state: RowScanState::default(),
+            probe_cursor,
             probe_spill_chunk: Chunk::try_new(ctx.query.allocator(MemoryTag::BaseTable))?,
             probe_input: None,
             probe_keys: None,
             scan_structure,
             probe_in_progress: false,
+            probe_exhausted,
+            unmatched_scan_state: None,
         }))
     }
 
@@ -242,5 +266,68 @@ impl HashJoinSpillReplaySourceExec {
             current.probe_in_progress = false;
         }
         Ok(count)
+    }
+
+    fn scan_current_unmatched(
+        &self,
+        current: &mut HashJoinSpillReplayPartitionLocal,
+        output: &mut Chunk,
+    ) -> Result<usize> {
+        if !matches!(
+            self.join_type,
+            JoinType::Right | JoinType::Outer | JoinType::RightSemi | JoinType::RightAnti
+        ) {
+            output.try_set_cardinality(0)?;
+            return Ok(0);
+        }
+
+        ensure_source_output(output, &self.output_types, VECTOR_SIZE)?;
+        let scan_state = current
+            .unmatched_scan_state
+            .get_or_insert_with(FullOuterScanState::new);
+        let emit_found = matches!(self.join_type, JoinType::RightSemi);
+        let mut build_chunk = Chunk::try_initialize(
+            &current.hash_table.build_types,
+            VECTOR_SIZE,
+            output.allocator().clone(),
+        )?;
+        let count = current
+            .hash_table
+            .scan_full_outer(scan_state, emit_found, &mut build_chunk)?;
+        if count == 0 {
+            output.try_set_cardinality(0)?;
+            return Ok(0);
+        }
+
+        let build_sel = SelectionVector::try_incremental(count, output.allocator().clone())?;
+        match self.join_type {
+            JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
+                &build_chunk,
+                &build_sel,
+                count,
+                &self.left_output_types(),
+                &self.right_projection,
+                output,
+            )?,
+            JoinType::RightSemi | JoinType::RightAnti => construct_semi_join_result(
+                &build_chunk,
+                &build_sel,
+                count,
+                &self.right_projection,
+                output,
+            )?,
+            _ => unreachable!("checked build-propagating join types above"),
+        }
+        Ok(count)
+    }
+
+    fn left_output_types(&self) -> Vec<LogicalType> {
+        if self.left_projection.is_empty() {
+            return self.probe_types.to_vec();
+        }
+        self.left_projection
+            .iter()
+            .map(|idx| self.probe_types[*idx].clone())
+            .collect()
     }
 }

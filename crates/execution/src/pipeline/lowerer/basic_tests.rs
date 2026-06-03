@@ -135,12 +135,12 @@ fn topn_lowers_to_build_emit_breaker_pipelines() {
 }
 
 #[test]
-fn hash_join_lowers_in_memory_without_spill_replay_pipeline() {
+fn hash_join_lowers_replay_fence_for_memory_triggered_external_fallback() {
     let plan = hash_join_plan(JoinType::Inner);
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
-    assert_eq!(graph.pipelines.len(), 2);
+    assert_eq!(graph.pipelines.len(), 3);
     assert!(matches!(
         graph.pipelines[0].sink,
         SinkSpec::HashJoinBuild(_)
@@ -149,12 +149,16 @@ fn hash_join_lowers_in_memory_without_spill_replay_pipeline() {
         graph.pipelines[1].transforms.as_slice(),
         [TransformSpec::HashJoinProbe(_)]
     ));
-    assert!(!graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.source, SourceSpec::HashJoinSpillReplay(_))));
-    assert_eq!(graph.dependencies.len(), 1);
+    assert!(matches!(
+        graph.pipelines[2].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert_eq!(graph.dependencies.len(), 2);
     assert_eq!(graph.dependencies[0].kind, DependencyKind::BuildBeforeProbe);
+    assert_eq!(
+        graph.dependencies[1].kind,
+        DependencyKind::ProbeBeforeSpillReplay
+    );
     assert_eq!(graph.handles.len(), 1);
 }
 
@@ -164,6 +168,7 @@ fn forced_external_hash_join_keeps_spill_replay_pipeline() {
         JoinType::Inner,
         PlanBuildContext {
             force_external: true,
+            rowset_scan_pushdown: true,
         },
     );
     let mut lowerer = PipelineLowerer::new(&plan);
@@ -217,7 +222,7 @@ fn projected_cross_product_folds_into_hash_join_probe_chain() {
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
-    assert_eq!(graph.pipelines.len(), 3);
+    assert_eq!(graph.pipelines.len(), 4);
     assert!(graph
         .pipelines
         .iter()
@@ -234,11 +239,11 @@ fn projected_cross_product_folds_into_hash_join_probe_chain() {
             TransformSpec::HashJoinProbe(_)
         ]
     ));
-    assert!(!graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.source, SourceSpec::HashJoinSpillReplay(_))));
-    assert_eq!(graph.dependencies.len(), 2);
+    assert!(matches!(
+        graph.pipelines[3].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert_eq!(graph.dependencies.len(), 3);
     assert_eq!(
         graph
             .dependencies
@@ -247,7 +252,15 @@ fn projected_cross_product_folds_into_hash_join_probe_chain() {
             .count(),
         2
     );
-    assert!(!graph
+    assert_eq!(
+        graph
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.kind == DependencyKind::ProbeBeforeSpillReplay)
+            .count(),
+        1
+    );
+    assert!(graph
         .dependencies
         .iter()
         .any(|dependency| dependency.kind == DependencyKind::ProbeBeforeSpillReplay));
@@ -314,6 +327,27 @@ fn right_nested_loop_join_lowers_unmatched_emit_pipeline() {
         .dependencies
         .iter()
         .any(|dependency| dependency.kind == DependencyKind::FinalizeBeforeEmit));
+}
+
+#[test]
+fn sort_range_join_lowers_to_sort_range_probe_pipeline() {
+    let plan = sort_range_join_plan(JoinType::Inner);
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 2);
+    assert!(graph
+        .pipelines
+        .iter()
+        .any(|pipeline| matches!(pipeline.sink, SinkSpec::Materialize(_))));
+    assert!(graph.pipelines.iter().any(|pipeline| matches!(
+        pipeline.transforms.as_slice(),
+        [TransformSpec::SortRangeJoinProbe(_)]
+    )));
+    assert!(graph
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.kind == DependencyKind::BuildBeforeProbe));
 }
 
 #[test]

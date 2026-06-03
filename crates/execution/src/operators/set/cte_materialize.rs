@@ -10,7 +10,7 @@ use crate::physical::properties::{MemoryClass, RequiredProperties};
 use crate::runtime::breaker::{CteHandle, HandleRef};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{
-    FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SingleTaskFinishDriver, SinkPoll,
+    FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
 };
 use crate::runtime::state::{BreakerHandleGlobal, CteMaterializeSinkLocal, SinkGlobal, SinkLocal};
 
@@ -94,7 +94,7 @@ impl CteMaterializeSinkExec {
             ));
         };
         let handle = global.handle.clone();
-        Ok(FinishWork::Parallel(SingleTaskFinishDriver::group(
+        Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
             "cte_materialize_seal",
             MemoryClass::Blocking,
             move |_ctx| handle.seal(),

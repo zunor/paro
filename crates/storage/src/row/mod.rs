@@ -3,16 +3,24 @@
 
 //! Execution-time row storage.
 //!
-//! This module is the sealed row-buffer kernel used by operators while a query is
-//! running. It is intentionally separate from `crate::rowset`, which is the
-//! persistent Tablet Rowset/Segment storage format. A `RowStoreBuilder` owns
-//! append-time regions; sealing it produces an immutable `RowStore` whose
-//! `RowAddr` handles stay stable for the store lifetime.
+//! This module is the sealed row-buffer kernel used when an execution operator
+//! must retain rows across batches: spill/replay, retained varlen payloads, sort
+//! run materialization, and late gather. It is intentionally separate from
+//! `crate::rowset`, which is the persistent Tablet Rowset/Segment storage
+//! format. High-frequency columnar pipeline intermediates should stay in
+//! `Chunk`/`Vector` form instead of defaulting to row-store materialization.
+//!
+//! A `RowStoreBuilder` owns append-time regions; sealing it produces an
+//! immutable `RowStore` whose `RowAddr` handles stay stable for the store
+//! lifetime. Store-level ordinals are `u64` and region-local metadata remains
+//! compact, so external/spill users are not capped by a single `u32` ordinal
+//! namespace.
 
 mod addr;
 mod block;
 mod builder;
 pub mod codec;
+pub mod format;
 mod layout;
 mod partition;
 mod pin;
@@ -24,10 +32,14 @@ mod store;
 
 pub use addr::RowAddr;
 pub use builder::{RowAppender, RowStoreBuilder};
+pub use format::{
+    RowFormat, RowFormatHandle, RowSpillReader, RowSpillWriter, RowStoreSpillReader,
+    RowStoreSpillWriter,
+};
 pub use layout::{RowLayout, RowValidityType};
 pub use partition::{RadixPartitionedRows, RadixPartitionedRowsBuilder, RadixPartitioning};
 pub use pinned::{PinnedRow, PinnedRows};
-pub use scan::{RowScanCursor, RowScanState};
+pub use scan::{ReclaimingRowScanCursor, RowScanCursor, RowScanState};
 pub use store::{Ordering, PrefixReleasableRowStore, ReclaimableRowStore, RowStore};
 
 #[cfg(test)]
@@ -191,7 +203,7 @@ mod tests {
     fn sealed_store_pins_ordinals_in_caller_order() {
         let store = build_store();
         let pinned = store
-            .pin_ordinals(&[2, 0, 3, 1], Ordering::Arbitrary)
+            .pin_ordinals(&[2_u64, 0, 3, 1], Ordering::Arbitrary)
             .unwrap();
 
         let mut output = test_chunk_with_capacity(store.layout().types(), 4);
@@ -238,7 +250,7 @@ mod tests {
 
         assert_eq!(store.physical_release_frontier(), first_block_rows);
         assert!(store.pin_ordinal_range(0, 1).is_err());
-        assert!(store.pin_ordinal_range(first_block_rows as u32, 1).is_ok());
+        assert!(store.pin_ordinal_range(first_block_rows as u64, 1).is_ok());
     }
 
     #[test]
@@ -323,6 +335,22 @@ mod tests {
             consumed += right.next_chunk(&mut chunk).unwrap();
         }
         assert_eq!(store.reclaimed_scan_chunk_prefix(), 1);
+    }
+
+    #[test]
+    fn owned_reclaiming_scanner_reclaims_without_borrowed_store() {
+        let store = build_large_store(70_000).into_reclaimable();
+        let first_block_rows = store.scan_chunks()[0].row_count as usize;
+        let mut scanner = store.into_reclaiming_scanner();
+        let mut chunk = test_chunk_with_capacity(&[LogicalType::Integer], VECTOR_SIZE);
+        let mut consumed = 0usize;
+
+        while consumed < first_block_rows {
+            consumed += scanner.next_chunk(&mut chunk).unwrap();
+        }
+
+        assert_eq!(consumed, first_block_rows);
+        assert_eq!(scanner.reclaimed_scan_chunk_prefix(), 1);
     }
 
     #[test]

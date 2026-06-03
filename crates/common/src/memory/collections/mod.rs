@@ -11,7 +11,7 @@ mod vec;
 
 pub use bytes::AccountedBytesMut;
 pub use hash_map::AccountedHashMap;
-pub use hash_set::AccountedHashSet;
+pub use hash_set::{AccountedHashSet, PrecomputedHashBuildHasher};
 pub use string::AccountedString;
 pub use vec::AccountedVec;
 

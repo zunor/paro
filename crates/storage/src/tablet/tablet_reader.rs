@@ -60,23 +60,26 @@ impl RowsetCursor {
         projection: &[ColumnId],
         params: &TabletReaderParams,
     ) -> Result<Self> {
-        // Ensure segments are loaded and protect rowset from deletion during read
-        if let Some(opts) = &params.segment_options {
-            rowset.load_with_options(opts.clone())?;
-        } else {
-            rowset.load()?;
+        // Ensure segments are loaded and protect rowset from deletion during read.
+        // Segment-granular rowset scans pass the already-loaded segment handle
+        // through TabletReaderParams to avoid rebuilding a cursor over every
+        // segment in the rowset for each morsel.
+        if params.segment.is_none() {
+            if let Some(opts) = &params.segment_options {
+                rowset.load_with_options(opts.clone())?;
+            } else {
+                rowset.load()?;
+            }
         }
         rowset.acquire();
 
-        let segments = rowset.segments();
+        let segments = if let Some(segment) = &params.segment {
+            vec![Arc::clone(segment)]
+        } else {
+            rowset.segments()
+        };
         let mut segment_iters = Vec::with_capacity(segments.len());
         for seg in segments {
-            if let Some(target_seg_id) = params.segment_id {
-                if seg.segment_id() != target_seg_id {
-                    continue;
-                }
-            }
-
             let col_ids: Vec<ColumnId> = if params.projection.is_none() && projection.is_empty() {
                 seg.footer()
                     .column_metas
@@ -438,33 +441,44 @@ impl TabletReader {
             }
 
             // Fetch next batch from current rowset/segment
-            let (rowids, batch_v, segment_finished, rowset_id, segment_id) = {
+            let (rowids, batch_v, batch_rows, segment_finished, rowset_id, segment_id) = {
                 let cursor = self.current_cursor.as_mut().unwrap();
                 let rowset_id = cursor.rowset.rowset_id();
 
                 if cursor.is_finished() {
-                    (Vec::new(), Vec::new(), true, rowset_id, 0)
+                    (Vec::new(), Vec::new(), 0, true, rowset_id, 0)
                 } else {
                     let iter = cursor.next_iter().expect("segment iterator must exist");
                     let segment_id = iter.segment_id();
-                    let (rowids, batch) = iter.next_batch(self.params.batch_size)?;
+                    // If the iterator read fewer columns than the final projection,
+                    // build_chunk must gather the missing columns via base rowids.
+                    let materialize_rowids =
+                        self.params.emit_row_id || iter.num_columns() < self.projection.len();
+                    let segment_batch = iter
+                        .next_batch_with_rowid_policy(self.params.batch_size, materialize_rowids)?;
                     let finished = !iter.has_next();
-                    (rowids, batch, finished, rowset_id, segment_id)
+                    (
+                        segment_batch.rowids,
+                        segment_batch.columns,
+                        segment_batch.rows,
+                        finished,
+                        rowset_id,
+                        segment_id,
+                    )
                 }
             };
 
-            let rows_read = rowids.len();
             let batch = batch_v;
 
             // If no more segments in this rowset, advance to next rowset
-            if rows_read == 0 && batch.is_empty() && segment_finished {
+            if batch_rows == 0 && batch.is_empty() && segment_finished {
                 self.state.current_rowset_idx += 1;
                 self.current_cursor = None;
                 continue;
             }
 
             // Infer row count (verifies against expected)
-            let rows = self.infer_row_count(&batch, rows_read)?;
+            let rows = self.infer_row_count(&batch, batch_rows)?;
 
             if rows == 0 {
                 // Empty batch – advance segment and continue

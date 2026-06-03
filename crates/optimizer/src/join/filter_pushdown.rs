@@ -15,9 +15,12 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+    ColumnRefExpression, ComparisonExpression, ComparisonType, ConjunctionType, ConstantExpression,
+    Expression,
 };
-use paro_planner::operator::{ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator};
+use paro_planner::operator::{
+    ColumnBinding, CrossProduct, Filter, Join, JoinComparisonType, JoinType, LogicalOperator,
+};
 use paro_planner::plan::LogicalPlan;
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,10 @@ impl JoinFilterPushdown {
                 }
                 other => LogicalOperator::Join(other),
             },
+            LogicalOperator::Filter(mut filter) => {
+                self.try_pushdown_cross_product_filters(&mut filter);
+                LogicalOperator::Filter(filter)
+            }
             other => other,
         }
     }
@@ -126,6 +133,155 @@ impl JoinFilterPushdown {
         }
     }
 
+    fn try_pushdown_cross_product_filters(&self, filter: &mut Filter) {
+        let LogicalOperator::Join(Join::Cross(cross)) = &mut filter.child.operator else {
+            return;
+        };
+        for expr in &filter.expressions {
+            self.try_pushdown_cross_product_filter_expr(cross, expr);
+        }
+    }
+
+    fn try_pushdown_cross_product_filter_expr(&self, cross: &mut CrossProduct, expr: &Expression) {
+        match expr {
+            Expression::Conjunction(conj) if conj.conjunction_type == ConjunctionType::And => {
+                for child in &conj.children {
+                    self.try_pushdown_cross_product_filter_expr(cross, child);
+                }
+            }
+            Expression::Comparison(cmp) if cmp.comparison_type == ComparisonType::Equal => {
+                self.try_pushdown_cross_product_equality(cross, &cmp.left, &cmp.right);
+            }
+            _ => {}
+        }
+    }
+
+    fn try_pushdown_cross_product_equality(
+        &self,
+        cross: &mut CrossProduct,
+        left_expr: &Expression,
+        right_expr: &Expression,
+    ) {
+        if self.try_pushdown_cross_product_binding_equality(cross, left_expr, right_expr) {
+            return;
+        }
+
+        let left_width = cross.left.types().len();
+        let Some(left_idx) = Self::extract_cross_product_output_index(left_expr) else {
+            return;
+        };
+        let Some(right_idx) = Self::extract_cross_product_output_index(right_expr) else {
+            return;
+        };
+
+        let left_from_probe = left_idx < left_width && right_idx >= left_width;
+        let right_from_probe = right_idx < left_width && left_idx >= left_width;
+        let Some((probe_op, probe_idx, build_op, build_idx)) = (if left_from_probe {
+            Some((
+                cross.left.as_mut(),
+                left_idx,
+                cross.right.as_ref(),
+                right_idx - left_width,
+            ))
+        } else if right_from_probe {
+            Some((
+                cross.left.as_mut(),
+                right_idx,
+                cross.right.as_ref(),
+                left_idx - left_width,
+            ))
+        } else {
+            None
+        }) else {
+            return;
+        };
+
+        let Some(probe_target) = Self::resolve_get_output_binding(&probe_op.operator, probe_idx)
+        else {
+            return;
+        };
+        let Some(build_target) = Self::resolve_get_output_binding(&build_op.operator, build_idx)
+        else {
+            return;
+        };
+        let _ = self.install_runtime_filters(&mut probe_op.operator, &probe_target, &build_target);
+    }
+
+    fn try_pushdown_cross_product_binding_equality(
+        &self,
+        cross: &mut CrossProduct,
+        left_expr: &Expression,
+        right_expr: &Expression,
+    ) -> bool {
+        let Some(left_binding) = Self::extract_filter_column_binding(left_expr) else {
+            return false;
+        };
+        let Some(right_binding) = Self::extract_filter_column_binding(right_expr) else {
+            return false;
+        };
+
+        if let (Some(probe_target), Some(build_target)) = (
+            Self::resolve_get_binding(&cross.left.operator, left_binding),
+            Self::resolve_get_binding(&cross.right.operator, right_binding),
+        ) {
+            return self.install_runtime_filters(
+                &mut cross.left.operator,
+                &probe_target,
+                &build_target,
+            );
+        }
+
+        if let (Some(probe_target), Some(build_target)) = (
+            Self::resolve_get_binding(&cross.left.operator, right_binding),
+            Self::resolve_get_binding(&cross.right.operator, left_binding),
+        ) {
+            return self.install_runtime_filters(
+                &mut cross.left.operator,
+                &probe_target,
+                &build_target,
+            );
+        }
+
+        false
+    }
+
+    fn extract_filter_column_binding(expr: &Expression) -> Option<ColumnBinding> {
+        match expr {
+            Expression::ColumnRef(col_ref) if col_ref.depth == 0 => Some(col_ref.binding),
+            Expression::Cast(cast) => Self::extract_filter_column_binding(cast.child.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn install_runtime_filters(
+        &self,
+        probe_op: &mut LogicalOperator,
+        probe_target: &ResolvedGetBinding,
+        build_target: &ResolvedGetBinding,
+    ) -> bool {
+        let Some((build_min, build_max)) = self.read_build_min_max(build_target) else {
+            return false;
+        };
+
+        let runtime_filters = Self::build_runtime_filter_expressions(
+            probe_target,
+            Self::cast_value(build_min, &probe_target.logical_type),
+            Self::cast_value(build_max, &probe_target.logical_type),
+        );
+        if runtime_filters.is_empty() {
+            return false;
+        }
+        Self::append_runtime_filters(probe_op, probe_target, &runtime_filters)
+    }
+
+    fn extract_cross_product_output_index(expr: &Expression) -> Option<usize> {
+        match expr {
+            Expression::Reference(reference) => Some(reference.index),
+            Expression::Cast(cast) => Self::extract_cross_product_output_index(cast.child.as_ref()),
+            _ => None,
+        }
+    }
+
     fn resolve_get_binding(
         op: &LogicalOperator,
         binding: ColumnBinding,
@@ -169,6 +325,64 @@ impl JoinFilterPushdown {
             LogicalOperator::EmptyResult(empty) => {
                 Self::resolve_get_binding(&empty.child.operator, binding)
             }
+            _ => None,
+        }
+    }
+
+    fn resolve_get_output_binding(
+        op: &LogicalOperator,
+        output_idx: usize,
+    ) -> Option<ResolvedGetBinding> {
+        match op {
+            LogicalOperator::Get(get) => {
+                let physical_column_id = *get.column_ids.get(output_idx)?;
+                let logical_type = get.column_types.get(output_idx)?.clone();
+                Some(ResolvedGetBinding {
+                    table_index: get.table_index,
+                    column_index: output_idx,
+                    physical_column_id,
+                    logical_type,
+                    table: get.table.clone(),
+                })
+            }
+            LogicalOperator::Projection(proj) => {
+                let expr = proj.expressions.get(output_idx)?;
+                Self::resolve_get_expression_binding(&proj.child.operator, expr)
+            }
+            LogicalOperator::Filter(filter) => {
+                Self::resolve_get_output_binding(&filter.child.operator, output_idx)
+            }
+            LogicalOperator::Limit(limit) => {
+                Self::resolve_get_output_binding(&limit.child.operator, output_idx)
+            }
+            LogicalOperator::Order(order) => {
+                Self::resolve_get_output_binding(&order.child.operator, output_idx)
+            }
+            LogicalOperator::TopN(topn) => {
+                Self::resolve_get_output_binding(&topn.child.operator, output_idx)
+            }
+            LogicalOperator::Distinct(distinct) => {
+                Self::resolve_get_output_binding(&distinct.child.operator, output_idx)
+            }
+            LogicalOperator::EmptyResult(empty) => {
+                Self::resolve_get_output_binding(&empty.child.operator, output_idx)
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_get_expression_binding(
+        op: &LogicalOperator,
+        expr: &Expression,
+    ) -> Option<ResolvedGetBinding> {
+        match expr {
+            Expression::ColumnRef(col_ref) if col_ref.depth == 0 => {
+                Self::resolve_get_binding(op, col_ref.binding)
+            }
+            Expression::Reference(reference) => {
+                Self::resolve_get_output_binding(op, reference.index)
+            }
+            Expression::Cast(cast) => Self::resolve_get_expression_binding(op, cast.child.as_ref()),
             _ => None,
         }
     }

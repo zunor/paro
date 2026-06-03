@@ -1,0 +1,189 @@
+[meta]
+name = "operator_runtime_baseline"
+description = "BASELINE operator runtime baseline: scan, join, aggregate, sort, spill, and sort-range join"
+run_order = 18
+
+[params]
+scan_rows = 100000
+scan_key_space = 1000
+int_join_rows = 5000
+string_join_rows = 4000
+agg_groups = 10000
+ie_rows = 512
+memory_limit = "256MB"
+forced_memory_limit = "128MB"
+temp_directory = "/tmp/paro_benchmark_operator_runtime_baseline"
+random_seed = 20260525
+thread_count = 1
+fast_path_expected = "current-single-active-driver"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "selective_rowset_scan"
+file = "sql/q_selective_rowset_scan.sql"
+validate = "scalar_equals"
+expected = 100
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "count_filter"
+file = "sql/q_count_filter.sql"
+validate = "scalar_equals"
+expected = 50000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_scalar_comparison"
+file = "sql/q_expr_scalar_comparison.sql"
+validate = "scalar_equals"
+expected = 50000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_conjunction"
+file = "sql/q_expr_conjunction.sql"
+validate = "scalar_equals"
+expected = 25000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_cast"
+file = "sql/q_expr_cast.sql"
+validate = "scalar_equals"
+expected = 450000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_string_function"
+file = "sql/q_expr_string_function.sql"
+validate = "scalar_equals"
+expected = 4000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_in_list"
+file = "sql/q_expr_in_list.sql"
+validate = "scalar_equals"
+expected = 50000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "integer_hash_join"
+file = "sql/q_integer_hash_join.sql"
+validate = "scalar_equals"
+expected = 5000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_join_key"
+file = "sql/q_expr_join_key.sql"
+validate = "scalar_equals"
+expected = 511
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "expr_runtime_filter"
+file = "sql/q_expr_runtime_filter.sql"
+validate = "scalar_equals"
+expected = 512
+plan_contains = ["Runtime Filter"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "string_hash_join"
+file = "sql/q_string_hash_join.sql"
+validate = "scalar_equals"
+expected = 4000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "high_cardinality_aggregate"
+file = "sql/q_high_cardinality_aggregate.sql"
+validate = "scalar_equals"
+expected = 10000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "large_distinct_aggregate"
+file = "sql/q_large_distinct_aggregate.sql"
+validate = "scalar_equals"
+expected = 10000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "grouping_sets_aggregate"
+file = "sql/q_grouping_sets_aggregate.sql"
+validate = "scalar_equals"
+expected = 10011
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "ordered_aggregate"
+file = "sql/q_ordered_aggregate.sql"
+validate = "scalar_equals"
+expected = 10000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "large_sort"
+file = "sql/q_large_sort.sql"
+validate = "scalar_equals"
+expected = 5000050000
+plan_contains = ["ORDER_BY"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "forced_external_hash_join"
+file = "sql/q_forced_external_hash_join.sql"
+setup = "sql/setup_external.sql"
+teardown = "sql/teardown_external.sql"
+validate = "scalar_equals"
+expected = 5000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "sort_range_join_full"
+file = "sql/q_sort_range_join_full.sql"
+validate = "scalar_equals"
+expected = 130816
+plan_contains = ["SORT_RANGE_JOIN", "sort_range"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "sort_range_join_selective"
+file = "sql/q_sort_range_join_selective.sql"
+validate = "scalar_equals"
+expected = 127
+plan_contains = ["SORT_RANGE_JOIN", "sort_range"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "classic_ie_join_selective"
+file = "sql/q_classic_ie_join_selective.sql"
+validate = "scalar_equals"
+expected = 1912
+plan_contains = ["CLASSIC_IE_JOIN", "classic_ie_join"]
+collect_explain_profile = true
+allow_reexecute = true

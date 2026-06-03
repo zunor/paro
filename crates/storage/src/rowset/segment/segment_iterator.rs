@@ -70,6 +70,22 @@ pub struct SegmentIterator {
     prefetcher: Option<Arc<Prefetcher>>,
 }
 
+pub struct SegmentBatch {
+    pub rowids: Vec<u32>,
+    pub rows: usize,
+    pub columns: Vec<(ColumnId, ColumnBatch)>,
+}
+
+impl SegmentBatch {
+    fn empty() -> Self {
+        Self {
+            rowids: Vec::new(),
+            rows: 0,
+            columns: Vec::new(),
+        }
+    }
+}
+
 impl SegmentIterator {
     pub(super) fn new(segment: &Segment, column_ids: Vec<ColumnId>) -> Result<Self> {
         Self::new_with_prefetcher(segment, column_ids, None)
@@ -165,7 +181,18 @@ impl SegmentIterator {
     ) -> Result<()> {
         if let Some(tree) = predicate_tree {
             let evaluator = IndexEvaluator::new(segment.predicate_indexes());
+            let needs_row_level_eval =
+                PredicateEvaluator::predicate_tree_requires_row_verification(&tree)
+                    || PredicateEvaluator::requires_row_level_predicate_eval(&evaluator, &tree);
             self.evaluated_selection = evaluator.evaluate(&tree);
+            if needs_row_level_eval {
+                if !matches!(
+                    self.evaluated_selection,
+                    PredicateResult::NoneMatch | PredicateResult::AllMatch
+                ) {
+                    self.evaluated_selection = PredicateResult::Unknown;
+                }
+            }
             self.update_selection_tracker();
             self.predicate_evaluator = PredicateEvaluator::new(
                 segment,
@@ -229,6 +256,15 @@ impl SegmentIterator {
         &mut self,
         batch_size: usize,
     ) -> Result<(Vec<u32>, Vec<(ColumnId, ColumnBatch)>)> {
+        let batch = self.next_batch_with_rowid_policy(batch_size, true)?;
+        Ok((batch.rowids, batch.columns))
+    }
+
+    pub fn next_batch_with_rowid_policy(
+        &mut self,
+        batch_size: usize,
+        materialize_sequential_rowids: bool,
+    ) -> Result<SegmentBatch> {
         if self.predicate_evaluator.is_some() {
             return self.next_batch_late_materialize(batch_size);
         }
@@ -236,12 +272,12 @@ impl SegmentIterator {
         loop {
             if !self.has_next() {
                 self.rowid_tracker.reset();
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(SegmentBatch::empty());
             }
 
             if matches!(self.evaluated_selection, PredicateResult::NoneMatch) {
                 self.rowid_tracker.reset();
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(SegmentBatch::empty());
             }
 
             if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
@@ -257,7 +293,8 @@ impl SegmentIterator {
                 }
                 if !found {
                     self.current_ordinal = self.num_rows;
-                    return Ok((Vec::new(), Vec::new()));
+                    self.rowid_tracker.reset();
+                    return Ok(SegmentBatch::empty());
                 }
             }
 
@@ -300,13 +337,17 @@ impl SegmentIterator {
                         continue;
                     }
                     self.rowid_tracker.reset();
-                    return Ok((Vec::new(), Vec::new()));
+                    return Ok(SegmentBatch::empty());
                 }
 
                 if self.column_iterators.is_empty() {
                     self.rowid_tracker
                         .set(rowids.capacity() * std::mem::size_of::<u32>());
-                    return Ok((rowids, Vec::new()));
+                    return Ok(SegmentBatch {
+                        rows: rowids.len(),
+                        rowids,
+                        columns: Vec::new(),
+                    });
                 }
 
                 let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
@@ -318,7 +359,11 @@ impl SegmentIterator {
 
                 self.rowid_tracker
                     .set(rowids.capacity() * std::mem::size_of::<u32>());
-                return Ok((rowids, results));
+                return Ok(SegmentBatch {
+                    rows: rowids.len(),
+                    rowids,
+                    columns: results,
+                });
             }
 
             let start_ord = self.current_ordinal as u32;
@@ -337,7 +382,7 @@ impl SegmentIterator {
             if self.column_iterators.is_empty() {
                 let remaining = (self.num_rows - self.current_ordinal) as usize;
                 let to_read = effective_batch_size.min(remaining);
-                let rowids = if to_read == 0 {
+                let rowids = if to_read == 0 || !materialize_sequential_rowids {
                     Vec::new()
                 } else {
                     (start_ord..start_ord + to_read as u32).collect()
@@ -349,7 +394,11 @@ impl SegmentIterator {
                     self.rowid_tracker
                         .set(rowids.capacity() * std::mem::size_of::<u32>());
                 }
-                return Ok((rowids, Vec::new()));
+                return Ok(SegmentBatch {
+                    rowids,
+                    rows: to_read,
+                    columns: Vec::new(),
+                });
             }
 
             let mut results = Vec::with_capacity(self.column_iterators.len());
@@ -366,30 +415,35 @@ impl SegmentIterator {
             } else {
                 self.current_ordinal += rows_read as u64;
             }
-            let rowids: Vec<u32> = (start_ord..start_ord + rows_read as u32).collect();
+            let rowids: Vec<u32> = if materialize_sequential_rowids {
+                (start_ord..start_ord + rows_read as u32).collect()
+            } else {
+                Vec::new()
+            };
             if rowids.is_empty() {
                 self.rowid_tracker.reset();
             } else {
                 self.rowid_tracker
                     .set(rowids.capacity() * std::mem::size_of::<u32>());
             }
-            return Ok((rowids, results));
+            return Ok(SegmentBatch {
+                rowids,
+                rows: rows_read,
+                columns: results,
+            });
         }
     }
 
-    fn next_batch_late_materialize(
-        &mut self,
-        batch_size: usize,
-    ) -> Result<(Vec<u32>, Vec<(ColumnId, ColumnBatch)>)> {
+    fn next_batch_late_materialize(&mut self, batch_size: usize) -> Result<SegmentBatch> {
         loop {
             if !self.has_next() {
                 self.rowid_tracker.reset();
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(SegmentBatch::empty());
             }
 
             if matches!(self.evaluated_selection, PredicateResult::NoneMatch) {
                 self.rowid_tracker.reset();
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(SegmentBatch::empty());
             }
 
             if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
@@ -406,7 +460,7 @@ impl SegmentIterator {
                 if !found {
                     self.current_ordinal = self.num_rows;
                     self.rowid_tracker.reset();
-                    return Ok((Vec::new(), Vec::new()));
+                    return Ok(SegmentBatch::empty());
                 }
             }
 
@@ -423,7 +477,8 @@ impl SegmentIterator {
             let mut rowids = Vec::with_capacity(batch_size);
             while rowids.len() < batch_size && self.current_ordinal < max_rowid {
                 let remaining = (max_rowid - self.current_ordinal) as usize;
-                let to_read = batch_size.min(remaining);
+                let output_remaining = batch_size - rowids.len();
+                let to_read = output_remaining.min(remaining);
                 if to_read == 0 {
                     break;
                 }
@@ -482,14 +537,18 @@ impl SegmentIterator {
                     continue;
                 }
                 self.rowid_tracker.reset();
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(SegmentBatch::empty());
             }
 
             self.rowid_tracker
                 .set(rowids.capacity() * std::mem::size_of::<u32>());
 
             if self.column_iterators.is_empty() {
-                return Ok((rowids, Vec::new()));
+                return Ok(SegmentBatch {
+                    rows: rowids.len(),
+                    rowids,
+                    columns: Vec::new(),
+                });
             }
 
             let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
@@ -499,7 +558,11 @@ impl SegmentIterator {
                 results.push((*col_id, batch));
             }
 
-            return Ok((rowids, results));
+            return Ok(SegmentBatch {
+                rows: rowids.len(),
+                rowids,
+                columns: results,
+            });
         }
     }
 

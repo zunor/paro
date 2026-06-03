@@ -16,7 +16,7 @@ use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::aggregate::accounted_rows::aggregate_modifier_memory_context;
 use crate::operators::aggregate::aggregate_kernel::{
     combine_states, destroy_states, initialize_states,
@@ -24,7 +24,9 @@ use crate::operators::aggregate::aggregate_kernel::{
 use crate::operators::aggregate::aggregate_object::{create_aggregate_objects, AggregateObject};
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 use crate::operators::aggregate::grouped_aggregate_data::reference_index;
-use crate::operators::aggregate::ordered_helpers::empty_ordered_collectors;
+use paro_storage::buffer::BufferPool;
+
+use crate::operators::aggregate::ordered_helpers::empty_ordered_collectors_with_memory;
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::physical::specs::AggregateSpec;
@@ -210,11 +212,11 @@ pub(crate) fn projected_payload_chunk<'a>(
             query.allocator(MemoryTag::BaseTable),
         )?;
     }
-    executor.execute_all_into_with_input(
-        ExpressionEvalInput {
+    executor.execute_all_kernel(
+        VectorKernelInput::from_eval_input(ExpressionEvalInput {
             params: query.params.as_ref(),
             columns: input,
-        },
+        }),
         query,
         payload,
     )?;
@@ -388,6 +390,8 @@ pub(crate) fn destroy_ungrouped_local(local: &mut UngroupedAggregateSinkLocal) -
 pub(crate) fn create_ungrouped_runtime_state(
     spec: &AggregateSpec,
     allocator: Arc<dyn paro_common::allocator::Allocator>,
+    buffer_pool: Arc<BufferPool>,
+    modifier_memory: MemoryAccountingContext,
 ) -> Result<UngroupedAggregateRuntimeState> {
     if spec.grouping_key_count != 0 {
         return Err(paro_error::internal(
@@ -396,7 +400,8 @@ pub(crate) fn create_ungrouped_runtime_state(
     }
     let objects = aggregate_objects(spec)?;
     let layout = AggregateStateLayout::new(&objects)?;
-    let ordered_collectors = empty_ordered_collectors(spec, &[]);
+    let ordered_collectors =
+        empty_ordered_collectors_with_memory(spec, &[], buffer_pool, modifier_memory)?;
     let aggregate_objects = Arc::from(objects.into_boxed_slice());
     let aggregate_inputs = Arc::from(aggregate_inputs(spec).into_boxed_slice());
     let mut state_buffer = vec![0u64; state_buffer_words(layout.total_size())];
@@ -422,6 +427,7 @@ pub(crate) fn create_hash_aggregate_tables(
     spec: &AggregateSpec,
     allocator: Arc<dyn paro_common::allocator::Allocator>,
     memory: MemoryAccountingContext,
+    parallelism: usize,
 ) -> Result<Vec<AggregateHashTable>> {
     if spec.grouping_key_count == 0 {
         return Err(paro_error::internal(
@@ -431,18 +437,69 @@ pub(crate) fn create_hash_aggregate_tables(
     let objects = aggregate_objects(spec)?;
     let inputs = aggregate_inputs(spec);
     let group_types = group_types(spec);
+    let strategy = choose_hash_aggregate_table_strategy(spec, &group_types, parallelism)?;
     normalized_grouping_sets(spec)?
         .iter()
-        .map(|_| {
-            AggregateHashTable::new_flat_with_memory(
+        .map(|_| match strategy {
+            HashAggregateTableStrategy::Flat => AggregateHashTable::new_flat_with_memory(
                 group_types.clone(),
                 objects.clone(),
                 inputs.clone(),
                 allocator.clone(),
                 memory.clone(),
-            )
+            ),
+            HashAggregateTableStrategy::Radix { partition_bits } => {
+                AggregateHashTable::new_radix_with_memory(
+                    group_types.clone(),
+                    objects.clone(),
+                    inputs.clone(),
+                    partition_bits,
+                    allocator.clone(),
+                    memory.clone(),
+                )
+            }
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashAggregateTableStrategy {
+    Flat,
+    Radix { partition_bits: usize },
+}
+
+fn choose_hash_aggregate_table_strategy(
+    spec: &AggregateSpec,
+    group_types: &[LogicalType],
+    parallelism: usize,
+) -> Result<HashAggregateTableStrategy> {
+    let grouping_sets = normalized_grouping_sets(spec)?;
+    if parallelism <= 1
+        || grouping_sets.len() != 1
+        || has_aggregate_filters(spec)
+        || has_aggregate_distinct(spec)
+        || has_aggregate_ordered(spec)
+    {
+        return Ok(HashAggregateTableStrategy::Flat);
+    }
+
+    let fixed_width_groups = group_types.iter().all(|ty| {
+        !matches!(
+            ty,
+            LogicalType::Varchar
+                | LogicalType::VarcharCollation(_)
+                | LogicalType::Blob
+                | LogicalType::Json
+                | LogicalType::Jsonb
+        )
+    });
+    let wide_group_key = group_types.len() >= 2 || !fixed_width_groups;
+    if !wide_group_key && parallelism < 4 {
+        return Ok(HashAggregateTableStrategy::Flat);
+    }
+
+    let partition_bits = parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize;
+    Ok(HashAggregateTableStrategy::Radix { partition_bits })
 }
 
 /// Create a perfect hash aggregate table.

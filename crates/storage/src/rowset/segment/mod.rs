@@ -51,5 +51,5 @@ mod segment_writer;
 
 pub use segment::{Segment, SegmentMeta, SegmentOptions, SegmentSharedPtr};
 pub use segment_format::{ColumnMeta, SegmentFooter};
-pub use segment_iterator::SegmentIterator;
+pub use segment_iterator::{SegmentBatch, SegmentIterator};
 pub use segment_writer::{ColumnData, SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions};

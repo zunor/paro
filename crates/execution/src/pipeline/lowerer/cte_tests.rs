@@ -147,7 +147,7 @@ fn left_delim_join_lowers_to_correlated_subquery_region() {
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
-    assert_eq!(graph.pipelines.len(), 3);
+    assert_eq!(graph.pipelines.len(), 4);
     assert!(matches!(graph.pipelines[0].sink, SinkSpec::DelimCapture(_)));
     assert!(matches!(
         graph.pipelines[1].source,
@@ -161,10 +161,10 @@ fn left_delim_join_lowers_to_correlated_subquery_region() {
         graph.pipelines[2].transforms.as_slice(),
         [TransformSpec::HashJoinProbe(_)]
     ));
-    assert!(!graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.source, SourceSpec::HashJoinSpillReplay(_))));
+    assert!(matches!(
+        graph.pipelines[3].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
     assert_eq!(
         graph.root,
         PipelineRoot::ControlRegion(ControlRegionId::new(0))
@@ -177,9 +177,12 @@ fn left_delim_join_lowers_to_correlated_subquery_region() {
     assert_eq!(region.capture, PipelineId::new(0));
     assert_eq!(
         region.dependent_roots,
-        vec![PipelineSubgraphRoot::Pipeline(PipelineId::new(1))]
+        vec![
+            PipelineSubgraphRoot::Pipeline(PipelineId::new(1)),
+            PipelineSubgraphRoot::Pipeline(PipelineId::new(2))
+        ]
     );
-    assert_eq!(region.join, PipelineId::new(2));
+    assert_eq!(region.join, PipelineId::new(3));
     assert!(region.cached_outer.is_some());
 }
 
@@ -209,7 +212,10 @@ fn delim_join_keeps_recursive_dependent_as_control_region_root() {
     assert_eq!(region.capture, PipelineId::new(0));
     assert_eq!(
         region.dependent_roots,
-        vec![PipelineSubgraphRoot::ControlRegion(ControlRegionId::new(0))]
+        vec![
+            PipelineSubgraphRoot::ControlRegion(ControlRegionId::new(0)),
+            PipelineSubgraphRoot::Pipeline(PipelineId::new(4))
+        ]
     );
     assert_ne!(region.join, recursive.emit);
 }

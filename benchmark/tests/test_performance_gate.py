@@ -890,6 +890,7 @@ staging_until = "2026-06-30"
     def test_source_registry_is_explicit(self) -> None:
         self.assertEqual(default_registry().get("sql_suite").source_type, "sql_suite")
         self.assertEqual(default_registry().get("divan_bench").source_type, "divan_bench")
+        self.assertEqual(default_registry().get("mixed_sql_suite").source_type, "mixed_sql_suite")
         with self.assertRaisesRegex(ValueError, "unknown measurement source type"):
             SourceRegistry().get("missing")
 
@@ -901,7 +902,16 @@ staging_until = "2026-06-30"
             "crate": "paro-execution",
             "bench": "operator_runtime_dispatch",
             "benches": [
-                {"id": "a", "items": 100, "samples_ms": [3.0, 1.0, 2.0]},
+                {
+                    "id": "a",
+                    "items": 100,
+                    "samples_ms": [3.0, 1.0, 2.0],
+                    "audit": {
+                        "chunk_count": 1,
+                        "allocator_tracking_event_counts": [2, 4, 6],
+                        "allocator_tracking_events_per_chunk": [2.0, 4.0, 6.0],
+                    },
+                },
                 {"id": "b", "items": 200, "samples_ms": [10.0, 12.0]},
             ],
         }
@@ -914,6 +924,7 @@ staging_until = "2026-06-30"
         self.assertEqual(query_a["samples_count"], 3)
         self.assertEqual(query_a["stats"]["p50"], 2.0)
         self.assertEqual(query_a["stats"]["p99"], 3.0)
+        self.assertEqual(query_a["audit"]["allocator_tracking_event_counts_median"], 4.0)
 
         retried = normalize_divan_payload(
             source,

@@ -10,6 +10,7 @@ use paro_common::allocator::{Allocator, ArenaAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::VectorOperations;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
@@ -17,8 +18,9 @@ use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 
 use super::aggregate_kernel::{
     build_state_vector, combine_states, destroy_states, filtered_input_vectors_for_aggregate,
-    finalize_states, initialize_states, input_vectors_for_aggregate, update_filtered_states,
-    update_states, with_aggregate_input_data, AggregatePayload,
+    finalize_states, initialize_states, input_vectors_for_aggregate,
+    serialize_aggregate_state_blob, update_filtered_states, update_states,
+    with_aggregate_input_data, AggregatePayload,
 };
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
@@ -272,6 +274,16 @@ impl GroupedAggregateHashTable {
             .map(|layout| layout.total_width)
     }
 
+    pub fn scan_output_types(&self) -> Vec<LogicalType> {
+        let mut output_types = self.layout.group_types.clone();
+        output_types.extend(self.aggregate_return_types.clone());
+        output_types
+    }
+
+    pub fn aggregate_count(&self) -> usize {
+        self.aggregate_return_types.len()
+    }
+
     pub fn with_capacity(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -347,47 +359,7 @@ impl GroupedAggregateHashTable {
     /// Hash grouped keys using Paro vector hash implementation.
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
         self.validate_group_chunk(groups)?;
-        let count = groups.size();
-        let mut hashes = Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
-        hashes.try_set_count(count)?;
-        if count == 0 {
-            return Ok(hashes);
-        }
-
-        if self.layout.group_count() == 0 {
-            for row_idx in 0..count {
-                hashes.set_u64(row_idx, EMPTY_GROUP_HASH);
-            }
-            return Ok(hashes);
-        }
-
-        let first = groups.column(0).ok_or_else(|| {
-            paro_error::internal("Missing first group key column while hashing".to_string())
-        })?;
-        VectorOperations::hash(first.as_ref(), &mut hashes, count);
-
-        let mut column_hashes =
-            Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
-        for group_idx in 1..self.layout.group_count() {
-            let group_column = groups.column(group_idx).ok_or_else(|| {
-                paro_error::internal(format!(
-                    "Missing group key column while hashing at index {group_idx}"
-                ))
-            })?;
-            VectorOperations::hash(group_column.as_ref(), &mut column_hashes, count);
-            for row_idx in 0..count {
-                let left = hashes.get_u64(row_idx).ok_or_else(|| {
-                    paro_error::internal(format!("Missing hash value at row {row_idx}"))
-                })?;
-                let right = column_hashes.get_u64(row_idx).ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "Missing combined hash value at row {row_idx}, column {group_idx}"
-                    ))
-                })?;
-                hashes.set_u64(row_idx, combine_hash_scalar(left, right));
-            }
-        }
-        Ok(hashes)
+        hash_group_columns(groups)
     }
 
     /// Probe and insert grouped keys, returning state addresses for each input row.
@@ -407,6 +379,7 @@ impl GroupedAggregateHashTable {
             new_groups.set_len(0);
             return Ok(0);
         }
+        self.ensure_lookup_storage_available()?;
 
         self.ensure_capacity_for(groups.size())?;
         self.ensure_row_storage_capacity(groups.size())?;
@@ -706,7 +679,8 @@ impl GroupedAggregateHashTable {
     /// Returns `true` if output rows were produced, `false` when scan is complete.
     pub fn scan(&mut self, position: &mut HTScanPosition, result: &mut Chunk) -> Result<bool> {
         let group_count = self.layout.group_count();
-        let aggregate_count = self.aggregate_objects.len();
+        let aggregate_count = self.layout.aggregate_count();
+        debug_assert_eq!(aggregate_count, self.aggregate_objects.len());
         let required_columns = group_count + aggregate_count;
         if result.column_count() < required_columns {
             return Err(paro_error::internal(format!(
@@ -787,36 +761,173 @@ impl GroupedAggregateHashTable {
         Ok(true)
     }
 
-    pub fn destroy(&mut self) -> Result<()> {
-        if self.count == 0 {
-            return Ok(());
+    /// Scan group keys plus the raw aggregate state block.
+    ///
+    /// This is only valid for aggregate functions whose state can be byte-copied
+    /// and later fed to `combine`. Callers are responsible for enforcing that
+    /// ABI contract before using the raw state blob.
+    pub fn scan_state_rows(
+        &self,
+        position: &mut HTScanPosition,
+        result: &mut Chunk,
+    ) -> Result<bool> {
+        let group_count = self.layout.group_count();
+        let required_columns = 1 + group_count + 1;
+        if result.column_count() < required_columns {
+            return Err(paro_error::internal(format!(
+                "Result chunk has insufficient columns for aggregate state scan: required={required_columns}, actual={}",
+                result.column_count()
+            )));
+        }
+        if position.offset >= self.count {
+            result.try_set_cardinality(0)?;
+            return Ok(false);
         }
 
-        let mut addresses = Vector::try_new(LogicalType::BigInt, self.count, self.allocator())?;
-        addresses.try_set_count(self.count)?;
-        unsafe {
-            let address_data = addresses.flat_data_mut::<*mut u8>();
-            for row_idx in 0..self.count {
-                *address_data.add(row_idx) = self.state_ptr(row_idx);
+        let batch_size = (self.count - position.offset).min(result.capacity());
+        result.try_set_cardinality(batch_size)?;
+
+        for row in 0..batch_size {
+            let source_ptr = self.row_ptr(position.offset + row);
+            result
+                .column_mut(0)
+                .ok_or_else(|| paro_error::internal("Missing aggregate state hash column"))?
+                .set_value(row, &Value::UBigInt(self.layout.load_hash(source_ptr)));
+            for group_idx in 0..group_count {
+                let value = self.layout.deserialize_group_value(
+                    source_ptr,
+                    group_idx,
+                    &self.varlen_heap,
+                )?;
+                result
+                    .column_mut(1 + group_idx)
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Missing aggregate state group column {group_idx}"
+                        ))
+                    })?
+                    .set_value(row, &value);
             }
+            let state_ptr = self.state_ptr(position.offset + row);
+            let state_bytes =
+                unsafe { std::slice::from_raw_parts(state_ptr, self.state_layout.total_size()) };
+            result
+                .column_mut(1 + group_count)
+                .ok_or_else(|| paro_error::internal("Missing aggregate state blob column"))?
+                .set_value(row, &Value::Blob(state_bytes.to_vec()));
         }
+
+        position.offset += batch_size;
+        Ok(true)
+    }
+
+    /// Scan group keys plus a serialized aggregate state blob.
+    ///
+    /// This path is used for aggregate functions with explicit state
+    /// serialize/deserialize hooks. The output schema matches
+    /// [`scan_state_rows`], but the final blob is an ABI-framed serialized
+    /// state rather than a raw byte copy.
+    pub fn scan_serialized_state_rows(
+        &self,
+        position: &mut HTScanPosition,
+        result: &mut Chunk,
+    ) -> Result<bool> {
+        let group_count = self.layout.group_count();
+        let required_columns = 1 + group_count + 1;
+        if result.column_count() < required_columns {
+            return Err(paro_error::internal(format!(
+                "Result chunk has insufficient columns for aggregate serialized state scan: required={required_columns}, actual={}",
+                result.column_count()
+            )));
+        }
+        if position.offset >= self.count {
+            result.try_set_cardinality(0)?;
+            return Ok(false);
+        }
+
+        let batch_size = (self.count - position.offset).min(result.capacity());
+        result.try_set_cardinality(batch_size)?;
+        let mut serialize_allocator = ArenaAllocator::new(self.allocator());
         let mut input_data = AggregateInputData::new(
             None,
-            &mut self.aggregate_allocator,
+            &mut serialize_allocator,
             AggregateCombineType::PreserveInput,
         );
-        destroy_states(
-            &self.aggregate_objects,
-            &mut input_data,
-            &addresses,
-            self.count,
-        )?;
 
-        self.entries.as_mut_slice().fill(AggregateHTEntry::empty());
+        for row in 0..batch_size {
+            let source_ptr = self.row_ptr(position.offset + row);
+            result
+                .column_mut(0)
+                .ok_or_else(|| {
+                    paro_error::internal("Missing aggregate serialized state hash column")
+                })?
+                .set_value(row, &Value::UBigInt(self.layout.load_hash(source_ptr)));
+            for group_idx in 0..group_count {
+                let value = self.layout.deserialize_group_value(
+                    source_ptr,
+                    group_idx,
+                    &self.varlen_heap,
+                )?;
+                result
+                    .column_mut(1 + group_idx)
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Missing aggregate serialized state group column {group_idx}"
+                        ))
+                    })?
+                    .set_value(row, &value);
+            }
+            let state_blob = serialize_aggregate_state_blob(
+                &self.aggregate_objects,
+                &self.state_layout,
+                self.state_ptr(position.offset + row),
+                &mut input_data,
+            )?;
+            result
+                .column_mut(1 + group_count)
+                .ok_or_else(|| {
+                    paro_error::internal("Missing aggregate serialized state blob column")
+                })?
+                .set_value(row, &Value::Blob(state_blob));
+        }
+
+        position.offset += batch_size;
+        Ok(true)
+    }
+
+    pub fn destroy(&mut self) -> Result<()> {
+        if self.count > 0 {
+            let mut addresses = Vector::try_new(LogicalType::BigInt, self.count, self.allocator())?;
+            addresses.try_set_count(self.count)?;
+            unsafe {
+                let address_data = addresses.flat_data_mut::<*mut u8>();
+                for row_idx in 0..self.count {
+                    *address_data.add(row_idx) = self.state_ptr(row_idx);
+                }
+            }
+            let mut input_data = AggregateInputData::new(
+                None,
+                &mut self.aggregate_allocator,
+                AggregateCombineType::PreserveInput,
+            );
+            destroy_states(
+                &self.aggregate_objects,
+                &mut input_data,
+                &addresses,
+                self.count,
+            )?;
+        }
+
         self.data.clear();
+        self.data.shrink_to_fit_and_refund();
+        self.entries.clear();
+        self.entries.shrink_to_fit_and_refund();
         self.varlen_heap.reset();
+        self.varlen_heap.shrink_to_fit_and_refund();
         self.aggregate_allocator.reset();
         self.count = 0;
+        self.capacity = 0;
+        self.bitmask = 0;
         Ok(())
     }
 
@@ -828,6 +939,46 @@ impl GroupedAggregateHashTable {
         self.entries.capacity() * size_of::<AggregateHTEntry>()
             + self.data.capacity() * size_of::<u64>()
             + self.varlen_heap.capacity()
+    }
+
+    pub fn reclaimable_finalized_memory(&self) -> usize {
+        self.entries.capacity() * size_of::<AggregateHTEntry>()
+            + self.data.capacity().saturating_sub(self.data.len()) * size_of::<u64>()
+            + self.varlen_heap.spare_capacity()
+    }
+
+    pub fn reclaimable_build_memory(&self) -> usize {
+        self.data.capacity().saturating_sub(self.data.len()) * size_of::<u64>()
+            + self.varlen_heap.spare_capacity()
+    }
+
+    pub fn reclaim_build_memory(&mut self, target_bytes: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+        let before = self.external_accounted_memory_usage();
+        if self.data.capacity() > self.data.len() {
+            self.data.shrink_to_fit_and_refund();
+        }
+        if self.varlen_heap.capacity() > self.varlen_heap.len() {
+            self.varlen_heap.shrink_to_fit_and_refund();
+        }
+        before.saturating_sub(self.external_accounted_memory_usage())
+    }
+
+    pub fn reclaim_finalized_memory(&mut self, target_bytes: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+        let before = self.external_accounted_memory_usage();
+        self.release_finalized_lookup_storage();
+        if self.data.capacity() > self.data.len() {
+            self.data.shrink_to_fit_and_refund();
+        }
+        if self.varlen_heap.capacity() > self.varlen_heap.len() {
+            self.varlen_heap.shrink_to_fit_and_refund();
+        }
+        before.saturating_sub(self.external_accounted_memory_usage())
     }
 
     pub fn resize(&mut self, new_capacity: usize) -> Result<()> {
@@ -1027,6 +1178,15 @@ row_width {}/{} agg_state_offset {}/{}",
         Ok(())
     }
 
+    fn ensure_lookup_storage_available(&self) -> Result<()> {
+        if self.capacity == 0 || self.entries.len() != self.capacity {
+            return Err(paro_error::internal(
+                "Aggregate hash table lookup storage was released after finalize".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_capacity_for(&mut self, incoming_rows: usize) -> Result<()> {
         if incoming_rows == 0 {
             return Ok(());
@@ -1066,10 +1226,20 @@ row_width {}/{} agg_state_offset {}/{}",
             })?;
         let target_words = bytes_to_words(target_bytes)?;
         if target_words > self.data.capacity() {
+            if self.data.capacity() > self.data.len() {
+                self.data.shrink_to_fit_and_refund();
+            }
             let additional = target_words.saturating_sub(self.data.len());
             self.data.try_reserve(additional)?;
         }
         Ok(())
+    }
+
+    fn release_finalized_lookup_storage(&mut self) {
+        self.entries.clear();
+        self.entries.shrink_to_fit_and_refund();
+        self.capacity = 0;
+        self.bitmask = 0;
     }
 
     fn append_group_row(
@@ -1350,6 +1520,55 @@ fn normalize_capacity(capacity: usize) -> Result<usize> {
         ));
     }
     Ok(normalized)
+}
+
+/// Hash grouped keys using Paro vector hash implementation.
+///
+/// This free function is used by aggregate payload spill before a grouped hash
+/// table exists. It deliberately hashes every column in the provided group
+/// chunk; callers that need schema validation should do that before calling.
+pub(crate) fn hash_group_columns(groups: &Chunk) -> Result<Vector> {
+    let count = groups.size();
+    let mut hashes = Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
+    hashes.try_set_count(count)?;
+    if count == 0 {
+        return Ok(hashes);
+    }
+
+    if groups.column_count() == 0 {
+        for row_idx in 0..count {
+            hashes.set_u64(row_idx, EMPTY_GROUP_HASH);
+        }
+        return Ok(hashes);
+    }
+
+    let first = groups.column(0).ok_or_else(|| {
+        paro_error::internal("Missing first group key column while hashing".to_string())
+    })?;
+    VectorOperations::hash(first.as_ref(), &mut hashes, count);
+
+    let mut column_hashes =
+        Vector::try_new(LogicalType::UBigInt, count, groups.allocator().clone())?;
+    for group_idx in 1..groups.column_count() {
+        let group_column = groups.column(group_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "Missing group key column while hashing at index {group_idx}"
+            ))
+        })?;
+        VectorOperations::hash(group_column.as_ref(), &mut column_hashes, count);
+        for row_idx in 0..count {
+            let left = hashes.get_u64(row_idx).ok_or_else(|| {
+                paro_error::internal(format!("Missing hash value at row {row_idx}"))
+            })?;
+            let right = column_hashes.get_u64(row_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Missing combined hash value at row {row_idx}, column {group_idx}"
+                ))
+            })?;
+            hashes.set_u64(row_idx, combine_hash_scalar(left, right));
+        }
+    }
+    Ok(hashes)
 }
 
 fn resize_threshold(capacity: usize) -> usize {
@@ -1736,6 +1955,59 @@ mod tests {
         assert_eq!(table.count(), 50);
         assert_eq!(probe_new_groups.len(), 0);
         assert!(table.memory_usage() >= base_memory);
+    }
+
+    #[test]
+    fn grouped_hash_table_reclaims_finalized_lookup_storage_without_breaking_scan() {
+        let mut table = GroupedAggregateHashTable::with_capacity(
+            vec![LogicalType::Integer],
+            vec![],
+            vec![],
+            8,
+            paro_common::test_utils::test_allocator(),
+            detached_table_memory(),
+        )
+        .expect("create grouped hash table");
+
+        let values = (0..50).map(|v| v as i32).collect::<Vec<_>>();
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                &values,
+                paro_common::test_utils::test_allocator(),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let hashes = table.hash_groups(&groups).expect("hash groups");
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+        table
+            .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+            .expect("insert groups");
+        assert_eq!(table.count(), 50);
+        assert!(table.capacity() > 0);
+
+        let before = table.external_accounted_memory_usage();
+        let reclaimable = table.reclaimable_finalized_memory();
+        assert!(
+            reclaimable >= table.capacity() * size_of::<AggregateHTEntry>(),
+            "finalized lookup entries should be reclaimable"
+        );
+
+        let reclaimed = table.reclaim_finalized_memory(1);
+        assert!(reclaimed > 0);
+        assert_eq!(table.capacity(), 0);
+        assert!(table.external_accounted_memory_usage() < before);
+
+        let mut scanned = collect_scan_rows(&mut table)
+            .into_iter()
+            .map(|row| match row.first().expect("group key") {
+                Value::Integer(value) => *value,
+                other => panic!("unexpected group key after lookup release: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        scanned.sort_unstable();
+        assert_eq!(scanned, values);
     }
 
     #[test]

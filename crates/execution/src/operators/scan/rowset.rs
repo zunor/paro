@@ -10,11 +10,15 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_function::scalar::FunctionExecContext;
 
+use paro_storage::index::{collect_predicate_columns, PredicateTree};
 use paro_storage::rowset::SegmentOptions;
+use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptions};
 use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
 use crate::physical::specs::RowsetScanSpec;
+use crate::pipeline::graph::RowsetSourceSpec;
+use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{RowsetSourceGlobal, RowsetSourceLocal, SourceGlobal, SourceLocal};
@@ -31,6 +35,17 @@ pub struct RowsetSourceDesc {
     pub column_ids: Box<[usize]>,
     pub emit_row_id: bool,
     pub returned_types: Box<[paro_common::types::LogicalType]>,
+    pub predicate: Option<PredicateTree>,
+    pub late_materialize: bool,
+    pub scan_order: Option<SegmentOrderOptions>,
+    pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterDesc]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowsetDynamicRuntimeFilterDesc {
+    pub handle: HandleRef<JoinBuildHandle>,
+    pub build_key_index: usize,
+    pub probe_column_id: u32,
 }
 
 impl RowsetSourceDesc {
@@ -41,7 +56,26 @@ impl RowsetSourceDesc {
             column_ids: spec.column_ids.clone(),
             emit_row_id: spec.emit_row_id,
             returned_types: spec.returned_types.clone(),
+            predicate: spec.predicate.clone(),
+            late_materialize: spec.late_materialize,
+            scan_order: spec.scan_order.clone(),
+            dynamic_runtime_filters: Vec::new().into_boxed_slice(),
         }
+    }
+
+    pub fn from_source_spec(spec: &RowsetSourceSpec) -> Self {
+        let mut desc = Self::from_plan_spec(&spec.scan);
+        desc.dynamic_runtime_filters = spec
+            .dynamic_runtime_filters
+            .iter()
+            .map(|filter| RowsetDynamicRuntimeFilterDesc {
+                handle: HandleRef::new(filter.handle),
+                build_key_index: filter.build_key_index,
+                probe_column_id: filter.probe_column_id,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        desc
     }
 }
 
@@ -58,10 +92,8 @@ impl RowsetSourceExec {
             ctx.query.transaction.read_snapshot().lease(),
         )?;
         let overlay = TxnOverlayReader::for_tablet(&table.tablet(), &ctx.query.transaction)?;
-        let mut segments = storage_snapshot
-            .segments_with_options(SegmentOptions::default())?
-            .into_iter()
-            .collect::<Vec<_>>();
+        let segment_options = SegmentOptions::default();
+        let mut segments = storage_snapshot.segments_with_options(segment_options.clone())?;
         if let Some(overlay) = &overlay {
             let visible_rowsets = segments
                 .iter()
@@ -69,10 +101,13 @@ impl RowsetSourceExec {
                 .collect::<HashSet<_>>();
             segments.extend(
                 overlay
-                    .segments_with_options(SegmentOptions::default())?
+                    .segments_with_options(segment_options)?
                     .into_iter()
                     .filter(|(rowset, _)| !visible_rowsets.contains(&rowset.rowset_id())),
             );
+        }
+        if let Some(order) = self.desc.scan_order.as_ref() {
+            reorder_segments(&mut segments, order);
         }
         let overlay_delete_vectors = overlay.as_ref().and_then(TxnOverlayReader::delete_vectors);
         let column_projection = if self.desc.column_ids.is_empty() && !self.desc.emit_row_id {
@@ -80,6 +115,12 @@ impl RowsetSourceExec {
         } else {
             ColumnProjection::new(self.desc.column_ids.to_vec())
         };
+        let predicate = self.effective_predicate(ctx)?;
+        let predicate_columns = predicate
+            .as_ref()
+            .map(collect_predicate_columns)
+            .unwrap_or_default()
+            .into_boxed_slice();
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
             table_index: self.desc.table_index,
@@ -89,6 +130,8 @@ impl RowsetSourceExec {
             next_segment: Default::default(),
             column_projection,
             overlay_delete_vectors,
+            predicate,
+            predicate_columns,
         })))
     }
 
@@ -114,7 +157,15 @@ impl RowsetSourceExec {
         loop {
             ctx.cancel.check()?;
             if local.reader.is_none() {
-                let segment_idx = global.next_segment.fetch_add(1, Ordering::AcqRel);
+                if local.assigned_segment_consumed {
+                    return Ok(SourcePoll::Finished);
+                }
+                let segment_idx = if let Some(segment_idx) = local.assigned_segment {
+                    local.assigned_segment_consumed = true;
+                    segment_idx
+                } else {
+                    global.next_segment.fetch_add(1, Ordering::AcqRel)
+                };
                 local.next_morsel = segment_idx;
                 let Some((rowset, segment)) = global.segments.get(segment_idx) else {
                     return Ok(SourcePoll::Finished);
@@ -124,7 +175,13 @@ impl RowsetSourceExec {
                     TabletReaderParams::with_version(global.storage_snapshot.visible_version())
                         .with_projection(global.column_projection.clone())
                         .with_emit_row_id(self.desc.emit_row_id)
-                        .with_segment(segment.segment_id());
+                        .with_segment_handle(Arc::clone(segment));
+                if let Some(predicate) = &global.predicate {
+                    params = params.with_predicates(predicate.clone());
+                    if self.desc.late_materialize && !global.predicate_columns.is_empty() {
+                        params = params.with_late_materialize(global.predicate_columns.to_vec());
+                    }
+                }
                 if let Some(delete_vectors) = &global.overlay_delete_vectors {
                     params = params.with_overlay_delete_vectors(Arc::clone(delete_vectors));
                 }
@@ -149,5 +206,34 @@ impl RowsetSourceExec {
                 }
             }
         }
+    }
+
+    fn effective_predicate(&self, ctx: &PipelineInitContext<'_>) -> Result<Option<PredicateTree>> {
+        let mut predicates = Vec::new();
+        if let Some(predicate) = &self.desc.predicate {
+            predicates.push(predicate.clone());
+        }
+        for filter in &self.desc.dynamic_runtime_filters {
+            let handle = ctx.handles.get(filter.handle)?;
+            if !handle.runtime_filter_ready() {
+                return Err(paro_error::internal(
+                    "hash join runtime filter was not published before rowset scan",
+                ));
+            }
+            if let Some(predicate) =
+                handle.runtime_filter_predicate(filter.build_key_index, filter.probe_column_id)
+            {
+                predicates.push(predicate);
+            }
+        }
+        Ok(combine_predicates(predicates))
+    }
+}
+
+fn combine_predicates(predicates: Vec<PredicateTree>) -> Option<PredicateTree> {
+    match predicates.len() {
+        0 => None,
+        1 => predicates.into_iter().next(),
+        _ => Some(PredicateTree::And(predicates)),
     }
 }

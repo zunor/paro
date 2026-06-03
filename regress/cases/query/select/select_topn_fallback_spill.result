@@ -18,6 +18,7 @@ PROJECTION  (rows=3)
       Output: id, __paro_hidden_1
       ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
         Columns: id, score
+        Scan Order: col#1 DESC by max LIMIT 3
 
 SELECT id
 FROM topn_fallback_spill_case
@@ -43,6 +44,7 @@ PROJECTION  (rows=5)
       Output: id, __paro_hidden_1
       ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
         Columns: id
+        Scan Order: col#0 ASC by min LIMIT 5 OFFSET 6000
 
 SELECT id
 FROM topn_fallback_spill_case
@@ -76,6 +78,8 @@ PIPELINE 1
   SOURCE #3 TOP_N_EMIT (actual time=<time-range> rows=<rows> loops=<loops>)
   TRANSFORM #4 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>)
   SINK #5 CLIENT_RESULT (actual time=<time-range> rows=<rows> loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 3
 

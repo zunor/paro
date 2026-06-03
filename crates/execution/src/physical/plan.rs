@@ -16,6 +16,9 @@ use paro_planner::expression::{AggregateType, Expression};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition};
 use paro_planner::operator::ExplainSpec;
 use paro_planner::plan::CardinalityEstimate;
+use paro_storage::table::segment_reorderer::{
+    OrderByStatistics, SegmentOrderOptions, SegmentOrderType,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct PhysicalPlanNodeArena {
@@ -213,16 +216,36 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
             if !spec.output_names.is_empty() {
                 push_list_property(&mut properties, "Columns", &spec.output_names);
             }
+            if let Some(predicate) = &spec.predicate {
+                push_string_property(&mut properties, "Pushed Predicate", predicate.to_string());
+            }
+            if spec.late_materialize {
+                push_string_property(&mut properties, "Late Materialize", "auto".to_string());
+            }
+            if !spec.residual_predicates.is_empty() {
+                push_string_property(
+                    &mut properties,
+                    "Residual Predicate",
+                    spec.residual_predicates
+                        .iter()
+                        .map(format_expr)
+                        .collect::<Vec<_>>()
+                        .join(" AND "),
+                );
+            }
             if !spec.runtime_filter_expressions.is_empty() {
                 push_string_property(
                     &mut properties,
-                    "Filter",
+                    "Runtime Filter",
                     spec.runtime_filter_expressions
                         .iter()
                         .map(format_expr)
                         .collect::<Vec<_>>()
                         .join(" AND "),
                 );
+            }
+            if let Some(order) = &spec.scan_order {
+                push_string_property(&mut properties, "Scan Order", format_segment_order(order));
             }
         }
         PhysicalNodeKind::Filter(spec) => {
@@ -271,9 +294,14 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 push_string_property(&mut properties, "Join Filter", format_expr(condition));
             }
         }
-        PhysicalNodeKind::IEJoin(spec) => {
+        PhysicalNodeKind::SortRangeJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
-            push_string_property(&mut properties, "Strategy", "nl_fallback".to_string());
+            push_string_property(&mut properties, "Strategy", "sort_range".to_string());
+            push_join_conditions(&mut properties, &spec.conditions);
+        }
+        PhysicalNodeKind::ClassicIeJoin(spec) => {
+            push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
+            push_string_property(&mut properties, "Strategy", "classic_ie_join".to_string());
             push_join_conditions(&mut properties, &spec.conditions);
         }
         PhysicalNodeKind::GraphScan(spec) => {
@@ -583,6 +611,30 @@ fn format_order_by(orders: &[paro_planner::binder::ir::OrderByNode]) -> String {
         .join(", ")
 }
 
+fn format_segment_order(order: &SegmentOrderOptions) -> String {
+    let stat = match order.order_by {
+        OrderByStatistics::Min => "min",
+        OrderByStatistics::Max => "max",
+    };
+    let direction = match order.order_type {
+        SegmentOrderType::Asc => "ASC",
+        SegmentOrderType::Desc => "DESC",
+    };
+    let limit = order
+        .row_limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+    let offset = if order.row_offset == 0 {
+        String::new()
+    } else {
+        format!(" OFFSET {}", order.row_offset)
+    };
+    format!(
+        "col#{} {direction} by {stat}{limit}{offset}",
+        order.column_idx
+    )
+}
+
 fn format_hops(min_hops: u64, max_hops: u64) -> String {
     if max_hops == u64::MAX {
         format!("{{{},}}", min_hops)
@@ -718,6 +770,7 @@ fn format_aggregate_expr(expr: &Expression, spec: &AggregateSpec) -> String {
 fn format_expr(expr: &Expression) -> String {
     match expr {
         Expression::Reference(reference) => format!("#{}", reference.index),
+        Expression::ColumnRef(column_ref) => format!("#{}", column_ref.binding.column_index),
         Expression::Constant(constant) => constant.value.to_string(),
         Expression::Comparison(comparison) => format!(
             "{} {} {}",
@@ -769,6 +822,30 @@ fn format_expr(expr: &Expression) -> String {
                     .join(", ")
             )
         }
+        Expression::Operator(operator) => match operator.operator_type {
+            paro_planner::expression::OperatorType::IsNull => operator
+                .children
+                .first()
+                .map(|child| format!("{} IS NULL", format_expr(child)))
+                .unwrap_or_else(|| "IS NULL".to_string()),
+            paro_planner::expression::OperatorType::IsNotNull => operator
+                .children
+                .first()
+                .map(|child| format!("{} IS NOT NULL", format_expr(child)))
+                .unwrap_or_else(|| "IS NOT NULL".to_string()),
+            paro_planner::expression::OperatorType::In if operator.children.len() >= 2 => {
+                format!(
+                    "{} IN ({})",
+                    format_expr(&operator.children[0]),
+                    operator.children[1..]
+                        .iter()
+                        .map(format_expr)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            _ => format!("{expr:?}"),
+        },
         _ => format!("{expr:?}"),
     }
 }

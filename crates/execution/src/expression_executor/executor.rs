@@ -3,7 +3,9 @@
 
 //! Compiled expression executor.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use paro_common::allocator::{Allocator, MemoryTag};
@@ -20,11 +22,7 @@ use paro_function::scalar::{
     DictionaryStrategy, FunctionErrorMode, FunctionExecContext, FunctionSideEffects,
     FunctionStability,
 };
-use paro_planner::expression::{
-    CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
-    ConjunctionExpression, ConstantExpression, Expression, FunctionExpression, OperatorExpression,
-    OperatorType, ReferenceExpression,
-};
+use paro_planner::expression::{Expression, OperatorType};
 
 use crate::runtime::{ExpressionEvalInput, ParameterBindings};
 
@@ -34,22 +32,32 @@ use super::predicate::{
     accumulate_selected_rows, build_marked_selection, copy_selection, scan_bool_selection,
     scan_false_bool_selection, scan_null_selection, select_all_rows,
 };
+use super::program::{
+    ExpressionProgramCache, ExpressionProgramVersion, PhysicalCaseExpression,
+    PhysicalCastExpression, PhysicalColumnRefExpression, PhysicalComparisonExpression,
+    PhysicalConjunctionExpression, PhysicalExpression, PhysicalExpressionProgram,
+    PhysicalFunctionExpression, PhysicalOperatorExpression, PhysicalReferenceExpression,
+    PhysicalSharedExpression,
+};
 use super::state::{
     CachedDictionaryInputId, CaseExpressionState, CastExpressionState, ColumnRefExpressionState,
     ComparisonExpressionState, CompiledExpressionState, ConjunctionExpressionState,
     ConstantExpressionState, EvaluatedValue, ExecuteFunctionState, OperatorExpressionState,
-    ParameterExpressionState, PreparedInList, ReferenceExpressionState, ValueSlot,
-    WindowExpressionState,
+    ParameterExpressionState, PreparedInList, ReferenceExpressionState, SharedBatchSignature,
+    SharedExpressionSlot, SharedExpressionState, ValueSlot,
 };
 
 #[derive(Debug)]
 pub struct CompiledExpressionProgram {
-    expressions: Vec<Expression>,
+    physical: Arc<PhysicalExpressionProgram>,
 }
 
 #[derive(Debug)]
 pub struct CompiledExecutorState {
     states: Vec<CompiledExpressionState>,
+    shared_states: Vec<Option<CompiledExpressionState>>,
+    shared_slots: Vec<SharedExpressionSlot>,
+    batch_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -58,110 +66,283 @@ pub struct ExpressionExecutor {
     pub state: CompiledExecutorState,
 }
 
-impl ExpressionExecutor {
-    fn assert_no_subquery_expression(expr: &Expression) {
-        match expr {
-            Expression::Function(func) => {
-                for child in &func.children {
-                    Self::assert_no_subquery_expression(child);
-                }
-            }
-            Expression::Cast(cast) => Self::assert_no_subquery_expression(&cast.child),
-            Expression::Comparison(comp) => {
-                Self::assert_no_subquery_expression(&comp.left);
-                Self::assert_no_subquery_expression(&comp.right);
-            }
-            Expression::Conjunction(conj) => {
-                for child in &conj.children {
-                    Self::assert_no_subquery_expression(child);
-                }
-            }
-            Expression::Case(case) => {
-                Self::assert_no_subquery_expression(&case.check);
-                Self::assert_no_subquery_expression(&case.result_if_true);
-                Self::assert_no_subquery_expression(&case.result_if_false);
-            }
-            Expression::Operator(op) => {
-                for child in &op.children {
-                    Self::assert_no_subquery_expression(child);
-                }
-            }
-            Expression::Aggregate(agg) => {
-                for child in &agg.children {
-                    Self::assert_no_subquery_expression(child);
-                }
-                if let Some(filter) = &agg.filter {
-                    Self::assert_no_subquery_expression(filter);
-                }
-                for order in &agg.order_bys {
-                    Self::assert_no_subquery_expression(&order.expression);
-                }
-            }
-            Expression::Window(window) => {
-                for child in &window.children {
-                    Self::assert_no_subquery_expression(child);
-                }
-                for partition in &window.partitions {
-                    Self::assert_no_subquery_expression(partition);
-                }
-                for order in &window.orders {
-                    Self::assert_no_subquery_expression(&order.expression);
-                }
-            }
-            Expression::Subquery(_) => {
-                panic!(
-                    "ExpressionExecutor invariant violated: Expression::Subquery must be flattened before execution"
-                );
-            }
-            Expression::Constant(_)
-            | Expression::Parameter(_)
-            | Expression::ColumnRef(_)
-            | Expression::Reference(_) => {}
+#[derive(Clone, Copy)]
+pub struct VectorKernelInput<'a> {
+    pub columns: &'a Chunk,
+    pub params: Option<&'a ParameterBindings>,
+    pub selection: Option<&'a SelectionVector>,
+    pub count: usize,
+}
+
+impl<'a> VectorKernelInput<'a> {
+    pub fn from_chunk(columns: &'a Chunk) -> Self {
+        Self {
+            columns,
+            params: None,
+            selection: None,
+            count: columns.size(),
         }
     }
 
+    pub fn from_eval_input(input: ExpressionEvalInput<'a>) -> Self {
+        Self {
+            columns: input.columns,
+            params: Some(input.params),
+            selection: None,
+            count: input.columns.size(),
+        }
+    }
+
+    pub fn with_selection(mut self, selection: Option<&'a SelectionVector>) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    pub fn with_count(mut self, count: usize) -> Self {
+        self.count = count;
+        self
+    }
+}
+
+struct SharedEvaluation<'a> {
+    nodes: &'a [PhysicalExpression],
+    states: &'a mut [Option<CompiledExpressionState>],
+    slots: &'a mut [SharedExpressionSlot],
+    epoch: u64,
+}
+
+thread_local! {
+    static THREAD_LOCAL_PROGRAM_CACHE: RefCell<ExpressionProgramCache> =
+        RefCell::new(ExpressionProgramCache::default());
+}
+
+impl SharedEvaluation<'_> {
+    fn execute_value(
+        &mut self,
+        expr: &PhysicalSharedExpression,
+        chunk: &Chunk,
+        sel: Option<&SelectionVector>,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
+    ) -> Result<EvaluatedValue> {
+        let node = self
+            .nodes
+            .get(expr.slot)
+            .ok_or_else(|| paro_error::internal("shared expression node out of bounds"))?;
+
+        let signature = SharedBatchSignature {
+            epoch: self.epoch,
+            count,
+            selection_identity: selection_identity(sel),
+            selection_hash: selection_hash(sel, count),
+        };
+        if self
+            .slots
+            .get(expr.slot)
+            .is_some_and(|slot| slot.signature == Some(signature))
+        {
+            return self.slots[expr.slot]
+                .value
+                .evaluated(true)
+                .ok_or_else(|| paro_error::internal("shared expression cache slot was empty"));
+        }
+
+        let value = self.execute_uncached(expr.slot, node, chunk, sel, count, runtime, params)?;
+        let slot = self
+            .slots
+            .get_mut(expr.slot)
+            .ok_or_else(|| paro_error::internal("shared expression scratch slot out of bounds"))?;
+        slot.value.set_value(value.as_vector().reference());
+        slot.signature = Some(signature);
+        slot.value
+            .evaluated(true)
+            .ok_or_else(|| paro_error::internal("shared expression cache slot was not stored"))
+    }
+
+    fn execute_uncached(
+        &mut self,
+        slot: usize,
+        node: &PhysicalExpression,
+        chunk: &Chunk,
+        sel: Option<&SelectionVector>,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
+    ) -> Result<EvaluatedValue> {
+        let mut state = self
+            .states
+            .get_mut(slot)
+            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?
+            .take()
+            .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
+        let value = catch_unwind(AssertUnwindSafe(|| {
+            ExpressionExecutor::execute_value(
+                node, &mut state, chunk, sel, count, runtime, params, self,
+            )
+        }));
+        self.states[slot] = Some(state);
+        match value {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+}
+
+fn selection_identity(sel: Option<&SelectionVector>) -> usize {
+    sel.and_then(SelectionVector::allocation_identity)
+        .unwrap_or_default()
+}
+
+fn selection_hash(sel: Option<&SelectionVector>, count: usize) -> u64 {
+    let Some(sel) = sel else {
+        return 0;
+    };
+    let mut hash = 0xcbf29ce484222325u64;
+    hash ^= count as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+    for row in &sel.as_slice()[..count] {
+        hash ^= u64::from(*row);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn expression_state_mismatch(
+    expr: &PhysicalExpression,
+    state: &CompiledExpressionState,
+) -> paro_error::ParoError {
+    paro_error::internal(format!(
+        "Expression state mismatch: expr={} state={}",
+        physical_expression_kind(expr),
+        compiled_expression_state_kind(state)
+    ))
+}
+
+fn physical_expression_kind(expr: &PhysicalExpression) -> &'static str {
+    match expr {
+        PhysicalExpression::Function(_) => "Function",
+        PhysicalExpression::Cast(_) => "Cast",
+        PhysicalExpression::Comparison(_) => "Comparison",
+        PhysicalExpression::Conjunction(_) => "Conjunction",
+        PhysicalExpression::Case(_) => "Case",
+        PhysicalExpression::Operator(_) => "Operator",
+        PhysicalExpression::Constant(_) => "Constant",
+        PhysicalExpression::Parameter(_) => "Parameter",
+        PhysicalExpression::ColumnRef(_) => "ColumnRef",
+        PhysicalExpression::Reference(_) => "Reference",
+        PhysicalExpression::Shared(_) => "Shared",
+    }
+}
+
+fn compiled_expression_state_kind(state: &CompiledExpressionState) -> &'static str {
+    match state {
+        CompiledExpressionState::Function(_) => "Function",
+        CompiledExpressionState::Cast(_) => "Cast",
+        CompiledExpressionState::Comparison(_) => "Comparison",
+        CompiledExpressionState::Conjunction(_) => "Conjunction",
+        CompiledExpressionState::Case(_) => "Case",
+        CompiledExpressionState::Operator(_) => "Operator",
+        CompiledExpressionState::Constant(_) => "Constant",
+        CompiledExpressionState::Parameter(_) => "Parameter",
+        CompiledExpressionState::ColumnRef(_) => "ColumnRef",
+        CompiledExpressionState::Reference(_) => "Reference",
+        CompiledExpressionState::Shared(_) => "Shared",
+        CompiledExpressionState::Subquery(_) => "Subquery",
+    }
+}
+
+impl ExpressionExecutor {
     pub fn new(expr: &Expression) -> Self {
         Self::with_expressions(std::slice::from_ref(expr))
     }
 
     pub fn with_expressions(exprs: &[Expression]) -> Self {
-        let expressions = exprs.to_vec();
-        let states = expressions.iter().map(Self::initialize).collect();
+        Self::with_expressions_and_version(exprs, ExpressionProgramVersion::anonymous())
+    }
+
+    pub fn with_expressions_for_session(
+        exprs: &[Expression],
+        session: &paro_context::StatementContext,
+    ) -> Self {
+        Self::with_expressions_and_version(exprs, ExpressionProgramVersion::from_session(session))
+    }
+
+    pub fn with_expressions_and_version(
+        exprs: &[Expression],
+        version: ExpressionProgramVersion,
+    ) -> Self {
+        let physical = Self::cached_program(exprs, version);
+        let states = (0..physical.unique_root_count())
+            .map(|root_idx| Self::initialize(physical.unique_root(root_idx)))
+            .collect();
+        let shared_states = (0..physical.shared_expression_count())
+            .map(|slot| Some(Self::initialize(physical.shared_node(slot))))
+            .collect();
+        let shared_slots = physical
+            .scratch_layout()
+            .slots()
+            .iter()
+            .map(|_| SharedExpressionSlot::default())
+            .collect();
         Self {
-            program: CompiledExpressionProgram { expressions },
-            state: CompiledExecutorState { states },
+            program: CompiledExpressionProgram { physical },
+            state: CompiledExecutorState {
+                states,
+                shared_states,
+                shared_slots,
+                batch_epoch: 0,
+            },
         }
     }
 
+    fn cached_program(
+        exprs: &[Expression],
+        version: ExpressionProgramVersion,
+    ) -> Arc<PhysicalExpressionProgram> {
+        THREAD_LOCAL_PROGRAM_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.get_or_compile(exprs, version)
+        })
+    }
+
     pub fn expression_count(&self) -> usize {
-        self.program.expressions.len()
+        self.program.physical.root_count()
+    }
+
+    pub fn physical_program(&self) -> &PhysicalExpressionProgram {
+        &self.program.physical
     }
 
     #[cfg(test)]
     pub(crate) fn compiled_state(&self, expr_idx: usize) -> &CompiledExpressionState {
-        &self.state.states[expr_idx]
+        &self.state.states[self.program.physical.root_state_index(expr_idx)]
     }
 
-    pub fn initialize(expr: &Expression) -> CompiledExpressionState {
-        Self::assert_no_subquery_expression(expr);
+    pub fn initialize(expr: &PhysicalExpression) -> CompiledExpressionState {
         match expr {
-            Expression::Function(e) => CompiledExpressionState::Function(ExecuteFunctionState {
-                child_states: e.children.iter().map(Self::initialize).collect(),
-                intermediate_types: e.children.iter().map(Expression::return_type).collect(),
-                intermediate_chunk: None,
-                local_state: None,
-                cached_dictionary_input_id: None,
-                cached_dictionary_output: None,
-                result: ValueSlot::default(),
-            }),
-            Expression::Cast(e) => CompiledExpressionState::Cast(CastExpressionState {
+            PhysicalExpression::Function(e) => {
+                CompiledExpressionState::Function(ExecuteFunctionState {
+                    child_states: e.children.iter().map(Self::initialize).collect(),
+                    intermediate_types: e
+                        .children
+                        .iter()
+                        .map(PhysicalExpression::return_type)
+                        .collect(),
+                    intermediate_chunk: None,
+                    local_state: None,
+                    cached_dictionary_input_id: None,
+                    cached_dictionary_output: None,
+                    result: ValueSlot::default(),
+                })
+            }
+            PhysicalExpression::Cast(e) => CompiledExpressionState::Cast(CastExpressionState {
                 child: Box::new(Self::initialize(&e.child)),
                 child_result: ValueSlot::default(),
                 result: ValueSlot::default(),
             }),
-            Expression::Comparison(e) => {
-                let dispatch =
-                    compile_comparison_dispatch(&e.left.return_type(), e.comparison_type);
+            PhysicalExpression::Comparison(e) => {
+                let dispatch = compile_comparison_dispatch(&e.left_type, e.comparison_type);
                 CompiledExpressionState::Comparison(ComparisonExpressionState {
                     left: Box::new(Self::initialize(&e.left)),
                     right: Box::new(Self::initialize(&e.right)),
@@ -172,14 +353,14 @@ impl ExpressionExecutor {
                     result: ValueSlot::default(),
                 })
             }
-            Expression::Conjunction(e) => {
+            PhysicalExpression::Conjunction(e) => {
                 CompiledExpressionState::Conjunction(ConjunctionExpressionState {
                     child_states: e.children.iter().map(Self::initialize).collect(),
                     ping: ValueSlot::default(),
                     pong: ValueSlot::default(),
                 })
             }
-            Expression::Case(e) => CompiledExpressionState::Case(CaseExpressionState {
+            PhysicalExpression::Case(e) => CompiledExpressionState::Case(CaseExpressionState {
                 check: Box::new(Self::initialize(&e.check)),
                 result_if_true: Box::new(Self::initialize(&e.result_if_true)),
                 result_if_false: Box::new(Self::initialize(&e.result_if_false)),
@@ -188,35 +369,31 @@ impl ExpressionExecutor {
                 false_result: ValueSlot::default(),
                 result: ValueSlot::default(),
             }),
-            Expression::Operator(e) => CompiledExpressionState::Operator(OperatorExpressionState {
-                child_states: e.children.iter().map(Self::initialize).collect(),
-                child_results: (0..e.children.len())
-                    .map(|_| ValueSlot::default())
-                    .collect(),
-                in_list: Self::prepare_in_list(e),
-                result: ValueSlot::default(),
-                aux: ValueSlot::default(),
-                scratch: ValueSlot::default(),
-            }),
-            Expression::Constant(_) => CompiledExpressionState::Constant(ConstantExpressionState),
-            Expression::Parameter(_) => {
+            PhysicalExpression::Operator(e) => {
+                CompiledExpressionState::Operator(OperatorExpressionState {
+                    child_states: e.children.iter().map(Self::initialize).collect(),
+                    child_results: (0..e.children.len())
+                        .map(|_| ValueSlot::default())
+                        .collect(),
+                    in_list: Self::prepare_in_list(e),
+                    result: ValueSlot::default(),
+                    aux: ValueSlot::default(),
+                    scratch: ValueSlot::default(),
+                })
+            }
+            PhysicalExpression::Constant(_) => {
+                CompiledExpressionState::Constant(ConstantExpressionState)
+            }
+            PhysicalExpression::Parameter(_) => {
                 CompiledExpressionState::Parameter(ParameterExpressionState::default())
             }
-            Expression::ColumnRef(_) => {
+            PhysicalExpression::ColumnRef(_) => {
                 CompiledExpressionState::ColumnRef(ColumnRefExpressionState)
             }
-            Expression::Reference(_) => {
+            PhysicalExpression::Reference(_) => {
                 CompiledExpressionState::Reference(ReferenceExpressionState)
             }
-            Expression::Aggregate(_) => {
-                panic!("Aggregate expressions should not be initialized by ExpressionExecutor");
-            }
-            Expression::Subquery(_) => {
-                panic!(
-                    "ExpressionExecutor invariant violated: Expression::Subquery must be flattened before execution"
-                );
-            }
-            Expression::Window(_) => CompiledExpressionState::Window(WindowExpressionState),
+            PhysicalExpression::Shared(_) => CompiledExpressionState::Shared(SharedExpressionState),
         }
     }
 
@@ -229,30 +406,12 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         result: &mut Vector,
     ) -> Result<()> {
-        let expr = &self.program.expressions[expr_idx];
-        let state = &mut self.state.states[expr_idx];
-        Self::execute_into_inner(expr, state, input, sel, count, runtime, None, result)
-    }
-
-    pub fn execute_into_with_input(
-        &mut self,
-        expr_idx: usize,
-        input: ExpressionEvalInput<'_>,
-        sel: Option<&SelectionVector>,
-        count: usize,
-        runtime: &dyn FunctionExecContext,
-        result: &mut Vector,
-    ) -> Result<()> {
-        let expr = &self.program.expressions[expr_idx];
-        let state = &mut self.state.states[expr_idx];
-        Self::execute_into_inner(
-            expr,
-            state,
-            input.columns,
-            sel,
-            count,
+        self.execute_kernel_into(
+            expr_idx,
+            VectorKernelInput::from_chunk(input)
+                .with_selection(sel)
+                .with_count(count),
             runtime,
-            Some(input.params),
             result,
         )
     }
@@ -263,64 +422,99 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         result: &mut Chunk,
     ) -> Result<()> {
-        let output_types: Vec<LogicalType> = self
-            .program
-            .expressions
-            .iter()
-            .map(Expression::return_type)
-            .collect();
-        Self::prepare_output_chunk(
-            result,
-            &output_types,
-            input.size(),
-            runtime.allocator(MemoryTag::BaseTable),
-        )?;
-        for expr_idx in 0..self.program.expressions.len() {
-            let column = result.column_mut(expr_idx).ok_or_else(|| {
-                paro_error::internal(format!("Output column {} not found", expr_idx))
-            })?;
-            self.execute_into(expr_idx, input, None, input.size(), runtime, column)?;
-        }
-        result.set_cardinality(input.size());
-        Ok(())
+        self.execute_all_kernel(VectorKernelInput::from_chunk(input), runtime, result)
     }
 
-    pub fn execute_all_into_with_input(
+    pub fn execute_all_kernel(
         &mut self,
-        input: ExpressionEvalInput<'_>,
+        input: VectorKernelInput<'_>,
         runtime: &dyn FunctionExecContext,
         result: &mut Chunk,
     ) -> Result<()> {
-        let output_types: Vec<LogicalType> = self
-            .program
-            .expressions
-            .iter()
-            .map(Expression::return_type)
-            .collect();
+        let physical = &self.program.physical;
+        let output_types = physical.root_return_types();
         Self::prepare_output_chunk(
             result,
             &output_types,
-            input.columns.size(),
+            input.count,
             runtime.allocator(MemoryTag::BaseTable),
         )?;
-        for expr_idx in 0..self.program.expressions.len() {
+
+        let CompiledExecutorState {
+            states,
+            shared_states,
+            shared_slots,
+            batch_epoch,
+        } = &mut self.state;
+        *batch_epoch = batch_epoch.wrapping_add(1);
+        let mut shared = SharedEvaluation {
+            nodes: physical.shared_nodes(),
+            states: shared_states,
+            slots: shared_slots,
+            epoch: *batch_epoch,
+        };
+
+        for expr_idx in 0..physical.root_count() {
+            let first_output = self.program.physical.root_first_output(expr_idx);
+            if first_output < expr_idx {
+                result.data[expr_idx] = Arc::clone(&result.data[first_output]);
+                continue;
+            }
             let column = result.column_mut(expr_idx).ok_or_else(|| {
                 paro_error::internal(format!("Output column {} not found", expr_idx))
             })?;
-            self.execute_into_with_input(
-                expr_idx,
-                ExpressionEvalInput {
-                    params: input.params,
-                    columns: input.columns,
-                },
-                None,
-                input.columns.size(),
+            let state_idx = physical.root_state_index(expr_idx);
+            let expr = physical.root(expr_idx);
+            Self::execute_into_inner(
+                expr,
+                &mut states[state_idx],
+                input.columns,
+                input.selection,
+                input.count,
                 runtime,
+                input.params,
                 column,
+                &mut shared,
             )?;
         }
-        result.set_cardinality(input.columns.size());
+        result.set_cardinality(input.count);
         Ok(())
+    }
+
+    pub fn execute_kernel_into(
+        &mut self,
+        expr_idx: usize,
+        input: VectorKernelInput<'_>,
+        runtime: &dyn FunctionExecContext,
+        result: &mut Vector,
+    ) -> Result<()> {
+        let physical = &self.program.physical;
+        let state_idx = physical.root_state_index(expr_idx);
+        let expr = physical.root(expr_idx);
+        let CompiledExecutorState {
+            states,
+            shared_states,
+            shared_slots,
+            batch_epoch,
+        } = &mut self.state;
+        *batch_epoch = batch_epoch.wrapping_add(1);
+        let mut shared = SharedEvaluation {
+            nodes: physical.shared_nodes(),
+            states: shared_states,
+            slots: shared_slots,
+            epoch: *batch_epoch,
+        };
+        Self::execute_into_inner(
+            expr,
+            &mut states[state_idx],
+            input.columns,
+            input.selection,
+            input.count,
+            runtime,
+            input.params,
+            result,
+            &mut shared,
+        )
     }
 
     pub fn select_into(
@@ -331,53 +525,47 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         sel: &mut SelectionVector,
     ) -> Result<usize> {
-        let expr = &self.program.expressions[expr_idx];
-        let state = &mut self.state.states[expr_idx];
-        Self::select_expression(expr, state, input, None, count, runtime, None, sel)
-    }
-
-    pub fn select_into_with_input(
-        &mut self,
-        expr_idx: usize,
-        input: ExpressionEvalInput<'_>,
-        count: usize,
-        runtime: &dyn FunctionExecContext,
-        sel: &mut SelectionVector,
-    ) -> Result<usize> {
-        let expr = &self.program.expressions[expr_idx];
-        let state = &mut self.state.states[expr_idx];
-        Self::select_expression(
-            expr,
-            state,
-            input.columns,
-            None,
-            count,
+        self.select_kernel(
+            expr_idx,
+            VectorKernelInput::from_chunk(input).with_count(count),
             runtime,
-            Some(input.params),
             sel,
         )
     }
 
-    pub fn select_into_with_input_and_selection(
+    pub fn select_kernel(
         &mut self,
         expr_idx: usize,
-        input: ExpressionEvalInput<'_>,
-        input_sel: Option<&SelectionVector>,
-        count: usize,
+        input: VectorKernelInput<'_>,
         runtime: &dyn FunctionExecContext,
         sel: &mut SelectionVector,
     ) -> Result<usize> {
-        let expr = &self.program.expressions[expr_idx];
-        let state = &mut self.state.states[expr_idx];
+        let physical = &self.program.physical;
+        let state_idx = physical.root_state_index(expr_idx);
+        let expr = physical.root(expr_idx);
+        let CompiledExecutorState {
+            states,
+            shared_states,
+            shared_slots,
+            batch_epoch,
+        } = &mut self.state;
+        *batch_epoch = batch_epoch.wrapping_add(1);
+        let mut shared = SharedEvaluation {
+            nodes: physical.shared_nodes(),
+            states: shared_states,
+            slots: shared_slots,
+            epoch: *batch_epoch,
+        };
         Self::select_expression(
             expr,
-            state,
+            &mut states[state_idx],
             input.columns,
-            input_sel,
-            count,
+            input.selection,
+            input.count,
             runtime,
-            Some(input.params),
+            input.params,
             sel,
+            &mut shared,
         )
     }
 
@@ -390,16 +578,23 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
     ) -> Result<Arc<Vector>> {
         let mut result = Vector::try_new(
-            self.program.expressions[expr_idx].return_type(),
+            self.program.physical.root_return_type(expr_idx),
             count.max(1),
             runtime.allocator(MemoryTag::BaseTable),
         )?;
-        self.execute_into(expr_idx, chunk, sel, count, runtime, &mut result)?;
+        self.execute_kernel_into(
+            expr_idx,
+            VectorKernelInput::from_chunk(chunk)
+                .with_selection(sel)
+                .with_count(count),
+            runtime,
+            &mut result,
+        )?;
         Ok(Arc::new(result))
     }
 
     fn execute_into_inner(
-        expr: &Expression,
+        expr: &PhysicalExpression,
         state: &mut CompiledExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -407,84 +602,101 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
-        match (expr, state) {
-            (Expression::Function(expr), CompiledExpressionState::Function(state)) => {
-                Self::execute_function_into(expr, state, chunk, sel, count, runtime, params, result)
+        match (expr, &mut *state) {
+            (PhysicalExpression::Function(expr), CompiledExpressionState::Function(state)) => {
+                Self::execute_function_into(
+                    expr, state, chunk, sel, count, runtime, params, result, shared,
+                )
             }
-            (Expression::Cast(expr), CompiledExpressionState::Cast(state)) => {
-                Self::execute_cast_into(expr, state, chunk, sel, count, runtime, params, result)
+            (PhysicalExpression::Cast(expr), CompiledExpressionState::Cast(state)) => {
+                Self::execute_cast_into(
+                    expr, state, chunk, sel, count, runtime, params, result, shared,
+                )
             }
-            (Expression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
+            (PhysicalExpression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
                 Self::execute_comparison_into(
-                    expr, state, chunk, sel, count, runtime, params, result,
+                    expr, state, chunk, sel, count, runtime, params, result, shared,
                 )
             }
-            (Expression::Conjunction(expr), CompiledExpressionState::Conjunction(state)) => {
-                Self::execute_conjunction_into(
-                    expr, state, chunk, sel, count, runtime, params, result,
+            (
+                PhysicalExpression::Conjunction(expr),
+                CompiledExpressionState::Conjunction(state),
+            ) => Self::execute_conjunction_into(
+                expr, state, chunk, sel, count, runtime, params, result, shared,
+            ),
+            (PhysicalExpression::Case(expr), CompiledExpressionState::Case(state)) => {
+                Self::execute_case_into(
+                    expr, state, chunk, sel, count, runtime, params, result, shared,
                 )
             }
-            (Expression::Case(expr), CompiledExpressionState::Case(state)) => {
-                Self::execute_case_into(expr, state, chunk, sel, count, runtime, params, result)
+            (PhysicalExpression::Operator(expr), CompiledExpressionState::Operator(state)) => {
+                Self::execute_operator_into(
+                    expr, state, chunk, sel, count, runtime, params, result, shared,
+                )
             }
-            (Expression::Operator(expr), CompiledExpressionState::Operator(state)) => {
-                Self::execute_operator_into(expr, state, chunk, sel, count, runtime, params, result)
-            }
-            (Expression::Constant(expr), CompiledExpressionState::Constant(_)) => {
+            (PhysicalExpression::Constant(expr), CompiledExpressionState::Constant(_)) => {
                 Self::execute_constant_into(expr, count, runtime, result)
             }
-            (Expression::Parameter(expr), CompiledExpressionState::Parameter(state)) => {
+            (PhysicalExpression::Parameter(expr), CompiledExpressionState::Parameter(state)) => {
                 Self::execute_parameter_into(&expr.slot, state, count, runtime, params, result)
             }
-            (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
+            (PhysicalExpression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
                 Self::execute_column_ref_into(expr, chunk, sel, count, result)
             }
-            (Expression::Reference(expr), CompiledExpressionState::Reference(_)) => {
+            (PhysicalExpression::Reference(expr), CompiledExpressionState::Reference(_)) => {
                 Self::execute_reference_into(expr, chunk, sel, count, result)
             }
-            (Expression::Aggregate(_), _) => Err(paro_error::internal(
-                "Aggregate expressions should not be executed by ExpressionExecutor",
-            )),
-            (Expression::Subquery(_), _) => Err(paro_error::not_implemented(
-                "Subquery execution in ExpressionExecutor",
-            )),
-            (Expression::Window(_), _) => Err(paro_error::not_implemented(
-                "Window execution in ExpressionExecutor",
-            )),
-            _ => Err(paro_error::internal("Expression state mismatch")),
+            (PhysicalExpression::Shared(expr), CompiledExpressionState::Shared(_)) => {
+                let value = shared.execute_value(expr, chunk, sel, count, runtime, params)?;
+                value.write_into(result)?;
+                result.set_len(count);
+                Ok(())
+            }
+            _ => Err(expression_state_mismatch(expr, state)),
         }
     }
 
     fn execute_value(
-        expr: &Expression,
+        expr: &PhysicalExpression,
         state: &mut CompiledExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
-        match (expr, state) {
-            (Expression::Function(expr), CompiledExpressionState::Function(state)) => {
-                Self::execute_function_value(expr, state, chunk, sel, count, runtime, params)
+        match (expr, &mut *state) {
+            (PhysicalExpression::Function(expr), CompiledExpressionState::Function(state)) => {
+                Self::execute_function_value(
+                    expr, state, chunk, sel, count, runtime, params, shared,
+                )
             }
-            (Expression::Cast(expr), CompiledExpressionState::Cast(state)) => {
-                Self::execute_cast_value(expr, state, chunk, sel, count, runtime, params)
+            (PhysicalExpression::Cast(expr), CompiledExpressionState::Cast(state)) => {
+                Self::execute_cast_value(expr, state, chunk, sel, count, runtime, params, shared)
             }
-            (Expression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
-                Self::execute_comparison_value(expr, state, chunk, sel, count, runtime, params)
+            (PhysicalExpression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
+                Self::execute_comparison_value(
+                    expr, state, chunk, sel, count, runtime, params, shared,
+                )
             }
-            (Expression::Conjunction(expr), CompiledExpressionState::Conjunction(state)) => {
-                Self::execute_conjunction_value(expr, state, chunk, sel, count, runtime, params)
+            (
+                PhysicalExpression::Conjunction(expr),
+                CompiledExpressionState::Conjunction(state),
+            ) => Self::execute_conjunction_value(
+                expr, state, chunk, sel, count, runtime, params, shared,
+            ),
+            (PhysicalExpression::Case(expr), CompiledExpressionState::Case(state)) => {
+                Self::execute_case_value(expr, state, chunk, sel, count, runtime, params, shared)
             }
-            (Expression::Case(expr), CompiledExpressionState::Case(state)) => {
-                Self::execute_case_value(expr, state, chunk, sel, count, runtime, params)
+            (PhysicalExpression::Operator(expr), CompiledExpressionState::Operator(state)) => {
+                Self::execute_operator_value(
+                    expr, state, chunk, sel, count, runtime, params, shared,
+                )
             }
-            (Expression::Operator(expr), CompiledExpressionState::Operator(state)) => {
-                Self::execute_operator_value(expr, state, chunk, sel, count, runtime, params)
-            }
-            (Expression::Constant(expr), CompiledExpressionState::Constant(_)) => {
+            (PhysicalExpression::Constant(expr), CompiledExpressionState::Constant(_)) => {
                 Ok(EvaluatedValue::Borrowed(Vector::try_constant_from_value(
                     expr.return_type.clone(),
                     expr.value.clone(),
@@ -492,25 +704,19 @@ impl ExpressionExecutor {
                     runtime.allocator(MemoryTag::BaseTable),
                 )?))
             }
-            (Expression::Parameter(expr), CompiledExpressionState::Parameter(state)) => {
+            (PhysicalExpression::Parameter(expr), CompiledExpressionState::Parameter(state)) => {
                 Self::execute_parameter_value(&expr.slot, state, count, runtime, params)
             }
-            (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
+            (PhysicalExpression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_)) => {
                 Self::execute_column_ref_value(expr, chunk, sel, count)
             }
-            (Expression::Reference(expr), CompiledExpressionState::Reference(_)) => {
+            (PhysicalExpression::Reference(expr), CompiledExpressionState::Reference(_)) => {
                 Self::execute_reference_value(expr, chunk, sel, count)
             }
-            (Expression::Aggregate(_), _) => Err(paro_error::internal(
-                "Aggregate expressions should not be executed by ExpressionExecutor",
-            )),
-            (Expression::Subquery(_), _) => Err(paro_error::not_implemented(
-                "Subquery execution in ExpressionExecutor",
-            )),
-            (Expression::Window(_), _) => Err(paro_error::not_implemented(
-                "Window execution in ExpressionExecutor",
-            )),
-            _ => Err(paro_error::internal("Expression state mismatch")),
+            (PhysicalExpression::Shared(expr), CompiledExpressionState::Shared(_)) => {
+                shared.execute_value(expr, chunk, sel, count, runtime, params)
+            }
+            _ => Err(expression_state_mismatch(expr, state)),
         }
     }
 
@@ -676,7 +882,7 @@ impl ExpressionExecutor {
     }
 
     fn try_dictionary_cached_function(
-        expr: &FunctionExpression,
+        expr: &PhysicalFunctionExpression,
         intermediate: &Chunk,
         count: usize,
         runtime: &dyn FunctionExecContext,
@@ -777,7 +983,7 @@ impl ExpressionExecutor {
         Ok(Some(result))
     }
 
-    fn prepare_in_list(expr: &OperatorExpression) -> Option<PreparedInList> {
+    fn prepare_in_list(expr: &PhysicalOperatorExpression) -> Option<PreparedInList> {
         if !matches!(expr.operator_type, OperatorType::In | OperatorType::NotIn)
             || expr.children.len() < 2
         {
@@ -787,7 +993,7 @@ impl ExpressionExecutor {
         let mut values = Vec::with_capacity(expr.children.len().saturating_sub(1));
         let mut has_null = false;
         for child in &expr.children[1..] {
-            let Expression::Constant(constant) = child else {
+            let PhysicalExpression::Constant(constant) = child else {
                 return Some(PreparedInList::Dynamic);
             };
             if constant.value.is_null() {
@@ -795,6 +1001,20 @@ impl ExpressionExecutor {
             } else {
                 values.push(constant.value.clone());
             }
+        }
+
+        match expr.children[0].return_type() {
+            LogicalType::Integer => {
+                if let Some(values) = Self::prepare_i32_in_values(&values) {
+                    return Some(PreparedInList::I32Const { values, has_null });
+                }
+            }
+            LogicalType::BigInt => {
+                if let Some(values) = Self::prepare_i64_in_values(&values) {
+                    return Some(PreparedInList::I64Const { values, has_null });
+                }
+            }
+            _ => {}
         }
 
         if values.len() > 8 {
@@ -807,8 +1027,29 @@ impl ExpressionExecutor {
         }
     }
 
+    fn prepare_i32_in_values(values: &[Value]) -> Option<Vec<i32>> {
+        let mut typed = values
+            .iter()
+            .map(Value::as_i64)
+            .map(|value| value.and_then(|value| i32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()?;
+        typed.sort_unstable();
+        typed.dedup();
+        Some(typed)
+    }
+
+    fn prepare_i64_in_values(values: &[Value]) -> Option<Vec<i64>> {
+        let mut typed = values
+            .iter()
+            .map(Value::as_i64)
+            .collect::<Option<Vec<_>>>()?;
+        typed.sort_unstable();
+        typed.dedup();
+        Some(typed)
+    }
+
     fn select_expression(
-        expr: &Expression,
+        expr: &PhysicalExpression,
         state: &mut CompiledExpressionState,
         chunk: &Chunk,
         input_sel: Option<&SelectionVector>,
@@ -816,14 +1057,17 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         output_sel: &mut SelectionVector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<usize> {
         if let Some(selected) = Self::try_direct_select(
-            expr, state, chunk, input_sel, count, runtime, params, output_sel,
+            expr, state, chunk, input_sel, count, runtime, params, output_sel, shared,
         )? {
             return Ok(selected);
         }
 
-        let value = Self::execute_value(expr, state, chunk, input_sel, count, runtime, params)?;
+        let value = Self::execute_value(
+            expr, state, chunk, input_sel, count, runtime, params, shared,
+        )?;
         Ok(scan_bool_selection(
             value.as_vector(),
             input_sel,
@@ -833,7 +1077,7 @@ impl ExpressionExecutor {
     }
 
     fn try_direct_select(
-        expr: &Expression,
+        expr: &PhysicalExpression,
         state: &mut CompiledExpressionState,
         chunk: &Chunk,
         input_sel: Option<&SelectionVector>,
@@ -841,9 +1085,10 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         output_sel: &mut SelectionVector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<Option<usize>> {
         match (expr, state) {
-            (Expression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
+            (PhysicalExpression::Comparison(expr), CompiledExpressionState::Comparison(state)) => {
                 let Some(select) = state.select else {
                     return Ok(None);
                 };
@@ -855,6 +1100,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 let right = Self::execute_value(
                     &expr.right,
@@ -864,6 +1110,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 Self::store_value(&mut state.left_result, &left);
                 Self::store_value(&mut state.right_result, &right);
@@ -875,7 +1122,10 @@ impl ExpressionExecutor {
                     output_sel,
                 )?))
             }
-            (Expression::Conjunction(expr), CompiledExpressionState::Conjunction(state)) => {
+            (
+                PhysicalExpression::Conjunction(expr),
+                CompiledExpressionState::Conjunction(state),
+            ) => {
                 if expr.children.is_empty() {
                     return Err(paro_error::internal("Conjunction without children"));
                 }
@@ -903,6 +1153,7 @@ impl ExpressionExecutor {
                                 runtime,
                                 params,
                                 &mut next,
+                                shared,
                             )?;
                             std::mem::swap(&mut current, &mut next);
                             current_count = selected;
@@ -925,6 +1176,7 @@ impl ExpressionExecutor {
                                 runtime,
                                 params,
                                 &mut next,
+                                shared,
                             )?;
                             if child_idx == 0 {
                                 super::predicate::mark_selected_rows(
@@ -940,7 +1192,7 @@ impl ExpressionExecutor {
                     }
                 }
             }
-            (Expression::Operator(expr), CompiledExpressionState::Operator(state)) => {
+            (PhysicalExpression::Operator(expr), CompiledExpressionState::Operator(state)) => {
                 match expr.operator_type {
                     OperatorType::IsNull => {
                         let child = Self::execute_value(
@@ -951,6 +1203,7 @@ impl ExpressionExecutor {
                             count,
                             runtime,
                             params,
+                            shared,
                         )?;
                         Self::store_value(&mut state.child_results[0], &child);
                         Ok(Some(scan_null_selection(
@@ -970,6 +1223,7 @@ impl ExpressionExecutor {
                             count,
                             runtime,
                             params,
+                            shared,
                         )?;
                         Self::store_value(&mut state.child_results[0], &child);
                         Ok(Some(scan_null_selection(
@@ -989,6 +1243,7 @@ impl ExpressionExecutor {
                             count,
                             runtime,
                             params,
+                            shared,
                         )?;
                         Self::store_value(&mut state.child_results[0], &child);
                         Ok(Some(scan_false_bool_selection(
@@ -1001,7 +1256,7 @@ impl ExpressionExecutor {
                     _ => Ok(None),
                 }
             }
-            (Expression::Constant(expr), CompiledExpressionState::Constant(_))
+            (PhysicalExpression::Constant(expr), CompiledExpressionState::Constant(_))
                 if expr.return_type == LogicalType::Boolean =>
             {
                 let selected = match expr.value {
@@ -1014,7 +1269,7 @@ impl ExpressionExecutor {
                 };
                 Ok(Some(selected))
             }
-            (Expression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_))
+            (PhysicalExpression::ColumnRef(expr), CompiledExpressionState::ColumnRef(_))
                 if expr.return_type == LogicalType::Boolean =>
             {
                 let value = Self::execute_column_ref_value(expr, chunk, input_sel, count)?;
@@ -1025,7 +1280,7 @@ impl ExpressionExecutor {
                     output_sel,
                 )))
             }
-            (Expression::Reference(expr), CompiledExpressionState::Reference(_))
+            (PhysicalExpression::Reference(expr), CompiledExpressionState::Reference(_))
                 if expr.return_type == LogicalType::Boolean =>
             {
                 let value = Self::execute_reference_value(expr, chunk, input_sel, count)?;
@@ -1036,8 +1291,8 @@ impl ExpressionExecutor {
                     output_sel,
                 )))
             }
-            (Expression::Parameter(expr), CompiledExpressionState::Parameter(state))
-                if expr.return_type() == LogicalType::Boolean =>
+            (PhysicalExpression::Parameter(expr), CompiledExpressionState::Parameter(state))
+                if expr.slot.ty == LogicalType::Boolean =>
             {
                 let value =
                     Self::execute_parameter_value(&expr.slot, state, count, runtime, params)?;
@@ -1053,7 +1308,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_function_into(
-        expr: &FunctionExpression,
+        expr: &PhysicalFunctionExpression,
         state: &mut ExecuteFunctionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -1061,6 +1316,7 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
         let allocator = runtime.allocator(MemoryTag::BaseTable);
         let ExecuteFunctionState {
@@ -1087,6 +1343,7 @@ impl ExpressionExecutor {
                 count,
                 runtime,
                 params,
+                shared,
             )?;
             intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
         }
@@ -1115,13 +1372,14 @@ impl ExpressionExecutor {
     }
 
     fn execute_function_value(
-        expr: &FunctionExpression,
+        expr: &PhysicalFunctionExpression,
         state: &mut ExecuteFunctionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
         let allocator = runtime.allocator(MemoryTag::BaseTable);
         let ExecuteFunctionState {
@@ -1149,6 +1407,7 @@ impl ExpressionExecutor {
                 count,
                 runtime,
                 params,
+                shared,
             )?;
             intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
         }
@@ -1177,7 +1436,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_cast_into(
-        expr: &CastExpression,
+        expr: &PhysicalCastExpression,
         state: &mut CastExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -1185,6 +1444,7 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
         let child_value = Self::execute_value(
             &expr.child,
@@ -1194,6 +1454,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         Self::store_value(&mut state.child_result, &child_value);
 
@@ -1220,13 +1481,14 @@ impl ExpressionExecutor {
     }
 
     fn execute_cast_value(
-        expr: &CastExpression,
+        expr: &PhysicalCastExpression,
         state: &mut CastExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
         let child_value = Self::execute_value(
             &expr.child,
@@ -1236,6 +1498,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         Self::store_value(&mut state.child_result, &child_value);
 
@@ -1260,7 +1523,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_comparison_into(
-        expr: &ComparisonExpression,
+        expr: &PhysicalComparisonExpression,
         state: &mut ComparisonExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -1268,6 +1531,7 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
         let left = Self::execute_value(
             &expr.left,
@@ -1277,6 +1541,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         let right = Self::execute_value(
             &expr.right,
@@ -1286,6 +1551,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         Self::store_value(&mut state.left_result, &left);
         Self::store_value(&mut state.right_result, &right);
@@ -1305,13 +1571,14 @@ impl ExpressionExecutor {
     }
 
     fn execute_comparison_value(
-        expr: &ComparisonExpression,
+        expr: &PhysicalComparisonExpression,
         state: &mut ComparisonExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
         let left = Self::execute_value(
             &expr.left,
@@ -1321,6 +1588,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         let right = Self::execute_value(
             &expr.right,
@@ -1330,6 +1598,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         Self::store_value(&mut state.left_result, &left);
         Self::store_value(&mut state.right_result, &right);
@@ -1372,7 +1641,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_conjunction_into(
-        expr: &ConjunctionExpression,
+        expr: &PhysicalConjunctionExpression,
         state: &mut ConjunctionExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -1380,6 +1649,7 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
         if expr.children.is_empty() {
             return Err(paro_error::internal("Conjunction without children"));
@@ -1392,6 +1662,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         if expr.children.len() == 1 {
             first.write_into(result)?;
@@ -1410,6 +1681,7 @@ impl ExpressionExecutor {
                 count,
                 runtime,
                 params,
+                shared,
             )?;
             let target_slot = if child_idx % 2 == 1 {
                 &mut state.ping
@@ -1437,13 +1709,14 @@ impl ExpressionExecutor {
     }
 
     fn execute_conjunction_value(
-        expr: &ConjunctionExpression,
+        expr: &PhysicalConjunctionExpression,
         state: &mut ConjunctionExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
         if expr.children.is_empty() {
             return Err(paro_error::internal("Conjunction without children"));
@@ -1456,6 +1729,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         if expr.children.len() == 1 {
             return Ok(first);
@@ -1473,6 +1747,7 @@ impl ExpressionExecutor {
                 count,
                 runtime,
                 params,
+                shared,
             )?;
             let target_slot = if child_idx % 2 == 1 {
                 &mut state.ping
@@ -1503,7 +1778,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_case_into(
-        expr: &CaseExpression,
+        expr: &PhysicalCaseExpression,
         state: &mut CaseExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -1511,6 +1786,7 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
         let check = Self::execute_value(
             &expr.check,
@@ -1520,6 +1796,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         let if_true = Self::execute_value(
             &expr.result_if_true,
@@ -1529,6 +1806,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         let if_false = Self::execute_value(
             &expr.result_if_false,
@@ -1538,6 +1816,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         Self::store_value(&mut state.check_result, &check);
         Self::store_value(&mut state.true_result, &if_true);
@@ -1554,13 +1833,14 @@ impl ExpressionExecutor {
     }
 
     fn execute_case_value(
-        expr: &CaseExpression,
+        expr: &PhysicalCaseExpression,
         state: &mut CaseExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
         let check = Self::execute_value(
             &expr.check,
@@ -1570,6 +1850,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         let if_true = Self::execute_value(
             &expr.result_if_true,
@@ -1579,6 +1860,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         let if_false = Self::execute_value(
             &expr.result_if_false,
@@ -1588,6 +1870,7 @@ impl ExpressionExecutor {
             count,
             runtime,
             params,
+            shared,
         )?;
         Self::store_value(&mut state.check_result, &check);
         Self::store_value(&mut state.true_result, &if_true);
@@ -1608,7 +1891,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_operator_into(
-        expr: &OperatorExpression,
+        expr: &PhysicalOperatorExpression,
         state: &mut OperatorExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
@@ -1616,21 +1899,24 @@ impl ExpressionExecutor {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
         result: &mut Vector,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<()> {
-        let value = Self::execute_operator_value(expr, state, chunk, sel, count, runtime, params)?;
+        let value =
+            Self::execute_operator_value(expr, state, chunk, sel, count, runtime, params, shared)?;
         value.write_into(result)?;
         result.set_len(count);
         Ok(())
     }
 
     fn execute_operator_value(
-        expr: &OperatorExpression,
+        expr: &PhysicalOperatorExpression,
         state: &mut OperatorExpressionState,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
+        shared: &mut SharedEvaluation<'_>,
     ) -> Result<EvaluatedValue> {
         match expr.operator_type {
             OperatorType::Not => {
@@ -1642,6 +1928,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 Self::store_value(&mut state.child_results[0], &child);
                 let result = Self::prepare_slot_result(
@@ -1671,6 +1958,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 Self::store_value(&mut state.child_results[0], &child);
                 let result = Self::prepare_slot_result(
@@ -1735,6 +2023,7 @@ impl ExpressionExecutor {
                         unresolved_count,
                         runtime,
                         params,
+                        shared,
                     )?;
                     Self::store_value(&mut state.child_results[child_idx], &child);
 
@@ -1766,6 +2055,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 Self::store_value(&mut state.child_results[0], &lhs);
 
@@ -1782,6 +2072,26 @@ impl ExpressionExecutor {
                     .as_ref()
                     .expect("IN operator should initialize an execution strategy")
                 {
+                    PreparedInList::I32Const { values, has_null } => {
+                        Self::execute_in_i32_const(
+                            lhs.as_vector(),
+                            values,
+                            *has_null,
+                            negate,
+                            result,
+                            count,
+                        );
+                    }
+                    PreparedInList::I64Const { values, has_null } => {
+                        Self::execute_in_i64_const(
+                            lhs.as_vector(),
+                            values,
+                            *has_null,
+                            negate,
+                            result,
+                            count,
+                        );
+                    }
                     PreparedInList::SmallConst { values, has_null } => {
                         Self::execute_in_const_values(
                             lhs.as_vector(),
@@ -1835,6 +2145,7 @@ impl ExpressionExecutor {
                                 count,
                                 runtime,
                                 params,
+                                shared,
                             )?;
                             Self::store_value(&mut state.child_results[rhs_idx], &rhs);
                             (eq_dispatch.compare)(
@@ -1882,6 +2193,7 @@ impl ExpressionExecutor {
                         count,
                         runtime,
                         params,
+                        shared,
                     )?;
                     Self::store_value(&mut state.child_results[child_idx], &child);
                     for row in 0..count {
@@ -1925,6 +2237,7 @@ impl ExpressionExecutor {
                         count,
                         runtime,
                         params,
+                        shared,
                     )?;
                     Self::store_value(&mut state.child_results[child_idx], &child);
                     let child_vec = Arc::make_mut(&mut children[child_idx]);
@@ -1956,6 +2269,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 let row_count = Self::execute_value(
                     &expr.children[1],
@@ -1965,6 +2279,7 @@ impl ExpressionExecutor {
                     count,
                     runtime,
                     params,
+                    shared,
                 )?;
                 Self::store_value(&mut state.child_results[0], &value);
                 Self::store_value(&mut state.child_results[1], &row_count);
@@ -2030,6 +2345,54 @@ impl ExpressionExecutor {
         }
     }
 
+    fn execute_in_i32_const(
+        lhs: &Vector,
+        values: &[i32],
+        has_null_rhs: bool,
+        negate: bool,
+        result: &mut Vector,
+        count: usize,
+    ) {
+        for row_idx in 0..count {
+            let Some(lhs_value) = lhs.get_i32(row_idx) else {
+                result.set_null(row_idx, true);
+                continue;
+            };
+
+            if values.binary_search(&lhs_value).is_ok() {
+                result.set_bool(row_idx, !negate);
+            } else if has_null_rhs {
+                result.set_null(row_idx, true);
+            } else {
+                result.set_bool(row_idx, negate);
+            }
+        }
+    }
+
+    fn execute_in_i64_const(
+        lhs: &Vector,
+        values: &[i64],
+        has_null_rhs: bool,
+        negate: bool,
+        result: &mut Vector,
+        count: usize,
+    ) {
+        for row_idx in 0..count {
+            let Some(lhs_value) = lhs.get_i64(row_idx) else {
+                result.set_null(row_idx, true);
+                continue;
+            };
+
+            if values.binary_search(&lhs_value).is_ok() {
+                result.set_bool(row_idx, !negate);
+            } else if has_null_rhs {
+                result.set_null(row_idx, true);
+            } else {
+                result.set_bool(row_idx, negate);
+            }
+        }
+    }
+
     fn execute_in_const_hash(
         lhs: &Vector,
         values: &HashSet<Value>,
@@ -2056,7 +2419,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_constant_into(
-        expr: &ConstantExpression,
+        expr: &super::program::ExpressionConstant,
         count: usize,
         runtime: &dyn FunctionExecContext,
         result: &mut Vector,
@@ -2071,12 +2434,12 @@ impl ExpressionExecutor {
     }
 
     fn execute_column_ref_value(
-        expr: &ColumnRefExpression,
+        expr: &PhysicalColumnRefExpression,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
     ) -> Result<EvaluatedValue> {
-        if expr.binding.column_index >= chunk.data.len() {
+        if expr.column_index >= chunk.data.len() {
             if count == 0 {
                 return Ok(EvaluatedValue::Borrowed(Vector::try_new(
                     expr.return_type.clone(),
@@ -2086,14 +2449,14 @@ impl ExpressionExecutor {
             }
             return Err(paro_error::internal(format!(
                 "Column reference index {} out of bounds (chunk columns={})",
-                expr.binding.column_index,
+                expr.column_index,
                 chunk.data.len()
             )));
         }
-        let column = chunk.data[expr.binding.column_index].as_ref();
+        let column = chunk.data[expr.column_index].as_ref();
         if let Some(sel) = sel {
             Ok(EvaluatedValue::Borrowed(Vector::try_dictionary(
-                chunk.data[expr.binding.column_index].clone(),
+                chunk.data[expr.column_index].clone(),
                 sel,
             )?))
         } else {
@@ -2102,7 +2465,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_column_ref_into(
-        expr: &ColumnRefExpression,
+        expr: &PhysicalColumnRefExpression,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
@@ -2115,7 +2478,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_reference_value(
-        expr: &ReferenceExpression,
+        expr: &PhysicalReferenceExpression,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
@@ -2146,7 +2509,7 @@ impl ExpressionExecutor {
     }
 
     fn execute_reference_into(
-        expr: &ReferenceExpression,
+        expr: &PhysicalReferenceExpression,
         chunk: &Chunk,
         sel: Option<&SelectionVector>,
         count: usize,
@@ -2303,6 +2666,13 @@ mod tests {
         ))
     }
 
+    fn constant_varchar(value: &str) -> Expression {
+        Expression::Constant(ConstantExpression::new(
+            Value::Varchar(value.to_string()),
+            LogicalType::Varchar,
+        ))
+    }
+
     fn parameter_i32(index: usize) -> Expression {
         Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
             RuntimeParamId::new(index),
@@ -2332,6 +2702,10 @@ mod tests {
 
     fn reference_i64(index: usize) -> Expression {
         Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt))
+    }
+
+    fn reference_varchar(index: usize) -> Expression {
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar))
     }
 
     fn reference_timestamp(index: usize) -> Expression {
@@ -2775,27 +3149,23 @@ mod tests {
             paro_common::test_utils::test_vector_with_capacity(LogicalType::Boolean, input.size());
 
         executor
-            .execute_into_with_input(
+            .execute_kernel_into(
                 0,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: &first_bindings,
                     columns: &input,
-                },
-                None,
-                input.size(),
+                }),
                 &runtime,
                 &mut first,
             )
             .expect("parameter comparison should execute");
         executor
-            .execute_into_with_input(
+            .execute_kernel_into(
                 0,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: &second_bindings,
                     columns: &input,
-                },
-                None,
-                input.size(),
+                }),
                 &runtime,
                 &mut second,
             )
@@ -2825,13 +3195,12 @@ mod tests {
         let mut selection = paro_common::test_utils::test_selection_with_capacity(input.size());
 
         let selected = executor
-            .select_into_with_input(
+            .select_kernel(
                 0,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: &true_bindings,
                     columns: &input,
-                },
-                input.size(),
+                }),
                 &runtime,
                 &mut selection,
             )
@@ -2840,13 +3209,12 @@ mod tests {
         assert_eq!(selection.as_slice(), &[0, 1, 2]);
 
         let selected = executor
-            .select_into_with_input(
+            .select_kernel(
                 0,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: &false_bindings,
                     columns: &input,
-                },
-                input.size(),
+                }),
                 &runtime,
                 &mut selection,
             )
@@ -2946,7 +3314,7 @@ mod tests {
     }
 
     #[test]
-    fn in_list_uses_small_and_hashed_constant_strategies_with_sql_null_semantics() {
+    fn in_list_uses_typed_constant_strategy_with_sql_null_semantics() {
         let session = test_session();
         let runtime = test_runtime(session.clone());
         let small_expr = in_list_i32_expr(&[Some(2), Some(4), None], false);
@@ -2981,12 +3349,36 @@ mod tests {
             CompiledExpressionState::Operator(state) => {
                 assert!(matches!(
                     state.in_list.as_ref(),
-                    Some(PreparedInList::SmallConst { .. })
+                    Some(PreparedInList::I32Const { .. })
                 ));
             }
             other => panic!("expected operator state, got {other:?}"),
         }
         match large_executor.compiled_state(0) {
+            CompiledExpressionState::Operator(state) => {
+                assert!(matches!(
+                    state.in_list.as_ref(),
+                    Some(PreparedInList::I32Const { .. })
+                ));
+            }
+            other => panic!("expected operator state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_list_keeps_boxed_hash_fallback_for_large_non_typed_constants() {
+        let mut children = vec![reference_varchar(0)];
+        for value in 0..16 {
+            children.push(constant_varchar(&format!("value_{value}")));
+        }
+        let expr = Expression::Operator(OperatorExpression::new(
+            OperatorType::In,
+            children,
+            LogicalType::Boolean,
+        ));
+        let executor = ExpressionExecutor::new(&expr);
+
+        match executor.compiled_state(0) {
             CompiledExpressionState::Operator(state) => {
                 assert!(matches!(
                     state.in_list.as_ref(),
@@ -3524,6 +3916,221 @@ mod tests {
         assert_eq!(first_output_ptr, second_output_ptr);
         assert_eq!(output.get_value(0, 0), Some(Value::Integer(5)));
         assert_eq!(output.get_value(0, 1), Some(Value::Integer(6)));
+    }
+
+    #[test]
+    fn physical_program_exposes_version_and_stable_root_fingerprints() {
+        let expr = greater_than_i32(0, 7);
+        let executor = ExpressionExecutor::new(&expr);
+        let program = executor.physical_program();
+
+        assert_eq!(program.root_count(), 1);
+        assert_eq!(
+            program.root_fingerprints(),
+            super::super::program::expression_list_fingerprints(std::slice::from_ref(&expr))
+        );
+        assert_eq!(
+            program.version().backend,
+            super::super::program::ExpressionBackend::VectorTreeV1
+        );
+    }
+
+    #[test]
+    fn duplicate_root_expressions_share_compiled_state_and_output() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let (expr, counter) = cached_identity_expr(0);
+        let mut executor = ExpressionExecutor::with_expressions(&[expr.clone(), expr]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        executor
+            .execute_all_into(&integer_chunk(&[1, 2, 3]), &runtime, &mut output)
+            .expect("duplicate roots should execute");
+
+        assert_eq!(executor.physical_program().unique_root_count(), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&output.data[0], &output.data[1]));
+    }
+
+    #[test]
+    fn duplicate_leading_roots_do_not_shift_later_unique_state() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let duplicate = reference_i32(0);
+        let later_unique = add_one_expr(0);
+        let mut executor =
+            ExpressionExecutor::with_expressions(&[duplicate.clone(), duplicate, later_unique]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        executor
+            .execute_all_into(&integer_chunk(&[1, 2, 3]), &runtime, &mut output)
+            .expect("later unique root should keep its own compiled state");
+
+        assert_eq!(executor.physical_program().unique_root_count(), 2);
+        assert!(Arc::ptr_eq(&output.data[0], &output.data[1]));
+        assert_eq!(output.get_value(2, 0), Some(Value::Integer(2)));
+        assert_eq!(output.get_value(2, 2), Some(Value::Integer(4)));
+    }
+
+    #[test]
+    fn repeated_child_expressions_share_scratch_within_kernel_batch() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let (shared_expr, counter) = cached_identity_expr(0);
+        let greater = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            shared_expr.clone(),
+            constant_i32(1),
+        ));
+        let less = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::LessThan,
+            shared_expr,
+            constant_i32(4),
+        ));
+        let mut executor = ExpressionExecutor::with_expressions(&[greater, less]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        assert_eq!(executor.physical_program().shared_expression_count(), 1);
+        assert_eq!(executor.physical_program().scratch_layout().len(), 1);
+
+        executor
+            .execute_all_into(&integer_chunk(&[1, 2, 5]), &runtime, &mut output)
+            .expect("shared child expressions should execute");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let greater_result = output.column(0).expect("greater output");
+        let less_result = output.column(1).expect("less output");
+        assert_eq!(greater_result.get_bool(0), Some(false));
+        assert_eq!(greater_result.get_bool(1), Some(true));
+        assert_eq!(greater_result.get_bool(2), Some(true));
+        assert_eq!(less_result.get_bool(0), Some(true));
+        assert_eq!(less_result.get_bool(1), Some(true));
+        assert_eq!(less_result.get_bool(2), Some(false));
+
+        executor
+            .execute_all_into(&integer_chunk(&[3]), &runtime, &mut output)
+            .expect("next batch should recompute shared scratch");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn repeated_child_expressions_share_scratch_with_selection() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let (shared_expr, counter) = cached_identity_expr(0);
+        let greater = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            shared_expr.clone(),
+            constant_i32(1),
+        ));
+        let less = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::LessThan,
+            shared_expr,
+            constant_i32(4),
+        ));
+        let mut executor = ExpressionExecutor::with_expressions(&[greater, less]);
+        let input = integer_chunk(&[0, 2, 5]);
+        let selection = paro_common::test_utils::test_selection(vec![1, 2]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        executor
+            .execute_all_kernel(
+                VectorKernelInput::from_chunk(&input)
+                    .with_selection(Some(&selection))
+                    .with_count(selection.len()),
+                &runtime,
+                &mut output,
+            )
+            .expect("shared selected child expressions should execute");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let greater_result = output.column(0).expect("greater output");
+        let less_result = output.column(1).expect("less output");
+        assert_eq!(greater_result.get_bool(0), Some(true));
+        assert_eq!(greater_result.get_bool(1), Some(true));
+        assert_eq!(less_result.get_bool(0), Some(true));
+        assert_eq!(less_result.get_bool(1), Some(false));
+    }
+
+    #[test]
+    fn repeated_child_expressions_share_scratch_inside_single_root() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let (shared_expr, counter) = cached_identity_expr(0);
+        let expr = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            shared_expr.clone(),
+            shared_expr,
+        ));
+        let mut executor = ExpressionExecutor::new(&expr);
+        let input = integer_chunk(&[7, 8, 9]);
+
+        let result = executor
+            .execute_expression(0, &input, None, input.size(), &runtime)
+            .expect("shared single-root expression should execute");
+
+        assert_eq!(executor.physical_program().shared_expression_count(), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(result.get_bool(0), Some(true));
+        assert_eq!(result.get_bool(1), Some(true));
+        assert_eq!(result.get_bool(2), Some(true));
+    }
+
+    #[test]
+    fn expression_program_cache_keys_include_version() {
+        let expr = greater_than_i32(0, 10);
+        let mut cache = crate::expression_executor::physical::ExpressionProgramCache::default();
+        let version = ExpressionProgramVersion::anonymous();
+
+        let first = cache.get_or_compile(std::slice::from_ref(&expr), version.clone());
+        let second = cache.get_or_compile(std::slice::from_ref(&expr), version.clone());
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+
+        let mut changed = version;
+        changed.settings_fingerprint = 42;
+        let third = cache.get_or_compile(std::slice::from_ref(&expr), changed);
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn expression_program_cache_evicts_lru_without_clearing_all_entries() {
+        let keep = greater_than_i32(0, 10);
+        let evict = less_than_i32(0, 20);
+        let insert = greater_than_i32(0, 30);
+        let version = ExpressionProgramVersion::anonymous();
+        let mut cache =
+            crate::expression_executor::physical::ExpressionProgramCache::with_capacity_limit(2);
+
+        let keep_program = cache.get_or_compile(std::slice::from_ref(&keep), version.clone());
+        cache.get_or_compile(std::slice::from_ref(&evict), version.clone());
+        let keep_again = cache.get_or_compile(std::slice::from_ref(&keep), version.clone());
+        assert!(Arc::ptr_eq(&keep_program, &keep_again));
+        cache.get_or_compile(std::slice::from_ref(&insert), version.clone());
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_program(std::slice::from_ref(&keep), &version));
+        assert!(cache.contains_program(std::slice::from_ref(&insert), &version));
+        assert!(!cache.contains_program(std::slice::from_ref(&evict), &version));
+    }
+
+    #[test]
+    fn expression_executor_reuses_cached_physical_programs() {
+        let expr = greater_than_i32(0, 10);
+        let first = ExpressionExecutor::new(&expr);
+        let second = ExpressionExecutor::new(&expr);
+
+        assert!(std::ptr::addr_eq(
+            first.physical_program(),
+            second.physical_program()
+        ));
     }
 
     #[test]

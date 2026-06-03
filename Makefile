@@ -1,7 +1,7 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark perf-gate perf-gate-sql perf-gate-divan perf-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
+.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark performance-gate performance-gate-sql performance-gate-divan performance-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
 
 # Build the project
 build:
@@ -327,14 +327,14 @@ bench-ping: ## Verify benchmark can connect to Paro
 	@$(MAKE) -C benchmark ping
 
 # ── Operator Runtime Performance Gate ────────────────────────
-perf-gate: ## Run operator runtime performance gate (requires parod running)
+performance-gate: ## Run operator runtime performance gate (requires parod running)
 	@$(MAKE) -C benchmark check GATE=operator-runtime $(if $(PID),PID=$(PID)) $(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
 
-perf-gate-sql: ## Run SQL performance gates only (requires parod running)
+performance-gate-sql: ## Run SQL performance gates only (requires parod running)
 	@$(MAKE) -C benchmark check GATE=operator-runtime INCLUDE_SOURCE=operator-runtime-sql $(if $(PID),PID=$(PID)) $(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
 
-perf-gate-divan: ## Run operator runtime Divan dispatch gate
+performance-gate-divan: ## Run operator runtime Divan dispatch gate
 	@PARO_BENCH_CARGO_PROFILE=release $(MAKE) -C benchmark check GATE=divan-dispatch $(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
 
-perf-gate-bless: ## Bless current operator runtime SQL gate baseline
+performance-gate-bless: ## Bless current operator runtime SQL gate baseline
 	@$(MAKE) -C benchmark bless GATE=operator-runtime $(if $(PID),PID=$(PID))

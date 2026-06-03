@@ -39,6 +39,17 @@ impl EffectiveSettings {
         matches!(self.get("force_external"), Some(Value::Boolean(true)))
     }
 
+    pub fn rowset_scan_pushdown(&self) -> bool {
+        !matches!(
+            self.get("rowset_scan_pushdown"),
+            Some(Value::Boolean(false))
+        )
+    }
+
+    pub fn parallel_scheduler(&self) -> bool {
+        matches!(self.get("parallel_scheduler"), Some(Value::Boolean(true)))
+    }
+
     pub fn threads(&self) -> Option<usize> {
         value_to_usize(self.get("threads"))
     }

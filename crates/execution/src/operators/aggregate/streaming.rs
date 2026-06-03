@@ -12,7 +12,7 @@ use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::scalar::FunctionExecContext;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::aggregate::aggregate_kernel::{
     destroy_states, finalize_states, initialize_states, update_states, AggregatePayload,
 };
@@ -74,8 +74,12 @@ impl StreamingAggregateTransformExec {
                 aggregate_objects: Arc::clone(&global.aggregate_objects),
                 layout: global.layout.clone(),
                 aggregate_inputs: Arc::clone(&global.aggregate_inputs),
-                projection_executor: (!self.spec.projection_exprs.is_empty())
-                    .then(|| ExpressionExecutor::with_expressions(&self.spec.projection_exprs)),
+                projection_executor: (!self.spec.projection_exprs.is_empty()).then(|| {
+                    ExpressionExecutor::with_expressions_for_session(
+                        &self.spec.projection_exprs,
+                        ctx.query.session.as_ref(),
+                    )
+                }),
                 payload_chunk: Chunk::try_initialize(
                     &self.spec.payload_types,
                     VECTOR_SIZE,
@@ -108,11 +112,11 @@ impl StreamingAggregateTransformExec {
         }
 
         if let Some(executor) = local.projection_executor.as_mut() {
-            executor.execute_all_into_with_input(
-                ExpressionEvalInput {
+            executor.execute_all_kernel(
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: input,
-                },
+                }),
                 ctx.query,
                 &mut local.payload_chunk,
             )?;

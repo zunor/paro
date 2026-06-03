@@ -7,9 +7,12 @@ impl PhysicalPlanGenerator {
     pub(crate) fn lower_join(
         &mut self,
         join: &Join,
+        join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         match join {
-            Join::Comparison(comparison) => self.lower_comparison_join(comparison),
+            Join::Comparison(comparison) => {
+                self.lower_comparison_join(comparison, join_cardinality)
+            }
             Join::Any(any) => self.lower_any_join(any),
             Join::Cross(cross) => self.lower_cross_product(cross),
         }
@@ -18,6 +21,7 @@ impl PhysicalPlanGenerator {
     pub(crate) fn lower_comparison_join(
         &mut self,
         join: &ComparisonJoin,
+        join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if !supports_typed_hash_join_type(join.join_type) {
             return self.unsupported_preserving_children(
@@ -37,8 +41,11 @@ impl PhysicalPlanGenerator {
         if all_hashable {
             return self.lower_comparison_hash_join(join);
         }
-        if is_ie_join_candidate(&join.conditions) {
-            return self.lower_ie_join(join);
+        if is_classic_ie_join_candidate(join, join_cardinality) {
+            return self.lower_classic_ie_join(join);
+        }
+        if is_sort_range_join_candidate(join, join_cardinality) {
+            return self.lower_sort_range_join(join);
         }
         self.lower_nested_loop_join(join)
     }
@@ -80,7 +87,7 @@ impl PhysicalPlanGenerator {
         Ok((PhysicalNodeKind::NestedLoopJoin(spec), vec![left, right]))
     }
 
-    pub(crate) fn lower_ie_join(
+    pub(crate) fn lower_sort_range_join(
         &mut self,
         join: &ComparisonJoin,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
@@ -91,18 +98,23 @@ impl PhysicalPlanGenerator {
         let left_names = project_by_index(
             &join.left.output_names(),
             &left_projection,
-            "iejoin left output",
+            "sort-range join left output",
         )?;
-        let left_types = project_by_index(&join.left.types(), &left_projection, "iejoin left")?;
+        let left_types =
+            project_by_index(&join.left.types(), &left_projection, "sort-range join left")?;
         let right_names = project_by_index(
             &join.right.output_names(),
             &right_projection,
-            "iejoin right output",
+            "sort-range join right output",
         )?;
-        let right_types = project_by_index(&join.right.types(), &right_projection, "iejoin right")?;
+        let right_types = project_by_index(
+            &join.right.types(),
+            &right_projection,
+            "sort-range join right",
+        )?;
         let output_names = join_output_names(join.join_type, left_names, right_names);
         let output_types = join.get_types();
-        let spec = IEJoinSpec {
+        let spec = SortRangeJoinSpec {
             join_type: join.join_type,
             conditions: join.conditions.clone().into_boxed_slice(),
             mark_null_condition_start: join.mark_null_condition_start,
@@ -113,7 +125,48 @@ impl PhysicalPlanGenerator {
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
         };
-        Ok((PhysicalNodeKind::IEJoin(spec), vec![left, right]))
+        Ok((PhysicalNodeKind::SortRangeJoin(spec), vec![left, right]))
+    }
+
+    pub(crate) fn lower_classic_ie_join(
+        &mut self,
+        join: &ComparisonJoin,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        let left = self.generate_node(join.left.as_ref())?;
+        let right = self.generate_node(join.right.as_ref())?;
+        let left_projection = nlj_left_projection(join);
+        let right_projection = nlj_right_projection(join);
+        let left_names = project_by_index(
+            &join.left.output_names(),
+            &left_projection,
+            "classic IE join left output",
+        )?;
+        let left_types =
+            project_by_index(&join.left.types(), &left_projection, "classic IE join left")?;
+        let right_names = project_by_index(
+            &join.right.output_names(),
+            &right_projection,
+            "classic IE join right output",
+        )?;
+        let right_types = project_by_index(
+            &join.right.types(),
+            &right_projection,
+            "classic IE join right",
+        )?;
+        let output_names = join_output_names(join.join_type, left_names, right_names);
+        let output_types = join.get_types();
+        let spec = ClassicIeJoinSpec {
+            join_type: join.join_type,
+            conditions: join.conditions.clone().into_boxed_slice(),
+            mark_null_condition_start: join.mark_null_condition_start,
+            left_projection: left_projection.into_boxed_slice(),
+            right_projection: right_projection.into_boxed_slice(),
+            left_output_types: left_types.into_boxed_slice(),
+            right_output_types: right_types.into_boxed_slice(),
+            output_names: output_names.into_boxed_slice(),
+            output_types: output_types.into_boxed_slice(),
+        };
+        Ok((PhysicalNodeKind::ClassicIeJoin(spec), vec![left, right]))
     }
 
     pub(crate) fn lower_any_join(

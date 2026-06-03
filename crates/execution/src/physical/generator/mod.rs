@@ -38,14 +38,14 @@ use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
 use super::row_type::RowType;
 use super::specs::{
-    AggregateSpec, CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec,
-    DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget, DummyScanSpec,
-    EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
-    GraphExpandSpec, GraphProjectSpec, GraphRowidMapping, GraphScanSpec, GraphShortestPathSpec,
-    HashJoinSpec, IEJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PerfectHashAggregatePlan, PhysicalNodeKind, ProjectSpec, RecursiveCteSpec, RowsetScanSpec,
-    SortSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec,
-    ValuesSpec, WindowSpec,
+    AggregateSpec, ClassicIeJoinSpec, CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec,
+    CteScanSpec, DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget,
+    DummyScanSpec, EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec,
+    FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping, GraphScanSpec,
+    GraphShortestPathSpec, HashJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec,
+    NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind, ProjectSpec, RecursiveCteSpec,
+    RowsetScanSpec, SortRangeJoinSpec, SortSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec,
+    UpdateSpec, UtilitySpec, ValuesSpec, WindowSpec,
 };
 
 mod predicate_builder;
@@ -55,16 +55,28 @@ mod dml;
 mod external;
 mod graph;
 mod helpers;
+mod inequality_join_gate;
 mod join;
 mod misc;
 mod scan;
 mod set;
 
 use helpers::*;
+use inequality_join_gate::*;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PlanBuildContext {
     pub force_external: bool,
+    pub rowset_scan_pushdown: bool,
+}
+
+impl Default for PlanBuildContext {
+    fn default() -> Self {
+        Self {
+            force_external: false,
+            rowset_scan_pushdown: true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -111,7 +123,9 @@ impl PhysicalPlanGenerator {
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,
             LogicalOperator::Aggregate(aggregate) => self.lower_aggregate(aggregate)?,
             LogicalOperator::Distinct(distinct) => self.lower_distinct(distinct)?,
-            LogicalOperator::Join(join) => self.lower_join(join)?,
+            LogicalOperator::Join(join) => {
+                self.lower_join(join, logical.stats.estimated_cardinality)?
+            }
             LogicalOperator::Window(window) => self.lower_window(window)?,
             LogicalOperator::TableFunctionGet(table_function) => {
                 self.lower_table_function(table_function)?

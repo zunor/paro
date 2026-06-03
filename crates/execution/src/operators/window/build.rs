@@ -13,7 +13,7 @@ use crate::physical::specs::WindowSpec;
 use crate::runtime::breaker::{HandleRef, WindowHandle};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{
-    FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SingleTaskFinishDriver, SinkPoll,
+    FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
 };
 use crate::runtime::state::{BreakerHandleGlobal, SinkGlobal, SinkLocal, WindowBuildSinkLocal};
 
@@ -103,7 +103,7 @@ impl WindowBuildSinkExec {
         };
         let handle = global.handle.clone();
         let spec = self.spec.clone();
-        Ok(FinishWork::Parallel(SingleTaskFinishDriver::group(
+        Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
             "window_seal",
             MemoryClass::Blocking,
             move |ctx| handle.seal(&spec, ctx.query.allocator(MemoryTag::BaseTable)),

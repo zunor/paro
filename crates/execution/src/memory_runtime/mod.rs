@@ -22,7 +22,7 @@ mod shared_object;
 mod system_reserve;
 
 pub use accounted_buffer::AccountedBuffer;
-pub use admission::{PipelineAdmissionController, PipelineAdmissionGuard};
+pub use admission::{AdmissionWaiterId, PipelineAdmissionController, PipelineAdmissionGuard};
 pub use arbitrator::MemoryArbitrator;
 pub use external_tracker::{LocalExternalMemoryTracker, OperatorExternalMemoryTracker};
 pub use local_grant::{
@@ -149,6 +149,24 @@ mod tests {
     }
 
     #[test]
+    fn query_pool_reclaimer_lifecycle_dedupes_and_unregisters_by_name() {
+        let pool = Arc::new(QueryMemoryPool::new(120));
+        pool.register_reclaimer_once_by_name(Arc::new(TestReclaimer {
+            pool: pool.clone(),
+            available: AtomicUsize::new(10),
+        }));
+        pool.register_reclaimer_once_by_name(Arc::new(TestReclaimer {
+            pool: pool.clone(),
+            available: AtomicUsize::new(20),
+        }));
+        assert_eq!(pool.reclaimer_count(), 1);
+
+        assert_eq!(pool.unregister_reclaimer_by_name("test_reclaimer"), 1);
+        assert_eq!(pool.unregister_reclaimer_by_name("test_reclaimer"), 0);
+        assert_eq!(pool.reclaimer_count(), 0);
+    }
+
+    #[test]
     fn admission_controller_blocks_and_wakes_waiter() {
         let controller = Arc::new(PipelineAdmissionController::new(1));
         let first = controller
@@ -159,6 +177,26 @@ mod tests {
             signal.downgrade(),
         ));
         assert!(blocked.is_none());
+        assert_eq!(controller.blocked_waiters(), 1);
+
+        drop(first);
+        assert_eq!(controller.blocked_waiters(), 0);
+    }
+
+    #[test]
+    fn admission_controller_dedupes_stable_waiter_registration() {
+        let controller = Arc::new(PipelineAdmissionController::new(1));
+        let first = controller
+            .try_acquire(paro_scheduler::task::InterruptState::new())
+            .expect("first slot should be admitted");
+        let waiter = AdmissionWaiterId(7);
+
+        assert!(controller
+            .try_acquire_for(waiter, paro_scheduler::task::InterruptState::new())
+            .is_none());
+        assert!(controller
+            .try_acquire_for(waiter, paro_scheduler::task::InterruptState::new())
+            .is_none());
         assert_eq!(controller.blocked_waiters(), 1);
 
         drop(first);

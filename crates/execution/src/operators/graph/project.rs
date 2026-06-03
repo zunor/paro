@@ -14,7 +14,7 @@ use paro_planner::operator::ColumnBinding;
 use paro_storage::tablet::TabletReaderParams;
 use paro_transaction::TableId;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::physical::specs::GraphProjectSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
@@ -45,12 +45,15 @@ impl GraphProjectTransformExec {
             Some(build_graph_project_materialized_runtime(ctx, &self.spec)?)
         };
         let raw_filter_executors = if materialized.is_none() {
-            graph_project_filter_executors(&self.spec.filters)
+            graph_project_filter_executors(&self.spec.filters, ctx.query.session.as_ref())
         } else {
             Vec::new()
         };
         let raw_project_executor = if materialized.is_none() {
-            Some(ExpressionExecutor::with_expressions(&self.spec.expressions))
+            Some(ExpressionExecutor::with_expressions_for_session(
+                &self.spec.expressions,
+                ctx.query.session.as_ref(),
+            ))
         } else {
             None
         };
@@ -120,11 +123,14 @@ fn build_graph_project_output(
     if spec.rowid_mappings.is_empty() {
         let input = clone_chunk_refs(input);
         if local.raw_project_executor.is_none() {
-            local.raw_project_executor =
-                Some(ExpressionExecutor::with_expressions(&spec.expressions));
+            local.raw_project_executor = Some(ExpressionExecutor::with_expressions_for_session(
+                &spec.expressions,
+                ctx.query.session.as_ref(),
+            ));
         }
         if local.raw_filter_executors.is_empty() && !spec.filters.is_empty() {
-            local.raw_filter_executors = graph_project_filter_executors(&spec.filters);
+            local.raw_filter_executors =
+                graph_project_filter_executors(&spec.filters, ctx.query.session.as_ref());
         }
         let Some(filtered) = apply_graph_project_filters(
             ctx,
@@ -144,11 +150,11 @@ fn build_graph_project_output(
             .raw_project_executor
             .as_mut()
             .expect("graph project raw executor initialized")
-            .execute_all_into_with_input(
-                ExpressionEvalInput {
+            .execute_all_kernel(
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: &filtered,
-                },
+                }),
                 ctx.query,
                 &mut projected,
             )?;
@@ -174,23 +180,26 @@ fn build_graph_project_output(
         filtered.size(),
         output.allocator().clone(),
     )?;
-    materialized_runtime
-        .project_executor
-        .execute_all_into_with_input(
-            ExpressionEvalInput {
-                params: ctx.query.params.as_ref(),
-                columns: &filtered,
-            },
-            ctx.query,
-            &mut projected,
-        )?;
+    materialized_runtime.project_executor.execute_all_kernel(
+        VectorKernelInput::from_eval_input(ExpressionEvalInput {
+            params: ctx.query.params.as_ref(),
+            columns: &filtered,
+        }),
+        ctx.query,
+        &mut projected,
+    )?;
     Ok(projected)
 }
 
-fn graph_project_filter_executors(filters: &[Expression]) -> Vec<ExpressionExecutor> {
+fn graph_project_filter_executors(
+    filters: &[Expression],
+    session: &paro_context::StatementContext,
+) -> Vec<ExpressionExecutor> {
     filters
         .iter()
-        .map(|filter| ExpressionExecutor::with_expressions(std::slice::from_ref(filter)))
+        .map(|filter| {
+            ExpressionExecutor::with_expressions_for_session(std::slice::from_ref(filter), session)
+        })
         .collect()
 }
 
@@ -297,8 +306,14 @@ fn build_graph_project_materialized_runtime(
     Ok(GraphProjectMaterializedRuntime {
         table_fetches: table_fetches.into_boxed_slice(),
         path_columns: path_columns.into_boxed_slice(),
-        filter_executors: graph_project_filter_executors(&remapped_filters),
-        project_executor: ExpressionExecutor::with_expressions(&remapped_expressions),
+        filter_executors: graph_project_filter_executors(
+            &remapped_filters,
+            ctx.query.session.as_ref(),
+        ),
+        project_executor: ExpressionExecutor::with_expressions_for_session(
+            &remapped_expressions,
+            ctx.query.session.as_ref(),
+        ),
     })
 }
 
@@ -402,25 +417,25 @@ fn apply_graph_project_filters(
             _ => SelectionVector::try_with_capacity(current_count.max(1), allocator.clone())?,
         };
         let selected = if let Some(selection) = current_selection.as_ref() {
-            executor.select_into_with_input_and_selection(
+            executor.select_kernel(
                 0,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: &chunk,
-                },
-                Some(selection),
-                current_count,
+                })
+                .with_selection(Some(selection))
+                .with_count(current_count),
                 ctx.query,
                 &mut output_selection,
             )?
         } else {
-            executor.select_into_with_input(
+            executor.select_kernel(
                 0,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: &chunk,
-                },
-                current_count,
+                })
+                .with_count(current_count),
                 ctx.query,
                 &mut output_selection,
             )?

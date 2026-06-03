@@ -1,9 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::hash_map::RandomState;
 use std::collections::hash_set::{Drain, Iter};
 use std::collections::HashSet;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::bytes_for_capacity;
 use crate::allocator::MemoryTag;
@@ -11,8 +12,8 @@ use crate::memory::{MemoryAccountingClass, MemoryGrant, MemoryResult};
 
 /// Grant-accounted `HashSet`.
 #[derive(Debug)]
-pub struct AccountedHashSet<T> {
-    inner: HashSet<T>,
+pub struct AccountedHashSet<T, S = RandomState> {
+    inner: HashSet<T, S>,
     grant: MemoryGrant,
     accounted_bytes: usize,
     publication: Option<AccountedHashSetPublication>,
@@ -25,17 +26,55 @@ struct AccountedHashSetPublication {
     auto_grow_grant: bool,
 }
 
+/// Build hasher for keys that already feed a high-quality u64 hash.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrecomputedHashBuildHasher;
+
+#[derive(Debug, Default)]
+pub struct PrecomputedHashHasher {
+    hash: u64,
+    initialized: bool,
+}
+
+impl BuildHasher for PrecomputedHashBuildHasher {
+    type Hasher = PrecomputedHashHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PrecomputedHashHasher::default()
+    }
+}
+
+impl Hasher for PrecomputedHashHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.initialized {
+            self.hash
+        } else {
+            0xcbf2_9ce4_8422_2325
+        };
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.hash = hash;
+        self.initialized = true;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.hash = value;
+        self.initialized = true;
+    }
+}
+
 impl<T> AccountedHashSet<T>
 where
     T: Eq + Hash,
 {
     pub fn new(grant: MemoryGrant) -> Self {
-        Self {
-            inner: HashSet::new(),
-            grant,
-            accounted_bytes: 0,
-            publication: None,
-        }
+        Self::new_with_hasher(grant, RandomState::new())
     }
 
     pub fn new_with_accounting(
@@ -43,8 +82,38 @@ where
         tag: MemoryTag,
         class: MemoryAccountingClass,
     ) -> Self {
+        Self::new_with_accounting_and_hasher(grant, tag, class, RandomState::new())
+    }
+
+    pub fn with_capacity(capacity: usize, grant: MemoryGrant) -> MemoryResult<Self> {
+        let mut set = Self::new(grant);
+        set.try_reserve(capacity)?;
+        Ok(set)
+    }
+}
+
+impl<T, S> AccountedHashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher,
+{
+    pub fn new_with_hasher(grant: MemoryGrant, hasher: S) -> Self {
         Self {
-            inner: HashSet::new(),
+            inner: HashSet::with_hasher(hasher),
+            grant,
+            accounted_bytes: 0,
+            publication: None,
+        }
+    }
+
+    pub fn new_with_accounting_and_hasher(
+        grant: MemoryGrant,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+        hasher: S,
+    ) -> Self {
+        Self {
+            inner: HashSet::with_hasher(hasher),
             grant,
             accounted_bytes: 0,
             publication: Some(AccountedHashSetPublication {
@@ -55,8 +124,12 @@ where
         }
     }
 
-    pub fn with_capacity(capacity: usize, grant: MemoryGrant) -> MemoryResult<Self> {
-        let mut set = Self::new(grant);
+    pub fn with_capacity_and_hasher(
+        capacity: usize,
+        grant: MemoryGrant,
+        hasher: S,
+    ) -> MemoryResult<Self> {
+        let mut set = Self::new_with_hasher(grant, hasher);
         set.try_reserve(capacity)?;
         Ok(set)
     }
@@ -196,7 +269,7 @@ where
     }
 }
 
-impl<T> Drop for AccountedHashSet<T> {
+impl<T, S> Drop for AccountedHashSet<T, S> {
     fn drop(&mut self) {
         if self.accounted_bytes > 0 {
             if let Some(publication) = self.publication {
