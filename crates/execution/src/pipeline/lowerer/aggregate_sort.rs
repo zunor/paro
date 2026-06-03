@@ -272,7 +272,7 @@ impl<'a> PipelineLowerer<'a> {
                 self.post_join_fanout_cache[root.index()] = Some(result);
                 return Ok(result);
             }
-            PhysicalNodeKind::IEJoin(spec) => {
+            PhysicalNodeKind::SortRangeJoin(spec) => {
                 let result = needs_nlj_unmatched_source(spec.join_type);
                 self.post_join_fanout_cache[root.index()] = Some(result);
                 return Ok(result);

@@ -17,7 +17,7 @@ use paro_context::{QueryMemoryRegistration, QueryMemoryTarget};
 
 use super::{
     GrowOutcome, MemoryDomainTagBytes, MemoryRuntimeStats, MemoryTagBytes,
-    PipelineAdmissionController, ReclaimHandle, ReclaimStats, Reclaimer,
+    PipelineAdmissionController, ReclaimHandle, ReclaimStats, Reclaimer, SpillCost,
 };
 
 const DEFAULT_UNBOUNDED_QUERY_CAPACITY: usize = usize::MAX / 4;
@@ -274,6 +274,24 @@ impl QueryMemoryPool {
         reclaimers.push(reclaimer);
     }
 
+    pub fn unregister_reclaimer_by_name(&self, name: &str) -> usize {
+        let mut reclaimers = self
+            .reclaimers
+            .lock()
+            .expect("query memory reclaimer lock poisoned");
+        let before = reclaimers.len();
+        reclaimers.retain(|reclaimer| reclaimer.name() != name);
+        before.saturating_sub(reclaimers.len())
+    }
+
+    #[cfg(test)]
+    pub fn reclaimer_count(&self) -> usize {
+        self.reclaimers
+            .lock()
+            .expect("query memory reclaimer lock poisoned")
+            .len()
+    }
+
     pub fn try_grow(&self, bytes: usize) -> MemoryResult<()> {
         if bytes == 0 {
             return Ok(());
@@ -357,7 +375,7 @@ impl QueryMemoryPool {
 
         let mut reclaimed = 0usize;
         let mut first_error = None;
-        for reclaimer in self.sorted_reclaimers() {
+        for reclaimer in self.reclaimers_by_cost() {
             if reclaimed < target_bytes {
                 if reclaimer.reclaimable_bytes() == 0 {
                     continue;
@@ -395,7 +413,7 @@ impl QueryMemoryPool {
         }
 
         let mut first_error = None;
-        for reclaimer in self.sorted_reclaimers() {
+        for reclaimer in self.reclaimers_by_cost() {
             if reclaimer.reclaimable_bytes() == 0 {
                 continue;
             }
@@ -454,14 +472,28 @@ impl QueryMemoryPool {
         }
     }
 
-    fn sorted_reclaimers(&self) -> Vec<Arc<dyn Reclaimer>> {
-        let mut reclaimers = self
+    fn reclaimers_by_cost(&self) -> Vec<Arc<dyn Reclaimer>> {
+        let reclaimers = self
             .reclaimers
             .lock()
             .expect("query memory reclaimer lock poisoned")
             .clone();
-        reclaimers.sort_by_key(|reclaimer| reclaimer.spill_cost());
-        reclaimers
+        let mut accounting = Vec::new();
+        let mut cache = Vec::new();
+        let mut spill = Vec::new();
+        let mut repartition = Vec::new();
+        for reclaimer in reclaimers {
+            match reclaimer.spill_cost() {
+                SpillCost::AccountingRelease => accounting.push(reclaimer),
+                SpillCost::CacheEviction => cache.push(reclaimer),
+                SpillCost::SpillToDisk => spill.push(reclaimer),
+                SpillCost::Repartition => repartition.push(reclaimer),
+            }
+        }
+        accounting.extend(cache);
+        accounting.extend(spill);
+        accounting.extend(repartition);
+        accounting
     }
 
     fn registration(&self) -> Option<QueryMemoryRegistration> {

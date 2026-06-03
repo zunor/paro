@@ -1,0 +1,5 @@
+name = "operator-runtime-mixed"
+description = "BASELINE mixed concurrent operator runtime workload"
+
+[[include]]
+workload = "operator_runtime_mixed"

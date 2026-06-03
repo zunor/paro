@@ -8,13 +8,15 @@ use paro_common::vector::VECTOR_SIZE;
 use paro_planner::operator::join::{JoinCondition, JoinType};
 
 use crate::expression_executor::executor::ExpressionExecutor;
-use crate::operators::join::hash::runtime::{
-    build_probe_spill_chunk_into, compute_hashes_for_keys_into, emit_empty_build_probe_result,
-    evaluate_join_keys_into, hash_join_memory_context, join_key_types, scan_hash_join_results,
-    JoinKeySide,
+use crate::operators::join::hash::hashing::compute_hashes_for_keys_into;
+use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types, JoinKeySide};
+use crate::operators::join::hash::memory::hash_join_memory_context;
+use crate::operators::join::hash::probe_output::{
+    emit_empty_build_probe_result, scan_hash_join_results,
 };
+use crate::operators::join::hash::spill::build_probe_spill_chunk_into;
 use crate::operators::output::ensure_transform_output;
-use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
+use crate::runtime::breaker::{HandleRef, JoinBuildHandle, JoinProbeSpillBuffer};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
     BreakerHandleGlobal, HashJoinProbeTransformLocal, TransformGlobal, TransformLocal,
@@ -44,7 +46,7 @@ impl HashJoinProbeTransformExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &TransformGlobal,
     ) -> Result<TransformLocal> {
         Ok(TransformLocal::HashJoinProbe(HashJoinProbeTransformLocal {
@@ -54,11 +56,17 @@ impl HashJoinProbeTransformExec {
             probe_key_executors: self
                 .conditions
                 .iter()
-                .map(|condition| ExpressionExecutor::new(&condition.left))
+                .map(|condition| {
+                    ExpressionExecutor::with_expressions_for_session(
+                        std::slice::from_ref(&condition.left),
+                        ctx.query.session.as_ref(),
+                    )
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             probe_hashes: None,
             probe_spill_chunk: None,
+            probe_spill_buffer: None,
             probe_in_progress: false,
         }))
     }
@@ -126,13 +134,20 @@ impl HashJoinProbeTransformExec {
                     .probe_spill_chunk
                     .as_ref()
                     .ok_or_else(|| paro_error::internal("hash join probe spill chunk missing"))?;
-                global.handle.spill.append_probe_chunk(
-                    hash_table.buffer_pool().clone(),
-                    radix_bits,
-                    input.column_count(),
-                    spill_chunk,
-                    hash_join_memory_context(ctx.query),
-                )?;
+                if local.probe_spill_buffer.is_none() {
+                    local.probe_spill_buffer = Some(JoinProbeSpillBuffer::new(
+                        hash_table.buffer_pool().clone(),
+                        radix_bits,
+                        input.column_count(),
+                        spill_chunk.types(),
+                        hash_join_memory_context(ctx.query),
+                    )?);
+                }
+                local
+                    .probe_spill_buffer
+                    .as_mut()
+                    .expect("hash join probe spill buffer initialized")
+                    .append(spill_chunk)?;
             }
             if let Some(spill_chunk) = local.probe_spill_chunk.as_mut() {
                 spill_chunk.data.clear();
@@ -141,7 +156,9 @@ impl HashJoinProbeTransformExec {
             return Ok(TransformPoll::NeedMoreInput);
         }
 
-        if hash_table.is_empty() {
+        if hash_table.is_empty()
+            && !(self.join_type == JoinType::Mark && hash_table.has_null_keys())
+        {
             let emitted = emit_empty_build_probe_result(
                 self.join_type,
                 input,
@@ -228,10 +245,23 @@ impl HashJoinProbeTransformExec {
     pub(crate) fn flush(
         &self,
         _ctx: &mut OperatorCallContext,
-        _global: &TransformGlobal,
-        _local: &mut TransformLocal,
+        global: &TransformGlobal,
+        local: &mut TransformLocal,
         _output: &mut Chunk,
     ) -> Result<TransformFlushPoll> {
+        let TransformGlobal::HashJoinProbe(global) = global else {
+            return Err(paro_error::internal(
+                "hash join probe transform global state mismatch",
+            ));
+        };
+        let TransformLocal::HashJoinProbe(local) = local else {
+            return Err(paro_error::internal(
+                "hash join probe transform local state mismatch",
+            ));
+        };
+        if let Some(buffer) = local.probe_spill_buffer.take() {
+            global.handle.spill.append_probe_buffer(buffer)?;
+        }
         Ok(TransformFlushPoll::Done)
     }
 

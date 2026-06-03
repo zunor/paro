@@ -12,14 +12,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryResult,
+};
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
+use paro_storage::buffer::BufferPool;
 
+use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
 use crate::operators::sort::topn_heap::{TopNBoundaryValue, TopNHeap};
 use crate::runtime::context::OperatorCleanupContext;
-use crate::sorting::sort::Sort;
+use crate::sorting::sort_descriptor::Sort;
 use crate::sorting::sorted_run::SortedRun;
 use crate::sorting::sorted_run_merger::{SortedRunMerger, SortedRunMergerGlobalState};
 
@@ -150,12 +156,7 @@ impl SortHandle {
                 total_count,
             }
         } else {
-            let merger = Arc::new(SortedRunMerger::new(
-                Arc::clone(&sort),
-                runs,
-                partition_size,
-                external,
-            ));
+            let merger = Arc::new(SortedRunMerger::new(Arc::clone(&sort), runs));
             let merger_gstate = Arc::new(SortedRunMergerGlobalState::new(
                 total_count,
                 partition_size,
@@ -193,6 +194,63 @@ impl SortHandle {
         self.pending_runs.lock().len()
     }
 
+    pub fn pending_reclaimable_bytes(&self) -> usize {
+        if self.is_sealed() {
+            return 0;
+        }
+        self.pending_runs
+            .lock()
+            .iter()
+            .filter(|run| !run.is_external())
+            .map(SortedRun::size_in_bytes)
+            .sum()
+    }
+
+    pub fn spill_pending_runs(
+        &self,
+        target_bytes: usize,
+        buffer_pool: Arc<BufferPool>,
+        memory: MemoryAccountingContext,
+    ) -> Result<ReclaimStats> {
+        if target_bytes == 0 || self.is_sealed() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+
+        let runs = {
+            let mut pending = self.pending_runs.lock();
+            if pending.iter().all(SortedRun::is_external) {
+                return Ok(ReclaimStats::empty(target_bytes));
+            }
+            self.mark_external();
+            std::mem::take(&mut *pending)
+        };
+
+        let mut reclaimed = 0usize;
+        let mut spilled = 0usize;
+        let mut converted = Vec::with_capacity(runs.len());
+        for run in runs {
+            if reclaimed < target_bytes && !run.is_external() {
+                let before = run.size_in_bytes();
+                let (external_run, reclaimed_bytes) =
+                    run.into_external(Arc::clone(&buffer_pool), memory.clone())?;
+                reclaimed = reclaimed.saturating_add(reclaimed_bytes);
+                spilled = spilled.saturating_add(before);
+                converted.push(external_run);
+            } else {
+                converted.push(run);
+            }
+        }
+
+        let mut pending = self.pending_runs.lock();
+        if pending.is_empty() {
+            *pending = converted;
+        } else {
+            converted.extend(std::mem::take(&mut *pending));
+            *pending = converted;
+        }
+        Ok(ReclaimStats::new(target_bytes, reclaimed, spilled))
+    }
+
     #[inline]
     pub fn cleanup_status(&self) -> CleanupStatus {
         self.cleanup.status()
@@ -200,10 +258,78 @@ impl SortHandle {
 }
 
 impl RuntimeCleanup for SortHandle {
-    fn cleanup(&self, _ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
+    fn cleanup(&self, ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
         self.pending_runs.lock().clear();
+        ctx.query
+            .memory
+            .unregister_reclaimer_by_name(&SortPendingRunsReclaimer::name_for(self));
         self.cleanup.mark(reason);
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct SortPendingRunsReclaimer {
+    name: String,
+    handle: Arc<SortHandle>,
+    buffer_pool: Arc<BufferPool>,
+    memory: MemoryAccountingContext,
+}
+
+impl SortPendingRunsReclaimer {
+    pub fn new(
+        handle: Arc<SortHandle>,
+        buffer_pool: Arc<BufferPool>,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        Self {
+            name: Self::name_for(&handle),
+            handle,
+            buffer_pool,
+            memory,
+        }
+    }
+
+    pub fn for_query(
+        handle: Arc<SortHandle>,
+        buffer_pool: Arc<BufferPool>,
+        query_memory: Arc<crate::memory_runtime::QueryMemoryPool>,
+    ) -> Self {
+        let memory = MemoryAccountingContext::from_owner(
+            query_memory,
+            MemoryDomain::Host,
+            MemoryTag::OrderBy,
+            MemoryAccountingClass::Revocable,
+        );
+        Self::new(handle, buffer_pool, memory)
+    }
+
+    pub fn name_for(handle: &SortHandle) -> String {
+        format!("sort_pending_runs:{}", handle.metadata().id.index())
+    }
+}
+
+impl Reclaimer for SortPendingRunsReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        self.handle.pending_reclaimable_bytes()
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> MemoryResult<ReclaimStats> {
+        self.handle
+            .spill_pending_runs(
+                target_bytes,
+                Arc::clone(&self.buffer_pool),
+                self.memory.clone(),
+            )
+            .map_err(|err| paro_common::memory::MemoryError::reclaim_failed(err.to_string()))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
     }
 }
 
@@ -432,6 +558,64 @@ mod tests {
         let payload_chunk = Chunk::try_new(test_allocator()).expect("empty payload chunk");
         builder.sink(&key_chunk, &payload_chunk).expect("sink run");
         builder.finish(external).expect("finish run")
+    }
+
+    fn buffer_pool_with_temp_dir() -> Arc<BufferPool> {
+        let pool = BufferPool::new_arc(16 * 1024 * 1024);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "paro_sort_reclaimer_{}_{:?}_{}",
+            std::process::id(),
+            std::thread::current().id(),
+            now
+        ));
+        pool.set_temporary_directory(temp_dir.to_string_lossy().to_string())
+            .expect("set temp directory");
+        pool
+    }
+
+    #[test]
+    fn sort_pending_runs_reclaimer_spills_in_memory_runs() {
+        let handle = Arc::new(SortHandle::new(metadata(BreakerHandleKind::Sort)));
+        let sort = int_sort();
+        handle
+            .initialize(
+                Arc::clone(&sort),
+                vec![LogicalType::Integer].into_boxed_slice(),
+                false,
+            )
+            .expect("initialize sort");
+        handle
+            .add_run(sorted_run(&sort, false))
+            .expect("add in-memory run");
+
+        let reclaimable = handle.pending_reclaimable_bytes();
+        assert!(reclaimable > 0);
+        let reclaimer = SortPendingRunsReclaimer::new(
+            Arc::clone(&handle),
+            buffer_pool_with_temp_dir(),
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable),
+        );
+
+        let stats = reclaimer.reclaim_sync(1).expect("reclaim pending run");
+        assert_eq!(stats.requested_bytes, 1);
+        assert!(stats.reclaimed_bytes > 0);
+        assert!(stats.spilled_bytes >= stats.reclaimed_bytes);
+        assert!(handle.is_external());
+        assert_eq!(handle.pending_run_count(), 1);
+        assert_eq!(handle.pending_reclaimable_bytes(), 0);
+        assert_eq!(
+            reclaimer.reclaim_sync(1).expect("idempotent reclaim"),
+            ReclaimStats::empty(1)
+        );
+
+        handle.seal(1).expect("seal sort");
+        let state = handle.sealed_state().expect("sealed state");
+        let merger = state.merger.as_ref().expect("external run merger");
+        assert!(merger.sorted_runs.iter().all(SortedRun::is_external));
     }
 
     #[test]

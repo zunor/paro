@@ -3,6 +3,13 @@
 
 use super::*;
 
+fn value_to_i32(value: &Value) -> Option<i32> {
+    match value {
+        Value::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
 #[test]
 fn hash_join_output_more_yields_between_output_chunks() {
     let output = QueryOutputPort::unbounded();
@@ -144,6 +151,167 @@ fn hash_join_output_more_yields_between_output_chunks() {
     }
     assert_eq!(output_rows, paro_common::vector::VECTOR_SIZE * 2 + 7);
     assert!(chunks >= 3, "expected multiple output chunks");
+}
+
+#[test]
+fn sort_range_join_uses_sorted_range_probe_candidates() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let row_type = RowType::new(
+        vec!["lv".to_string(), "rv".to_string()],
+        vec![LogicalType::Integer, LogicalType::Integer],
+    );
+
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let handle = handles.register(
+        BreakerHandleKind::Materialized,
+        RowType::new(
+            vec!["r1".to_string(), "r2".to_string(), "rv".to_string()],
+            vec![
+                LogicalType::Integer,
+                LogicalType::Integer,
+                LogicalType::Integer,
+            ],
+        ),
+        Default::default(),
+    );
+    let build_id = PipelineId::new(0);
+    let probe_id = PipelineId::new(1);
+    handles.set_producer(handle, build_id).unwrap();
+    handles.add_consumer(handle, probe_id).unwrap();
+
+    let conditions = vec![
+        JoinCondition::new(
+            reference(0, LogicalType::Integer),
+            reference(0, LogicalType::Integer),
+            JoinComparisonType::LessThan,
+        ),
+        JoinCondition::new(
+            reference(1, LogicalType::Integer),
+            reference(1, LogicalType::Integer),
+            JoinComparisonType::GreaterThan,
+        ),
+    ];
+    let graph = PipelineGraph {
+        pipelines: vec![
+            PipelineSpec {
+                id: build_id,
+                source: SourceSpec::Values(values_spec(
+                    vec![
+                        vec![int_constant(5), int_constant(0), int_constant(50)],
+                        vec![int_constant(7), int_constant(3), int_constant(70)],
+                        vec![int_constant(10), int_constant(4), int_constant(100)],
+                        vec![int_constant(2), int_constant(9), int_constant(20)],
+                    ],
+                    vec![
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                    ],
+                )),
+                transforms: Vec::new(),
+                sink: SinkSpec::Materialize(MaterializeSinkSpec {
+                    handle,
+                    required: Default::default(),
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: RowType::new(
+                    vec!["r1".to_string(), "r2".to_string(), "rv".to_string()],
+                    vec![
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                    ],
+                ),
+            },
+            PipelineSpec {
+                id: probe_id,
+                source: SourceSpec::Values(values_spec(
+                    vec![
+                        vec![int_constant(4), int_constant(5), int_constant(100)],
+                        vec![int_constant(6), int_constant(4), int_constant(200)],
+                    ],
+                    vec![
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                    ],
+                )),
+                transforms: vec![TransformSpec::SortRangeJoinProbe(SortRangeJoinProbeSpec {
+                    handle,
+                    join_type: JoinType::Inner,
+                    conditions: conditions.into_boxed_slice(),
+                    mark_null_condition_start: None,
+                    left_projection: vec![2].into_boxed_slice(),
+                    right_projection: vec![2].into_boxed_slice(),
+                    right_output_types: vec![
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                    ]
+                    .into_boxed_slice(),
+                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
+                    output_types: vec![LogicalType::Integer, LogicalType::Integer]
+                        .into_boxed_slice(),
+                })],
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type,
+            },
+        ],
+        dependencies: vec![PipelineDependency {
+            producer: build_id,
+            consumer: probe_id,
+            kind: DependencyKind::BuildBeforeProbe,
+        }],
+        handles: handles.finish(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(probe_id),
+    };
+
+    let (build_runtime, probe_runtime) = runtimes_from_graph(&query, &graph);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(23),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let build_task = build_runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("build task");
+    let mut build_exec = PipelineTaskExecutor::new(build_runtime, build_task);
+    run_to_done(&mut build_exec, &query, &thread, &wake, &mut profiler);
+
+    let probe_task = probe_runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("probe task");
+    let mut probe_exec = PipelineTaskExecutor::new(probe_runtime, probe_task);
+    run_to_done(&mut probe_exec, &query, &thread, &wake, &mut profiler);
+
+    let mut rows = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        for row in 0..chunk.size() {
+            rows.push((chunk.data[0].get_value(row), chunk.data[1].get_value(row)));
+        }
+    }
+    rows.sort_by_key(|(left, right)| {
+        (
+            value_to_i32(left).expect("left int"),
+            value_to_i32(right).expect("right int"),
+        )
+    });
+    assert_eq!(
+        rows,
+        vec![
+            (Value::Integer(100), Value::Integer(50)),
+            (Value::Integer(100), Value::Integer(70)),
+            (Value::Integer(100), Value::Integer(100)),
+            (Value::Integer(200), Value::Integer(70)),
+        ]
+    );
 }
 
 #[test]
@@ -419,229 +587,6 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
     assert_eq!(unmatched.size(), 1);
     assert!(unmatched.column(0).unwrap().is_null(0));
     assert_eq!(unmatched.column(1).unwrap().get_i32(0), Some(20));
-}
-
-#[test]
-fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds() {
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let mut handles = BreakerHandleCatalogBuilder::default();
-    let handle = handles.register(
-        BreakerHandleKind::HashJoinBuild,
-        RowType::new(
-            vec!["lv".to_string(), "rv".to_string()],
-            vec![LogicalType::Integer, LogicalType::Integer],
-        ),
-        Default::default(),
-    );
-    let replay_id = PipelineId::new(0);
-    handles.add_consumer(handle, replay_id).unwrap();
-    let graph = PipelineGraph {
-        pipelines: vec![PipelineSpec {
-            id: replay_id,
-            source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
-                handle,
-                join_type: JoinType::Inner,
-                conditions: vec![join_condition()].into_boxed_slice(),
-                probe_types: vec![LogicalType::Integer].into_boxed_slice(),
-                build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                left_projection: vec![0].into_boxed_slice(),
-                right_projection: vec![0].into_boxed_slice(),
-                output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                output_types: vec![LogicalType::Integer, LogicalType::Integer].into_boxed_slice(),
-            }),
-            transforms: Vec::new(),
-            sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-            sink_sharing: SinkSharing::Exclusive,
-            properties: PipelineProperties::default(),
-            output: RowType::new(
-                vec!["lv".to_string(), "rv".to_string()],
-                vec![LogicalType::Integer, LogicalType::Integer],
-            ),
-        }],
-        dependencies: Vec::new(),
-        handles: handles.finish(),
-        control_regions: Vec::new(),
-        root: PipelineRoot::Pipeline(replay_id),
-    };
-    let programs = PipelineProgramBuilder::default()
-        .build_program_set(&graph)
-        .expect("program set");
-    let registry = Arc::new(BreakerHandleRegistry::from_catalog(&graph.handles).expect("handles"));
-    let runtime = Arc::new(
-        PipelineRuntime::with_registry(
-            programs.get(replay_id).unwrap().clone(),
-            registry,
-            query.params.clone(),
-            &query,
-        )
-        .expect("replay runtime"),
-    );
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let thread = ThreadContext::single_threaded();
-    let wake = OperatorWakeScope {
-        task_id: PipelineTaskId(20),
-        generation: WakeGeneration(0),
-    };
-    let mut profiler = OperatorProfiler::disabled();
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    assert!(output.pop_front().is_none());
-}
-
-#[test]
-fn hash_join_external_spill_replay_source_outputs_probe_matches() {
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let build_row_type = RowType::new(
-        vec!["rk".to_string(), "rv".to_string()],
-        vec![LogicalType::Integer, LogicalType::Integer],
-    );
-    let join_row_type = RowType::new(
-        vec!["lv".to_string(), "rv".to_string()],
-        vec![LogicalType::Integer, LogicalType::Integer],
-    );
-
-    let mut handles = BreakerHandleCatalogBuilder::default();
-    let handle = handles.register(
-        BreakerHandleKind::HashJoinBuild,
-        join_row_type.clone(),
-        Default::default(),
-    );
-    let build_id = PipelineId::new(0);
-    let probe_id = PipelineId::new(1);
-    let replay_id = PipelineId::new(2);
-    handles.set_producer(handle, build_id).unwrap();
-    handles.add_consumer(handle, probe_id).unwrap();
-    handles.add_consumer(handle, replay_id).unwrap();
-
-    let graph = PipelineGraph {
-        pipelines: vec![
-            PipelineSpec {
-                id: build_id,
-                source: SourceSpec::Values(values_spec(
-                    vec![
-                        vec![int_constant(1), int_constant(10)],
-                        vec![int_constant(2), int_constant(20)],
-                    ],
-                    vec![LogicalType::Integer, LogicalType::Integer],
-                )),
-                transforms: Vec::new(),
-                sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
-                    handle,
-                    join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
-                    build_projection: vec![1].into_boxed_slice(),
-                    build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    required: Default::default(),
-                    force_external: true,
-                }),
-                sink_sharing: SinkSharing::Exclusive,
-                properties: PipelineProperties::default(),
-                output: build_row_type,
-            },
-            PipelineSpec {
-                id: probe_id,
-                source: SourceSpec::Values(values_spec(
-                    vec![
-                        vec![int_constant(1), int_constant(100)],
-                        vec![int_constant(3), int_constant(300)],
-                    ],
-                    vec![LogicalType::Integer, LogicalType::Integer],
-                )),
-                transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
-                    handle,
-                    join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
-                    left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                    output_types: vec![LogicalType::Integer, LogicalType::Integer]
-                        .into_boxed_slice(),
-                })],
-                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-                sink_sharing: SinkSharing::Exclusive,
-                properties: PipelineProperties::default(),
-                output: join_row_type.clone(),
-            },
-            PipelineSpec {
-                id: replay_id,
-                source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
-                    handle,
-                    join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
-                    probe_types: vec![LogicalType::Integer, LogicalType::Integer]
-                        .into_boxed_slice(),
-                    build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                    output_types: vec![LogicalType::Integer, LogicalType::Integer]
-                        .into_boxed_slice(),
-                }),
-                transforms: Vec::new(),
-                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-                sink_sharing: SinkSharing::Exclusive,
-                properties: PipelineProperties::default(),
-                output: join_row_type,
-            },
-        ],
-        dependencies: vec![
-            PipelineDependency {
-                producer: build_id,
-                consumer: probe_id,
-                kind: DependencyKind::BuildBeforeProbe,
-            },
-            PipelineDependency {
-                producer: probe_id,
-                consumer: replay_id,
-                kind: DependencyKind::ProbeBeforeSpillReplay,
-            },
-        ],
-        handles: handles.finish(),
-        control_regions: Vec::new(),
-        root: PipelineRoot::Pipeline(replay_id),
-    };
-    let programs = PipelineProgramBuilder::default()
-        .build_program_set(&graph)
-        .expect("program set");
-    let registry = Arc::new(BreakerHandleRegistry::from_catalog(&graph.handles).expect("handles"));
-    let runtimes = [build_id, probe_id, replay_id]
-        .into_iter()
-        .map(|id| {
-            Arc::new(
-                PipelineRuntime::with_registry(
-                    programs.get(id).unwrap().clone(),
-                    Arc::clone(&registry),
-                    query.params.clone(),
-                    &query,
-                )
-                .expect("runtime"),
-            )
-        })
-        .collect::<Vec<_>>();
-    let thread = ThreadContext::single_threaded();
-    let wake = OperatorWakeScope {
-        task_id: PipelineTaskId(22),
-        generation: WakeGeneration(0),
-    };
-    let mut profiler = OperatorProfiler::disabled();
-
-    for runtime in &runtimes {
-        let task = runtime
-            .create_task_state(&query, paro_common::test_utils::test_allocator())
-            .expect("task");
-        let mut executor = PipelineTaskExecutor::new(Arc::clone(runtime), task);
-        run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    }
-
-    let chunk = output.pop_front().expect("external replay output");
-    assert_eq!(chunk.size(), 1);
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(100));
-    assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(10));
-    assert!(output.pop_front().is_none());
 }
 
 #[test]

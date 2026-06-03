@@ -3,16 +3,20 @@
 
 use std::sync::Arc;
 
-use paro_common::allocator::{BufferAllocator, BufferManager};
+use paro_common::allocator::{Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{GrantAllocator, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::sort_key::SortKeyEncoding;
+use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::row::{
-    Ordering as RowOrdering, PrefixReleasableRowStore, RowLayout, RowStore, RowStoreBuilder,
+    Ordering as RowOrdering, PrefixReleasableRowStore, RowLayout, RowSpillWriter, RowStore,
+    RowStoreBuilder, RowStoreSpillWriter,
 };
+
+use crate::operators::sort::row_format::SortRowFormat;
 
 use super::sort_key_store::SortKeyStore;
 use super::sort_projection_column::SortProjectionColumn;
@@ -194,7 +198,17 @@ impl RunBuilder {
         if let Some(payload_rows) = self.payload_rows.as_mut() {
             payload_rows.append(payload)?;
         }
-        self.count += key.size() as u32;
+        let appended = u32::try_from(key.size()).map_err(|_| {
+            paro_error::internal(format!(
+                "sort run append exceeds u32 batch ordinal domain: rows={}",
+                key.size()
+            ))
+        })?;
+        self.count = self.count.checked_add(appended).ok_or_else(|| {
+            paro_error::internal(
+                "sort run row count exceeds u32 ordinal domain; storage RowStore uses u64 ordinals but sorted-run ordinals are still u32".to_string(),
+            )
+        })?;
         Ok(())
     }
 
@@ -216,25 +230,13 @@ impl RunBuilder {
 
         let storage = if external {
             let reordered_key_store = self.key_store.reorder_by_permutation(&permutation)?;
-            let reordered_key_rows = reorder_row_store(
+            let (reordered_key_rows, reordered_payload_rows) = write_sorted_external_rows(
                 Arc::clone(&self.buffer_pool),
                 self.memory.clone(),
                 &key_rows,
+                payload_rows.as_ref(),
                 &permutation,
-            )?
-            .into_prefix_releasable();
-            let reordered_payload_rows = payload_rows
-                .as_ref()
-                .map(|rows| {
-                    reorder_row_store(
-                        Arc::clone(&self.buffer_pool),
-                        self.memory.clone(),
-                        rows,
-                        &permutation,
-                    )
-                })
-                .transpose()?
-                .map(RowStore::into_prefix_releasable);
+            )?;
             RunStorage::External {
                 key_store: reordered_key_store,
                 key_rows: reordered_key_rows,
@@ -339,20 +341,13 @@ impl SortedRun {
                 ..
             } => {
                 let reordered_key_store = key_store.reorder_by_permutation(&permutation)?;
-                let reordered_key_rows = reorder_row_store(
+                let (reordered_key_rows, reordered_payload_rows) = write_sorted_external_rows(
                     buffer_pool.clone(),
                     memory.clone(),
                     &key_rows,
+                    payload_rows.as_ref(),
                     &permutation,
-                )?
-                .into_prefix_releasable();
-                let reordered_payload_rows = payload_rows
-                    .as_ref()
-                    .map(|rows| {
-                        reorder_row_store(buffer_pool.clone(), memory.clone(), rows, &permutation)
-                    })
-                    .transpose()?
-                    .map(RowStore::into_prefix_releasable);
+                )?;
                 RunStorage::External {
                     key_store: reordered_key_store,
                     key_rows: reordered_key_rows,
@@ -710,7 +705,7 @@ impl<'a> RunRowCursor<'a> {
         let reuse =
             self.pinned.is_some() && start == self.current_start && requested_end == current_end;
         if !reuse {
-            self.pinned = Some(self.store.pin_ordinal_range(start, len)?);
+            self.pinned = Some(self.store.pin_ordinal_range(start as u64, len as u64)?);
             self.current_start = start;
             self.current_len = len;
         }
@@ -721,32 +716,77 @@ impl<'a> RunRowCursor<'a> {
     }
 }
 
-fn reorder_row_store(
+fn write_sorted_external_rows(
     buffer_pool: Arc<BufferPool>,
     memory: MemoryAccountingContext,
-    source: &RowStore,
+    key_source: &RowStore,
+    payload_source: Option<&RowStore>,
     permutation: &[u32],
-) -> Result<RowStore> {
-    let allocator = Arc::new(BufferAllocator::new(
+) -> Result<(PrefixReleasableRowStore, Option<PrefixReleasableRowStore>)> {
+    let allocator: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
         Arc::clone(&buffer_pool) as Arc<dyn BufferManager>,
         MemoryTag::OrderBy,
     ));
-    let mut builder = RowStoreBuilder::new_with_memory(
-        buffer_pool,
-        Arc::new(source.layout().clone()),
-        MemoryTag::OrderBy,
-        memory,
+    let key_format = SortRowFormat::new(
+        key_source.layout().types().iter().cloned(),
+        std::iter::empty::<LogicalType>(),
     );
-    let column_ids: Vec<usize> = (0..source.layout().column_count()).collect();
-    let mut gathered = Chunk::try_initialize(source.layout().types(), VECTOR_SIZE, allocator)?;
+    let mut key_writer = RowStoreSpillWriter::new(
+        Arc::clone(&buffer_pool),
+        key_format,
+        MemoryTag::OrderBy,
+        memory.clone(),
+    );
+    let mut payload_writer = payload_source.map(|source| {
+        let payload_format = SortRowFormat::new(
+            std::iter::empty::<LogicalType>(),
+            source.layout().types().iter().cloned(),
+        );
+        RowStoreSpillWriter::new(
+            Arc::clone(&buffer_pool),
+            payload_format,
+            MemoryTag::OrderBy,
+            memory.clone(),
+        )
+    });
+    let key_column_ids: Vec<usize> = (0..key_source.layout().column_count()).collect();
+    let payload_column_ids = payload_source
+        .map(|source| (0..source.layout().column_count()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut key_gathered = Chunk::try_initialize(
+        key_source.layout().types(),
+        VECTOR_SIZE,
+        Arc::clone(&allocator),
+    )?;
+    let mut payload_gathered = payload_source
+        .map(|source| {
+            Chunk::try_initialize(source.layout().types(), VECTOR_SIZE, Arc::clone(&allocator))
+        })
+        .transpose()?;
 
     for batch in permutation.chunks(VECTOR_SIZE) {
-        gathered.try_reset(gathered.allocator().clone())?;
-        let pinned = source.pin_ordinals(batch, RowOrdering::Arbitrary)?;
-        pinned.gather_columns(&column_ids, &mut gathered, 0)?;
-        gathered.set_cardinality(batch.len());
-        builder.append(&gathered)?;
+        key_gathered.try_reset(key_gathered.allocator().clone())?;
+        let pinned = key_source.pin_ordinals(batch, RowOrdering::Arbitrary)?;
+        pinned.gather_columns(&key_column_ids, &mut key_gathered, 0)?;
+        key_gathered.set_cardinality(batch.len());
+        key_writer.append_chunk(&key_gathered)?;
+
+        if let (Some(source), Some(writer), Some(gathered)) = (
+            payload_source,
+            payload_writer.as_mut(),
+            payload_gathered.as_mut(),
+        ) {
+            gathered.try_reset(gathered.allocator().clone())?;
+            let pinned = source.pin_ordinals(batch, RowOrdering::Arbitrary)?;
+            pinned.gather_columns(&payload_column_ids, gathered, 0)?;
+            gathered.set_cardinality(batch.len());
+            writer.append_chunk(gathered)?;
+        }
     }
 
-    Ok(builder.seal())
+    let payload_rows = match payload_writer {
+        Some(writer) => Some(writer.finish()?.into_prefix_releasable()),
+        None => None,
+    };
+    Ok((key_writer.finish()?.into_prefix_releasable(), payload_rows))
 }

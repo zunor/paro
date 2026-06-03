@@ -367,19 +367,6 @@ pub(crate) fn is_hash_join_comparison(comparison: JoinComparisonType) -> bool {
     )
 }
 
-pub(crate) fn is_ie_join_candidate(conditions: &[JoinCondition]) -> bool {
-    conditions.len() == 2
-        && conditions.iter().all(|c| {
-            matches!(
-                c.comparison,
-                JoinComparisonType::LessThan
-                    | JoinComparisonType::LessThanOrEqual
-                    | JoinComparisonType::GreaterThan
-                    | JoinComparisonType::GreaterThanOrEqual
-            )
-        })
-}
-
 pub(crate) fn nlj_left_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),

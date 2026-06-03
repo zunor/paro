@@ -122,8 +122,8 @@ pub enum CompiledExpressionState {
     ColumnRef(ColumnRefExpressionState),
     Operator(OperatorExpressionState),
     Reference(ReferenceExpressionState),
+    Shared(SharedExpressionState),
     Subquery(SubqueryExpressionState),
-    Window(WindowExpressionState),
 }
 
 #[derive(Debug)]
@@ -204,6 +204,14 @@ pub struct OperatorExpressionState {
 #[derive(Debug)]
 pub(crate) enum PreparedInList {
     Dynamic,
+    I32Const {
+        values: Vec<i32>,
+        has_null: bool,
+    },
+    I64Const {
+        values: Vec<i64>,
+        has_null: bool,
+    },
     SmallConst {
         values: Vec<Value>,
         has_null: bool,
@@ -218,7 +226,21 @@ pub(crate) enum PreparedInList {
 pub struct ReferenceExpressionState;
 
 #[derive(Debug)]
-pub struct SubqueryExpressionState;
+pub struct SharedExpressionState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedBatchSignature {
+    pub epoch: u64,
+    pub count: usize,
+    pub selection_identity: usize,
+    pub selection_hash: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct SharedExpressionSlot {
+    pub value: ValueSlot,
+    pub signature: Option<SharedBatchSignature>,
+}
 
 #[derive(Debug)]
-pub struct WindowExpressionState;
+pub struct SubqueryExpressionState;

@@ -10,8 +10,8 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_common::vector::VECTOR_SIZE;
 use paro_context::{
-    NoopStatementTimeoutDriver, StatementCancelReason, StatementCancellation, StatementContext,
-    TestStatementContextBuilder,
+    NoopStatementTimeoutDriver, RuntimeLimits, StatementCancelReason, StatementCancellation,
+    StatementContext, TestStatementContextBuilder,
 };
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_planner::binder::context::BindContext;
@@ -31,7 +31,7 @@ use crate::physical::generator::{PhysicalPlanGenerator, PlanBuildContext};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::node::{OperatorLabel, PhysicalPlanNode};
 use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
-use crate::physical::properties::{PipelineProperties, PlanPropertyMap};
+use crate::physical::properties::{Parallelism, PipelineProperties, PlanPropertyMap};
 use crate::physical::specs::PhysicalNodeKind;
 use crate::physical::{ChunkScanSpec, DummyScanSpec, RowType};
 use crate::pipeline::graph::{
@@ -318,6 +318,76 @@ fn fetch_driven_aggregate_dag_keeps_root_output_bounded() {
 }
 
 #[test]
+fn completed_output_parallel_scheduler_consumes_chunk_morsels() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let chunks = (0..8).map(|value| i32_chunk(&[value])).collect::<Vec<_>>();
+    let output_type = LogicalType::Integer;
+    let row_type = RowType::new(vec!["v".to_string()], vec![output_type.clone()]);
+    let chunk_spec = ChunkScanSpec {
+        chunks: Arc::from(chunks.into_boxed_slice()),
+        output_names: vec!["v".to_string()].into_boxed_slice(),
+        output_types: vec![output_type.clone()].into_boxed_slice(),
+    };
+    let mut properties = PipelineProperties::default();
+    properties.capabilities.parallelism = Parallelism::unbounded();
+    let graph = Arc::new(PipelineGraph {
+        pipelines: vec![PipelineSpec {
+            id: PipelineId::new(0),
+            source: SourceSpec::Chunk(chunk_spec.clone()),
+            transforms: Vec::new(),
+            sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+            sink_sharing: SinkSharing::Exclusive,
+            properties,
+            output: row_type.clone(),
+        }],
+        dependencies: Vec::new(),
+        handles: BreakerHandleCatalogBuilder::default().finish(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(PipelineId::new(0)),
+    });
+    let programs = PipelineProgramBuilder::default()
+        .build_program_set(graph.as_ref())
+        .expect("pipeline programs");
+    let statement = StatementProgram::Pipeline {
+        plan: Arc::new(single_node_plan(
+            PhysicalNodeKind::ChunkScan(chunk_spec),
+            row_type,
+        )),
+        graph,
+        programs,
+    };
+    let session = TestStatementContextBuilder::minimal()
+        .with_limits(RuntimeLimits {
+            max_threads: 4,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: false,
+            temporary_directory: String::new(),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: true,
+        })
+        .build();
+    session.scheduler().set_threads(4).expect("worker threads");
+
+    let execution = execute_program(
+        session,
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        allocator,
+    )
+    .expect("execute parallel scheduler program");
+
+    let mut values = Vec::new();
+    while let Some(chunk) = execution.query.output.pop_front() {
+        values.push(chunk.column(0).unwrap().get_i32(0).unwrap());
+    }
+    values.sort_unstable();
+    assert_eq!(values, (0..8).collect::<Vec<_>>());
+}
+
+#[test]
 fn completed_output_materializes_root_output_until_client_fetch() {
     let allocator = paro_common::test_utils::test_allocator();
     let chunk_count = 8usize;
@@ -462,6 +532,7 @@ fn result_handler_cleans_fetch_driver_on_blocked_internal_error() {
     let execution = ProgramExecution {
         query,
         driver: Some(driver),
+        background: None,
     };
     let mut handler = ResultHandler::from_program_execution(
         vec!["v".to_string()],

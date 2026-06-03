@@ -114,7 +114,7 @@ workloads early there as well.
 Current project policy:
 - Generic median-latency baseline comparison has been removed.
 - Use `make -C benchmark run` for ad-hoc measurement reports.
-- Use `runner.py gate check` or the `make perf-gate-*` aliases for performance
+- Use `runner.py gate check` or the `make performance-gate-*` aliases for performance
   gates backed by `benchmark/policies/<gate>.toml` and
   `benchmark/baselines/<gate>/<platform>.json`.
 
@@ -262,17 +262,61 @@ Notes:
   regression, which makes it suitable for `git bisect run` after choosing a
   known-good archived commit.
 
+### Operator Runtime Baseline Contract
+
+- Naming: `operator_runtime_baseline` and `operator-runtime-baseline` are the
+  canonical baseline workload and suite names. Numbered perf-stage names are not
+  used for operator-runtime benchmark entry points.
+- Owner: execution runtime maintainers own `operator-runtime`,
+  `operator-runtime-mixed`, and `divan-dispatch`; policy files live in
+  `benchmark/policies/`, and non-shadow promotion is checked by
+  `tools/ci/check_policy_evolution.py`. A benchmark without an owner stays
+  shadow-only and cannot become a release gate.
+- Result storage: local raw reports live under `benchmark/report/`; release
+  baselines live in `benchmark/baselines/<gate>/<platform>.json`; rolling
+  calibration lives in the append-only performance archive configured by
+  `PARO_PERF_ARCHIVE_REPOSITORY` in `.github/workflows/ci.yml` and
+  `.github/workflows/benchmark-nightly.yml`.
+- Bless permission: only policy-evolution runs from release builds, fresh data
+  dirs, and explicitly declared platforms may refresh checked-in baselines.
+  Local blesses are for investigation unless the policy-evolution flow guarded
+  by `tools/ci/check_policy_evolution.py` produced the same source set.
+- Runtime contract: gate payloads and fingerprints record thread count, query
+  memory cap, temp directory, data scale, random seed, and single-task fast-path
+  status from `PARO_BENCH_*` / `PARO_PERF_*` env vars via
+  `benchmark/harness/runtime_contract.py`. `benchmark/Makefile` exports local
+  defaults; CI exports the same values before starting `parod`.
+- Re-run rule: noisy PR failures use quorum retries for the failed query set.
+  `benchmark/harness/cli/gate_check.py` implements `QUORUM_RETRIES`; if archive
+  calibration is unavailable, use the static RSS/P99/noise floors and do not
+  bless a new baseline from that run.
+- Baseline coverage: `operator-runtime-baseline` covers selective scan,
+  count/filter, integer and string hash join, high-cardinality aggregate,
+  large sort, forced external hash join, and IE-join fallback. The main
+  `operator-runtime` gate includes those queries under staging until all
+  platforms are blessed.
+- Mixed concurrency: `operator-runtime-mixed` measures N small queries plus one
+  large OLAP query, scan/join mixed execution, and temp-directory contention
+  with P99/RSS through `benchmark/harness/sources/mixed_sql_suite.py`. Create
+  its first baseline with
+  `make -C benchmark bless GATE=operator-runtime-mixed PID=<parod-pid>` after
+  the normal operator-runtime baseline is green.
+- Hot-path audit: benchmark jobs start `parod` with `PARO_ALLOC_AUDIT=1`; the
+  operator profiler emits `allocator_tracking_event_count`, and the Divan
+  dispatch source stores per-chunk allocator tracking events in the projected
+  baseline.
+
 Run the operator runtime gate from the repository root:
 
 ```bash
-make perf-gate-sql
-make perf-gate-divan
+make performance-gate-sql
+make performance-gate-divan
 ```
 
 Refresh its SQL baseline:
 
 ```bash
-make perf-gate-bless
+make performance-gate-bless
 ```
 
 The operator runtime SQL gate requires RSS sampling for memory coverage. The

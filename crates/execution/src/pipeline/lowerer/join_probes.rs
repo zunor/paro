@@ -251,6 +251,157 @@ impl<'a> PipelineLowerer<'a> {
         Ok((producer, handle))
     }
 
+    pub(crate) fn lower_sort_range_build(
+        &mut self,
+        right: PhysicalPlanNodeId,
+        spec: &SortRangeJoinSpec,
+        pipelines: &mut Vec<PipelineSpec>,
+        dependencies: &mut Vec<PipelineDependency>,
+    ) -> Result<(PipelineId, BreakerHandleId)> {
+        let right_output = RowType::new(
+            (0..spec.right_output_types.len())
+                .map(|idx| format!("sort_range_build_{}", idx + 1))
+                .collect(),
+            spec.right_output_types.to_vec(),
+        );
+        let handle = self.handles.register(
+            BreakerHandleKind::Materialized,
+            right_output,
+            Default::default(),
+        );
+        let producer = self.lower_subtree_to_sink(
+            right,
+            SinkSpec::Materialize(MaterializeSinkSpec {
+                handle,
+                required: Default::default(),
+            }),
+            SinkSharing::Exclusive,
+            self.plan.node(right).output.clone(),
+            pipelines,
+            dependencies,
+        )?;
+        self.handles.set_producer(handle, producer)?;
+        Ok((producer, handle))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lower_sort_range_join_to_sink(
+        &mut self,
+        root: PhysicalPlanNodeId,
+        spec: &SortRangeJoinSpec,
+        consumer_transforms: Vec<TransformSpec>,
+        sink: SinkSpec,
+        sink_sharing: SinkSharing,
+        output: RowType,
+        pipelines: &mut Vec<PipelineSpec>,
+        dependencies: &mut Vec<PipelineDependency>,
+    ) -> Result<PipelineId> {
+        let needs_unmatched = needs_nlj_unmatched_source(spec.join_type);
+        let downstream_is_client = matches!(sink, SinkSpec::ClientResult(_))
+            && matches!(sink_sharing, SinkSharing::Exclusive);
+        if needs_unmatched
+            && consumer_transforms
+                .iter()
+                .any(|t| matches!(t, TransformSpec::Limit(_)))
+        {
+            return Err(paro_error::not_implemented(
+                "LIMIT above right/full sort-range join requires a shared post-join limit pipeline",
+            ));
+        }
+        let branch_sharing = if downstream_is_client {
+            SinkSharing::Exclusive
+        } else {
+            match sink_sharing {
+                SinkSharing::Exclusive => {
+                    if needs_unmatched {
+                        SinkSharing::Shared(self.next_shared_sink())
+                    } else {
+                        SinkSharing::Exclusive
+                    }
+                }
+                shared @ SinkSharing::Shared(_) => shared,
+            }
+        };
+
+        let node = self.plan.node(root);
+        let children = self.plan.child_ids(&node.children);
+        let [left, right] = children else {
+            return Err(paro_error::internal(format!(
+                "{} expected exactly two sort-range join children, got {}",
+                node.label.display_name,
+                children.len()
+            )));
+        };
+
+        let (producer, handle) =
+            self.lower_sort_range_build(*right, spec, pipelines, dependencies)?;
+
+        let (source, mut transforms, pending_builds) =
+            self.collect_probe_roles(*left, pipelines, dependencies)?;
+        let source_handles = source.clone();
+        transforms.push(sort_range_probe_transform(handle, spec));
+        transforms.extend(consumer_transforms.iter().cloned());
+
+        let pushed = self.push_pipeline(
+            source,
+            transforms,
+            sink.clone(),
+            branch_sharing,
+            output.clone(),
+            pipelines,
+            dependencies,
+        )?;
+        let consumer = pushed.entry;
+        self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
+        for pending in &pending_builds {
+            self.handles.add_consumer(pending.handle, consumer)?;
+        }
+        self.handles.add_consumer(handle, consumer)?;
+        dependencies.extend(
+            pending_builds
+                .into_iter()
+                .map(|pending| PipelineDependency {
+                    producer: pending.producer,
+                    consumer,
+                    kind: DependencyKind::BuildBeforeProbe,
+                }),
+        );
+        dependencies.push(PipelineDependency {
+            producer,
+            consumer,
+            kind: DependencyKind::BuildBeforeProbe,
+        });
+
+        if needs_unmatched {
+            let unmatched_source = SourceSpec::NljUnmatched(NljUnmatchedSourceSpec {
+                handle,
+                join_type: spec.join_type,
+                left_output_types: spec.left_output_types.clone(),
+                right_projection: spec.right_projection.clone(),
+                output_names: spec.output_names.clone(),
+                output_types: spec.output_types.clone(),
+            });
+            let unmatched = self.push_pipeline(
+                unmatched_source,
+                consumer_transforms,
+                sink,
+                branch_sharing,
+                output,
+                pipelines,
+                dependencies,
+            )?;
+            self.handles.add_consumer(handle, unmatched.entry)?;
+            dependencies.push(PipelineDependency {
+                producer: consumer,
+                consumer: unmatched.entry,
+                kind: DependencyKind::FinalizeBeforeEmit,
+            });
+            return Ok(unmatched.tail);
+        }
+
+        Ok(pushed.tail)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn lower_hash_join_to_sink(
         &mut self,
@@ -321,6 +472,7 @@ impl<'a> PipelineLowerer<'a> {
 
         let (source, mut transforms, pending_builds) =
             self.collect_probe_roles(*left, pipelines, dependencies)?;
+        let source = self.attach_hash_join_runtime_filters(source, &transforms, handle, spec);
         let probe_source_handles = source.clone();
         transforms.push(hash_join_probe_transform(handle, spec));
         transforms.extend(consumer_transforms.iter().cloned());
@@ -356,8 +508,11 @@ impl<'a> PipelineLowerer<'a> {
             kind: DependencyKind::BuildBeforeProbe,
         });
 
-        let needs_replay = spec.force_external || needs_unmatched;
-        let replay = if needs_replay {
+        let replay = {
+            // Non-forced hash joins can still switch to external mode during
+            // build finish under memory pressure. Keep the replay fence in the
+            // graph for every hash join; the source exits immediately when the
+            // handle stayed in-memory.
             let replay_source = SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                 handle,
                 join_type: spec.join_type,
@@ -385,8 +540,6 @@ impl<'a> PipelineLowerer<'a> {
                 kind: DependencyKind::ProbeBeforeSpillReplay,
             });
             Some(replay)
-        } else {
-            None
         };
 
         if needs_unmatched {
@@ -472,6 +625,8 @@ impl<'a> PipelineLowerer<'a> {
 
                 let (source, mut transforms, mut pending_builds) =
                     self.collect_probe_roles(*left, pipelines, dependencies)?;
+                let source =
+                    self.attach_hash_join_runtime_filters(source, &transforms, handle, &spec);
                 transforms.push(hash_join_probe_transform(handle, &spec));
                 pending_builds.push(PendingProbeBuild { producer, handle });
                 Ok((source, transforms, pending_builds))
@@ -499,39 +654,30 @@ impl<'a> PipelineLowerer<'a> {
                 pending_builds.push(PendingProbeBuild { producer, handle });
                 Ok((source, transforms, pending_builds))
             }
-            PhysicalNodeKind::IEJoin(spec) => {
-                let nlj_spec = NestedLoopJoinSpec {
-                    join_type: spec.join_type,
-                    conditions: spec.conditions.clone(),
-                    mark_null_condition_start: spec.mark_null_condition_start,
-                    arbitrary_condition: None,
-                    left_projection: spec.left_projection.clone(),
-                    right_projection: spec.right_projection.clone(),
-                    left_output_types: spec.left_output_types.clone(),
-                    right_output_types: spec.right_output_types.clone(),
-                    output_names: spec.output_names.clone(),
-                    output_types: spec.output_types.clone(),
-                };
+            PhysicalNodeKind::SortRangeJoin(spec) => {
                 if needs_nlj_unmatched_source(spec.join_type) {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
                 }
                 let children = self.plan.child_ids(&node.children);
                 let [left, right] = children else {
                     return Err(paro_error::internal(format!(
-                        "{} expected exactly two IE join children, got {}",
+                        "{} expected exactly two sort-range join children, got {}",
                         node.label.display_name,
                         children.len()
                     )));
                 };
 
                 let (producer, handle) =
-                    self.lower_nlj_build(*right, &nlj_spec, pipelines, dependencies)?;
+                    self.lower_sort_range_build(*right, spec, pipelines, dependencies)?;
 
                 let (source, mut transforms, mut pending_builds) =
                     self.collect_probe_roles(*left, pipelines, dependencies)?;
-                transforms.push(nlj_probe_transform(handle, &nlj_spec));
+                transforms.push(sort_range_probe_transform(handle, spec));
                 pending_builds.push(PendingProbeBuild { producer, handle });
                 Ok((source, transforms, pending_builds))
+            }
+            PhysicalNodeKind::ClassicIeJoin(_) => {
+                self.collect_probe_roles_source_fallback(root, pipelines, dependencies)
             }
             PhysicalNodeKind::CrossProduct(spec) => {
                 let spec = spec.clone();
@@ -562,7 +708,8 @@ impl<'a> PipelineLowerer<'a> {
                         kind,
                         PhysicalNodeKind::HashJoin(_)
                             | PhysicalNodeKind::NestedLoopJoin(_)
-                            | PhysicalNodeKind::IEJoin(_)
+                            | PhysicalNodeKind::SortRangeJoin(_)
+                            | PhysicalNodeKind::ClassicIeJoin(_)
                             | PhysicalNodeKind::CrossProduct(_)
                             | PhysicalNodeKind::ExternalTable(_)
                     )
@@ -576,6 +723,41 @@ impl<'a> PipelineLowerer<'a> {
                 Ok((source, transforms, Vec::new()))
             }
         }
+    }
+
+    pub(crate) fn attach_hash_join_runtime_filters(
+        &self,
+        mut source: SourceSpec,
+        transforms: &[TransformSpec],
+        handle: BreakerHandleId,
+        spec: &HashJoinSpec,
+    ) -> SourceSpec {
+        if !can_push_hash_join_runtime_filter(spec.join_type) || !transforms.is_empty() {
+            return source;
+        }
+        let SourceSpec::Rowset(rowset) = &mut source else {
+            return source;
+        };
+        for (build_key_index, condition) in spec.conditions.iter().enumerate() {
+            if condition.comparison != JoinComparisonType::Equal {
+                continue;
+            }
+            let Expression::Reference(reference) = &condition.left else {
+                continue;
+            };
+            let Some(&probe_column_id) = rowset.scan.column_ids.get(reference.index) else {
+                continue;
+            };
+            let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
+                continue;
+            };
+            rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
+                handle,
+                build_key_index,
+                probe_column_id,
+            });
+        }
+        source
     }
 
     pub(crate) fn collect_probe_roles_source_fallback(
@@ -609,4 +791,8 @@ impl<'a> PipelineLowerer<'a> {
             vec![PendingProbeBuild { producer, handle }],
         ))
     }
+}
+
+fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
+    matches!(join_type, JoinType::Inner | JoinType::Semi)
 }

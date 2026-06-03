@@ -663,9 +663,14 @@ mod tests {
     fn finalize_stage_registers_before_async_completion() {
         let runtime = Arc::new(JournalApplyRuntime::new());
         let published = Arc::new(AtomicBool::new(false));
+        let (registered_tx, registered_rx) = mpsc::channel();
         let (submitted_tx, submitted_rx) = mpsc::channel();
         let (complete_tx, complete_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let hooks = CommitFinalizeStageHooks {
+            on_registered: Arc::new(move |commit_ts| {
+                registered_tx.send(commit_ts).unwrap();
+            }),
             on_submission: Arc::new(move |submission, _| {
                 submitted_tx.send(submission.commit_ts).unwrap();
             }),
@@ -677,16 +682,51 @@ mod tests {
         };
         let stage =
             CommitFinalizeStage::new_inline(runtime, CommitFinalizeStageOptions::default(), hooks);
+        let published_for_request = Arc::clone(&published);
 
         stage
             .schedule(
-                vec![durable_job(CommitTs::new(1), Arc::clone(&published))],
+                vec![durable_job_with_plan(
+                    CommitTs::new(1),
+                    RequiredPublishPlan::new(
+                        Box::new(move |handle| {
+                            release_rx
+                                .recv_timeout(Duration::from_secs(2))
+                                .expect("test must release apply request after registration");
+                            let published = Arc::clone(&published_for_request);
+                            ApplyRequest {
+                                lsn: handle.durable_lsn(),
+                                durable_batch_lsn: handle.durable_batch_lsn(),
+                                commit_id: Some(handle.commit_ts().into_raw()),
+                                wait_mode: WaitMode::Published,
+                                catalog_serial: false,
+                                catalog_pre: Box::new(|| Ok(())),
+                                tablet_parts: Vec::<TabletApplyPart>::new(),
+                                descriptor_phase: Box::new(|| Ok(())),
+                                catalog_post: Box::new(|| Ok(())),
+                                on_published: Box::new(move || {
+                                    published.store(true, Ordering::Release);
+                                    Ok(())
+                                }),
+                            }
+                        }),
+                        Arc::from([]),
+                    ),
+                )],
                 durable_batch(1),
             )
             .unwrap();
-        stage.wait_until_registered(CommitTs::new(1)).unwrap();
+        assert_eq!(
+            registered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CommitTs::new(1)
+        );
 
         assert_eq!(stage.registered_commit_ts(), CommitTs::new(1));
+        assert!(matches!(
+            complete_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
         assert_eq!(
             submitted_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             CommitTs::new(1)

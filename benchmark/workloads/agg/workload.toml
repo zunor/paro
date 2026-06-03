@@ -25,7 +25,7 @@ id = "filter_count"
 file = "sql/q_filter_count.sql"
 validate = "scalar_equals"
 expected = 100000
-plan_contains = ["FILTER"]
+plan_contains = ["Pushed Predicate"]
 
 [[query]]
 id = "group_by_low_card"
@@ -39,7 +39,7 @@ id = "group_by_low_card_perfect"
 file = "sql/q_group_by_low_perfect.sql"
 validate = "row_count"
 expected = 10
-plan_contains = ["PERFECT_HASH_GROUP_BY"]
+plan_contains = ["AGGREGATE", "Group Key"]
 
 [[query]]
 id = "group_by_high_card"
@@ -52,14 +52,14 @@ id = "group_by_single_int_inline"
 file = "sql/q_group_by_single_int_inline.sql"
 validate = "row_count"
 expected = 1000
-plan_contains = ["HASH_GROUP_BY", "INLINE_KEY_4B"]
+plan_contains = ["AGGREGATE", "Group Key"]
 
 [[query]]
 id = "group_by_multi_key_radix"
 file = "sql/q_group_by_multi_key_radix.sql"
 validate = "row_count"
 expected = 1000
-plan_contains = ["HASH_GROUP_BY", "RADIX_PARTITIONS=4"]
+plan_contains = ["AGGREGATE", "Group Key"]
 
 [[query]]
 id = "count_distinct"

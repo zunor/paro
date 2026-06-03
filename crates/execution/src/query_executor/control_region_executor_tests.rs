@@ -30,13 +30,13 @@ use crate::pipeline::{PipelineProgramBuilder, StatementProgram};
 use crate::query_executor::program_executor::{
     start_program_with_output_for_test, ProgramExecution,
 };
-use crate::runtime::{ParameterBindings, QueryOutputPort};
+use crate::runtime::{ParameterBindings, QueryOutputPort, RUNTIME_WAIT_TIMEOUT};
 
 #[test]
-fn recursive_control_region_root_runs_completed_output_synchronously() {
+fn recursive_control_region_root_uses_bounded_background_output() {
     let allocator = paro_common::test_utils::test_allocator();
     let statement = recursive_control_region_statement();
-    let execution = start_program_with_output_for_test(
+    let mut execution = start_program_with_output_for_test(
         TestStatementContextBuilder::minimal().build(),
         &statement,
         Arc::new(ParameterBindings::empty()),
@@ -49,22 +49,22 @@ fn recursive_control_region_root_runs_completed_output_synchronously() {
     .expect("control-region program starts");
 
     assert!(
-        execution.driver.is_none(),
-        "control-region roots must stay on the synchronous completed-output path"
+        execution.background.is_some(),
+        "control-region roots should use a background bounded-output producer"
     );
-    assert_eq!(execution.query.output.capacity(), usize::MAX);
-    assert_eq!(collect_i32_output(&execution), vec![1, 2, 3]);
+    assert_eq!(execution.query.output.capacity(), 2);
+    assert_eq!(collect_i32_background_output(&mut execution), vec![1, 2, 3]);
 
     let stats = execution.query.output.stats();
     assert_eq!(stats.pushed_rows, 3);
-    assert_eq!(stats.blocked_pushes, 0);
+    assert!(stats.peak_queue_chunks <= 2);
 }
 
 #[test]
-fn correlated_control_region_root_runs_completed_output_synchronously() {
+fn correlated_control_region_root_uses_bounded_background_output() {
     let allocator = paro_common::test_utils::test_allocator();
     let statement = correlated_control_region_statement();
-    let execution = start_program_with_output_for_test(
+    let mut execution = start_program_with_output_for_test(
         TestStatementContextBuilder::minimal().build(),
         &statement,
         Arc::new(ParameterBindings::empty()),
@@ -77,15 +77,15 @@ fn correlated_control_region_root_runs_completed_output_synchronously() {
     .expect("correlated control-region program starts");
 
     assert!(
-        execution.driver.is_none(),
-        "correlated control regions must stay on the synchronous completed-output path"
+        execution.background.is_some(),
+        "correlated control regions should use a background bounded-output producer"
     );
-    assert_eq!(execution.query.output.capacity(), usize::MAX);
-    assert_eq!(collect_i32_output(&execution), vec![1, 2, 3]);
+    assert_eq!(execution.query.output.capacity(), 2);
+    assert_eq!(collect_i32_background_output(&mut execution), vec![1, 2, 3]);
 
     let stats = execution.query.output.stats();
     assert_eq!(stats.pushed_rows, 3);
-    assert_eq!(stats.blocked_pushes, 0);
+    assert!(stats.peak_queue_chunks <= 2);
 }
 
 #[test]
@@ -352,12 +352,30 @@ fn statement_from_graph(graph: Arc<PipelineGraph>, row_type: RowType) -> Stateme
     }
 }
 
-fn collect_i32_output(execution: &ProgramExecution) -> Vec<i32> {
+fn collect_i32_background_output(execution: &mut ProgramExecution) -> Vec<i32> {
     let mut values = Vec::new();
-    while let Some(chunk) = execution.query.output.pop_front() {
-        for row in 0..chunk.size() {
-            values.push(chunk.column(0).unwrap().get_i32(row).unwrap());
+    loop {
+        while let Some(chunk) = execution.query.output.pop_front() {
+            for row in 0..chunk.size() {
+                values.push(chunk.column(0).unwrap().get_i32(row).unwrap());
+            }
         }
+        let Some(background) = execution.background.as_ref() else {
+            break;
+        };
+        if background.is_finished() {
+            execution
+                .background
+                .as_mut()
+                .expect("background checked")
+                .join()
+                .expect("background control-region execution");
+            break;
+        }
+        execution
+            .query
+            .output
+            .wait_for_change_timeout(RUNTIME_WAIT_TIMEOUT);
     }
     values
 }

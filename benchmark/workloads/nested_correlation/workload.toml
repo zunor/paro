@@ -11,9 +11,11 @@ id = "three_level_scalar_explain"
 file = "sql/q_three_level_scalar_explain.sql"
 validate = "text_contains_all"
 expected = [
-  "Aggregates: FIRST((SELECT (SELECT d.score",
-  "Join Condition: col1 IS NOT DISTINCT FROM ref_1",
-  "Filter: (col0 = delim_1)",
+  "DELIM_JOIN",
+  "Join Type: LEFT",
+  "Output: (SELECT (SELECT d.score",
+  "Aggregates: first(#1)",
+  "Filter: #0 = #2",
 ]
 
 [[query]]
@@ -22,7 +24,7 @@ file = "sql/q_four_level_exists_explain.sql"
 validate = "text_contains_all"
 expected = [
   "Join Type: MARK",
-  "Join Condition: col1 IS NOT DISTINCT FROM delim_1, col2 IS NOT DISTINCT FROM delim_2",
-  "Filter: (first >= ref_2)",
-  "Aggregates: FIRST(d.score)",
+  "Join Condition: #1 IS NOT DISTINCT FROM #0, #2 IS NOT DISTINCT FROM #1",
+  "Filter: #2 >= #1",
+  "Aggregates: first(#2)",
 ]

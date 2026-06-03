@@ -7,6 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{GrantAllocator, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
+use paro_common::vector::SelectionVector;
 
 use crate::buffer::{BufferPool, MemoryTag, DEFAULT_BLOCK_SIZE};
 use crate::row::block::{MAX_BLOCKS_PER_REGION, MAX_ROWS_PER_REGION};
@@ -141,6 +142,16 @@ impl RowStoreBuilder {
         appender.append(chunk)
     }
 
+    pub fn append_selected(
+        &mut self,
+        chunk: &Chunk,
+        sel: &SelectionVector,
+        count: usize,
+    ) -> Result<usize> {
+        let mut appender = self.appender();
+        appender.append_selected(chunk, sel, count)
+    }
+
     pub fn try_absorb(&mut self, other: RowStoreBuilder) -> Result<()> {
         self.ensure_compatible(&other)?;
         self.finish_current_region();
@@ -216,6 +227,46 @@ impl RowStoreBuilder {
             )));
         }
         Ok(count)
+    }
+
+    fn append_selected_with_state(
+        &mut self,
+        state: &mut RawRowAppendState,
+        chunk: &Chunk,
+        sel: &SelectionVector,
+        count: usize,
+    ) -> Result<usize> {
+        if count == 0 {
+            return Ok(0);
+        }
+        if count > sel.len() {
+            return Err(paro_error::internal(format!(
+                "row-store selected append count exceeds selection length: count={count}, selection_len={}",
+                sel.len()
+            )));
+        }
+        self.rotate_if_needed(count)?;
+
+        self.current
+            .initialize_append(state, RawRowPinProperties::UnpinAfterDone);
+        let appended = self.current.append_with_sel(state, chunk, sel, count)?;
+        self.count += appended as u64;
+
+        if self.current.count() as u64 > MAX_ROWS_PER_REGION {
+            return Err(paro_error::internal(format!(
+                "row region has {} rows, exceeding {}",
+                self.current.count(),
+                MAX_ROWS_PER_REGION
+            )));
+        }
+        if collection_row_block_count(&self.current) > MAX_BLOCKS_PER_REGION {
+            return Err(paro_error::internal(format!(
+                "row region has {} row blocks, exceeding {}",
+                collection_row_block_count(&self.current),
+                MAX_BLOCKS_PER_REGION
+            )));
+        }
+        Ok(appended)
     }
 
     fn rotate_if_needed(&mut self, incoming_rows: usize) -> Result<()> {
@@ -314,5 +365,15 @@ pub struct RowAppender<'a> {
 impl RowAppender<'_> {
     pub fn append(&mut self, chunk: &Chunk) -> Result<usize> {
         self.builder.append_with_state(&mut self.state, chunk)
+    }
+
+    pub fn append_selected(
+        &mut self,
+        chunk: &Chunk,
+        sel: &SelectionVector,
+        count: usize,
+    ) -> Result<usize> {
+        self.builder
+            .append_selected_with_state(&mut self.state, chunk, sel, count)
     }
 }

@@ -10,7 +10,6 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 impl TabletReader {
@@ -74,17 +73,13 @@ impl TabletReader {
             return Chunk::try_new(self.allocator.clone());
         }
 
-        let mut data_map: HashMap<ColumnId, &crate::rowset::column::ColumnBatch> = HashMap::new();
-        for (column_id, column_batch) in batch.iter() {
-            data_map.insert(*column_id, column_batch);
-        }
-
         let mut read_vectors: Vec<Arc<Vector>> = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
+        let mut batch_hint = 0usize;
 
         for (idx, col_id) in self.projection.iter().enumerate() {
             let ty = &self.read_types[idx];
-            if let Some(col_batch) = data_map.get(col_id) {
+            if let Some(col_batch) = find_column_batch(batch, *col_id, &mut batch_hint) {
                 let storage_provenance = col_batch.storage_dictionary.as_ref().map(|_| {
                     vector_decoder::storage_dictionary_provenance_id(rowset_id, segment_id, *col_id)
                 });
@@ -198,4 +193,23 @@ impl TabletReader {
         vector.set_count(rows);
         Ok(vector)
     }
+}
+
+fn find_column_batch<'a>(
+    batch: &'a [(ColumnId, crate::rowset::column::ColumnBatch)],
+    column_id: ColumnId,
+    hint: &mut usize,
+) -> Option<&'a crate::rowset::column::ColumnBatch> {
+    if let Some((candidate, column_batch)) = batch.get(*hint) {
+        if *candidate == column_id {
+            *hint += 1;
+            return Some(column_batch);
+        }
+    }
+
+    let found = batch
+        .iter()
+        .position(|(candidate, _)| *candidate == column_id)?;
+    *hint = found + 1;
+    Some(&batch[found].1)
 }

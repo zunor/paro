@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from .executor import QueryExecutionResult, WorkloadExecutionResult
 from .performance_gate import GateOutcome
+from .runtime_contract import runtime_contract_payload
 
 if TYPE_CHECKING:
     from .archive.calibration import ArchiveHealth
@@ -43,6 +44,7 @@ class BenchmarkReporter:
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "git": self._collect_git_info(),
             "system": self._collect_system_info(),
+            "runtime": runtime_contract_payload(include_environment=True),
             "config": {
                 "iterations": iterations,
                 "warmup": warmup,
@@ -100,6 +102,9 @@ class BenchmarkReporter:
                     "explain_profile": {
                         "status": query.explain_profile_status,
                         "detail": query.explain_profile_detail,
+                        "wall_time_ms": query.explain_profile_time_ms,
+                        "execution_time_ms": query.explain_profile_execution_time_ms,
+                        "overhead_ratio": query.explain_profile_overhead_ratio,
                         "raw_json": query.explain_profile_raw_json,
                         "operators": query.operator_profiles,
                     },
@@ -516,7 +521,11 @@ def _render_explain_summary(queries: Any) -> list[str]:
         if not isinstance(operators, list):
             lines.append(f"- `{query_id}`: explain profile collected, but operator list is unavailable")
             continue
-        lines.append(f"- `{query_id}`: {_summarize_operator_profiles(operators)}")
+        summary = _summarize_operator_profiles(operators)
+        ratio = explain.get("overhead_ratio")
+        if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+            summary = f"{summary}; profile/primary execution ratio: `{ratio:.2f}x`"
+        lines.append(f"- `{query_id}`: {summary}")
     return lines
 
 

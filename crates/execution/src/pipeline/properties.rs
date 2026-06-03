@@ -46,6 +46,7 @@ impl PipelinePropertyAccumulator {
             | TransformSpec::Project(_)
             | TransformSpec::HashJoinProbe(_)
             | TransformSpec::NestedLoopJoinProbe(_)
+            | TransformSpec::SortRangeJoinProbe(_)
             | TransformSpec::CrossProductProbe(_)
             | TransformSpec::ExternalProject(_)
             | TransformSpec::GraphExpand(_)
@@ -168,6 +169,7 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
             properties.memory.class = MemoryClass::Blocking;
         }
         SourceSpec::NljUnmatched(_)
+        | SourceSpec::ClassicIeJoin(_)
         | SourceSpec::HashJoinSpillReplay(_)
         | SourceSpec::HashJoinUnmatched(_)
         | SourceSpec::HashAggregateEmit(_)
@@ -195,8 +197,8 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
         }
         SourceSpec::SortEmit(spec) => {
             properties.provided.ordering = OrderingProperty::Fixed(spec.ordering.clone());
-            properties.capabilities.parallelism = Parallelism::single();
-            properties.placement = Placement::SingleTask;
+            properties.capabilities.parallelism = Parallelism::unbounded();
+            properties.placement = Placement::Local;
             properties.memory.class = MemoryClass::Blocking;
         }
         SourceSpec::TopNEmit(spec) => {

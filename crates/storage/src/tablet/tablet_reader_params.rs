@@ -3,7 +3,7 @@
 
 use crate::buffer::Prefetcher;
 use crate::index::PredicateTree;
-use crate::rowset::segment::SegmentOptions;
+use crate::rowset::segment::{SegmentOptions, SegmentSharedPtr};
 use crate::tablet::{ColumnId, TabletRef};
 use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
 use paro_common::allocator::Allocator;
@@ -23,7 +23,7 @@ pub struct TabletReaderParams {
     pub predicate_tree: Option<PredicateTree>,
     pub late_materialize: bool,
     pub predicate_columns: Option<Vec<ColumnId>>,
-    pub segment_id: Option<u32>,
+    pub segment: Option<SegmentSharedPtr>,
     pub segment_options: Option<SegmentOptions>,
     pub prefetcher: Option<Arc<Prefetcher>>,
     pub emit_row_id: bool,
@@ -83,7 +83,7 @@ impl Default for TabletReaderParams {
             predicate_tree: None,
             late_materialize: false,
             predicate_columns: None,
-            segment_id: None,
+            segment: None,
             segment_options: None,
             prefetcher: None,
             emit_row_id: false,
@@ -128,8 +128,8 @@ impl TabletReaderParams {
         self
     }
 
-    pub fn with_segment(mut self, segment_id: u32) -> Self {
-        self.segment_id = Some(segment_id);
+    pub fn with_segment_handle(mut self, segment: SegmentSharedPtr) -> Self {
+        self.segment = Some(segment);
         self
     }
 

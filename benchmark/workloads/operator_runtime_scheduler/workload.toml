@@ -1,0 +1,61 @@
+[meta]
+name = "operator_runtime_scheduler"
+description = "SCHEDULER pipeline scheduler, rowset segment morsels, and worker admission benchmark"
+run_order = 22
+
+[params]
+segments = 8
+rows_per_segment = 1000
+rows = 8000
+thread_count = 4
+memory_limit = "256MB"
+temp_directory = "/tmp/paro_benchmark_operator_runtime_scheduler"
+random_seed = 20260526
+fast_path_expected = "parallel-scheduler-enabled"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "scan_only_parallel"
+file = "sql/q_scan_only_parallel.sql"
+validate = "scalar_equals"
+expected = 4000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "hash_join_parallel"
+file = "sql/q_hash_join_parallel.sql"
+validate = "scalar_equals"
+expected = 8000
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "aggregate_parallel"
+file = "sql/q_aggregate_parallel.sql"
+validate = "scalar_equals"
+expected = 128
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "sort_seal_parallel"
+file = "sql/q_sort_seal_parallel.sql"
+validate = "scalar_equals"
+expected = 32004000
+plan_contains = ["ORDER_BY"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "scan_join_mixed_parallel"
+file = "sql/q_scan_join_mixed_parallel.sql"
+validate = "scalar_equals"
+expected = 6001
+plan_contains = ["HASH_JOIN"]
+collect_explain_profile = true
+allow_reexecute = true

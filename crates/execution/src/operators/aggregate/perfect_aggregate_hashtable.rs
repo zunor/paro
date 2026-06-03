@@ -552,6 +552,14 @@ impl PerfectAggregateHashTable {
         self.data.capacity() * size_of::<u64>() + self.occupancy.capacity() * size_of::<u8>()
     }
 
+    pub fn reclaimable_finalized_memory(&self) -> usize {
+        0
+    }
+
+    pub fn reclaim_finalized_memory(&mut self, _target_bytes: usize) -> usize {
+        0
+    }
+
     fn combine_pointer_batch(
         &mut self,
         source_ptrs: &[*mut u8],

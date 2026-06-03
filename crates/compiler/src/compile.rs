@@ -205,6 +205,7 @@ fn generate_typed_physical_plan(
     let mut generator = paro_execution::physical::PhysicalPlanGenerator::new(
         paro_execution::physical::PlanBuildContext {
             force_external: ctx.limits.force_external,
+            rowset_scan_pushdown: ctx.limits.rowset_scan_pushdown,
         },
     );
     generator.generate(logical_plan)

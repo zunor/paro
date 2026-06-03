@@ -107,6 +107,47 @@ impl PipelineTaskExecutor {
         }
     }
 
+    /// Create an executor that starts at the global finish phase.
+    ///
+    /// Parallel pipeline scheduling runs N data tasks through source,
+    /// transform flush, and local sink merge. Once all local merges have
+    /// rendezvoused, a single finish task owns the global seal/finalize path.
+    pub fn new_finish_task(runtime: Arc<PipelineRuntime>, task: PipelineTaskState) -> Self {
+        let mut executor = Self::new(runtime, task);
+        executor.phase = PipelineTaskPhase::Merging;
+        executor.completion_stage = PipelineCompletionStage::PrepareFinish;
+        executor
+    }
+
+    /// Step a data task until its local sink state has been merged.
+    ///
+    /// This intentionally stops before `prepare_finish`/`finish_work`; those
+    /// stages are owned by the scheduler-created finish work unit.
+    pub fn step_until_local_merge(
+        &mut self,
+        ctx: &mut PipelineTaskStepContext<'_>,
+    ) -> Result<TaskStepResult> {
+        if self.transition_done_after_local_merge() {
+            return Ok(TaskStepResult::Done);
+        }
+
+        let result = self.step(ctx)?;
+        if matches!(result, TaskStepResult::Continue) && self.transition_done_after_local_merge() {
+            return Ok(TaskStepResult::Done);
+        }
+        Ok(result)
+    }
+
+    fn transition_done_after_local_merge(&mut self) -> bool {
+        if self.phase == PipelineTaskPhase::Merging
+            && self.completion_stage != PipelineCompletionStage::MergeLocal
+        {
+            self.phase = PipelineTaskPhase::Done;
+            return true;
+        }
+        false
+    }
+
     pub fn resume_after_wake(&mut self) -> Result<()> {
         if self.phase != PipelineTaskPhase::Blocked {
             return Err(paro_error::internal("only blocked tasks can be resumed"));
@@ -146,6 +187,7 @@ impl PipelineTaskExecutor {
 
 mod finish;
 mod helpers;
+mod parallel_finish;
 mod running;
 
 #[cfg(test)]

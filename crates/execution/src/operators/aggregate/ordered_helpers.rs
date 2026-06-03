@@ -7,22 +7,29 @@
 //! path. At finish time, each ordered aggregate sorts its own collected rows
 //! and replays them into the regular aggregate state kernel.
 //!
-//! Values are stored in a flat arena (`Vec<Value>`) with fixed stride per row,
-//! eliminating per-row heap allocations on the consume hot path.
+//! Rows are collected into an operator-owned typed row store. This avoids the
+//! old fixed-stride value arena while still keeping ORDER BY replay
+//! isolated from the normal aggregate update path.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use paro_common::allocator::ArenaAllocator;
+use paro_common::allocator::{Allocator, ArenaAllocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext, PrecomputedHashBuildHasher,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
+use paro_common::vector::{SelectionVector, Vector, VectorSelection, VECTOR_SIZE};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_planner::expression::{Expression, OrderByExpression};
+use paro_storage::buffer::{BufferPool, MemoryTag as StorageMemoryTag};
+use paro_storage::row::{RowLayout, RowStoreBuilder, RowValidityType};
 
+use crate::operators::aggregate::accounted_rows::{hash_value, mix_row_hash};
 use crate::operators::aggregate::aggregate_kernel::{
     build_state_vector, update_states, AggregatePayload,
 };
@@ -36,24 +43,45 @@ use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::Aggregat
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::UngroupedAggregateRuntimeState;
 
-/// Flat arena storing ordered aggregate rows without per-row heap allocations.
-///
-/// Each row occupies `stride()` contiguous slots in `values`:
-/// `[group_values... | order_values... | input_values...]`
-///
-/// Sequence (insertion order) is implicit: row N is at offset `N * stride`.
-#[derive(Debug, Clone)]
+/// Typed row arena storing `[group values... | order values... | input values...]`.
+#[derive(Debug)]
 pub(crate) struct OrderedAggregateCollector {
-    values: Vec<Value>,
+    rows: RowStoreBuilder,
+    row_types: Arc<[LogicalType]>,
+    layout: Arc<RowLayout>,
+    buffer_pool: Arc<BufferPool>,
+    memory: MemoryAccountingContext,
     group_width: usize,
     order_width: usize,
     input_width: usize,
 }
 
 impl OrderedAggregateCollector {
-    pub(crate) fn new(group_width: usize, order_width: usize, input_width: usize) -> Self {
+    pub(crate) fn new(
+        buffer_pool: Arc<BufferPool>,
+        row_types: Vec<LogicalType>,
+        memory: MemoryAccountingContext,
+        group_width: usize,
+        order_width: usize,
+        input_width: usize,
+    ) -> Self {
+        let row_types: Arc<[LogicalType]> = Arc::from(row_types.into_boxed_slice());
+        let layout = Arc::new(RowLayout::from_types(
+            row_types.iter().cloned().collect(),
+            RowValidityType::CanHaveNullValues,
+        ));
+        let rows = RowStoreBuilder::new_with_memory(
+            Arc::clone(&buffer_pool),
+            Arc::clone(&layout),
+            StorageMemoryTag::HashTable,
+            memory.clone(),
+        );
         Self {
-            values: Vec::new(),
+            rows,
+            row_types,
+            layout,
+            buffer_pool,
+            memory,
             group_width,
             order_width,
             input_width,
@@ -61,76 +89,57 @@ impl OrderedAggregateCollector {
     }
 
     #[inline]
-    fn stride(&self) -> usize {
-        self.group_width + self.order_width + self.input_width
-    }
-
-    #[inline]
-    fn reserve_rows(&mut self, rows: usize) {
-        self.values.reserve(rows.saturating_mul(self.stride()));
+    fn empty_builder(&self) -> RowStoreBuilder {
+        RowStoreBuilder::new_with_memory(
+            Arc::clone(&self.buffer_pool),
+            Arc::clone(&self.layout),
+            StorageMemoryTag::HashTable,
+            self.memory.clone(),
+        )
     }
 
     #[inline]
     pub(crate) fn row_count(&self) -> usize {
-        let s = self.stride();
-        if s == 0 {
-            return 0;
-        }
-        self.values.len() / s
+        usize::try_from(self.rows.count()).unwrap_or(usize::MAX)
     }
 
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.rows.count() == 0
     }
 
-    #[inline]
-    fn group_values(&self, row: usize) -> &[Value] {
-        let base = row * self.stride();
-        &self.values[base..base + self.group_width]
-    }
-
-    #[inline]
-    fn order_values(&self, row: usize) -> &[Value] {
-        let base = row * self.stride() + self.group_width;
-        &self.values[base..base + self.order_width]
-    }
-
-    #[inline]
-    fn input_values(&self, row: usize) -> &[Value] {
-        let base = row * self.stride() + self.group_width + self.order_width;
-        &self.values[base..base + self.input_width]
-    }
-
-    #[inline]
-    fn push_row(
+    fn append_rows(
         &mut self,
         payload: &Chunk,
         group_refs: &[usize],
         order_refs: &[usize],
         input_refs: &[usize],
-        row_idx: usize,
+        selection: Option<&SelectionVector>,
     ) -> Result<()> {
-        for &col_idx in group_refs {
-            self.values.push(payload_value(payload, col_idx, row_idx)?);
-        }
-        for &col_idx in order_refs {
-            self.values.push(payload_value(payload, col_idx, row_idx)?);
-        }
-        for &col_idx in input_refs {
-            self.values.push(payload_value(payload, col_idx, row_idx)?);
+        validate_ordered_row_refs(payload, group_refs, order_refs, input_refs)?;
+        let row_refs = ordered_row_refs(group_refs, order_refs, input_refs);
+        let mut projected = Chunk::try_init_empty(&self.row_types, payload.allocator().clone())?;
+        projected.reference_columns(payload, &row_refs);
+        let appended = if let Some(selection) = selection {
+            self.rows
+                .append_selected(&projected, selection, selection.len())?
+        } else {
+            self.rows.append(&projected)?
+        };
+        let expected = selection.map_or(payload.size(), SelectionVector::len);
+        if appended != expected {
+            return Err(paro_error::internal(format!(
+                "ordered aggregate row append count mismatch: expected={expected}, appended={appended}"
+            )));
         }
         Ok(())
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.values.clear();
     }
 
     fn append(&mut self, other: &mut Self) -> Result<()> {
         if self.group_width != other.group_width
             || self.order_width != other.order_width
             || self.input_width != other.input_width
+            || self.row_types.as_ref() != other.row_types.as_ref()
         {
             return Err(paro_error::internal(format!(
                 "ordered aggregate collector shape mismatch: target=({},{},{}) source=({},{},{})",
@@ -142,23 +151,78 @@ impl OrderedAggregateCollector {
                 other.input_width
             )));
         }
-        self.values.append(&mut other.values);
+        let replacement = other.empty_builder();
+        let source_rows = std::mem::replace(&mut other.rows, replacement);
+        self.rows.try_absorb(source_rows)?;
         Ok(())
+    }
+
+    fn take_rows(&mut self, allocator: Arc<dyn Allocator>) -> Result<OrderedRows> {
+        let count = self.row_count();
+        let replacement = self.empty_builder();
+        let rows = std::mem::replace(&mut self.rows, replacement);
+        let store = rows.try_seal()?;
+        let mut chunk = Chunk::try_initialize(self.row_types.as_ref(), count.max(1), allocator)?;
+        if count > 0 {
+            let pinned = store.pin_ordinal_range(0, count as u64)?;
+            let positions = identity_output_positions(count)?;
+            let projections = (0..self.row_types.len())
+                .map(|idx| (idx, idx))
+                .collect::<Vec<_>>();
+            pinned.gather_columns_projected(&projections, &mut chunk, &positions)?;
+            chunk.try_set_cardinality(count)?;
+        }
+        Ok(OrderedRows {
+            chunk,
+            group_width: self.group_width,
+            order_width: self.order_width,
+            input_width: self.input_width,
+        })
     }
 }
 
-pub(crate) fn empty_ordered_collectors(
+pub(crate) fn empty_ordered_collectors_with_memory(
     spec: &AggregateSpec,
     group_refs: &[usize],
-) -> Vec<OrderedAggregateCollector> {
+    buffer_pool: Arc<BufferPool>,
+    memory: MemoryAccountingContext,
+) -> Result<Vec<OrderedAggregateCollector>> {
     let group_width = group_refs.len();
     spec.aggregate_orders
         .iter()
         .enumerate()
         .map(|(agg_idx, order_refs)| {
+            if order_refs.is_empty() {
+                return Ok(OrderedAggregateCollector::new(
+                    Arc::clone(&buffer_pool),
+                    Vec::new(),
+                    memory.clone(),
+                    0,
+                    0,
+                    0,
+                ));
+            }
             let order_width = order_refs.len();
             let input_width = spec.aggregate_inputs[agg_idx].len();
-            OrderedAggregateCollector::new(group_width, order_width, input_width)
+            let mut row_types = ordered_row_types(
+                spec,
+                group_refs,
+                order_refs,
+                &spec.aggregate_inputs[agg_idx],
+            )?;
+            if row_types.len() != group_width + order_width + input_width {
+                return Err(paro_error::internal(format!(
+                    "ordered aggregate row type width mismatch: aggregate={agg_idx}"
+                )));
+            }
+            Ok(OrderedAggregateCollector::new(
+                Arc::clone(&buffer_pool),
+                std::mem::take(&mut row_types),
+                memory.clone(),
+                group_width,
+                order_width,
+                input_width,
+            ))
         })
         .collect()
 }
@@ -190,23 +254,7 @@ pub(crate) fn collect_ordered_rows(
         let order_refs = &spec.aggregate_orders[agg_idx];
         let filter = filter_selections.as_ref().and_then(|f| f[agg_idx].as_ref());
         let collector = &mut collectors[agg_idx];
-        if let Some(selection) = filter {
-            collector.reserve_rows(selection.len());
-            for idx in 0..selection.len() {
-                collector.push_row(
-                    payload,
-                    group_refs,
-                    order_refs,
-                    input_refs,
-                    selection.get(idx),
-                )?;
-            }
-        } else {
-            collector.reserve_rows(payload.size());
-            for row_idx in 0..payload.size() {
-                collector.push_row(payload, group_refs, order_refs, input_refs, row_idx)?;
-            }
-        }
+        collector.append_rows(payload, group_refs, order_refs, input_refs, filter)?;
     }
     Ok(())
 }
@@ -236,6 +284,7 @@ pub(crate) fn finalize_ordered_into_hash_tables(
     aggregate_objects: &[AggregateObject],
     group_refs: &[usize],
     grouping_sets: &[Box<[usize]>],
+    modifier_memory: &MemoryAccountingContext,
     ordered_collectors: &mut [OrderedAggregateCollector],
     tables: &mut [AggregateHashTable],
 ) -> Result<()> {
@@ -250,19 +299,28 @@ pub(crate) fn finalize_ordered_into_hash_tables(
     let group_types = group_types(spec);
     let full_layout = AggregateStateLayout::new(aggregate_objects)?;
     for (agg_idx, object) in aggregate_objects.iter().enumerate() {
-        let collector = &ordered_collectors[agg_idx];
+        let collector = &mut ordered_collectors[agg_idx];
         if object.order_bys.is_empty() || collector.is_empty() {
             continue;
         }
+        let allocator = tables
+            .first()
+            .map(AggregateHashTable::allocator)
+            .ok_or_else(|| {
+                paro_error::internal(
+                    "hash aggregate has no tables while finalizing ordered aggregates",
+                )
+            })?;
+        let ordered_rows = collector.take_rows(allocator)?;
         let input_count = spec.aggregate_inputs[agg_idx].len();
         let input_types = aggregate_input_types(spec, agg_idx)?;
         let orders = aggregate_orders(spec, agg_idx)?;
         for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
             let present_groups = grouping_set_present_mask(group_count, grouping_set, agg_idx)?;
-            let mut indices: Vec<usize> = (0..collector.row_count()).collect();
+            let mut indices: Vec<usize> = (0..ordered_rows.row_count()).collect();
             indices.sort_by(|&left, &right| {
-                compare_projected_groups_arena(collector, left, right, &present_groups)
-                    .then_with(|| compare_order_values_arena(collector, left, right, orders))
+                compare_projected_groups_rows(&ordered_rows, left, right, &present_groups)
+                    .then_with(|| compare_order_values_rows(&ordered_rows, left, right, orders))
                     .then_with(|| left.cmp(&right))
             });
             let allocator = table.allocator();
@@ -284,11 +342,21 @@ pub(crate) fn finalize_ordered_into_hash_tables(
                 allocator,
             };
             let mut batch = Vec::with_capacity(batch_cap);
-            let mut distinct_seen = object.is_distinct().then(HashSet::<Box<[Value]>>::new);
+            let mut distinct_seen = if object.is_distinct() {
+                Some(new_ordered_distinct_set(
+                    modifier_memory,
+                    indices.len(),
+                    agg_idx,
+                )?)
+            } else {
+                None
+            };
             for &row_idx in &indices {
                 if let Some(seen) = distinct_seen.as_mut() {
-                    let key = projected_distinct_key_arena(collector, row_idx, &present_groups);
-                    if !seen.insert(key) {
+                    let key = OrderedDistinctRow::new(&ordered_rows, row_idx, &present_groups);
+                    if !seen.try_insert(key).map_err(|e| {
+                        paro_error::out_of_memory(format!("ordered aggregate {agg_idx}: {e}"))
+                    })? {
                         continue;
                     }
                 }
@@ -296,20 +364,20 @@ pub(crate) fn finalize_ordered_into_hash_tables(
                 if batch.len() < VECTOR_SIZE {
                     continue;
                 }
-                updater.flush_arena(collector, &batch)?;
+                updater.flush_rows(&ordered_rows, &batch)?;
                 batch.clear();
             }
             if !batch.is_empty() {
-                updater.flush_arena(collector, &batch)?;
+                updater.flush_rows(&ordered_rows, &batch)?;
             }
         }
-        ordered_collectors[agg_idx].clear();
     }
     Ok(())
 }
 
 pub(crate) fn finalize_ordered_ungrouped(
     spec: &AggregateSpec,
+    modifier_memory: &MemoryAccountingContext,
     state: &mut UngroupedAggregateRuntimeState,
 ) -> Result<()> {
     let aggregate_count = state.aggregate_objects.len();
@@ -322,32 +390,43 @@ pub(crate) fn finalize_ordered_ungrouped(
     let objects = Arc::clone(&state.aggregate_objects);
     for agg_idx in 0..aggregate_count {
         let object = &objects[agg_idx];
-        let collector = &state.ordered_collectors[agg_idx];
+        let collector = &mut state.ordered_collectors[agg_idx];
         if object.order_bys.is_empty() || collector.is_empty() {
             continue;
         }
+        let allocator = state.arena_allocator.get_allocator().clone();
+        let ordered_rows = collector.take_rows(allocator.clone())?;
         let input_count = spec.aggregate_inputs[agg_idx].len();
         let input_types = aggregate_input_types(spec, agg_idx)?;
         let orders = aggregate_orders(spec, agg_idx)?;
-        let mut indices: Vec<usize> = (0..collector.row_count()).collect();
+        let mut indices: Vec<usize> = (0..ordered_rows.row_count()).collect();
         indices.sort_by(|&left, &right| {
-            compare_order_values_arena(collector, left, right, orders)
+            compare_order_values_rows(&ordered_rows, left, right, orders)
                 .then_with(|| left.cmp(&right))
         });
 
-        let allocator = state.arena_allocator.get_allocator().clone();
         let state_offset = state.layout.state_offset(agg_idx);
         let agg_ptr = unsafe { (state.state_buffer.as_mut_ptr() as *mut u8).add(state_offset) };
         let single_input = vec![(0..input_count).collect::<Vec<usize>>()];
         let batch_cap = indices.len().min(VECTOR_SIZE).max(1);
         let mut input_chunk = Chunk::try_initialize(&input_types, batch_cap, allocator.clone())?;
         let mut addresses = Vector::try_new(LogicalType::BigInt, batch_cap, allocator)?;
-        let mut distinct_seen = object.is_distinct().then(HashSet::<Box<[Value]>>::new);
+        let mut distinct_seen = if object.is_distinct() {
+            Some(new_ordered_distinct_set(
+                modifier_memory,
+                indices.len(),
+                agg_idx,
+            )?)
+        } else {
+            None
+        };
         let mut batch = Vec::with_capacity(batch_cap);
         for &row_idx in &indices {
             if let Some(seen) = distinct_seen.as_mut() {
-                let key = collector.input_values(row_idx).into();
-                if !seen.insert(key) {
+                let key = OrderedDistinctRow::new(&ordered_rows, row_idx, &[]);
+                if !seen.try_insert(key).map_err(|e| {
+                    paro_error::out_of_memory(format!("ordered aggregate {agg_idx}: {e}"))
+                })? {
                     continue;
                 }
             }
@@ -362,7 +441,7 @@ pub(crate) fn finalize_ordered_ungrouped(
                 &mut addresses,
                 agg_ptr,
                 &mut input_chunk,
-                collector,
+                &ordered_rows,
                 &batch,
             )?;
             batch.clear();
@@ -375,11 +454,11 @@ pub(crate) fn finalize_ordered_ungrouped(
                 &mut addresses,
                 agg_ptr,
                 &mut input_chunk,
-                collector,
+                &ordered_rows,
                 &batch,
             )?;
         }
-        state.ordered_collectors[agg_idx].clear();
+        drop(distinct_seen);
     }
     Ok(())
 }
@@ -401,21 +480,17 @@ struct OrderedTableBatchUpdater<'a> {
 }
 
 impl OrderedTableBatchUpdater<'_> {
-    fn flush_arena(
-        &mut self,
-        collector: &OrderedAggregateCollector,
-        batch: &[usize],
-    ) -> Result<()> {
-        populate_ordered_group_chunk_arena(
+    fn flush_rows(&mut self, rows: &OrderedRows, batch: &[usize]) -> Result<()> {
+        populate_ordered_group_chunk_rows(
             &mut self.groups,
-            collector,
+            rows,
             batch,
             self.present_groups,
             self.agg_idx,
         )?;
-        populate_ordered_input_chunk_arena(
+        populate_ordered_input_chunk_rows(
             &mut self.input_chunk,
-            collector,
+            rows,
             batch,
             self.input_count,
             self.agg_idx,
@@ -467,10 +542,10 @@ fn flush_ungrouped_ordered_batch_arena(
     addresses: &mut Vector,
     agg_ptr: *mut u8,
     input_chunk: &mut Chunk,
-    collector: &OrderedAggregateCollector,
+    rows: &OrderedRows,
     batch: &[usize],
 ) -> Result<()> {
-    populate_ordered_input_chunk_arena(input_chunk, collector, batch, single_input[0].len(), 0)?;
+    populate_ordered_input_chunk_rows(input_chunk, rows, batch, single_input[0].len(), 0)?;
     fill_repeated_state_addresses(addresses, agg_ptr, batch.len())?;
     let payload_desc = AggregatePayload {
         chunk: input_chunk,
@@ -490,49 +565,101 @@ fn flush_ungrouped_ordered_batch_arena(
     )
 }
 
-fn populate_ordered_input_chunk_arena(
+struct OrderedRows {
+    chunk: Chunk,
+    group_width: usize,
+    order_width: usize,
+    input_width: usize,
+}
+
+impl OrderedRows {
+    #[inline]
+    fn row_count(&self) -> usize {
+        self.chunk.size()
+    }
+
+    #[inline]
+    fn input_base(&self) -> usize {
+        self.group_width + self.order_width
+    }
+
+    fn value(&self, column_idx: usize, row_idx: usize) -> Value {
+        self.chunk
+            .column(column_idx)
+            .expect("ordered aggregate row column should exist")
+            .get_value(row_idx)
+    }
+
+    fn values_equal(&self, column_idx: usize, left: usize, right: usize) -> bool {
+        self.value(column_idx, left) == self.value(column_idx, right)
+    }
+}
+
+fn populate_ordered_input_chunk_rows(
     chunk: &mut Chunk,
-    collector: &OrderedAggregateCollector,
+    rows: &OrderedRows,
     batch: &[usize],
     input_count: usize,
     agg_idx: usize,
 ) -> Result<()> {
     chunk.try_set_cardinality(batch.len())?;
+    if input_count > rows.input_width {
+        return Err(paro_error::internal(format!(
+            "ordered aggregate input width mismatch: aggregate={agg_idx}, expected={input_count}, stored={}",
+            rows.input_width
+        )));
+    }
+    let selection = batch_selection(batch, chunk.allocator().clone())?;
+    let selection = VectorSelection::materialized(selection);
     for input_idx in 0..input_count {
-        let col = chunk.column_mut(input_idx).ok_or_else(|| {
+        let source_col_idx = rows.input_base() + input_idx;
+        let source_col = rows.chunk.column(source_col_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "missing ordered aggregate stored input column {input_idx} at aggregate {agg_idx}"
+            ))
+        })?;
+        let target_col = chunk.column_mut(input_idx).ok_or_else(|| {
             paro_error::internal(format!(
                 "missing ordered aggregate input column {input_idx} at aggregate {agg_idx}"
             ))
         })?;
-        for (out_idx, &row_idx) in batch.iter().enumerate() {
-            let inputs = collector.input_values(row_idx);
-            col.set_value(out_idx, &inputs[input_idx]);
-        }
+        target_col.try_copy_selection(0, source_col, &selection, batch.len())?;
     }
     Ok(())
 }
 
-fn populate_ordered_group_chunk_arena(
+fn populate_ordered_group_chunk_rows(
     groups: &mut Chunk,
-    collector: &OrderedAggregateCollector,
+    rows: &OrderedRows,
     batch: &[usize],
     present_groups: &[bool],
     agg_idx: usize,
 ) -> Result<()> {
     groups.try_set_cardinality(batch.len())?;
+    if present_groups.len() > rows.group_width {
+        return Err(paro_error::internal(format!(
+            "ordered aggregate group width mismatch: aggregate={agg_idx}, expected={}, stored={}",
+            present_groups.len(),
+            rows.group_width
+        )));
+    }
+    let selection = batch_selection(batch, groups.allocator().clone())?;
+    let selection = VectorSelection::materialized(selection);
     for (group_idx, is_present) in present_groups.iter().copied().enumerate() {
-        let col = groups.column_mut(group_idx).ok_or_else(|| {
+        let target_col = groups.column_mut(group_idx).ok_or_else(|| {
             paro_error::internal(format!(
                 "missing ordered aggregate group column {group_idx} at aggregate {agg_idx}"
             ))
         })?;
         if is_present {
-            for (out_idx, &row_idx) in batch.iter().enumerate() {
-                let gv = collector.group_values(row_idx);
-                col.set_value(out_idx, &gv[group_idx]);
-            }
+            let source_col = rows.chunk.column(group_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "missing ordered aggregate stored group column {group_idx} at aggregate {agg_idx}"
+                ))
+            })?;
+            target_col.try_copy_selection(0, source_col, &selection, batch.len())?;
         } else {
-            col.validity_mut().try_set_all_invalid(batch.len())?;
+            target_col.validity_mut().try_set_all_invalid(batch.len())?;
         }
     }
     Ok(())
@@ -555,23 +682,89 @@ fn grouping_set_present_mask(
     Ok(present)
 }
 
-fn projected_distinct_key_arena(
-    collector: &OrderedAggregateCollector,
-    row: usize,
-    present_groups: &[bool],
-) -> Box<[Value]> {
-    let groups = collector.group_values(row);
-    let inputs = collector.input_values(row);
-    let mut key = Vec::with_capacity(
-        present_groups.iter().filter(|present| **present).count() + inputs.len(),
-    );
-    for (group_idx, present) in present_groups.iter().copied().enumerate() {
-        if present {
-            key.push(groups[group_idx].clone());
+#[derive(Clone, Copy)]
+struct OrderedDistinctRow<'a> {
+    rows: &'a OrderedRows,
+    row_idx: usize,
+    present_groups: &'a [bool],
+    hash: u64,
+}
+
+impl<'a> OrderedDistinctRow<'a> {
+    fn new(rows: &'a OrderedRows, row_idx: usize, present_groups: &'a [bool]) -> Self {
+        let mut hash = mix_row_hash(0xa6d3_75f9_1452_2c29, present_groups.len() as u64);
+        for (group_idx, present) in present_groups.iter().copied().enumerate() {
+            if present {
+                hash = mix_row_hash(hash, hash_value(&rows.value(group_idx, row_idx)));
+            }
+        }
+        for input_idx in 0..rows.input_width {
+            hash = mix_row_hash(
+                hash,
+                hash_value(&rows.value(rows.input_base() + input_idx, row_idx)),
+            );
+        }
+        Self {
+            rows,
+            row_idx,
+            present_groups,
+            hash,
         }
     }
-    key.extend(inputs.iter().cloned());
-    key.into_boxed_slice()
+}
+
+impl PartialEq for OrderedDistinctRow<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.present_groups != other.present_groups {
+            return false;
+        }
+        for (group_idx, present) in self.present_groups.iter().copied().enumerate() {
+            if present
+                && !self
+                    .rows
+                    .values_equal(group_idx, self.row_idx, other.row_idx)
+            {
+                return false;
+            }
+        }
+        for input_idx in 0..self.rows.input_width {
+            let source_col_idx = self.rows.input_base() + input_idx;
+            if !self
+                .rows
+                .values_equal(source_col_idx, self.row_idx, other.row_idx)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Eq for OrderedDistinctRow<'_> {}
+
+impl Hash for OrderedDistinctRow<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+fn new_ordered_distinct_set<'a>(
+    modifier_memory: &MemoryAccountingContext,
+    capacity: usize,
+    agg_idx: usize,
+) -> Result<AccountedHashSet<OrderedDistinctRow<'a>, PrecomputedHashBuildHasher>> {
+    let metadata_memory = modifier_memory.with_class(MemoryAccountingClass::Metadata);
+    let mut seen = AccountedHashSet::new_with_accounting_and_hasher(
+        metadata_memory
+            .grant()
+            .map_err(|e| paro_error::out_of_memory(format!("ordered aggregate {agg_idx}: {e}")))?,
+        metadata_memory.tag(),
+        metadata_memory.accounting_class(),
+        PrecomputedHashBuildHasher,
+    );
+    seen.try_reserve(capacity)
+        .map_err(|e| paro_error::out_of_memory(format!("ordered aggregate {agg_idx}: {e}")))?;
+    Ok(seen)
 }
 
 fn aggregate_input_types(spec: &AggregateSpec, agg_idx: usize) -> Result<Vec<LogicalType>> {
@@ -605,33 +798,91 @@ fn aggregate_orders(spec: &AggregateSpec, agg_idx: usize) -> Result<&[OrderByExp
     }
 }
 
-#[inline]
-fn payload_value(payload: &Chunk, col_idx: usize, row_idx: usize) -> Result<Value> {
-    payload
-        .column(col_idx)
-        .map(|col| col.get_value(row_idx))
-        .ok_or_else(|| {
-            paro_error::internal(format!(
-                "ordered aggregate payload column not found: idx={col_idx}"
-            ))
-        })
+fn ordered_row_refs(
+    group_refs: &[usize],
+    order_refs: &[usize],
+    input_refs: &[usize],
+) -> Vec<usize> {
+    group_refs
+        .iter()
+        .chain(order_refs.iter())
+        .chain(input_refs.iter())
+        .copied()
+        .collect()
 }
 
-fn compare_projected_groups_arena(
-    collector: &OrderedAggregateCollector,
+fn ordered_row_types(
+    spec: &AggregateSpec,
+    group_refs: &[usize],
+    order_refs: &[usize],
+    input_refs: &[usize],
+) -> Result<Vec<LogicalType>> {
+    ordered_row_refs(group_refs, order_refs, input_refs)
+        .into_iter()
+        .map(|idx| {
+            spec.payload_types.get(idx).cloned().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "ordered aggregate payload type index out of bounds: idx={idx}, type_count={}",
+                    spec.payload_types.len()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn validate_ordered_row_refs(
+    payload: &Chunk,
+    group_refs: &[usize],
+    order_refs: &[usize],
+    input_refs: &[usize],
+) -> Result<()> {
+    for col_idx in ordered_row_refs(group_refs, order_refs, input_refs) {
+        if col_idx >= payload.column_count() {
+            return Err(paro_error::internal(format!(
+                "ordered aggregate payload column not found: idx={col_idx}, column_count={}",
+                payload.column_count()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn identity_output_positions(count: usize) -> Result<Vec<u32>> {
+    let count_u32 = u32::try_from(count).map_err(|_| {
+        paro_error::internal(format!(
+            "ordered aggregate row count exceeds vector selection domain: count={count}"
+        ))
+    })?;
+    Ok((0..count_u32).collect())
+}
+
+fn batch_selection(batch: &[usize], allocator: Arc<dyn Allocator>) -> Result<SelectionVector> {
+    let mut selection = SelectionVector::try_with_capacity(batch.len(), allocator)?;
+    selection.set_len(batch.len());
+    for (out_idx, &row_idx) in batch.iter().enumerate() {
+        let row_idx = u32::try_from(row_idx).map_err(|_| {
+            paro_error::internal(format!(
+                "ordered aggregate row index exceeds vector selection domain: row_idx={row_idx}"
+            ))
+        })?;
+        selection.try_set(out_idx, row_idx as usize)?;
+    }
+    Ok(selection)
+}
+
+fn compare_projected_groups_rows(
+    rows: &OrderedRows,
     left: usize,
     right: usize,
     present_groups: &[bool],
 ) -> Ordering {
-    let left_groups = collector.group_values(left);
-    let right_groups = collector.group_values(right);
     for (group_idx, present) in present_groups.iter().copied().enumerate() {
         if !present {
             continue;
         }
         let cmp = compare_values(
-            &left_groups[group_idx],
-            &right_groups[group_idx],
+            &rows.value(group_idx, left),
+            &rows.value(group_idx, right),
             true,
             true,
         );
@@ -642,18 +893,17 @@ fn compare_projected_groups_arena(
     Ordering::Equal
 }
 
-fn compare_order_values_arena(
-    collector: &OrderedAggregateCollector,
+fn compare_order_values_rows(
+    rows: &OrderedRows,
     left: usize,
     right: usize,
     orders: &[OrderByExpression],
 ) -> Ordering {
-    let left_orders = collector.order_values(left);
-    let right_orders = collector.order_values(right);
     for (idx, order) in orders.iter().enumerate() {
+        let col_idx = rows.group_width + idx;
         let cmp = compare_values(
-            &left_orders[idx],
-            &right_orders[idx],
+            &rows.value(col_idx, left),
+            &rows.value(col_idx, right),
             order.ascending,
             order.nulls_first,
         );
@@ -689,5 +939,113 @@ fn compare_values(left: &Value, right: &Value, ascending: bool, nulls_first: boo
                 cmp.reverse()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_common::allocator::DefaultAllocator;
+    use paro_storage::buffer::BufferPool;
+
+    use crate::memory_runtime::QueryMemoryPool;
+    use crate::operators::aggregate::accounted_rows::aggregate_modifier_memory_context;
+
+    use super::*;
+
+    fn modifier_memory() -> MemoryAccountingContext {
+        let owner: Arc<dyn paro_common::memory::MemoryOwner> =
+            Arc::new(QueryMemoryPool::new(8 * 1024 * 1024));
+        aggregate_modifier_memory_context(owner)
+    }
+
+    fn collector_with_group_order_input_rows(
+        rows: &[(i32, i32, i32, i32)],
+    ) -> OrderedAggregateCollector {
+        let allocator = Arc::new(DefaultAllocator::new());
+        let types = vec![
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Integer,
+        ];
+        let mut chunk = Chunk::try_initialize(&types, rows.len().max(1), allocator).expect("chunk");
+        chunk.try_set_cardinality(rows.len()).expect("cardinality");
+        for (row_idx, &(group0, group1, order, input)) in rows.iter().enumerate() {
+            chunk
+                .set_value(0, row_idx, &Value::Integer(group0))
+                .expect("group0");
+            chunk
+                .set_value(1, row_idx, &Value::Integer(group1))
+                .expect("group1");
+            chunk
+                .set_value(2, row_idx, &Value::Integer(order))
+                .expect("order");
+            chunk
+                .set_value(3, row_idx, &Value::Integer(input))
+                .expect("input");
+        }
+        let mut collector = OrderedAggregateCollector::new(
+            BufferPool::new_arc(1024 * 1024),
+            types,
+            modifier_memory(),
+            2,
+            1,
+            1,
+        );
+        collector
+            .append_rows(&chunk, &[0, 1], &[2], &[3], None)
+            .expect("append rows");
+        collector
+    }
+
+    #[test]
+    fn ordered_distinct_row_deduplicates_without_boxed_value_key() {
+        let mut collector = collector_with_group_order_input_rows(&[
+            (1, 10, 2, 100),
+            (1, 20, 1, 100),
+            (1, 20, 3, 200),
+        ]);
+        let rows = collector
+            .take_rows(Arc::new(DefaultAllocator::new()))
+            .expect("ordered rows");
+        let present_groups = [true, false];
+        let mut seen = new_ordered_distinct_set(&modifier_memory(), rows.row_count(), 0)
+            .expect("distinct set");
+
+        assert!(seen
+            .try_insert(OrderedDistinctRow::new(&rows, 0, &present_groups))
+            .expect("insert first projected row"));
+        assert!(!seen
+            .try_insert(OrderedDistinctRow::new(&rows, 1, &present_groups))
+            .expect("dedupe duplicate projected row"));
+        assert!(seen
+            .try_insert(OrderedDistinctRow::new(&rows, 2, &present_groups))
+            .expect("insert second input"));
+    }
+
+    #[test]
+    fn ungrouped_ordered_distinct_row_uses_only_input_values() {
+        let mut collector = collector_with_group_order_input_rows(&[
+            (1, 10, 2, 100),
+            (9, 90, 1, 100),
+            (9, 90, 3, 200),
+        ]);
+        let rows = collector
+            .take_rows(Arc::new(DefaultAllocator::new()))
+            .expect("ordered rows");
+        let mut seen = new_ordered_distinct_set(&modifier_memory(), rows.row_count(), 0)
+            .expect("distinct set");
+
+        assert!(seen
+            .try_insert(OrderedDistinctRow::new(&rows, 0, &[]))
+            .expect("insert first input"));
+        assert!(!seen
+            .try_insert(OrderedDistinctRow::new(&rows, 1, &[]))
+            .expect("dedupe duplicate input"));
+        assert!(seen
+            .try_insert(OrderedDistinctRow::new(&rows, 2, &[]))
+            .expect("insert second input"));
     }
 }

@@ -11,7 +11,6 @@ pub mod explain;
 pub mod expression_executor;
 pub mod join_hashtable;
 pub mod memory_runtime;
-pub(crate) mod operator_state;
 pub mod operators;
 pub mod physical;
 pub mod pipeline;

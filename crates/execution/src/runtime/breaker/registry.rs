@@ -475,6 +475,9 @@ mod tests {
             .expect("aggregate")
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: Vec::new(),
+                spilled_payloads: Vec::new(),
+                spilled_states: Vec::new(),
+                spilled_outputs: None,
                 ordered_collectors: Vec::new(),
             }))
             .expect("initialize aggregate");

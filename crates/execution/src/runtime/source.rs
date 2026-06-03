@@ -17,6 +17,7 @@ pub use crate::operators::join::hash::{
     HashJoinSpillReplaySourceExec, HashJoinUnmatchedSourceExec,
 };
 pub use crate::operators::join::nested_loop::NljUnmatchedSourceExec;
+pub use crate::operators::join::sort_range::ClassicIeJoinSourceExec;
 pub use crate::operators::scan::{
     ChunkSourceExec, DummySourceExec, EmptySourceExec, ExpressionSourceExec, RowsetSourceDesc,
     RowsetSourceExec, TableFunctionSourceExec, ValuesSourceExec,
@@ -48,6 +49,7 @@ pub enum SourceExec {
     GraphScan(GraphScanSourceExec),
     ExternalTable(ExternalTableSourceExec),
     Materialized(MaterializedSourceExec),
+    ClassicIeJoin(ClassicIeJoinSourceExec),
     NljUnmatched(NljUnmatchedSourceExec),
     HashJoinSpillReplay(HashJoinSpillReplaySourceExec),
     HashJoinUnmatched(HashJoinUnmatchedSourceExec),
@@ -81,6 +83,7 @@ impl SourceExec {
             Self::GraphScan(_) => "GRAPH_SCAN",
             Self::ExternalTable(_) => "EXTERNAL_TABLE",
             Self::Materialized(_) => "MATERIALIZED",
+            Self::ClassicIeJoin(_) => "CLASSIC_IE_JOIN",
             Self::NljUnmatched(_) => "NLJ_UNMATCHED",
             Self::HashJoinSpillReplay(_) => "HASH_JOIN_SPILL_REPLAY",
             Self::HashJoinUnmatched(_) => "HASH_JOIN_UNMATCHED",
@@ -115,6 +118,7 @@ impl SourceExec {
             Self::GraphScan(exec) => exec.create_global(ctx),
             Self::ExternalTable(exec) => exec.create_global(ctx),
             Self::Materialized(exec) => exec.create_global(ctx),
+            Self::ClassicIeJoin(exec) => exec.create_global(ctx),
             Self::NljUnmatched(exec) => exec.create_global(ctx),
             Self::HashJoinSpillReplay(exec) => exec.create_global(ctx),
             Self::HashJoinUnmatched(exec) => exec.create_global(ctx),
@@ -153,6 +157,7 @@ impl SourceExec {
             Self::GraphScan(exec) => exec.create_local(ctx, global),
             Self::ExternalTable(exec) => exec.create_local(ctx, global),
             Self::Materialized(exec) => exec.create_local(ctx, global),
+            Self::ClassicIeJoin(exec) => exec.create_local(ctx, global),
             Self::NljUnmatched(exec) => exec.create_local(ctx, global),
             Self::HashJoinSpillReplay(exec) => exec.create_local(ctx, global),
             Self::HashJoinUnmatched(exec) => exec.create_local(ctx, global),
@@ -193,6 +198,7 @@ impl SourceExec {
             Self::GraphScan(exec) => exec.poll_next(ctx, global, local, output),
             Self::ExternalTable(exec) => exec.poll_next(ctx, global, local, output),
             Self::Materialized(exec) => exec.poll_next(ctx, global, local, output),
+            Self::ClassicIeJoin(exec) => exec.poll_next(ctx, global, local, output),
             Self::NljUnmatched(exec) => exec.poll_next(ctx, global, local, output),
             Self::HashJoinSpillReplay(exec) => exec.poll_next(ctx, global, local, output),
             Self::HashJoinUnmatched(exec) => exec.poll_next(ctx, global, local, output),

@@ -14,6 +14,8 @@ import subprocess
 import tomllib
 from typing import Any
 
+from ..runtime_contract import runtime_contract_payload
+
 
 UNKNOWN = "unknown"
 
@@ -125,11 +127,7 @@ def _runtime_fingerprint(command: str) -> dict[str, Any]:
         "parod_args": shlex.split(command) if command else [],
         "thread_pool": os.getenv("PARO_BENCH_THREAD_POOL", "default"),
         "data_dir_mode": data_dir_mode,
-        "performance_env": {
-            key: value
-            for key, value in sorted(os.environ.items())
-            if key.startswith("PARO_PERF_")
-        },
+        **runtime_contract_payload(include_environment=True),
     }
 
 

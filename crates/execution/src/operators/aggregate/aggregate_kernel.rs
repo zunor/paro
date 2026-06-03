@@ -12,6 +12,10 @@ use paro_function::aggregate::AggregateInputData;
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
 
+const SERIALIZED_STATE_MAGIC: &[u8; 8] = b"PAAGST01";
+const STATE_PART_RAW_BYTES: u8 = 0;
+const STATE_PART_FUNCTION_SERIALIZED: u8 = 1;
+
 /// Payload chunk + input mapping required by aggregate updates.
 pub struct AggregatePayload<'a> {
     /// Extracted payload chunk (already computed by projection/extraction).
@@ -163,6 +167,119 @@ pub fn destroy_states(
         with_aggregate_input_data(object, input_data, |aggr_input| unsafe {
             destructor(&states, &aggr_input, count);
         });
+    }
+    Ok(())
+}
+
+pub(crate) fn aggregate_state_spill_supported(objects: &[AggregateObject]) -> bool {
+    objects.iter().all(|object| {
+        object.function.destructor.is_none()
+            || (object.function.state_serialize.is_some()
+                && object.function.state_deserialize.is_some())
+    })
+}
+
+pub(crate) fn aggregate_state_spill_requires_serialization(objects: &[AggregateObject]) -> bool {
+    objects
+        .iter()
+        .any(|object| object.function.destructor.is_some())
+}
+
+pub(crate) fn serialize_aggregate_state_blob(
+    objects: &[AggregateObject],
+    layout: &AggregateStateLayout,
+    base: *const u8,
+    input_data: &mut AggregateInputData<'_>,
+) -> Result<Vec<u8>> {
+    validate_layout(layout, objects)?;
+    let mut output = Vec::new();
+    output.extend_from_slice(SERIALIZED_STATE_MAGIC);
+    write_u32(&mut output, objects.len())?;
+    for (agg_idx, object) in objects.iter().enumerate() {
+        let state_ptr = unsafe { base.add(layout.state_offset(agg_idx)) };
+        let mut part = Vec::new();
+        if let Some(serialize) = object.function.state_serialize {
+            with_aggregate_input_data_result(object, input_data, |aggr_input| unsafe {
+                serialize(state_ptr, &aggr_input, &mut part)
+            })?;
+            output.push(STATE_PART_FUNCTION_SERIALIZED);
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(state_ptr, object.payload_size) };
+            part.extend_from_slice(bytes);
+            output.push(STATE_PART_RAW_BYTES);
+        }
+        write_u64(&mut output, part.len())?;
+        output.extend_from_slice(&part);
+    }
+    Ok(output)
+}
+
+pub(crate) fn deserialize_aggregate_state_blob(
+    objects: &[AggregateObject],
+    layout: &AggregateStateLayout,
+    blob: &[u8],
+    base: *mut u8,
+    input_data: &mut AggregateInputData<'_>,
+) -> Result<()> {
+    validate_layout(layout, objects)?;
+    let mut offset = 0;
+    let magic = read_exact(blob, &mut offset, SERIALIZED_STATE_MAGIC.len())?;
+    if magic != SERIALIZED_STATE_MAGIC {
+        return Err(paro_error::internal(
+            "Invalid serialized aggregate state header",
+        ));
+    }
+    let aggregate_count = read_u32(blob, &mut offset)?;
+    if aggregate_count != objects.len() {
+        return Err(paro_error::internal(format!(
+            "Serialized aggregate state count mismatch: expected={} actual={aggregate_count}",
+            objects.len()
+        )));
+    }
+    for (agg_idx, object) in objects.iter().enumerate() {
+        let tag = read_u8(blob, &mut offset)?;
+        let len = read_u64(blob, &mut offset)?;
+        let part = read_exact(blob, &mut offset, len)?;
+        let state_ptr = unsafe { base.add(layout.state_offset(agg_idx)) };
+        match tag {
+            STATE_PART_RAW_BYTES => {
+                if object.function.destructor.is_some() {
+                    return Err(paro_error::internal(format!(
+                        "Aggregate state part {agg_idx} requires explicit deserializer"
+                    )));
+                }
+                if part.len() != object.payload_size {
+                    return Err(paro_error::internal(format!(
+                        "Raw aggregate state part width mismatch at {agg_idx}: expected={} actual={}",
+                        object.payload_size,
+                        part.len()
+                    )));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(part.as_ptr(), state_ptr, part.len());
+                }
+            }
+            STATE_PART_FUNCTION_SERIALIZED => {
+                let deserialize = object.function.state_deserialize.ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Aggregate state part {agg_idx} has no deserializer"
+                    ))
+                })?;
+                with_aggregate_input_data_result(object, input_data, |aggr_input| unsafe {
+                    deserialize(part, &aggr_input, state_ptr)
+                })?;
+            }
+            other => {
+                return Err(paro_error::internal(format!(
+                    "Invalid aggregate state part tag at {agg_idx}: {other}"
+                )));
+            }
+        }
+    }
+    if offset != blob.len() {
+        return Err(paro_error::internal(
+            "Trailing bytes in serialized aggregate state",
+        ));
     }
     Ok(())
 }
@@ -356,6 +473,62 @@ pub(crate) fn with_aggregate_input_data<F>(
     let bind_data = object.bind_info.as_deref().or(default_bind_data);
     let aggr_input = AggregateInputData::new(bind_data, allocator, combine_type);
     f(aggr_input);
+}
+
+pub(crate) fn with_aggregate_input_data_result<F>(
+    object: &AggregateObject,
+    input_data: &mut AggregateInputData<'_>,
+    f: F,
+) -> Result<()>
+where
+    F: FnOnce(AggregateInputData<'_>) -> Result<()>,
+{
+    let default_bind_data = input_data.bind_data;
+    let combine_type = input_data.combine_type;
+    let allocator = &mut *input_data.allocator;
+    let bind_data = object.bind_info.as_deref().or(default_bind_data);
+    let aggr_input = AggregateInputData::new(bind_data, allocator, combine_type);
+    f(aggr_input)
+}
+
+fn write_u32(output: &mut Vec<u8>, value: usize) -> Result<()> {
+    let value = u32::try_from(value)
+        .map_err(|_| paro_error::internal("aggregate state count exceeds u32"))?;
+    output.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_u64(output: &mut Vec<u8>, value: usize) -> Result<()> {
+    let value = u64::try_from(value)
+        .map_err(|_| paro_error::internal("aggregate state part exceeds u64"))?;
+    output.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn read_u8(input: &[u8], offset: &mut usize) -> Result<u8> {
+    Ok(read_exact(input, offset, 1)?[0])
+}
+
+fn read_u32(input: &[u8], offset: &mut usize) -> Result<usize> {
+    let bytes = read_exact(input, offset, 4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().expect("u32 bytes")) as usize)
+}
+
+fn read_u64(input: &[u8], offset: &mut usize) -> Result<usize> {
+    let bytes = read_exact(input, offset, 8)?;
+    usize::try_from(u64::from_le_bytes(bytes.try_into().expect("u64 bytes")))
+        .map_err(|_| paro_error::internal("aggregate state part length exceeds usize"))
+}
+
+fn read_exact<'a>(input: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| paro_error::internal("aggregate state blob offset overflow"))?;
+    let bytes = input
+        .get(*offset..end)
+        .ok_or_else(|| paro_error::internal("Truncated aggregate state blob"))?;
+    *offset = end;
+    Ok(bytes)
 }
 
 #[cfg(test)]

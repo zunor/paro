@@ -40,7 +40,7 @@ def load_staging_queries(
     current_date = date.today() if today is None else today
     staging: StagingMap = {}
     for source in policy.sources:
-        if source.type != "sql_suite" or not source.suite:
+        if source.type not in {"sql_suite", "mixed_sql_suite"} or not source.suite:
             continue
         suite_path = root_dir / "suites" / f"{source.suite}.toml"
         suite = _load_toml(suite_path)

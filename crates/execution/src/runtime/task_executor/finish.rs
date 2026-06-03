@@ -1,7 +1,11 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use paro_common::allocator::MemoryTag;
+use paro_function::scalar::FunctionExecContext;
+
 use super::helpers::finish_context;
+use super::parallel_finish::run_parallel_finish_tasks;
 use super::*;
 
 impl PipelineTaskExecutor {
@@ -331,6 +335,14 @@ impl PipelineTaskExecutor {
             .take()
             .expect("finish group must exist while driving parallel finish");
 
+        if group.task_count_hint > 1 && self.active_finish_task.is_none() {
+            let result = self.drive_parallel_finish_group(ctx, &group);
+            if matches!(result, Ok(TaskStepResult::Blocked(_))) {
+                self.finish_group = Some(group);
+            }
+            return result;
+        }
+
         if let Some(task_id) = self.active_finish_task {
             let result = self.run_finish_task(ctx, &group, task_id);
             if result.is_ok() && self.completion_stage == PipelineCompletionStage::FinishWork {
@@ -415,6 +427,62 @@ impl PipelineTaskExecutor {
             }
             FinishTaskPoll::Pending(blocker) => Ok(self.block(PipelineTaskPhase::Merging, blocker)),
         }
+    }
+
+    fn drive_parallel_finish_group(
+        &mut self,
+        ctx: &mut PipelineTaskStepContext<'_>,
+        group: &FinishTaskGroup,
+    ) -> Result<TaskStepResult> {
+        let mut task_ids = Vec::with_capacity(group.task_count_hint);
+        loop {
+            let next = {
+                let mut finish_ctx = finish_context(
+                    ctx,
+                    self.runtime.program.id,
+                    self.runtime.program.sink.operator_id,
+                    None,
+                    &self.task,
+                );
+                match group.driver.next_task(&mut finish_ctx) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        self.cancel_finish_group(
+                            ctx,
+                            group,
+                            Self::cancel_reason_for_error(ctx.query, &error),
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+            match next {
+                NextFinishTask::Task(task_id) => task_ids.push(task_id),
+                NextFinishTask::Drained => break,
+                NextFinishTask::Pending(blocker) => {
+                    return Ok(self.block(PipelineTaskPhase::Merging, blocker));
+                }
+            }
+        }
+
+        if task_ids.is_empty() {
+            self.completion_stage = PipelineCompletionStage::Finish;
+            return Ok(TaskStepResult::Continue);
+        }
+
+        let result = run_parallel_finish_tasks(
+            self.runtime.clone(),
+            ctx.query,
+            group.clone(),
+            task_ids,
+            ctx.query.allocator(MemoryTag::Allocator),
+        );
+        if let Err(error) = result {
+            self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
+            return Err(error);
+        }
+        self.completion_stage = PipelineCompletionStage::Finish;
+        Ok(TaskStepResult::Continue)
     }
 
     pub(crate) fn cancel_finish_group(

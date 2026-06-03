@@ -1,6 +1,6 @@
 [meta]
 name = "row_sort_phase0"
-description = "Phase 0 row-store sort baseline covering fixed-key full sort, variable-key TopN, and external full sort"
+description = "Phase 0 row-store sort baseline covering fixed-key scan-order TopN, variable-key TopN, and external TopN"
 run_order = 30
 
 [params]
@@ -21,7 +21,7 @@ id = "fixed_key_in_memory"
 file = "sql/q_fixed_key_in_memory.sql"
 validate = "row_count"
 expected = 64
-plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+plan_contains = ["TOP_N", "Scan Order"]
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -41,6 +41,6 @@ setup = "sql/setup_external.sql"
 teardown = "sql/teardown_external.sql"
 validate = "row_count"
 expected = 64
-plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+plan_contains = ["TOP_N", "Scan Order"]
 collect_explain_profile = true
 allow_reexecute = true

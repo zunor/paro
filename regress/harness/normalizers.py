@@ -21,10 +21,34 @@ _EXTERNAL_LATENCY_RE = re.compile(
 _ROWS_LOOPS_RE = re.compile(r"rows=\d+\s+loops=\d+")
 _JSON_OPERATOR_TIMING_RE = re.compile(r'"(startup_time_ms|total_time_ms)"\s*:\s*[\d.]+')
 _JSON_OPERATOR_COUNTERS_RE = re.compile(r'"(rows|loops)"\s*:\s*\d+')
+_PROFILE_LINE_RE = re.compile(
+    r"PROFILE schema_version=(\d+) query_id=\d+ events=\d+ "
+    r"parallelism=\d+ workers=\d+ worker_utilization=[\d.]+ "
+    r"ready_time_us=\d+ wait_time_us=\d+ wake_coalesce=\d+ backpressure=\d+ "
+    r"runtime_filter_installed=(\d+) runtime_filter_no_wait=(\d+)"
+)
+_MEMORY_PROFILE_LINE_RE = re.compile(
+    r"MEMORY_PROFILE grant_bytes=\d+ revoked_bytes=\d+ revocable_bytes=\d+ "
+    r"spill_bytes=\d+ spill_latency_us=\d+ yield_latency_us=\d+ "
+    r"repartition_depth=(\d+)"
+)
+_JSON_PROFILE_FLOAT_RE = re.compile(
+    r'"(duration_ms|end_ms|start_ms|operator_time_ms|worker_utilization)"\s*:\s*[\d.]+'
+)
+_JSON_PROFILE_INT_RE = re.compile(
+    r'"(query_id|thread_id|total_threads|max_threads|observed_workers|ready_time_us|'
+    r'wait_time_us|wake_count|wake_coalesce_count|backpressure_count|'
+    r'spill_latency_us|yield_latency_us)"\s*:\s*\d+'
+)
 _JSON_PLANNING_TIME_RE = re.compile(r'"Planning Time"\s*:\s*"[\d.]+\s*ms"')
 _JSON_EXECUTION_TIME_RE = re.compile(r'"Execution Time"\s*:\s*"[\d.]+\s*ms"')
 _JSON_BYTES_FIELD_RE = re.compile(
-    r'"(Memory|Disk|Peak Memory|Temp Storage|Total Temp Storage|peak_memory_bytes|temp_storage_bytes)"\s*:\s*\d+'
+    r'"(Memory|Disk|Peak Memory|Temp Storage|Total Temp Storage|peak_memory_bytes|'
+    r'temp_storage_bytes|grant_bytes|revocable_bytes|revoked_bytes|spill_bytes)"\s*:\s*\d+'
+)
+_RUNTIME_KEY_VALUE_BYTES_RE = re.compile(
+    r"\b(spilled_bytes|peak_memory_bytes|temp_storage_bytes|grant_bytes|"
+    r"revocable_bytes|revoked_bytes|spill_bytes)=\d+\b"
 )
 _COPY_ROWCOUNT_RE = re.compile(r"^COPY\s+\d+$")
 _TXN_NUMERIC_ID_RE = re.compile(
@@ -44,6 +68,26 @@ def normalize_explain_operator_timing(lines: list[str]) -> list[str]:
     for line in lines:
         line = _ACTUAL_TIME_RE.sub("actual time=<time-range>", line)
         line = _JSON_OPERATOR_TIMING_RE.sub(lambda m: f'"{m.group(1)}": 0.0', line)
+        line = _PROFILE_LINE_RE.sub(
+            (
+                r"PROFILE schema_version=\1 query_id=<id> events=<events> "
+                r"parallelism=<threads> workers=<workers> worker_utilization=<ratio> "
+                r"ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> "
+                r"backpressure=<count> runtime_filter_installed=\2 "
+                r"runtime_filter_no_wait=\3"
+            ),
+            line,
+        )
+        line = _MEMORY_PROFILE_LINE_RE.sub(
+            (
+                r"MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> "
+                r"revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> "
+                r"yield_latency_us=<us> repartition_depth=\1"
+            ),
+            line,
+        )
+        line = _JSON_PROFILE_FLOAT_RE.sub(lambda m: f'"{m.group(1)}": 0.0', line)
+        line = _JSON_PROFILE_INT_RE.sub(lambda m: f'"{m.group(1)}": 0', line)
         result.append(line)
     return result
 
@@ -65,6 +109,7 @@ def normalize_explain_runtime_bytes(lines: list[str]) -> list[str]:
     result: list[str] = []
     for line in lines:
         line = _BYTES_FIELD_RE.sub(r"\1: <bytes>", line)
+        line = _RUNTIME_KEY_VALUE_BYTES_RE.sub(lambda m: f"{m.group(1)}=<bytes>", line)
         line = _JSON_BYTES_FIELD_RE.sub(lambda m: f'"{m.group(1)}": 0', line)
         result.append(line)
     return result

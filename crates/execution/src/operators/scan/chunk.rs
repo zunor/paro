@@ -31,18 +31,27 @@ impl ChunkSourceExec {
         global: &SourceGlobal,
     ) -> Result<SourceLocal> {
         global.chunk()?;
-        Ok(SourceLocal::Chunk(ChunkSourceLocal))
+        Ok(SourceLocal::Chunk(ChunkSourceLocal::default()))
     }
 
     pub(crate) fn poll_next(
         &self,
         _ctx: &mut OperatorCallContext,
         global: &SourceGlobal,
-        _local: &mut SourceLocal,
+        local: &mut SourceLocal,
         output: &mut Chunk,
     ) -> Result<SourcePoll> {
         let global = global.chunk()?;
-        let idx = global.next_chunk.fetch_add(1, Ordering::AcqRel);
+        let local = local.chunk_mut()?;
+        if local.assigned_chunk_consumed {
+            return Ok(SourcePoll::Finished);
+        }
+        let idx = if let Some(idx) = local.assigned_chunk {
+            local.assigned_chunk_consumed = true;
+            idx
+        } else {
+            global.next_chunk.fetch_add(1, Ordering::AcqRel)
+        };
         let Some(chunk) = global.chunks.get(idx) else {
             return Ok(SourcePoll::Finished);
         };

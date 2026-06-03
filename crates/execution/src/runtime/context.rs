@@ -3,9 +3,10 @@
 
 //! Runtime contexts shared by role factories and operator calls.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::allocator::{Allocator, BufferAllocator, MemoryTag};
@@ -130,6 +131,7 @@ pub struct UtilityContext<'a> {
     pub errors: &'a QueryErrorRegistry,
 }
 
+#[derive(Clone)]
 pub struct QueryRuntimeContext {
     pub session: Arc<StatementContext>,
     pub catalog: CatalogSnapshot,
@@ -139,6 +141,7 @@ pub struct QueryRuntimeContext {
     pub output: QueryOutputPort,
     pub cancellation: StatementCancellation,
     pub errors: QueryErrorRegistry,
+    pub wake_events: QueryWakeRegistry,
     pub profiler: QueryProfilerRegistry,
     pub explain_profiler: Option<Arc<ExplainProfiler>>,
 }
@@ -159,6 +162,7 @@ impl QueryRuntimeContext {
             memory,
             output,
             errors: QueryErrorRegistry::default(),
+            wake_events: QueryWakeRegistry::default(),
             profiler: QueryProfilerRegistry::default(),
             explain_profiler: None,
         }
@@ -171,6 +175,56 @@ impl QueryRuntimeContext {
 
     pub fn record_operator_error(&self, error: ParoError) -> QueryErrorId {
         self.errors.record_root(error)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryWakeRegistry {
+    inner: Arc<Mutex<QueryWakeRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct QueryWakeRegistryState {
+    ready: HashSet<WakeKey>,
+    coalesced: HashMap<WakeKey, u64>,
+}
+
+impl QueryWakeRegistry {
+    pub fn wake(&self, key: WakeKey) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("query wake registry lock poisoned");
+        if !inner.ready.insert(key) {
+            *inner.coalesced.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    pub fn wake_registration(&self, registration: PendingWakeRegistration) {
+        self.wake(registration.key());
+    }
+
+    pub fn is_ready(&self, key: WakeKey) -> bool {
+        self.inner
+            .lock()
+            .expect("query wake registry lock poisoned")
+            .ready
+            .contains(&key)
+    }
+
+    pub fn take_ready(&self, key: WakeKey) -> bool {
+        self.take_ready_with_coalesced(key).is_some()
+    }
+
+    pub fn take_ready_with_coalesced(&self, key: WakeKey) -> Option<u64> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("query wake registry lock poisoned");
+        if !inner.ready.remove(&key) {
+            return None;
+        }
+        Some(inner.coalesced.remove(&key).unwrap_or(0))
     }
 }
 
@@ -263,6 +317,17 @@ impl QueryOutputPort {
         )
     }
 
+    pub fn with_blocking_writes(port: &Self) -> Self {
+        match port.inner.mode {
+            QueryOutputPortMode::Buffered { collect_stats }
+            | QueryOutputPortMode::BlockingBuffered { collect_stats } => Self::with_mode(
+                port.inner.capacity.max(1),
+                QueryOutputPortMode::BlockingBuffered { collect_stats },
+            ),
+            QueryOutputPortMode::Discarding => Self::discarding(),
+        }
+    }
+
     pub fn discarding() -> Self {
         Self::with_mode(0, QueryOutputPortMode::Discarding)
     }
@@ -275,6 +340,8 @@ impl QueryOutputPort {
                 chunks: Mutex::new(VecDeque::new()),
                 stats: Mutex::new(QueryOutputPortStats::default()),
                 generation: AtomicU64::new(0),
+                closed: AtomicBool::new(false),
+                cv: Condvar::new(),
             }),
         }
     }
@@ -288,6 +355,12 @@ impl QueryOutputPort {
             QueryOutputPortMode::Buffered {
                 collect_stats: true,
             } => self.try_push_buffered_with_stats(chunk),
+            QueryOutputPortMode::BlockingBuffered {
+                collect_stats: false,
+            } => self.push_blocking_buffered(chunk),
+            QueryOutputPortMode::BlockingBuffered {
+                collect_stats: true,
+            } => self.push_blocking_buffered_with_stats(chunk),
             QueryOutputPortMode::Discarding => self.try_push_discarding(chunk),
         }
     }
@@ -299,10 +372,14 @@ impl QueryOutputPort {
             .chunks
             .lock()
             .expect("query output port lock poisoned");
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputWrite::Blocked(chunk);
+        }
         if chunks.len() >= self.inner.capacity {
             return QueryOutputWrite::Blocked(chunk);
         }
         chunks.push_back(chunk);
+        self.inner.cv.notify_all();
         QueryOutputWrite::Written
     }
 
@@ -313,6 +390,9 @@ impl QueryOutputPort {
             .chunks
             .lock()
             .expect("query output port lock poisoned");
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputWrite::Blocked(chunk);
+        }
         if chunks.len() >= self.inner.capacity {
             self.inner
                 .stats
@@ -333,6 +413,66 @@ impl QueryOutputPort {
         stats.pushed_chunks += 1;
         stats.pushed_rows += rows;
         stats.peak_queue_chunks = stats.peak_queue_chunks.max(queue_len);
+        self.inner.cv.notify_all();
+        QueryOutputWrite::Written
+    }
+
+    fn push_blocking_buffered(&self, chunk: Chunk) -> QueryOutputWrite {
+        let mut chunks = self
+            .inner
+            .chunks
+            .lock()
+            .expect("query output port lock poisoned");
+        while chunks.len() >= self.inner.capacity && !self.inner.closed.load(Ordering::Acquire) {
+            chunks = self
+                .inner
+                .cv
+                .wait(chunks)
+                .expect("query output port condvar poisoned");
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputWrite::Blocked(chunk);
+        }
+        chunks.push_back(chunk);
+        self.inner.cv.notify_all();
+        QueryOutputWrite::Written
+    }
+
+    fn push_blocking_buffered_with_stats(&self, chunk: Chunk) -> QueryOutputWrite {
+        let rows = chunk.size();
+        let mut chunks = self
+            .inner
+            .chunks
+            .lock()
+            .expect("query output port lock poisoned");
+        while chunks.len() >= self.inner.capacity && !self.inner.closed.load(Ordering::Acquire) {
+            self.inner
+                .stats
+                .lock()
+                .expect("query output port stats lock poisoned")
+                .blocked_pushes += 1;
+            chunks = self
+                .inner
+                .cv
+                .wait(chunks)
+                .expect("query output port condvar poisoned");
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputWrite::Blocked(chunk);
+        }
+        chunks.push_back(chunk);
+        let queue_len = chunks.len();
+        drop(chunks);
+
+        let mut stats = self
+            .inner
+            .stats
+            .lock()
+            .expect("query output port stats lock poisoned");
+        stats.pushed_chunks += 1;
+        stats.pushed_rows += rows;
+        stats.peak_queue_chunks = stats.peak_queue_chunks.max(queue_len);
+        self.inner.cv.notify_all();
         QueryOutputWrite::Written
     }
 
@@ -357,6 +497,12 @@ impl QueryOutputPort {
             QueryOutputPortMode::Buffered {
                 collect_stats: true,
             } => self.try_push_reference_buffered_with_stats(chunk),
+            QueryOutputPortMode::BlockingBuffered {
+                collect_stats: false,
+            } => self.push_reference_blocking_buffered(chunk),
+            QueryOutputPortMode::BlockingBuffered {
+                collect_stats: true,
+            } => self.push_reference_blocking_buffered_with_stats(chunk),
             QueryOutputPortMode::Discarding => self.try_push_reference_discarding(chunk),
         }
     }
@@ -368,10 +514,14 @@ impl QueryOutputPort {
             .chunks
             .lock()
             .expect("query output port lock poisoned");
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputReferenceWrite::Blocked;
+        }
         if chunks.len() >= self.inner.capacity {
             return QueryOutputReferenceWrite::Blocked;
         }
         chunks.push_back(chunk.clone_referencing_vectors());
+        self.inner.cv.notify_all();
         QueryOutputReferenceWrite::Written
     }
 
@@ -382,6 +532,9 @@ impl QueryOutputPort {
             .chunks
             .lock()
             .expect("query output port lock poisoned");
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputReferenceWrite::Blocked;
+        }
         if chunks.len() >= self.inner.capacity {
             self.inner
                 .stats
@@ -402,6 +555,69 @@ impl QueryOutputPort {
         stats.pushed_chunks += 1;
         stats.pushed_rows += rows;
         stats.peak_queue_chunks = stats.peak_queue_chunks.max(queue_len);
+        self.inner.cv.notify_all();
+        QueryOutputReferenceWrite::Written
+    }
+
+    fn push_reference_blocking_buffered(&self, chunk: &Chunk) -> QueryOutputReferenceWrite {
+        let mut chunks = self
+            .inner
+            .chunks
+            .lock()
+            .expect("query output port lock poisoned");
+        while chunks.len() >= self.inner.capacity && !self.inner.closed.load(Ordering::Acquire) {
+            chunks = self
+                .inner
+                .cv
+                .wait(chunks)
+                .expect("query output port condvar poisoned");
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputReferenceWrite::Blocked;
+        }
+        chunks.push_back(chunk.clone_referencing_vectors());
+        self.inner.cv.notify_all();
+        QueryOutputReferenceWrite::Written
+    }
+
+    fn push_reference_blocking_buffered_with_stats(
+        &self,
+        chunk: &Chunk,
+    ) -> QueryOutputReferenceWrite {
+        let rows = chunk.size();
+        let mut chunks = self
+            .inner
+            .chunks
+            .lock()
+            .expect("query output port lock poisoned");
+        while chunks.len() >= self.inner.capacity && !self.inner.closed.load(Ordering::Acquire) {
+            self.inner
+                .stats
+                .lock()
+                .expect("query output port stats lock poisoned")
+                .blocked_pushes += 1;
+            chunks = self
+                .inner
+                .cv
+                .wait(chunks)
+                .expect("query output port condvar poisoned");
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            return QueryOutputReferenceWrite::Blocked;
+        }
+        chunks.push_back(chunk.clone_referencing_vectors());
+        let queue_len = chunks.len();
+        drop(chunks);
+
+        let mut stats = self
+            .inner
+            .stats
+            .lock()
+            .expect("query output port stats lock poisoned");
+        stats.pushed_chunks += 1;
+        stats.pushed_rows += rows;
+        stats.peak_queue_chunks = stats.peak_queue_chunks.max(queue_len);
+        self.inner.cv.notify_all();
         QueryOutputReferenceWrite::Written
     }
 
@@ -421,8 +637,14 @@ impl QueryOutputPort {
         match self.inner.mode {
             QueryOutputPortMode::Buffered {
                 collect_stats: false,
+            }
+            | QueryOutputPortMode::BlockingBuffered {
+                collect_stats: false,
             } => self.pop_front_buffered(),
             QueryOutputPortMode::Buffered {
+                collect_stats: true,
+            }
+            | QueryOutputPortMode::BlockingBuffered {
                 collect_stats: true,
             } => self.pop_front_buffered_with_stats(),
             QueryOutputPortMode::Discarding => None,
@@ -439,6 +661,7 @@ impl QueryOutputPort {
         let chunk = chunks.pop_front();
         if chunk.is_some() {
             self.inner.generation.fetch_add(1, Ordering::AcqRel);
+            self.inner.cv.notify_all();
         }
         chunk
     }
@@ -462,8 +685,34 @@ impl QueryOutputPort {
             stats.popped_chunks += 1;
             stats.popped_rows += rows;
             self.inner.generation.fetch_add(1, Ordering::AcqRel);
+            self.inner.cv.notify_all();
         }
         chunk
+    }
+
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.cv.notify_all();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    pub fn wait_for_change_timeout(&self, timeout: Duration) {
+        let chunks = self
+            .inner
+            .chunks
+            .lock()
+            .expect("query output port lock poisoned");
+        if !chunks.is_empty() || self.is_closed() {
+            return;
+        }
+        let _ = self
+            .inner
+            .cv
+            .wait_timeout(chunks, timeout)
+            .expect("query output port condvar poisoned");
     }
 
     pub fn capacity(&self) -> usize {
@@ -535,11 +784,14 @@ struct QueryOutputPortInner {
     chunks: Mutex<VecDeque<Chunk>>,
     stats: Mutex<QueryOutputPortStats>,
     generation: AtomicU64,
+    closed: AtomicBool,
+    cv: Condvar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryOutputPortMode {
     Buffered { collect_stats: bool },
+    BlockingBuffered { collect_stats: bool },
     Discarding,
 }
 
@@ -867,6 +1119,39 @@ mod tests {
             batch,
             WakeToken::external_operator_batch(RuntimeOperatorId::new(7), 7)
         );
+    }
+
+    #[test]
+    fn query_wake_registry_tracks_ready_wake_keys() {
+        let registry = QueryWakeRegistry::default();
+        let key = WakeKey {
+            source: WakeSource::Memory,
+            token: WakeToken(42),
+            generation: WakeGeneration(7),
+        };
+
+        assert!(!registry.is_ready(key));
+        registry.wake(key);
+        assert!(registry.is_ready(key));
+        assert!(registry.take_ready(key));
+        assert!(!registry.take_ready(key));
+    }
+
+    #[test]
+    fn query_wake_registry_counts_duplicate_ready_wakes() {
+        let registry = QueryWakeRegistry::default();
+        let key = WakeKey {
+            source: WakeSource::Memory,
+            token: WakeToken(42),
+            generation: WakeGeneration(7),
+        };
+
+        registry.wake(key);
+        registry.wake(key);
+        registry.wake(key);
+
+        assert_eq!(registry.take_ready_with_coalesced(key), Some(2));
+        assert_eq!(registry.take_ready_with_coalesced(key), None);
     }
 
     #[test]

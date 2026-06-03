@@ -1,0 +1,1103 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! PipelineScheduler execution driver.
+//!
+//! The first production path parallelizes one morsel-capable pipeline at a
+//! time: one immutable `PipelineRuntime` owns global source/sink state, N data
+//! worker tasks create task-local state and pull source-owned morsels, and one
+//! finish worker seals the pipeline after the local merge barrier.
+
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
+
+use parking_lot::Mutex as ParkingMutex;
+use paro_common::allocator::Allocator;
+use paro_common::error::{self as paro_error, ParoError, Result};
+use paro_scheduler::task::{
+    InterruptState, ProducerToken, Task, TaskExecutionMode, TaskExecutionResult,
+};
+
+use crate::explain::profiler::{OperatorProfiler, ProfileMorselRange, ProfileWorkerContext};
+use crate::explain::types::ExplainRuntimeStats;
+use crate::memory_runtime::{AdmissionWaiterId, PipelineAdmissionGuard};
+use crate::pipeline::graph::{PipelineGraph, PipelineId, SinkSharing};
+use crate::pipeline::PipelineProgramSet;
+use crate::runtime::{
+    Blocker, BreakerHandleRegistry, OperatorWakeScope, PendingWakeRegistration,
+    PipelineDependencyGates, PipelineRuntime, PipelineTaskExecutor, PipelineTaskId,
+    PipelineTaskStepContext, QueryRuntimeContext, SharedSinkRuntimeSet, SourceGlobal, SourceLocal,
+    TaskStepResult, WakeKey, WakeSource, WakeToken, WorkGroupCompletion,
+};
+use crate::thread_context::ThreadContext;
+
+use super::scheduling_policy::{PipelineSchedulingPolicy, ReadyEntry};
+
+pub struct PipelineScheduler<'a> {
+    graph: &'a PipelineGraph,
+    programs: &'a PipelineProgramSet,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+    handles: Arc<BreakerHandleRegistry>,
+    shared_sinks: SharedSinkRuntimeSet,
+    gates: PipelineDependencyGates,
+    finished: Vec<bool>,
+    finished_count: usize,
+    ready: BinaryHeap<ReadyEntry<PipelineId>>,
+    ready_seq: u64,
+    policy: PipelineSchedulingPolicy,
+}
+
+impl<'a> PipelineScheduler<'a> {
+    pub fn run_to_completion_with_registry(
+        graph: &'a PipelineGraph,
+        programs: &'a PipelineProgramSet,
+        handles: Arc<BreakerHandleRegistry>,
+        query: &QueryRuntimeContext,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<()> {
+        let mut scheduler = Self::new(graph, programs, handles, query.clone(), allocator)?;
+        scheduler.run()
+    }
+
+    pub fn should_use_parallel_scheduler(
+        graph: &PipelineGraph,
+        query: &QueryRuntimeContext,
+    ) -> bool {
+        query.session.limits.parallel_scheduler
+            && graph.control_regions.is_empty()
+            && query.session.number_of_threads() > 1
+    }
+
+    fn new(
+        graph: &'a PipelineGraph,
+        programs: &'a PipelineProgramSet,
+        handles: Arc<BreakerHandleRegistry>,
+        query: QueryRuntimeContext,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        if !graph.control_regions.is_empty() {
+            return Err(paro_error::internal(
+                "PipelineScheduler v1 does not execute control-region graphs",
+            ));
+        }
+        let shared_sinks = SharedSinkRuntimeSet::from_graph(graph)?;
+        let gates = PipelineDependencyGates::from_graph(graph);
+        let mut scheduler = Self {
+            graph,
+            programs,
+            query: Arc::new(query),
+            allocator,
+            handles,
+            shared_sinks,
+            gates,
+            finished: vec![false; programs.pipeline_count()],
+            finished_count: 0,
+            ready: BinaryHeap::new(),
+            ready_seq: 0,
+            policy: PipelineSchedulingPolicy::default(),
+        };
+        for pipeline in scheduler.gates.ready_pipelines() {
+            scheduler.push_ready_pipeline(pipeline, 0);
+        }
+        Ok(scheduler)
+    }
+
+    fn run(&mut self) -> Result<()> {
+        while self.finished_count < self.finished.len() {
+            self.query.cancellation.check()?;
+            let Some(entry) = self.ready.pop() else {
+                return Err(paro_error::internal(
+                    "pipeline scheduler could not find a ready work unit",
+                ));
+            };
+            let pipeline = entry.payload;
+            if self.finished[pipeline.index()] {
+                continue;
+            }
+            if !self.gates.is_ready(pipeline) {
+                return Err(paro_error::internal(
+                    "pipeline scheduler dequeued a pipeline before its gates opened",
+                ));
+            }
+            self.run_pipeline(pipeline)?;
+            self.mark_pipeline_finished(pipeline);
+        }
+        Ok(())
+    }
+
+    fn run_pipeline(&mut self, pipeline: PipelineId) -> Result<()> {
+        let runtime = self.create_runtime(pipeline)?;
+        let Some(morsels) = source_morsels(&runtime.source_global) else {
+            return self.run_single_pipeline(runtime, 0, 1);
+        };
+        let total_threads = self.pipeline_thread_count(pipeline, morsels.len());
+        if total_threads <= 1 || morsels.len() <= 1 {
+            return self.run_single_pipeline(runtime, 0, 1);
+        }
+
+        self.run_parallel_data_tasks(runtime.clone(), morsels, total_threads)?;
+        self.run_finish_task(runtime, total_threads)
+    }
+
+    fn create_runtime(&self, pipeline: PipelineId) -> Result<Arc<PipelineRuntime>> {
+        let program = self
+            .programs
+            .get(pipeline)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("pipeline program missing"))?;
+        let spec = self
+            .graph
+            .pipeline(pipeline)
+            .ok_or_else(|| paro_error::internal("pipeline spec missing"))?;
+        let shared_sink = match spec.sink_sharing {
+            SinkSharing::Exclusive => None,
+            SinkSharing::Shared(id) => self.shared_sinks.get(id),
+        };
+        Ok(Arc::new(PipelineRuntime::with_registry_and_shared_sink(
+            program,
+            self.handles.clone(),
+            self.query.params.clone(),
+            self.query.as_ref(),
+            shared_sink,
+        )?))
+    }
+
+    fn pipeline_thread_count(&self, pipeline: PipelineId, morsel_count: usize) -> usize {
+        let Some(spec) = self.graph.pipeline(pipeline) else {
+            return 1;
+        };
+        if spec.sink_sharing != SinkSharing::Exclusive {
+            return 1;
+        }
+        let parallelism = spec.properties.capabilities.parallelism;
+        if parallelism.max <= 1 {
+            return 1;
+        }
+        if morsel_count <= 1 {
+            return 1;
+        }
+        let threads = self.query.session.number_of_threads().max(1);
+        let cap = parallelism
+            .max
+            .min(threads)
+            .min(morsel_count)
+            .max(parallelism.min);
+        cap.max(1)
+    }
+
+    fn run_single_pipeline(
+        &self,
+        runtime: Arc<PipelineRuntime>,
+        thread_id: usize,
+        total_threads: usize,
+    ) -> Result<()> {
+        let task = runtime.create_task_state(self.query.as_ref(), self.allocator.clone())?;
+        let mut executor = PipelineTaskExecutor::new(runtime.clone(), task);
+        let thread = ThreadContext::new(thread_id, total_threads);
+        let wake = OperatorWakeScope {
+            task_id: PipelineTaskId(runtime.program.id.index() as u64),
+            generation: self.query.output.wake_generation(),
+        };
+        let mut profiler = self.query.explain_profiler.as_ref().map_or_else(
+            OperatorProfiler::disabled,
+            |profiler| {
+                OperatorProfiler::new_with_context(
+                    profiler.clone(),
+                    ProfileWorkerContext::new(
+                        Some(runtime.program.id.index() as u64),
+                        Some(runtime.program.id.index() as u64),
+                        Some(thread_id as u64),
+                        Some(total_threads as u64),
+                        None,
+                    ),
+                )
+            },
+        );
+        let mut ctx = PipelineTaskStepContext {
+            query: self.query.as_ref(),
+            thread: &thread,
+            wake: &wake,
+            profiler: &mut profiler,
+        };
+        loop {
+            match executor.step(&mut ctx)? {
+                TaskStepResult::Continue => {}
+                TaskStepResult::Done => {
+                    profiler.flush();
+                    return Ok(());
+                }
+                TaskStepResult::Blocked(blocker) => {
+                    return Err(single_task_blocked_error(&blocker))
+                }
+            }
+        }
+    }
+
+    fn run_parallel_data_tasks(
+        &self,
+        runtime: Arc<PipelineRuntime>,
+        morsels: Vec<SourceMorsel>,
+        total_threads: usize,
+    ) -> Result<()> {
+        let scheduler = self.query.session.scheduler().clone();
+        let producer = scheduler.create_producer_with_priority(0);
+        let group = Arc::new(PipelineWorkerCoordinator::new(morsels.len()));
+        let mut tasks = Vec::with_capacity(morsels.len());
+        for (task_idx, morsel) in morsels.into_iter().enumerate() {
+            let work = WorkUnit::morsel(runtime.program.id, task_idx as u64, morsel);
+            let task = PipelineWorkerTask::new_data(
+                runtime.clone(),
+                self.query.clone(),
+                self.allocator.clone(),
+                Arc::downgrade(&group),
+                work,
+                task_idx % total_threads,
+                total_threads,
+                Some(morsel),
+            );
+            tasks.push(as_scheduler_task(task));
+        }
+        producer.schedule_tasks(tasks);
+        wait_for_group(self.query.as_ref(), scheduler.as_ref(), &producer, &group)
+    }
+
+    fn run_finish_task(&self, runtime: Arc<PipelineRuntime>, total_threads: usize) -> Result<()> {
+        let scheduler = self.query.session.scheduler().clone();
+        let producer = scheduler.create_producer_with_priority(0);
+        let group = Arc::new(PipelineWorkerCoordinator::new(1));
+        let work = WorkUnit::finish(runtime.program.id);
+        let task = as_scheduler_task(PipelineWorkerTask::new_finish(
+            runtime,
+            self.query.clone(),
+            self.allocator.clone(),
+            Arc::downgrade(&group),
+            work,
+            0,
+            total_threads,
+        ));
+        producer.schedule_task(task);
+        wait_for_group(self.query.as_ref(), scheduler.as_ref(), &producer, &group)
+    }
+
+    fn push_ready_pipeline(&mut self, pipeline: PipelineId, dependency_unblocks: u32) {
+        let priority = self.policy.ready_priority_for_pipeline(
+            self.graph,
+            pipeline,
+            dependency_unblocks,
+            self.ready_seq.min(u32::MAX as u64) as u32,
+            self.query.memory.available_bytes(),
+        );
+        self.ready.push(ReadyEntry {
+            priority,
+            seq: self.ready_seq,
+            payload: pipeline,
+        });
+        self.ready_seq = self.ready_seq.saturating_add(1);
+    }
+
+    fn mark_pipeline_finished(&mut self, pipeline: PipelineId) {
+        if self.finished[pipeline.index()] {
+            return;
+        }
+        self.finished[pipeline.index()] = true;
+        self.finished_count += 1;
+        for event in self.gates.mark_finished(pipeline) {
+            if !self.finished[event.pipeline.index()] && self.gates.is_ready(event.pipeline) {
+                self.push_ready_pipeline(event.pipeline, 1);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WorkUnitId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceMorsel {
+    RowsetSegment { segment_idx: usize },
+    Chunk { chunk_idx: usize },
+    SortEmit { task_idx: usize },
+}
+
+const PROFILE_MORSEL_ROWSET_SEGMENT: &str = "rowset_segment";
+const PROFILE_MORSEL_CHUNK: &str = "chunk";
+const PROFILE_MORSEL_SORT_EMIT: &str = "sort_emit";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkUnitKind {
+    Morsel(SourceMorsel),
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkUnit {
+    id: WorkUnitId,
+    pipeline: PipelineId,
+    kind: WorkUnitKind,
+}
+
+impl WorkUnit {
+    fn morsel(pipeline: PipelineId, ordinal: u64, morsel: SourceMorsel) -> Self {
+        Self {
+            id: WorkUnitId(((pipeline.index() as u64) << 32) | ordinal),
+            pipeline,
+            kind: WorkUnitKind::Morsel(morsel),
+        }
+    }
+
+    fn finish(pipeline: PipelineId) -> Self {
+        Self {
+            id: WorkUnitId(((pipeline.index() as u64) << 32) | 0xffff_ffff),
+            pipeline,
+            kind: WorkUnitKind::Finish,
+        }
+    }
+}
+
+struct PipelineWorkerCoordinator {
+    completion: WorkGroupCompletion,
+    inner: Mutex<PipelineWorkerCoordinatorInner>,
+}
+
+struct PipelineWorkerCoordinatorInner {
+    waiters: WaiterRegistry,
+    blocked: HashMap<WorkUnitId, BlockedWorker>,
+    ready: VecDeque<PipelineWorkerTask>,
+}
+
+impl PipelineWorkerCoordinator {
+    fn new(task_count: usize) -> Self {
+        Self {
+            completion: WorkGroupCompletion::new(task_count),
+            inner: Mutex::new(PipelineWorkerCoordinatorInner {
+                waiters: WaiterRegistry::default(),
+                blocked: HashMap::new(),
+                ready: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn finish(&self, result: Result<()>) {
+        self.completion.finish(result);
+    }
+
+    fn cancel_queued(&self, count: usize) {
+        self.completion.cancel_queued(count);
+    }
+
+    fn cancel_blocked(&self) -> usize {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("pipeline worker coordinator lock poisoned");
+        // `ready` holds resumed work that has not been handed back to the
+        // scheduler yet. Those units have no running worker left to report
+        // completion, so cancellation must account for them with blocked work.
+        let count = inner.blocked.len().saturating_add(inner.ready.len());
+        if count == 0 {
+            return 0;
+        }
+        inner.blocked.clear();
+        inner.ready.clear();
+        inner.waiters.clear();
+        drop(inner);
+        self.completion.cancel_queued(count);
+        count
+    }
+
+    fn block(&self, blocked: BlockedWorker) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("pipeline worker coordinator lock poisoned");
+        if let Some(wake) = blocked.blocker.wake {
+            inner.waiters.register(wake, blocked.task.work.id);
+            inner.blocked.insert(blocked.task.work.id, blocked);
+        } else {
+            drop(inner);
+            self.completion.finish(Err(paro_error::internal(format!(
+                "pipeline work unit {:?} blocked on {:?} without a wake key",
+                blocked.task.work.id, blocked.blocker.reason
+            ))));
+        }
+    }
+
+    fn drain_ready(&self, query: &QueryRuntimeContext) -> Vec<PipelineWorkerTask> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("pipeline worker coordinator lock poisoned");
+        let ready = inner.waiters.ready_keys(query);
+        let coalesced_wakes = ready.coalesced_wakes as u64;
+        for key in ready.keys {
+            for unit_id in inner.waiters.wake(key) {
+                if let Some(blocked) = inner.blocked.remove(&unit_id) {
+                    inner
+                        .ready
+                        .push_back(blocked.task.into_resumed(coalesced_wakes));
+                }
+            }
+        }
+        inner.ready.drain(..).collect()
+    }
+
+    fn snapshot(&self) -> Result<Option<usize>> {
+        self.completion.snapshot()
+    }
+
+    fn remaining(&self) -> usize {
+        self.completion.remaining()
+    }
+
+    fn wait_for_worker_completion_with_timeout(&self) {
+        self.completion.wait_for_worker_completion_with_timeout();
+    }
+}
+
+#[derive(Default)]
+struct WaiterRegistry {
+    by_key: HashMap<WakeKey, Vec<WorkUnitId>>,
+    by_unit: HashMap<WorkUnitId, WakeKey>,
+}
+
+impl WaiterRegistry {
+    fn register(&mut self, wake: PendingWakeRegistration, unit_id: WorkUnitId) {
+        let key = wake.key();
+        let previous_key = self.by_unit.insert(unit_id, key);
+        if previous_key == Some(key) {
+            return;
+        }
+        if let Some(previous_key) = previous_key {
+            if let Some(waiters) = self.by_key.get_mut(&previous_key) {
+                waiters.retain(|unit| *unit != unit_id);
+                if waiters.is_empty() {
+                    self.by_key.remove(&previous_key);
+                }
+            }
+        }
+        let waiters = self.by_key.entry(key).or_default();
+        if !waiters.contains(&unit_id) {
+            waiters.push(unit_id);
+        }
+    }
+
+    fn wake(&mut self, key: WakeKey) -> Vec<WorkUnitId> {
+        let units = self.by_key.remove(&key).unwrap_or_default();
+        for unit in &units {
+            self.by_unit.remove(unit);
+        }
+        units
+    }
+
+    fn ready_keys(&self, query: &QueryRuntimeContext) -> ReadyWakeBatch {
+        let mut keys = Vec::new();
+        let mut coalesced_wakes = 0;
+        for key in self.by_key.keys().copied() {
+            if let Some(coalesced) = wake_key_ready(query, key) {
+                keys.push(key);
+                coalesced_wakes += coalesced as usize;
+            }
+        }
+        ReadyWakeBatch {
+            keys,
+            coalesced_wakes,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_key.clear();
+        self.by_unit.clear();
+    }
+}
+
+struct ReadyWakeBatch {
+    keys: Vec<WakeKey>,
+    coalesced_wakes: usize,
+}
+
+struct BlockedWorker {
+    blocker: Blocker,
+    task: PipelineWorkerTask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineWorkerMode {
+    Data,
+    Finish,
+}
+
+struct PipelineWorkerTask {
+    runtime: Arc<PipelineRuntime>,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+    group: Weak<PipelineWorkerCoordinator>,
+    work: WorkUnit,
+    thread_id: usize,
+    total_threads: usize,
+    mode: PipelineWorkerMode,
+    morsel: Option<SourceMorsel>,
+    executor: Option<PipelineTaskExecutor>,
+    profiler: Option<OperatorProfiler>,
+    blocked: Option<Blocker>,
+    blocked_at: Option<Instant>,
+    ready_at: Option<Instant>,
+    wake_coalesce_count: u64,
+    recorded_start: bool,
+    token: Option<ProducerToken>,
+}
+
+impl PipelineWorkerTask {
+    fn new_data(
+        runtime: Arc<PipelineRuntime>,
+        query: Arc<QueryRuntimeContext>,
+        allocator: Arc<dyn Allocator>,
+        group: Weak<PipelineWorkerCoordinator>,
+        work: WorkUnit,
+        thread_id: usize,
+        total_threads: usize,
+        morsel: Option<SourceMorsel>,
+    ) -> Self {
+        let ready_at = query.explain_profiler.as_ref().map(|_| Instant::now());
+        Self {
+            runtime,
+            query,
+            allocator,
+            group,
+            work,
+            thread_id,
+            total_threads,
+            mode: PipelineWorkerMode::Data,
+            morsel,
+            executor: None,
+            profiler: None,
+            blocked: None,
+            blocked_at: None,
+            ready_at,
+            wake_coalesce_count: 0,
+            recorded_start: false,
+            token: None,
+        }
+    }
+
+    fn new_finish(
+        runtime: Arc<PipelineRuntime>,
+        query: Arc<QueryRuntimeContext>,
+        allocator: Arc<dyn Allocator>,
+        group: Weak<PipelineWorkerCoordinator>,
+        work: WorkUnit,
+        thread_id: usize,
+        total_threads: usize,
+    ) -> Self {
+        let ready_at = query.explain_profiler.as_ref().map(|_| Instant::now());
+        Self {
+            runtime,
+            query,
+            allocator,
+            group,
+            work,
+            thread_id,
+            total_threads,
+            mode: PipelineWorkerMode::Finish,
+            morsel: None,
+            executor: None,
+            profiler: None,
+            blocked: None,
+            blocked_at: None,
+            ready_at,
+            wake_coalesce_count: 0,
+            recorded_start: false,
+            token: None,
+        }
+    }
+
+    fn into_resumed(mut self, coalesced_wakes: u64) -> Self {
+        self.blocked = None;
+        self.ready_at = self.query.explain_profiler.as_ref().map(|_| Instant::now());
+        self.wake_coalesce_count = self.wake_coalesce_count.saturating_add(coalesced_wakes);
+        self
+    }
+
+    fn take_blocked_worker(&mut self, blocker: Blocker) -> BlockedWorker {
+        BlockedWorker {
+            blocker,
+            task: PipelineWorkerTask {
+                runtime: self.runtime.clone(),
+                query: self.query.clone(),
+                allocator: self.allocator.clone(),
+                group: self.group.clone(),
+                work: self.work,
+                thread_id: self.thread_id,
+                total_threads: self.total_threads,
+                mode: self.mode,
+                morsel: self.morsel,
+                executor: self.executor.take(),
+                profiler: self.profiler.take(),
+                blocked: self.blocked.take(),
+                blocked_at: self.blocked_at.take(),
+                ready_at: self.ready_at.take(),
+                wake_coalesce_count: self.wake_coalesce_count,
+                recorded_start: self.recorded_start,
+                token: None,
+            },
+        }
+    }
+
+    fn ensure_profiler(&mut self) {
+        if self.profiler.is_some() {
+            return;
+        }
+        self.profiler = Some(self.query.explain_profiler.as_ref().map_or_else(
+            OperatorProfiler::disabled,
+            |profiler| {
+                OperatorProfiler::new_with_context(
+                    profiler.clone(),
+                    ProfileWorkerContext::new(
+                        Some(self.runtime.program.id.index() as u64),
+                        Some(self.work.id.0),
+                        Some(self.thread_id as u64),
+                        Some(self.total_threads as u64),
+                        profile_morsel_range_from_work(self.work),
+                    ),
+                )
+            },
+        ));
+    }
+
+    fn ensure_executor(&mut self) -> Result<()> {
+        if self.executor.is_some() {
+            return Ok(());
+        }
+        let mut task = self
+            .runtime
+            .create_task_state(self.query.as_ref(), self.allocator.clone())?;
+        if let Some(morsel) = self.morsel {
+            assign_source_morsel(&mut task.source, morsel)?;
+        }
+        self.executor = Some(match self.mode {
+            PipelineWorkerMode::Data => PipelineTaskExecutor::new(self.runtime.clone(), task),
+            PipelineWorkerMode::Finish => {
+                PipelineTaskExecutor::new_finish_task(self.runtime.clone(), task)
+            }
+        });
+        Ok(())
+    }
+
+    fn run(&mut self) -> Result<Option<Blocker>> {
+        self.ensure_profiler();
+        let source_node_id = self.runtime.program.source.operator_id.index() as u64;
+        if let Some(ready_at) = self.ready_at.take() {
+            let ready_time_us = ready_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            if ready_time_us > 0 {
+                self.profiler
+                    .as_mut()
+                    .expect("profiler initialized")
+                    .record_runtime(
+                        source_node_id,
+                        ExplainRuntimeStats {
+                            scheduler_ready_time_us: Some(ready_time_us),
+                            ..ExplainRuntimeStats::default()
+                        },
+                    );
+            }
+        }
+        let _admission = match self.try_enter_admission()? {
+            AdmissionEntry::Acquired(guard) => guard,
+            AdmissionEntry::Blocked(blocker) => {
+                self.profiler
+                    .as_mut()
+                    .expect("profiler initialized")
+                    .record_blocked(source_node_id, &blocker);
+                self.blocked_at = Some(Instant::now());
+                self.blocked = Some(blocker.clone());
+                return Ok(Some(blocker));
+            }
+        };
+        self.ensure_executor()?;
+        let previous_blocker = self.blocked.take();
+        let resumed_from_block = previous_blocker.is_some();
+        if resumed_from_block {
+            let wait_time_us = self
+                .blocked_at
+                .take()
+                .map(|blocked_at| blocked_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0);
+            self.profiler
+                .as_mut()
+                .expect("profiler initialized")
+                .record_wake(source_node_id, previous_blocker.as_ref(), wait_time_us);
+            self.executor
+                .as_mut()
+                .expect("executor initialized")
+                .resume_after_wake()?;
+        }
+        let thread = ThreadContext::new(self.thread_id, self.total_threads);
+        let wake = self.wake_scope();
+        let mut ctx = PipelineTaskStepContext {
+            query: self.query.as_ref(),
+            thread: &thread,
+            wake: &wake,
+            profiler: self.profiler.as_mut().expect("profiler initialized"),
+        };
+        if self.morsel.is_some() && !self.recorded_start {
+            ctx.profiler.record_runtime(
+                source_node_id,
+                ExplainRuntimeStats {
+                    scheduler_worker_count: Some(1),
+                    scheduler_morsel_count: Some(1),
+                    ..ExplainRuntimeStats::default()
+                },
+            );
+            self.recorded_start = true;
+        }
+        if self.wake_coalesce_count > 0 {
+            let coalesced_wakes = self.wake_coalesce_count;
+            self.wake_coalesce_count = 0;
+            ctx.profiler.record_runtime(
+                source_node_id,
+                ExplainRuntimeStats {
+                    scheduler_wake_coalesce_count: Some(coalesced_wakes),
+                    ..ExplainRuntimeStats::default()
+                },
+            );
+        }
+        loop {
+            let step = match self.mode {
+                PipelineWorkerMode::Data => self
+                    .executor
+                    .as_mut()
+                    .expect("executor initialized")
+                    .step_until_local_merge(&mut ctx)?,
+                PipelineWorkerMode::Finish => self
+                    .executor
+                    .as_mut()
+                    .expect("executor initialized")
+                    .step(&mut ctx)?,
+            };
+            match step {
+                TaskStepResult::Continue => {}
+                TaskStepResult::Done => {
+                    self.profiler
+                        .as_mut()
+                        .expect("profiler initialized")
+                        .flush();
+                    return Ok(None);
+                }
+                TaskStepResult::Blocked(blocker) => {
+                    ctx.profiler.record_blocked(source_node_id, &blocker);
+                    self.blocked = Some(blocker.clone());
+                    self.blocked_at = Some(Instant::now());
+                    return Ok(Some(blocker));
+                }
+            }
+        }
+    }
+
+    fn try_enter_admission(&self) -> Result<AdmissionEntry> {
+        let wake = self
+            .wake_scope()
+            .register(WakeSource::Memory, WakeToken(self.work.id.0));
+        let key = wake.key();
+        let query = self.query.clone();
+        let interrupt = InterruptState::with_callback(Arc::new(move || {
+            query.wake_events.wake(key);
+            Ok(())
+        }));
+        let controller = self.query.memory.admission_controller();
+        if let Some(guard) =
+            controller.try_acquire_for(AdmissionWaiterId(self.work.id.0), interrupt)
+        {
+            return Ok(AdmissionEntry::Acquired(guard));
+        }
+        Ok(AdmissionEntry::Blocked(
+            Blocker::new(crate::runtime::BlockReason::Memory).with_wake(wake),
+        ))
+    }
+
+    fn wake_scope(&self) -> OperatorWakeScope {
+        OperatorWakeScope {
+            task_id: PipelineTaskId(self.work.id.0),
+            generation: self.query.output.wake_generation(),
+        }
+    }
+}
+
+enum AdmissionEntry {
+    Acquired(PipelineAdmissionGuard),
+    Blocked(Blocker),
+}
+
+impl Task for PipelineWorkerTask {
+    fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
+        let result = match panic::catch_unwind(AssertUnwindSafe(|| self.run())) {
+            Ok(result) => result,
+            Err(_) => Err(paro_error::internal("pipeline worker task panicked")),
+        };
+        let Some(group) = self.group.upgrade() else {
+            return Err(paro_error::internal("pipeline worker coordinator dropped"));
+        };
+        match result {
+            Ok(None) => group.finish(Ok(())),
+            Ok(Some(blocker)) => {
+                group.block(self.take_blocked_worker(blocker));
+            }
+            Err(error) => group.finish(Err(error)),
+        }
+        Ok(TaskExecutionResult::Finished)
+    }
+
+    fn set_token(&mut self, token: ProducerToken) {
+        self.token = Some(token);
+    }
+
+    fn get_token(&self) -> Option<ProducerToken> {
+        self.token.clone()
+    }
+
+    fn task_type(&self) -> &str {
+        "PipelineWorkerTask"
+    }
+}
+
+fn wait_for_group(
+    query: &QueryRuntimeContext,
+    scheduler: &paro_scheduler::scheduler::TaskScheduler,
+    producer: &ProducerToken,
+    group: &Arc<PipelineWorkerCoordinator>,
+) -> Result<()> {
+    let marker = std::sync::atomic::AtomicBool::new(true);
+    loop {
+        let ready = group.drain_ready(query);
+        if !ready.is_empty() {
+            producer.schedule_tasks(ready.into_iter().map(as_scheduler_task).collect());
+        }
+        if let Err(error) = query.cancellation.check() {
+            cancel_and_drain(scheduler, producer, group);
+            return Err(error);
+        }
+        match group.snapshot() {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => {}
+            Err(error) => {
+                cancel_and_drain(scheduler, producer, group);
+                return Err(error);
+            }
+        }
+        scheduler.execute_tasks_for_producer(producer, &marker, usize::MAX);
+        if let Some(error) = scheduler.get_error_for_producer(producer) {
+            cancel_and_drain(scheduler, producer, group);
+            return Err(paro_error::internal(error.to_string()));
+        }
+        match group.snapshot() {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => {}
+            Err(error) => {
+                cancel_and_drain(scheduler, producer, group);
+                return Err(error);
+            }
+        }
+        if !scheduler.wait_for_task_for_producer(producer) {
+            group.wait_for_worker_completion_with_timeout();
+        }
+    }
+}
+
+fn cancel_and_drain(
+    scheduler: &paro_scheduler::scheduler::TaskScheduler,
+    producer: &ProducerToken,
+    group: &PipelineWorkerCoordinator,
+) {
+    let cancelled = scheduler.cancel_tasks_for_producer(producer);
+    group.cancel_queued(cancelled);
+    group.cancel_blocked();
+    wait_for_running_workers(group);
+}
+
+fn wait_for_running_workers(group: &PipelineWorkerCoordinator) {
+    while group.remaining() > 0 {
+        group.wait_for_worker_completion_with_timeout();
+    }
+}
+
+fn as_scheduler_task(task: PipelineWorkerTask) -> Arc<ParkingMutex<dyn Task>> {
+    Arc::new(ParkingMutex::new(task))
+}
+
+fn source_morsels(source: &SourceGlobal) -> Option<Vec<SourceMorsel>> {
+    match source {
+        SourceGlobal::Rowset(global) => Some(
+            (0..global.segments.len())
+                .map(|segment_idx| SourceMorsel::RowsetSegment { segment_idx })
+                .collect(),
+        ),
+        SourceGlobal::Chunk(global) => Some(
+            (0..global.chunks.len())
+                .map(|chunk_idx| SourceMorsel::Chunk { chunk_idx })
+                .collect(),
+        ),
+        SourceGlobal::SortEmit(global) => {
+            let task_count = global
+                .handle
+                .sealed_state()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .merger_gstate
+                        .as_ref()
+                        .map(|merger| merger.max_threads())
+                })
+                .unwrap_or(1)
+                .max(1);
+            Some(
+                (0..task_count)
+                    .map(|task_idx| SourceMorsel::SortEmit { task_idx })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn assign_source_morsel(source: &mut SourceLocal, morsel: SourceMorsel) -> Result<()> {
+    match (source, morsel) {
+        (SourceLocal::Rowset(local), SourceMorsel::RowsetSegment { segment_idx }) => {
+            local.assign_segment_morsel(segment_idx);
+            Ok(())
+        }
+        (SourceLocal::Chunk(local), SourceMorsel::Chunk { chunk_idx }) => {
+            local.assign_chunk_morsel(chunk_idx);
+            Ok(())
+        }
+        (SourceLocal::SortEmit(_), SourceMorsel::SortEmit { .. }) => Ok(()),
+        (source, morsel) => Err(paro_error::internal(format!(
+            "source local {} cannot accept scheduler morsel {:?}",
+            source.variant_name(),
+            morsel
+        ))),
+    }
+}
+
+fn profile_morsel_range_from_work(work: WorkUnit) -> Option<ProfileMorselRange> {
+    match work.kind {
+        WorkUnitKind::Morsel(SourceMorsel::RowsetSegment { segment_idx }) => {
+            Some(ProfileMorselRange::new(
+                PROFILE_MORSEL_ROWSET_SEGMENT,
+                segment_idx as u64,
+                segment_idx as u64 + 1,
+            ))
+        }
+        WorkUnitKind::Morsel(SourceMorsel::Chunk { chunk_idx }) => Some(ProfileMorselRange::new(
+            PROFILE_MORSEL_CHUNK,
+            chunk_idx as u64,
+            chunk_idx as u64 + 1,
+        )),
+        WorkUnitKind::Morsel(SourceMorsel::SortEmit { task_idx }) => Some(ProfileMorselRange::new(
+            PROFILE_MORSEL_SORT_EMIT,
+            task_idx as u64,
+            task_idx as u64 + 1,
+        )),
+        WorkUnitKind::Finish => None,
+    }
+}
+
+fn wake_key_ready(query: &QueryRuntimeContext, key: WakeKey) -> Option<u64> {
+    match key.source {
+        WakeSource::OutputBuffer => (query.output.wake_generation() != key.generation).then_some(0),
+        WakeSource::Cancellation => query.cancellation.is_cancelled().then_some(0),
+        WakeSource::Memory
+        | WakeSource::Spill
+        | WakeSource::ExternalRuntime
+        | WakeSource::DerivedIndex => query.wake_events.take_ready_with_coalesced(key),
+    }
+}
+
+fn single_task_blocked_error(blocker: &Blocker) -> ParoError {
+    match blocker.wake.map(|wake| wake.source) {
+        Some(WakeSource::OutputBuffer) => paro_error::internal(
+            "parallel completed-output pipeline blocked on output backpressure",
+        ),
+        Some(source) => paro_error::internal(format!(
+            "single-task parallel scheduler fallback blocked on unsupported wake source {source:?}"
+        )),
+        None => paro_error::internal(format!(
+            "single-task parallel scheduler fallback blocked on {:?} without a wake key",
+            blocker.reason
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::PipelineReadyPriority;
+
+    use super::*;
+
+    #[test]
+    fn ready_heap_uses_policy_priority() {
+        let mut heap = BinaryHeap::new();
+        heap.push(ReadyEntry {
+            priority: PipelineReadyPriority::new(1),
+            seq: 0,
+            payload: PipelineId::new(0),
+        });
+        heap.push(ReadyEntry {
+            priority: PipelineReadyPriority::new(10),
+            seq: 1,
+            payload: PipelineId::new(1),
+        });
+        assert_eq!(heap.pop().unwrap().payload, PipelineId::new(1));
+    }
+
+    #[test]
+    fn worker_coordinator_cancel_queued_releases_pending_slots() {
+        let coordinator = PipelineWorkerCoordinator::new(3);
+        coordinator.cancel_queued(2);
+        assert_eq!(coordinator.remaining(), 1);
+        coordinator.finish(Ok(()));
+        assert_eq!(coordinator.snapshot().unwrap(), None);
+    }
+
+    #[test]
+    fn waiter_registry_wakes_registered_work_units_once() {
+        let wake = PendingWakeRegistration {
+            task_id: PipelineTaskId(7),
+            source: WakeSource::Memory,
+            token: crate::runtime::WakeToken(11),
+            generation: crate::runtime::WakeGeneration(3),
+        };
+        let unit = WorkUnitId(99);
+        let mut registry = WaiterRegistry::default();
+
+        registry.register(wake, unit);
+        registry.register(wake, unit);
+
+        assert_eq!(registry.wake(wake.key()), vec![unit]);
+        assert!(registry.wake(wake.key()).is_empty());
+    }
+
+    #[test]
+    fn waiter_registry_moves_unit_when_wake_key_changes() {
+        let old_wake = PendingWakeRegistration {
+            task_id: PipelineTaskId(7),
+            source: WakeSource::Memory,
+            token: crate::runtime::WakeToken(11),
+            generation: crate::runtime::WakeGeneration(3),
+        };
+        let new_wake = PendingWakeRegistration {
+            task_id: PipelineTaskId(7),
+            source: WakeSource::Spill,
+            token: crate::runtime::WakeToken(12),
+            generation: crate::runtime::WakeGeneration(3),
+        };
+        let unit = WorkUnitId(99);
+        let mut registry = WaiterRegistry::default();
+
+        registry.register(old_wake, unit);
+        registry.register(new_wake, unit);
+
+        assert!(registry.wake(old_wake.key()).is_empty());
+        assert_eq!(registry.wake(new_wake.key()), vec![unit]);
+    }
+}

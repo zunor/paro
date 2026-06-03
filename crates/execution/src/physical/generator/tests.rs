@@ -1,20 +1,25 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_catalog::entry::{EdgeTableInfo, VertexTableInfo};
+use std::sync::Arc;
+
+use paro_catalog::entry::{ColumnDefinition, EdgeTableInfo, TableCatalogEntry, VertexTableInfo};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::window::WindowFunction;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
-    ConstantExpression, Expression, ReferenceExpression, WindowExpression, WindowFrame,
+    ComparisonExpression, ComparisonType, ConjunctionExpression, ConjunctionType,
+    ConstantExpression, Expression, OperatorExpression, OperatorType, ReferenceExpression,
+    WindowExpression, WindowFrame,
 };
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
-    ExpressionGet, Filter, GraphExpand, GraphScan, Limit, LogicalOperator, Order, Projection,
+    ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order, Projection,
     SetOperation, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
+use paro_storage::index::PredicateTree;
 
 use super::*;
 
@@ -85,6 +90,149 @@ fn arena_generator_lowers_distinct_to_hash_aggregate() {
     assert_eq!(spec.output_names.as_ref(), ["a"]);
     assert_eq!(plan.child_ids(&plan.node(plan.root).children).len(), 1);
     assert!(PhysicalPlanGenerator::ensure_fully_typed(&plan).is_ok());
+}
+
+#[test]
+fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
+    let ctx = BindContext::new();
+    let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let mut filter = Filter::new(
+        get,
+        vec![
+            comparison(
+                ComparisonType::GreaterThanOrEqual,
+                ref_expr(0, LogicalType::Integer),
+                int_const(10),
+            ),
+            Expression::Operator(OperatorExpression::new(
+                OperatorType::In,
+                vec![
+                    ref_expr(1, LogicalType::Integer),
+                    int_const(3),
+                    int_const(7),
+                ],
+                LogicalType::Boolean,
+            )),
+            Expression::Operator(OperatorExpression::new_unary(
+                OperatorType::IsNull,
+                ref_expr(2, LogicalType::Varchar),
+                LogicalType::Boolean,
+            )),
+        ],
+    );
+    filter.projection_map = vec![0];
+    let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let physical = generator.generate(&plan).expect("filter should lower");
+
+    let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
+        panic!("fully pushed filter should lower to rowset scan root");
+    };
+    assert_eq!(spec.column_ids.as_ref(), [0]);
+    assert!(spec.residual_predicates.is_empty());
+    assert!(!spec.late_materialize);
+    let Some(PredicateTree::And(children)) = spec.predicate.as_ref() else {
+        panic!("expected conjunctive storage predicate");
+    };
+    assert_eq!(children.len(), 3);
+    assert!(physical
+        .format_explain_text_with_spec(&paro_planner::operator::ExplainSpec::default())
+        .contains("Pushed Predicate"));
+}
+
+#[test]
+fn arena_generator_can_disable_rowset_scan_pushdown() {
+    let ctx = BindContext::new();
+    let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let filter = Filter::new(
+        get,
+        vec![comparison(
+            ComparisonType::Equal,
+            ref_expr(0, LogicalType::Integer),
+            int_const(42),
+        )],
+    );
+    let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext {
+        rowset_scan_pushdown: false,
+        ..PlanBuildContext::default()
+    });
+    let physical = generator.generate(&plan).expect("filter should lower");
+
+    let PhysicalNodeKind::Filter(_) = &physical.node(physical.root).kind else {
+        panic!("disabled pushdown should keep a filter root");
+    };
+    let [child] = physical.child_ids(&physical.node(physical.root).children) else {
+        panic!("filter should have one rowset child");
+    };
+    let PhysicalNodeKind::RowsetScan(scan) = &physical.node(*child).kind else {
+        panic!("filter child should be rowset scan");
+    };
+    assert!(scan.predicate.is_none());
+    assert!(!scan.late_materialize);
+}
+
+#[test]
+fn arena_generator_keeps_residual_filter_above_pushed_rowset_scan() {
+    let ctx = BindContext::new();
+    let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let filter = Filter::new(
+        get,
+        vec![Expression::Conjunction(ConjunctionExpression {
+            conjunction_type: ConjunctionType::And,
+            children: vec![
+                comparison(
+                    ComparisonType::Equal,
+                    ref_expr(0, LogicalType::Integer),
+                    int_const(42),
+                ),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Boolean(true),
+                    LogicalType::Boolean,
+                )),
+            ],
+        })],
+    );
+    let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let physical = generator.generate(&plan).expect("filter should lower");
+
+    let PhysicalNodeKind::Filter(spec) = &physical.node(physical.root).kind else {
+        panic!("residual expression should keep a filter root");
+    };
+    assert_eq!(spec.expressions.len(), 1);
+    let [child] = physical.child_ids(&physical.node(physical.root).children) else {
+        panic!("filter should have one rowset child");
+    };
+    let PhysicalNodeKind::RowsetScan(scan) = &physical.node(*child).kind else {
+        panic!("filter child should be rowset scan");
+    };
+    assert!(scan.predicate.is_some());
+    assert_eq!(scan.residual_predicates.len(), 1);
+}
+
+#[test]
+fn arena_generator_pushes_get_runtime_filters_into_rowset_scan() {
+    let ctx = BindContext::new();
+    let mut get = test_get();
+    get.runtime_filter_expressions.push(comparison(
+        ComparisonType::LessThanOrEqual,
+        ref_expr(0, LogicalType::Integer),
+        int_const(99),
+    ));
+    let plan = LogicalPlan::new(&ctx, LogicalOperator::Get(get));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let physical = generator.generate(&plan).expect("get should lower");
+
+    let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
+        panic!("expected rowset scan");
+    };
+    assert!(spec.predicate.is_some());
+    assert_eq!(spec.runtime_filter_expressions.len(), 1);
 }
 
 #[test]
@@ -434,4 +582,63 @@ fn arena_generator_lowers_row_literal_union_all_to_values() {
     };
     assert_eq!(spec.expressions.len(), 2);
     assert_eq!(spec.output_names.as_ref(), ["v"]);
+}
+
+fn test_get() -> Get {
+    let storage = Arc::new(
+        paro_storage::table::table_factory::TableFactory::default()
+            .create_table(&[
+                LogicalType::Integer,
+                LogicalType::Integer,
+                LogicalType::Varchar,
+            ])
+            .expect("table storage"),
+    );
+    let table = Arc::new(TableCatalogEntry::new(
+        "paro".to_string(),
+        "public".to_string(),
+        "scan_t".to_string(),
+        vec![
+            ColumnDefinition::new("a".to_string(), LogicalType::Integer),
+            ColumnDefinition::new("b".to_string(), LogicalType::Integer),
+            ColumnDefinition::new("c".to_string(), LogicalType::Varchar),
+        ],
+        storage,
+        0,
+    ));
+    Get {
+        table_index: 0,
+        returned_types: vec![
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Varchar,
+        ],
+        names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        relation_name: Some("scan_t".to_string()),
+        relation_alias: None,
+        column_ids: vec![0, 1, 2],
+        column_types: vec![
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Varchar,
+        ],
+        table: Some(table),
+        scan_order: None,
+        runtime_filter_expressions: Vec::new(),
+    }
+}
+
+fn ref_expr(index: usize, ty: LogicalType) -> Expression {
+    Expression::Reference(ReferenceExpression::new(index, ty))
+}
+
+fn int_const(value: i32) -> Expression {
+    Expression::Constant(ConstantExpression::new(
+        Value::Integer(value),
+        LogicalType::Integer,
+    ))
+}
+
+fn comparison(comparison_type: ComparisonType, left: Expression, right: Expression) -> Expression {
+    Expression::Comparison(ComparisonExpression::new(comparison_type, left, right))
 }

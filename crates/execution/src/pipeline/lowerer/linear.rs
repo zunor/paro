@@ -15,7 +15,10 @@ impl<'a> PipelineLowerer<'a> {
             match &node.kind {
                 PhysicalNodeKind::RowsetScan(spec) => {
                     transforms.reverse();
-                    return Ok((SourceSpec::Rowset(spec.clone()), transforms));
+                    return Ok((
+                        SourceSpec::Rowset(RowsetSourceSpec::new(spec.clone())),
+                        transforms,
+                    ));
                 }
                 PhysicalNodeKind::Values(spec) => {
                     transforms.reverse();
@@ -176,9 +179,11 @@ impl<'a> PipelineLowerer<'a> {
                     transforms.push(TransformSpec::ExternalProject(spec.clone()));
                     current = self.only_child(current)?;
                 }
-                PhysicalNodeKind::NestedLoopJoin(_) | PhysicalNodeKind::IEJoin(_) => {
+                PhysicalNodeKind::NestedLoopJoin(_)
+                | PhysicalNodeKind::SortRangeJoin(_)
+                | PhysicalNodeKind::ClassicIeJoin(_) => {
                     return Err(paro_error::internal(
-                        "nested loop / IE join must be lowered as breaker, not linear role",
+                        "nested loop / sort-range / classic IE join must be lowered as breaker, not linear role",
                     ));
                 }
                 PhysicalNodeKind::Insert(_)

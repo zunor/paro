@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use paro_scheduler::task::InterruptState;
@@ -14,7 +14,16 @@ use paro_scheduler::task::InterruptState;
 pub struct PipelineAdmissionController {
     max_slots: AtomicUsize,
     used_slots: AtomicUsize,
-    waiters: Mutex<VecDeque<InterruptState>>,
+    next_waiter_id: AtomicU64,
+    waiters: Mutex<VecDeque<AdmissionWaiter>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdmissionWaiterId(pub u64);
+
+struct AdmissionWaiter {
+    id: AdmissionWaiterId,
+    interrupt: InterruptState,
 }
 
 impl fmt::Debug for PipelineAdmissionController {
@@ -32,6 +41,7 @@ impl PipelineAdmissionController {
         Self {
             max_slots: AtomicUsize::new(max_slots.max(1)),
             used_slots: AtomicUsize::new(0),
+            next_waiter_id: AtomicU64::new(0),
             waiters: Mutex::new(VecDeque::new()),
         }
     }
@@ -67,15 +77,33 @@ impl PipelineAdmissionController {
         self: &Arc<Self>,
         interrupt: InterruptState,
     ) -> Option<PipelineAdmissionGuard> {
+        let id = AdmissionWaiterId(self.next_waiter_id.fetch_add(1, Ordering::Relaxed));
+        self.try_acquire_for(id, interrupt)
+    }
+
+    pub fn try_acquire_for(
+        self: &Arc<Self>,
+        waiter_id: AdmissionWaiterId,
+        interrupt: InterruptState,
+    ) -> Option<PipelineAdmissionGuard> {
         let mut used = self.used_slots.load(Ordering::Acquire);
         loop {
             if used >= self.max_slots() {
-                self.waiters
+                let mut waiters = self
+                    .waiters
                     .lock()
-                    .expect("pipeline admission waiters lock poisoned")
-                    .push_back(interrupt);
+                    .expect("pipeline admission waiters lock poisoned");
                 if self.used_slots() < self.max_slots() {
-                    self.wake_waiters();
+                    used = self.used_slots.load(Ordering::Acquire);
+                    continue;
+                }
+                if let Some(waiter) = waiters.iter_mut().find(|waiter| waiter.id == waiter_id) {
+                    waiter.interrupt = interrupt;
+                } else {
+                    waiters.push_back(AdmissionWaiter {
+                        id: waiter_id,
+                        interrupt,
+                    });
                 }
                 return None;
             }
@@ -106,13 +134,14 @@ impl PipelineAdmissionController {
     }
 
     fn wake_waiters(&self) {
-        let waiter = self
-            .waiters
-            .lock()
-            .expect("pipeline admission waiters lock poisoned")
-            .pop_front();
+        let waiter = {
+            self.waiters
+                .lock()
+                .expect("pipeline admission waiters lock poisoned")
+                .pop_front()
+        };
         if let Some(waiter) = waiter {
-            let _ = waiter.callback();
+            let _ = waiter.interrupt.callback();
         }
     }
 }

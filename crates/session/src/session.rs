@@ -209,6 +209,8 @@ impl Session {
             temporary_directory: temp_directory.clone(),
             max_temp_directory_size,
             force_external: settings.force_external(),
+            rowset_scan_pushdown: settings.rowset_scan_pushdown(),
+            parallel_scheduler: settings.parallel_scheduler(),
         };
 
         let mut databases = self.instance.database_registry().get_databases();

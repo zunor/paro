@@ -29,7 +29,8 @@ impl<'a> PipelineLowerer<'a> {
         let breaker = match &node.kind {
             PhysicalNodeKind::HashJoin(spec) => BreakerDispatch::HashJoin(spec.clone()),
             PhysicalNodeKind::NestedLoopJoin(spec) => BreakerDispatch::NestedLoopJoin(spec.clone()),
-            PhysicalNodeKind::IEJoin(spec) => BreakerDispatch::IEJoin(spec.clone()),
+            PhysicalNodeKind::SortRangeJoin(spec) => BreakerDispatch::SortRangeJoin(spec.clone()),
+            PhysicalNodeKind::ClassicIeJoin(spec) => BreakerDispatch::ClassicIeJoin(spec.clone()),
             PhysicalNodeKind::CrossProduct(spec) => BreakerDispatch::CrossProduct(spec.clone()),
             _ => {
                 let (source, mut transforms) = self.collect_linear_roles(join_root)?;

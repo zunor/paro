@@ -3,6 +3,7 @@
 
 //! Streaming result handling for typed query execution.
 
+mod background_output;
 mod completed_output;
 mod typed_streaming;
 
@@ -17,7 +18,7 @@ use paro_context::StatementCancellation;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::query_executor::pipeline_driver::PipelineExecutionDriver;
-use crate::query_executor::program_executor::ProgramExecution;
+use crate::query_executor::program_executor::{BackgroundExecutionDriver, ProgramExecution};
 use crate::runtime::{CleanupReason, QueryOutputPort, QueryRuntimeContext};
 
 enum ResultOutput {
@@ -27,6 +28,10 @@ enum ResultOutput {
         query: QueryRuntimeContext,
         output: QueryOutputPort,
         driver: PipelineExecutionDriver,
+    },
+    Background {
+        output: QueryOutputPort,
+        driver: BackgroundExecutionDriver,
     },
 }
 
@@ -99,6 +104,11 @@ impl ResultHandler {
                 query: execution.query,
                 driver,
             }
+        } else if let Some(driver) = execution.background {
+            ResultOutput::Background {
+                output: execution.query.output.clone(),
+                driver,
+            }
         } else {
             ResultOutput::Completed(execution.query.output)
         };
@@ -133,6 +143,7 @@ impl ResultHandler {
         match &self.output {
             ResultOutput::Completed(_) => self.fetch_completed_output(),
             ResultOutput::FetchDriven { .. } => self.fetch_typed_streaming_output(),
+            ResultOutput::Background { .. } => self.fetch_background_output(),
             ResultOutput::Closed => {
                 self.mark_closed();
                 Err(paro_common::error::internal(
@@ -154,7 +165,10 @@ impl ResultHandler {
             return;
         }
 
-        if matches!(self.output, ResultOutput::FetchDriven { .. }) {
+        if matches!(
+            self.output,
+            ResultOutput::FetchDriven { .. } | ResultOutput::Background { .. }
+        ) {
             if let Err(error) = self.cleanup_typed_driver(CleanupReason::Cancelled(
                 paro_context::StatementCancelReason::UserRequest,
             )) {
@@ -185,6 +199,7 @@ impl ResultHandler {
             ResultOutput::FetchDriven {
                 query, mut driver, ..
             } => driver.cleanup(&query, reason),
+            ResultOutput::Background { mut driver, .. } => driver.join(),
             other => {
                 self.output = other;
                 Ok(())

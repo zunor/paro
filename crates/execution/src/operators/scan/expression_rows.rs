@@ -10,7 +10,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_function::scalar::FunctionExecContext;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::runtime::context::OperatorCallContext;
 use crate::runtime::source::SourcePoll;
 use crate::runtime::ExpressionEvalInput;
@@ -71,14 +71,13 @@ pub(crate) fn poll_expression_rows(
                 vector.try_reset_for_execution(1, ctx.query.allocator(MemoryTag::BaseTable))?;
             }
             vector.try_set_count(1)?;
-            executor.execute_into_with_input(
+            executor.execute_kernel_into(
                 expr_idx,
-                ExpressionEvalInput {
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: &dummy,
-                },
-                None,
-                1,
+                })
+                .with_count(1),
                 ctx.query,
                 vector,
             )?;

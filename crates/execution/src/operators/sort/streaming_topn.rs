@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::scalar::FunctionExecContext;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::sort::topn_heap::TopNHeap;
 use crate::physical::specs::TopNSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
@@ -38,7 +38,7 @@ impl StreamingTopNTransformExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &TransformGlobal,
     ) -> Result<TransformLocal> {
         let order_exprs = self
@@ -54,7 +54,10 @@ impl StreamingTopNTransformExec {
                 self.spec.limit,
                 self.spec.offset,
             ),
-            order_executor: ExpressionExecutor::with_expressions(&order_exprs),
+            order_executor: ExpressionExecutor::with_expressions_for_session(
+                &order_exprs,
+                ctx.query.session.as_ref(),
+            ),
             output_chunks: Default::default(),
             finalized: false,
         }))
@@ -86,11 +89,11 @@ impl StreamingTopNTransformExec {
             input.size().max(1),
             ctx.query.allocator(MemoryTag::BaseTable),
         )?;
-        local.order_executor.execute_all_into_with_input(
-            ExpressionEvalInput {
+        local.order_executor.execute_all_kernel(
+            VectorKernelInput::from_eval_input(ExpressionEvalInput {
                 params: ctx.query.params.as_ref(),
                 columns: input,
-            },
+            }),
             ctx.query,
             &mut sort_chunk,
         )?;

@@ -7,10 +7,14 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::vector::VECTOR_SIZE;
+use paro_storage::row::RowSpillReader;
 
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
-use crate::runtime::breaker::{AggregateHandle, AggregateRuntimeState, HandleRef};
+use crate::runtime::breaker::{
+    AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
+    AggregateRuntimeState, HandleRef,
+};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
@@ -65,7 +69,13 @@ impl HashAggregateEmitSourceExec {
                 "hash aggregate emit source local state mismatch",
             ));
         };
-        if local.tables.is_none() {
+        if local.tables.is_none() && local.spilled_outputs.is_none() {
+            ctx.query.memory.unregister_reclaimer_by_name(
+                &AggregateBuildCompactionReclaimer::name_for(&global.handle),
+            );
+            ctx.query.memory.unregister_reclaimer_by_name(
+                &AggregateFinalizedStateReclaimer::name_for(&global.handle),
+            );
             let Some(state) = global.handle.take_state()? else {
                 return Ok(SourcePoll::Finished);
             };
@@ -74,10 +84,22 @@ impl HashAggregateEmitSourceExec {
                     "aggregate handle does not contain hash aggregate state",
                 ));
             };
-            local.positions = vec![Default::default(); state.tables.len()];
-            local.tables = Some(state.tables);
+            if let Some(spilled_outputs) = state.spilled_outputs {
+                local.spilled_outputs = Some(
+                    spilled_outputs
+                        .into_iter()
+                        .map(|output| output.map(|output| output.into_reader()))
+                        .collect(),
+                );
+            } else {
+                local.positions = vec![Default::default(); state.tables.len()];
+                local.tables = Some(state.tables);
+            }
         }
         ensure_source_output(output, &self.spec.output_types, VECTOR_SIZE)?;
+        if local.spilled_outputs.is_some() {
+            return self.poll_spilled_outputs(local, output);
+        }
         let tables = local.tables.as_mut().ok_or_else(|| {
             paro_error::internal("hash aggregate emit source did not load hash tables")
         })?;
@@ -98,6 +120,62 @@ impl HashAggregateEmitSourceExec {
         output.try_set_cardinality(0)?;
         Ok(SourcePoll::Finished)
     }
+
+    fn poll_spilled_outputs(
+        &self,
+        local: &mut HashAggregateEmitSourceLocal,
+        output: &mut Chunk,
+    ) -> Result<SourcePoll> {
+        let spilled_outputs = local.spilled_outputs.as_mut().ok_or_else(|| {
+            paro_error::internal("hash aggregate emit source did not load spilled outputs")
+        })?;
+        while local.grouping_idx < spilled_outputs.len() {
+            if let Some(reader) = spilled_outputs[local.grouping_idx].as_mut() {
+                if local.spilled_chunk.is_none() {
+                    local.spilled_chunk = Some(Chunk::try_new(output.allocator().clone())?);
+                }
+                let scratch = local
+                    .spilled_chunk
+                    .as_mut()
+                    .expect("spilled aggregate scratch chunk initialized");
+                let scanned = reader.read_next(scratch)?;
+                if scanned > 0 {
+                    copy_spilled_output_rows(scratch, output)?;
+                    populate_grouping_columns(&self.spec, output, local.grouping_idx)?;
+                    return Ok(SourcePoll::Output);
+                }
+            }
+            local.grouping_idx += 1;
+        }
+        output.try_set_cardinality(0)?;
+        Ok(SourcePoll::Finished)
+    }
+}
+
+fn copy_spilled_output_rows(source: &Chunk, output: &mut Chunk) -> Result<()> {
+    let row_count = source.size();
+    if output.column_count() < source.column_count() {
+        return Err(paro_error::internal(format!(
+            "hash aggregate spilled output has more columns than source output: spilled={} output={}",
+            source.column_count(),
+            output.column_count()
+        )));
+    }
+    output.try_set_cardinality(row_count)?;
+    for col_idx in 0..source.column_count() {
+        let source_vector = source.column(col_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "missing spilled aggregate output source column {col_idx}"
+            ))
+        })?;
+        let target = output.column_mut(col_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "missing spilled aggregate output target column {col_idx}"
+            ))
+        })?;
+        target.try_copy_range(0, source_vector.as_ref(), 0, row_count)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn populate_grouping_columns(

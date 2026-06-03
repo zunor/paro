@@ -15,8 +15,8 @@ use crate::row::RowStore;
 pub struct ScanChunkMeta {
     pub region_idx: usize,
     pub row_block_idx: usize,
-    pub ordinal_start: u32,
-    pub ordinal_end: u32,
+    pub ordinal_start: u64,
+    pub ordinal_end: u64,
     pub row_count: u32,
     pub local_ordinal_start: u32,
     pub local_ordinal_end: u32,
@@ -66,7 +66,7 @@ fn next_chunk_with_state(
         }
 
         let batch_len = remaining.min(VECTOR_SIZE as u32);
-        let start = meta.ordinal_start + state.offset_in_scan_chunk;
+        let start = meta.ordinal_start + state.offset_in_scan_chunk as u64;
         let required_capacity = batch_len as usize;
         let output_types = store.layout().types();
         if output.column_count() != output_types.len()
@@ -82,7 +82,7 @@ fn next_chunk_with_state(
             output.try_reset(output.allocator().clone())?;
         }
 
-        let pinned = store.pin_ordinal_range(start, batch_len)?;
+        let pinned = store.pin_ordinal_range(start, batch_len as u64)?;
         let columns: Vec<usize> = (0..store.layout().column_count()).collect();
         pinned.gather_columns(&columns, output, 0)?;
         drop(pinned);
@@ -259,6 +259,59 @@ impl<'a> RowScanCursor<'a> {
                 reclaim.advance(frontier);
             }
         })
+    }
+}
+
+/// Owning scan cursor that releases consumed row-store prefixes as it advances.
+#[derive(Debug)]
+pub struct ReclaimingRowScanCursor {
+    store: RowStore,
+    tracker: ReclaimTracker,
+    state: RowScanState,
+    slot: Option<ScannerSlot>,
+}
+
+impl ReclaimingRowScanCursor {
+    pub(crate) fn new(store: RowStore, tracker: ReclaimTracker) -> Self {
+        let slot = tracker.frontiers.register(0);
+        Self {
+            store,
+            tracker,
+            state: RowScanState::default(),
+            slot: Some(slot),
+        }
+    }
+
+    /// Read the next scan chunk and reclaim fully consumed prefixes.
+    pub fn next_chunk(&mut self, output: &mut Chunk) -> Result<usize> {
+        let store = &self.store;
+        let tracker = &self.tracker;
+        let slot = self
+            .slot
+            .as_ref()
+            .expect("reclaiming row scan cursor slot must exist before drop");
+        next_chunk_with_state(store, &mut self.state, output, |frontier| {
+            tracker.update_frontier(store, slot, frontier);
+        })
+    }
+
+    #[inline]
+    pub fn count(&self) -> u64 {
+        self.store.count()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn reclaimed_scan_chunk_prefix(&self) -> u32 {
+        self.tracker.released_scan_chunk_prefix()
+    }
+}
+
+impl Drop for ReclaimingRowScanCursor {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.tracker.unregister_scanner(&self.store, &slot);
+        }
     }
 }
 

@@ -11,15 +11,15 @@ use paro_common::types::LogicalType;
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::physical::properties::{MemoryClass, RequiredProperties};
-use crate::runtime::breaker::{HandleRef, SortHandle};
+use crate::runtime::breaker::{HandleRef, SortHandle, SortPendingRunsReclaimer};
 use crate::runtime::context::{
     OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
 };
 use crate::runtime::sink::{
-    FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SingleTaskFinishDriver, SinkPoll,
+    FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
 };
 use crate::runtime::state::{BreakerHandleGlobal, SinkGlobal, SinkLocal, SortBuildSinkLocal};
-use crate::sorting::sort::{
+use crate::sorting::sort_descriptor::{
     build_key_chunk_into as build_sort_key_chunk_into,
     build_payload_chunk_into as build_sort_payload_chunk_into, Sort,
 };
@@ -57,6 +57,15 @@ impl SortBuildSinkExec {
             false,
         )?);
         handle.initialize(sort, self.output_types.clone(), force_external)?;
+        if query_has_temporary_directory(ctx.query) {
+            ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                SortPendingRunsReclaimer::for_query(
+                    handle.clone(),
+                    ctx.query.session.buffer_pool().clone(),
+                    ctx.query.memory.clone(),
+                ),
+            ));
+        }
         Ok(SinkGlobal::SortBuild(Arc::new(BreakerHandleGlobal {
             handle,
         })))
@@ -110,7 +119,8 @@ impl SortBuildSinkExec {
             local.maximum_run_size = sort_run_target_bytes(ctx.query, global.handle.is_external());
             local.external = global.handle.is_external();
         }
-        let key_chunk = build_sort_key_chunk_into(input, sort.orders(), &mut local.key_chunk)?;
+        let key_chunk =
+            build_sort_key_chunk_into(input, sort.key_column_indices(), &mut local.key_chunk)?;
         let payload_chunk = build_sort_payload_chunk_into(
             input,
             sort.input_projection_map(),
@@ -188,7 +198,7 @@ impl SortBuildSinkExec {
         } else {
             MemoryClass::Blocking
         };
-        Ok(FinishWork::Parallel(SingleTaskFinishDriver::group(
+        Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
             "sort_seal",
             memory_class,
             move |_ctx| handle.seal(num_threads),
@@ -208,6 +218,9 @@ impl SortBuildSinkExec {
         if !global.handle.is_sealed() {
             global.handle.seal(ctx.query.session.number_of_threads())?;
         }
+        ctx.query
+            .memory
+            .unregister_reclaimer_by_name(&SortPendingRunsReclaimer::name_for(&global.handle));
         Ok(FinishPoll::Done)
     }
 

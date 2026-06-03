@@ -4,8 +4,10 @@
 //! Hash table primitives used by join operators.
 
 mod build_store;
+pub(crate) mod hash_kernel;
 
 pub mod ht_entry;
-pub mod join_hashtable;
-pub mod perfect_hash_join;
 pub mod scan_structure;
+pub mod table;
+
+pub use table::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};

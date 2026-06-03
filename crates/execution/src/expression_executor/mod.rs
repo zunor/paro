@@ -6,6 +6,14 @@
 mod comparison;
 mod execution_state;
 mod predicate;
+mod program;
 
 pub mod executor;
+pub mod physical {
+    pub use super::program::{
+        expression_fingerprint, expression_list_fingerprints, ExpressionBackend,
+        ExpressionProgramCache, ExpressionProgramCacheKey, ExpressionProgramVersion,
+        ExpressionScratchLayout, ExpressionScratchSlot, PhysicalExpressionProgram,
+    };
+}
 pub mod state;

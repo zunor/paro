@@ -4,11 +4,10 @@
 pub(crate) mod cross_product;
 pub mod delim;
 pub mod hash;
-pub mod ie;
-pub mod join_filter_pushdown;
 pub mod join_result_helpers;
 pub mod nested_loop;
 pub mod piecewise_merge;
+pub mod sort_range;
 pub mod state;
 
 pub use cross_product::CrossProductProbeTransformExec;

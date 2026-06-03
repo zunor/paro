@@ -309,6 +309,33 @@ fn run_two_stage_breaker(
     run_to_done(&mut emit, query, thread, wake, &mut profiler);
 }
 
+fn run_two_stage_breaker_with_profile(
+    graph: PipelineGraph,
+    query: &QueryRuntimeContext,
+    thread: &ThreadContext,
+    wake: &OperatorWakeScope,
+) -> ExplainProfileSnapshot {
+    let profile = ExplainProfiler::new();
+    let (build_runtime, emit_runtime) = runtimes_from_graph(query, &graph);
+    let mut build = PipelineTaskExecutor::new(
+        build_runtime.clone(),
+        build_runtime
+            .create_task_state(query, paro_common::test_utils::test_allocator())
+            .expect("build task"),
+    );
+    let mut emit = PipelineTaskExecutor::new(
+        emit_runtime.clone(),
+        emit_runtime
+            .create_task_state(query, paro_common::test_utils::test_allocator())
+            .expect("emit task"),
+    );
+    let mut profiler = OperatorProfiler::new(profile.clone());
+    run_to_done(&mut build, query, thread, wake, &mut profiler);
+    run_to_done(&mut emit, query, thread, wake, &mut profiler);
+    profiler.flush();
+    profile.snapshot()
+}
+
 #[test]
 fn ungrouped_aggregate_breaker_merges_and_emits_count() {
     let output = QueryOutputPort::unbounded();
@@ -388,6 +415,205 @@ fn hash_aggregate_breaker_groups_and_emits_counts() {
         .collect::<Vec<_>>();
     rows.sort_unstable();
     assert_eq!(rows, vec![(1, 2), (2, 1)]);
+}
+
+#[test]
+fn hash_aggregate_breaker_spills_payload_partitions_when_forced_external() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_aggregate_payload_spill"),
+            max_temp_directory_size: None,
+            force_external: true,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
+    let spec = grouped_count_spec(None);
+    let graph = aggregate_breaker_graph(
+        SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
+            handle: BreakerHandleId::new(0),
+            spec: spec.clone(),
+            required: Default::default(),
+        }),
+        SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
+            handle: BreakerHandleId::new(0),
+            spec,
+        }),
+        vec![
+            vec![int_constant(1)],
+            vec![int_constant(2)],
+            vec![int_constant(1)],
+            vec![int_constant(3)],
+            vec![int_constant(2)],
+        ],
+        vec![LogicalType::Integer],
+        RowType::new(
+            vec!["k".to_string(), "count".to_string()],
+            vec![LogicalType::Integer, LogicalType::BigInt],
+        ),
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(24),
+        generation: WakeGeneration(0),
+    };
+    let profile = run_two_stage_breaker_with_profile(graph, &query, &thread, &wake);
+
+    let mut rows = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        rows.extend((0..chunk.size()).map(|idx| {
+            (
+                chunk.column(0).unwrap().get_i32(idx).unwrap(),
+                chunk.column(1).unwrap().get_i64(idx).unwrap(),
+            )
+        }));
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 2), (2, 2), (3, 1)]);
+    assert!(profile.operators.values().any(|actual| {
+        actual.runtime.spilled == Some(true)
+            && actual.runtime.spilled_bytes.unwrap_or(0) > 0
+            && actual.runtime.repartition_depth == Some(1)
+    }));
+}
+
+#[test]
+fn hash_aggregate_breaker_preemptively_spills_payload_under_low_query_cap() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_aggregate_low_cap_payload_spill"),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
+    let spec = grouped_count_spec(None);
+    let graph = aggregate_breaker_graph(
+        SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
+            handle: BreakerHandleId::new(0),
+            spec: spec.clone(),
+            required: Default::default(),
+        }),
+        SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
+            handle: BreakerHandleId::new(0),
+            spec,
+        }),
+        vec![
+            vec![int_constant(1)],
+            vec![int_constant(2)],
+            vec![int_constant(1)],
+            vec![int_constant(3)],
+            vec![int_constant(2)],
+        ],
+        vec![LogicalType::Integer],
+        RowType::new(
+            vec!["k".to_string(), "count".to_string()],
+            vec![LogicalType::Integer, LogicalType::BigInt],
+        ),
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(25),
+        generation: WakeGeneration(0),
+    };
+    let profile = run_two_stage_breaker_with_profile(graph, &query, &thread, &wake);
+
+    let mut rows = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        rows.extend((0..chunk.size()).map(|idx| {
+            (
+                chunk.column(0).unwrap().get_i32(idx).unwrap(),
+                chunk.column(1).unwrap().get_i64(idx).unwrap(),
+            )
+        }));
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 2), (2, 2), (3, 1)]);
+    assert!(profile.operators.values().any(|actual| {
+        actual.runtime.spilled == Some(true)
+            && actual.runtime.spilled_bytes.unwrap_or(0) > 0
+            && actual.runtime.repartition_depth == Some(1)
+    }));
+}
+
+#[test]
+fn hash_aggregate_breaker_spills_payload_when_available_query_memory_is_low() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 16 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_aggregate_available_payload_spill"),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
+    query
+        .memory
+        .try_grow(15 * 1024 * 1024 + 1)
+        .expect("reserve most query memory");
+    let spec = grouped_count_spec(None);
+    let graph = aggregate_breaker_graph(
+        SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
+            handle: BreakerHandleId::new(0),
+            spec: spec.clone(),
+            required: Default::default(),
+        }),
+        SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
+            handle: BreakerHandleId::new(0),
+            spec,
+        }),
+        vec![
+            vec![int_constant(1)],
+            vec![int_constant(2)],
+            vec![int_constant(1)],
+            vec![int_constant(3)],
+            vec![int_constant(2)],
+        ],
+        vec![LogicalType::Integer],
+        RowType::new(
+            vec!["k".to_string(), "count".to_string()],
+            vec![LogicalType::Integer, LogicalType::BigInt],
+        ),
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(26),
+        generation: WakeGeneration(0),
+    };
+    let profile = run_two_stage_breaker_with_profile(graph, &query, &thread, &wake);
+
+    let mut rows = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        rows.extend((0..chunk.size()).map(|idx| {
+            (
+                chunk.column(0).unwrap().get_i32(idx).unwrap(),
+                chunk.column(1).unwrap().get_i64(idx).unwrap(),
+            )
+        }));
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 2), (2, 2), (3, 1)]);
+    assert!(profile.operators.values().any(|actual| {
+        actual.runtime.spilled == Some(true)
+            && actual.runtime.spilled_bytes.unwrap_or(0) > 0
+            && actual.runtime.repartition_depth == Some(1)
+    }));
 }
 
 #[test]

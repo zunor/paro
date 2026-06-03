@@ -43,10 +43,10 @@ PROJECTION  (rows=1)
     Limit: 2
     ->  PROJECTION  (rows=1)
       Output: id, __paro_hidden_1
-      ->  FILTER  (rows=1)
-        Filter: #1 = 'x'
-        ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
-          Columns: id, category, emb
+      ->  ROWSET_SCAN on public.vector_topn_case  (rows=1)
+        Columns: id, category, emb
+        Pushed Predicate: col#1 = 'x'
+        Late Materialize: auto
 
 SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]', id LIMIT 2;
 id

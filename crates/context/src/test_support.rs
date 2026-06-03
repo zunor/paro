@@ -158,7 +158,22 @@ impl TestStatementContextBuilder {
         let can_create_elevated_routine = self
             .can_create_elevated_routine
             .unwrap_or(can_create_routine);
+        let limits = self.limits.unwrap_or(RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: false,
+            temporary_directory: String::new(),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        });
         let buffer_pool = BufferPool::new_arc(64 * 1024 * 1024);
+        if limits.use_temporary_directory && !limits.temporary_directory.is_empty() {
+            buffer_pool
+                .set_temporary_directory(limits.temporary_directory.clone())
+                .expect("set test temporary directory");
+        }
         let buffer_manager = Arc::new(StandardBufferManager::new_with_pool(
             buffer_pool.clone(),
             paro_storage::buffer::DEFAULT_BLOCK_ALLOC_SIZE,
@@ -174,14 +189,6 @@ impl TestStatementContextBuilder {
         });
         let graph_manager = Arc::new(EmptyGraphManager);
         let settings = Arc::new(EffectiveSettings::new(self.settings));
-        let limits = self.limits.unwrap_or(RuntimeLimits {
-            max_threads: 1,
-            max_memory: 64 * 1024 * 1024,
-            use_temporary_directory: false,
-            temporary_directory: String::new(),
-            max_temp_directory_size: None,
-            force_external: false,
-        });
         let catalog = Arc::new(ParoCatalog::new(self.current_database.clone()));
         Arc::new(StatementContext {
             env: StatementEnvironment {

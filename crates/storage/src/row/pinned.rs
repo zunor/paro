@@ -323,7 +323,7 @@ impl PinnedRow<'_, '_> {
     }
 
     #[inline]
-    pub fn ordinal(&self) -> u32 {
+    pub fn ordinal(&self) -> u64 {
         self.rows.logical_rows[self.logical_index].ordinal
     }
 

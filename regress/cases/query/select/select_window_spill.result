@@ -50,10 +50,10 @@ WHERE part IN (1, 2);
 QUERY PLAN
 PROJECTION  (rows=6)
   Output: part, id, score, rn, rk, lead_score, lag_score
-  ->  FILTER  (rows=6)
-    Filter: #0 = 1 OR #0 = 2
-    ->  ROWSET_SCAN on public.window_spill_test  (rows=32)
-      Columns: part, id, score
+  ->  ROWSET_SCAN on public.window_spill_test  (rows=6)
+    Columns: part, id, score
+    Pushed Predicate: col#0 = 1 OR col#0 = 2
+    Late Materialize: auto
 
 CREATE TABLE window_large_partition_test (part INT, id INT, payload VARCHAR);
 CREATE TABLE

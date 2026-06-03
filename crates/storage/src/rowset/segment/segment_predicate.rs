@@ -32,7 +32,9 @@ impl PredicateEvaluator {
         prefetcher: Option<Arc<Prefetcher>>,
         explicit_predicate_columns: Option<Vec<ColumnId>>,
     ) -> Result<Option<Self>> {
-        if !Self::requires_row_level_predicate_eval(evaluator, &tree) {
+        if !Self::predicate_tree_requires_row_verification(&tree)
+            && !Self::requires_row_level_predicate_eval(evaluator, &tree)
+        {
             return Ok(None);
         }
 
@@ -88,6 +90,12 @@ impl PredicateEvaluator {
         match predicate_tree {
             PredicateTree::Leaf(predicate) => {
                 let leaf = PredicateTree::Leaf(predicate.clone());
+                if predicate.requires_row_level_verification() {
+                    return !matches!(
+                        evaluator.evaluate(&leaf),
+                        PredicateResult::NoneMatch | PredicateResult::AllMatch
+                    );
+                }
                 !matches!(
                     evaluator.evaluate(&leaf),
                     PredicateResult::Bitmap(_)
@@ -98,6 +106,15 @@ impl PredicateEvaluator {
             PredicateTree::And(children) | PredicateTree::Or(children) => children
                 .iter()
                 .any(|child| Self::requires_row_level_predicate_eval(evaluator, child)),
+        }
+    }
+
+    pub(super) fn predicate_tree_requires_row_verification(predicate_tree: &PredicateTree) -> bool {
+        match predicate_tree {
+            PredicateTree::Leaf(predicate) => predicate.requires_row_level_verification(),
+            PredicateTree::And(children) | PredicateTree::Or(children) => children
+                .iter()
+                .any(Self::predicate_tree_requires_row_verification),
         }
     }
 
@@ -266,5 +283,23 @@ impl PredicateEvaluator {
     ) -> Option<&'a Value> {
         let idx = self.predicate_column_map.get(&column_id)?;
         values_by_col.get(*idx)?.get(row_idx)
+    }
+}
+
+trait PredicateVerificationExt {
+    fn requires_row_level_verification(&self) -> bool;
+}
+
+impl PredicateVerificationExt for Predicate {
+    fn requires_row_level_verification(&self) -> bool {
+        matches!(
+            self,
+            Predicate::NotEq { .. }
+                | Predicate::Lt { .. }
+                | Predicate::Le { .. }
+                | Predicate::Gt { .. }
+                | Predicate::Ge { .. }
+                | Predicate::Range { .. }
+        )
     }
 }

@@ -1,0 +1,75 @@
+[meta]
+name = "operator_runtime_scan_pushdown"
+description = "SCAN-PUSHDOWN rowset scan pushdown, late materialization, and scan-order benchmark"
+run_order = 19
+
+[params]
+scan_rows = 200000
+scan_key_space = 1000
+memory_limit = "256MB"
+temp_directory = "/tmp/paro_benchmark_operator_runtime_scan_pushdown"
+random_seed = 20260525
+thread_count = 1
+fast_path_expected = "current-single-active-driver"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "high_selectivity_eq_pushdown"
+file = "sql/q_high_selectivity_eq_pushdown.sql"
+validate = "scalar_equals"
+expected = 1
+plan_contains = ["Pushed Predicate"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "high_selectivity_eq_no_pushdown"
+file = "sql/q_high_selectivity_eq_pushdown.sql"
+setup = "sql/setup_disable_pushdown.sql"
+teardown = "sql/teardown_enable_pushdown.sql"
+validate = "scalar_equals"
+expected = 1
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "low_selectivity_range_pushdown"
+file = "sql/q_low_selectivity_range_pushdown.sql"
+validate = "scalar_equals"
+expected = 180000
+plan_contains = ["Pushed Predicate"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "null_pushdown"
+file = "sql/q_null_pushdown.sql"
+validate = "scalar_equals"
+expected = 20000
+plan_contains = ["Pushed Predicate"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "wide_late_materialize"
+file = "sql/q_wide_late_materialize.sql"
+validate = "scalar_equals"
+expected = 577343600
+plan_contains = ["Pushed Predicate"]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "topn_scan_order"
+file = "sql/q_topn_scan_order.sql"
+validate = "ordered_rows"
+expected = [[200000], [199999], [199998], [199997], [199996], [199995], [199994], [199993], [199992], [199991]]
+plan_contains = ["Scan Order"]
+collect_explain_profile = true
+allow_reexecute = true

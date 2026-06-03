@@ -14,7 +14,7 @@ use crate::row::RowAddr;
 /// Physical row location inside one sealed store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RowLocation {
-    pub ordinal: u32,
+    pub ordinal: u64,
     pub addr: RowAddr,
     pub region_index: usize,
     pub local_ordinal: usize,
@@ -120,7 +120,7 @@ impl RowRegion {
                             row_within_block as u32,
                         )?;
                         locations.push(RowLocation {
-                            ordinal: ordinal as u32,
+                            ordinal,
                             addr,
                             region_index: index as usize,
                             local_ordinal,

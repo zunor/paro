@@ -9,7 +9,8 @@ pub mod control_region;
 pub mod ids;
 pub mod parameter;
 pub mod pipeline_runtime;
-pub mod scheduling;
+pub mod scheduler;
+pub mod scheduling_policy;
 pub mod scratch;
 pub mod sink;
 pub mod source;
@@ -17,6 +18,7 @@ pub mod state;
 pub mod task_executor;
 pub mod transform;
 pub mod utility;
+pub(crate) mod work_group;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -128,6 +130,7 @@ fn null_u64_error(label: &str, row: usize) -> paro_common::error::ParoError {
 pub use crate::operators::join::nested_loop::{
     NestedLoopJoinProbeTransformExec, NljUnmatchedSourceExec,
 };
+pub use crate::operators::join::sort_range::SortRangeJoinProbeTransformExec;
 pub use breaker::{
     AggregateHandle, BreakerHandleMetadata, BreakerHandleRegistry, CleanupReason, CleanupState,
     CleanupStatus, CompletionLatch, CteHandle, DelimHandle, ExternalTableHandle, HandleRef,
@@ -157,9 +160,11 @@ pub use ids::{
 };
 pub use parameter::{ExpressionEvalInput, ParameterBindingEpoch, ParameterBindings};
 pub use pipeline_runtime::PipelineRuntime;
-pub use scheduling::{
+pub use scheduler::PipelineScheduler;
+pub(crate) use scheduling_policy::RUNTIME_WAIT_TIMEOUT;
+pub use scheduling_policy::{
     FairnessPolicy, PipelineReadyEvent, PipelineReadyPriority, PipelineSchedulingPolicy,
-    ReadyQueuePolicy, WakeCoalescer, WakeStormPolicy,
+    ReadyEntry, ReadyQueuePolicy, WakeStormPolicy,
 };
 pub use scratch::{
     ChunkLayout, ChunkLease, ExpressionScratchArena, ExpressionScratchLease, PendingChunkState,
@@ -176,13 +181,13 @@ pub use sink::{
     UngroupedAggregateSinkExec, UpdateSinkExec, WindowBuildSinkExec,
 };
 pub use source::{
-    AdaptiveSearchSourceExec, ChunkSourceExec, CteScanSourceExec, DelimScanSourceExec,
-    DummySourceExec, DynSourceExec, EmptySourceExec, ExpressionSourceExec, ExternalTableSourceExec,
-    FullTextSearchSourceExec, GraphScanSourceExec, HashAggregateEmitSourceExec,
-    HashJoinSpillReplaySourceExec, HashJoinUnmatchedSourceExec, MaterializedSourceExec,
-    PerfectHashAggregateEmitSourceExec, RecursiveTableScanSourceExec, RowsetSourceDesc,
-    RowsetSourceExec, SetOperationEmitSourceExec, SortEmitSourceExec, SourceExec, SourcePoll,
-    SparseVectorSearchSourceExec, TableFunctionSourceExec, TopNEmitSourceExec,
+    AdaptiveSearchSourceExec, ChunkSourceExec, ClassicIeJoinSourceExec, CteScanSourceExec,
+    DelimScanSourceExec, DummySourceExec, DynSourceExec, EmptySourceExec, ExpressionSourceExec,
+    ExternalTableSourceExec, FullTextSearchSourceExec, GraphScanSourceExec,
+    HashAggregateEmitSourceExec, HashJoinSpillReplaySourceExec, HashJoinUnmatchedSourceExec,
+    MaterializedSourceExec, PerfectHashAggregateEmitSourceExec, RecursiveTableScanSourceExec,
+    RowsetSourceDesc, RowsetSourceExec, SetOperationEmitSourceExec, SortEmitSourceExec, SourceExec,
+    SourcePoll, SparseVectorSearchSourceExec, TableFunctionSourceExec, TopNEmitSourceExec,
     UngroupedAggregateEmitSourceExec, ValuesSourceExec, VectorSearchSourceExec,
     WindowEmitSourceExec,
 };
@@ -221,3 +226,4 @@ pub use transform::{
     TransformFlushPoll, TransformPoll,
 };
 pub use utility::{run_once as run_utility_once, UtilityRunResult};
+pub(crate) use work_group::WorkGroupCompletion;

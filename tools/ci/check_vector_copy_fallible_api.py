@@ -108,7 +108,7 @@ SETTER_ALLOWLIST = {
 
 def git_files(pattern: str) -> list[Path]:
     result = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", pattern],
+        ["git", "-C", str(ROOT), "ls-files", "--cached", "--others", "--exclude-standard", pattern],
         check=True,
         capture_output=True,
         text=True,
@@ -120,7 +120,7 @@ def rust_files() -> list[Path]:
     return [
         path
         for path in git_files("crates/**/*.rs")
-        if any(path.is_relative_to(prefix) for prefix in CHECK_PREFIXES)
+        if (ROOT / path).exists() and any(path.is_relative_to(prefix) for prefix in CHECK_PREFIXES)
     ]
 
 

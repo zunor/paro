@@ -24,7 +24,7 @@ use paro_planner::operator::external_project::ExternalProjectExpression;
 use serde_json::{json, Value as JsonValue};
 
 use crate::execution_context::ExecutionContext;
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::memory_runtime::OperatorMemoryScope;
 
 use super::batching::SubmissionBatchPolicy;
@@ -178,7 +178,11 @@ impl ExternalProjectExecutor for TestProjectExecutor {
             MemoryTag::ExternalRuntimeHost,
             paro_common::memory::MemoryAccountingClass::NonRevocable,
         ))?;
-        executor.execute_all_into(submission.input, ctx, &mut generated)?;
+        executor.execute_all_kernel(
+            VectorKernelInput::from_chunk(submission.input),
+            ctx,
+            &mut generated,
+        )?;
 
         let elapsed_us = started_at.elapsed().as_micros() as u64;
         let output_bytes = SubmissionBatchPolicy::estimate_chunk_bytes(&generated);
@@ -399,7 +403,11 @@ fn evaluate_external_arguments(
         paro_common::memory::MemoryAccountingClass::NonRevocable,
     );
     let mut argument_chunk = Chunk::try_new(allocator)?;
-    executor.execute_all_into(input, ctx, &mut argument_chunk)?;
+    executor.execute_all_kernel(
+        VectorKernelInput::from_chunk(input),
+        ctx,
+        &mut argument_chunk,
+    )?;
     (0..argument_chunk.column_count())
         .map(|idx| json_column_from_chunk(&argument_chunk, idx))
         .collect()

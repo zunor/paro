@@ -13,6 +13,7 @@
 use crate::aggregate::{
     AggregateCombineType, AggregateFunction, AggregateFunctionSet, AggregateInputData,
 };
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use std::ptr;
@@ -58,6 +59,105 @@ fn combine_states(source: &StringAggState, target: &mut StringAggState) {
     if target.combine_separator.is_none() {
         target.combine_separator = source.combine_separator.clone();
     }
+}
+
+fn write_u64(output: &mut Vec<u8>, value: usize) -> Result<()> {
+    let value = u64::try_from(value)
+        .map_err(|_| paro_error::internal("string_agg state field exceeds u64"))?;
+    output.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn read_u8(input: &[u8], offset: &mut usize) -> Result<u8> {
+    let value = *input
+        .get(*offset)
+        .ok_or_else(|| paro_error::internal("Truncated string_agg state"))?;
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_u64(input: &[u8], offset: &mut usize) -> Result<usize> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| paro_error::internal("string_agg state offset overflow"))?;
+    let bytes = input
+        .get(*offset..end)
+        .ok_or_else(|| paro_error::internal("Truncated string_agg state length"))?;
+    *offset = end;
+    usize::try_from(u64::from_le_bytes(bytes.try_into().expect("u64 bytes")))
+        .map_err(|_| paro_error::internal("string_agg state length exceeds usize"))
+}
+
+fn read_string(input: &[u8], offset: &mut usize) -> Result<String> {
+    let len = read_u64(input, offset)?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| paro_error::internal("string_agg state string offset overflow"))?;
+    let bytes = input
+        .get(*offset..end)
+        .ok_or_else(|| paro_error::internal("Truncated string_agg state string"))?;
+    *offset = end;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|err| paro_error::internal(format!("Invalid string_agg state UTF-8: {err}")))
+}
+
+unsafe fn serialize_state(
+    state: *const u8,
+    _input_data: &AggregateInputData,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    let state = &*(state as *const StringAggState);
+    output.push(u8::from(state.is_set));
+    write_u64(output, state.result.len())?;
+    output.extend_from_slice(state.result.as_bytes());
+    match &state.combine_separator {
+        Some(separator) => {
+            output.push(1);
+            write_u64(output, separator.len())?;
+            output.extend_from_slice(separator.as_bytes());
+        }
+        None => output.push(0),
+    }
+    Ok(())
+}
+
+unsafe fn deserialize_state(
+    input: &[u8],
+    _input_data: &AggregateInputData,
+    state: *mut u8,
+) -> Result<()> {
+    let mut offset = 0;
+    let is_set = match read_u8(input, &mut offset)? {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(paro_error::internal(format!(
+                "Invalid string_agg is_set marker: {value}"
+            )));
+        }
+    };
+    let result = read_string(input, &mut offset)?;
+    let combine_separator = match read_u8(input, &mut offset)? {
+        0 => None,
+        1 => Some(read_string(input, &mut offset)?),
+        value => {
+            return Err(paro_error::internal(format!(
+                "Invalid string_agg separator marker: {value}"
+            )));
+        }
+    };
+    if offset != input.len() {
+        return Err(paro_error::internal("Trailing bytes in string_agg state"));
+    }
+    ptr::write(
+        state as *mut StringAggState,
+        StringAggState {
+            result,
+            is_set,
+            combine_separator,
+        },
+    );
+    Ok(())
 }
 
 mod string_agg_one_arg {
@@ -357,30 +457,36 @@ pub fn get_string_agg_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("string_agg".to_string());
     let state_size = std::mem::size_of::<StringAggState>();
 
-    set.add_function(AggregateFunction::new(
-        "string_agg".to_string(),
-        vec![LogicalType::Varchar],
-        LogicalType::Varchar,
-        state_size,
-        string_agg_one_arg::initialize,
-        string_agg_one_arg::update,
-        string_agg_one_arg::combine,
-        string_agg_one_arg::finalize,
-        Some(string_agg_one_arg::simple_update),
-        Some(string_agg_one_arg::destructor),
-    ));
-    set.add_function(AggregateFunction::new(
-        "string_agg".to_string(),
-        vec![LogicalType::Varchar, LogicalType::Varchar],
-        LogicalType::Varchar,
-        state_size,
-        string_agg_two_args::initialize,
-        string_agg_two_args::update,
-        string_agg_two_args::combine,
-        string_agg_two_args::finalize,
-        Some(string_agg_two_args::simple_update),
-        Some(string_agg_two_args::destructor),
-    ));
+    set.add_function(
+        AggregateFunction::new(
+            "string_agg".to_string(),
+            vec![LogicalType::Varchar],
+            LogicalType::Varchar,
+            state_size,
+            string_agg_one_arg::initialize,
+            string_agg_one_arg::update,
+            string_agg_one_arg::combine,
+            string_agg_one_arg::finalize,
+            Some(string_agg_one_arg::simple_update),
+            Some(string_agg_one_arg::destructor),
+        )
+        .with_state_serialization(serialize_state, deserialize_state),
+    );
+    set.add_function(
+        AggregateFunction::new(
+            "string_agg".to_string(),
+            vec![LogicalType::Varchar, LogicalType::Varchar],
+            LogicalType::Varchar,
+            state_size,
+            string_agg_two_args::initialize,
+            string_agg_two_args::update,
+            string_agg_two_args::combine,
+            string_agg_two_args::finalize,
+            Some(string_agg_two_args::simple_update),
+            Some(string_agg_two_args::destructor),
+        )
+        .with_state_serialization(serialize_state, deserialize_state),
+    );
 
     set
 }

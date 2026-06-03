@@ -15,16 +15,13 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_storage::buffer::{BufferPool, MemoryTag};
 
-use crate::execution_context::ExecutionContext;
 use crate::result_type::SourceResultType;
-use crate::sorting::sort::Sort;
+use crate::sorting::sort_descriptor::Sort;
 use crate::sorting::sorted_run::RunBuilder;
 use crate::sorting::sorted_run::SortedRun;
 use crate::sorting::sorted_run_merger::{
     SortedRunMerger, SortedRunMergerGlobalState, SortedRunMergerLocalState,
 };
-use crate::thread_context::ThreadContext;
-use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
 
 fn build_int_sort() -> Sort {
     Sort::new(
@@ -58,15 +55,6 @@ fn build_varchar_sort() -> Sort {
         false,
     )
     .unwrap()
-}
-
-fn test_session() -> Arc<StatementContext> {
-    TestStatementContextBuilder::minimal().build()
-}
-
-fn test_runtime() -> ExecutionContext<'static> {
-    let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-    ExecutionContext::new(test_session(), thread, None)
 }
 
 fn build_int_run(sort: &Sort, rows: &[(i32, &str)], external: bool) -> SortedRun {
@@ -312,7 +300,7 @@ fn merger_merges_variable_external_runs() {
     let sort = Arc::new(build_varchar_sort());
     let run1 = build_external_run(&sort, &[("delta", 4), ("alpha", 1)]);
     let run2 = build_external_run(&sort, &[("charlie", 3), ("bravo", 2)]);
-    let merger = SortedRunMerger::new(Arc::clone(&sort), vec![run1, run2], 2, true);
+    let merger = SortedRunMerger::new(Arc::clone(&sort), vec![run1, run2]);
     let gstate = SortedRunMergerGlobalState::new(merger.total_count(), 2, true, 1);
     let mut lstate = SortedRunMergerLocalState::new();
 
@@ -341,46 +329,36 @@ fn merger_merges_variable_external_runs() {
 }
 
 #[test]
-fn sort_get_data_initializes_empty_output_chunk() {
-    let ctx = test_runtime();
-    let sort = build_int_sort();
-    let gstate = sort.get_global_sink_state(&ctx).unwrap();
-    let mut lstate = sort.get_local_sink_state(&ctx).unwrap();
-    let input = Chunk::from_vectors(
-        vec![
-            paro_common::test_utils::test_i32_vector_with_allocator(
-                &[30, 10, 20],
-                paro_common::test_utils::test_allocator(),
-            ),
-            paro_common::test_utils::test_string_vector_with_allocator(
-                &["c", "a", "b"],
-                paro_common::test_utils::test_allocator(),
-            ),
-        ],
-        paro_common::test_utils::test_allocator(),
+fn merger_reuses_output_batch_scratch_across_batches() {
+    let sort = Arc::new(build_varchar_sort());
+    let run1 = build_external_run(&sort, &[("delta", 4), ("alpha", 1)]);
+    let run2 = build_external_run(&sort, &[("charlie", 3), ("bravo", 2)]);
+    let merger = SortedRunMerger::new(Arc::clone(&sort), vec![run1, run2]);
+    let gstate = SortedRunMergerGlobalState::new(merger.total_count(), 2, true, 1);
+    let mut lstate = SortedRunMergerLocalState::new();
+    let mut output = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Varchar, LogicalType::Integer],
+        VECTOR_SIZE,
     );
 
-    sort.sink(&ctx, &input, gstate.as_ref(), lstate.as_mut())
-        .unwrap();
-    sort.combine(&ctx, gstate.as_ref(), lstate.as_mut())
-        .unwrap();
-    sort.finalize(gstate.as_ref()).unwrap();
-
-    let source = sort.get_global_source_state(&ctx, gstate.as_ref()).unwrap();
-    let mut local_source = sort.get_local_source_state(&ctx, source.as_ref()).unwrap();
-    let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
-        .expect("test chunk allocation failed");
-    let result = sort
-        .get_data(&ctx, &mut output, source.as_ref(), local_source.as_mut())
-        .unwrap();
-
-    assert_eq!(result, SourceResultType::Finished);
+    assert_eq!(lstate.scratch_capacities(), (0, 0, 0, 0));
     assert_eq!(
-        collect_int_pairs(&output),
-        vec![
-            (10, "a".to_string()),
-            (20, "b".to_string()),
-            (30, "c".to_string()),
-        ]
+        merger.get_data(&mut output, &gstate, &mut lstate).unwrap(),
+        SourceResultType::HaveMoreOutput
     );
+    let first_caps = lstate.scratch_capacities();
+    assert!(first_caps.0 >= 2);
+    assert!(first_caps.1 > 0);
+    assert!(first_caps.2 >= 2);
+    assert!(first_caps.3 > 0);
+
+    assert_eq!(
+        merger.get_data(&mut output, &gstate, &mut lstate).unwrap(),
+        SourceResultType::Finished
+    );
+    let second_caps = lstate.scratch_capacities();
+    assert!(second_caps.0 >= first_caps.0);
+    assert!(second_caps.1 >= first_caps.1);
+    assert!(second_caps.2 >= first_caps.2);
+    assert!(second_caps.3 >= first_caps.3);
 }

@@ -106,6 +106,23 @@ pub(crate) fn nlj_probe_transform(
     })
 }
 
+pub(crate) fn sort_range_probe_transform(
+    handle: BreakerHandleId,
+    spec: &SortRangeJoinSpec,
+) -> TransformSpec {
+    TransformSpec::SortRangeJoinProbe(SortRangeJoinProbeSpec {
+        handle,
+        join_type: spec.join_type,
+        conditions: spec.conditions.clone(),
+        mark_null_condition_start: spec.mark_null_condition_start,
+        left_projection: spec.left_projection.clone(),
+        right_projection: spec.right_projection.clone(),
+        right_output_types: spec.right_output_types.clone(),
+        output_names: spec.output_names.clone(),
+        output_types: spec.output_types.clone(),
+    })
+}
+
 pub(crate) fn needs_nlj_unmatched_source(join_type: JoinType) -> bool {
     matches!(
         join_type,

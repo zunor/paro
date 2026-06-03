@@ -38,9 +38,11 @@ class SourceRegistry:
 
 def default_registry() -> SourceRegistry:
     from .divan_bench import DivanBenchSource
+    from .mixed_sql_suite import MixedSqlSuiteSource
     from .sql_suite import SqlSuiteSource
 
     registry = SourceRegistry()
     registry.register(DivanBenchSource())
+    registry.register(MixedSqlSuiteSource())
     registry.register(SqlSuiteSource())
     return registry

@@ -3,6 +3,7 @@
 
 use std::mem::size_of;
 use std::ptr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use paro_common::allocator::Allocator;
@@ -13,16 +14,19 @@ use paro_common::memory::{
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
+use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_storage::buffer::{BufferPool, MemoryTag, DEFAULT_BLOCK_ALLOC_SIZE};
 use paro_storage::row::codec::unsafe_api;
-use paro_storage::row::{RowLayout, RowValidityType};
+use paro_storage::row::{RowFormat, RowFormatHandle, RowLayout, RowValidityType};
+
+use crate::operators::join::hash::row_format::HashJoinRowFormat;
 
 use super::ht_entry::{increment_and_wrap, HtEntry};
 
 #[derive(Debug, Clone)]
 pub struct BuildRowLayout {
     base: Arc<RowLayout>,
+    row_format: HashJoinRowFormat,
     key_count: usize,
     payload_count: usize,
     spill_types: Vec<LogicalType>,
@@ -40,6 +44,11 @@ impl BuildRowLayout {
         build_types: Vec<LogicalType>,
         has_found_flag: bool,
     ) -> Self {
+        let row_format = HashJoinRowFormat::build_spill(
+            equality_types.clone(),
+            build_types.clone(),
+            has_found_flag,
+        );
         let mut base_types = equality_types.clone();
         base_types.extend(build_types.clone());
         let base = Arc::new(RowLayout::from_types(
@@ -47,15 +56,13 @@ impl BuildRowLayout {
             RowValidityType::CanHaveNullValues,
         ));
 
-        let mut spill_types = base_types;
+        let spill_types = row_format.logical_types().to_vec();
         let found_input_col_idx = if has_found_flag {
-            spill_types.push(LogicalType::Boolean);
-            Some(spill_types.len() - 1)
+            Some(base_types.len())
         } else {
             None
         };
-        let hash_input_col_idx = spill_types.len();
-        spill_types.push(LogicalType::UBigInt);
+        let hash_input_col_idx = spill_types.len() - 1;
 
         let hash_offset = base.row_width();
         let next_offset = hash_offset + size_of::<u64>();
@@ -64,6 +71,7 @@ impl BuildRowLayout {
 
         Self {
             base,
+            row_format,
             key_count: equality_types.len(),
             payload_count: build_types.len(),
             spill_types,
@@ -79,6 +87,11 @@ impl BuildRowLayout {
     #[inline]
     pub fn base(&self) -> &Arc<RowLayout> {
         &self.base
+    }
+
+    #[inline]
+    pub fn row_format(&self) -> &HashJoinRowFormat {
+        &self.row_format
     }
 
     #[inline]
@@ -158,13 +171,16 @@ impl BuildRowLayout {
     #[inline]
     pub fn set_found(&self, row_ptr: *mut u8, found: bool) {
         unsafe {
-            ptr::write_unaligned(row_ptr.add(self.found_offset), u8::from(found));
+            (*(row_ptr.add(self.found_offset) as *const AtomicU8))
+                .store(u8::from(found), Ordering::Relaxed);
         }
     }
 
     #[inline]
     pub fn found(&self, row_ptr: *const u8) -> bool {
-        unsafe { ptr::read_unaligned(row_ptr.add(self.found_offset)) != 0 }
+        unsafe {
+            (*(row_ptr.add(self.found_offset) as *const AtomicU8)).load(Ordering::Relaxed) != 0
+        }
     }
 
     pub fn read_value(&self, row_ptr: *const u8, col_idx: usize) -> Value {
@@ -358,6 +374,10 @@ impl std::fmt::Debug for HashBuildStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HashBuildStore")
             .field("layout", &self.layout)
+            .field(
+                "row_format",
+                &RowFormatHandle::from_format(self.layout.row_format()),
+            )
             .field("buffer_pool", &self.buffer_pool)
             .field("allocator", &self.allocator.name())
             .field("tag", &self.tag)
@@ -426,7 +446,7 @@ impl HashBuildStore {
     }
 
     pub fn merge(&mut self, other: HashBuildStore) -> Result<()> {
-        if self.layout.spill_types() != other.layout.spill_types() {
+        if self.layout.row_format() != other.layout.row_format() {
             return Err(paro_error::internal(
                 "cannot merge HashBuildStore with mismatched layouts".to_string(),
             ));
@@ -444,10 +464,10 @@ impl HashBuildStore {
         if chunk.size() == 0 {
             return Ok(0);
         }
-        if chunk.column_count() != self.layout.spill_types().len() {
+        if chunk.column_count() != self.layout.row_format().logical_types().len() {
             return Err(paro_error::internal(format!(
                 "HashBuildStore append width mismatch: expected {}, got {}",
-                self.layout.spill_types().len(),
+                self.layout.row_format().logical_types().len(),
                 chunk.column_count()
             )));
         }
@@ -514,6 +534,90 @@ impl HashBuildStore {
             )?;
             appended += 1;
         }
+        self.count = self.count.saturating_add(appended as u32);
+        Ok(appended)
+    }
+
+    pub fn append_key_payload_chunk(
+        &mut self,
+        keys: &Chunk,
+        payload: &Chunk,
+        selection: &SelectionVector,
+        selected_count: usize,
+        hashes: &[u64],
+        found: bool,
+    ) -> Result<usize> {
+        if selected_count == 0 {
+            return Ok(0);
+        }
+        if hashes.len() < selected_count {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore append hash count mismatch: selected={selected_count}, hashes={}",
+                hashes.len()
+            )));
+        }
+        if keys.column_count() != self.layout.key_count() {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore key width mismatch: expected {}, got {}",
+                self.layout.key_count(),
+                keys.column_count()
+            )));
+        }
+        if payload.column_count() != self.layout.payload_count() {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore payload width mismatch: expected {}, got {}",
+                self.layout.payload_count(),
+                payload.column_count()
+            )));
+        }
+
+        let mut base_columns = Vec::with_capacity(self.layout.base().column_count());
+        for col_idx in 0..self.layout.key_count() {
+            base_columns.push(keys.column(col_idx).ok_or_else(|| {
+                paro_error::internal(format!("missing hash join key column {col_idx}"))
+            })?);
+        }
+        for payload_idx in 0..self.layout.payload_count() {
+            base_columns.push(payload.column(payload_idx).ok_or_else(|| {
+                paro_error::internal(format!("missing hash join payload column {payload_idx}"))
+            })?);
+        }
+
+        let layout = self.layout.clone();
+        let mut appended = 0usize;
+        for out_idx in 0..selected_count {
+            let source_row_idx = selection.get(out_idx);
+            let estimated_heap_bytes =
+                estimate_row_heap_bytes(&layout, &base_columns, source_row_idx);
+            let block = self.ensure_current_block()?;
+            block.append_row(
+                &layout,
+                estimated_heap_bytes,
+                |row_ptr, owned_bytes, owned_values, used_bytes| {
+                    for (col_idx, column) in base_columns.iter().enumerate() {
+                        unsafe {
+                            unsafe_api::write_vector_value(
+                                layout.base(),
+                                row_ptr,
+                                col_idx,
+                                column.as_ref(),
+                                source_row_idx,
+                                owned_bytes,
+                                owned_values,
+                                used_bytes,
+                            )
+                        }?;
+                    }
+
+                    layout.set_hash(row_ptr, hashes[out_idx]);
+                    layout.set_next(row_ptr, ptr::null());
+                    layout.set_found(row_ptr, found);
+                    Ok(())
+                },
+            )?;
+            appended += 1;
+        }
+
         self.count = self.count.saturating_add(appended as u32);
         Ok(appended)
     }
@@ -742,13 +846,47 @@ fn estimate_row_heap_bytes(
         .iter()
         .enumerate()
         .map(|(col_idx, logical_type)| {
-            if columns[col_idx].is_null(row_idx) {
-                return 0;
-            }
-            let value = columns[col_idx].get_value(row_idx);
-            estimate_value_heap_bytes(logical_type, &value)
+            estimate_vector_heap_bytes(logical_type, columns[col_idx].as_ref(), row_idx)
         })
         .sum()
+}
+
+fn estimate_vector_heap_bytes(
+    logical_type: &LogicalType,
+    vector: &paro_common::vector::Vector,
+    row_idx: usize,
+) -> usize {
+    if vector.is_null(row_idx) {
+        return 0;
+    }
+
+    match logical_type {
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Json
+        | LogicalType::Jsonb
+        | LogicalType::StringLiteral => vector
+            .get_string(row_idx)
+            .map(|value| if value.len() > 12 { value.len() } else { 0 })
+            .unwrap_or_else(|| {
+                let value = vector.get_value(row_idx);
+                estimate_value_heap_bytes(logical_type, &value)
+            }),
+        LogicalType::Blob => vector
+            .get_blob(row_idx)
+            .map(|value| if value.len() > 12 { value.len() } else { 0 })
+            .unwrap_or_else(|| {
+                let value = vector.get_value(row_idx);
+                estimate_value_heap_bytes(logical_type, &value)
+            }),
+        LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Array(_, _) => {
+            let value = vector.get_value(row_idx);
+            estimate_value_heap_bytes(logical_type, &value)
+        }
+        _ => 0,
+    }
 }
 
 fn estimate_value_heap_bytes(logical_type: &LogicalType, value: &Value) -> usize {

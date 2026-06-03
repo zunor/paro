@@ -12,12 +12,12 @@ use paro_planner::operator::join::{JoinCondition, JoinType};
 use crate::physical::properties::{PipelineProperties, RequiredProperties};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
-    AdaptiveSearchSpec, AggregateSpec, ChunkScanSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec,
-    EmptyResultSpec, ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec,
-    FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphScanSpec, GraphShortestPathSpec,
-    InsertSpec, LimitSpec, ProjectSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec,
-    SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec,
-    VectorSearchSpec, WindowSpec,
+    AdaptiveSearchSpec, AggregateSpec, ChunkScanSpec, ClassicIeJoinSpec, CopyToFileSpec,
+    DeleteSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, ExternalProjectSpec,
+    ExternalTableSpec, FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec,
+    GraphScanSpec, GraphShortestPathSpec, InsertSpec, LimitSpec, ProjectSpec, RowsetScanSpec,
+    SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
+    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -373,7 +373,7 @@ pub struct PipelineSpec {
 
 #[derive(Debug, Clone)]
 pub enum SourceSpec {
-    Rowset(RowsetScanSpec),
+    Rowset(RowsetSourceSpec),
     Values(ValuesSpec),
     Dummy(DummyScanSpec),
     Empty(EmptyResultSpec),
@@ -387,6 +387,7 @@ pub enum SourceSpec {
     GraphScan(GraphScanSpec),
     ExternalTable(ExternalTableSourceSpec),
     Materialized(MaterializedSourceSpec),
+    ClassicIeJoin(ClassicIeJoinSourceSpec),
     NljUnmatched(NljUnmatchedSourceSpec),
     HashJoinSpillReplay(HashJoinSpillReplaySourceSpec),
     HashJoinUnmatched(HashJoinUnmatchedSourceSpec),
@@ -406,9 +407,10 @@ impl SourceSpec {
     #[inline]
     pub fn output_row_type(&self, fallback: &RowType) -> RowType {
         match self {
-            Self::Rowset(spec) => {
-                RowType::new(spec.output_names.to_vec(), spec.returned_types.to_vec())
-            }
+            Self::Rowset(spec) => RowType::new(
+                spec.scan.output_names.to_vec(),
+                spec.scan.returned_types.to_vec(),
+            ),
             Self::Values(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
@@ -441,6 +443,10 @@ impl SourceSpec {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
             Self::Dummy(_) => RowType::new(Vec::new(), Vec::new()),
+            Self::ClassicIeJoin(spec) => RowType::new(
+                spec.spec.output_names.to_vec(),
+                spec.spec.output_types.to_vec(),
+            ),
             Self::NljUnmatched(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
@@ -491,8 +497,17 @@ impl SourceSpec {
         mut visit: impl FnMut(BreakerHandleId, BreakerHandleKind) -> Result<()>,
     ) -> Result<()> {
         match self {
+            Self::Rowset(source) => {
+                for filter in &source.dynamic_runtime_filters {
+                    visit(filter.handle, BreakerHandleKind::HashJoinBuild)?;
+                }
+            }
             Self::Materialized(source) => {
                 visit(source.handle, BreakerHandleKind::Materialized)?;
+            }
+            Self::ClassicIeJoin(source) => {
+                visit(source.left_handle, BreakerHandleKind::Materialized)?;
+                visit(source.right_handle, BreakerHandleKind::Materialized)?;
             }
             Self::NljUnmatched(source) => {
                 visit(source.handle, BreakerHandleKind::Materialized)?;
@@ -543,8 +558,46 @@ impl SourceSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct RowsetSourceSpec {
+    pub scan: RowsetScanSpec,
+    pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterSpec]>,
+}
+
+impl RowsetSourceSpec {
+    pub fn new(scan: RowsetScanSpec) -> Self {
+        Self {
+            scan,
+            dynamic_runtime_filters: Vec::new().into_boxed_slice(),
+        }
+    }
+
+    pub fn add_dynamic_runtime_filter(&mut self, filter: RowsetDynamicRuntimeFilterSpec) {
+        let mut filters = self.dynamic_runtime_filters.to_vec();
+        if filters.iter().any(|existing| existing == &filter) {
+            return;
+        }
+        filters.push(filter);
+        self.dynamic_runtime_filters = filters.into_boxed_slice();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsetDynamicRuntimeFilterSpec {
+    pub handle: BreakerHandleId,
+    pub build_key_index: usize,
+    pub probe_column_id: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct MaterializedSourceSpec {
     pub handle: BreakerHandleId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassicIeJoinSourceSpec {
+    pub left_handle: BreakerHandleId,
+    pub right_handle: BreakerHandleId,
+    pub spec: ClassicIeJoinSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +705,7 @@ pub enum TransformSpec {
     Project(ProjectSpec),
     HashJoinProbe(HashJoinProbeSpec),
     NestedLoopJoinProbe(NestedLoopJoinProbeSpec),
+    SortRangeJoinProbe(SortRangeJoinProbeSpec),
     CrossProductProbe(CrossProductProbeSpec),
     Limit(LimitSpec),
     StreamingTopN(TopNSpec),
@@ -702,6 +756,9 @@ impl TransformSpec {
             Self::NestedLoopJoinProbe(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
+            Self::SortRangeJoinProbe(spec) => {
+                RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
+            }
             Self::CrossProductProbe(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
@@ -719,6 +776,9 @@ impl TransformSpec {
                 visit(transform.handle, BreakerHandleKind::HashJoinBuild)?;
             }
             Self::NestedLoopJoinProbe(transform) => {
+                visit(transform.handle, BreakerHandleKind::Materialized)?;
+            }
+            Self::SortRangeJoinProbe(transform) => {
                 visit(transform.handle, BreakerHandleKind::Materialized)?;
             }
             Self::CrossProductProbe(transform) => {
@@ -753,6 +813,19 @@ pub struct NestedLoopJoinProbeSpec {
     pub conditions: Box<[JoinCondition]>,
     pub mark_null_condition_start: Option<usize>,
     pub arbitrary_condition: Option<Expression>,
+    pub left_projection: Box<[usize]>,
+    pub right_projection: Box<[usize]>,
+    pub right_output_types: Box<[LogicalType]>,
+    pub output_names: Box<[String]>,
+    pub output_types: Box<[LogicalType]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SortRangeJoinProbeSpec {
+    pub handle: BreakerHandleId,
+    pub join_type: JoinType,
+    pub conditions: Box<[JoinCondition]>,
+    pub mark_null_condition_start: Option<usize>,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub right_output_types: Box<[LogicalType]>,

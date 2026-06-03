@@ -18,7 +18,7 @@ use paro_storage::tablet::{TabletReader, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::sort::build::query_has_temporary_directory;
 use crate::physical::specs::GraphScanSpec;
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
@@ -202,11 +202,11 @@ fn poll_graph_scan_filter(
                         scan_chunk.size(),
                         scan_chunk.allocator().clone(),
                     )?;
-                    filter_scan.filter_executor.execute_all_into_with_input(
-                        ExpressionEvalInput {
+                    filter_scan.filter_executor.execute_all_kernel(
+                        VectorKernelInput::from_eval_input(ExpressionEvalInput {
                             params: ctx.query.params.as_ref(),
                             columns: &scan_chunk,
-                        },
+                        }),
                         ctx.query,
                         &mut filter_result,
                     )?;
@@ -351,10 +351,10 @@ fn init_graph_filter_scan(
     )?;
     Ok(GraphFilterScanState {
         reader,
-        filter_executor: ExpressionExecutor::with_expressions(&[remap_graph_columns(
-            filter,
-            &column_ids,
-        )?]),
+        filter_executor: ExpressionExecutor::with_expressions_for_session(
+            &[remap_graph_columns(filter, &column_ids)?],
+            ctx.query.session.as_ref(),
+        ),
         current_chunk: None,
         current_filter: None,
         current_row: 0,

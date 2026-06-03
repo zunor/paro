@@ -3,19 +3,21 @@
 
 //! Fetch-driven scheduler for ordinary typed pipeline DAGs.
 
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::explain::profiler::OperatorProfiler;
+use crate::explain::profiler::{OperatorProfiler, ProfileWorkerContext};
 use crate::pipeline::graph::{PipelineGraph, PipelineId, PipelineRoot, SinkSharing};
 use crate::pipeline::PipelineProgramSet;
 use crate::runtime::{
     BlockReason, Blocker, BreakerHandleRegistry, CleanupReason, OperatorWakeScope,
-    PipelineDependencyGates, PipelineRuntime, PipelineTaskExecutor, PipelineTaskId,
-    PipelineTaskStepContext, QueryRuntimeContext, SharedSinkRuntimeSet, TaskStepResult, WakeSource,
+    PipelineDependencyGates, PipelineRuntime, PipelineSchedulingPolicy, PipelineTaskExecutor,
+    PipelineTaskId, PipelineTaskStepContext, QueryRuntimeContext, ReadyEntry, SharedSinkRuntimeSet,
+    TaskStepResult, WakeSource,
 };
 use crate::thread_context::ThreadContext;
 
@@ -45,8 +47,10 @@ pub struct PipelineExecutionDriver {
     gates: PipelineDependencyGates,
     finished: Vec<bool>,
     finished_count: usize,
-    ready: VecDeque<PipelineId>,
-    active: Option<ActivePipelineTask>,
+    ready: BinaryHeap<ReadyEntry<PipelineId>>,
+    ready_seq: u64,
+    running: VecDeque<ActivePipelineTask>,
+    policy: PipelineSchedulingPolicy,
     allocator: Arc<dyn Allocator>,
 }
 
@@ -63,9 +67,8 @@ impl PipelineExecutionDriver {
         let handles = Arc::new(BreakerHandleRegistry::from_catalog(&graph.handles)?);
         let shared_sinks = SharedSinkRuntimeSet::from_graph(&graph)?;
         let gates = PipelineDependencyGates::from_graph(&graph);
-        let ready = gates.ready_pipelines().into_iter().collect::<VecDeque<_>>();
         let pipeline_count = programs.pipeline_count();
-        Ok(Self {
+        let mut driver = Self {
             graph,
             programs,
             handles,
@@ -73,10 +76,16 @@ impl PipelineExecutionDriver {
             gates,
             finished: vec![false; pipeline_count],
             finished_count: 0,
-            ready,
-            active: None,
+            ready: BinaryHeap::new(),
+            ready_seq: 0,
+            running: VecDeque::new(),
+            policy: PipelineSchedulingPolicy::default(),
             allocator,
-        })
+        };
+        for pipeline in driver.gates.ready_pipelines() {
+            driver.push_ready_pipeline(pipeline, 0, query.memory.available_bytes());
+        }
+        Ok(driver)
     }
 
     pub fn drive_until_output_or_finished(
@@ -133,23 +142,25 @@ impl PipelineExecutionDriver {
             if self.finished_count == self.finished.len() {
                 return Ok(PipelineDriveResult::Finished);
             }
-            if self.active.is_none() {
-                self.start_next_ready_pipeline(query)?;
+            if self.running.is_empty() {
+                self.start_ready_pipelines(query)?;
             }
-            let Some(active) = self.active.as_mut() else {
+            let Some(mut active) = self.running.pop_front() else {
                 return Err(paro_error::internal(
-                    "typed pipeline scheduler has unfinished work but no active task",
+                    "typed pipeline scheduler has unfinished work but no running task",
                 ));
             };
 
             match active.step(query)? {
-                TaskStepResult::Continue => {}
+                TaskStepResult::Continue => {
+                    self.running.push_back(active);
+                }
                 TaskStepResult::Done => {
                     let pipeline = active.pipeline;
-                    self.active = None;
-                    self.mark_pipeline_finished(pipeline);
+                    self.mark_pipeline_finished(pipeline, query);
                 }
                 TaskStepResult::Blocked(blocker) => {
+                    self.running.push_front(active);
                     if stop_on_output && !query.output.is_empty() {
                         return Ok(PipelineDriveResult::ChunkReady);
                     }
@@ -159,13 +170,31 @@ impl PipelineExecutionDriver {
         }
     }
 
-    fn start_next_ready_pipeline(&mut self, query: &QueryRuntimeContext) -> Result<()> {
-        loop {
-            let Some(pipeline_id) = self.ready.pop_front() else {
-                return Err(paro_error::internal(
-                    "typed pipeline scheduler could not find a ready pipeline",
-                ));
+    fn start_ready_pipelines(&mut self, query: &QueryRuntimeContext) -> Result<()> {
+        let target = self.target_active_tasks(query);
+        while self.running.len() < target {
+            let Some(task) = self.pop_next_ready_pipeline(query)? else {
+                break;
             };
+            self.running.push_back(task);
+        }
+        if self.running.is_empty() {
+            return Err(paro_error::internal(
+                "typed pipeline scheduler could not find a ready pipeline",
+            ));
+        }
+        Ok(())
+    }
+
+    fn pop_next_ready_pipeline(
+        &mut self,
+        query: &QueryRuntimeContext,
+    ) -> Result<Option<ActivePipelineTask>> {
+        loop {
+            let Some(entry) = self.ready.pop() else {
+                return Ok(None);
+            };
+            let pipeline_id = entry.payload;
             if self
                 .finished
                 .get(pipeline_id.index())
@@ -179,15 +208,33 @@ impl PipelineExecutionDriver {
                     "typed pipeline scheduler dequeued a pipeline before its gates opened",
                 ));
             }
-            self.active = Some(self.create_pipeline_task(pipeline_id, query)?);
-            return Ok(());
+            let thread_id = self.running.len();
+            return Ok(Some(self.create_pipeline_task(
+                pipeline_id,
+                query,
+                thread_id,
+                self.target_active_tasks(query),
+            )?));
         }
+    }
+
+    fn target_active_tasks(&self, query: &QueryRuntimeContext) -> usize {
+        if !query.session.limits.parallel_scheduler {
+            return 1;
+        }
+        query
+            .session
+            .number_of_threads()
+            .max(1)
+            .min(self.ready.len().saturating_add(self.running.len()).max(1))
     }
 
     fn create_pipeline_task(
         &self,
         pipeline: PipelineId,
         query: &QueryRuntimeContext,
+        thread_id: usize,
+        total_threads: usize,
     ) -> Result<ActivePipelineTask> {
         let program = self
             .programs
@@ -209,10 +256,37 @@ impl PipelineExecutionDriver {
             query,
             shared_sink,
         )?);
-        ActivePipelineTask::new(runtime, query, self.allocator.clone())
+        ActivePipelineTask::new(
+            runtime,
+            query,
+            self.allocator.clone(),
+            thread_id,
+            total_threads,
+        )
     }
 
-    fn mark_pipeline_finished(&mut self, pipeline: PipelineId) {
+    fn push_ready_pipeline(
+        &mut self,
+        pipeline: PipelineId,
+        dependency_unblocks: u32,
+        available_memory: usize,
+    ) {
+        let priority = self.policy.ready_priority_for_pipeline(
+            self.graph.as_ref(),
+            pipeline,
+            dependency_unblocks,
+            self.ready_seq.min(u32::MAX as u64) as u32,
+            available_memory,
+        );
+        self.ready.push(ReadyEntry {
+            priority,
+            seq: self.ready_seq,
+            payload: pipeline,
+        });
+        self.ready_seq = self.ready_seq.saturating_add(1);
+    }
+
+    fn mark_pipeline_finished(&mut self, pipeline: PipelineId, query: &QueryRuntimeContext) {
         if self.finished[pipeline.index()] {
             return;
         }
@@ -220,7 +294,7 @@ impl PipelineExecutionDriver {
         self.finished_count += 1;
         for event in self.gates.mark_finished(pipeline) {
             if !self.finished[event.pipeline.index()] && self.gates.is_ready(event.pipeline) {
-                self.ready.push_back(event.pipeline);
+                self.push_ready_pipeline(event.pipeline, 1, query.memory.available_bytes());
             }
         }
     }
@@ -259,11 +333,13 @@ impl Drop for PipelineExecutionDriver {
 
 struct ActivePipelineTask {
     pipeline: PipelineId,
+    source_node_id: u64,
     executor: PipelineTaskExecutor,
     thread: ThreadContext,
     wake: OperatorWakeScope,
     profiler: OperatorProfiler,
     blocked: Option<Blocker>,
+    blocked_at: Option<Instant>,
 }
 
 impl ActivePipelineTask {
@@ -271,26 +347,41 @@ impl ActivePipelineTask {
         runtime: Arc<PipelineRuntime>,
         query: &QueryRuntimeContext,
         allocator: Arc<dyn Allocator>,
+        thread_id: usize,
+        total_threads: usize,
     ) -> Result<Self> {
         let task = runtime.create_task_state(query, allocator)?;
         let pipeline = runtime.program.id;
+        let source_node_id = runtime.program.source.operator_id.index() as u64;
         let task_id = PipelineTaskId(pipeline.index() as u64);
-        let profiler = query
-            .explain_profiler
-            .as_ref()
-            .map_or_else(OperatorProfiler::disabled, |profiler| {
-                OperatorProfiler::new(profiler.clone())
-            });
+        let profiler =
+            query
+                .explain_profiler
+                .as_ref()
+                .map_or_else(OperatorProfiler::disabled, |profiler| {
+                    OperatorProfiler::new_with_context(
+                        profiler.clone(),
+                        ProfileWorkerContext::new(
+                            Some(pipeline.index() as u64),
+                            Some(pipeline.index() as u64),
+                            Some(thread_id as u64),
+                            Some(total_threads.max(1) as u64),
+                            None,
+                        ),
+                    )
+                });
         Ok(Self {
             pipeline,
+            source_node_id,
             executor: PipelineTaskExecutor::new(runtime, task),
-            thread: ThreadContext::single_threaded(),
+            thread: ThreadContext::new(thread_id, total_threads.max(1)),
             wake: OperatorWakeScope {
                 task_id,
                 generation: query.output.wake_generation(),
             },
             profiler,
             blocked: None,
+            blocked_at: None,
         })
     }
 
@@ -319,7 +410,9 @@ impl ActivePipelineTask {
         match &result {
             TaskStepResult::Done => self.profiler.flush(),
             TaskStepResult::Blocked(blocker) => {
+                self.profiler.record_blocked(self.source_node_id, blocker);
                 self.blocked = Some(blocker.clone());
+                self.blocked_at = Some(Instant::now());
             }
             TaskStepResult::Continue => {}
         }
@@ -348,7 +441,14 @@ impl ActivePipelineTask {
             return Ok(false);
         }
         self.executor.resume_after_wake()?;
-        self.blocked = None;
+        let blocker = self.blocked.take();
+        let wait_time_us = self
+            .blocked_at
+            .take()
+            .map(|blocked_at| blocked_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        self.profiler
+            .record_wake(self.source_node_id, blocker.as_ref(), wait_time_us);
         self.wake.generation = query.output.wake_generation();
         Ok(true)
     }

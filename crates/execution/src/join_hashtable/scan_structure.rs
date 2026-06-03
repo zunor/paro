@@ -12,7 +12,7 @@ use paro_common::vector::Vector;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use std::sync::Arc;
 
-use crate::join_hashtable::join_hashtable::JoinHashTable;
+use crate::join_hashtable::JoinHashTable;
 use crate::operators::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
     construct_semi_join_result,
@@ -29,10 +29,14 @@ pub struct ScanStructure {
     pub pointers: Vec<usize>,
     /// Incremental selection vector for the pointers.
     pub sel_vector: SelectionVector,
+    /// Reusable selection vector for probe rows after NULL filtering.
+    pub probe_sel: SelectionVector,
+    /// Reusable selection vector for probe rows that need to continue a chain.
+    continue_sel: SelectionVector,
     /// Selection vector for matches that passed equality checks.
     pub chain_match_sel: SelectionVector,
-    /// Selection vector for matches that failed equality checks (and need chain advancement).
-    pub chain_no_match_sel: SelectionVector,
+    /// General-purpose scratch selection for residual filters and output gathers.
+    pub scratch_sel: SelectionVector,
     /// Number of active pointers (matches found and needs verifying).
     pub count: usize,
     /// Whether each probe-side row has found at least one match.
@@ -41,6 +45,10 @@ pub struct ScanStructure {
     pub lhs_sel: SelectionVector,
     /// Pointers to build-side rows that passed all predicates.
     pub rhs_pointers: Vec<usize>,
+    /// Reusable probe hash buffer.
+    pub hashes: Vec<u64>,
+    /// Reusable flags for residual-filtered probe rows.
+    accepted_flags: Vec<bool>,
     /// Number of matches to be returned in current batch.
     pub match_count: usize,
     /// Whether the scan is finished.
@@ -61,8 +69,10 @@ impl std::fmt::Debug for ScanStructure {
             .field("allocator", &self.allocator.name())
             .field("pointers", &self.pointers)
             .field("sel_vector", &self.sel_vector)
+            .field("probe_sel", &self.probe_sel)
+            .field("continue_sel", &self.continue_sel)
             .field("chain_match_sel", &self.chain_match_sel)
-            .field("chain_no_match_sel", &self.chain_no_match_sel)
+            .field("scratch_sel", &self.scratch_sel)
             .field("count", &self.count)
             .field("match_count", &self.match_count)
             .field("finished", &self.finished)
@@ -103,17 +113,16 @@ impl ScanStructure {
 
             if res_count > 0 {
                 let rhs_offset = base_count;
-                let mut residual_sel =
-                    SelectionVector::try_incremental(res_count, self.allocator.clone())?;
+                self.scratch_sel.set_len(res_count);
                 let accepted_count = residual_filter(
                     &self.chain_match_sel,
                     &self.rhs_pointers[rhs_offset..rhs_offset + res_count],
                     res_count,
-                    &mut residual_sel,
+                    &mut self.scratch_sel,
                 )?;
 
                 for i in 0..accepted_count {
-                    let match_idx = residual_sel.get(i);
+                    let match_idx = self.scratch_sel.get(i);
                     self.chain_match_sel
                         .set(i, self.chain_match_sel.get(match_idx));
                     self.rhs_pointers[rhs_offset + i] = self.rhs_pointers[rhs_offset + match_idx];
@@ -180,12 +189,16 @@ impl ScanStructure {
             allocator: allocator.clone(),
             pointers: vec![0; VECTOR_SIZE],
             sel_vector: SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone())?,
+            probe_sel: SelectionVector::try_with_capacity(VECTOR_SIZE, allocator.clone())?,
+            continue_sel: SelectionVector::try_with_capacity(VECTOR_SIZE, allocator.clone())?,
             chain_match_sel: SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone())?,
-            chain_no_match_sel: SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone())?,
+            scratch_sel: SelectionVector::try_with_capacity(VECTOR_SIZE, allocator.clone())?,
             count: 0,
             found_match: vec![false; VECTOR_SIZE],
             lhs_sel: SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone())?,
             rhs_pointers: vec![0; VECTOR_SIZE],
+            hashes: vec![0; VECTOR_SIZE],
+            accepted_flags: vec![false; VECTOR_SIZE],
             match_count: 0,
             finished: false,
             is_null: true,
@@ -204,10 +217,13 @@ impl ScanStructure {
         self.pointers.resize(capacity, 0);
         self.found_match.resize(capacity, false);
         self.rhs_pointers.resize(capacity, 0);
+        self.hashes.resize(capacity, 0);
+        self.accepted_flags.resize(capacity, false);
         self.sel_vector = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
+        self.probe_sel = SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
+        self.continue_sel = SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
         self.chain_match_sel = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
-        self.chain_no_match_sel =
-            SelectionVector::try_incremental(capacity, self.allocator.clone())?;
+        self.scratch_sel = SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
         self.lhs_sel = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
         Ok(())
     }
@@ -300,6 +316,33 @@ impl ScanStructure {
         self.count = new_count;
     }
 
+    fn advance_pointers_continue_sel(&mut self, sel_count: usize) {
+        if !self.has_long_chains {
+            self.count = 0;
+            return;
+        }
+
+        let mut new_count = 0;
+        for i in 0..sel_count {
+            let idx = self.continue_sel.get(i);
+            let ptr = self.pointers[idx];
+            if ptr == 0 {
+                continue;
+            }
+
+            let next_ptr = unsafe {
+                let next_ptr_location = (ptr + self.pointer_offset) as *const *const u8;
+                std::ptr::read_unaligned(next_ptr_location)
+            };
+            self.pointers[idx] = next_ptr as usize;
+            if next_ptr as usize != 0 {
+                self.sel_vector.set(new_count, idx);
+                new_count += 1;
+            }
+        }
+        self.count = new_count;
+    }
+
     /// Mark rows as matched (for outer joins).
     pub fn mark_matches(&mut self, result_sel: &SelectionVector, result_count: usize) {
         for i in 0..result_count {
@@ -347,7 +390,7 @@ impl ScanStructure {
                 !matches!(
                     condition.comparison,
                     paro_planner::operator::join::JoinComparisonType::NotDistinctFrom
-                ) && keys.data[col_idx].get_value(row_idx).is_null()
+                ) && keys.data[col_idx].is_null(row_idx)
             })
     }
 
@@ -362,39 +405,44 @@ impl ScanStructure {
     {
         while self.count > 0 {
             let match_count = self.resolve_predicates(keys, hash_table, 0);
-            let mut accepted_sel =
-                SelectionVector::try_incremental(match_count, self.allocator.clone())?;
+            self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
                 &self.rhs_pointers[..match_count],
                 match_count,
-                &mut accepted_sel,
+                &mut self.scratch_sel,
             )?;
 
-            let mut accepted_flags = vec![false; self.found_match.len()];
+            // accepted_flags is only read for rows that remain in sel_vector in
+            // this chain step, so clearing the active slice is enough and avoids
+            // an O(VECTOR_SIZE) reset on every long-chain iteration.
+            for i in 0..self.count {
+                self.accepted_flags[self.sel_vector.get(i)] = false;
+            }
             for i in 0..accepted_count {
-                let match_idx = accepted_sel.get(i);
+                let match_idx = self.scratch_sel.get(i);
                 let lhs_idx = self.chain_match_sel.get(match_idx);
                 self.found_match[lhs_idx] = true;
-                accepted_flags[lhs_idx] = true;
+                self.accepted_flags[lhs_idx] = true;
             }
 
-            let mut continue_rows = Vec::with_capacity(self.count.saturating_sub(accepted_count));
+            self.continue_sel.set_len(self.count);
+            let mut continue_count = 0usize;
+            let continue_rows = self.continue_sel.as_mut_slice();
             for i in 0..self.count {
                 let lhs_idx = self.sel_vector.get(i);
-                if !accepted_flags[lhs_idx] {
-                    continue_rows.push(lhs_idx as u32);
+                if !self.accepted_flags[lhs_idx] {
+                    continue_rows[continue_count] = lhs_idx as u32;
+                    continue_count += 1;
                 }
             }
 
-            if continue_rows.is_empty() {
+            if continue_count == 0 {
                 self.count = 0;
                 break;
             }
 
-            let continue_sel =
-                SelectionVector::try_from_indices(continue_rows, self.allocator.clone())?;
-            self.advance_pointers_sel(&continue_sel, continue_sel.len());
+            self.advance_pointers_continue_sel(continue_count);
         }
 
         Ok(())
@@ -411,17 +459,16 @@ impl ScanStructure {
     {
         while self.count > 0 {
             let match_count = self.resolve_predicates(keys, hash_table, 0);
-            let mut accepted_sel =
-                SelectionVector::try_incremental(match_count, self.allocator.clone())?;
+            self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
                 &self.rhs_pointers[..match_count],
                 match_count,
-                &mut accepted_sel,
+                &mut self.scratch_sel,
             )?;
 
             for i in 0..accepted_count {
-                let match_idx = accepted_sel.get(i);
+                let match_idx = self.scratch_sel.get(i);
                 let lhs_idx = self.chain_match_sel.get(match_idx);
                 self.found_match[lhs_idx] = true;
                 let rhs_ptr = self.rhs_pointers[match_idx];
@@ -453,20 +500,35 @@ impl ScanStructure {
 
         self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
 
-        let selected_rows: Vec<u32> = (0..left.size())
-            .filter(|&idx| self.found_match[idx] == MATCH)
-            .map(|idx| idx as u32)
-            .collect();
-
-        if selected_rows.is_empty() {
-            result.set_cardinality(0);
-        } else {
-            let sel = SelectionVector::try_from_indices(selected_rows, self.allocator.clone())?;
-            if MATCH {
-                construct_semi_join_result(left, &sel, sel.len(), left_projection_map, result)?;
-            } else {
-                construct_anti_join_result(left, &sel, sel.len(), left_projection_map, result)?;
+        self.scratch_sel.set_len(left.size());
+        let mut selected_count = 0usize;
+        let selected_rows = self.scratch_sel.as_mut_slice();
+        for idx in 0..left.size() {
+            if self.found_match[idx] == MATCH {
+                selected_rows[selected_count] = idx as u32;
+                selected_count += 1;
             }
+        }
+        self.scratch_sel.set_len(selected_count);
+
+        if selected_count == 0 {
+            result.set_cardinality(0);
+        } else if MATCH {
+            construct_semi_join_result(
+                left,
+                &self.scratch_sel,
+                selected_count,
+                left_projection_map,
+                result,
+            )?;
+        } else {
+            construct_anti_join_result(
+                left,
+                &self.scratch_sel,
+                selected_count,
+                left_projection_map,
+                result,
+            )?;
         }
 
         self.finished = true;
@@ -482,10 +544,7 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         base_offset: usize,
     ) -> usize {
-        // For now, we only implement simple equality checks
-
         let mut match_count = 0;
-        let equality_types = &hash_table.equality_types;
 
         for i in 0..self.count {
             let idx = self.sel_vector.get(i);
@@ -495,20 +554,7 @@ impl ScanStructure {
                 continue;
             }
 
-            // Verify all equality conditions
-            let mut matched = true;
-
-            for (col_idx, _col_type) in equality_types.iter().enumerate() {
-                let probe_val = keys.data[col_idx].get_value(idx);
-                let build_val = hash_table.read_equality_value(row_ptr, col_idx);
-
-                if !hash_table.equality_values_match(col_idx, &probe_val, &build_val) {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if matched {
+            if hash_table.key_values_match_build_row(keys, idx, row_ptr) {
                 self.chain_match_sel.set(match_count, idx);
                 self.rhs_pointers[base_offset + match_count] = row_ptr as usize;
                 match_count += 1;
@@ -617,17 +663,16 @@ impl ScanStructure {
             let rhs_offset = base_count;
             let match_count = self.resolve_predicates(keys, hash_table, rhs_offset);
             if match_count > 0 {
-                let mut accepted_sel =
-                    SelectionVector::try_incremental(match_count, self.allocator.clone())?;
+                self.scratch_sel.set_len(match_count);
                 let accepted_count = residual_filter(
                     &self.chain_match_sel,
                     &self.rhs_pointers[rhs_offset..rhs_offset + match_count],
                     match_count,
-                    &mut accepted_sel,
+                    &mut self.scratch_sel,
                 )?;
 
                 for i in 0..accepted_count {
-                    let match_idx = accepted_sel.get(i);
+                    let match_idx = self.scratch_sel.get(i);
                     let lhs_idx = self.chain_match_sel.get(match_idx);
                     self.lhs_sel.set(base_count + i, lhs_idx);
                     self.rhs_pointers[rhs_offset + i] = self.rhs_pointers[rhs_offset + match_idx];
@@ -655,22 +700,26 @@ impl ScanStructure {
             return Ok(base_count);
         }
 
-        let unmatched_rows: Vec<u32> = (0..left.size())
-            .filter(|&idx| !self.found_match[idx])
-            .map(|idx| idx as u32)
-            .collect();
+        self.scratch_sel.set_len(left.size());
+        let mut unmatched_count = 0usize;
+        let unmatched_rows = self.scratch_sel.as_mut_slice();
+        for idx in 0..left.size() {
+            if !self.found_match[idx] {
+                unmatched_rows[unmatched_count] = idx as u32;
+                unmatched_count += 1;
+            }
+        }
+        self.scratch_sel.set_len(unmatched_count);
 
-        if unmatched_rows.is_empty() {
+        if unmatched_count == 0 {
             result.set_cardinality(0);
         } else {
-            let unmatched_sel =
-                SelectionVector::try_from_indices(unmatched_rows, self.allocator.clone())?;
             let projected_right_types =
                 Self::projected_build_types(hash_table, right_projection_map);
             construct_left_outer_result(
                 left,
-                &unmatched_sel,
-                unmatched_sel.len(),
+                &self.scratch_sel,
+                unmatched_count,
                 left_projection_map,
                 &projected_right_types,
                 result,
@@ -861,17 +910,16 @@ impl ScanStructure {
 
         while self.count > 0 {
             let match_count = self.resolve_predicates(keys, hash_table, 0);
-            let mut accepted_sel =
-                SelectionVector::try_incremental(match_count, self.allocator.clone())?;
+            self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
                 &self.rhs_pointers[..match_count],
                 match_count,
-                &mut accepted_sel,
+                &mut self.scratch_sel,
             )?;
 
             for i in 0..accepted_count {
-                let match_idx = accepted_sel.get(i);
+                let match_idx = self.scratch_sel.get(i);
                 let lhs_idx = self.chain_match_sel.get(match_idx);
                 if matched_ptrs[lhs_idx].is_some() {
                     return Err(paro_common::error::invalid_input(
@@ -1025,7 +1073,7 @@ impl ScanStructure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::join_hashtable::join_hashtable::{JoinHashTable, JoinHashTableConfig};
+    use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
     use paro_common::chunk::Chunk;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;

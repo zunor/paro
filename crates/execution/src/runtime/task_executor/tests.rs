@@ -9,7 +9,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_context::{
-    NoopStatementTimeoutDriver, StatementCancelReason, StatementCancellation,
+    NoopStatementTimeoutDriver, RuntimeLimits, StatementCancelReason, StatementCancellation,
     TestStatementContextBuilder,
 };
 use paro_function::aggregate::distributive::count::get_count_star_function;
@@ -23,9 +23,9 @@ use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, OrderByExpression, ReferenceExpression,
     WindowExpression, WindowFrame,
 };
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
-use crate::explain::profiler::OperatorProfiler;
+use crate::explain::profiler::{ExplainProfileSnapshot, ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::properties::{MemoryClass, PipelineProperties, PropertyRepairKind};
 use crate::physical::row_type::RowType;
@@ -42,7 +42,7 @@ use crate::pipeline::graph::{
     MaterializeSinkSpec, MaterializedSourceSpec, PerfectHashAggregateEmitSourceSpec,
     PerfectHashAggregateSinkSpec, PipelineDependency, PipelineGraph, PipelineId, PipelineRoot,
     PipelineSpec, PropertyRepairSpec, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
-    SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
+    SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
     UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, WindowBuildSinkSpec,
     WindowEmitSourceSpec,
 };
@@ -65,6 +65,32 @@ fn query_context(output: QueryOutputPort) -> QueryRuntimeContext {
         Arc::new(QueryMemoryPool::unbounded()),
         output,
     )
+}
+
+fn query_context_with_limits(
+    output: QueryOutputPort,
+    limits: RuntimeLimits,
+) -> QueryRuntimeContext {
+    let max_memory = limits.max_memory;
+    QueryRuntimeContext::new(
+        TestStatementContextBuilder::minimal()
+            .with_limits(limits)
+            .build(),
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::new(max_memory)),
+        output,
+    )
+}
+
+fn unique_temp_dir(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("{}_{}_{}", prefix, std::process::id(), now))
+        .to_string_lossy()
+        .to_string()
 }
 
 fn empty_runtime(query: &QueryRuntimeContext) -> Arc<PipelineRuntime> {
@@ -287,6 +313,8 @@ fn install_statement_cancellation(
 mod breaker_tests;
 #[path = "completion_tests.rs"]
 mod completion_tests;
+#[path = "hash_join_spill_tests.rs"]
+mod hash_join_spill_tests;
 #[path = "join_tests.rs"]
 mod join_tests;
 #[path = "running_tests.rs"]

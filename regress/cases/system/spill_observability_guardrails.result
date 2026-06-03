@@ -30,11 +30,13 @@ QUERY PLAN
 PIPELINE 0
   SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=4)
   TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=3)
-  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 spilled=true peak_memory_bytes=303095 spilled_bytes=886405)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
   TRANSFORM #4 PROJECTION (actual time=<time-range> rows=10000 loops=5)
   SINK #5 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 10000
 
@@ -46,11 +48,13 @@ GROUP BY k1, k2;
 QUERY PLAN
 PIPELINE 0
   SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=50)
-  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=49)
+  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=49 spilled=true spilled_bytes=<bytes> repartition_depth=1)
 PIPELINE 1
-  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=99)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=200000 loops=98)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=200000 loops=98)
+  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=105)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=200000 loops=104)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=200000 loops=104)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=1
 Execution Time: <time-ms>
 Rows Returned: 200000
 
@@ -78,11 +82,13 @@ QUERY PLAN
 PIPELINE 0
   SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=4)
   TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=3)
-  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 peak_memory_bytes=362135)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 peak_memory_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
   TRANSFORM #4 PROJECTION (actual time=<time-range> rows=10000 loops=5)
   SINK #5 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 10000
 

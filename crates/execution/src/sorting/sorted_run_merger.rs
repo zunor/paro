@@ -2,19 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::sort_key::compare_keys;
 use paro_common::vector::VECTOR_SIZE;
 
-use crate::execution_context::ExecutionContext;
-use crate::operator_state::{GlobalSourceState, LocalSourceState};
 use crate::result_type::SourceResultType;
 
-use super::sort::Sort;
+use super::sort_descriptor::Sort;
 use super::sort_key_store::KeyCursor;
 use super::sorted_run::{RunRowCursor, SortedRun};
+
+const MERGE_KEY_SCRATCH_RETAIN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct KWayMergeState {
@@ -35,6 +37,27 @@ struct RunConsumption {
 struct MergeOutputBatch {
     output_positions: Vec<u32>,
     consumptions: Vec<RunConsumption>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MergeHeapEntry {
+    key: Vec<u8>,
+    run_idx: usize,
+    sorted_position: u32,
+}
+
+impl Ord for MergeHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_keys(&other.key, &self.key)
+            .then_with(|| other.run_idx.cmp(&self.run_idx))
+            .then_with(|| other.sorted_position.cmp(&self.sorted_position))
+    }
+}
+
+impl PartialOrd for MergeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl MergeOutputBatch {
@@ -77,24 +100,15 @@ pub struct SortedRunMerger {
     pub(crate) sort: Arc<Sort>,
     pub(crate) sorted_runs: Vec<SortedRun>,
     total_count: usize,
-    partition_size: usize,
-    external: bool,
 }
 
 impl SortedRunMerger {
-    pub fn new(
-        sort: Arc<Sort>,
-        sorted_runs: Vec<SortedRun>,
-        partition_size: usize,
-        external: bool,
-    ) -> Self {
+    pub fn new(sort: Arc<Sort>, sorted_runs: Vec<SortedRun>) -> Self {
         let total_count = sorted_runs.iter().map(SortedRun::count).sum();
         Self {
             sort,
             sorted_runs,
             total_count,
-            partition_size: partition_size.max(1),
-            external,
         }
     }
 
@@ -106,26 +120,6 @@ impl SortedRunMerger {
     #[inline]
     pub fn run_count(&self) -> usize {
         self.sorted_runs.len()
-    }
-
-    pub fn get_local_source_state(
-        &self,
-        _ctx: &ExecutionContext,
-        _global_state: &dyn GlobalSourceState,
-    ) -> Result<Box<dyn LocalSourceState>> {
-        Ok(Box::new(SortedRunMergerLocalState::new()))
-    }
-
-    pub fn get_global_source_state(
-        &self,
-        _ctx: &ExecutionContext,
-    ) -> Result<Box<dyn GlobalSourceState>> {
-        Ok(Box::new(SortedRunMergerGlobalState::new(
-            self.total_count,
-            self.partition_size,
-            self.external,
-            1,
-        )))
     }
 
     pub fn get_data(
@@ -152,9 +146,8 @@ impl SortedRunMerger {
             .map(|run| run.key_store().cursor_on_demand(1))
             .collect::<Vec<_>>();
 
-        let mut output_batch = MergeOutputBatch::default();
-        self.collect_output_batch(lstate, &mut key_cursors, &mut output_batch)?;
-        if output_batch.len() == 0 {
+        self.collect_output_batch(lstate, &mut key_cursors)?;
+        if lstate.output_batch.len() == 0 {
             self.finish_partition(gstate, lstate)?;
             if gstate.all_partitions_scanned() {
                 chunk.set_cardinality(0);
@@ -175,8 +168,8 @@ impl SortedRunMerger {
             .map(SortedRun::external_payload_cursor)
             .collect::<Vec<Option<RunRowCursor<'_>>>>();
 
-        for consumption in &output_batch.consumptions {
-            let positions = &output_batch.output_positions[consumption.output_range_start
+        for consumption in &lstate.output_batch.consumptions {
+            let positions = &lstate.output_batch.output_positions[consumption.output_range_start
                 ..consumption.output_range_start + consumption.output_range_len];
             let run = &self.sorted_runs[consumption.run_idx];
             run.gather_sorted_range_projected(
@@ -189,7 +182,7 @@ impl SortedRunMerger {
                 payload_row_cursors[consumption.run_idx].as_mut(),
             )?;
         }
-        chunk.set_cardinality(output_batch.len());
+        chunk.set_cardinality(lstate.output_batch.len());
 
         let mut result = SourceResultType::HaveMoreOutput;
         if lstate.batch_exhausted() {
@@ -234,6 +227,7 @@ impl SortedRunMerger {
             current_positions: start_positions,
             end_positions,
         });
+        lstate.clear_merge_heap();
         Ok(true)
     }
 
@@ -256,63 +250,82 @@ impl SortedRunMerger {
         &self,
         lstate: &mut SortedRunMergerLocalState,
         key_cursors: &mut [KeyCursor<'_>],
-        output_batch: &mut MergeOutputBatch,
     ) -> Result<()> {
-        output_batch.clear();
-        let Some(merge_state) = lstate.merge_state.as_mut() else {
+        lstate.output_batch.clear();
+        if lstate.merge_state.is_none() {
             return Ok(());
-        };
+        }
 
-        let remaining = merge_state
-            .end_positions
-            .iter()
-            .zip(merge_state.current_positions.iter())
-            .map(|(end, current)| end.saturating_sub(*current) as usize)
-            .sum::<usize>();
+        let remaining = {
+            let merge_state = lstate
+                .merge_state
+                .as_ref()
+                .expect("merge state checked above");
+            merge_state
+                .end_positions
+                .iter()
+                .zip(merge_state.current_positions.iter())
+                .map(|(end, current)| end.saturating_sub(*current) as usize)
+                .sum::<usize>()
+        };
         let batch_count = remaining.min(VECTOR_SIZE);
+        if lstate.merge_heap.is_empty() && remaining > 0 {
+            for run_idx in 0..self.sorted_runs.len() {
+                let sorted_position = {
+                    let merge_state = lstate
+                        .merge_state
+                        .as_ref()
+                        .expect("merge state checked above");
+                    (merge_state.current_positions[run_idx] < merge_state.end_positions[run_idx])
+                        .then_some(merge_state.current_positions[run_idx])
+                };
+                let Some(sorted_position) = sorted_position else {
+                    continue;
+                };
+                let mut entry = lstate.take_merge_heap_entry(run_idx, sorted_position);
+                self.read_merge_heap_entry_key(&mut entry, key_cursors)?;
+                lstate.merge_heap.push(entry);
+            }
+        }
 
         for output_idx in 0..batch_count {
-            let Some(run_idx) = self.select_next_run(merge_state, key_cursors)? else {
+            let Some(mut entry) = lstate.merge_heap.pop() else {
                 break;
             };
-            let sorted_position = merge_state.current_positions[run_idx];
-            merge_state.current_positions[run_idx] += 1;
-            output_batch.push(run_idx, sorted_position, output_idx as u32);
+            lstate
+                .output_batch
+                .push(entry.run_idx, entry.sorted_position, output_idx as u32);
             lstate.current_position += 1;
+            let next_position = entry.sorted_position + 1;
+            let end_position = {
+                let merge_state = lstate
+                    .merge_state
+                    .as_mut()
+                    .expect("merge state checked above");
+                merge_state.current_positions[entry.run_idx] = next_position;
+                merge_state.end_positions[entry.run_idx]
+            };
+            if next_position < end_position {
+                entry.sorted_position = next_position;
+                self.read_merge_heap_entry_key(&mut entry, key_cursors)?;
+                lstate.merge_heap.push(entry);
+            } else {
+                lstate.recycle_merge_heap_entry(entry);
+            }
         }
 
         Ok(())
     }
 
-    fn select_next_run(
+    fn read_merge_heap_entry_key(
         &self,
-        merge_state: &KWayMergeState,
+        entry: &mut MergeHeapEntry,
         key_cursors: &mut [KeyCursor<'_>],
-    ) -> Result<Option<usize>> {
-        let mut best: Option<usize> = None;
-        for run_idx in 0..self.sorted_runs.len() {
-            if merge_state.current_positions[run_idx] >= merge_state.end_positions[run_idx] {
-                continue;
-            }
-            best = match best {
-                None => Some(run_idx),
-                Some(best_idx) => {
-                    let ordering = self.compare_positions(
-                        run_idx,
-                        merge_state.current_positions[run_idx],
-                        best_idx,
-                        merge_state.current_positions[best_idx],
-                        key_cursors,
-                    )?;
-                    if ordering == Ordering::Less {
-                        Some(run_idx)
-                    } else {
-                        Some(best_idx)
-                    }
-                }
-            };
-        }
-        Ok(best)
+    ) -> Result<()> {
+        let ordinal = self.sorted_runs[entry.run_idx]
+            .source_ordinal_at_sorted_position(entry.sorted_position)?;
+        key_cursors[entry.run_idx].read_key_into(ordinal, &mut entry.key)?;
+        Ok(())
     }
 
     fn compute_partition_boundaries(
@@ -408,6 +421,9 @@ pub struct SortedRunMergerLocalState {
     pub merge_state: Option<KWayMergeState>,
     pub prev_run_positions: Option<Vec<u32>>,
     pub partition_idx: Option<usize>,
+    output_batch: MergeOutputBatch,
+    merge_heap: BinaryHeap<MergeHeapEntry>,
+    merge_entry_pool: Vec<MergeHeapEntry>,
 }
 
 impl SortedRunMergerLocalState {
@@ -418,6 +434,9 @@ impl SortedRunMergerLocalState {
             merge_state: None,
             prev_run_positions: None,
             partition_idx: None,
+            output_batch: MergeOutputBatch::default(),
+            merge_heap: BinaryHeap::new(),
+            merge_entry_pool: Vec::new(),
         }
     }
 
@@ -428,15 +447,51 @@ impl SortedRunMergerLocalState {
             true
         }
     }
-}
 
-impl LocalSourceState for SortedRunMergerLocalState {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn clear_merge_heap(&mut self) {
+        while let Some(entry) = self.merge_heap.pop() {
+            self.recycle_merge_heap_entry(entry);
+        }
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn take_merge_heap_entry(&mut self, run_idx: usize, sorted_position: u32) -> MergeHeapEntry {
+        if let Some(mut entry) = self.merge_entry_pool.pop() {
+            entry.run_idx = run_idx;
+            entry.sorted_position = sorted_position;
+            entry.key.clear();
+            entry
+        } else {
+            MergeHeapEntry {
+                key: Vec::new(),
+                run_idx,
+                sorted_position,
+            }
+        }
+    }
+
+    fn recycle_merge_heap_entry(&mut self, mut entry: MergeHeapEntry) {
+        if entry.key.capacity() > MERGE_KEY_SCRATCH_RETAIN_BYTES {
+            entry.key = Vec::new();
+        } else {
+            entry.key.clear();
+        }
+        self.merge_entry_pool.push(entry);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scratch_capacities(&self) -> (usize, usize, usize, usize) {
+        let key_scratch_bytes = self
+            .merge_heap
+            .iter()
+            .chain(self.merge_entry_pool.iter())
+            .map(|entry| entry.key.capacity())
+            .sum();
+        (
+            self.output_batch.output_positions.capacity(),
+            self.output_batch.consumptions.capacity(),
+            self.merge_heap.capacity(),
+            key_scratch_bytes,
+        )
     }
 }
 
@@ -557,15 +612,5 @@ impl SortedRunMergerGlobalState {
         }
         *next_release_partition = release_upto;
         Ok(())
-    }
-}
-
-impl GlobalSourceState for SortedRunMergerGlobalState {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn max_threads(&self) -> usize {
-        self.max_threads()
     }
 }

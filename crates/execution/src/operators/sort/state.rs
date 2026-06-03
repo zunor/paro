@@ -9,7 +9,7 @@ use paro_common::types::LogicalType;
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::runtime::breaker::SortSealedState;
-use crate::sorting::sort::Sort;
+use crate::sorting::sort_descriptor::Sort;
 use crate::sorting::sorted_run::RunBuilder;
 use crate::sorting::sorted_run_merger::SortedRunMergerLocalState;
 

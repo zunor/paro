@@ -114,6 +114,8 @@ PIPELINE 5
   SOURCE #19 SORT_EMIT (actual time=<time-range> rows=2 loops=2)
   TRANSFORM #20 PROJECTION (actual time=<time-range> rows=2 loops=1)
   SINK #21 CLIENT_RESULT (actual time=<time-range> rows=2 loops=1)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 2
 
@@ -186,5 +188,7 @@ CONTROL_REGION 0 RECURSIVE_CTE (iterations=3 termination=empty_delta)
   ITERATION 1 (delta_rows=1 working_rows=1)
   ITERATION 2 (delta_rows=2 working_rows=2)
   ITERATION 3 (delta_rows=2 working_rows=2)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 5

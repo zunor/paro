@@ -3,19 +3,23 @@
 
 //! DISTINCT aggregate helpers shared by hash and ungrouped build sinks.
 
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use paro_common::allocator::ArenaAllocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::{AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext};
-use paro_common::runtime_value::Value;
+use paro_common::memory::{
+    AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext, PrecomputedHashBuildHasher,
+};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
+use paro_storage::buffer::BufferPool;
+use paro_storage::row::{Ordering, PinnedRows};
 
-use crate::operators::aggregate::accounted_rows::{AccountedValueRow, AccountedValueRowSet};
+use crate::operators::aggregate::accounted_rows::{
+    AccountedDistinctKey, DistinctRowSet, DistinctRows,
+};
 use crate::operators::aggregate::aggregate_kernel::{
     build_state_vector, update_states, AggregatePayload,
 };
@@ -35,8 +39,9 @@ pub(crate) fn collect_distinct_rows(
     aggregate_objects: &[AggregateObject],
     payload: &Chunk,
     group_refs: &[usize],
+    buffer_pool: &Arc<BufferPool>,
     modifier_memory: &MemoryAccountingContext,
-    distinct_sets: &mut [Option<AccountedValueRowSet>],
+    distinct_sets: &mut [Option<DistinctRowSet>],
 ) -> Result<()> {
     let row_count = payload.size();
     let filter_selections = if has_aggregate_filters(spec) {
@@ -49,21 +54,33 @@ pub(crate) fn collect_distinct_rows(
             continue;
         }
         let input_refs = &spec.aggregate_inputs[agg_idx];
+        let row_refs = distinct_row_refs(group_refs, input_refs);
+        validate_distinct_row_refs(payload, &row_refs, agg_idx)?;
+        let row_types = distinct_row_types(spec, &row_refs, agg_idx)?;
+        if distinct_sets[agg_idx].is_none() {
+            distinct_sets[agg_idx] = Some(DistinctRowSet::new(
+                Arc::clone(buffer_pool),
+                row_types,
+                modifier_memory.clone(),
+            ));
+        }
         let seen = distinct_sets[agg_idx]
-            .get_or_insert_with(|| AccountedValueRowSet::new(modifier_memory.clone()));
+            .as_mut()
+            .expect("distinct set initialized");
+        let mut projected_payload =
+            Chunk::try_init_empty(seen.row_types(), payload.allocator().clone())?;
+        projected_payload.reference_columns(payload, &row_refs);
         let filter = filter_selections.as_ref().and_then(|f| f[agg_idx].as_ref());
+        let mut selection =
+            SelectionVector::try_with_capacity(row_count, payload.allocator().clone())?;
+        selection.set_len(row_count);
+        let mut selected_count = 0usize;
+        let mut key_scratch = Vec::new();
         let mut insert_row = |row_idx: usize| -> Result<()> {
-            let mut key = Vec::with_capacity(group_refs.len() + input_refs.len());
-            for &col_idx in group_refs.iter().chain(input_refs.iter()) {
-                let col = payload.column(col_idx).ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "distinct payload column not found: idx={col_idx}"
-                    ))
-                })?;
-                key.push(col.get_value(row_idx));
+            if seen.try_insert_key_from_chunk(&projected_payload, row_idx, &mut key_scratch)? {
+                selection.try_set(selected_count, row_idx)?;
+                selected_count += 1;
             }
-            seen.insert(key)
-                .map_err(|e| paro_error::out_of_memory(format!("distinct aggregate: {e}")))?;
             Ok(())
         };
         if let Some(sel) = filter {
@@ -75,66 +92,48 @@ pub(crate) fn collect_distinct_rows(
                 insert_row(row_idx)?;
             }
         }
+        selection.set_len(selected_count);
+        seen.append_selected_rows(&projected_payload, &selection, selected_count)?;
     }
     Ok(())
 }
 
-/// Trait for accessing values from a distinct row.
-pub(crate) trait DistinctRowValues {
-    fn values(&self) -> &[Value];
+fn distinct_row_refs(group_refs: &[usize], input_refs: &[usize]) -> Vec<usize> {
+    group_refs
+        .iter()
+        .chain(input_refs.iter())
+        .copied()
+        .collect()
 }
 
-impl DistinctRowValues for AccountedValueRow {
-    fn values(&self) -> &[Value] {
-        &self[..]
-    }
-}
-
-impl DistinctRowValues for &AccountedValueRow {
-    fn values(&self) -> &[Value] {
-        &(*self)[..]
-    }
-}
-
-/// A projected view of a distinct row for grouping-set deduplication.
-#[derive(Clone, Copy)]
-pub(crate) struct ProjectedDistinctRow<'a> {
-    pub row: &'a AccountedValueRow,
-    pub present_groups: &'a [bool],
-    pub group_count: usize,
-}
-
-impl PartialEq for ProjectedDistinctRow<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        if self.group_count != other.group_count
-            || self.present_groups != other.present_groups
-            || self.row.len().saturating_sub(self.group_count)
-                != other.row.len().saturating_sub(other.group_count)
-        {
-            return false;
+fn validate_distinct_row_refs(payload: &Chunk, row_refs: &[usize], agg_idx: usize) -> Result<()> {
+    for &col_idx in row_refs {
+        if col_idx >= payload.column_count() {
+            return Err(paro_error::internal(format!(
+                "distinct payload column not found for aggregate {agg_idx}: idx={col_idx}, column_count={}",
+                payload.column_count()
+            )));
         }
-        for group_idx in 0..self.group_count {
-            if self.present_groups[group_idx] && self.row[group_idx] != other.row[group_idx] {
-                return false;
-            }
-        }
-        self.row[self.group_count..] == other.row[other.group_count..]
     }
+    Ok(())
 }
 
-impl Eq for ProjectedDistinctRow<'_> {}
-
-impl Hash for ProjectedDistinctRow<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.group_count.hash(state);
-        self.present_groups.hash(state);
-        for group_idx in 0..self.group_count {
-            if self.present_groups[group_idx] {
-                self.row[group_idx].hash(state);
-            }
-        }
-        self.row[self.group_count..].hash(state);
-    }
+fn distinct_row_types(
+    spec: &AggregateSpec,
+    row_refs: &[usize],
+    agg_idx: usize,
+) -> Result<Vec<LogicalType>> {
+    row_refs
+        .iter()
+        .map(|&idx| {
+            spec.payload_types.get(idx).cloned().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "distinct payload type not found for aggregate {agg_idx}: idx={idx}, type_count={}",
+                    spec.payload_types.len()
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Build a bitmask indicating which groups are present in a grouping set.
@@ -156,69 +155,139 @@ pub(crate) fn grouping_set_present_mask(
 }
 
 /// Allocate an accounted hash set for projected distinct deduplication.
-pub(crate) fn new_projected_distinct_set<'a>(
+pub(crate) fn new_projected_distinct_set(
     modifier_memory: &MemoryAccountingContext,
     capacity: usize,
     agg_idx: usize,
-) -> Result<AccountedHashSet<ProjectedDistinctRow<'a>>> {
+) -> Result<AccountedHashSet<AccountedDistinctKey, PrecomputedHashBuildHasher>> {
     let metadata_memory = modifier_memory.with_class(MemoryAccountingClass::Metadata);
-    let mut seen = AccountedHashSet::new_with_accounting(
+    let mut seen = AccountedHashSet::new_with_accounting_and_hasher(
         metadata_memory
             .grant()
             .map_err(|e| paro_error::out_of_memory(format!("distinct aggregate {agg_idx}: {e}")))?,
         metadata_memory.tag(),
         metadata_memory.accounting_class(),
+        PrecomputedHashBuildHasher,
     );
     seen.try_reserve(capacity)
         .map_err(|e| paro_error::out_of_memory(format!("distinct aggregate {agg_idx}: {e}")))?;
     Ok(seen)
 }
 
-/// Populate an input chunk with values from distinct rows.
-pub(crate) fn populate_distinct_input_chunk<R: DistinctRowValues>(
+/// Populate an input chunk from pinned distinct rows.
+pub(crate) fn populate_distinct_input_chunk(
     chunk: &mut Chunk,
-    rows: &[R],
+    pinned: &PinnedRows<'_>,
+    output_positions: &[u32],
     value_offset: usize,
     input_count: usize,
     agg_idx: usize,
 ) -> Result<()> {
-    chunk.try_set_cardinality(rows.len())?;
-    for input_idx in 0..input_count {
-        let col = chunk.column_mut(input_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "missing input column {input_idx} while finalizing DISTINCT aggregate {agg_idx}"
-            ))
-        })?;
-        for (row_idx, row) in rows.iter().enumerate() {
-            col.set_value(row_idx, &row.values()[value_offset + input_idx]);
+    if chunk.column_count() < input_count {
+        return Err(paro_error::internal(format!(
+            "missing input columns while finalizing DISTINCT aggregate {agg_idx}: required={input_count}, actual={}",
+            chunk.column_count()
+        )));
+    }
+    let projections = (0..input_count)
+        .map(|input_idx| (value_offset + input_idx, input_idx))
+        .collect::<Vec<_>>();
+    if projections.is_empty() {
+        chunk.try_set_cardinality(pinned.len())?;
+        return Ok(());
+    }
+    pinned.gather_columns_projected(&projections, chunk, output_positions)?;
+    Ok(())
+}
+
+/// Populate a group chunk from pinned distinct rows, applying present mask.
+pub(crate) fn populate_distinct_group_chunk(
+    groups: &mut Chunk,
+    pinned: &PinnedRows<'_>,
+    output_positions: &[u32],
+    present_groups: &[bool],
+    agg_idx: usize,
+) -> Result<()> {
+    if groups.column_count() < present_groups.len() {
+        return Err(paro_error::internal(format!(
+            "missing group columns while finalizing DISTINCT aggregate {agg_idx}: required={}, actual={}",
+            present_groups.len(),
+            groups.column_count()
+        )));
+    }
+    groups.try_set_cardinality(pinned.len())?;
+    let projections = present_groups
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(group_idx, is_present)| is_present.then_some((group_idx, group_idx)))
+        .collect::<Vec<_>>();
+    if !projections.is_empty() {
+        pinned.gather_columns_projected(&projections, groups, output_positions)?;
+    }
+    for (group_idx, is_present) in present_groups.iter().copied().enumerate() {
+        if !is_present {
+            let col = groups.column_mut(group_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "missing group column {group_idx} while finalizing DISTINCT aggregate {agg_idx}"
+                ))
+            })?;
+            col.validity_mut().try_set_all_invalid(pinned.len())?;
         }
     }
     Ok(())
 }
 
-/// Populate a group chunk with values from distinct rows, applying present mask.
-pub(crate) fn populate_distinct_group_chunk<R: DistinctRowValues>(
-    groups: &mut Chunk,
-    rows: &[R],
+fn reset_identity_output_positions(positions: &mut Vec<u32>, count: usize) -> Result<()> {
+    let count_u32 = u32::try_from(count).map_err(|_| {
+        paro_error::internal(format!(
+            "distinct batch too large for output positions: count={count}"
+        ))
+    })?;
+    positions.clear();
+    positions
+        .try_reserve(count)
+        .map_err(|_| paro_error::out_of_memory("distinct output position allocation failed"))?;
+    positions.extend(0..count_u32);
+    Ok(())
+}
+
+fn projected_distinct_key_types(
+    group_types: &[LogicalType],
+    input_types: &[LogicalType],
     present_groups: &[bool],
-    agg_idx: usize,
-) -> Result<()> {
-    groups.try_set_cardinality(rows.len())?;
+) -> Vec<LogicalType> {
+    let mut types = Vec::with_capacity(
+        present_groups.iter().filter(|&&present| present).count() + input_types.len(),
+    );
     for (group_idx, is_present) in present_groups.iter().copied().enumerate() {
-        let col = groups.column_mut(group_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "missing group column {group_idx} while finalizing DISTINCT aggregate {agg_idx}"
-            ))
-        })?;
         if is_present {
-            for (row_idx, row) in rows.iter().enumerate() {
-                col.set_value(row_idx, &row.values()[group_idx]);
-            }
-        } else {
-            col.validity_mut().try_set_all_invalid(rows.len())?;
+            types.push(group_types[group_idx].clone());
         }
     }
-    Ok(())
+    types.extend(input_types.iter().cloned());
+    types
+}
+
+fn projected_distinct_key_projections(
+    group_count: usize,
+    input_count: usize,
+    present_groups: &[bool],
+) -> Vec<(usize, usize)> {
+    let mut output_idx = 0usize;
+    let mut projections =
+        Vec::with_capacity(present_groups.iter().filter(|&&present| present).count() + input_count);
+    for (group_idx, is_present) in present_groups.iter().copied().enumerate() {
+        if is_present {
+            projections.push((group_idx, output_idx));
+            output_idx += 1;
+        }
+    }
+    for input_idx in 0..input_count {
+        projections.push((group_count + input_idx, output_idx));
+        output_idx += 1;
+    }
+    projections
 }
 
 /// Finalize distinct rows into hash aggregate tables after all input is consumed.
@@ -228,7 +297,7 @@ pub(crate) fn finalize_distinct_into_tables(
     group_refs: &[usize],
     grouping_sets: &[Box<[usize]>],
     modifier_memory: &MemoryAccountingContext,
-    distinct_sets: &mut [Option<AccountedValueRowSet>],
+    distinct_sets: &mut [Option<DistinctRowSet>],
     tables: &mut [AggregateHashTable],
 ) -> Result<()> {
     let group_count = group_refs.len();
@@ -245,7 +314,7 @@ pub(crate) fn finalize_distinct_into_tables(
             continue;
         }
         let rows = match distinct_sets[agg_idx].take() {
-            Some(set) => set.into_rows(),
+            Some(set) => set.into_rows()?,
             None => continue,
         };
         if rows.is_empty() {
@@ -254,13 +323,11 @@ pub(crate) fn finalize_distinct_into_tables(
         let input_refs = &spec.aggregate_inputs[agg_idx];
         let input_count = input_refs.len();
         let expected_len = group_count + input_count;
-        for row in &rows {
-            if row.len() != expected_len {
-                return Err(paro_error::internal(format!(
-                    "distinct row width mismatch at aggregate {agg_idx}: expected={expected_len}, actual={}",
-                    row.len()
-                )));
-            }
+        if rows.row_width() != expected_len {
+            return Err(paro_error::internal(format!(
+                "distinct row width mismatch at aggregate {agg_idx}: expected={expected_len}, actual={}",
+                rows.row_width()
+            )));
         }
         let allocator = tables
             .first()
@@ -292,42 +359,66 @@ pub(crate) fn finalize_distinct_into_tables(
                 new_groups: SelectionVector::try_with_capacity(capacity, allocator.clone())?,
                 arena: ArenaAllocator::new(table_allocator),
                 allocator: allocator.clone(),
+                output_positions: Vec::new(),
             };
-            let mut batch = Vec::with_capacity(rows.len().min(VECTOR_SIZE));
             let needs_projected_dedup = present_groups.iter().any(|present| !present);
-            let mut projected_seen = if needs_projected_dedup {
-                Some(new_projected_distinct_set(
-                    modifier_memory,
-                    rows.len(),
-                    agg_idx,
-                )?)
-            } else {
-                None
-            };
-            for row in &rows {
-                if let Some(seen) = projected_seen.as_mut() {
-                    let inserted = seen
-                        .try_insert(ProjectedDistinctRow {
-                            row,
-                            present_groups: &present_groups,
-                            group_count,
-                        })
-                        .map_err(|e| {
-                            paro_error::out_of_memory(format!("distinct aggregate {agg_idx}: {e}"))
-                        })?;
+            if !needs_projected_dedup {
+                for batch in rows.ordinals().chunks(VECTOR_SIZE) {
+                    updater.flush(&rows, batch)?;
+                }
+                continue;
+            }
+
+            let mut projected_seen =
+                new_projected_distinct_set(modifier_memory, rows.len(), agg_idx)?;
+            let projected_key_memory = modifier_memory.with_class(MemoryAccountingClass::Metadata);
+            let projected_key_types =
+                projected_distinct_key_types(&group_types, &input_types, &present_groups);
+            let projected_key_projections =
+                projected_distinct_key_projections(group_count, input_count, &present_groups);
+            let mut projected_key_chunk =
+                Chunk::try_initialize(&projected_key_types, capacity, allocator.clone())?;
+            let mut projected_positions = Vec::new();
+            let mut key_scratch = Vec::new();
+            let mut batch = Vec::with_capacity(rows.len().min(VECTOR_SIZE));
+            for candidate_ordinals in rows.ordinals().chunks(VECTOR_SIZE) {
+                reset_identity_output_positions(
+                    &mut projected_positions,
+                    candidate_ordinals.len(),
+                )?;
+                let pinned = rows.pin_ordinals(candidate_ordinals, Ordering::Sequential)?;
+                if projected_key_projections.is_empty() {
+                    projected_key_chunk.try_set_cardinality(candidate_ordinals.len())?;
+                } else {
+                    pinned.gather_columns_projected(
+                        &projected_key_projections,
+                        &mut projected_key_chunk,
+                        &projected_positions,
+                    )?;
+                }
+                for (row_idx, &ordinal) in candidate_ordinals.iter().enumerate() {
+                    let key = AccountedDistinctKey::from_chunk_row(
+                        &projected_key_memory,
+                        &projected_key_chunk,
+                        row_idx,
+                        &mut key_scratch,
+                    )?;
+                    let inserted = projected_seen.try_insert(key).map_err(|e| {
+                        paro_error::out_of_memory(format!("distinct aggregate {agg_idx}: {e}"))
+                    })?;
                     if !inserted {
                         continue;
                     }
+                    batch.push(ordinal);
+                    if batch.len() < VECTOR_SIZE {
+                        continue;
+                    }
+                    updater.flush(&rows, &batch)?;
+                    batch.clear();
                 }
-                batch.push(row);
-                if batch.len() < VECTOR_SIZE {
-                    continue;
-                }
-                updater.flush(&batch)?;
-                batch.clear();
             }
             if !batch.is_empty() {
-                updater.flush(&batch)?;
+                updater.flush(&rows, &batch)?;
             }
         }
     }
@@ -350,14 +441,24 @@ pub(crate) struct DistinctTableBatchUpdater<'a> {
     new_groups: SelectionVector,
     arena: ArenaAllocator,
     allocator: Arc<dyn paro_common::allocator::Allocator>,
+    output_positions: Vec<u32>,
 }
 
 impl DistinctTableBatchUpdater<'_> {
-    pub(crate) fn flush(&mut self, batch: &[&AccountedValueRow]) -> Result<()> {
-        populate_distinct_group_chunk(&mut self.groups, batch, self.present_groups, self.agg_idx)?;
+    pub(crate) fn flush(&mut self, rows: &DistinctRows, batch: &[u64]) -> Result<()> {
+        let pinned = rows.pin_ordinals(batch, Ordering::Sequential)?;
+        reset_identity_output_positions(&mut self.output_positions, batch.len())?;
+        populate_distinct_group_chunk(
+            &mut self.groups,
+            &pinned,
+            &self.output_positions,
+            self.present_groups,
+            self.agg_idx,
+        )?;
         populate_distinct_input_chunk(
             &mut self.input_chunk,
-            batch,
+            &pinned,
+            &self.output_positions,
             self.group_count,
             self.input_count,
             self.agg_idx,
@@ -411,7 +512,7 @@ pub(crate) fn finalize_ungrouped_distinct(
             continue;
         }
         let rows = match local.distinct_sets[agg_idx].take() {
-            Some(set) => set.into_rows(),
+            Some(set) => set.into_rows()?,
             None => continue,
         };
         if rows.is_empty() {
@@ -433,8 +534,18 @@ pub(crate) fn finalize_ungrouped_distinct(
             rows.len().min(VECTOR_SIZE).max(1),
             allocator.clone(),
         )?;
-        for batch in rows.chunks(VECTOR_SIZE) {
-            populate_distinct_input_chunk(&mut input_chunk, batch, 0, input_count, agg_idx)?;
+        let mut output_positions = Vec::new();
+        for batch in rows.ordinals().chunks(VECTOR_SIZE) {
+            let pinned = rows.pin_ordinals(batch, Ordering::Sequential)?;
+            reset_identity_output_positions(&mut output_positions, batch.len())?;
+            populate_distinct_input_chunk(
+                &mut input_chunk,
+                &pinned,
+                &output_positions,
+                0,
+                input_count,
+                agg_idx,
+            )?;
             fill_repeated_state_addresses(&mut local.addresses, agg_ptr, batch.len())?;
             let payload_desc = AggregatePayload {
                 chunk: &input_chunk,

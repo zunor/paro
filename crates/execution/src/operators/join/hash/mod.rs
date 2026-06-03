@@ -2,9 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub(crate) mod build;
+pub(crate) mod hashing;
+pub(crate) mod keys;
+pub(crate) mod memory;
+pub(crate) mod payload;
 pub(crate) mod probe;
+pub(crate) mod probe_output;
 pub(crate) mod replay;
-pub(crate) mod runtime;
+pub mod row_format;
+pub(crate) mod spill;
 pub(crate) mod unmatched;
 
 pub use build::HashJoinBuildSinkExec;

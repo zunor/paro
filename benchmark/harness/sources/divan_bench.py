@@ -115,7 +115,7 @@ def normalize_divan_payload(
                 f"structured Divan bench '{bench_id}' has {len(samples)} samples; "
                 f"expected at least {minimum_sample_count}"
             )
-        queries.append({
+        query = {
             "id": bench_id,
             "samples_ms": samples,
             "samples_count": len(samples),
@@ -123,7 +123,11 @@ def normalize_divan_payload(
             "divan": {
                 "items": _optional_positive_int(bench.get("items")),
             },
-        })
+        }
+        audit = _optional_audit(bench.get("audit"))
+        if audit:
+            query["audit"] = audit
+        queries.append(query)
 
     if not queries:
         raise ValueError(f"structured Divan result for source '{source.name}' contains no selected benches")
@@ -242,6 +246,30 @@ def _optional_positive_int(value: Any) -> int | None:
     if isinstance(value, int) and value > 0:
         return value
     return None
+
+
+def _optional_audit(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    audit: dict[str, Any] = {}
+    chunk_count = _optional_positive_int(value.get("chunk_count"))
+    if chunk_count is not None:
+        audit["chunk_count"] = chunk_count
+    for key in ("allocator_tracking_event_counts", "allocator_tracking_events_per_chunk"):
+        raw = value.get(key)
+        if not isinstance(raw, list):
+            continue
+        numbers = [
+            float(item)
+            for item in raw
+            if isinstance(item, (int, float)) and not isinstance(item, bool)
+        ]
+        if not numbers:
+            continue
+        audit[key] = numbers
+        audit[f"{key}_median"] = float(statistics.median(numbers))
+        audit[f"{key}_max"] = float(max(numbers))
+    return audit or None
 
 
 def _safe_path_name(value: str) -> str:

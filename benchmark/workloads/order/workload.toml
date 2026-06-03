@@ -1,6 +1,6 @@
 [meta]
 name = "order"
-description = "ORDER BY and TopN benchmarks covering in-memory sort, variable keys, and fallback plans"
+description = "ORDER BY and TopN benchmarks covering in-memory sort, variable keys, and scan-order TopN plans"
 
 [params]
 numeric_rows = 12000
@@ -44,4 +44,4 @@ id = "topn_large_fallback"
 file = "sql/q_topn_large_fallback.sql"
 validate = "ordered_rows"
 expected = [[6001], [6002], [6003], [6004], [6005]]
-plan_contains = ["STREAMING_LIMIT", "ORDER_BY"]
+plan_contains = ["TOP_N", "Scan Order"]

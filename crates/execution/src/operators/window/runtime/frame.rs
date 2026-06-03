@@ -37,17 +37,110 @@ pub(super) fn aggregate_window_value(
 ) -> Result<Value> {
     let (frame_start, frame_end) =
         frame_bounds(chunks, sorted_keys, partition, expr, absolute_idx)?;
-    let name = expr.function.name.to_ascii_lowercase();
-    match name.as_str() {
-        "count" => aggregate_count(chunks, sorted_keys, frame_start, frame_end, expr),
-        "sum" => aggregate_sum(chunks, sorted_keys, frame_start, frame_end, expr),
-        "avg" => aggregate_avg(chunks, sorted_keys, frame_start, frame_end, expr),
-        "min" => aggregate_min_max(chunks, sorted_keys, frame_start, frame_end, expr, false),
-        "max" => aggregate_min_max(chunks, sorted_keys, frame_start, frame_end, expr, true),
-        _ => Err(paro_error::not_implemented(format!(
+    match aggregate_frame_function(&expr.function.name) {
+        Some(AggregateFrameFunction::Count) => {
+            aggregate_count(chunks, sorted_keys, frame_start, frame_end, expr)
+        }
+        Some(AggregateFrameFunction::Sum) => {
+            aggregate_sum(chunks, sorted_keys, frame_start, frame_end, expr)
+        }
+        Some(AggregateFrameFunction::Avg) => {
+            aggregate_avg(chunks, sorted_keys, frame_start, frame_end, expr)
+        }
+        Some(AggregateFrameFunction::Min) => {
+            aggregate_min_max(chunks, sorted_keys, frame_start, frame_end, expr, false)
+        }
+        Some(AggregateFrameFunction::Max) => {
+            aggregate_min_max(chunks, sorted_keys, frame_start, frame_end, expr, true)
+        }
+        None => Err(paro_error::not_implemented(format!(
             "Aggregate window function '{}' is not supported by the window breaker frame kernel",
             expr.function.name
         ))),
+    }
+}
+
+pub(super) fn try_aggregate_partition_fast(
+    chunks: &[Chunk],
+    sorted_keys: &[WindowRowKey],
+    partition: WindowPartition,
+    expr: &WindowExpression,
+) -> Result<Option<Vec<Value>>> {
+    if expr.frame.frame_type != WindowFrameType::Rows {
+        return Ok(None);
+    }
+    let Some(function) = aggregate_frame_function(&expr.function.name) else {
+        return Ok(None);
+    };
+    if function != AggregateFrameFunction::Count && expr.children.len() != 1 {
+        return Ok(None);
+    }
+
+    let partition_len = partition.end.saturating_sub(partition.start);
+    let mut starts = Vec::with_capacity(partition_len);
+    let mut ends = Vec::with_capacity(partition_len);
+    for absolute_idx in partition.start..partition.end {
+        let (start, end) = frame_bounds(chunks, sorted_keys, partition, expr, absolute_idx)?;
+        starts.push(start - partition.start);
+        ends.push(end - partition.start);
+    }
+
+    match function {
+        AggregateFrameFunction::Count if expr.children.is_empty() => {
+            Ok(Some(fast_count_star(&starts, &ends)))
+        }
+        AggregateFrameFunction::Count => {
+            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
+            Ok(Some(fast_count_values(&starts, &ends, &values)))
+        }
+        AggregateFrameFunction::Sum => {
+            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
+            Ok(fast_sum_values(&starts, &ends, &values, &expr.return_type))
+        }
+        AggregateFrameFunction::Avg => {
+            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
+            Ok(Some(fast_avg_values(
+                &starts,
+                &ends,
+                &values,
+                &expr.return_type,
+            )))
+        }
+        AggregateFrameFunction::Min | AggregateFrameFunction::Max => {
+            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
+            Ok(Some(fast_min_max_values(
+                &starts,
+                &ends,
+                &values,
+                &expr.return_type,
+                function == AggregateFrameFunction::Max,
+            )?))
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggregateFrameFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+fn aggregate_frame_function(name: &str) -> Option<AggregateFrameFunction> {
+    if name.eq_ignore_ascii_case("count") {
+        Some(AggregateFrameFunction::Count)
+    } else if name.eq_ignore_ascii_case("sum") {
+        Some(AggregateFrameFunction::Sum)
+    } else if name.eq_ignore_ascii_case("avg") {
+        Some(AggregateFrameFunction::Avg)
+    } else if name.eq_ignore_ascii_case("min") {
+        Some(AggregateFrameFunction::Min)
+    } else if name.eq_ignore_ascii_case("max") {
+        Some(AggregateFrameFunction::Max)
+    } else {
+        None
     }
 }
 
@@ -99,6 +192,237 @@ fn frame_bounds(
         }
     };
     Ok((start.min(partition.end), end.min(partition.end).max(start)))
+}
+
+fn partition_argument_values(
+    chunks: &[Chunk],
+    sorted_keys: &[WindowRowKey],
+    partition: WindowPartition,
+    expr: &WindowExpression,
+) -> Result<Vec<Value>> {
+    let child = expr
+        .children
+        .first()
+        .ok_or_else(|| paro_error::internal("window aggregate requires one argument"))?;
+    Ok(sorted_keys[partition.start..partition.end]
+        .iter()
+        .map(|key| value_from_expr(chunks, key, child))
+        .collect())
+}
+
+fn fast_count_star(starts: &[usize], ends: &[usize]) -> Vec<Value> {
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&start, &end)| Value::BigInt(end.saturating_sub(start) as i64))
+        .collect()
+}
+
+fn fast_count_values(starts: &[usize], ends: &[usize], values: &[Value]) -> Vec<Value> {
+    let mut prefix = Vec::with_capacity(values.len() + 1);
+    prefix.push(0i64);
+    for value in values {
+        let next = prefix.last().copied().unwrap_or(0) + i64::from(!value.is_null());
+        prefix.push(next);
+    }
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&start, &end)| Value::BigInt(prefix[end] - prefix[start]))
+        .collect()
+}
+
+fn fast_sum_values(
+    starts: &[usize],
+    ends: &[usize],
+    values: &[Value],
+    return_type: &LogicalType,
+) -> Option<Vec<Value>> {
+    let use_float = matches!(return_type, LogicalType::Float | LogicalType::Double)
+        || values
+            .iter()
+            .any(|value| value_to_f64(value).is_some() && value_to_i64(value).is_none());
+    let mut counts = Vec::with_capacity(values.len() + 1);
+    let mut int_prefix = Vec::with_capacity(values.len() + 1);
+    let mut float_prefix = Vec::with_capacity(values.len() + 1);
+    counts.push(0usize);
+    int_prefix.push(0i128);
+    float_prefix.push(0.0f64);
+    for value in values {
+        let mut count = *counts.last().unwrap_or(&0);
+        let mut int_sum = *int_prefix.last().unwrap_or(&0);
+        let mut float_sum = *float_prefix.last().unwrap_or(&0.0);
+        if let Some(number) = value_to_f64(value) {
+            count += 1;
+            if use_float {
+                float_sum += number;
+            } else if let Some(integer) = value_to_i64(value) {
+                int_sum += integer as i128;
+            } else {
+                return None;
+            }
+        }
+        counts.push(count);
+        int_prefix.push(int_sum);
+        float_prefix.push(float_sum);
+    }
+
+    Some(
+        starts
+            .iter()
+            .zip(ends)
+            .map(|(&start, &end)| {
+                if counts[end] == counts[start] {
+                    return Value::Null(return_type.clone());
+                }
+                number_value_for_type(
+                    return_type,
+                    int_prefix[end] - int_prefix[start],
+                    float_prefix[end] - float_prefix[start],
+                    use_float,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn fast_avg_values(
+    starts: &[usize],
+    ends: &[usize],
+    values: &[Value],
+    return_type: &LogicalType,
+) -> Vec<Value> {
+    let mut counts = Vec::with_capacity(values.len() + 1);
+    let mut sums = Vec::with_capacity(values.len() + 1);
+    counts.push(0usize);
+    sums.push(0.0f64);
+    for value in values {
+        let mut count = *counts.last().unwrap_or(&0);
+        let mut sum = *sums.last().unwrap_or(&0.0);
+        if let Some(number) = value_to_f64(value) {
+            count += 1;
+            sum += number;
+        }
+        counts.push(count);
+        sums.push(sum);
+    }
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&start, &end)| {
+            let count = counts[end] - counts[start];
+            if count == 0 {
+                Value::Null(return_type.clone())
+            } else {
+                Value::Double((sums[end] - sums[start]) / count as f64)
+            }
+        })
+        .collect()
+}
+
+fn fast_min_max_values(
+    starts: &[usize],
+    ends: &[usize],
+    values: &[Value],
+    return_type: &LogicalType,
+    is_max: bool,
+) -> Result<Vec<Value>> {
+    let sparse = MinMaxSparseTable::new(values, is_max)?;
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&start, &end)| {
+            Ok(sparse
+                .query(values, start, end)?
+                .map(|idx| values[idx].clone())
+                .unwrap_or_else(|| Value::Null(return_type.clone())))
+        })
+        .collect()
+}
+
+struct MinMaxSparseTable {
+    levels: Vec<Vec<Option<usize>>>,
+    logs: Vec<usize>,
+    is_max: bool,
+}
+
+impl MinMaxSparseTable {
+    fn new(values: &[Value], is_max: bool) -> Result<Self> {
+        let n = values.len();
+        let mut logs = vec![0usize; n + 1];
+        for idx in 2..=n {
+            logs[idx] = logs[idx / 2] + 1;
+        }
+        let mut levels = Vec::new();
+        levels.push(
+            values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| (!value.is_null()).then_some(idx))
+                .collect::<Vec<_>>(),
+        );
+        let mut width = 1usize;
+        while width.saturating_mul(2) <= n {
+            let prev = levels.last().expect("sparse table has base level");
+            let next_len = n - width * 2 + 1;
+            let mut next = Vec::with_capacity(next_len);
+            for idx in 0..next_len {
+                next.push(better_index(values, prev[idx], prev[idx + width], is_max)?);
+            }
+            levels.push(next);
+            width *= 2;
+        }
+        Ok(Self {
+            levels,
+            logs,
+            is_max,
+        })
+    }
+
+    fn query(&self, values: &[Value], start: usize, end: usize) -> Result<Option<usize>> {
+        if start >= end {
+            return Ok(None);
+        }
+        let len = end - start;
+        let level = self.logs[len];
+        let width = 1usize << level;
+        better_index(
+            values,
+            self.levels[level][start],
+            self.levels[level][end - width],
+            self.is_max,
+        )
+    }
+}
+
+fn better_index(
+    values: &[Value],
+    left: Option<usize>,
+    right: Option<usize>,
+    is_max: bool,
+) -> Result<Option<usize>> {
+    match (left, right) {
+        (None, None) => Ok(None),
+        (Some(idx), None) | (None, Some(idx)) => Ok(Some(idx)),
+        (Some(left), Some(right)) => {
+            let replace = values[right]
+                .partial_cmp(&values[left])
+                .map(|ordering| {
+                    if is_max {
+                        ordering.is_gt()
+                    } else {
+                        ordering.is_lt()
+                    }
+                })
+                .ok_or_else(|| {
+                    paro_error::invalid_input(format!(
+                        "window MIN/MAX values are not comparable: left={:?}, right={:?}",
+                        values[left], values[right]
+                    ))
+                })?;
+            Ok(Some(if replace { right } else { left }))
+        }
+    }
 }
 
 fn frame_offset(chunks: &[Chunk], key: &WindowRowKey, expr: &Expression) -> Result<usize> {

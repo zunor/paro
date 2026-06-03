@@ -1,0 +1,61 @@
+[meta]
+name = "operator_runtime_mixed"
+description = "BASELINE mixed concurrent operator runtime baseline"
+run_order = 19
+
+[params]
+small_rows = 1000
+scan_rows = 100000
+scan_key_space = 1000
+join_left_rows = 5000
+join_right_rows = 1000
+sort_rows = 50000
+mixed_concurrency = 4
+mixed_iterations = 3
+memory_limit = "256MB"
+temp_directory = "/tmp/paro_benchmark_operator_runtime_mixed"
+random_seed = 20260525
+thread_count = 1
+fast_path_expected = "current-single-active-driver"
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "small_point_lookup"
+file = "sql/q_small_point_lookup.sql"
+validate = "scalar_equals"
+expected = 145
+
+[[query]]
+id = "large_olap"
+file = "sql/q_large_olap.sql"
+validate = "scalar_equals"
+expected = 500
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "scan_filter"
+file = "sql/q_scan_filter.sql"
+validate = "scalar_equals"
+expected = 100
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "hash_join"
+file = "sql/q_hash_join.sql"
+validate = "scalar_equals"
+expected = 5000
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "temp_sort"
+file = "sql/q_temp_sort.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3], [4], [5], [6], [7], [8], [9], [10]]
+collect_explain_profile = true
+allow_reexecute = true

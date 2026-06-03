@@ -18,7 +18,7 @@ id = "order_by_external_shape"
 file = "sql/q_order_by_spill.sql"
 validate = "ordered_rows"
 expected = [[1], [2], [3], [4], [5], [6], [7], [8], [9], [10], [11], [12]]
-plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+plan_contains = ["TOP_N", "Scan Order"]
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -27,7 +27,7 @@ id = "order_by_external_payload"
 file = "sql/q_order_by_payload_spill.sql"
 validate = "ordered_rows"
 expected = [["zzzz_payload_1"], ["zzzz_payload_2"], ["zzzz_payload_3"], ["zzzz_payload_4"], ["zzzz_payload_5"], ["zzzz_payload_6"]]
-plan_contains = ["ORDER_BY", "STREAMING_LIMIT"]
+plan_contains = ["TOP_N", "Scan Order"]
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -41,7 +41,7 @@ id = "hash_agg_external_shape"
 file = "sql/q_hash_agg_spill.sql"
 validate = "scalar_equals"
 expected = 50000
-plan_contains = ["HASH_GROUP_BY"]
+plan_contains = ["AGGREGATE", "Group Key"]
 collect_explain_profile = true
 allow_reexecute = true
 

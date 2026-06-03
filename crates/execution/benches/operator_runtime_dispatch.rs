@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use divan::Bencher;
-use paro_common::allocator::Allocator;
+use paro_common::allocator::{
+    allocator_tracking_event_count, reset_allocator_tracking_event_count, Allocator,
+};
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
@@ -143,17 +145,30 @@ where
     }
 
     let mut samples_ms = Vec::with_capacity(sample_count);
+    let mut tracking_events = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
+        reset_allocator_tracking_event_count();
         let start = Instant::now();
         let checksum = run_once();
         divan::black_box(checksum);
         samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        tracking_events.push(allocator_tracking_event_count());
     }
 
+    let chunks = items.div_ceil(VECTOR_SIZE).max(1);
+    let tracking_events_per_chunk = tracking_events
+        .iter()
+        .map(|value| *value as f64 / chunks as f64)
+        .collect::<Vec<_>>();
     serde_json::json!({
         "id": id,
         "items": items,
         "samples_ms": samples_ms,
+        "audit": {
+            "allocator_tracking_event_counts": tracking_events,
+            "allocator_tracking_events_per_chunk": tracking_events_per_chunk,
+            "chunk_count": chunks,
+        },
     })
 }
 

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 
@@ -96,20 +95,26 @@ pub fn construct_mark_join_result(
     project_columns(left, &left_sel, left_projection_map, result, 0)?;
 
     let marker_offset = projection_indices(left.column_count(), left_projection_map).len();
-    let marker_vec = result
-        .column_mut(marker_offset)
-        .expect("marker output column must exist");
+    result.data[marker_offset] = Arc::new(Vector::try_new(
+        LogicalType::Boolean,
+        count.max(1),
+        result.allocator().clone(),
+    )?);
+    let marker_vec = Arc::make_mut(&mut result.data[marker_offset]);
+    marker_vec.set_len(count);
     for (idx, marker) in markers.iter().enumerate() {
         match marker {
             Some(value) => {
-                marker_vec.set_value(idx, &Value::Boolean(*value));
-                marker_vec.try_set_null(idx, false)?;
+                marker_vec.set_bool(idx, *value);
             }
             None => {
-                marker_vec.set_value(idx, &Value::Boolean(false));
+                marker_vec.set_bool(idx, false);
                 marker_vec.try_set_null(idx, true)?;
             }
         }
+    }
+    if result.capacity() < count {
+        result.set_capacity(count);
     }
     result.try_set_cardinality(count)?;
     Ok(())
@@ -213,6 +218,39 @@ mod tests {
         assert_eq!(result.size(), 2);
         assert_eq!(result.data[1].get_value(0).to_string(), "true");
         assert!(result.data[1].is_null(1));
+    }
+
+    #[test]
+    fn mark_join_result_resizes_marker_for_large_probe_chunk() {
+        let values = (0..=paro_common::vector::VECTOR_SIZE as i32).collect::<Vec<_>>();
+        let markers = values
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| (idx % 2 == 0).then_some(true))
+            .collect::<Vec<_>>();
+        let left = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &values,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::Integer, LogicalType::Boolean],
+            paro_common::vector::VECTOR_SIZE,
+        );
+
+        construct_mark_join_result(&left, &[], &markers, &mut result).unwrap();
+
+        assert_eq!(result.size(), values.len());
+        assert_eq!(result.data[1].get_bool(0), Some(true));
+        assert!(result.data[1].is_null(1));
+        assert_eq!(
+            result.data[1].get_bool(paro_common::vector::VECTOR_SIZE),
+            Some(true)
+        );
     }
 
     #[test]

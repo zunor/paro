@@ -362,6 +362,8 @@ mod tests {
             finalize: noop_finalize,
             simple_update: None,
             destructor: None,
+            state_serialize: None,
+            state_deserialize: None,
             varargs: None,
             bind_data: None,
         };

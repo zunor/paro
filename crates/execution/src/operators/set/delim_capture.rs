@@ -11,7 +11,7 @@ use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
 
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::physical::properties::RequiredProperties;
 use crate::runtime::breaker::{DelimHandle, HandleRef};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
@@ -52,7 +52,10 @@ impl DelimCaptureSinkExec {
     ) -> Result<SinkLocal> {
         let key_types = delim_key_types(&self.duplicate_keys);
         Ok(SinkLocal::DelimCapture(DelimCaptureSinkLocal {
-            key_executor: ExpressionExecutor::with_expressions(&self.duplicate_keys),
+            key_executor: ExpressionExecutor::with_expressions_for_session(
+                &self.duplicate_keys,
+                ctx.query.session.as_ref(),
+            ),
             key_chunk: Chunk::try_initialize(
                 &key_types,
                 VECTOR_SIZE,
@@ -84,11 +87,11 @@ impl DelimCaptureSinkExec {
         if self.duplicate_keys.is_empty() {
             local.key_chunk.try_set_cardinality(input.size())?;
         } else {
-            local.key_executor.execute_all_into_with_input(
-                ExpressionEvalInput {
+            local.key_executor.execute_all_kernel(
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
                     params: ctx.query.params.as_ref(),
                     columns: input,
-                },
+                }),
                 ctx.query,
                 &mut local.key_chunk,
             )?;

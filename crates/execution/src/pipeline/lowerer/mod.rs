@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::mem;
 
 use paro_common::error::{self as paro_error, Result};
+use paro_common::types::LogicalType;
 use paro_function::window::WindowFunctionType;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{AggregateType, Expression, ReferenceExpression};
-use paro_planner::operator::join::JoinType;
+use paro_planner::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::plan::PhysicalPlan;
@@ -19,25 +20,26 @@ use crate::physical::properties::{
 };
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
-    AggregateSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanTarget,
-    ExternalTableSpec, HashJoinSpec, IEJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide, SetOperationSpec, SortSpec,
-    TopNSpec, WindowSpec,
+    AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
+    DelimScanTarget, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
+    PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide, SetOperationSpec, SortRangeJoinSpec,
+    SortSpec, TopNSpec, WindowSpec,
 };
 
 use super::graph::{
-    ClientResultSpec, ControlRegion, ControlRegionId, CopyToFileSinkSpec, CorrelatedSubqueryRegion,
-    CrossProductBuildSinkSpec, CrossProductProbeSpec, CteMaterializeSinkSpec, CteScanSourceSpec,
-    DeleteSinkSpec, DelimCaptureSinkSpec, DelimJoinSide, DelimScanSourceSpec, DependencyKind,
-    ExternalTableSinkSpec, ExternalTableSourceSpec, HashAggregateBuildSinkSpec,
-    HashAggregateEmitSourceSpec, HashJoinBuildSinkSpec, HashJoinProbeSpec,
-    HashJoinSpillReplaySourceSpec, HashJoinUnmatchedSourceSpec, InsertSinkSpec,
+    ClassicIeJoinSourceSpec, ClientResultSpec, ControlRegion, ControlRegionId, CopyToFileSinkSpec,
+    CorrelatedSubqueryRegion, CrossProductBuildSinkSpec, CrossProductProbeSpec,
+    CteMaterializeSinkSpec, CteScanSourceSpec, DeleteSinkSpec, DelimCaptureSinkSpec, DelimJoinSide,
+    DelimScanSourceSpec, DependencyKind, ExternalTableSinkSpec, ExternalTableSourceSpec,
+    HashAggregateBuildSinkSpec, HashAggregateEmitSourceSpec, HashJoinBuildSinkSpec,
+    HashJoinProbeSpec, HashJoinSpillReplaySourceSpec, HashJoinUnmatchedSourceSpec, InsertSinkSpec,
     MaterializeSinkSpec, MaterializedSourceSpec, NestedLoopJoinProbeSpec,
     PerfectHashAggregateEmitSourceSpec, PerfectHashAggregateSinkSpec, PipelineDependency,
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,
-    RecursiveTermination, SetOperationEmitSourceSpec, SetOperationInputSinkSpec, SharedSinkId,
-    SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec, SourceSpec, TopNBuildSinkSpec,
+    RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetSourceSpec,
+    SetOperationEmitSourceSpec, SetOperationInputSinkSpec, SharedSinkId, SinkSharing, SinkSpec,
+    SortBuildSinkSpec, SortEmitSourceSpec, SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec,
     TopNEmitSourceSpec, TransformSpec, UngroupedAggregateEmitSourceSpec,
     UngroupedAggregateSinkSpec, UpdateSinkSpec, WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
@@ -72,19 +74,6 @@ pub(crate) struct PendingProbeBuild {
 pub(crate) struct PipelineChain {
     pub(crate) entry: PipelineId,
     pub(crate) tail: PipelineId,
-}
-
-pub(crate) enum BreakerDispatch {
-    TopN(TopNSpec),
-    Sort(SortSpec),
-    Aggregate(AggregateSpec),
-    SetOperation(SetOperationSpec),
-    Window(WindowSpec),
-    HashJoin(HashJoinSpec),
-    NestedLoopJoin(NestedLoopJoinSpec),
-    IEJoin(IEJoinSpec),
-    CrossProduct(CrossProductSpec),
-    ExternalTable(ExternalTableSpec),
 }
 
 impl<'a> PipelineLowerer<'a> {
@@ -176,6 +165,8 @@ impl<'a> PipelineLowerer<'a> {
 }
 
 mod aggregate_sort;
+mod breaker_lowering;
+mod classic_ie_join;
 mod cte;
 mod dispatch;
 mod external;
@@ -184,9 +175,11 @@ mod join_breakers;
 mod join_probes;
 mod linear;
 mod materialized_pair;
+mod pipeline_dispatch;
 mod pipelines;
 mod set_operation;
 
+pub(crate) use breaker_lowering::BreakerDispatch;
 use helpers::*;
 
 #[cfg(test)]

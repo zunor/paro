@@ -11,7 +11,9 @@ use crate::row::pin::{PinSet, PrefixReleaseState};
 use crate::row::pinned::PinnedRows;
 use crate::row::raw::{RawRowCollection, RawRowLayout};
 use crate::row::region::{RowLocation, RowRegion};
-use crate::row::scan::{ReclaimTracker, RowParallelScanCursor, RowScanCursor, ScanChunkMeta};
+use crate::row::scan::{
+    ReclaimTracker, ReclaimingRowScanCursor, RowParallelScanCursor, RowScanCursor, ScanChunkMeta,
+};
 use crate::row::{RowAddr, RowLayout};
 
 /// Caller-declared ordinal ordering for batch pinning.
@@ -31,7 +33,7 @@ pub struct RowStore {
     count: u64,
     region_row_prefix: Vec<u64>,
     ordinal_locations: Vec<RowLocation>,
-    addr_to_ordinal: HashMap<RowAddr, u32>,
+    addr_to_ordinal: HashMap<RowAddr, u64>,
     scan_chunks: Vec<ScanChunkMeta>,
 }
 
@@ -50,17 +52,17 @@ impl RowStore {
         }
 
         let count: u64 = raw_regions.iter().map(|region| region.count() as u64).sum();
-        if count > u32::MAX as u64 {
-            return Err(paro_error::internal(format!(
-                "row store count {} exceeds u32 ordinal addressability",
+        let indexed_count = usize::try_from(count).map_err(|_| {
+            paro_error::internal(format!(
+                "row store count {} cannot be indexed on this platform",
                 count
-            )));
-        }
+            ))
+        })?;
 
         let mut regions = Vec::with_capacity(raw_regions.len());
         let mut region_row_prefix = Vec::with_capacity(raw_regions.len() + 1);
-        let mut ordinal_locations = Vec::with_capacity(count as usize);
-        let mut addr_to_ordinal = HashMap::with_capacity(count as usize);
+        let mut ordinal_locations = Vec::with_capacity(indexed_count);
+        let mut addr_to_ordinal = HashMap::with_capacity(indexed_count);
         let mut scan_chunks = Vec::new();
         let mut ordinal_base = 0u64;
         region_row_prefix.push(0);
@@ -81,8 +83,8 @@ impl RowStore {
                         let local_range = region
                             .block_local_ordinals(block_idx)
                             .expect("row block local ordinal range");
-                        let ordinal_start = (ordinal_base as u32) + local_range.start as u32;
-                        let ordinal_end = ordinal_start + block.row_count();
+                        let ordinal_start = ordinal_base + local_range.start as u64;
+                        let ordinal_end = ordinal_start + block.row_count() as u64;
                         ScanChunkMeta {
                             region_idx: region_index,
                             row_block_idx: block_idx,
@@ -179,7 +181,7 @@ impl RowStore {
         self.scan_chunks.len() as u32
     }
 
-    pub fn addr_at_ordinal(&self, ordinal: u32) -> Result<RowAddr> {
+    pub fn addr_at_ordinal(&self, ordinal: u64) -> Result<RowAddr> {
         self.location_for_ordinal(ordinal)
             .map(|location| location.addr)
     }
@@ -206,26 +208,31 @@ impl RowStore {
         ))
     }
 
-    pub fn pin_ordinals(&self, ordinals: &[u32], ordering: Ordering) -> Result<PinnedRows<'_>> {
+    pub fn pin_ordinals<O>(&self, ordinals: &[O], ordering: Ordering) -> Result<PinnedRows<'_>>
+    where
+        O: Copy + Into<u64>,
+    {
         let mut rows = Vec::with_capacity(ordinals.len());
         for &ordinal in ordinals {
-            rows.push(*self.location_for_ordinal(ordinal)?);
+            rows.push(*self.location_for_ordinal(ordinal.into())?);
         }
         Ok(PinnedRows::new(self, rows, ordering, PinSet::none()))
     }
 
-    pub fn pin_ordinal_range(&self, start: u32, len: u32) -> Result<PinnedRows<'_>> {
+    pub fn pin_ordinal_range(&self, start: u64, len: u64) -> Result<PinnedRows<'_>> {
         let end = start
             .checked_add(len)
             .ok_or_else(|| paro_error::internal("row ordinal range overflow"))?;
-        if end as u64 > self.count {
+        if end > self.count {
             return Err(paro_error::internal(format!(
                 "row ordinal range [{}, {}) exceeds count {}",
                 start, end, self.count
             )));
         }
 
-        let rows = self.ordinal_locations[start as usize..end as usize].to_vec();
+        let start_idx = self.ordinal_to_index(start)?;
+        let end_idx = self.ordinal_to_index(end)?;
+        let rows = self.ordinal_locations[start_idx..end_idx].to_vec();
         Ok(PinnedRows::new(
             self,
             rows,
@@ -267,8 +274,9 @@ impl RowStore {
         Ok(())
     }
 
-    fn location_for_ordinal(&self, ordinal: u32) -> Result<&RowLocation> {
-        self.ordinal_locations.get(ordinal as usize).ok_or_else(|| {
+    fn location_for_ordinal(&self, ordinal: u64) -> Result<&RowLocation> {
+        let index = self.ordinal_to_index(ordinal)?;
+        self.ordinal_locations.get(index).ok_or_else(|| {
             paro_error::internal(format!(
                 "row ordinal {} out of range for store count {}",
                 ordinal, self.count
@@ -276,10 +284,19 @@ impl RowStore {
         })
     }
 
+    fn ordinal_to_index(&self, ordinal: u64) -> Result<usize> {
+        usize::try_from(ordinal).map_err(|_| {
+            paro_error::internal(format!(
+                "row ordinal {} cannot be indexed on this platform",
+                ordinal
+            ))
+        })
+    }
+
     pub(crate) fn scan_chunk_prefix_for_ordinal_frontier(&self, frontier: u64) -> u32 {
         self.scan_chunks
             .iter()
-            .take_while(|meta| meta.ordinal_end as u64 <= frontier)
+            .take_while(|meta| meta.ordinal_end <= frontier)
             .count() as u32
     }
 
@@ -289,7 +306,7 @@ impl RowStore {
         } else {
             self.scan_chunks
                 .get(prefix as usize - 1)
-                .map(|meta| meta.ordinal_end as u64)
+                .map(|meta| meta.ordinal_end)
                 .unwrap_or(self.count)
         }
     }
@@ -333,7 +350,7 @@ impl PrefixReleasableRowStore {
         self.store.size_in_bytes()
     }
 
-    pub fn pin_ordinal_range(&self, start: u32, len: u32) -> Result<PinnedRows<'_>> {
+    pub fn pin_ordinal_range(&self, start: u64, len: u64) -> Result<PinnedRows<'_>> {
         if len == 0 {
             return Ok(PinnedRows::new(
                 &self.store,
@@ -345,7 +362,7 @@ impl PrefixReleasableRowStore {
 
         let pin_set = PinSet::prefix(&self.store, &self.release_state);
         let physical_frontier = self.release_state.physical_release_frontier();
-        if (start as u64) < physical_frontier {
+        if start < physical_frontier {
             return Err(paro_error::internal(format!(
                 "row ordinal range starts before physical release frontier: start={}, physical_frontier={}",
                 start, physical_frontier
@@ -355,7 +372,7 @@ impl PrefixReleasableRowStore {
         let end = start
             .checked_add(len)
             .ok_or_else(|| paro_error::internal("row ordinal range overflow"))?;
-        if end as u64 > self.store.count() {
+        if end > self.store.count() {
             return Err(paro_error::internal(format!(
                 "row ordinal range [{}, {}) exceeds count {}",
                 start,
@@ -364,7 +381,9 @@ impl PrefixReleasableRowStore {
             )));
         }
 
-        let rows = self.store.ordinal_locations[start as usize..end as usize].to_vec();
+        let start_idx = self.store.ordinal_to_index(start)?;
+        let end_idx = self.store.ordinal_to_index(end)?;
+        let rows = self.store.ordinal_locations[start_idx..end_idx].to_vec();
         Ok(PinnedRows::new(
             &self.store,
             rows,
@@ -420,6 +439,10 @@ impl ReclaimableRowStore {
 
     pub fn scanner(&self) -> RowScanCursor<'_> {
         RowScanCursor::with_reclaim(&self.store, self.tracker.register_scanner(&self.store))
+    }
+
+    pub fn into_reclaiming_scanner(self) -> ReclaimingRowScanCursor {
+        ReclaimingRowScanCursor::new(self.store, self.tracker)
     }
 
     #[cfg(test)]

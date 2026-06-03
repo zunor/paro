@@ -174,7 +174,7 @@ LEFT JOIN join_spill_skew_r r
 QUERY PLAN
 PIPELINE 0
   SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=2)
-  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=3000 loops=1)
+  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=3000 loops=1 runtime_filter_installed_count=1)
 PIPELINE 1
   SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=2)
   TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=0 loops=0)
@@ -186,6 +186,8 @@ PIPELINE 3
   SOURCE #7 UNGROUPED_AGGREGATE_EMIT (actual time=<time-range> rows=1 loops=2)
   TRANSFORM #8 PROJECTION (actual time=<time-range> rows=1 loops=1)
   SINK #9 CLIENT_RESULT (actual time=<time-range> rows=1 loops=1)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 1
 

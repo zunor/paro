@@ -22,6 +22,7 @@ pub use accumulator::MemoryAccumulator;
 pub use allocation_ledger::{AllocationEntry, AllocationId, AllocationLedger};
 pub use collections::{
     AccountedBytesMut, AccountedHashMap, AccountedHashSet, AccountedString, AccountedVec,
+    PrecomputedHashBuildHasher,
 };
 pub use domain::{MemoryDomain, MEMORY_DOMAIN_COUNT};
 pub use error::{MemoryError, MemoryResult};

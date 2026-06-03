@@ -90,6 +90,23 @@ pub type AggregateFinalizeFn =
 pub type AggregateDestructorFn =
     unsafe fn(states: &Vector, input_data: &AggregateInputData, count: usize);
 
+/// Function to serialize one aggregate state into an engine-owned byte buffer.
+///
+/// This is used by build-phase aggregate spill for states that contain
+/// owned heap objects and therefore cannot be byte-copied safely.
+pub type AggregateStateSerializeFn = unsafe fn(
+    state: *const u8,
+    input_data: &AggregateInputData,
+    output: &mut Vec<u8>,
+) -> Result<()>;
+
+/// Function to deserialize one aggregate state from bytes into uninitialized state memory.
+///
+/// Implementations must fully initialize `state` on success so the normal
+/// aggregate `combine` and `destructor` hooks can be used afterwards.
+pub type AggregateStateDeserializeFn =
+    unsafe fn(input: &[u8], input_data: &AggregateInputData, state: *mut u8) -> Result<()>;
+
 /// Function to simple update (for ungrouped aggregates).
 /// The state is a single pointer, inputs are vectors.
 pub type AggregateSimpleUpdateFn =
@@ -144,6 +161,12 @@ pub struct AggregateFunction {
     /// Destructor for the state (optional).
     pub destructor: Option<AggregateDestructorFn>,
 
+    /// Optional serializer for complex aggregate states.
+    pub state_serialize: Option<AggregateStateSerializeFn>,
+
+    /// Optional deserializer for complex aggregate states.
+    pub state_deserialize: Option<AggregateStateDeserializeFn>,
+
     /// Type for variable arguments (None = no varargs).
     /// When set, the function accepts any number of additional arguments of this type.
     pub varargs: Option<LogicalType>,
@@ -190,9 +213,22 @@ impl AggregateFunction {
             finalize,
             simple_update,
             destructor,
+            state_serialize: None,
+            state_deserialize: None,
             varargs: None,
             bind_data: None,
         }
+    }
+
+    /// Set explicit state serialization hooks for build-phase spill.
+    pub fn with_state_serialization(
+        mut self,
+        serialize: AggregateStateSerializeFn,
+        deserialize: AggregateStateDeserializeFn,
+    ) -> Self {
+        self.state_serialize = Some(serialize);
+        self.state_deserialize = Some(deserialize);
+        self
     }
 
     /// Set varargs type for variable argument support.

@@ -32,7 +32,7 @@ use paro_function::table::{
 use paro_planner::expression::Expression;
 
 use crate::execution_context::ExecutionContext;
-use crate::expression_executor::executor::ExpressionExecutor;
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::physical::specs::TableFunctionScanSpec;
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -1711,14 +1711,13 @@ fn evaluate_table_function_arguments(
             1,
             ctx.query.allocator(MemoryTag::BaseTable),
         )?;
-        executor.execute_into_with_input(
+        executor.execute_kernel_into(
             idx,
-            ExpressionEvalInput {
+            VectorKernelInput::from_eval_input(ExpressionEvalInput {
                 params: ctx.params,
                 columns: &dummy,
-            },
-            None,
-            1,
+            })
+            .with_count(1),
             ctx.query,
             &mut vector,
         )?;

@@ -5,18 +5,46 @@
 //!
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::{Get, LogicalOperator, TopN};
+use paro_planner::operator::{Get, LogicalOperator, Projection, TopN};
 use paro_planner::plan::LogicalPlan;
 use paro_storage::table::segment_reorderer::{
     OrderByColumnType, OrderByStatistics, SegmentOrderOptions, SegmentOrderType,
 };
 
-/// Resolve `Get` under optional leading `Projection` nodes without overlapping `&mut plan.operator` borrows.
-fn get_under_projections_mut(plan: &mut LogicalPlan) -> Option<&mut Get> {
+/// Resolve `Get` under optional leading `Projection` nodes and map a TopN
+/// order expression back to the base scan output.
+fn get_under_projections_mut<'a>(
+    plan: &'a mut LogicalPlan,
+    order_expression: &Expression,
+) -> Option<(&'a mut Get, Expression)> {
     match &mut plan.operator {
-        LogicalOperator::Projection(proj) => get_under_projections_mut(proj.child.as_mut()),
-        LogicalOperator::Get(get) => Some(get),
+        LogicalOperator::Projection(proj) => {
+            let mapped = map_projection_expression(order_expression, proj)?;
+            get_under_projections_mut(proj.child.as_mut(), &mapped)
+        }
+        LogicalOperator::Get(get) => Some((get, order_expression.clone())),
         _ => None,
+    }
+}
+
+fn map_projection_expression(expr: &Expression, projection: &Projection) -> Option<Expression> {
+    match expr {
+        Expression::Reference(reference) => projection.expressions.get(reference.index).cloned(),
+        Expression::ColumnRef(column_ref)
+            if column_ref.binding.table_index == projection.table_index =>
+        {
+            projection
+                .expressions
+                .get(column_ref.binding.column_index)
+                .cloned()
+        }
+        Expression::Cast(cast) => {
+            let mapped_child = map_projection_expression(cast.child.as_ref(), projection)?;
+            let mut mapped = cast.clone();
+            mapped.child = Box::new(mapped_child);
+            Some(Expression::Cast(mapped))
+        }
+        _ => Some(expr.clone()),
     }
 }
 
@@ -57,16 +85,20 @@ impl SegmentPruner {
 
     /// Try to optimize a TopN operator.
     fn try_optimize_topn(&mut self, topn: &mut TopN) {
-        // Look through projections to find Get
-        let Some(get) = get_under_projections_mut(topn.child.as_mut()) else {
+        let Some(order) = topn.orders.first() else {
+            return;
+        };
+        let Some((get, order_expression)) =
+            get_under_projections_mut(topn.child.as_mut(), &order.expression)
+        else {
             return;
         };
 
-        // We can only optimize if we scan a single table and have at least one order clause
-        if get.table.is_some() && !topn.orders.is_empty() {
-            let order = &topn.orders[0];
+        // We can only optimize if we scan a single table and have an order
+        // clause that maps to a real base column.
+        if get.table.is_some() {
             if let Some((base_col_idx, projected_idx)) =
-                self.extract_column_indices(&order.expression, get)
+                self.extract_column_indices(&order_expression, get)
             {
                 let column_type = self.get_column_type(get, projected_idx);
 
