@@ -200,7 +200,9 @@ def _evaluate_metric(
             baseline_value=baseline_value,
             detail="current metric is missing",
         )
-    if baseline_value <= 0.0:
+    max_value = _absolute_bound(policy.absolute_max, key, metric)
+    min_value = _absolute_bound(policy.absolute_min, key, metric)
+    if baseline_value < 0.0:
         return GateEntry(
             kind=GateEntryKind.INVALID_BASELINE,
             key=key,
@@ -209,6 +211,25 @@ def _evaluate_metric(
             baseline_value=baseline_value,
             current_value=current_value,
             detail="baseline metric must be positive",
+        )
+    if baseline_value == 0.0:
+        status = GateStatus.OK if current_value == 0.0 else GateStatus.REGRESS
+        detail = None if status == GateStatus.OK else "current metric changed from zero baseline"
+        if max_value is not None and current_value > max_value:
+            status = GateStatus.REGRESS
+            detail = f"current metric exceeds absolute max {max_value:g}"
+        if min_value is not None and current_value < min_value:
+            status = GateStatus.REGRESS
+            detail = f"current metric is below absolute min {min_value:g}"
+        return GateEntry(
+            kind=GateEntryKind.COMPARED_METRIC,
+            key=key,
+            metric=metric,
+            status=status,
+            baseline_value=baseline_value,
+            current_value=current_value,
+            change_percent=0.0 if current_value == 0.0 else None,
+            detail=detail,
         )
 
     change = ((current_value - baseline_value) / baseline_value) * 100.0
@@ -232,12 +253,13 @@ def _evaluate_metric(
             policy=policy,
         )
 
-    max_value = policy.absolute_max.get(metric)
+    detail = None
     if max_value is not None and current_value > max_value:
         status = GateStatus.REGRESS
-    min_value = policy.absolute_min.get(metric)
+        detail = f"current metric exceeds absolute max {max_value:g}"
     if min_value is not None and current_value < min_value:
         status = GateStatus.REGRESS
+        detail = f"current metric is below absolute min {min_value:g}"
 
     return GateEntry(
         kind=GateEntryKind.COMPARED_METRIC,
@@ -247,7 +269,21 @@ def _evaluate_metric(
         baseline_value=baseline_value,
         current_value=current_value,
         change_percent=change,
+        detail=detail,
     )
+
+
+def _absolute_bound(bounds: dict[str, float], key: QueryKey, metric: str) -> float | None:
+    for bound_key in (
+        f"{key.workload}.{key.query_id}.{metric}",
+        f"{key.query_id}.{metric}",
+        metric,
+    ):
+        value = bounds.get(bound_key)
+        if value is not None:
+            return value
+    return None
+
 
 def _apply_statistical_model(
     *,

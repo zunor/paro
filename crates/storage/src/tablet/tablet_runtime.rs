@@ -16,7 +16,7 @@ use super::prepared_txn_registry::PreparedTxnRegistry;
 use super::schema_adapter::TabletSchemaAdaptationPlan;
 use super::shutdown_sweep;
 use super::statistics::TabletStatistics;
-use super::tablet_meta::{AppliedMutationMeta, TabletMeta};
+use super::tablet_meta::{AppliedMutationMeta, SearchGenerationHeadMeta, TabletMeta};
 use super::tablet_schema::{ColumnId, TabletSchemaRef};
 use super::versioned_rowset_catalog::{
     RowsetCatalogCheckpointSlice, RowsetCatalogDescriptor, RowsetCatalogFlags,
@@ -35,6 +35,7 @@ use crate::primary_key::{
 };
 use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
 use crate::rowset::{Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentsOverlap};
+use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
 use paro_common::effect::{
     CompactionCumulativePointAction, RetiredRowsetInput, TabletMutation, VersionSpan,
@@ -172,6 +173,26 @@ pub struct CheckpointMaintenanceTicket {
 pub trait CheckpointPublishObserver: Send + Sync + std::fmt::Debug {
     fn begin_compaction_publish(&self, tablet_id: TabletId) -> CheckpointMaintenanceTicket;
     fn finish_compaction_publish(&self, ticket: CheckpointMaintenanceTicket);
+}
+
+pub trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
+    fn prepare_rowset_publish(
+        &self,
+        _tablet_id: TabletId,
+        _version: i64,
+        _visible_rowsets: &[RowsetSharedPtr],
+    ) -> Result<Vec<SearchGenerationHeadMeta>> {
+        Ok(Vec::new())
+    }
+
+    fn rowset_published(&self, tablet_id: TabletId, version: i64, rowset: RowsetSharedPtr);
+
+    fn search_inline_builders_for_compaction(
+        &self,
+        _tablet_id: TabletId,
+    ) -> SearchInlineBuilderSet {
+        SearchInlineBuilderSet::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +460,9 @@ pub struct Tablet {
     /// Bound checkpoint observer for compaction publish sequencing.
     checkpoint_publish_observer: RwLock<Option<Arc<dyn CheckpointPublishObserver>>>,
 
+    /// Best-effort observer for derived-state refresh after rowset publish.
+    rowset_publish_observer: RwLock<Option<std::sync::Weak<dyn RowsetPublishObserver>>>,
+
     /// Maintenance publish ids for visible and retired rowsets.
     rowset_maintenance_ids: RwLock<HashMap<u64, u64>>,
 
@@ -539,6 +563,7 @@ impl Tablet {
             meta_lock: RwLock::new(()),
             checkpoint_capture_epoch: AtomicU64::new(0),
             checkpoint_publish_observer: RwLock::new(None),
+            rowset_publish_observer: RwLock::new(None),
             rowset_maintenance_ids: RwLock::new(HashMap::new()),
             applied_mutations: RwLock::new(applied_mutations),
             primary_index: RwLock::new(primary_index),
@@ -700,6 +725,117 @@ impl Tablet {
 
     pub fn bind_checkpoint_publish_observer(&self, observer: Arc<dyn CheckpointPublishObserver>) {
         *self.checkpoint_publish_observer.write().unwrap() = Some(observer);
+    }
+
+    pub fn bind_rowset_publish_observer(
+        &self,
+        observer: std::sync::Weak<dyn RowsetPublishObserver>,
+    ) {
+        *self.rowset_publish_observer.write().unwrap() = Some(observer);
+    }
+
+    fn notify_rowset_published(&self, version: i64, rowset: RowsetSharedPtr) {
+        let observer = self
+            .rowset_publish_observer
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(observer) = observer {
+            observer.rowset_published(self.tablet_id(), version, rowset);
+        }
+    }
+
+    fn prepare_search_rowset_publish(
+        &self,
+        version: i64,
+        visible_rowsets: &[RowsetSharedPtr],
+    ) -> Result<Vec<SearchGenerationHeadMeta>> {
+        let observer = self
+            .rowset_publish_observer
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let Some(observer) = observer else {
+            return Ok(Vec::new());
+        };
+        observer.prepare_rowset_publish(self.tablet_id(), version, visible_rowsets)
+    }
+
+    fn rowsets_with_pending_publish(
+        &self,
+        current_max_version: i64,
+        version: i64,
+        rowset: &RowsetSharedPtr,
+    ) -> Result<Vec<RowsetSharedPtr>> {
+        let mut rowsets = if current_max_version >= 0 {
+            self.capture_consistent_rowsets(current_max_version)?
+        } else {
+            Vec::new()
+        };
+        rowset.set_version(Version::singleton(version));
+        rowsets.push(rowset.clone());
+        rowsets.sort_by_key(|rowset| rowset.start_version());
+        Ok(rowsets)
+    }
+
+    fn apply_search_generation_heads_locked(&self, heads: Vec<SearchGenerationHeadMeta>) {
+        if heads.is_empty() {
+            return;
+        }
+        let mut meta = self.meta.write().unwrap();
+        for head in heads {
+            meta.upsert_search_generation_head(head);
+        }
+    }
+
+    pub(crate) fn search_generation_head(
+        &self,
+        definition_id: u64,
+    ) -> Option<SearchGenerationHeadMeta> {
+        self.meta
+            .read()
+            .unwrap()
+            .search_generation_heads()
+            .iter()
+            .find(|head| head.definition_id == definition_id)
+            .cloned()
+    }
+
+    pub(crate) fn search_generation_heads(&self) -> Vec<SearchGenerationHeadMeta> {
+        self.meta.read().unwrap().search_generation_heads().to_vec()
+    }
+
+    pub(crate) fn persist_search_generation_head(
+        &self,
+        head: SearchGenerationHeadMeta,
+    ) -> Result<()> {
+        let _lock = self.meta_lock.write().unwrap();
+        {
+            let mut meta = self.meta.write().unwrap();
+            meta.upsert_search_generation_head(head);
+        }
+        self.save_meta()
+    }
+
+    pub(crate) fn remove_search_generation_head(&self, definition_id: u64) -> Result<()> {
+        let _lock = self.meta_lock.write().unwrap();
+        {
+            let mut meta = self.meta.write().unwrap();
+            meta.remove_search_generation_head(definition_id);
+        }
+        self.save_meta()
+    }
+
+    pub(crate) fn search_inline_builders_for_compaction(&self) -> SearchInlineBuilderSet {
+        self.rowset_publish_observer
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|observer| observer.search_inline_builders_for_compaction(self.tablet_id()))
+            .unwrap_or_default()
     }
 
     pub fn begin_checkpoint_compaction_publish(&self) -> Option<CheckpointMaintenanceTicket> {
@@ -1622,35 +1758,49 @@ impl Tablet {
     /// metadata is only updated in memory and persisted via `save_meta`.
     pub fn rowset_commit(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
         self.ensure_not_shutdown("commit rowset")?;
-        let _lock = self.meta_lock.write().unwrap();
-        self.rowset_commit_locked(version, rowset)
+        let published = {
+            let _lock = self.meta_lock.write().unwrap();
+            self.rowset_commit_locked(version, rowset.clone())?
+        };
+        if published {
+            self.notify_rowset_published(version, rowset);
+        }
+        Ok(())
     }
 
     /// Commit a rowset using the next available version.
     pub fn rowset_commit_auto(&self, rowset: RowsetSharedPtr) -> Result<i64> {
         self.ensure_not_shutdown("commit rowset")?;
-        let _lock = self.meta_lock.write().unwrap();
-        let next_version = self.max_version.load(Ordering::Acquire) + 1;
-        self.rowset_commit_locked(next_version, rowset)?;
-        Ok(next_version)
+        let (version, published) = {
+            let _lock = self.meta_lock.write().unwrap();
+            let next_version = self.max_version.load(Ordering::Acquire) + 1;
+            let published = self.rowset_commit_locked(next_version, rowset.clone())?;
+            (next_version, published)
+        };
+        if published {
+            self.notify_rowset_published(version, rowset);
+        }
+        Ok(version)
     }
 
-    fn rowset_commit_locked(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
+    fn rowset_commit_locked(&self, version: i64, rowset: RowsetSharedPtr) -> Result<bool> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
         if version <= current_max {
             // Already committed (idempotent)
-            return Ok(());
+            return Ok(false);
         }
 
-        rowset.set_version(Version::singleton(version));
+        let visible_rowsets = self.rowsets_with_pending_publish(current_max, version, &rowset)?;
         self.validate_rowset_registration_locked(&rowset)?;
+        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets)?;
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
+        self.apply_search_generation_heads_locked(search_heads);
         self.save_meta()?;
 
         self.validate_version_graph()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Publish a PRIMARY_KEYS rowset and staged index updates atomically.
@@ -1661,8 +1811,14 @@ impl Tablet {
         update: PrimaryIndexUpdate,
     ) -> Result<()> {
         self.ensure_not_shutdown("publish rowset with primary index")?;
-        let _lock = self.meta_lock.write().unwrap();
-        self.publish_rowset_with_index_locked(version, rowset, update)
+        let published = {
+            let _lock = self.meta_lock.write().unwrap();
+            self.publish_rowset_with_index_locked(version, rowset.clone(), update)?
+        };
+        if published {
+            self.notify_rowset_published(version, rowset);
+        }
+        Ok(())
     }
 
     /// Publish a PRIMARY_KEYS rowset using the next available version.
@@ -1672,9 +1828,16 @@ impl Tablet {
         update: PrimaryIndexUpdate,
     ) -> Result<i64> {
         self.ensure_not_shutdown("publish rowset with primary index")?;
-        let _lock = self.meta_lock.write().unwrap();
-        let version = self.max_version.load(Ordering::Acquire) + 1;
-        self.publish_rowset_with_index_locked(version, rowset, update)?;
+        let (version, published) = {
+            let _lock = self.meta_lock.write().unwrap();
+            let version = self.max_version.load(Ordering::Acquire) + 1;
+            let published =
+                self.publish_rowset_with_index_locked(version, rowset.clone(), update)?;
+            (version, published)
+        };
+        if published {
+            self.notify_rowset_published(version, rowset);
+        }
         Ok(version)
     }
 
@@ -1683,26 +1846,28 @@ impl Tablet {
         version: i64,
         rowset: RowsetSharedPtr,
         update: PrimaryIndexUpdate,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
         if version <= current_max {
-            return Ok(());
+            return Ok(false);
         }
 
-        rowset.set_version(Version::singleton(version));
+        let visible_rowsets = self.rowsets_with_pending_publish(current_max, version, &rowset)?;
         self.ensure_rowset_rssids(&rowset);
         self.align_next_rowset_id(rowset.rowset_id());
         self.validate_rowset_registration_locked(&rowset)?;
         let prepared = self.prepare_primary_index_publish(&rowset, update)?;
+        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets)?;
         self.apply_prepared_primary_index_publish(version, &rowset, prepared)?;
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
+        self.apply_search_generation_heads_locked(search_heads);
         self.save_meta()?;
         self.validate_version_graph()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Apply row-id deletes for journal replay and persist delete vectors.

@@ -55,6 +55,14 @@ pub struct GraphLinks {
     offsets: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GraphLinksDegreeSummary {
+    pub total_links: u64,
+    pub level0_links: u64,
+    pub max_level0_degree: u32,
+    pub avg_level0_degree: f32,
+}
+
 #[derive(Debug)]
 struct ParsedLayout {
     payload_offset: usize,
@@ -175,6 +183,36 @@ impl GraphLinks {
         let mut links = Vec::new();
         self.for_each_link(point_id, level, |neighbor| links.push(neighbor));
         Some(links)
+    }
+
+    pub fn degree_summary(&self) -> GraphLinksDegreeSummary {
+        let mut total_links = 0u64;
+        let mut level0_links = 0u64;
+        let mut max_level0_degree = 0u32;
+        for point_id in 0..self.num_points() as PointOffset {
+            for level in 0..self.num_levels(point_id) {
+                let mut degree = 0u32;
+                self.for_each_link(point_id, level, |_| {
+                    degree = degree.saturating_add(1);
+                });
+                total_links = total_links.saturating_add(u64::from(degree));
+                if level == 0 {
+                    level0_links = level0_links.saturating_add(u64::from(degree));
+                    max_level0_degree = max_level0_degree.max(degree);
+                }
+            }
+        }
+        let avg_level0_degree = if self.num_points() == 0 {
+            0.0
+        } else {
+            level0_links as f32 / self.num_points() as f32
+        };
+        GraphLinksDegreeSummary {
+            total_links,
+            level0_links,
+            max_level0_degree,
+            avg_level0_degree,
+        }
     }
 
     fn links_bytes(&self) -> &[u8] {

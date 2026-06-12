@@ -9,13 +9,14 @@ use super::children::{PlanChildren, PlanChildrenArena};
 use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
 use super::properties::PlanPropertyMap;
-use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind};
+use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
 use crate::explain::types::{ExplainDoc, ExplainNode, ExplainProperty, ExplainValue};
 use paro_catalog::entry::StandardEntry;
 use paro_planner::expression::{AggregateType, Expression};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition};
 use paro_planner::operator::ExplainSpec;
 use paro_planner::plan::CardinalityEstimate;
+use paro_storage::search::CapabilityToken;
 use paro_storage::table::segment_reorderer::{
     OrderByStatistics, SegmentOrderOptions, SegmentOrderType,
 };
@@ -272,6 +273,28 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
             }
             push_string_property(&mut properties, "Limit", spec.limit.to_string());
         }
+        PhysicalNodeKind::VectorSearch(spec) => {
+            push_search_token_properties(&mut properties, &spec.capability_token);
+            push_string_property(&mut properties, "Column", spec.column_id.to_string());
+            push_string_property(&mut properties, "Limit", spec.k.to_string());
+        }
+        PhysicalNodeKind::SparseVectorSearch(spec) => {
+            push_search_token_properties(&mut properties, &spec.capability_token);
+            push_string_property(&mut properties, "Column", spec.column_id.to_string());
+            push_string_property(&mut properties, "Limit", spec.k.to_string());
+        }
+        PhysicalNodeKind::FullTextSearch(spec) => {
+            push_search_token_properties(&mut properties, &spec.capability_token);
+            push_string_property(&mut properties, "Column", spec.column_id.to_string());
+            push_string_property(&mut properties, "Mode", format!("{:?}", spec.mode));
+        }
+        PhysicalNodeKind::AdaptiveSearch(spec) => {
+            push_string_property(&mut properties, "Strategy", "adaptive".to_string());
+            push_search_token_properties(
+                &mut properties,
+                search_source_token(spec.selected.as_ref()),
+            );
+        }
         PhysicalNodeKind::Limit(spec) => {
             if let Some(limit) = &spec.limit {
                 push_string_property(&mut properties, "Limit", format_expr(limit));
@@ -458,6 +481,33 @@ fn push_aggregate_properties(properties: &mut Vec<ExplainProperty>, spec: &Aggre
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+    }
+}
+
+fn push_search_token_properties(properties: &mut Vec<ExplainProperty>, token: &CapabilityToken) {
+    push_string_property(
+        properties,
+        "Search Definition",
+        token.definition_id.to_string(),
+    );
+    push_string_property(
+        properties,
+        "Search Generation",
+        token.generation_id.to_string(),
+    );
+    push_string_property(properties, "Search Root", token.root_version.to_string());
+    push_string_property(
+        properties,
+        "Search Capability",
+        format!("{:?}", token.capability_state),
+    );
+}
+
+fn search_source_token(source: &SearchSourceSpec) -> &CapabilityToken {
+    match source {
+        SearchSourceSpec::Vector(spec) => &spec.capability_token,
+        SearchSourceSpec::Sparse(spec) => &spec.capability_token,
+        SearchSourceSpec::FullText(spec) => &spec.capability_token,
     }
 }
 

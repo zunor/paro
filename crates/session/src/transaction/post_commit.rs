@@ -10,9 +10,17 @@ use paro_catalog::entry::{
 use paro_common::effect::{DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
+use paro_common::types::LogicalType;
 use paro_storage::metrics::storage_metrics;
-use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
+use paro_storage::search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
 use serde_json::{json, Value};
+
+fn vector_dimension(logical_type: &LogicalType) -> u64 {
+    match logical_type {
+        LogicalType::Array(_, dimension) => *dimension as u64,
+        _ => 0,
+    }
+}
 
 pub struct PostCommitActions;
 
@@ -434,6 +442,7 @@ impl PostCommitActions {
                 .map(|column| column.index)
                 .collect(),
             expression: Self::search_expression(entry),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
             provider_config: Self::search_provider_config(storage, entry)?,
             config_fingerprint: 0,
         };
@@ -498,9 +507,10 @@ impl PostCommitActions {
                     "m": column.hnsw_m,
                     "ef_construct": column.hnsw_ef_construct,
                     "distance": column.hnsw_distance,
+                    "dimension": vector_dimension(&column.logical_type),
                 }))
             }
-            CatalogIndexType::Sparse => Ok(json!({})),
+            CatalogIndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
             CatalogIndexType::FullText => {
                 let config = entry
                     .fulltext_binding()

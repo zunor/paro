@@ -4,6 +4,7 @@
 use crate::compaction::execution::rowset_merger::RowsetMerger;
 use crate::compaction::execution::workspace::{CompactionBuildOutput, CompactionWorkspace};
 use crate::compaction::plan::types::CompactionPlan;
+use crate::search::SearchInlineBuilderSet;
 use crate::tablet::Tablet;
 use paro_common::allocator::default_allocator;
 use paro_common::error::Result;
@@ -19,6 +20,26 @@ impl VerticalMerger {
         plan: Arc<CompactionPlan>,
         workspace: CompactionWorkspace,
     ) -> Result<Option<CompactionBuildOutput>> {
-        RowsetMerger::build(tablet, plan, workspace, Arc::new(default_allocator()))
+        Self::build_with_search_inline_builders(
+            tablet,
+            plan,
+            workspace,
+            SearchInlineBuilderSet::default(),
+        )
+    }
+
+    pub fn build_with_search_inline_builders(
+        tablet: &Tablet,
+        plan: Arc<CompactionPlan>,
+        workspace: CompactionWorkspace,
+        search_inline_builders: SearchInlineBuilderSet,
+    ) -> Result<Option<CompactionBuildOutput>> {
+        RowsetMerger::build_with_search_inline_builders(
+            tablet,
+            plan,
+            workspace,
+            Arc::new(default_allocator()),
+            search_inline_builders,
+        )
     }
 }

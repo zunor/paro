@@ -27,6 +27,7 @@ pub fn register_vector_functions() -> Vec<ScalarFunctionSet> {
         get_cosine_distance_functions(),
         get_inner_product_functions(),
         get_neg_inner_product_functions(),
+        get_sparse_vector_functions(),
         get_sparse_distance_functions(),
         get_vector_dims_functions(),
         get_vector_norm_functions(),

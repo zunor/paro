@@ -1,0 +1,78 @@
+[meta]
+name = "search_derived_state_phase0"
+description = "Search derived-state write/build, query open, and row fetch baseline"
+run_order = 35
+
+[params]
+rows = 20000
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[build]
+file = "sql/build.sql"
+
+[[query]]
+id = "fulltext_topk"
+file = "sql/q_fulltext_topk.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fulltext_project_payload"
+file = "sql/q_fulltext_project_payload.sql"
+validate = "ordered_rows"
+expected = [[1, "payload alpha"], [2, "payload beta"], [3, "payload gamma"]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fulltext_project_fixed_payload"
+file = "sql/q_fulltext_project_fixed_payload.sql"
+validate = "ordered_rows"
+expected = [[10], [20], [30]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fulltext_project_low_cardinality_payload"
+file = "sql/q_fulltext_project_low_cardinality_payload.sql"
+validate = "ordered_rows"
+expected = [[1, "seed"], [2, "seed"], [3, "seed"]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fulltext_project_nullable_payload"
+file = "sql/q_fulltext_project_nullable_payload.sql"
+validate = "ordered_rows"
+expected = [[1, "nullable alpha"], [2, "<null>"], [3, "nullable gamma"]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "fulltext_project_multi_payload"
+file = "sql/q_fulltext_project_multi_payload.sql"
+validate = "ordered_rows"
+expected = [[1, 10, "seed", "payload alpha"], [2, 20, "seed", "payload beta"], [3, 30, "seed", "payload gamma"]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "sparse_topk"
+file = "sql/q_sparse_topk.sql"
+validate = "ordered_rows"
+expected = [[1], [2], [3]]
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "hnsw_topk"
+file = "sql/q_hnsw_topk.sql"
+validate = "ordered_rows"
+expected = [[1], [4], [2]]
+collect_explain_profile = true
+allow_reexecute = true

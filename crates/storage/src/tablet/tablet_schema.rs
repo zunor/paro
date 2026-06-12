@@ -466,6 +466,10 @@ impl TabletSchema {
             // Logical type
             let type_id = col.logical_type.type_id();
             data.push(type_id);
+            let mut logical_type_bytes = Vec::new();
+            col.logical_type.serialize(&mut logical_type_bytes)?;
+            data.extend_from_slice(&(logical_type_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(&logical_type_bytes);
 
             // Flags: is_key, is_nullable, has_default_value
             let flags = (col.is_key as u8)
@@ -592,8 +596,17 @@ impl TabletSchema {
             offset += name_len;
 
             // Logical type
-            let type_id = read_u8!();
-            let logical_type = LogicalType::from_type_id(type_id).unwrap_or(LogicalType::Unknown);
+            let _type_id = read_u8!();
+            let logical_type_len = read_u32!() as usize;
+            if offset + logical_type_len > data.len() {
+                return Err(paro_error::internal(
+                    "Invalid TabletSchema data: truncated logical type",
+                ));
+            }
+            let mut logical_type_reader =
+                std::io::Cursor::new(&data[offset..offset + logical_type_len]);
+            let logical_type = LogicalType::deserialize(&mut logical_type_reader)?;
+            offset += logical_type_len;
 
             // Flags
             let flags = read_u8!();
@@ -764,7 +777,14 @@ mod tests {
         col2.length = 123;
         col2.aggregation_type = Some("SUM".to_string());
 
-        let columns = vec![col1, col2];
+        let col3 = TabletColumn::new(
+            3,
+            "embedding",
+            LogicalType::Array(Box::new(LogicalType::Float), 4),
+        )
+        .with_hnsw_index(8, 64, 0);
+
+        let columns = vec![col1, col2, col3];
         let mut schema = TabletSchema::new(1, columns, KeysType::PrimaryKeys).unwrap();
         schema.set_sort_key_idxes(vec![0]).unwrap();
         schema.set_num_short_key_columns(1);
@@ -775,7 +795,7 @@ mod tests {
         assert_eq!(restored.id(), 1);
         assert_eq!(restored.schema_id(), 1);
         assert_eq!(restored.schema_version(), 1);
-        assert_eq!(restored.num_columns(), 2);
+        assert_eq!(restored.num_columns(), 3);
         assert_eq!(restored.num_short_key_columns(), 1);
         assert_eq!(restored.sort_key_idxes(), &[0]);
 
@@ -789,6 +809,15 @@ mod tests {
         assert_eq!(rcol2.name, "val");
         assert_eq!(rcol2.length, 123);
         assert_eq!(rcol2.aggregation_type.as_ref().unwrap(), "SUM");
+
+        let rcol3 = restored.column(2).unwrap();
+        assert_eq!(
+            rcol3.logical_type,
+            LogicalType::Array(Box::new(LogicalType::Float), 4)
+        );
+        assert!(rcol3.index_hnsw);
+        assert_eq!(rcol3.hnsw_m, 8);
+        assert_eq!(rcol3.hnsw_ef_construct, 64);
     }
 
     #[test]

@@ -8,10 +8,11 @@
 //! Prefix lookup is accelerated by a trie-backed aggregated bitmap, avoiding
 //! repeated BTree range scans on hot `:*` queries.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 
 use super::posting_list::{DocId, PostingList};
 use super::tokenizer::Token;
@@ -69,6 +70,23 @@ impl InvertedIndex {
 
     /// Add a document to the index.
     pub fn add_document(&mut self, doc_id: DocId, tokens: &[Token]) -> Result<()> {
+        self.add_document_internal(doc_id, tokens, true)
+    }
+
+    pub(crate) fn add_document_deferred_prefix(
+        &mut self,
+        doc_id: DocId,
+        tokens: &[Token],
+    ) -> Result<()> {
+        self.add_document_internal(doc_id, tokens, false)
+    }
+
+    fn add_document_internal(
+        &mut self,
+        doc_id: DocId,
+        tokens: &[Token],
+        update_prefix_trie: bool,
+    ) -> Result<()> {
         if self.doc_lengths.contains_key(&doc_id) {
             return Err(paro_error::invalid_input(
                 "FullTextInvertedIndex: duplicate doc_id",
@@ -76,15 +94,20 @@ impl InvertedIndex {
         }
 
         let mut doc_len = 0u32;
-        let mut unique_terms = HashSet::new();
+        let mut unique_terms = SmallVec::<[&str; 16]>::new();
         for token in tokens {
             let list = self.postings.entry(token.term.clone()).or_default();
             list.add_position(doc_id, token.position)?;
             doc_len += 1;
-            unique_terms.insert(token.term.clone());
+            let term = token.term.as_str();
+            if !unique_terms.contains(&term) {
+                unique_terms.push(term);
+            }
         }
-        for term in unique_terms {
-            self.prefix_trie.insert(&term, doc_id);
+        if update_prefix_trie {
+            for term in unique_terms {
+                self.prefix_trie.insert(term, doc_id);
+            }
         }
 
         self.doc_lengths.insert(doc_id, doc_len);
@@ -173,7 +196,7 @@ impl InvertedIndex {
         index
     }
 
-    fn rebuild_prefix_trie(&mut self) {
+    pub(crate) fn rebuild_prefix_trie(&mut self) {
         let mut trie = PrefixTrie::default();
         for (term, list) in &self.postings {
             for elem in list.iter() {

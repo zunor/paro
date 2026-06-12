@@ -9,15 +9,19 @@ use crate::compaction::execution::rowset_merger::RowsetMerger;
 use crate::compaction::execution::workspace::{CompactionBuildOutput, CompactionWorkspace};
 use crate::compaction::plan::CompactionPlanner;
 use crate::index::fulltext::query_parser::ParsedQuery;
+use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::{FullTextIndex, FullTextIndexConfig};
 use crate::index::fulltext::tokenizer::TokenizerKind;
 use crate::index::hnsw::SearchParams;
 use crate::index::{BoundIndex, Predicate, PredicateResult, PredicateTree};
 use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
+use crate::metrics::storage_metrics;
 use crate::rowset::{SegmentIterator, SparseVector};
+use crate::search::providers::fulltext::search::FullTextTopKProvider;
 use crate::search::{
-    CoverageState, OpenedSearchCursor, ResourceBudget, SearchBatchConfig, SearchBatchState,
-    SearchIndexDefinition, SearchIndexKind, SearchMaintenanceAction, SearchProviderStats,
+    ArtifactLocation, CoverageState, OpenedSearchCursor, ResourceBudget, SearchBatchConfig,
+    SearchBatchState, SearchCapabilityState, SearchFreshnessPolicy, SearchIndexDefinition,
+    SearchIndexKind, SearchMaintenanceAction, SearchNotQueryableReason, SearchProviderStats,
 };
 use crate::statistics::IndexType;
 use crate::table::storage_descriptor::TableStorageDescriptor;
@@ -29,7 +33,11 @@ use crate::transaction::txn::Transaction;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_transaction::{CommitTs, ReadTs, RetentionLeaseKind, TransactionView};
+use paro_common::vector::Vector;
+use paro_transaction::{
+    CommandId, CommitTs, IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTs,
+    RetentionLeaseKind, TransactionView,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -90,6 +98,18 @@ fn read_view(table: &TableHandle) -> TransactionView {
     TransactionView::autocommit(ReadTs::new(visible))
 }
 
+fn transaction_view_for_command(txn: &Transaction, command_id: u32) -> TransactionView {
+    TransactionView::new(
+        txn.writer_id(),
+        txn.read_ts(),
+        ReadSnapshot::without_lease(ReadTs::new(txn.visible_commit_ts().into_raw())),
+        IsolationLevel::Snapshot,
+        CommandId::new(command_id),
+        paro_transaction::ReadTrackerHandle::noop(),
+        ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]),
+    )
+}
+
 fn commit_transaction(txn: &Transaction, commit_id: u64) -> paro_common::error::Result<()> {
     let apply_result = txn.apply_prepared_storage_for_commit(commit_id);
     txn.release_transaction_locks();
@@ -116,6 +136,20 @@ fn stable_test_data_dir(table_id: u64, partition_id: u64, tablet_id: u64) -> Pat
 }
 
 fn register_fulltext_definition(table: &TableHandle, column_id: u32, config: &str) -> u64 {
+    register_fulltext_definition_with_freshness(
+        table,
+        column_id,
+        config,
+        SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+    )
+}
+
+fn register_fulltext_definition_with_freshness(
+    table: &TableHandle,
+    column_id: u32,
+    config: &str,
+    freshness_policy: SearchFreshnessPolicy,
+) -> u64 {
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
     let provider_config = json!({ "config": config });
     let expression = format!("to_tsvector('{}', col_{})", config, column_id);
@@ -126,6 +160,7 @@ fn register_fulltext_definition(table: &TableHandle, column_id: u32, config: &st
         kind: SearchIndexKind::FullText,
         column_ids: vec![column_id],
         expression: Some(expression.clone()),
+        freshness_policy,
         config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
             SearchIndexKind::FullText,
             &[column_id],
@@ -143,7 +178,7 @@ fn register_fulltext_definition(table: &TableHandle, column_id: u32, config: &st
 fn register_sparse_definition(table: &TableHandle, column_id: u32) -> u64 {
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
     let expression = format!("sparse_vector(col_{})", column_id);
-    let provider_config = json!({});
+    let provider_config = json!({ "physical_encoding": "binary-v1" });
     let definition = SearchIndexDefinition {
         definition_id,
         table_id: table.tablet().table_id(),
@@ -151,6 +186,7 @@ fn register_sparse_definition(table: &TableHandle, column_id: u32) -> u64 {
         kind: SearchIndexKind::Sparse,
         column_ids: vec![column_id],
         expression: Some(expression.clone()),
+        freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
         config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
             SearchIndexKind::Sparse,
             &[column_id],
@@ -163,6 +199,16 @@ fn register_sparse_definition(table: &TableHandle, column_id: u32) -> u64 {
         .register_search_definition(definition)
         .expect("register test sparse definition");
     definition_id
+}
+
+fn test_sparse_blob_vector(values: &[SparseVector]) -> Vector {
+    let mut vector = Vector::try_new(LogicalType::Blob, values.len(), test_allocator())
+        .expect("blob vector allocation");
+    for (idx, value) in values.iter().enumerate() {
+        vector.set_blob(idx, &value.to_row_image_v1().expect("sparse row image"));
+    }
+    vector.set_count(values.len());
+    vector
 }
 
 fn collect_row_ids_by_id(table: &TableHandle) -> HashMap<i32, u64> {
@@ -251,6 +297,36 @@ fn collect_i32_column(chunks: &[Chunk], col_idx: usize) -> Vec<i32> {
     values
 }
 
+fn collect_i32_score_pairs(
+    chunks: &[Chunk],
+    id_col_idx: usize,
+    score_col_idx: usize,
+) -> Vec<(i32, f32)> {
+    let mut values = Vec::new();
+    for chunk in chunks {
+        let ids = chunk.column(id_col_idx).expect("id column not found");
+        let scores = chunk.column(score_col_idx).expect("score column not found");
+        for row in 0..chunk.size() {
+            values.push((
+                ids.get_i32(row).expect("id column value as i32"),
+                scores.get_f32(row).expect("score column value as f32"),
+            ));
+        }
+    }
+    values.sort_unstable_by_key(|(id, _)| *id);
+    values
+}
+
+fn fulltext_degraded_score_metric_count(table_id: u64, reason: &str) -> u64 {
+    storage_metrics()
+        .snapshot()
+        .search_fulltext_degraded_score_by_key
+        .into_iter()
+        .find(|series| series.key.table_id == table_id && series.key.reason == reason)
+        .map(|series| series.degraded_queries)
+        .unwrap_or(0)
+}
+
 fn drain_search_cursor(
     table: &TableHandle,
     opened: OpenedSearchCursor,
@@ -318,8 +394,9 @@ fn run_vector_cursor_with_slots(
 
 fn infer_fulltext_config(table: &TableHandle, column_id: usize) -> String {
     table
-        .search_write_plan()
-        .expect("search write plan")
+        .search_write_context()
+        .expect("search write context")
+        .plan
         .fulltext
         .into_iter()
         .find_map(|binding| (binding.column_id as usize == column_id).then_some(binding.config))
@@ -1289,6 +1366,45 @@ fn vector_search_filters_rows_deleted_by_primary_keys() {
 }
 
 #[test]
+fn hnsw_capability_exposes_generation_level_provider_stats() {
+    let table = create_hnsw_table(2);
+    table
+        .append(&chunk_with_embeddings(
+            &[1, 2, 3, 4, 5],
+            &[
+                vec![0.0_f32, 0.0],
+                vec![1.0_f32, 0.0],
+                vec![0.0_f32, 1.0],
+                vec![1.0_f32, 1.0],
+                vec![2.0_f32, 2.0],
+            ],
+            2,
+        ))
+        .unwrap();
+
+    let capability = table.vector_capability(1).expect("hnsw capability");
+    let SearchProviderStats::Hnsw(provider_stats) = capability
+        .generation_stats
+        .provider_stats
+        .clone()
+        .expect("hnsw provider stats")
+    else {
+        panic!("expected hnsw provider stats");
+    };
+    assert_eq!(provider_stats.vector_count, 5);
+    assert_eq!(provider_stats.dimension, 2);
+    assert_eq!(provider_stats.m, 8);
+    assert_eq!(provider_stats.ef_construction, 64);
+    assert!(provider_stats.graph_memory_bytes > 0);
+    assert_eq!(
+        provider_stats.vector_storage_bytes,
+        5 * 2 * std::mem::size_of::<f32>() as u64
+    );
+    assert!(provider_stats.total_graph_links >= provider_stats.level0_graph_links);
+    assert!(provider_stats.avg_level0_degree >= 0.0);
+}
+
+#[test]
 fn vector_search_returns_updated_vector_after_update() {
     let table = create_hnsw_table(2);
     let ids = [1, 2];
@@ -1492,6 +1608,44 @@ fn vector_search_materializes_varlen_and_null_columns() {
     assert_eq!(id_col.get_i32(1), Some(2));
     assert_eq!(note_col.get_string(1), None);
     assert!(note_col.is_null(1));
+}
+
+#[test]
+fn vector_search_for_view_filters_overlay_deleted_rows() {
+    let table = create_hnsw_table(2);
+    table
+        .append(&chunk_with_embeddings(
+            &[1, 2, 3],
+            &[vec![10.0_f32, 0.0], vec![9.0_f32, 0.0], vec![8.0_f32, 0.0]],
+            2,
+        ))
+        .unwrap();
+
+    let params = SearchParams {
+        ef: Some(64),
+        ..Default::default()
+    };
+    let outside_txn = table
+        .vector_search(1, &[10.0, 0.0], 1, &params, None, &[0])
+        .unwrap();
+    assert_eq!(collect_i32_column(&outside_txn, 0), vec![1]);
+
+    let row_ids = collect_row_ids_by_id(&table);
+    let txn = Arc::new(Transaction::new(4101, table.max_version() as u64 + 1));
+    let deleted = table
+        .delete(&read_view(&table), &[row_ids[&1]], txn.clone())
+        .unwrap();
+    assert_eq!(deleted, 1);
+    txn.publish_command_boundary(CommandId::new(1));
+    let view = transaction_view_for_command(&txn, 1);
+
+    let opened = table
+        .open_vector_search_cursor_for_view(1, &[10.0, 0.0], 3, params, None, &view)
+        .expect("open vector search cursor for txn view");
+    let chunks = drain_search_cursor(&table, opened, &[0], false, 3, 1)
+        .expect("drain txn view search cursor");
+
+    assert_eq!(collect_i32_column(&chunks, 0), vec![2, 3]);
 }
 
 #[test]
@@ -2247,7 +2401,10 @@ fn fulltext_definition_on_empty_table_installs_empty_queryable_generation() {
         .generation_stats
         .provider_stats
         .clone()
-        .expect("empty generation provider stats");
+        .expect("empty generation provider stats")
+    else {
+        panic!("expected fulltext provider stats");
+    };
     assert_eq!(provider_stats.total_docs, 0);
     assert_eq!(provider_stats.total_terms, 0);
 
@@ -2277,9 +2434,13 @@ fn search_snapshot_pins_derived_delta_when_generation_lags_read_ts() {
     let table = create_table(&[LogicalType::Varchar]);
     let definition_id = register_fulltext_definition(&table, 0, "simple");
     let target_version = table.max_version().saturating_add(10);
+    let capability = table
+        .fulltext_capability(0, "simple")
+        .expect("fulltext capability");
+    assert_eq!(capability.definition_id, definition_id);
 
     let snapshot = table
-        .open_search_snapshot(definition_id, table.tablet_id(), target_version)
+        .open_search_snapshot(&capability, target_version)
         .expect("open lagging search snapshot");
     let lease_info = snapshot
         .derived_lag_lease_info()
@@ -2513,19 +2674,23 @@ fn fulltext_registry_definition_auto_builds_on_transaction_commit() {
 
 #[test]
 fn sparse_registry_definition_auto_builds_for_inserts() {
-    let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
+    let table = create_table(&[LogicalType::Integer, LogicalType::Blob]);
     register_sparse_definition(&table, 1);
 
+    let v1 = SparseVector::new(vec![1, 3], vec![1.0, 0.5]).unwrap();
+    let v2 = SparseVector::new(vec![2], vec![1.0]).unwrap();
+    let v3 = SparseVector::new(vec![1, 2], vec![0.7, 0.2]).unwrap();
+    let v4 = SparseVector::new(vec![4], vec![1.0]).unwrap();
     table
         .append(&test_chunk_from_vectors(vec![
             test_i32_vector(&[1, 2]),
-            test_string_vector(&["{1:1.0,3:0.5}", "{2:1.0}"]),
+            test_sparse_blob_vector(&[v1, v2]),
         ]))
         .unwrap();
     table
         .append(&test_chunk_from_vectors(vec![
             test_i32_vector(&[3, 4]),
-            test_string_vector(&["{1:0.7,2:0.2}", "{4:1.0}"]),
+            test_sparse_blob_vector(&[v3, v4]),
         ]))
         .unwrap();
 
@@ -2544,17 +2709,107 @@ fn sparse_registry_definition_auto_builds_for_inserts() {
 }
 
 #[test]
+fn sparse_registry_rejects_varchar_sparse_input() {
+    let table = create_table(&[LogicalType::Varchar]);
+    let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    let provider_config = json!({});
+    let expression = "sparse_vector(col_0)".to_string();
+    let definition = SearchIndexDefinition {
+        definition_id,
+        table_id: table.tablet().table_id(),
+        name: format!("__test_sparse_reject_{}", definition_id),
+        kind: SearchIndexKind::Sparse,
+        column_ids: vec![0],
+        expression: Some(expression.clone()),
+        freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
+        config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+            SearchIndexKind::Sparse,
+            &[0],
+            Some(&expression),
+            &provider_config,
+        ),
+        provider_config,
+    };
+
+    let err = table
+        .register_search_definition(definition)
+        .expect_err("default sparse encoding should reject Varchar input");
+    assert!(
+        err.to_string()
+            .contains("Blob binary sparse row image column"),
+        "unexpected sparse validation error: {err}"
+    );
+}
+
+#[test]
+fn sparse_registry_rejects_textual_blob_payload_during_inline_build() {
+    let table = create_table(&[LogicalType::Integer, LogicalType::Blob]);
+    register_sparse_definition(&table, 1);
+
+    let mut textual_blob =
+        Vector::try_new(LogicalType::Blob, 1, test_allocator()).expect("blob vector allocation");
+    textual_blob.set_blob(0, b"{1:1.0}");
+    textual_blob.set_count(1);
+
+    let err = table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1]),
+            textual_blob,
+        ]))
+        .expect_err("Sparse Blob payload must be a typed binary row image, not text");
+    assert!(
+        err.to_string()
+            .contains("Sparse binary row image decode failed"),
+        "unexpected sparse text payload error: {err}"
+    );
+}
+
+#[test]
+fn sparse_capability_exposes_generation_level_provider_stats() {
+    let table = create_table(&[LogicalType::Integer, LogicalType::Blob]);
+    register_sparse_definition(&table, 1);
+
+    let v1 = SparseVector::new(vec![1, 2], vec![3.0, 4.0]).unwrap();
+    let v2 = SparseVector::new(vec![2], vec![2.0]).unwrap();
+    table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_sparse_blob_vector(&[v1, v2]),
+        ]))
+        .unwrap();
+
+    let capability = table.sparse_capability(1).expect("sparse capability");
+    let SearchProviderStats::Sparse(provider_stats) = capability
+        .generation_stats
+        .provider_stats
+        .clone()
+        .expect("sparse provider stats")
+    else {
+        panic!("expected sparse provider stats");
+    };
+    assert_eq!(provider_stats.row_count, 2);
+    assert_eq!(provider_stats.nnz, 3);
+    assert_eq!(provider_stats.posting_fanout, 3);
+    assert_eq!(provider_stats.unique_dimensions, 2);
+    assert!((provider_stats.avg_vector_nnz - 1.5).abs() < 1e-6);
+    assert!((provider_stats.l2_norm_sum - 7.0).abs() < 1e-6);
+    assert_eq!(provider_stats.max_l2_norm, 5.0);
+}
+
+#[test]
 fn sparse_registry_definition_auto_builds_on_transaction_commit() {
-    let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
+    let table = create_table(&[LogicalType::Integer, LogicalType::Blob]);
     register_sparse_definition(&table, 1);
 
     let txn = Arc::new(Transaction::new(9101, 9101));
+    let v1 = SparseVector::new(vec![5], vec![1.0]).unwrap();
+    let v2 = SparseVector::new(vec![2, 5], vec![0.6, 0.4]).unwrap();
     table
         .append_with_transaction(
             &read_view(&table),
             &test_chunk_from_vectors(vec![
                 test_i32_vector(&[10, 11]),
-                test_string_vector(&["{5:1.0}", "{2:0.6,5:0.4}"]),
+                test_sparse_blob_vector(&[v1, v2]),
             ]),
             txn.clone(),
         )
@@ -2578,7 +2833,7 @@ fn sparse_registry_definition_auto_builds_on_transaction_commit() {
 }
 
 #[test]
-fn fulltext_late_definition_bootstrap_materializes_existing_rowsets() {
+fn fulltext_late_definition_bootstrap_publishes_sidecar_generation() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     table
         .append(&test_chunk_from_vectors(vec![
@@ -2610,7 +2865,14 @@ fn fulltext_late_definition_bootstrap_materializes_existing_rowsets() {
             ..
         }
     ));
-    assert!(table.fulltext_capability(1, "simple").is_some());
+    let capability_before = table
+        .fulltext_capability(1, "simple")
+        .expect("fulltext capability before bootstrap");
+    assert_eq!(capability_before.tail_summary.pending_rowsets, 2);
+    assert_eq!(capability_before.tail_summary.pending_segments, 2);
+    assert_eq!(capability_before.tail_summary.pending_rows, 4);
+    assert!(capability_before.tail_summary.pending_bytes > 0);
+    assert!(capability_before.tail_summary.exact_tail_merge);
 
     let snapshot_before = table
         .open_search_generation_snapshot(definition_id)
@@ -2647,12 +2909,21 @@ fn fulltext_late_definition_bootstrap_materializes_existing_rowsets() {
         .expect("generation after bootstrap");
     assert!(snapshot_after.coverage.is_complete());
     assert_eq!(snapshot_after.artifacts.artifacts.len(), 2);
+    assert!(snapshot_after.artifacts.artifacts.iter().all(|artifact| {
+        matches!(
+            artifact.location,
+            ArtifactLocation::SidecarArtifactFile { .. }
+        )
+    }));
+
+    let after = collect_i32_column(&table.fulltext_filter(1, &query, None, &[0]).unwrap(), 0);
+    assert_eq!(after, vec![1, 3]);
 
     for (_, segment) in table.collect_segments(table.max_version()).unwrap() {
         let meta = segment.get_column_meta(1).expect("text column meta");
         assert!(
-            meta.fulltext_index_pointer.is_some(),
-            "bootstrap should materialize durable fulltext payloads"
+            meta.fulltext_index_pointer.is_none(),
+            "late bootstrap must publish sidecar artifacts instead of patching immutable segment footers"
         );
     }
 }
@@ -2731,7 +3002,56 @@ fn fulltext_late_definition_exact_tail_merge_resolves_partial_rows() {
 }
 
 #[test]
-fn sparse_late_definition_exact_tail_merge_resolves_partial_rows() {
+fn fulltext_tail_over_budget_rejects_before_provider_open() {
+    let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
+    table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1]),
+            test_string_vector(&["vector tail"]),
+        ]))
+        .unwrap();
+
+    register_fulltext_definition_with_freshness(
+        &table,
+        1,
+        "simple",
+        SearchFreshnessPolicy::BoundedLag {
+            max_tail_rows: 0,
+            max_lag_millis: 0,
+        },
+    );
+
+    let capability = table
+        .fulltext_capability(1, "simple")
+        .expect("fulltext capability");
+    assert_eq!(
+        capability.capability_state(),
+        SearchCapabilityState::NotQueryable {
+            reason: SearchNotQueryableReason::TailOverBudget,
+        }
+    );
+
+    let query = FullTextIndex::new_default().parse_query("vector").unwrap();
+    let err = table
+        .open_fulltext_search_cursor(
+            1,
+            &query,
+            1,
+            "simple",
+            None,
+            None,
+            FullTextScoreMode::Bm25,
+            table.max_version(),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not queryable"),
+        "tail over budget should reject before provider open, got {err}"
+    );
+}
+
+#[test]
+fn fulltext_topk_mixed_artifact_tail_uses_unified_generation_stats() {
     let table = create_table_with_keys(
         &[
             LogicalType::Integer,
@@ -2744,7 +3064,126 @@ fn sparse_late_definition_exact_tail_merge_resolves_partial_rows() {
         .append(&test_chunk_from_vectors(vec![
             test_i32_vector(&[1, 2]),
             test_i32_vector(&[10, 20]),
-            test_string_vector(&["{1:1.0,3:0.5}", "{2:1.0}"]),
+            test_string_vector(&["vector database", "vector database"]),
+        ]))
+        .unwrap();
+
+    let definition_id = register_fulltext_definition(&table, 2, "simple");
+    let report = table.bootstrap_search_generations().unwrap();
+    assert_eq!(report.definitions_updated, 1);
+
+    let coverage_after_bootstrap = table
+        .search_generation_coverage(definition_id)
+        .unwrap()
+        .expect("fulltext coverage after bootstrap");
+    assert!(coverage_after_bootstrap.is_complete());
+
+    let row_ids = collect_row_ids_by_id(&table);
+    table
+        .update_direct(
+            &read_view(&table),
+            &[row_ids[&1]],
+            &[1],
+            &[vec![Value::Integer(15)]],
+        )
+        .unwrap();
+
+    let coverage_after_partial = table
+        .search_generation_coverage(definition_id)
+        .unwrap()
+        .expect("fulltext coverage after partial update");
+    assert!(matches!(
+        coverage_after_partial.coverage,
+        CoverageState::TailPending {
+            exact_tail_merge: true,
+            ..
+        }
+    ));
+
+    let query = FullTextIndex::new_default().parse_query("vector").unwrap();
+    let opened = table
+        .open_fulltext_search_cursor(
+            2,
+            &query,
+            2,
+            "simple",
+            None,
+            None,
+            FullTextScoreMode::Bm25,
+            table.max_version(),
+        )
+        .unwrap();
+    let chunks = drain_search_cursor(&table, opened, &[0], true, 2, 4).unwrap();
+    let scored_rows = collect_i32_score_pairs(&chunks, 0, 1);
+    assert_eq!(scored_rows.len(), 2);
+    assert_eq!(scored_rows[0].0, 1);
+    assert_eq!(scored_rows[1].0, 2);
+
+    let delta = (scored_rows[0].1 - scored_rows[1].1).abs();
+    assert!(
+        delta < 1e-6,
+        "artifact and tail rows with identical text should share final score, rows={scored_rows:?}"
+    );
+}
+
+#[test]
+fn fulltext_topk_missing_generation_stats_records_degraded_metric() {
+    let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
+    register_fulltext_definition(&table, 1, "simple");
+    table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_string_vector(&["vector database", "noise"]),
+        ]))
+        .unwrap();
+
+    let query = FullTextIndex::new_default().parse_query("vector").unwrap();
+    let capability = table
+        .fulltext_capability(1, "simple")
+        .expect("fulltext capability");
+    let snapshot = table
+        .open_search_snapshot(&capability, table.max_version())
+        .expect("search snapshot");
+    let table_id = table.table_id();
+    let reason = "missing_generation_stats";
+    let before = fulltext_degraded_score_metric_count(table_id, reason);
+
+    let opened = FullTextTopKProvider::new(
+        table.tablet(),
+        1,
+        &query,
+        1,
+        "simple",
+        None,
+        None,
+        FullTextScoreMode::Bm25,
+    )
+    .open(snapshot)
+    .unwrap();
+    let chunks = drain_search_cursor(&table, opened, &[0], false, 1, 4).unwrap();
+    assert_eq!(collect_i32_column(&chunks, 0), vec![1]);
+
+    let after = fulltext_degraded_score_metric_count(table_id, reason);
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn sparse_late_definition_exact_tail_merge_resolves_partial_rows() {
+    let table = create_table_with_keys(
+        &[
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Blob,
+        ],
+        KeysType::PrimaryKeys,
+    );
+    let v1 = SparseVector::new(vec![1, 3], vec![1.0, 0.5]).unwrap();
+    let v2 = SparseVector::new(vec![2], vec![1.0]).unwrap();
+    table
+        .append(&test_chunk_from_vectors(vec![
+            test_i32_vector(&[1, 2]),
+            test_i32_vector(&[10, 20]),
+            test_sparse_blob_vector(&[v1, v2]),
         ]))
         .unwrap();
 
@@ -2835,120 +3274,6 @@ fn fulltext_update_delete_respect_delete_bitmap() {
     let noise_query = FullTextIndex::new_default().parse_query("noise").unwrap();
     let noise_chunks = table.fulltext_filter(1, &noise_query, None, &[0]).unwrap();
     assert_eq!(collect_i32_column(&noise_chunks, 0), vec![2]);
-}
-
-#[test]
-fn fulltext_compaction_rebuild_preserves_search_results() {
-    let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
-    register_fulltext_definition(&table, 1, "simple");
-
-    table
-        .append(&test_chunk_from_vectors(vec![
-            test_i32_vector(&[1, 2]),
-            test_string_vector(&["vector one", "noise"]),
-        ]))
-        .unwrap();
-    table
-        .append(&test_chunk_from_vectors(vec![
-            test_i32_vector(&[3, 4]),
-            test_string_vector(&["vector two", "other"]),
-        ]))
-        .unwrap();
-
-    let query = FullTextIndex::new_default().parse_query("vector").unwrap();
-    let before = collect_i32_column(&table.fulltext_filter(1, &query, None, &[0]).unwrap(), 0);
-    assert_eq!(before, vec![1, 3]);
-
-    let artifact = build_duplicate_key_compaction_output(&table, 77_001);
-    let output_rowset = artifact.rowset.clone();
-    rebuild_compaction_indexes(
-        table.tablet().as_ref(),
-        output_rowset.clone(),
-        &artifact.plan,
-    )
-    .unwrap();
-    output_rowset.load().unwrap();
-
-    let merged_stats = output_rowset.statistics().expect("rowset stats");
-    let ft_stats = merged_stats
-        .fulltext_index(1)
-        .expect("merged fulltext stats on compacted rowset");
-    assert_eq!(ft_stats.total_docs, 4);
-    assert_eq!(ft_stats.total_terms, 6);
-
-    for segment in output_rowset.segments() {
-        assert!(
-            segment.fulltext_index(1).is_some(),
-            "compaction output segment should expose the rebuilt durable fulltext payload"
-        );
-    }
-
-    let mut after = Vec::new();
-    for segment in output_rowset.segments() {
-        let mut id_iter = segment.new_column_iterator(0).unwrap();
-        for hit in segment
-            .fulltext_search_text(1, "vector", 10, None, None)
-            .unwrap()
-        {
-            id_iter.seek_to_ordinal(hit.idx as u64).unwrap();
-            let (_rowids, batch) = id_iter.next_batch(1).unwrap();
-            let id = i32::from_le_bytes(batch.data[0..4].try_into().unwrap());
-            after.push(id);
-        }
-    }
-    after.sort_unstable();
-    assert_eq!(after, before);
-}
-
-#[test]
-fn sparse_compaction_rebuild_preserves_search_results() {
-    let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
-    register_sparse_definition(&table, 1);
-
-    table
-        .append(&test_chunk_from_vectors(vec![
-            test_i32_vector(&[1, 2]),
-            test_string_vector(&["{1:1.0,3:0.5}", "{2:1.0}"]),
-        ]))
-        .unwrap();
-    table
-        .append(&test_chunk_from_vectors(vec![
-            test_i32_vector(&[3, 4]),
-            test_string_vector(&["{1:0.7,2:0.2}", "{4:1.0}"]),
-        ]))
-        .unwrap();
-
-    let query = SparseVector::parse("{1:1.0}").unwrap();
-    let before = collect_i32_column(&sparse_search(&table, 1, &query, 10, &[0]).unwrap(), 0);
-    assert_eq!(before, vec![1, 3]);
-
-    let artifact = build_duplicate_key_compaction_output(&table, 77_003);
-    let output_rowset = artifact.rowset.clone();
-    rebuild_compaction_indexes(
-        table.tablet().as_ref(),
-        output_rowset.clone(),
-        &artifact.plan,
-    )
-    .unwrap();
-    output_rowset.load().unwrap();
-
-    let mut after = Vec::new();
-    for segment in output_rowset.segments() {
-        assert!(
-            segment.sparse_index(1).is_some(),
-            "compaction output segment should expose the rebuilt durable sparse payload"
-        );
-
-        let mut id_iter = segment.new_column_iterator(0).unwrap();
-        for hit in segment.sparse_vector_search(1, &query, 10, None).unwrap() {
-            id_iter.seek_to_ordinal(hit.idx as u64).unwrap();
-            let (_rowids, batch) = id_iter.next_batch(1).unwrap();
-            let id = i32::from_le_bytes(batch.data[0..4].try_into().unwrap());
-            after.push(id);
-        }
-    }
-    after.sort_unstable();
-    assert_eq!(after, before);
 }
 
 #[test]

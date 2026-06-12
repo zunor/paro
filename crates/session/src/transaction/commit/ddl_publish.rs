@@ -15,13 +15,14 @@ use paro_common::effect::{
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
+use paro_common::types::LogicalType;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::{
     index::{
         graph::{GraphProjectionIndex, GraphStorageGeneration},
         BoundIndex,
     },
-    search::{SearchIndexDefinition, SearchIndexKind},
+    search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind},
     table::table_handle::TableHandle,
     transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor,
 };
@@ -30,6 +31,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type CommitApplyWork = Box<dyn FnOnce(u64) -> Result<()> + Send + 'static>;
+
+fn vector_dimension(logical_type: &LogicalType) -> u64 {
+    match logical_type {
+        LogicalType::Array(_, dimension) => *dimension as u64,
+        _ => 0,
+    }
+}
 
 pub(super) fn build_apply_descriptor_phase(
     instance: Arc<Instance>,
@@ -340,6 +348,7 @@ impl IndexBackfillPublishTask {
                 .map(|column| column.index)
                 .collect(),
             expression: Self::search_expression(entry),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
             provider_config: Self::search_provider_config(storage, entry)?,
             config_fingerprint: 0,
         };
@@ -399,9 +408,10 @@ impl IndexBackfillPublishTask {
                     "m": column.hnsw_m,
                     "ef_construct": column.hnsw_ef_construct,
                     "distance": column.hnsw_distance,
+                    "dimension": vector_dimension(&column.logical_type),
                 }))
             }
-            CatalogIndexType::Sparse => Ok(json!({})),
+            CatalogIndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
             CatalogIndexType::FullText => {
                 let config = entry
                     .fulltext_binding()

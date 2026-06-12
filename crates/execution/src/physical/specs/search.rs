@@ -10,13 +10,14 @@ use paro_storage::index::hnsw::types::SearchParams;
 use paro_storage::index::PredicateTree;
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::{
-    FullTextQueryKind, FullTextQueryStats, FullTextScoreMode, NormalizedSearchRequest,
-    SearchRequestMode,
+    CapabilityToken, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
+    NormalizedSearchRequest, SearchRequestMode,
 };
 
 #[derive(Debug, Clone)]
 pub struct VectorSearchSpec {
     pub table: Arc<TableCatalogEntry>,
+    pub capability_token: CapabilityToken,
     pub column_id: usize,
     pub query_vector: Vec<f32>,
     pub k: usize,
@@ -31,6 +32,7 @@ pub struct VectorSearchSpec {
 #[derive(Debug, Clone)]
 pub struct SparseVectorSearchSpec {
     pub table: Arc<TableCatalogEntry>,
+    pub capability_token: CapabilityToken,
     pub column_id: usize,
     pub query_vector: SparseVector,
     pub k: usize,
@@ -44,6 +46,7 @@ pub struct SparseVectorSearchSpec {
 #[derive(Debug, Clone)]
 pub struct FullTextSearchSpec {
     pub table: Arc<TableCatalogEntry>,
+    pub capability_token: CapabilityToken,
     pub column_id: usize,
     pub query: String,
     pub query_kind: FullTextQueryKind,

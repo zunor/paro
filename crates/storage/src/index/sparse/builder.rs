@@ -45,6 +45,27 @@ impl SparseIndexBuilder {
         Ok(())
     }
 
+    pub(crate) fn add_with_remap_scratch(
+        &mut self,
+        doc_id: PointOffset,
+        vector: &SparseVector,
+        remap_scratch: &mut SparseVector,
+    ) -> Result<()> {
+        self.index
+            .upsert_with_remap_scratch(doc_id, vector, remap_scratch)?;
+        let next = doc_id
+            .checked_add(1)
+            .ok_or_else(|| paro_error::out_of_range("doc_id exceeds u32 range"))?;
+        if next > self.next_doc_id {
+            self.next_doc_id = next;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_doc_id(&self) -> PointOffset {
+        self.next_doc_id
+    }
+
     /// Add a vector with the next sequential document ID.
     pub fn push(&mut self, vector: &SparseVector) -> Result<PointOffset> {
         let doc_id = self.next_doc_id;
@@ -65,6 +86,17 @@ impl SparseIndexBuilder {
             self.next_doc_id = doc_id;
         }
         Ok(())
+    }
+
+    /// Remove a vector that was added for an explicit document ID.
+    pub fn remove(&mut self, doc_id: PointOffset, vector: &SparseVector) -> Result<()> {
+        self.index.remove(doc_id, vector)
+    }
+
+    /// Reset the next sequential document ID after a suffix rollback.
+    pub fn set_next_doc_id(&mut self, next_doc_id: PointOffset) {
+        self.next_doc_id = next_doc_id;
+        self.index.set_num_vectors(next_doc_id as usize);
     }
 
     /// Build index from a sparse vector column file (doc_id = row ordinal).

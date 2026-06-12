@@ -11,6 +11,7 @@ use super::inverted_index::InvertedIndex;
 use super::posting_list::DocId;
 use super::query_eval::{self, TokenLike};
 use super::query_parser::ParsedQuery;
+use super::text_index::FullTextScoringStats;
 use super::tokenizer::{Token, TokenPosition};
 
 /// Score mode for full-text ranking.
@@ -42,7 +43,7 @@ pub fn score_document_from_index(
     bm25: &Bm25,
     query: &ParsedQuery,
     doc_id: DocId,
-    stats: super::text_index::GlobalFullTextStats,
+    stats: &FullTextScoringStats,
 ) -> f32 {
     match score_mode {
         FullTextScoreMode::Bm25 => score_bm25(index, bm25, query, doc_id, stats),
@@ -62,14 +63,28 @@ pub fn score_document_from_tokens<T: TokenLike>(
     }
 }
 
+/// Score a tokenized document with the same query-time stats used by index-backed candidates.
+pub fn score_document_from_tokens_with_stats<T: TokenLike>(
+    score_mode: FullTextScoreMode,
+    tokens: &[T],
+    query: &ParsedQuery,
+    bm25: &Bm25,
+    stats: &FullTextScoringStats,
+) -> f32 {
+    match score_mode {
+        FullTextScoreMode::Bm25 => score_bm25_tokens_with_stats(tokens, query, bm25, stats),
+        FullTextScoreMode::CoverDensity => score_cover_density_tokens(tokens, query),
+    }
+}
+
 fn score_bm25(
     index: &InvertedIndex,
     bm25: &Bm25,
     query: &ParsedQuery,
     doc_id: DocId,
-    stats: super::text_index::GlobalFullTextStats,
+    stats: &FullTextScoringStats,
 ) -> f32 {
-    if stats.total_docs == 0 || stats.avg_doc_length == 0.0 {
+    if stats.global.total_docs == 0 || stats.global.avg_doc_length == 0.0 {
         return 0.0;
     }
     let Some(doc_len) = index.doc_length(doc_id) else {
@@ -79,17 +94,7 @@ fn score_bm25(
         return 0.0;
     }
 
-    let dl = doc_len as f32;
-    let total_docs_f = stats.total_docs as f32;
-    score_bm25_query(
-        index,
-        bm25,
-        query,
-        doc_id,
-        dl,
-        total_docs_f,
-        stats.avg_doc_length,
-    )
+    score_bm25_query(index, bm25, query, doc_id, doc_len as f32, stats)
 }
 
 fn score_bm25_query(
@@ -98,34 +103,31 @@ fn score_bm25_query(
     query: &ParsedQuery,
     doc_id: DocId,
     doc_len: f32,
-    total_docs: f32,
-    avgdl: f32,
+    stats: &FullTextScoringStats,
 ) -> f32 {
     match query {
-        ParsedQuery::Term(term) => {
-            bm25_term_score(index, bm25, term, doc_id, doc_len, total_docs, avgdl)
-        }
+        ParsedQuery::Term(term) => bm25_term_score(index, bm25, term, doc_id, doc_len, stats),
         ParsedQuery::Prefix(prefix) => {
-            bm25_prefix_score(index, bm25, prefix, doc_id, doc_len, total_docs, avgdl)
+            bm25_prefix_score(index, bm25, prefix, doc_id, doc_len, stats)
         }
         ParsedQuery::Phrase(terms) => terms
             .iter()
-            .map(|term| bm25_term_score(index, bm25, term, doc_id, doc_len, total_docs, avgdl))
+            .map(|term| bm25_term_score(index, bm25, term, doc_id, doc_len, stats))
             .sum(),
         ParsedQuery::FollowedBy(items, _) => items
             .iter()
-            .map(|item| score_bm25_query(index, bm25, item, doc_id, doc_len, total_docs, avgdl))
+            .map(|item| score_bm25_query(index, bm25, item, doc_id, doc_len, stats))
             .sum(),
         ParsedQuery::And(items) => {
             let mut sum = 0.0;
             for item in items {
-                sum += score_bm25_query(index, bm25, item, doc_id, doc_len, total_docs, avgdl);
+                sum += score_bm25_query(index, bm25, item, doc_id, doc_len, stats);
             }
             sum
         }
         ParsedQuery::Or(items) => items
             .iter()
-            .map(|item| score_bm25_query(index, bm25, item, doc_id, doc_len, total_docs, avgdl))
+            .map(|item| score_bm25_query(index, bm25, item, doc_id, doc_len, stats))
             .fold(0.0, f32::max),
         ParsedQuery::Not(_) => 0.0,
     }
@@ -137,18 +139,23 @@ fn bm25_term_score(
     term: &str,
     doc_id: DocId,
     doc_len: f32,
-    total_docs: f32,
-    avgdl: f32,
+    stats: &FullTextScoringStats,
 ) -> f32 {
     let Some(list) = index.get_posting_list(term) else {
         return 0.0;
     };
-    let df = list.len() as f32;
+    let df = stats.doc_freq(term, list.len() as u32) as f32;
     let tf = list
         .get(doc_id)
         .map(|elem| elem.term_frequency as f32)
         .unwrap_or(0.0);
-    bm25.score(tf, doc_len, avgdl, df, total_docs)
+    bm25.score(
+        tf,
+        doc_len,
+        stats.global.avg_doc_length,
+        df,
+        stats.global.total_docs as f32,
+    )
 }
 
 fn bm25_prefix_score(
@@ -157,21 +164,26 @@ fn bm25_prefix_score(
     prefix: &str,
     doc_id: DocId,
     doc_len: f32,
-    total_docs: f32,
-    avgdl: f32,
+    stats: &FullTextScoringStats,
 ) -> f32 {
     let mut score = 0.0;
     for (term, list) in index.postings().range(prefix.to_string()..) {
         if !term.starts_with(prefix) {
             break;
         }
-        let df = list.len() as f32;
+        let df = stats.doc_freq(term, list.len() as u32) as f32;
         let tf = list
             .get(doc_id)
             .map(|elem| elem.term_frequency as f32)
             .unwrap_or(0.0);
         if tf > 0.0 {
-            score += bm25.score(tf, doc_len, avgdl, df, total_docs);
+            score += bm25.score(
+                tf,
+                doc_len,
+                stats.global.avg_doc_length,
+                df,
+                stats.global.total_docs as f32,
+            );
         }
     }
     score
@@ -390,6 +402,96 @@ fn score_bm25_tokens_query(
     }
 }
 
+fn score_bm25_tokens_with_stats<T: TokenLike>(
+    tokens: &[T],
+    query: &ParsedQuery,
+    bm25: &Bm25,
+    stats: &FullTextScoringStats,
+) -> f32 {
+    if tokens.is_empty() || stats.global.total_docs == 0 || stats.global.avg_doc_length == 0.0 {
+        return 0.0;
+    }
+
+    let mut term_freqs = BTreeMap::<&str, u32>::new();
+    for token in tokens {
+        *term_freqs.entry(token.term()).or_default() += 1;
+    }
+
+    score_bm25_tokens_query_with_stats(query, tokens.len() as f32, &term_freqs, bm25, stats)
+}
+
+fn score_bm25_tokens_query_with_stats(
+    query: &ParsedQuery,
+    doc_len: f32,
+    term_freqs: &BTreeMap<&str, u32>,
+    bm25: &Bm25,
+    stats: &FullTextScoringStats,
+) -> f32 {
+    match query {
+        ParsedQuery::Term(term) => bm25_token_term_score(
+            term,
+            *term_freqs.get(term.as_str()).unwrap_or(&0),
+            doc_len,
+            bm25,
+            stats,
+        ),
+        ParsedQuery::Prefix(prefix) => term_freqs
+            .iter()
+            .filter(|(term, _)| term.starts_with(prefix))
+            .map(|(term, tf)| bm25_token_term_score(term, *tf, doc_len, bm25, stats))
+            .sum(),
+        ParsedQuery::Phrase(terms) => terms
+            .iter()
+            .map(|term| {
+                bm25_token_term_score(
+                    term,
+                    *term_freqs.get(term.as_str()).unwrap_or(&0),
+                    doc_len,
+                    bm25,
+                    stats,
+                )
+            })
+            .sum(),
+        ParsedQuery::FollowedBy(items, _) | ParsedQuery::And(items) => {
+            let mut sum = 0.0;
+            for item in items {
+                let score =
+                    score_bm25_tokens_query_with_stats(item, doc_len, term_freqs, bm25, stats);
+                if score == 0.0 && !matches!(item, ParsedQuery::Not(_)) {
+                    return 0.0;
+                }
+                sum += score;
+            }
+            sum
+        }
+        ParsedQuery::Or(items) => items
+            .iter()
+            .map(|item| score_bm25_tokens_query_with_stats(item, doc_len, term_freqs, bm25, stats))
+            .fold(0.0, f32::max),
+        ParsedQuery::Not(_) => 0.0,
+    }
+}
+
+fn bm25_token_term_score(
+    term: &str,
+    tf: u32,
+    doc_len: f32,
+    bm25: &Bm25,
+    stats: &FullTextScoringStats,
+) -> f32 {
+    if tf == 0 {
+        return 0.0;
+    }
+    let df = stats.doc_freq(term, 1) as f32;
+    bm25.score(
+        tf as f32,
+        doc_len,
+        stats.global.avg_doc_length,
+        df,
+        stats.global.total_docs as f32,
+    )
+}
+
 fn lightweight_bm25_component(tf: f32, doc_len: f32) -> f32 {
     if tf <= 0.0 || doc_len <= 0.0 {
         return 0.0;
@@ -539,16 +641,63 @@ mod tests {
             std::collections::HashMap::from([(1, 3)]),
         );
         let bm25 = Bm25::default();
-        let stats = super::super::text_index::GlobalFullTextStats::from_totals(1, 3);
+        let stats = super::super::text_index::FullTextScoringStats::from_global_stats(
+            super::super::text_index::GlobalFullTextStats::from_totals(1, 3),
+        );
         let term = score_document_from_index(
             FullTextScoreMode::Bm25,
             &index,
             &bm25,
             &ParsedQuery::Term("vector".to_string()),
             1,
-            stats,
+            &stats,
         );
         assert!(term > 0.0);
+    }
+
+    #[test]
+    fn bm25_token_and_index_scoring_share_generation_stats() {
+        let tokenizer = DefaultTokenizer::new();
+        let mut artifact_tokens = Vec::new();
+        tokenizer.tokenize("vector database", &mut artifact_tokens);
+        let index = InvertedIndex::from_parts(
+            artifact_tokens
+                .iter()
+                .fold(std::collections::BTreeMap::new(), |mut acc, token| {
+                    acc.entry(token.term.clone())
+                        .or_insert_with(Default::default)
+                        .add_position(1, token.position)
+                        .unwrap();
+                    acc
+                }),
+            std::collections::HashMap::from([(1, 2)]),
+        );
+
+        let mut term_doc_freqs = std::collections::BTreeMap::new();
+        term_doc_freqs.insert("vector".to_string(), 2);
+        let stats = super::super::text_index::FullTextScoringStats::with_term_doc_freqs(
+            super::super::text_index::GlobalFullTextStats::from_totals(2, 4),
+            term_doc_freqs,
+        );
+        let bm25 = Bm25::default();
+        let query = ParsedQuery::Term("vector".to_string());
+        let artifact_score =
+            score_document_from_index(FullTextScoreMode::Bm25, &index, &bm25, &query, 1, &stats);
+
+        let mut tail_tokens = Vec::new();
+        tokenizer.tokenize("vector database", &mut tail_tokens);
+        let tail_score = score_document_from_tokens_with_stats(
+            FullTextScoreMode::Bm25,
+            &tail_tokens,
+            &query,
+            &bm25,
+            &stats,
+        );
+
+        assert!(
+            (artifact_score - tail_score).abs() < 1e-6,
+            "artifact and tail final scorer must share generation stats"
+        );
     }
 
     #[test]

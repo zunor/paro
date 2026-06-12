@@ -5,7 +5,8 @@
 
 use paro_common::types::LogicalType;
 use paro_storage::search::{
-    NormalizedSearchRequest, SearchCapability, SearchIntent, SequentialCapability,
+    CapabilityToken, NormalizedSearchRequest, SearchCostEstimate, SearchIndexKind, SearchIntent,
+    SequentialCapability,
 };
 
 pub use paro_storage::search::{
@@ -28,12 +29,14 @@ pub enum Confidence {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchCandidate {
     pub intent: SearchIntent,
-    pub capability: SearchCapability,
+    pub token: CapabilityToken,
+    pub kind: SearchIndexKind,
+    pub estimated_cost: Option<SearchCostEstimate>,
 }
 
 impl SearchCandidate {
-    pub fn estimated_cost(&self) -> Option<paro_storage::search::SearchCostEstimate> {
-        self.capability.estimated_cost
+    pub const fn estimated_cost(&self) -> Option<SearchCostEstimate> {
+        self.estimated_cost
     }
 }
 

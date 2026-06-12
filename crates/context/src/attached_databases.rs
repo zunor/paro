@@ -93,7 +93,7 @@ pub struct AttachedDatabaseTransactionMetricsSnapshot {
     pub read_tracking_analytical_scan_count: u64,
     pub read_tracking_safe_snapshot_preferred_count: u64,
     pub derived_index_lag_ts: u64,
-    pub derived_delta_merge_cost: u64,
+    pub tail_exact_merge_cost: u64,
     pub commit_participant_count: u64,
     pub inflight_batch_conflict_reject_count: u64,
     pub retention_watermark_lag_ms: u64,

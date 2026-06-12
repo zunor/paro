@@ -61,6 +61,10 @@ impl PostingList {
         &self.elements
     }
 
+    pub fn last_doc_id(&self) -> Option<DocId> {
+        self.elements.last().map(|element| element.doc_id)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &PostingElement> {
         self.elements.iter()
     }
@@ -128,20 +132,29 @@ impl PostingList {
     /// magic(4) | num_elements(4) | [doc_id(4) | weight(4)] * num_elements
     /// ```
     pub fn to_bytes(&self) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(self.serialized_len());
+        self.write_to(&mut buf)?;
+        Ok(buf.freeze())
+    }
+
+    pub(crate) fn serialized_len(&self) -> usize {
+        8 + self.elements.len() * 8
+    }
+
+    pub(crate) fn write_to(&self, buf: &mut BytesMut) -> Result<()> {
         if !self.is_sorted() {
             return Err(paro_error::invalid_input(
                 "PostingList: doc_ids must be sorted before serialization",
             ));
         }
 
-        let mut buf = BytesMut::with_capacity(8 + self.elements.len() * 8);
         buf.extend_from_slice(MAGIC);
         buf.put_u32_le(self.elements.len() as u32);
         for elem in &self.elements {
             buf.put_u32_le(elem.doc_id);
             buf.put_f32_le(elem.weight);
         }
-        Ok(buf.freeze())
+        Ok(())
     }
 
     /// Deserialize from bytes.

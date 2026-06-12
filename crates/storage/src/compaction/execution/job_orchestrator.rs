@@ -8,6 +8,7 @@ use crate::compaction::plan::types::{
     CompactionJobId, CompactionLifecycleState, CompactionPlan, ExecutionLayout,
 };
 use crate::compaction::publish::{CompactionPublisher, CompactionValidator};
+use crate::search::SearchInlineBuilderSet;
 use crate::tablet::Tablet;
 use paro_common::allocator::Allocator;
 use paro_common::error::Result;
@@ -21,11 +22,30 @@ pub fn run_job(
     job_id: CompactionJobId,
     allocator: Arc<dyn Allocator>,
 ) -> Result<bool> {
-    run_job_with_lifecycle(
+    run_job_inner(
         tablet,
         plan,
         job_id,
         allocator,
+        SearchInlineBuilderSet::default(),
+        CancellationToken::new(),
+        |_| {},
+    )
+}
+
+pub fn run_job_with_search_inline_builders(
+    tablet: &Arc<Tablet>,
+    plan: Arc<CompactionPlan>,
+    job_id: CompactionJobId,
+    allocator: Arc<dyn Allocator>,
+    search_inline_builders: SearchInlineBuilderSet,
+) -> Result<bool> {
+    run_job_inner(
+        tablet,
+        plan,
+        job_id,
+        allocator,
+        search_inline_builders,
         CancellationToken::new(),
         |_| {},
     )
@@ -36,6 +56,52 @@ pub fn run_job_with_lifecycle<F>(
     plan: Arc<CompactionPlan>,
     job_id: CompactionJobId,
     allocator: Arc<dyn Allocator>,
+    cancel_token: CancellationToken,
+    on_state: F,
+) -> Result<bool>
+where
+    F: FnMut(CompactionLifecycleState),
+{
+    run_job_inner(
+        tablet,
+        plan,
+        job_id,
+        allocator,
+        SearchInlineBuilderSet::default(),
+        cancel_token,
+        on_state,
+    )
+}
+
+pub fn run_job_with_lifecycle_and_search_inline_builders<F>(
+    tablet: &Arc<Tablet>,
+    plan: Arc<CompactionPlan>,
+    job_id: CompactionJobId,
+    allocator: Arc<dyn Allocator>,
+    search_inline_builders: SearchInlineBuilderSet,
+    cancel_token: CancellationToken,
+    on_state: F,
+) -> Result<bool>
+where
+    F: FnMut(CompactionLifecycleState),
+{
+    run_job_inner(
+        tablet,
+        plan,
+        job_id,
+        allocator,
+        search_inline_builders,
+        cancel_token,
+        on_state,
+    )
+}
+
+fn run_job_inner<F>(
+    tablet: &Arc<Tablet>,
+    plan: Arc<CompactionPlan>,
+    job_id: CompactionJobId,
+    allocator: Arc<dyn Allocator>,
+    search_inline_builders: SearchInlineBuilderSet,
     cancel_token: CancellationToken,
     mut on_state: F,
 ) -> Result<bool>
@@ -52,10 +118,19 @@ where
         )?;
 
     let output = match plan.execution_layout {
-        ExecutionLayout::Vertical => VerticalMerger::build(tablet, plan.clone(), workspace)?,
-        ExecutionLayout::Horizontal => {
-            RowsetMerger::build(tablet, plan.clone(), workspace, allocator)?
-        }
+        ExecutionLayout::Vertical => VerticalMerger::build_with_search_inline_builders(
+            tablet,
+            plan.clone(),
+            workspace,
+            search_inline_builders,
+        )?,
+        ExecutionLayout::Horizontal => RowsetMerger::build_with_search_inline_builders(
+            tablet,
+            plan.clone(),
+            workspace,
+            allocator,
+            search_inline_builders,
+        )?,
     };
     let Some(output) = output else {
         return Ok(false);

@@ -83,7 +83,7 @@ async fn paro_transaction_metrics_is_queryable_from_sql() {
                 ssi_validation_abort_count,
                 ssi_abort_due_to_coarse_scan_marker, read_tracker_record_count,
                 read_tracker_coarsened_count, derived_index_lag_ts,
-                derived_delta_merge_cost, commit_participant_count,
+                tail_exact_merge_cost, commit_participant_count,
                 inflight_batch_conflict_reject_count,
                 retention_watermark_lag_ms, oldest_active_rw_lag_ms,
                 read_snapshot_lease_count, active_rw_txn_count,

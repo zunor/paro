@@ -13,6 +13,7 @@
 //! - ZoneMap filtering for predicate pushdown
 
 use crate::buffer::{PrefetchItem, Prefetcher};
+use crate::metrics::storage_metrics;
 use crate::rowset::encoding::{
     BinaryDictPageDecoder, BinaryPlainPageDecoder, BitShufflePageDecoder, PlainPageDecoder,
     RlePageDecoder,
@@ -38,6 +39,8 @@ pub struct ColumnBatch {
     pub nulls: Option<Bytes>,
     /// Optional storage dictionary payload for storage-aware dictionary execution.
     pub storage_dictionary: Option<StorageDictionaryBatch>,
+    /// Page-local span seeks used by read_by_rowids() to assemble this batch.
+    pub page_run_seeks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -46,12 +49,22 @@ pub struct StorageDictionaryBatch {
     pub codes: Bytes,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RowIdPageRun {
+    run_start: usize,
+    run_end: usize,
+    span_start: u64,
+    span_end: u64,
+    span_len: usize,
+}
+
 impl ColumnBatch {
     pub fn new(data: Bytes, nulls: Option<Bytes>) -> Self {
         Self {
             data,
             nulls,
             storage_dictionary: None,
+            page_run_seeks: 0,
         }
     }
 
@@ -60,7 +73,13 @@ impl ColumnBatch {
             data: codes.clone(),
             nulls,
             storage_dictionary: Some(StorageDictionaryBatch { dictionary, codes }),
+            page_run_seeks: 0,
         }
+    }
+
+    pub fn with_page_run_seeks(mut self, page_run_seeks: usize) -> Self {
+        self.page_run_seeks = page_run_seeks;
+        self
     }
 
     pub fn empty() -> Self {
@@ -68,6 +87,7 @@ impl ColumnBatch {
             data: Bytes::new(),
             nulls: None,
             storage_dictionary: None,
+            page_run_seeks: 0,
         }
     }
 
@@ -486,14 +506,157 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
     fn current_page_num_rows(&self) -> u64 {
         if let Some(page_idx) = self.current_page_idx {
             // Get next page's first ordinal or total rows
-            if let Some(next_entry) = self.ordinal_index.get_page(page_idx + 1) {
-                next_entry.first_ordinal - self.current_page_first_ordinal
-            } else {
-                self.meta.num_rows - self.current_page_first_ordinal
-            }
+            self.page_end_ordinal(page_idx) - self.current_page_first_ordinal
         } else {
             0
         }
+    }
+
+    fn page_end_ordinal(&self, page_idx: usize) -> u64 {
+        if let Some(next_entry) = self.ordinal_index.get_page(page_idx + 1) {
+            next_entry.first_ordinal
+        } else {
+            self.meta.num_rows
+        }
+    }
+
+    fn page_index_for_rowid(&self, rowid: u64) -> Result<usize> {
+        if rowid >= self.meta.num_rows {
+            return Err(paro_error::out_of_range(format!(
+                "rowid {} not found",
+                rowid
+            )));
+        }
+
+        let Some(page_idx) = self.ordinal_index.seek_at_or_before(rowid) else {
+            return Err(paro_error::out_of_range(format!(
+                "rowid {} not found",
+                rowid
+            )));
+        };
+        let Some(entry) = self.ordinal_index.get_page(page_idx) else {
+            return Err(paro_error::out_of_range(format!(
+                "page index {} out of range",
+                page_idx
+            )));
+        };
+        if rowid < entry.first_ordinal || rowid >= self.page_end_ordinal(page_idx) {
+            return Err(paro_error::out_of_range(format!(
+                "rowid {} not found",
+                rowid
+            )));
+        }
+        Ok(page_idx)
+    }
+
+    fn next_rowid_page_run(
+        &self,
+        sorted_rowids: &[(usize, u64)],
+        idx: &mut usize,
+    ) -> Result<RowIdPageRun> {
+        let page_idx = self.page_index_for_rowid(sorted_rowids[*idx].1)?;
+        let page_end = self.page_end_ordinal(page_idx);
+        let run_start = *idx;
+        *idx += 1;
+        while *idx < sorted_rowids.len() && sorted_rowids[*idx].1 < page_end {
+            *idx += 1;
+        }
+
+        let run = &sorted_rowids[run_start..*idx];
+        let span_start = run
+            .first()
+            .map(|&(_, rowid)| rowid)
+            .expect("run should not be empty");
+        let span_end = run
+            .last()
+            .map(|&(_, rowid)| rowid)
+            .expect("run should not be empty");
+        let span_len = usize::try_from(span_end - span_start + 1)
+            .map_err(|_| paro_error::data_corrupted("rowid span overflow"))?;
+
+        Ok(RowIdPageRun {
+            run_start,
+            run_end: *idx,
+            span_start,
+            span_end,
+            span_len,
+        })
+    }
+
+    fn plain_varlen_row_ranges(
+        batch: &ColumnBatch,
+        row_count: usize,
+    ) -> Result<Vec<(usize, usize)>> {
+        if batch.storage_dictionary.is_some() {
+            return Err(paro_error::internal(
+                "plain varlen row extraction received storage dictionary batch",
+            ));
+        }
+
+        let mut offset = 0usize;
+        let mut ranges = Vec::with_capacity(row_count);
+        while ranges.len() < row_count {
+            let len_start = offset;
+            let len_end = offset
+                .checked_add(std::mem::size_of::<u32>())
+                .ok_or_else(|| paro_error::data_corrupted("varlen row length overflow"))?;
+            if len_end > batch.data.len() {
+                return Err(paro_error::data_corrupted(
+                    "varlen row length prefix truncated",
+                ));
+            }
+
+            let len = u32::from_le_bytes(
+                batch.data[len_start..len_end]
+                    .try_into()
+                    .expect("u32 length prefix"),
+            ) as usize;
+            let value_end = len_end
+                .checked_add(len)
+                .ok_or_else(|| paro_error::data_corrupted("varlen row value overflow"))?;
+            if value_end > batch.data.len() {
+                return Err(paro_error::data_corrupted("varlen row extends past batch"));
+            }
+
+            ranges.push((len_start, value_end));
+            offset = value_end;
+        }
+
+        Ok(ranges)
+    }
+
+    fn next_batch_within_current_page(&mut self, n: usize) -> Result<(usize, ColumnBatch)> {
+        if n == 0 || !self.ensure_page_loaded()? {
+            return Ok((0, ColumnBatch::empty()));
+        }
+
+        let decoder = self
+            .current_decoder
+            .as_mut()
+            .ok_or_else(|| paro_error::internal("column page decoder not loaded"))?;
+        let page_remaining = decoder.count().saturating_sub(decoder.current_index()) as usize;
+        let to_read = n.min(page_remaining);
+        if to_read == 0 {
+            return Ok((0, ColumnBatch::empty()));
+        }
+
+        let (count, data) = decoder.next_batch(to_read)?;
+        let nulls = if let Some(ref mut null_decoder) = self.current_null_decoder {
+            let (null_count, null_bytes) = null_decoder.next_batch(count)?;
+            if null_count != count {
+                return Err(paro_error::data_corrupted(
+                    "Null map count mismatch with data page",
+                ));
+            }
+            Some(null_bytes)
+        } else if self.meta.is_nullable {
+            Some(Bytes::from(vec![0u8; count]))
+        } else {
+            None
+        };
+
+        self.current_ordinal += count as u64;
+        Ok((count, ColumnBatch::new(data, nulls)))
     }
 
     /// Check if we need to load the next page.
@@ -628,61 +791,249 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         } else {
             None
         };
+        let mut page_run_seeks = 0usize;
 
-        for &(orig_idx, rowid) in sorted_rowids {
-            self.seek_internal(rowid)?;
+        let mut idx = 0usize;
+        while idx < sorted_rowids.len() {
+            let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
+            let run = &sorted_rowids[row_run.run_start..row_run.run_end];
+
+            self.seek_internal(row_run.span_start)?;
+            page_run_seeks += 1;
             if !self.ensure_page_loaded()? {
                 return Err(paro_error::out_of_range(format!(
                     "rowid {} not found",
-                    rowid
+                    row_run.span_start
                 )));
             }
 
             let (count, code_bytes) = match self.current_decoder.as_mut() {
                 Some(PageDecoderImpl::BinaryDict(decoder)) if decoder.is_dict_encoded() => {
-                    decoder.next_dict_codes(1)?
+                    decoder.next_dict_codes(row_run.span_len)?
                 }
-                _ => return Ok(None),
+                _ => {
+                    storage_metrics().add_column_read_by_rowids_page_run_seeks(page_run_seeks);
+                    return Ok(None);
+                }
             };
 
-            if count == 0 || code_bytes.len() < std::mem::size_of::<u32>() {
+            if count != row_run.span_len
+                || code_bytes.len()
+                    < row_run
+                        .span_len
+                        .checked_mul(std::mem::size_of::<u32>())
+                        .ok_or_else(|| {
+                            paro_error::data_corrupted("dictionary code bytes overflow")
+                        })?
+            {
                 return Err(paro_error::out_of_range(format!(
                     "rowid {} not found",
-                    rowid
+                    row_run.span_end
                 )));
             }
 
-            codes[orig_idx] =
-                u32::from_le_bytes(code_bytes[..4].try_into().expect("u32 code slice"));
+            let span_nulls = if let Some(ref mut null_decoder) = self.current_null_decoder {
+                let (null_count, null_bytes) = null_decoder.next_batch(row_run.span_len)?;
+                if null_count != row_run.span_len {
+                    return Err(paro_error::data_corrupted(
+                        "Null map count mismatch with dictionary row lookup",
+                    ));
+                }
+                Some(null_bytes)
+            } else if self.meta.is_nullable {
+                Some(Bytes::from(vec![0u8; row_run.span_len]))
+            } else {
+                None
+            };
 
-            if let Some(ref mut nulls) = nulls_out {
-                let is_null = if let Some(ref mut null_decoder) = self.current_null_decoder {
-                    let (null_count, null_bytes) = null_decoder.next_batch(1)?;
-                    if null_count != 1 {
-                        return Err(paro_error::data_corrupted(
-                            "Null map count mismatch with dictionary row lookup",
-                        ));
-                    }
-                    null_bytes.first().copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                nulls[orig_idx] = is_null;
+            for &(orig_idx, rowid) in run {
+                let row_idx = usize::try_from(rowid - row_run.span_start)
+                    .map_err(|_| paro_error::data_corrupted("dictionary row offset overflow"))?;
+                let code_offset = row_idx
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or_else(|| paro_error::data_corrupted("dictionary code offset overflow"))?;
+                let code_end = code_offset
+                    .checked_add(std::mem::size_of::<u32>())
+                    .ok_or_else(|| paro_error::data_corrupted("dictionary code end overflow"))?;
+                if code_end > code_bytes.len() {
+                    return Err(paro_error::out_of_range(format!(
+                        "dictionary row {} out of range",
+                        row_idx
+                    )));
+                }
+                codes[orig_idx] = u32::from_le_bytes(
+                    code_bytes[code_offset..code_end]
+                        .try_into()
+                        .expect("u32 code slice"),
+                );
+
+                if let Some(ref mut nulls) = nulls_out {
+                    let is_null = span_nulls
+                        .as_ref()
+                        .and_then(|b| b.get(row_idx))
+                        .copied()
+                        .unwrap_or(0);
+                    nulls[orig_idx] = is_null;
+                }
             }
 
-            self.current_ordinal += 1;
+            self.current_ordinal = row_run
+                .span_end
+                .checked_add(1)
+                .ok_or_else(|| paro_error::data_corrupted("dictionary row ordinal overflow"))?;
         }
+        storage_metrics().add_column_read_by_rowids_page_run_seeks(page_run_seeks);
 
         let mut encoded_codes = Vec::with_capacity(total_rows * std::mem::size_of::<u32>());
         for code in codes {
             encoded_codes.extend_from_slice(&code.to_le_bytes());
         }
 
-        Ok(Some(ColumnBatch::with_storage_dictionary(
-            dictionary,
-            Bytes::from(encoded_codes),
-            nulls_out.map(Bytes::from),
-        )))
+        Ok(Some(
+            ColumnBatch::with_storage_dictionary(
+                dictionary,
+                Bytes::from(encoded_codes),
+                nulls_out.map(Bytes::from),
+            )
+            .with_page_run_seeks(page_run_seeks),
+        ))
+    }
+
+    fn read_plain_varlen_by_rowids(
+        &mut self,
+        sorted_rowids: &[(usize, u64)],
+        total_rows: usize,
+    ) -> Result<ColumnBatch> {
+        let mut values: Vec<Vec<u8>> = vec![Vec::new(); total_rows];
+        let mut nulls_out: Option<Vec<u8>> = if self.meta.is_nullable {
+            Some(vec![0u8; total_rows])
+        } else {
+            None
+        };
+
+        let mut idx = 0usize;
+        let mut page_run_seeks = 0usize;
+        while idx < sorted_rowids.len() {
+            let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
+            let run = &sorted_rowids[row_run.run_start..row_run.run_end];
+
+            self.seek_internal(row_run.span_start)?;
+            page_run_seeks += 1;
+            let (count, batch) = self.next_batch_within_current_page(row_run.span_len)?;
+            if count != row_run.span_len {
+                return Err(paro_error::out_of_range(format!(
+                    "rowid {} not found",
+                    row_run.span_end
+                )));
+            }
+            let row_ranges = Self::plain_varlen_row_ranges(&batch, count)?;
+
+            for &(orig_idx, rowid) in run {
+                let row_idx = usize::try_from(rowid - row_run.span_start)
+                    .map_err(|_| paro_error::data_corrupted("varlen row offset overflow"))?;
+                let Some(&(row_start, row_end)) = row_ranges.get(row_idx) else {
+                    return Err(paro_error::out_of_range(format!(
+                        "varlen row {} out of range",
+                        row_idx
+                    )));
+                };
+                values[orig_idx].extend_from_slice(&batch.data[row_start..row_end]);
+                if let Some(ref mut nulls) = nulls_out {
+                    let is_null = batch
+                        .nulls
+                        .as_ref()
+                        .and_then(|b| b.get(row_idx))
+                        .copied()
+                        .unwrap_or(0);
+                    nulls[orig_idx] = is_null;
+                }
+            }
+        }
+        storage_metrics().add_column_read_by_rowids_page_run_seeks(page_run_seeks);
+
+        let total_len: usize = values.iter().map(|v| v.len()).sum();
+        let mut result = Vec::with_capacity(total_len);
+        for v in values {
+            result.extend_from_slice(&v);
+        }
+        Ok(
+            ColumnBatch::new(Bytes::from(result), nulls_out.map(Bytes::from))
+                .with_page_run_seeks(page_run_seeks),
+        )
+    }
+
+    fn read_fixed_width_by_rowids(
+        &mut self,
+        sorted_rowids: &[(usize, u64)],
+        total_rows: usize,
+        type_size: usize,
+    ) -> Result<ColumnBatch> {
+        let data_len = total_rows
+            .checked_mul(type_size)
+            .ok_or_else(|| paro_error::data_corrupted("fixed-width result size overflow"))?;
+        let mut result = vec![0u8; data_len];
+        let mut result_nulls: Option<Vec<u8>> = if self.meta.is_nullable {
+            Some(vec![0u8; total_rows])
+        } else {
+            None
+        };
+
+        let mut idx = 0usize;
+        let mut page_run_seeks = 0usize;
+        while idx < sorted_rowids.len() {
+            let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
+            let run = &sorted_rowids[row_run.run_start..row_run.run_end];
+
+            self.seek_internal(row_run.span_start)?;
+            page_run_seeks += 1;
+            let (count, batch) = self.next_batch_within_current_page(row_run.span_len)?;
+            if count != row_run.span_len {
+                return Err(paro_error::out_of_range(format!(
+                    "rowid {} not found",
+                    row_run.span_end
+                )));
+            }
+
+            for &(orig_idx, rowid) in run {
+                let row_idx = usize::try_from(rowid - row_run.span_start)
+                    .map_err(|_| paro_error::data_corrupted("fixed-width row offset overflow"))?;
+                let src_start = row_idx
+                    .checked_mul(type_size)
+                    .ok_or_else(|| paro_error::data_corrupted("fixed-width source overflow"))?;
+                let src_end = src_start
+                    .checked_add(type_size)
+                    .ok_or_else(|| paro_error::data_corrupted("fixed-width source end overflow"))?;
+                let dst_start = orig_idx.checked_mul(type_size).ok_or_else(|| {
+                    paro_error::data_corrupted("fixed-width destination overflow")
+                })?;
+                let dst_end = dst_start.checked_add(type_size).ok_or_else(|| {
+                    paro_error::data_corrupted("fixed-width destination end overflow")
+                })?;
+                if src_end > batch.data.len() || dst_end > result.len() {
+                    return Err(paro_error::out_of_range(format!(
+                        "fixed-width row {} out of range",
+                        row_idx
+                    )));
+                }
+
+                result[dst_start..dst_end].copy_from_slice(&batch.data[src_start..src_end]);
+                if let Some(ref mut nulls_out) = result_nulls {
+                    let is_null = batch
+                        .nulls
+                        .as_ref()
+                        .and_then(|b| b.get(row_idx))
+                        .copied()
+                        .unwrap_or(0);
+                    nulls_out[orig_idx] = is_null;
+                }
+            }
+        }
+        storage_metrics().add_column_read_by_rowids_page_run_seeks(page_run_seeks);
+
+        Ok(
+            ColumnBatch::new(Bytes::from(result), result_nulls.map(Bytes::from))
+                .with_page_run_seeks(page_run_seeks),
+        )
     }
 }
 
@@ -769,54 +1120,11 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
         }
 
         if let Some(type_size) = self.meta.type_size {
-            let mut result = Vec::with_capacity(rowids.len() * type_size);
-            let mut result_nulls: Option<Vec<u8>> = if self.meta.is_nullable {
-                Some(vec![0u8; rowids.len()])
-            } else {
-                None
-            };
-
-            // Sort rowids for sequential access
             let mut sorted_rowids: Vec<(usize, u64)> = rowids.iter().copied().enumerate().collect();
             sorted_rowids.sort_by_key(|&(_, rowid)| rowid);
-
-            // Read each rowid
-            for &(orig_idx, rowid) in &sorted_rowids {
-                self.seek_to_ordinal(rowid)?;
-                let (count, batch) = self.next_batch(1)?;
-                if count == 0 {
-                    return Err(paro_error::out_of_range(format!(
-                        "rowid {} not found",
-                        rowid
-                    )));
-                }
-                result.extend_from_slice(&batch.data);
-                if let Some(ref mut nulls_out) = result_nulls {
-                    let is_null = batch
-                        .nulls
-                        .as_ref()
-                        .and_then(|b| b.first())
-                        .copied()
-                        .unwrap_or(0);
-                    nulls_out[orig_idx] = is_null;
-                }
-            }
-
-            // Reorder results to match original rowid order
-            let mut final_result = vec![0u8; rowids.len() * type_size];
-            for (i, &(orig_idx, _)) in sorted_rowids.iter().enumerate() {
-                let src_start = i * type_size;
-                let dst_start = orig_idx * type_size;
-                final_result[dst_start..dst_start + type_size]
-                    .copy_from_slice(&result[src_start..src_start + type_size]);
-            }
-
-            Ok(ColumnBatch::new(
-                Bytes::from(final_result),
-                result_nulls.map(Bytes::from),
-            ))
+            self.read_fixed_width_by_rowids(&sorted_rowids, rowids.len(), type_size)
         } else {
-            // Variable-length types: read per row and keep length-prefixed bytes.
+            // Variable-length types keep their length-prefixed bytes after page-local span reads.
             let mut sorted_rowids: Vec<(usize, u64)> = rowids.iter().copied().enumerate().collect();
             sorted_rowids.sort_by_key(|&(_, rowid)| rowid);
 
@@ -826,42 +1134,7 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
                 return Ok(batch);
             }
 
-            let mut values: Vec<Vec<u8>> = vec![Vec::new(); rowids.len()];
-            let mut nulls_out: Option<Vec<u8>> = if self.meta.is_nullable {
-                Some(vec![0u8; rowids.len()])
-            } else {
-                None
-            };
-            for &(orig_idx, rowid) in &sorted_rowids {
-                self.seek_to_ordinal(rowid)?;
-                let (count, batch) = self.next_batch(1)?;
-                if count == 0 {
-                    return Err(paro_error::out_of_range(format!(
-                        "rowid {} not found",
-                        rowid
-                    )));
-                }
-                if let Some(ref mut nulls) = nulls_out {
-                    let is_null = batch
-                        .nulls
-                        .as_ref()
-                        .and_then(|b| b.first())
-                        .copied()
-                        .unwrap_or(0);
-                    nulls[orig_idx] = is_null;
-                }
-                values[orig_idx] = batch.data.to_vec();
-            }
-
-            let total_len: usize = values.iter().map(|v| v.len()).sum();
-            let mut result = Vec::with_capacity(total_len);
-            for v in values {
-                result.extend_from_slice(&v);
-            }
-            Ok(ColumnBatch::new(
-                Bytes::from(result),
-                nulls_out.map(Bytes::from),
-            ))
+            self.read_plain_varlen_by_rowids(&sorted_rowids, rowids.len())
         }
     }
 
@@ -1029,6 +1302,51 @@ mod tests {
         (buffer, reader_meta, ordinal_index)
     }
 
+    fn create_fixed_i32_iterator(
+        nullable: bool,
+        page_size: usize,
+        row_count: usize,
+    ) -> Box<dyn ColumnIterator + Send + Sync> {
+        let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+            .with_nullable(nullable)
+            .with_compression(CompressionType::None)
+            .with_page_size(page_size);
+        let buffer = Cursor::new(Vec::new());
+        let mut writer = ScalarColumnWriter::new(opts, buffer).unwrap();
+
+        let values: Vec<i32> = (0..row_count as i32).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let nulls = nullable.then(|| {
+            let mut flags = vec![0u8; row_count.div_ceil(8)];
+            if row_count > 7 {
+                flags[0] |= 1 << 7;
+            }
+            flags
+        });
+        writer
+            .append(
+                &bytes,
+                nulls.as_deref(),
+                row_count.try_into().expect("row count fits in u32"),
+            )
+            .unwrap();
+
+        let meta = writer.finish().unwrap();
+        let buffer = Cursor::new(writer.into_inner().into_inner());
+        let reader_meta =
+            ColumnReaderMeta::from_writer_meta(&meta, FieldType::Int).with_nullable(nullable);
+        let mut reader = ColumnReader::create(
+            reader_meta,
+            buffer,
+            ColumnReaderOptions::default(),
+            create_page_reader(),
+            None,
+            None,
+        )
+        .unwrap();
+        reader.new_iterator().unwrap()
+    }
+
     fn create_dict_varchar_iterator(nullable: bool) -> Box<dyn ColumnIterator + Send + Sync> {
         let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
             .with_nullable(nullable)
@@ -1044,7 +1362,43 @@ mod tests {
             data.extend_from_slice(&(value.len() as u32).to_le_bytes());
             data.extend_from_slice(value.as_bytes());
         }
-        let nulls = nullable.then(|| vec![0u8, 1, 0, 0]);
+        let nulls = nullable.then(|| vec![0b0000_0010]);
+        writer
+            .append(
+                &data,
+                nulls.as_deref(),
+                strings.len().try_into().expect("string count fits in u32"),
+            )
+            .unwrap();
+
+        let meta = writer.finish().unwrap();
+        let buffer = Cursor::new(writer.into_inner().into_inner());
+        let reader_meta =
+            ColumnReaderMeta::from_writer_meta(&meta, FieldType::Varchar).with_nullable(nullable);
+        let mut reader = ColumnReader::create(
+            reader_meta,
+            buffer,
+            ColumnReaderOptions::default(),
+            create_page_reader(),
+            None,
+            None,
+        )
+        .unwrap();
+        reader.new_iterator().unwrap()
+    }
+
+    fn create_plain_varchar_iterator(nullable: bool) -> Box<dyn ColumnIterator + Send + Sync> {
+        let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
+            .with_nullable(nullable)
+            .with_encoding(EncodingType::Plain)
+            .with_compression(CompressionType::None)
+            .with_page_size(4096);
+        let buffer = Cursor::new(Vec::new());
+        let mut writer = ScalarColumnWriter::new(opts, buffer).unwrap();
+
+        let strings = ["zero", "one", "two", "three", "four"];
+        let data = encode_varlen_strings(&strings);
+        let nulls = nullable.then(|| vec![0b0000_0100]);
         writer
             .append(
                 &data,
@@ -1175,6 +1529,22 @@ mod tests {
         assert_eq!(v0, 10);
         assert_eq!(v1, 50);
         assert_eq!(v2, 90);
+    }
+
+    #[test]
+    fn test_scalar_iterator_read_by_rowids_preserves_fixed_order_duplicates_and_nulls() {
+        let mut iter = create_fixed_i32_iterator(true, 32, 24);
+
+        let batch = iter.read_by_rowids(&[18, 3, 18, 7]).unwrap();
+        assert_eq!(batch.data.len(), 4 * std::mem::size_of::<i32>());
+
+        let values = batch
+            .data
+            .chunks_exact(std::mem::size_of::<i32>())
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("i32 bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![18, 3, 18, 7]);
+        assert_eq!(batch.nulls.as_deref(), Some(&[0, 0, 0, 1][..]));
     }
 
     #[test]
@@ -1329,5 +1699,44 @@ mod tests {
             .expect("decoded rowid storage dictionary should keep provenance");
         assert_eq!(info.provenance_id, Some(88));
         assert_eq!(info.source, DictionarySource::Storage);
+    }
+
+    #[test]
+    fn test_varchar_iterator_read_by_rowids_storage_dictionary_preserves_duplicates_and_nulls() {
+        let mut iter = create_dict_varchar_iterator(true);
+
+        let batch = iter.read_by_rowids(&[2, 1, 2, 3]).unwrap();
+        assert!(batch.storage_dictionary.is_some());
+
+        let vector = vector_decoder::decode_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            4,
+            Arc::new(default_allocator()),
+            Some(89),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("apple"));
+        assert!(vector.is_null(1));
+        assert_eq!(vector.get_string(2), Some("apple"));
+        assert_eq!(vector.get_string(3), Some("cherry"));
+        let info = vector
+            .dictionary_info()
+            .expect("decoded rowid storage dictionary should keep provenance");
+        assert_eq!(info.provenance_id, Some(89));
+        assert_eq!(info.source, DictionarySource::Storage);
+    }
+
+    #[test]
+    fn test_varchar_iterator_read_by_rowids_preserves_plain_order_duplicates_and_nulls() {
+        let mut iter = create_plain_varchar_iterator(true);
+
+        let batch = iter.read_by_rowids(&[3, 1, 3, 2]).unwrap();
+
+        assert_eq!(batch.varlen_row(0).unwrap().unwrap().as_ref(), b"three");
+        assert_eq!(batch.varlen_row(1).unwrap().unwrap().as_ref(), b"one");
+        assert_eq!(batch.varlen_row(2).unwrap().unwrap().as_ref(), b"three");
+        assert!(batch.varlen_row(3).unwrap().is_none());
     }
 }

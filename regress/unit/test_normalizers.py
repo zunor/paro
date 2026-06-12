@@ -141,6 +141,28 @@ def test_apply_explain_routine_ids_normalizer_rewrites_catalog_ids_only() -> Non
     ]
 
 
+def test_apply_explain_search_ids_normalizer_rewrites_dynamic_ids_only() -> None:
+    lines = [
+        "  ->  FULLTEXT_SCAN on public.docs  (rows=4)",
+        "    Search Definition: 10706",
+        "    Search Generation: 3",
+        "    Search Root: 12",
+        "    Search Capability: Queryable",
+        "    Column: 2",
+        "    Mode: Filter",
+    ]
+
+    assert apply_normalizers(lines, ("explain_search_ids",)) == [
+        "  ->  FULLTEXT_SCAN on public.docs  (rows=4)",
+        "    Search Definition: <search-definition-id>",
+        "    Search Generation: <search-generation-id>",
+        "    Search Root: <search-root-id>",
+        "    Search Capability: Queryable",
+        "    Column: 2",
+        "    Mode: Filter",
+    ]
+
+
 def test_apply_explain_external_runtime_normalizer_rewrites_latency_line() -> None:
     lines = [
         "Latency(us): acquire=1 queue=0 kernel=34738 encode_decode=34693",
@@ -285,6 +307,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_summary_timing",
         "explain_runtime_bytes",
         "explain_routine_ids",
+        "explain_search_ids",
         "explain_external_runtime",
         "explain_runtime",
         "copy_rowcount",

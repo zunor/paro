@@ -252,11 +252,17 @@ def _optional_audit(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     audit: dict[str, Any] = {}
-    chunk_count = _optional_positive_int(value.get("chunk_count"))
-    if chunk_count is not None:
-        audit["chunk_count"] = chunk_count
-    for key in ("allocator_tracking_event_counts", "allocator_tracking_events_per_chunk"):
-        raw = value.get(key)
+    for key, raw in value.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if key == "chunk_count":
+            chunk_count = _optional_positive_int(raw)
+            if chunk_count is not None:
+                audit["chunk_count"] = chunk_count
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            audit[key] = float(raw)
+            continue
         if not isinstance(raw, list):
             continue
         numbers = [
@@ -268,6 +274,7 @@ def _optional_audit(value: Any) -> dict[str, Any] | None:
             continue
         audit[key] = numbers
         audit[f"{key}_median"] = float(statistics.median(numbers))
+        audit[f"{key}_p99"] = _percentile(sorted(numbers), 0.99)
         audit[f"{key}_max"] = float(max(numbers))
     return audit or None
 

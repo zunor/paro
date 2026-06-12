@@ -20,7 +20,7 @@ use crate::rowset::{
     rowset_writer::RowsetWriterSavepoint, save_base_rowids, ColumnData, RowsetSharedPtr,
     RowsetWriter, RowsetWriterBuilder, RowsetWriterContext,
 };
-use crate::search::write_path::{materialize_rowset_artifacts, SearchWritePlan};
+use crate::search::write_path::SearchWriteContext;
 use crate::tablet::{
     KeysType, PrimaryIndexUpdate, TabletRef, TabletSchemaRef, TabletState, Version,
 };
@@ -70,8 +70,8 @@ pub struct DeltaWriter {
     partial_base_rowids_by_key: HashMap<Vec<u8>, RowID>,
     /// Base row-id chain for all partial rows flushed to the current rowset.
     partial_base_rowids: Vec<RowID>,
-    /// Durable search artifacts that should be materialized before publish.
-    search_write_plan: SearchWritePlan,
+    /// Durable search artifacts and inline builders resolved before rowset writing.
+    search_write_context: SearchWriteContext,
     /// Transactional read timestamp for committed primary-key visibility.
     read_ts: Option<ReadTs>,
     /// Transaction-private primary-key overlay visible when this writer was opened.
@@ -120,35 +120,35 @@ impl DeltaWriter {
             txn_id,
             allocator,
             None,
-            SearchWritePlan::default(),
+            SearchWriteContext::default(),
             None,
             HashMap::new(),
         )
     }
 
-    pub(crate) fn open_with_allocator_and_search_plan(
+    pub(crate) fn open_with_allocator_and_search_context(
         tablet: TabletRef,
         txn_id: u64,
         allocator: Arc<dyn Allocator>,
-        search_write_plan: SearchWritePlan,
+        search_write_context: SearchWriteContext,
     ) -> Result<Self> {
         Self::open_internal(
             tablet,
             txn_id,
             allocator,
             None,
-            search_write_plan,
+            search_write_context,
             None,
             HashMap::new(),
         )
     }
 
-    pub(crate) fn open_transactional_with_allocator_and_search_plan(
+    pub(crate) fn open_transactional_with_allocator_and_search_context(
         tablet: TabletRef,
         txn_id: u64,
         read_ts: ReadTs,
         allocator: Arc<dyn Allocator>,
-        search_write_plan: SearchWritePlan,
+        search_write_context: SearchWriteContext,
         primary_key_overlay: HashMap<Vec<u8>, Option<RowID>>,
     ) -> Result<Self> {
         Self::open_internal(
@@ -156,7 +156,7 @@ impl DeltaWriter {
             txn_id,
             allocator,
             None,
-            search_write_plan,
+            search_write_context,
             Some(read_ts),
             primary_key_overlay,
         )
@@ -168,12 +168,28 @@ impl DeltaWriter {
         partial_update_columns: Vec<usize>,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
+        Self::open_partial_with_allocator_and_search_context(
+            tablet,
+            txn_id,
+            partial_update_columns,
+            allocator,
+            SearchWriteContext::default(),
+        )
+    }
+
+    pub(crate) fn open_partial_with_allocator_and_search_context(
+        tablet: TabletRef,
+        txn_id: u64,
+        partial_update_columns: Vec<usize>,
+        allocator: Arc<dyn Allocator>,
+        search_write_context: SearchWriteContext,
+    ) -> Result<Self> {
         Self::open_internal(
             tablet,
             txn_id,
             allocator,
             Some(partial_update_columns),
-            SearchWritePlan::default(),
+            search_write_context,
             None,
             HashMap::new(),
         )
@@ -184,7 +200,7 @@ impl DeltaWriter {
         txn_id: u64,
         allocator: Arc<dyn Allocator>,
         partial_update_columns: Option<Vec<usize>>,
-        search_write_plan: SearchWritePlan,
+        search_write_context: SearchWriteContext,
         read_ts: Option<ReadTs>,
         primary_key_overlay: HashMap<Vec<u8>, Option<RowID>>,
     ) -> Result<Self> {
@@ -233,11 +249,13 @@ impl DeltaWriter {
                 .rowset_id(rowset_id)
                 .max_rows_per_segment(u64::MAX)
                 .write_column_ids(write_column_ids)
+                .search_inline_builders(search_write_context.inline_builders.clone())
                 .build()?
         } else {
             let ctx =
                 RowsetWriterContext::new(schema.clone(), tablet.tablet_id(), version, &rowset_path)
-                    .with_rowset_id(rowset_id);
+                    .with_rowset_id(rowset_id)
+                    .with_search_inline_builders(search_write_context.inline_builders.clone());
             RowsetWriter::create(ctx)?
         };
 
@@ -277,21 +295,24 @@ impl DeltaWriter {
             partial_update_columns,
             partial_base_rowids_by_key: HashMap::new(),
             partial_base_rowids: Vec::new(),
-            search_write_plan,
+            search_write_context,
             read_ts,
             primary_key_overlay,
         })
     }
 
-    pub(crate) fn ensure_search_write_plan(
+    pub(crate) fn ensure_search_write_context(
         &mut self,
-        search_write_plan: &SearchWritePlan,
+        search_write_context: &SearchWriteContext,
     ) -> Result<()> {
-        if self.search_write_plan.is_empty() {
-            self.search_write_plan = search_write_plan.clone();
+        if self.search_write_context.is_empty() {
+            self.search_write_context = search_write_context.clone();
             return Ok(());
         }
-        if &self.search_write_plan == search_write_plan {
+        if self
+            .search_write_context
+            .matches_write_identity(search_write_context)
+        {
             return Ok(());
         }
         Err(paro_error::invalid_input(
@@ -889,7 +910,6 @@ impl DeltaWriter {
             .take()
             .ok_or_else(|| paro_error::internal("rowset_writer missing"))?;
         let rowset = writer.build_shared()?;
-        materialize_rowset_artifacts(&rowset, &self.search_write_plan)?;
 
         let primary_update = if self.serializer.is_some() {
             Some(PrimaryIndexUpdate {
@@ -955,13 +975,18 @@ impl DeltaWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::{
+        FlushSearchMode, InlineArtifactBuildResult, InlineArtifactBuilder, SearchFreshnessPolicy,
+        SearchIndexDefinition, SearchIndexKind, SearchInlineBuilderEntry, SearchInlineBuilderSet,
+        SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx, SegmentSinkSavepoint,
+    };
     use crate::tablet::{
         tablet_schema::{KeysType, TabletColumn, TabletSchema},
         Tablet,
     };
     use crate::test_utils::*;
     use paro_common::types::LogicalType;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn create_test_tablet() -> (TabletRef, TempDir) {
@@ -984,6 +1009,102 @@ mod tests {
         test_chunk_from_vectors(vec![v0, v1])
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SearchSinkEvent {
+        Open {
+            definition_id: u64,
+            flush_mode: FlushSearchMode,
+        },
+        Append {
+            base_row_id: u32,
+            rows: u32,
+            column_ids: Option<Vec<u32>>,
+        },
+        Finish,
+    }
+
+    struct RecordingInlineBuilder {
+        events: Arc<Mutex<Vec<SearchSinkEvent>>>,
+    }
+
+    impl InlineArtifactBuilder for RecordingInlineBuilder {
+        fn open_sink(&self, ctx: &SegmentFlushCtx<'_>) -> Result<Box<dyn SegmentChunkSink>> {
+            self.events.lock().unwrap().push(SearchSinkEvent::Open {
+                definition_id: ctx.definition.definition_id,
+                flush_mode: ctx.flush_mode,
+            });
+            Ok(Box::new(RecordingSink {
+                events: Arc::clone(&self.events),
+            }))
+        }
+    }
+
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<SearchSinkEvent>>>,
+    }
+
+    impl SegmentChunkSink for RecordingSink {
+        fn append_chunk(&mut self, input: SegmentChunkInput<'_>) -> Result<()> {
+            self.events.lock().unwrap().push(SearchSinkEvent::Append {
+                base_row_id: input.base_row_id,
+                rows: input
+                    .columns
+                    .first()
+                    .map(|column| column.num_values)
+                    .unwrap_or(0),
+                column_ids: input.column_ids.map(<[u32]>::to_vec),
+            });
+            Ok(())
+        }
+
+        fn mark_savepoint(&mut self) -> Result<SegmentSinkSavepoint> {
+            Ok(SegmentSinkSavepoint {
+                rows_seen: 0,
+                bytes_buffered: 0,
+                entries_seen: 0,
+                state_id: 0,
+            })
+        }
+
+        fn rollback_to_savepoint(&mut self, _savepoint: &SegmentSinkSavepoint) -> Result<()> {
+            Ok(())
+        }
+
+        fn finish(self: Box<Self>) -> Result<InlineArtifactBuildResult> {
+            self.events.lock().unwrap().push(SearchSinkEvent::Finish);
+            Ok(InlineArtifactBuildResult {
+                blobs: Vec::new(),
+                stats_delta: None,
+            })
+        }
+    }
+
+    fn recording_search_context(events: Arc<Mutex<Vec<SearchSinkEvent>>>) -> SearchWriteContext {
+        let definition = SearchIndexDefinition {
+            definition_id: 77,
+            table_id: 10,
+            name: "recording".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![1],
+            expression: None,
+            provider_config: serde_json::json!({"config": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+            config_fingerprint: 1,
+        };
+        SearchWriteContext {
+            plan: Default::default(),
+            inline_builders: SearchInlineBuilderSet::new(
+                vec![SearchInlineBuilderEntry::new(
+                    definition,
+                    3,
+                    SearchFreshnessPolicy::Required,
+                    Arc::new(RecordingInlineBuilder { events }),
+                )],
+                None,
+            ),
+        }
+    }
+
     #[test]
     fn delta_writer_basic_commit() {
         let (tablet, _tmp) = create_test_tablet();
@@ -1001,6 +1122,39 @@ mod tests {
         assert_eq!(tablet.num_rowsets(), 1);
         // Primary index should contain 60 unique keys (latest wins across batches)
         assert_eq!(tablet.snapshot_primary_index_entries().unwrap().len(), 60);
+    }
+
+    #[test]
+    fn delta_writer_passes_inline_builder_set_to_rowset_writer() {
+        let (tablet, _tmp) = create_test_tablet();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = DeltaWriter::open_with_allocator_and_search_context(
+            tablet,
+            31,
+            Arc::new(default_allocator()),
+            recording_search_context(Arc::clone(&events)),
+        )
+        .unwrap();
+
+        writer.write_chunk(&sample_chunk(3)).unwrap();
+        let rowset = writer.commit().unwrap();
+
+        assert_eq!(rowset.num_rows(), 3);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                SearchSinkEvent::Open {
+                    definition_id: 77,
+                    flush_mode: FlushSearchMode::InlineRequired,
+                },
+                SearchSinkEvent::Append {
+                    base_row_id: 0,
+                    rows: 3,
+                    column_ids: None,
+                },
+                SearchSinkEvent::Finish,
+            ]
+        );
     }
 
     #[test]

@@ -33,6 +33,12 @@ def metric_value(query: dict[str, Any], metric: str) -> float | None:
         if is_number(value):
             return float(value)
 
+    audit = query.get("audit")
+    if isinstance(audit, dict) and metric.startswith("audit_"):
+        value = audit.get(metric.removeprefix("audit_"))
+        if is_number(value):
+            return float(value)
+
     return None
 
 
@@ -45,7 +51,7 @@ def is_number(value: Any) -> bool:
 
 
 def is_resource_metric(metric: str) -> bool:
-    return metric.startswith(("rss_", "memory_", "spill_"))
+    return metric.startswith(("rss_", "memory_", "spill_", "audit_"))
 
 
 def sample_count(query: dict[str, Any]) -> int:

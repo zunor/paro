@@ -72,8 +72,12 @@ impl InvertedIndex {
             .zip(vector.weights.iter().copied())
         {
             let list = self.postings.entry(dim).or_default();
-            // PostingList::upsert keeps ordering by doc_id.
-            list.upsert(doc_id, weight);
+            if list.last_doc_id().is_none_or(|last| doc_id > last) {
+                list.push_sorted(PostingElement { doc_id, weight })?;
+            } else {
+                // PostingList::upsert keeps ordering by doc_id.
+                list.upsert(doc_id, weight);
+            }
         }
         Ok(())
     }

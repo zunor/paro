@@ -47,12 +47,11 @@ impl SparseVectorIndex {
             postings.iter().map(|(k, v)| (*k, v)).collect();
         posting_entries.sort_unstable_by_key(|(k, _)| *k);
         for (dim_id, list) in posting_entries {
-            let list_bytes = list.to_bytes()?;
-            let list_len = u32::try_from(list_bytes.len())
+            let list_len = u32::try_from(list.serialized_len())
                 .map_err(|_| paro_error::out_of_range("posting list too large"))?;
             buf.put_u32_le(dim_id);
             buf.put_u32_le(list_len);
-            buf.extend_from_slice(&list_bytes);
+            list.write_to(&mut buf)?;
         }
 
         let stats = SparseIndexStatistics::collect(self);

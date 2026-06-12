@@ -5,6 +5,7 @@
 //!
 //! Combines tokenizer and inverted index with basic configuration.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -47,10 +48,21 @@ pub struct GlobalFullTextStats {
     pub total_docs: u32,
     pub total_terms: u64,
     pub avg_doc_length: f32,
+    pub bm25_k1: f32,
+    pub bm25_b: f32,
 }
 
 impl GlobalFullTextStats {
     pub fn from_totals(total_docs: u32, total_terms: u64) -> Self {
+        Self::from_totals_with_bm25(total_docs, total_terms, 1.2, 0.75)
+    }
+
+    pub fn from_totals_with_bm25(
+        total_docs: u32,
+        total_terms: u64,
+        bm25_k1: f32,
+        bm25_b: f32,
+    ) -> Self {
         let avg_doc_length = if total_docs == 0 {
             0.0
         } else {
@@ -60,7 +72,65 @@ impl GlobalFullTextStats {
             total_docs,
             total_terms,
             avg_doc_length,
+            bm25_k1,
+            bm25_b,
         }
+    }
+
+    pub fn with_added_totals(self, docs: u32, terms: u64) -> Self {
+        Self::from_totals_with_bm25(
+            self.total_docs.saturating_add(docs),
+            self.total_terms.saturating_add(terms),
+            self.bm25_k1,
+            self.bm25_b,
+        )
+    }
+}
+
+/// Query-time BM25 snapshot used to score every candidate in one corpus frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullTextScoringStats {
+    pub global: GlobalFullTextStats,
+    term_doc_freqs: BTreeMap<String, u32>,
+}
+
+impl FullTextScoringStats {
+    pub fn from_global_stats(global: GlobalFullTextStats) -> Self {
+        Self {
+            global,
+            term_doc_freqs: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_term_doc_freqs(
+        global: GlobalFullTextStats,
+        term_doc_freqs: BTreeMap<String, u32>,
+    ) -> Self {
+        Self {
+            global,
+            term_doc_freqs,
+        }
+    }
+
+    pub fn local_index(index: &InvertedIndex, config: &FullTextIndexConfig) -> Self {
+        Self::from_global_stats(GlobalFullTextStats::from_totals_with_bm25(
+            index.total_docs(),
+            index.total_terms(),
+            config.bm25_k1,
+            config.bm25_b,
+        ))
+    }
+
+    pub fn bm25(&self) -> Bm25 {
+        Bm25::new(self.global.bm25_k1, self.global.bm25_b)
+    }
+
+    pub fn doc_freq(&self, term: &str, fallback: u32) -> u32 {
+        self.term_doc_freqs
+            .get(term)
+            .copied()
+            .filter(|doc_freq| *doc_freq > 0)
+            .unwrap_or(fallback)
     }
 }
 
@@ -69,18 +139,15 @@ pub struct FullTextIndex {
     tokenizer: Box<dyn Tokenizer>,
     inverted_index: InvertedIndex,
     config: FullTextIndexConfig,
-    bm25: Bm25,
     telemetry: Mutex<FullTextSearchTelemetry>,
 }
 
 impl FullTextIndex {
     pub fn new(tokenizer: Box<dyn Tokenizer>, config: FullTextIndexConfig) -> Self {
-        let bm25 = Bm25::new(config.bm25_k1, config.bm25_b);
         Self {
             tokenizer,
             inverted_index: InvertedIndex::new(),
             config,
-            bm25,
             telemetry: Mutex::new(FullTextSearchTelemetry::default()),
         }
     }
@@ -119,20 +186,47 @@ impl FullTextIndex {
         config: FullTextIndexConfig,
         inverted_index: InvertedIndex,
     ) -> Self {
-        let bm25 = Bm25::new(config.bm25_k1, config.bm25_b);
         Self {
             tokenizer,
             inverted_index,
             config,
-            bm25,
             telemetry: Mutex::new(FullTextSearchTelemetry::default()),
         }
     }
 
     /// Tokenize and add a document into the index.
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
-        let tokens = self.tokenize_filtered(text);
-        self.inverted_index.add_document(doc_id, &tokens)
+        let mut tokens = Vec::new();
+        self.add_document_with_token_buffer(doc_id, text, &mut tokens)
+    }
+
+    /// Tokenize and add a document using caller-owned scratch storage.
+    pub fn add_document_with_token_buffer(
+        &mut self,
+        doc_id: DocId,
+        text: &str,
+        tokens: &mut Vec<Token>,
+    ) -> Result<()> {
+        tokens.clear();
+        self.tokenize_filtered_into(text, tokens);
+        self.inverted_index.add_document(doc_id, tokens)
+    }
+
+    pub(crate) fn add_document_with_token_buffer_deferred_prefix(
+        &mut self,
+        doc_id: DocId,
+        text: &str,
+        tokens: &mut Vec<Token>,
+    ) -> Result<()> {
+        tokens.clear();
+        self.tokenize_filtered_into(text, tokens);
+        self.inverted_index
+            .add_document_deferred_prefix(doc_id, tokens)
+    }
+
+    /// Remove a document from the index.
+    pub fn remove_document(&mut self, doc_id: DocId) -> bool {
+        self.inverted_index.remove_document(doc_id)
     }
 
     /// Parse MATCH query text into a parsed query.
@@ -175,7 +269,7 @@ impl FullTextIndex {
         query: &ParsedQuery,
         top_k: usize,
         filter_bitmap: Option<&RoaringBitmap>,
-        global_stats: Option<&GlobalFullTextStats>,
+        scoring_stats: Option<&FullTextScoringStats>,
         score_mode: FullTextScoreMode,
     ) -> Vec<ScoredPoint> {
         if top_k == 0 {
@@ -201,13 +295,15 @@ impl FullTextIndex {
             return Vec::new();
         }
 
-        let stats = global_stats.copied().unwrap_or_else(|| {
-            GlobalFullTextStats::from_totals(
-                self.inverted_index.total_docs(),
-                self.inverted_index.total_terms(),
-            )
-        });
-        if stats.total_docs == 0 || stats.avg_doc_length == 0.0 {
+        let local_stats;
+        let stats = match scoring_stats {
+            Some(stats) => stats,
+            None => {
+                local_stats = FullTextScoringStats::local_index(&self.inverted_index, &self.config);
+                &local_stats
+            }
+        };
+        if stats.global.total_docs == 0 || stats.global.avg_doc_length == 0.0 {
             let elapsed_us = start.elapsed().as_micros() as u64;
             self.telemetry.lock().unwrap().record_search(
                 elapsed_us,
@@ -234,11 +330,12 @@ impl FullTextIndex {
         }
 
         let mut topk = FixedLengthPriorityQueue::new(effective_top_k);
+        let bm25 = stats.bm25();
         for doc_id in match_bitmap.iter() {
             let score = score_document_from_index(
                 score_mode,
                 &self.inverted_index,
-                &self.bm25,
+                &bm25,
                 query,
                 doc_id as DocId,
                 stats,
@@ -261,13 +358,11 @@ impl FullTextIndex {
         topk.into_sorted_vec()
     }
 
-    fn tokenize_filtered(&self, text: &str) -> Vec<Token> {
-        let mut tokens = Vec::new();
-        self.tokenizer.tokenize(text, &mut tokens);
-        tokens
-            .into_iter()
-            .filter(|token| self.is_token_len_valid(&token.term))
-            .collect()
+    fn tokenize_filtered_into(&self, text: &str, tokens: &mut Vec<Token>) {
+        self.tokenizer.tokenize(text, tokens);
+        if self.config.min_token_len != 1 || self.config.max_token_len.is_some() {
+            tokens.retain(|token| self.is_token_len_valid(&token.term));
+        }
     }
 
     fn match_bitmap(&self, query: &ParsedQuery) -> RoaringBitmap {
@@ -592,7 +687,12 @@ mod tests {
             "Local per-segment stats should differ for asymmetric segments"
         );
 
-        let global = GlobalFullTextStats::from_totals(201, 201);
+        let mut term_doc_freqs = BTreeMap::new();
+        term_doc_freqs.insert("vector".to_string(), 2);
+        let global = FullTextScoringStats::with_term_doc_freqs(
+            GlobalFullTextStats::from_totals(201, 201),
+            term_doc_freqs,
+        );
         let global_small = seg_small.search(
             &query_small,
             1,
@@ -614,6 +714,67 @@ mod tests {
         assert!(
             delta < 1e-6,
             "Expected equal scores with global stats, delta={delta}"
+        );
+    }
+
+    #[test]
+    fn test_search_uses_generation_doc_freqs_instead_of_segment_local_df() {
+        let mut rare_segment = FullTextIndex::new_default();
+        rare_segment.add_document(1, "vector").unwrap();
+
+        let mut common_segment = FullTextIndex::new_default();
+        common_segment.add_document(1, "vector").unwrap();
+        for i in 2..=50 {
+            common_segment.add_document(i, "vector").unwrap();
+        }
+
+        let query = rare_segment.parse_query("vector").unwrap();
+        let global_without_df =
+            FullTextScoringStats::from_global_stats(GlobalFullTextStats::from_totals(51, 51));
+        let rare_local_df = rare_segment.search(
+            &query,
+            1,
+            None,
+            Some(&global_without_df),
+            FullTextScoreMode::Bm25,
+        );
+        let common_local_df = common_segment.search(
+            &query,
+            1,
+            None,
+            Some(&global_without_df),
+            FullTextScoreMode::Bm25,
+        );
+        assert!(
+            (rare_local_df[0].score - common_local_df[0].score).abs() > 1e-3,
+            "local df fallback should expose asymmetric segment scoring"
+        );
+
+        let mut term_doc_freqs = BTreeMap::new();
+        term_doc_freqs.insert("vector".to_string(), 51);
+        let generation_stats = FullTextScoringStats::with_term_doc_freqs(
+            GlobalFullTextStats::from_totals(51, 51),
+            term_doc_freqs,
+        );
+        let rare_global_df = rare_segment.search(
+            &query,
+            1,
+            None,
+            Some(&generation_stats),
+            FullTextScoreMode::Bm25,
+        );
+        let common_global_df = common_segment.search(
+            &query,
+            1,
+            None,
+            Some(&generation_stats),
+            FullTextScoreMode::Bm25,
+        );
+
+        let delta = (rare_global_df[0].score - common_global_df[0].score).abs();
+        assert!(
+            delta < 1e-6,
+            "expected unified generation df, delta={delta}"
         );
     }
 

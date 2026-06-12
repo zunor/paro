@@ -9,7 +9,7 @@
 
 use crate::primary_key::RowID;
 use crate::rowset::RowsetSharedPtr;
-use crate::search::write_path::SearchWritePlan;
+use crate::search::write_path::SearchWriteContext;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState};
 use crate::transaction::spill::{
@@ -678,7 +678,7 @@ impl TxnWriteBuffer {
         read_ts: ReadTs,
         tablet: TabletRef,
         allocator: Arc<dyn Allocator>,
-        search_write_plan: SearchWritePlan,
+        search_write_context: SearchWriteContext,
         estimated_new_bytes: u64,
         f: F,
     ) -> Result<R>
@@ -732,12 +732,12 @@ impl TxnWriteBuffer {
         };
 
         if let std::collections::btree_map::Entry::Vacant(entry) = inner.writers.entry(key) {
-            let writer = DeltaWriter::open_transactional_with_allocator_and_search_plan(
+            let writer = DeltaWriter::open_transactional_with_allocator_and_search_context(
                 tablet,
                 txn_id,
                 read_ts,
                 allocator,
-                search_write_plan.clone(),
+                search_write_context.clone(),
                 primary_key_overlay.unwrap_or_default(),
             )?;
             entry.insert(writer);
@@ -747,7 +747,7 @@ impl TxnWriteBuffer {
             .writers
             .get_mut(&key)
             .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
-        writer.ensure_search_write_plan(&search_write_plan)?;
+        writer.ensure_search_write_context(&search_write_context)?;
         let result = f(writer)?;
         if force_flush_after_write {
             writer.flush_memtable()?;

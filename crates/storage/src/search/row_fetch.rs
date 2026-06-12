@@ -4,14 +4,18 @@
 //! Late materialization helpers for fetching projected search rows.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::codec::{cell_decoder::decode_cell_into_vector, physical_layout};
+use crate::metrics::{storage_metrics, SearchRowFetchMetricKey};
+use crate::rowset::column::ColumnBatch;
+use crate::rowset::encoding::BinaryPlainPageDecoder;
 use crate::rowset::RowsetId;
 use crate::search::{CandidateBatch, PhysicalRowRef, SearchReadSnapshot};
 use crate::tablet::TabletRef;
 use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::chunk::Chunk;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::{self as paro_error, codes, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use std::sync::Arc;
@@ -27,6 +31,211 @@ impl ProjectedCell {
         Self {
             bytes: Vec::new(),
             is_null: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowFetchMode {
+    Materialize {
+        row_limit: usize,
+        byte_limit: usize,
+    },
+    #[allow(dead_code)]
+    Streaming {
+        batch_rows: usize,
+        batch_bytes: usize,
+    },
+}
+
+impl RowFetchMode {
+    #[allow(dead_code)]
+    const DEFAULT_STREAMING_ROWS: usize = 1024;
+    #[allow(dead_code)]
+    const DEFAULT_STREAMING_BYTES: usize = 4 * 1024 * 1024;
+    const DEFAULT_MATERIALIZE_BYTES: usize = 16 * 1024 * 1024;
+
+    pub(crate) fn materialize(row_limit: usize) -> Self {
+        Self::Materialize {
+            row_limit,
+            byte_limit: Self::DEFAULT_MATERIALIZE_BYTES,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn streaming() -> Self {
+        Self::Streaming {
+            batch_rows: Self::DEFAULT_STREAMING_ROWS,
+            batch_bytes: Self::DEFAULT_STREAMING_BYTES,
+        }
+    }
+
+    fn limits(self) -> RowFetchLimits {
+        match self {
+            Self::Materialize {
+                row_limit,
+                byte_limit,
+            } => RowFetchLimits {
+                row_limit,
+                byte_limit,
+            },
+            Self::Streaming {
+                batch_rows,
+                batch_bytes,
+            } => RowFetchLimits {
+                row_limit: batch_rows,
+                byte_limit: batch_bytes,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowFetchLimits {
+    row_limit: usize,
+    byte_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RowFetchStats {
+    pub(crate) rows: usize,
+    pub(crate) projected_columns: usize,
+    pub(crate) segment_groups: usize,
+    pub(crate) column_batches: usize,
+    pub(crate) fixed_width_column_batches: usize,
+    pub(crate) varlen_column_batches: usize,
+    pub(crate) projected_bytes: usize,
+    pub(crate) column_read_by_rowids_page_run_seeks: usize,
+    pub(crate) elapsed_micros: u64,
+}
+
+impl RowFetchStats {
+    fn finish(mut self, projected_bytes: usize, started_at: Instant) -> Self {
+        self.projected_bytes = projected_bytes;
+        self.elapsed_micros = elapsed_micros_since(started_at);
+        self
+    }
+}
+
+pub(crate) struct ProjectedBatch {
+    pub(crate) data_cache: HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>>,
+    pub(crate) stats: RowFetchStats,
+}
+
+#[allow(dead_code)]
+pub(crate) struct RowFetchStreamBatch<'a> {
+    pub(crate) rows: &'a [PhysicalRowRef],
+    pub(crate) projected: ProjectedBatch,
+}
+
+pub(crate) struct SearchRowFetcher<'a> {
+    snapshot: &'a SearchReadSnapshot,
+    column_types: &'a [LogicalType],
+}
+
+impl<'a> SearchRowFetcher<'a> {
+    pub(crate) fn new(snapshot: &'a SearchReadSnapshot, column_types: &'a [LogicalType]) -> Self {
+        Self {
+            snapshot,
+            column_types,
+        }
+    }
+
+    pub(crate) fn fetch_batch(
+        &self,
+        rows: &[PhysicalRowRef],
+        projected_columns: &[usize],
+        mode: RowFetchMode,
+    ) -> Result<ProjectedBatch> {
+        fetch_projected_batch(
+            self.snapshot,
+            rows,
+            projected_columns,
+            self.column_types,
+            mode,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stream<'rows, 'projection>(
+        &'a self,
+        rows: &'rows [PhysicalRowRef],
+        projected_columns: &'projection [usize],
+        mode: RowFetchMode,
+    ) -> Result<SearchRowFetchStream<'a, 'rows, 'projection>> {
+        let RowFetchMode::Streaming {
+            batch_rows,
+            batch_bytes,
+        } = mode
+        else {
+            return Err(paro_error::invalid_input(
+                "search row fetch stream requires RowFetchMode::Streaming",
+            ));
+        };
+        if batch_rows == 0 {
+            return Err(paro_error::invalid_input(
+                "search row fetch streaming batch_rows must be greater than zero",
+            ));
+        }
+        if batch_bytes == 0 {
+            return Err(paro_error::invalid_input(
+                "search row fetch streaming batch_bytes must be greater than zero",
+            ));
+        }
+        Ok(SearchRowFetchStream {
+            fetcher: self,
+            rows,
+            projected_columns,
+            next_row_offset: 0,
+            batch_rows,
+            batch_bytes,
+        })
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct SearchRowFetchStream<'fetcher, 'rows, 'projection> {
+    fetcher: &'fetcher SearchRowFetcher<'fetcher>,
+    rows: &'rows [PhysicalRowRef],
+    projected_columns: &'projection [usize],
+    next_row_offset: usize,
+    batch_rows: usize,
+    batch_bytes: usize,
+}
+
+impl<'fetcher, 'rows, 'projection> SearchRowFetchStream<'fetcher, 'rows, 'projection> {
+    #[allow(dead_code)]
+    pub(crate) fn next_batch(&mut self) -> Result<Option<RowFetchStreamBatch<'rows>>> {
+        if self.next_row_offset >= self.rows.len() {
+            return Ok(None);
+        }
+
+        let remaining = self.rows.len() - self.next_row_offset;
+        let mut candidate_rows = self.batch_rows.min(remaining).max(1);
+        loop {
+            let start = self.next_row_offset;
+            let end = start + candidate_rows;
+            let rows = &self.rows[start..end];
+            match self.fetcher.fetch_batch(
+                rows,
+                self.projected_columns,
+                RowFetchMode::Streaming {
+                    batch_rows: candidate_rows,
+                    batch_bytes: self.batch_bytes,
+                },
+            ) {
+                Ok(projected) => {
+                    self.next_row_offset = end;
+                    return Ok(Some(RowFetchStreamBatch { rows, projected }));
+                }
+                Err(err)
+                    if candidate_rows > 1
+                        && err.is(codes::resource::CONFIGURATION_LIMIT_EXCEEDED) =>
+                {
+                    candidate_rows = (candidate_rows / 2).max(1);
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 }
@@ -98,12 +307,22 @@ pub(crate) fn materialize_column(
     Ok(vector)
 }
 
-pub(crate) fn fetch_projected_columns(
+fn fetch_projected_batch(
     snapshot: &SearchReadSnapshot,
     rows: &[PhysicalRowRef],
     projected_columns: &[usize],
     column_types: &[LogicalType],
-) -> Result<HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>>> {
+    mode: RowFetchMode,
+) -> Result<ProjectedBatch> {
+    let started_at = Instant::now();
+    let limits = mode.limits();
+    validate_row_fetch_limits(rows.len(), limits)?;
+    let mut stats = RowFetchStats {
+        rows: rows.len(),
+        projected_columns: projected_columns.len(),
+        ..Default::default()
+    };
+
     let mut fetch_map = HashMap::new();
     for row in rows {
         let segment = snapshot.table_lease.resolve_segment(*row)?;
@@ -112,8 +331,10 @@ pub(crate) fn fetch_projected_columns(
             .or_insert_with(|| (segment, Vec::new()));
         entry.1.push(row.row_id as u64);
     }
+    stats.segment_groups = fetch_map.len();
 
     let mut data_cache: HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>> = HashMap::new();
+    let mut projected_bytes = 0usize;
 
     for ((rowset_id, segment_id), (segment, row_ids)) in fetch_map {
         for (result_col_idx, &projected_column_id) in projected_columns.iter().enumerate() {
@@ -122,9 +343,12 @@ pub(crate) fn fetch_projected_columns(
                 .get(projected_column_id)
                 .ok_or_else(|| paro_error::internal("Invalid projected column index"))?;
             let fixed_row_width = physical_layout::fixed_row_width(logical_type).ok();
+            stats.column_batches += 1;
 
             if let Some(type_size) = fixed_row_width {
+                stats.fixed_width_column_batches += 1;
                 let batch = iter.read_by_rowids(&row_ids)?;
+                stats.column_read_by_rowids_page_run_seeks += batch.page_run_seeks;
                 let bytes = batch.data;
                 let nulls = batch.nulls.as_deref();
                 for (row_offset, row_id) in row_ids.iter().enumerate() {
@@ -143,35 +367,229 @@ pub(crate) fn fetch_projected_columns(
                         bytes: value,
                         is_null,
                     };
+                    projected_bytes =
+                        add_projected_bytes(projected_bytes, type_size, limits.byte_limit)?;
                 }
             } else {
-                // Variable-length columns still fall back to per-row seeks today.
-                // Sort rowids first so the iterator mostly moves forward within a segment.
-                let mut sorted_row_ids = row_ids.clone();
-                sorted_row_ids.sort_unstable();
-                for row_id in sorted_row_ids {
-                    iter.seek_to_ordinal(row_id)?;
-                    let (_, batch) = iter.next_batch(1)?;
-                    let cell = batch.varlen_row(0)?;
-                    let is_null = cell.is_none();
-                    let bytes = if let Some(cell) = cell {
-                        let mut encoded = Vec::with_capacity(4 + cell.len());
-                        encoded.extend_from_slice(&(cell.len() as u32).to_le_bytes());
-                        encoded.extend_from_slice(cell.as_ref());
-                        encoded
-                    } else {
-                        Vec::new()
-                    };
-                    data_cache
-                        .entry((rowset_id, segment_id, row_id))
-                        .or_insert_with(|| vec![ProjectedCell::null(); projected_columns.len()])
-                        [result_col_idx] = ProjectedCell { bytes, is_null };
-                }
+                let batch = iter.read_by_rowids(&row_ids)?;
+                stats.column_read_by_rowids_page_run_seeks += batch.page_run_seeks;
+                projected_bytes = project_varlen_batch(
+                    &mut data_cache,
+                    rowset_id,
+                    segment_id,
+                    &row_ids,
+                    result_col_idx,
+                    projected_columns.len(),
+                    &batch,
+                    projected_bytes,
+                    limits.byte_limit,
+                )?;
+                stats.varlen_column_batches += 1;
             }
         }
     }
 
-    Ok(data_cache)
+    let stats = stats.finish(projected_bytes, started_at);
+    let metric_key = SearchRowFetchMetricKey {
+        table_id: snapshot.table.table_id,
+        provider: snapshot.provider_kind,
+    };
+    storage_metrics().record_search_row_fetch(
+        metric_key,
+        stats.rows,
+        stats.projected_columns,
+        stats.segment_groups,
+        stats.column_batches,
+        stats.fixed_width_column_batches,
+        stats.varlen_column_batches,
+        stats.projected_bytes,
+        stats.column_read_by_rowids_page_run_seeks,
+        stats.elapsed_micros,
+    );
+
+    Ok(ProjectedBatch { data_cache, stats })
+}
+
+fn project_varlen_batch(
+    data_cache: &mut HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>>,
+    rowset_id: RowsetId,
+    segment_id: u32,
+    row_ids: &[u64],
+    result_col_idx: usize,
+    projected_column_count: usize,
+    batch: &ColumnBatch,
+    mut projected_bytes: usize,
+    byte_limit: usize,
+) -> Result<usize> {
+    if let Some(storage_dictionary) = &batch.storage_dictionary {
+        let mut decoder = BinaryPlainPageDecoder::new(storage_dictionary.dictionary.clone());
+        decoder.init()?;
+        for (row_offset, row_id) in row_ids.iter().enumerate() {
+            let is_null = is_null_at(batch.nulls.as_deref(), row_offset);
+            let bytes = if is_null {
+                Vec::new()
+            } else {
+                let code_offset = row_offset
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted("storage dictionary row offset overflow")
+                    })?;
+                let code_end = code_offset
+                    .checked_add(std::mem::size_of::<u32>())
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted("storage dictionary code offset overflow")
+                    })?;
+                if code_end > storage_dictionary.codes.len() {
+                    return Err(paro_error::out_of_range(format!(
+                        "storage dictionary row {} out of range",
+                        row_offset
+                    )));
+                }
+                let code = u32::from_le_bytes(
+                    storage_dictionary.codes[code_offset..code_end]
+                        .try_into()
+                        .expect("u32 code slice"),
+                );
+                let cell = decoder.string_at(code).ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "storage dictionary code {} out of range",
+                        code
+                    ))
+                })?;
+                encode_varlen_cell(cell.as_ref())
+            };
+            set_projected_cell(
+                data_cache,
+                rowset_id,
+                segment_id,
+                *row_id,
+                result_col_idx,
+                projected_column_count,
+                ProjectedCell { bytes, is_null },
+            );
+            projected_bytes = add_projected_bytes(
+                projected_bytes,
+                data_cache[&(rowset_id, segment_id, *row_id)][result_col_idx]
+                    .bytes
+                    .len(),
+                byte_limit,
+            )?;
+        }
+        return Ok(projected_bytes);
+    }
+
+    let mut offset = 0usize;
+    for (row_offset, row_id) in row_ids.iter().enumerate() {
+        let len_end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("varlen row length offset overflow"))?;
+        if len_end > batch.data.len() {
+            return Err(paro_error::data_corrupted(
+                "varlen projected batch length prefix truncated",
+            ));
+        }
+        let len = u32::from_le_bytes(
+            batch.data[offset..len_end]
+                .try_into()
+                .expect("u32 length prefix"),
+        ) as usize;
+        let value_end = len_end
+            .checked_add(len)
+            .ok_or_else(|| paro_error::data_corrupted("varlen projected batch value overflow"))?;
+        if value_end > batch.data.len() {
+            return Err(paro_error::data_corrupted(
+                "varlen projected batch row extends past payload",
+            ));
+        }
+
+        let is_null = is_null_at(batch.nulls.as_deref(), row_offset);
+        let bytes = if is_null {
+            Vec::new()
+        } else {
+            batch.data.slice(offset..value_end).to_vec()
+        };
+        set_projected_cell(
+            data_cache,
+            rowset_id,
+            segment_id,
+            *row_id,
+            result_col_idx,
+            projected_column_count,
+            ProjectedCell { bytes, is_null },
+        );
+        projected_bytes = add_projected_bytes(
+            projected_bytes,
+            data_cache[&(rowset_id, segment_id, *row_id)][result_col_idx]
+                .bytes
+                .len(),
+            byte_limit,
+        )?;
+        offset = value_end;
+    }
+    if offset != batch.data.len() {
+        return Err(paro_error::data_corrupted(
+            "varlen projected batch has trailing bytes",
+        ));
+    }
+    Ok(projected_bytes)
+}
+
+fn set_projected_cell(
+    data_cache: &mut HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>>,
+    rowset_id: RowsetId,
+    segment_id: u32,
+    row_id: u64,
+    result_col_idx: usize,
+    projected_column_count: usize,
+    cell: ProjectedCell,
+) {
+    data_cache
+        .entry((rowset_id, segment_id, row_id))
+        .or_insert_with(|| vec![ProjectedCell::null(); projected_column_count])[result_col_idx] =
+        cell;
+}
+
+fn is_null_at(nulls: Option<&[u8]>, row_offset: usize) -> bool {
+    nulls
+        .and_then(|nulls| nulls.get(row_offset))
+        .copied()
+        .unwrap_or(0)
+        != 0
+}
+
+fn encode_varlen_cell(cell: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + cell.len());
+    encoded.extend_from_slice(&(cell.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(cell);
+    encoded
+}
+
+fn validate_row_fetch_limits(row_count: usize, limits: RowFetchLimits) -> Result<()> {
+    if row_count > limits.row_limit {
+        return Err(paro_error::configuration_limit_exceeded(format!(
+            "search row fetch row limit exceeded: {} > {}",
+            row_count, limits.row_limit
+        )));
+    }
+    Ok(())
+}
+
+fn add_projected_bytes(current: usize, added: usize, byte_limit: usize) -> Result<usize> {
+    let next = current
+        .checked_add(added)
+        .ok_or_else(|| paro_error::out_of_memory("search row fetch projected bytes overflow"))?;
+    if next > byte_limit {
+        return Err(paro_error::configuration_limit_exceeded(format!(
+            "search row fetch byte limit exceeded: {} > {}",
+            next, byte_limit
+        )));
+    }
+    Ok(next)
+}
+
+fn elapsed_micros_since(started_at: Instant) -> u64 {
+    let micros = started_at.elapsed().as_micros();
+    micros.min(u128::from(u64::MAX)) as u64
 }
 
 pub(crate) fn materialize_candidate_batch(
@@ -185,8 +603,13 @@ pub(crate) fn materialize_candidate_batch(
     let row_count = batch.rows.len();
     let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
     let mut output_vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
-    let data_cache =
-        fetch_projected_columns(snapshot, &batch.rows, projected_columns, column_types)?;
+    let projected_batch = SearchRowFetcher::new(snapshot, column_types).fetch_batch(
+        &batch.rows,
+        projected_columns,
+        RowFetchMode::materialize(row_count),
+    )?;
+    let ProjectedBatch { data_cache, stats } = projected_batch;
+    debug_assert!(stats.projected_bytes <= RowFetchMode::DEFAULT_MATERIALIZE_BYTES);
 
     for (result_col_idx, &column_idx) in projected_columns.iter().enumerate() {
         let logical_type = column_types
@@ -218,4 +641,354 @@ pub(crate) fn materialize_candidate_batch(
     }
 
     Ok(Chunk::from_vectors(output_vectors, allocator))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::hnsw::SearchParams;
+    use crate::rowset::encoding::BinaryPlainPageBuilder;
+    use crate::search::{ResourceBudget, SearchBatchConfig, SearchBatchState};
+    use crate::table::table_factory::TableFactory;
+    use crate::test_utils::{
+        test_chunk_from_vectors, test_embedding_vector, test_i64_vector, test_string_vector,
+    };
+    use bytes::Bytes;
+
+    #[test]
+    fn project_varlen_batch_decodes_length_prefixed_rows_once() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_varlen_cell(b"alpha"));
+        payload.extend_from_slice(&encode_varlen_cell(b"beta"));
+        payload.extend_from_slice(&encode_varlen_cell(b"ignored-null-payload"));
+        let batch = ColumnBatch::new(Bytes::from(payload), Some(Bytes::from(vec![0, 0, 1])));
+        let mut data_cache = HashMap::new();
+
+        let projected_bytes =
+            project_varlen_batch(&mut data_cache, 7, 3, &[11, 12, 13], 0, 1, &batch, 0, 1024)
+                .expect("project varlen batch");
+
+        assert_eq!(
+            data_cache[&(7, 3, 11)][0].bytes,
+            encode_varlen_cell(b"alpha")
+        );
+        assert_eq!(
+            data_cache[&(7, 3, 12)][0].bytes,
+            encode_varlen_cell(b"beta")
+        );
+        assert!(data_cache[&(7, 3, 13)][0].is_null);
+        assert!(data_cache[&(7, 3, 13)][0].bytes.is_empty());
+        assert_eq!(
+            projected_bytes,
+            encode_varlen_cell(b"alpha").len() + encode_varlen_cell(b"beta").len()
+        );
+    }
+
+    #[test]
+    fn row_fetch_limits_reject_oversized_batches() {
+        validate_row_fetch_limits(
+            3,
+            RowFetchLimits {
+                row_limit: 2,
+                byte_limit: 1024,
+            },
+        )
+        .expect_err("row limit should reject");
+
+        add_projected_bytes(8, 4, 10).expect_err("byte limit should reject");
+    }
+
+    #[test]
+    fn row_fetch_mode_defaults_match_design_contract() {
+        assert_eq!(
+            RowFetchMode::materialize(99).limits(),
+            RowFetchLimits {
+                row_limit: 99,
+                byte_limit: 16 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            RowFetchMode::streaming().limits(),
+            RowFetchLimits {
+                row_limit: 1024,
+                byte_limit: 4 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn project_varlen_batch_enforces_byte_limit() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_varlen_cell(b"alpha"));
+        let batch = ColumnBatch::new(Bytes::from(payload), None);
+        let mut data_cache = HashMap::new();
+
+        project_varlen_batch(&mut data_cache, 7, 3, &[11], 0, 1, &batch, 0, 4)
+            .expect_err("varlen byte limit should reject");
+    }
+
+    #[test]
+    fn project_varlen_batch_decodes_storage_dictionary_rows() {
+        let batch = storage_dictionary_batch(
+            &["apple", "banana", "cherry"],
+            &[2, 0, 1, 2],
+            Some(vec![0, 0, 1, 0]),
+        );
+        let mut data_cache = HashMap::new();
+
+        let projected_bytes = project_varlen_batch(
+            &mut data_cache,
+            7,
+            3,
+            &[11, 12, 13, 14],
+            0,
+            1,
+            &batch,
+            0,
+            1024,
+        )
+        .expect("project dictionary varlen batch");
+
+        assert_eq!(
+            data_cache[&(7, 3, 11)][0].bytes,
+            encode_varlen_cell(b"cherry")
+        );
+        assert_eq!(
+            data_cache[&(7, 3, 12)][0].bytes,
+            encode_varlen_cell(b"apple")
+        );
+        assert!(data_cache[&(7, 3, 13)][0].is_null);
+        assert!(data_cache[&(7, 3, 13)][0].bytes.is_empty());
+        assert_eq!(
+            data_cache[&(7, 3, 14)][0].bytes,
+            encode_varlen_cell(b"cherry")
+        );
+        assert_eq!(
+            projected_bytes,
+            encode_varlen_cell(b"cherry").len()
+                + encode_varlen_cell(b"apple").len()
+                + encode_varlen_cell(b"cherry").len()
+        );
+    }
+
+    #[test]
+    fn search_row_fetch_stream_emits_resume_batches() {
+        let table = TableFactory::default()
+            .create_table(&[
+                LogicalType::Array(Box::new(LogicalType::Float), 2),
+                LogicalType::Varchar,
+            ])
+            .expect("create table");
+        table
+            .append(&test_chunk_from_vectors(vec![
+                test_embedding_vector(
+                    &[vec![10.0_f32, 0.0], vec![9.0_f32, 0.0], vec![8.0_f32, 0.0]],
+                    2,
+                ),
+                test_string_vector(&["alpha", "beta", "gamma"]),
+            ]))
+            .expect("append");
+
+        let opened = table
+            .open_vector_search_cursor(
+                0,
+                &[10.0, 0.0],
+                3,
+                SearchParams {
+                    ef: Some(64),
+                    ..Default::default()
+                },
+                None,
+                table.max_version(),
+            )
+            .expect("open vector cursor");
+        let mut cursor = opened.cursor;
+        let snapshot = opened.snapshot;
+        let mut budget = ResourceBudget {
+            memory_limit_bytes: 64 * 1024 * 1024,
+            heap_budget_items: 1024,
+            parallelism_slots: 1,
+            cpu_step_budget: None,
+            context: None,
+        };
+        let candidates = loop {
+            match cursor
+                .next_batch(
+                    &SearchBatchConfig {
+                        row_limit: 3,
+                        preferred_bytes: 1 << 20,
+                    },
+                    &mut budget,
+                )
+                .expect("next search batch")
+            {
+                SearchBatchState::Ready(batch) if batch.is_empty() => continue,
+                SearchBatchState::Ready(batch) => break batch,
+                SearchBatchState::Exhausted => panic!("expected search candidates"),
+            }
+        };
+        assert_eq!(candidates.rows.len(), 3);
+
+        let fetcher = SearchRowFetcher::new(&snapshot, table.types());
+        let mut stream = fetcher
+            .stream(
+                &candidates.rows,
+                &[1],
+                RowFetchMode::Streaming {
+                    batch_rows: 2,
+                    batch_bytes: 1024,
+                },
+            )
+            .expect("open row fetch stream");
+        let first = stream
+            .next_batch()
+            .expect("fetch first stream batch")
+            .expect("first stream batch");
+        assert_eq!(first.rows.len(), 2);
+        assert_eq!(first.projected.stats.rows, 2);
+        assert_eq!(first.projected.stats.projected_columns, 1);
+        assert!(first.projected.stats.projected_bytes > 0);
+        assert_eq!(
+            first.projected.stats.column_batches,
+            first.projected.stats.varlen_column_batches
+        );
+        for row in first.rows {
+            assert!(!first.projected.data_cache[&row_cache_key(*row)][0].is_null);
+        }
+
+        let second = stream
+            .next_batch()
+            .expect("fetch second stream batch")
+            .expect("second stream batch");
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.projected.stats.rows, 1);
+        assert_eq!(second.projected.stats.projected_columns, 1);
+        assert!(second.projected.stats.projected_bytes > 0);
+        assert!(stream
+            .next_batch()
+            .expect("fetch exhausted stream batch")
+            .is_none());
+    }
+
+    #[test]
+    fn search_row_fetch_preserves_unsorted_duplicates_and_projection_order() {
+        let table = TableFactory::default()
+            .create_table(&[
+                LogicalType::Array(Box::new(LogicalType::Float), 2),
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+            ])
+            .expect("create table");
+        table
+            .append(&test_chunk_from_vectors(vec![
+                test_embedding_vector(
+                    &[vec![10.0_f32, 0.0], vec![9.0_f32, 0.0], vec![8.0_f32, 0.0]],
+                    2,
+                ),
+                test_string_vector(&["alpha", "beta", "gamma"]),
+                test_i64_vector(&[10, 20, 30]),
+            ]))
+            .expect("append");
+
+        let opened = table
+            .open_vector_search_cursor(
+                0,
+                &[10.0, 0.0],
+                3,
+                SearchParams {
+                    ef: Some(64),
+                    ..Default::default()
+                },
+                None,
+                table.max_version(),
+            )
+            .expect("open vector cursor");
+        let snapshot = opened.snapshot;
+        let segment = snapshot
+            .table_lease
+            .visible_segments()
+            .first()
+            .expect("visible segment");
+        let rows = [
+            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 2),
+            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 0),
+            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 2),
+            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 1),
+        ];
+
+        let projected = SearchRowFetcher::new(&snapshot, table.types())
+            .fetch_batch(&rows, &[2, 1], RowFetchMode::materialize(rows.len()))
+            .expect("fetch projected rows");
+
+        assert_eq!(projected.stats.rows, 4);
+        assert_eq!(projected.stats.projected_columns, 2);
+        assert_eq!(projected.stats.segment_groups, 1);
+        assert_eq!(projected.stats.column_batches, 2);
+        assert_eq!(projected.stats.fixed_width_column_batches, 1);
+        assert_eq!(projected.stats.varlen_column_batches, 1);
+        assert_eq!(
+            projected.stats.projected_bytes,
+            4 * std::mem::size_of::<i64>()
+                + encode_varlen_cell(b"gamma").len()
+                + encode_varlen_cell(b"alpha").len()
+                + encode_varlen_cell(b"gamma").len()
+                + encode_varlen_cell(b"beta").len()
+        );
+
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let numbers = materialize_column(
+            &table.tablet(),
+            &LogicalType::BigInt,
+            2,
+            0,
+            &rows,
+            &projected.data_cache,
+            allocator.clone(),
+        )
+        .expect("materialize numeric projection");
+        let labels = materialize_column(
+            &table.tablet(),
+            &LogicalType::Varchar,
+            1,
+            1,
+            &rows,
+            &projected.data_cache,
+            allocator,
+        )
+        .expect("materialize string projection");
+
+        assert_eq!(numbers.get_i64(0), Some(30));
+        assert_eq!(numbers.get_i64(1), Some(10));
+        assert_eq!(numbers.get_i64(2), Some(30));
+        assert_eq!(numbers.get_i64(3), Some(20));
+        assert_eq!(labels.get_string(0), Some("gamma"));
+        assert_eq!(labels.get_string(1), Some("alpha"));
+        assert_eq!(labels.get_string(2), Some("gamma"));
+        assert_eq!(labels.get_string(3), Some("beta"));
+    }
+
+    fn storage_dictionary_batch(
+        values: &[&str],
+        codes: &[u32],
+        nulls: Option<Vec<u8>>,
+    ) -> ColumnBatch {
+        let mut dictionary_payload = Vec::new();
+        for value in values {
+            dictionary_payload.extend_from_slice(&encode_varlen_cell(value.as_bytes()));
+        }
+        let mut dictionary_builder = BinaryPlainPageBuilder::new(1024);
+        assert_eq!(
+            dictionary_builder.add_length_prefixed(&dictionary_payload),
+            values.len() as u32
+        );
+        let dictionary = dictionary_builder
+            .finish()
+            .expect("finish storage dictionary page");
+        let code_payload: Vec<u8> = codes.iter().flat_map(|code| code.to_le_bytes()).collect();
+        ColumnBatch::with_storage_dictionary(
+            dictionary,
+            Bytes::from(code_payload),
+            nulls.map(Bytes::from),
+        )
+    }
 }

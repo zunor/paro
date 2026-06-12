@@ -50,4 +50,7 @@ workload = "order"
 workload = "primary_key_dml"
 
 [[include]]
+workload = "search_derived_state_phase0"
+
+[[include]]
 workload = "vector"

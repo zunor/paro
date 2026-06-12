@@ -18,6 +18,10 @@ pub type DimensionId = u32;
 pub type DimWeight = f32;
 
 const MAGIC: &[u8; 4] = b"SPV1";
+const ROW_IMAGE_MAGIC: &[u8; 4] = b"SVR1";
+const ROW_IMAGE_HEADER_LEN: usize = 8;
+const ROW_IMAGE_ENTRY_LEN: usize =
+    std::mem::size_of::<DimensionId>() + std::mem::size_of::<DimWeight>();
 
 /// Sparse vector (dimension IDs + weights).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -62,6 +66,27 @@ impl SparseVector {
         }
 
         if self.dims.len() <= 1 {
+            return Ok(());
+        }
+
+        if self.dims.len() <= 64 {
+            for idx in 1..self.dims.len() {
+                let dim = self.dims[idx];
+                let weight = self.weights[idx];
+                let mut insert_at = idx;
+                while insert_at > 0 && self.dims[insert_at - 1] > dim {
+                    self.dims[insert_at] = self.dims[insert_at - 1];
+                    self.weights[insert_at] = self.weights[insert_at - 1];
+                    insert_at -= 1;
+                }
+                self.dims[insert_at] = dim;
+                self.weights[insert_at] = weight;
+            }
+            if self.dims.windows(2).any(|w| w[0] == w[1]) {
+                return Err(paro_error::invalid_input(
+                    "SparseVector: duplicate dimension IDs",
+                ));
+            }
             return Ok(());
         }
 
@@ -168,6 +193,73 @@ impl SparseVector {
         let mut vec = Self::new(dims, weights)?;
         vec.sort_by_dim()?;
         Ok(vec)
+    }
+
+    /// Encode this vector as a typed sparse row image.
+    ///
+    /// Layout: `SVR1` magic, `u32` nnz, then sorted `(u32 dim, f32 weight)` pairs.
+    pub fn to_row_image_v1(&self) -> Result<Vec<u8>> {
+        let mut vector = self.clone();
+        vector.sort_by_dim()?;
+        let len = vector.len();
+        let byte_len = ROW_IMAGE_HEADER_LEN
+            .checked_add(len.checked_mul(ROW_IMAGE_ENTRY_LEN).ok_or_else(|| {
+                paro_error::out_of_range("sparse row image entry length overflow")
+            })?)
+            .ok_or_else(|| paro_error::out_of_range("sparse row image length overflow"))?;
+        let mut out = Vec::with_capacity(byte_len);
+        out.extend_from_slice(ROW_IMAGE_MAGIC);
+        out.extend_from_slice(
+            &u32::try_from(len)
+                .map_err(|_| paro_error::out_of_range("sparse row image nnz exceeds u32"))?
+                .to_le_bytes(),
+        );
+        for (dim, weight) in vector.dims.iter().zip(vector.weights.iter()) {
+            out.extend_from_slice(&dim.to_le_bytes());
+            out.extend_from_slice(&weight.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    pub fn from_row_image_v1(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < ROW_IMAGE_HEADER_LEN {
+            return Err(paro_error::data_corrupted(
+                "sparse row image shorter than header",
+            ));
+        }
+        if &bytes[..4] != ROW_IMAGE_MAGIC {
+            return Err(paro_error::data_corrupted(
+                "sparse row image has invalid magic",
+            ));
+        }
+        let nnz = u32::from_le_bytes(bytes[4..8].try_into().expect("nnz header")) as usize;
+        let expected_len = ROW_IMAGE_HEADER_LEN
+            .checked_add(nnz.checked_mul(ROW_IMAGE_ENTRY_LEN).ok_or_else(|| {
+                paro_error::data_corrupted("sparse row image entry length overflow")
+            })?)
+            .ok_or_else(|| paro_error::data_corrupted("sparse row image length overflow"))?;
+        if bytes.len() != expected_len {
+            return Err(paro_error::data_corrupted(format!(
+                "sparse row image length mismatch: expected {}, got {}",
+                expected_len,
+                bytes.len()
+            )));
+        }
+
+        let mut dims = Vec::with_capacity(nnz);
+        let mut weights = Vec::with_capacity(nnz);
+        let mut offset = ROW_IMAGE_HEADER_LEN;
+        for _ in 0..nnz {
+            let dim = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("dim"));
+            offset += 4;
+            let weight = f32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("weight"));
+            offset += 4;
+            dims.push(dim);
+            weights.push(weight);
+        }
+        let vector = Self::new(dims, weights)?;
+        vector.ensure_sorted()?;
+        Ok(vector)
     }
 }
 
@@ -554,5 +646,14 @@ mod tests {
         let got1 = restored.get(1).unwrap();
         assert_eq!(got1.dims, vec![10]);
         assert_eq!(got1.weights, vec![2.0]);
+    }
+
+    #[test]
+    fn test_sparse_vector_row_image_v1_roundtrip() {
+        let vector = SparseVector::new(vec![3, 1], vec![0.5, 1.0]).unwrap();
+        let bytes = vector.to_row_image_v1().unwrap();
+        let restored = SparseVector::from_row_image_v1(&bytes).unwrap();
+        assert_eq!(restored.dims, vec![1, 3]);
+        assert_eq!(restored.weights, vec![1.0, 0.5]);
     }
 }

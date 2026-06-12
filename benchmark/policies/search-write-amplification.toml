@@ -1,0 +1,72 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "search-write-amplification"
+version = 1
+enforcement = "shadow"
+
+[[sources]]
+name = "search-write-amplification"
+type = "divan_bench"
+crate = "paro-storage"
+bench = "search_write_amplification"
+measurement_class = "rust_micro"
+required = true
+
+[metrics]
+required = [
+  "p50",
+  "p99",
+  "throughput_per_second",
+  "audit_rows_per_second_median",
+  "audit_artifact_build_cpu_us_per_row_p99",
+  "audit_artifact_bytes_p99",
+  "audit_manifest_publish_bytes_p99",
+  "audit_write_amplification_p99",
+  "audit_segment_file_open_count_p99",
+  "audit_segment_file_count_p99",
+]
+
+[thresholds]
+latency_regression_percent = 10.0
+resource_regression_percent = 20.0
+throughput_min_ratio = 0.90
+
+[noise_floors]
+latency_ms = 0.0
+p99_latency_ms = 0.0
+short_query_latency_ms = 0.0
+short_query_max_p50_ms = 0.0
+tail_sample_min_count = 30
+resource_kb = 0.0
+rss_kb = 0.0
+
+[absolute_max]
+"fulltext_inline_write_64b_text.audit_artifact_build_cpu_us_per_row_p99" = 5.0
+"sparse_inline_write_32_nnz.audit_artifact_build_cpu_us_per_row_p99" = 3.0
+"audit_manifest_publish_bytes_p99" = 65536.0
+"audit_segment_file_open_count_p99" = 1.0
+"audit_segment_file_count_p99" = 128.0
+"audit_write_amplification_p99" = 8.0
+
+[absolute_min]
+"audit_rows_per_second_median" = 1000.0
+
+[statistics]
+model = "mann_whitney_rolling_p95_holm"
+family_alpha_first_run = 0.05
+family_alpha_confirmed = 0.01
+false_positive_target = 0.02
+true_positive_target = 0.95
+
+[calibration]
+source = "archive"
+min_clean_observations_sql_macro = 30
+min_clean_observations_rust_micro = 30
+rolling_window_sql_macro = 30
+rolling_window_rust_micro = 30
+noise_floor_formula = "directional_rolling_p95_delta"
+
+[coverage]
+new_query_staging_days = 14

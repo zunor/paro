@@ -4,11 +4,11 @@
 use super::table_handle::TableHandle;
 use crate::index::BoundIndex;
 use crate::rowset::RowsetId;
-use crate::search::write_path::SearchWritePlan;
+use crate::search::write_path::SearchWriteContext;
 use crate::search::{
-    FullTextIntent, GenerationReadSnapshot, SearchBootstrapReport, SearchCapability,
-    SearchGenerationCoverage, SearchIndexDefinition, SearchIndexKind, SearchIntent,
-    SearchMaintenanceReport,
+    CapabilityToken, FullTextIntent, GenerationReadSnapshot, OpenSearchCursorResult,
+    SearchBootstrapReport, SearchCapability, SearchGenerationCoverage, SearchIndexDefinition,
+    SearchIndexKind, SearchIntent, SearchMaintenanceReport,
 };
 use crate::tablet::ColumnId;
 use paro_common::error::Result;
@@ -91,8 +91,8 @@ impl TableHandle {
             + self.search_registry.catalog_definition_count()
     }
 
-    pub(crate) fn search_write_plan(&self) -> Result<SearchWritePlan> {
-        self.search_registry.write_plan()
+    pub(crate) fn search_write_context(&self) -> Result<SearchWriteContext> {
+        self.search_registry.write_context()
     }
 
     pub fn open_search_generation_snapshot(
@@ -100,6 +100,14 @@ impl TableHandle {
         definition_id: u64,
     ) -> Result<Option<GenerationReadSnapshot>> {
         self.search_registry.open_generation_snapshot(definition_id)
+    }
+
+    pub fn open_search_generation_snapshot_with_token(
+        &self,
+        token: &CapabilityToken,
+    ) -> Result<OpenSearchCursorResult<GenerationReadSnapshot>> {
+        self.search_registry
+            .open_generation_snapshot_with_token(token)
     }
 
     pub fn search_generation_coverage(
@@ -115,6 +123,16 @@ impl TableHandle {
 
     pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
         let mut report = self.search_registry.maintenance_sweep()?;
+        if report.manifest_delta_compaction_requested
+            && self.search_registry.compact_manifest_deltas()? > 0
+        {
+            self.search_registry.ensure_fresh();
+            report = self.search_registry.maintenance_sweep()?;
+        }
+        if report.sidecar_repack_requested {
+            self.search_registry.ensure_fresh();
+            report = self.search_registry.maintenance_sweep()?;
+        }
         if report.compaction_requested && self.optimize_compact()? {
             self.search_registry.ensure_fresh();
             report = self.search_registry.maintenance_sweep()?;
