@@ -28,6 +28,7 @@ id	rank	rank_cd
 3	2.000000	2.000000
 4	2.375000	2.000000
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_t024_rank_cd
@@ -47,6 +48,12 @@ PROJECTION  (rows=1)
     ->  PROJECTION  (rows=1)
       Output: id, __paro_hidden_1, __paro_hidden_2
       ->  FULLTEXT_SCAN on public.ft_t024_rank_cd  (rows=5)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 1
+        Mode: Filter
 
 DROP INDEX IF EXISTS idx_ft_t024_rank_cd_fts;
 DROP INDEX

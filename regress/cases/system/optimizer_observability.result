@@ -45,6 +45,7 @@ name	enabled	has_invocations
 search_optimization	true	true
 statistics_gathering	true	true
 
+-- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
 SELECT id
 FROM obs_docs
@@ -66,6 +67,12 @@ PROJECTION  (rows=0)
       Cardinality: [0, 0, 1]
       Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
       ->  FULLTEXT_SCAN on public.obs_docs  (rows=3)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 1
+        Mode: Filter
         Cardinality: [3, 3, 3]
         Output Schema: id INTEGER, title VARCHAR
 

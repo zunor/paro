@@ -41,6 +41,7 @@ from harness.performance_gate import (  # noqa: E402
     validate_existing_baseline_for_bless,
 )
 from harness.performance_gate.entry import GateEntry  # noqa: E402
+from harness.performance_gate.metric_accessor import metric_value  # noqa: E402
 from harness.performance_gate.outcome import GateOutcome  # noqa: E402
 from harness.performance_gate.quorum_statistics import (  # noqa: E402
     estimate_effect_power,
@@ -80,6 +81,7 @@ def query(
     p99: float | None = None,
     throughput: float | None = None,
     rss_peak_kb: float | None = None,
+    audit: dict | None = None,
     samples: int = 20,
     error: str | None = None,
 ) -> dict:
@@ -96,6 +98,8 @@ def query(
         }
     if rss_peak_kb is not None:
         item["rss"] = {"peak_kb": rss_peak_kb}
+    if audit is not None:
+        item["audit"] = audit
     return item
 
 
@@ -555,6 +559,82 @@ class PerformanceGateTests(unittest.TestCase):
         )
         self.assertEqual(outcome.entries[0].status, GateStatus.REGRESS)
 
+    def test_query_specific_absolute_metric_bounds_override_global(self) -> None:
+        outcome = evaluate_gate(
+            policy=test_policy(
+                metrics=("p99",),
+                latency_regression_percent=1000.0,
+                absolute_max={"p99": 1000.0, "q.p99": 90.0},
+            ),
+            current_payload=payload(query("q", p50=10.0, p99=95.0)),
+            baseline_payload=baseline_payload(query("q", p50=10.0, p99=50.0)),
+        )
+        self.assertEqual(outcome.entries[0].status, GateStatus.REGRESS)
+        self.assertIn("absolute max 90", outcome.entries[0].detail or "")
+
+    def test_workload_specific_absolute_metric_bounds_override_query_bound(self) -> None:
+        outcome = evaluate_gate(
+            policy=test_policy(
+                metrics=("throughput_per_second",),
+                throughput_min_ratio=0.1,
+                absolute_min={
+                    "q.throughput_per_second": 1.0,
+                    "w.q.throughput_per_second": 20.0,
+                },
+            ),
+            current_payload=payload(query("q", p50=10.0, throughput=15.0)),
+            baseline_payload=baseline_payload(query("q", p50=10.0, throughput=10.0)),
+        )
+        self.assertEqual(outcome.entries[0].status, GateStatus.REGRESS)
+        self.assertIn("absolute min 20", outcome.entries[0].detail or "")
+
+    def test_audit_metric_absolute_bound_is_supported(self) -> None:
+        outcome = evaluate_gate(
+            policy=test_policy(
+                metrics=("audit_manifest_publish_bytes",),
+                resource_regression_percent=1000.0,
+                absolute_max={"audit_manifest_publish_bytes": 1024.0},
+            ),
+            current_payload=payload(
+                query("q", audit={"manifest_publish_bytes": 2048.0})
+            ),
+            baseline_payload=baseline_payload(
+                query("q", audit={"manifest_publish_bytes": 512.0})
+            ),
+        )
+        self.assertEqual(outcome.entries[0].status, GateStatus.REGRESS)
+        self.assertIn("absolute max 1024", outcome.entries[0].detail or "")
+
+    def test_zero_baseline_audit_metric_is_valid_when_current_stays_zero(self) -> None:
+        outcome = evaluate_gate(
+            policy=test_policy(metrics=("audit_search_layer_varlen_fallback_seek_count",)),
+            current_payload=payload(
+                query("q", audit={"search_layer_varlen_fallback_seek_count": 0.0})
+            ),
+            baseline_payload=baseline_payload(
+                query("q", audit={"search_layer_varlen_fallback_seek_count": 0.0})
+            ),
+        )
+
+        self.assertEqual(outcome.entries[0].kind, GateEntryKind.COMPARED_METRIC)
+        self.assertEqual(outcome.entries[0].status, GateStatus.OK)
+        self.assertEqual(outcome.entries[0].change_percent, 0.0)
+
+    def test_zero_baseline_audit_metric_regresses_when_current_becomes_positive(self) -> None:
+        outcome = evaluate_gate(
+            policy=test_policy(metrics=("audit_search_layer_varlen_fallback_seek_count",)),
+            current_payload=payload(
+                query("q", audit={"search_layer_varlen_fallback_seek_count": 1.0})
+            ),
+            baseline_payload=baseline_payload(
+                query("q", audit={"search_layer_varlen_fallback_seek_count": 0.0})
+            ),
+        )
+
+        self.assertEqual(outcome.entries[0].kind, GateEntryKind.COMPARED_METRIC)
+        self.assertEqual(outcome.entries[0].status, GateStatus.REGRESS)
+        self.assertIn("zero baseline", outcome.entries[0].detail or "")
+
     def test_index_queries_uses_stable_param_key(self) -> None:
         indexed = index_queries(payload(query("q"), params={"b": 2, "a": 1}))
 
@@ -925,6 +1005,8 @@ staging_until = "2026-06-30"
         self.assertEqual(query_a["stats"]["p50"], 2.0)
         self.assertEqual(query_a["stats"]["p99"], 3.0)
         self.assertEqual(query_a["audit"]["allocator_tracking_event_counts_median"], 4.0)
+        self.assertEqual(query_a["audit"]["allocator_tracking_event_counts_p99"], 6.0)
+        self.assertEqual(metric_value(query_a, "audit_allocator_tracking_event_counts_p99"), 6.0)
 
         retried = normalize_divan_payload(
             source,

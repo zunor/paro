@@ -9,12 +9,12 @@ use crate::tablet::ColumnId;
 
 use super::artifact::ArtifactLocation;
 use super::stats::{
-    BuildEpoch, ConfigFingerprint, ExecutionModes, GenerationStats, PreferHint, ProviderVariantId,
-    SearchArtifactStats, SearchCostEstimate, SearchDefinitionId, SearchGenerationId, SegmentId,
-    TableId,
+    BuildEpoch, CatchUpBacklogTier, ConfigFingerprint, ExecutionModes, GenerationStats,
+    MaintenancePriority, PreferHint, ProviderVariantId, SearchArtifactStats, SearchCostEstimate,
+    SearchDefinitionId, SearchGenerationId, SegmentId, TableId,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SearchIndexKind {
     Hnsw,
     Sparse,
@@ -31,7 +31,32 @@ pub struct SearchIndexDefinition {
     pub column_ids: Vec<ColumnId>,
     pub expression: Option<String>,
     pub provider_config: Value,
+    pub freshness_policy: SearchFreshnessPolicy,
     pub config_fingerprint: ConfigFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchDefinitionOrigin {
+    CatalogIndex { index_id: u64 },
+    SchemaSeed { column_id: ColumnId },
+}
+
+impl SearchDefinitionOrigin {
+    pub const fn catalog(index_id: u64) -> Self {
+        Self::CatalogIndex { index_id }
+    }
+
+    pub const fn schema_seed(column_id: ColumnId) -> Self {
+        Self::SchemaSeed { column_id }
+    }
+
+    pub const fn is_catalog_index(self) -> bool {
+        matches!(self, Self::CatalogIndex { .. })
+    }
+
+    pub fn is_schema_seed_for(self, column_id: ColumnId) -> bool {
+        matches!(self, Self::SchemaSeed { column_id: seed_column } if seed_column == column_id)
+    }
 }
 
 /// Physical segment address for a durable artifact in the current storage layout.
@@ -81,15 +106,81 @@ impl CoverageState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTailSummary {
+    pub pending_rowsets: usize,
+    pub pending_segments: usize,
+    pub pending_rows: u64,
+    pub pending_bytes: u64,
+    pub delete_rows: u64,
+    pub exact_tail_merge: bool,
+    pub backlog_tier: CatchUpBacklogTier,
+    pub maintenance_priority: MaintenancePriority,
+}
+
+impl SearchTailSummary {
+    pub const fn complete() -> Self {
+        Self {
+            pending_rowsets: 0,
+            pending_segments: 0,
+            pending_rows: 0,
+            pending_bytes: 0,
+            delete_rows: 0,
+            exact_tail_merge: true,
+            backlog_tier: CatchUpBacklogTier::Healthy,
+            maintenance_priority: MaintenancePriority::Idle,
+        }
+    }
+
+    pub const fn has_pending_rows(&self) -> bool {
+        self.pending_rows > 0
+    }
+}
+
+impl Default for SearchTailSummary {
+    fn default() -> Self {
+        Self::complete()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchFreshnessPolicy {
+    Required,
+    BoundedLag {
+        max_tail_rows: u64,
+        max_lag_millis: u64,
+    },
+    Opportunistic,
+}
+
+impl SearchFreshnessPolicy {
+    pub const fn bounded_by_tail_rows(max_tail_rows: u64) -> Self {
+        Self::BoundedLag {
+            max_tail_rows,
+            max_lag_millis: 0,
+        }
+    }
+
+    pub const fn default_for_kind(kind: SearchIndexKind) -> Self {
+        match kind {
+            SearchIndexKind::Hnsw => Self::bounded_by_tail_rows(4_096),
+            SearchIndexKind::Sparse => Self::bounded_by_tail_rows(32_768),
+            SearchIndexKind::FullText => Self::bounded_by_tail_rows(16_384),
+        }
+    }
+}
+
 /// Queryable generation head exposed to planners/providers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchGeneration {
     pub definition_id: SearchDefinitionId,
     pub generation_id: SearchGenerationId,
+    pub root_version: u64,
     pub build_epoch: BuildEpoch,
     pub build_snapshot_version: i64,
     pub indexed_through_ts: u64,
     pub coverage: CoverageState,
+    pub tail_summary: SearchTailSummary,
     pub manifest_location: Option<ArtifactLocation>,
     pub generation_stats: GenerationStats,
     pub execution_modes: ExecutionModes,
@@ -102,13 +193,63 @@ pub struct SearchCapability {
     pub table_id: TableId,
     pub kind: SearchIndexKind,
     pub generation_id: SearchGenerationId,
+    pub root_version: u64,
     pub indexed_through_ts: u64,
     pub coverage: CoverageState,
+    pub tail_summary: SearchTailSummary,
+    pub freshness_policy: SearchFreshnessPolicy,
     pub config_fingerprint: ConfigFingerprint,
     pub generation_stats: GenerationStats,
     pub execution_modes: ExecutionModes,
     pub estimated_cost: Option<SearchCostEstimate>,
     pub prefer_hint: Option<PreferHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchCapabilityState {
+    Queryable,
+    NotQueryable { reason: SearchNotQueryableReason },
+}
+
+impl SearchCapabilityState {
+    pub const fn is_queryable(&self) -> bool {
+        matches!(self, Self::Queryable)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchNotQueryableReason {
+    CoverageIncomplete,
+    TailOverBudget,
+    FreshnessRequired,
+    ProviderDisabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityToken {
+    pub definition_id: SearchDefinitionId,
+    pub generation_id: SearchGenerationId,
+    pub root_version: u64,
+    pub capability_state: SearchCapabilityState,
+}
+
+impl CapabilityToken {
+    pub fn from_capability(capability: &SearchCapability) -> Self {
+        Self {
+            definition_id: capability.definition_id,
+            generation_id: capability.generation_id,
+            root_version: capability.root_version,
+            capability_state: capability.capability_state(),
+        }
+    }
+
+    pub const fn is_generation_stale(&self, current_generation_id: SearchGenerationId) -> bool {
+        self.generation_id != current_generation_id
+    }
+
+    pub const fn is_queryable(&self) -> bool {
+        self.capability_state.is_queryable()
+    }
 }
 
 impl SearchCapability {
@@ -121,8 +262,11 @@ impl SearchCapability {
             table_id: definition.table_id,
             kind: definition.kind,
             generation_id: generation.generation_id,
+            root_version: generation.root_version,
             indexed_through_ts: generation.indexed_through_ts,
             coverage: generation.coverage.clone(),
+            tail_summary: generation.tail_summary,
+            freshness_policy: definition.freshness_policy,
             config_fingerprint: generation.config_fingerprint,
             generation_stats: generation.generation_stats.clone(),
             execution_modes: generation.execution_modes.clone(),
@@ -145,10 +289,51 @@ impl SearchCapability {
         if self.coverage.is_complete() {
             return true;
         }
-        self.coverage.supports_exact_tail_merge()
-            && self
+        if !self.coverage.supports_exact_tail_merge()
+            || !self
                 .execution_modes
                 .contains(super::stats::SearchExecutionMode::ExactTailMerge)
+        {
+            return false;
+        }
+        match self.freshness_policy {
+            SearchFreshnessPolicy::Required => false,
+            SearchFreshnessPolicy::BoundedLag { max_tail_rows, .. } => {
+                self.tail_summary.pending_rows <= max_tail_rows
+            }
+            SearchFreshnessPolicy::Opportunistic => false,
+        }
+    }
+
+    pub fn capability_state(&self) -> SearchCapabilityState {
+        if self.is_queryable() {
+            SearchCapabilityState::Queryable
+        } else if self.tail_summary.has_pending_rows()
+            && matches!(self.freshness_policy, SearchFreshnessPolicy::Required)
+        {
+            SearchCapabilityState::NotQueryable {
+                reason: SearchNotQueryableReason::FreshnessRequired,
+            }
+        } else if self.tail_summary.has_pending_rows()
+            && (!self.tail_summary.exact_tail_merge
+                || matches!(
+                    self.freshness_policy,
+                    SearchFreshnessPolicy::BoundedLag { max_tail_rows, .. }
+                        if self.tail_summary.pending_rows > max_tail_rows
+                ))
+        {
+            SearchCapabilityState::NotQueryable {
+                reason: SearchNotQueryableReason::TailOverBudget,
+            }
+        } else {
+            SearchCapabilityState::NotQueryable {
+                reason: SearchNotQueryableReason::CoverageIncomplete,
+            }
+        }
+    }
+
+    pub fn capability_token(&self) -> CapabilityToken {
+        CapabilityToken::from_capability(self)
     }
 }
 
@@ -199,9 +384,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CoverageState, SearchCapability, SearchGeneration, SearchIndexDefinition, SearchIndexKind,
+        CoverageState, SearchCapability, SearchCapabilityState, SearchFreshnessPolicy,
+        SearchGeneration, SearchIndexDefinition, SearchIndexKind, SearchNotQueryableReason,
+        SearchTailSummary,
     };
-    use crate::search::artifact::ArtifactLocation;
+    use crate::search::artifact::{ArtifactFileId, ArtifactLocation};
     use crate::search::stats::{
         ExecutionModes, FullTextProviderStats, GenerationStats, SearchExecutionMode,
         SearchProviderStats,
@@ -233,19 +420,27 @@ mod tests {
             column_ids: vec![3],
             expression: Some("to_tsvector('simple', body)".to_string()),
             provider_config: json!({"tokenizer": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 99,
         };
         let generation = SearchGeneration {
             definition_id: 7,
             generation_id: 13,
+            root_version: 5,
             build_epoch: 2,
             build_snapshot_version: 42,
             indexed_through_ts: 42,
             coverage: CoverageState::Complete,
+            tail_summary: SearchTailSummary::complete(),
             manifest_location: Some(ArtifactLocation::SidecarArtifactFile {
-                relative_path: "artifact/fts.manifest".into(),
-                byte_offset: 0,
-                byte_length: 64,
+                file_id: ArtifactFileId {
+                    definition_id: 7,
+                    generation_id: 13,
+                    package_index: 0,
+                },
+                offset: 0,
+                len: 64,
+                checksum: 1234,
             }),
             generation_stats: GenerationStats {
                 indexed_rows: 100,
@@ -274,10 +469,64 @@ mod tests {
         assert_eq!(capability.table_id, 11);
         assert_eq!(capability.definition_id, 7);
         assert_eq!(capability.generation_id, 13);
+        assert_eq!(capability.root_version, 5);
         assert_eq!(capability.indexed_through_ts, 42);
+        assert_eq!(capability.tail_summary, SearchTailSummary::complete());
         assert_eq!(capability.kind, SearchIndexKind::FullText);
         assert!(capability
             .execution_modes
             .contains(SearchExecutionMode::ExactTailMerge));
+    }
+
+    #[test]
+    fn capability_token_tracks_generation_staleness_not_root_version_churn() {
+        let capability = SearchCapability {
+            definition_id: 7,
+            table_id: 11,
+            kind: SearchIndexKind::FullText,
+            generation_id: 13,
+            root_version: 5,
+            indexed_through_ts: 42,
+            coverage: CoverageState::TailPending {
+                pending_rowsets: 1,
+                pending_segments: 1,
+                pending_rows: 16,
+                exact_tail_merge: false,
+            },
+            tail_summary: SearchTailSummary {
+                pending_rowsets: 1,
+                pending_segments: 1,
+                pending_rows: 16,
+                pending_bytes: 256,
+                delete_rows: 0,
+                exact_tail_merge: false,
+                ..SearchTailSummary::complete()
+            },
+            freshness_policy: SearchFreshnessPolicy::BoundedLag {
+                max_tail_rows: 8,
+                max_lag_millis: 0,
+            },
+            config_fingerprint: 99,
+            generation_stats: GenerationStats::default(),
+            execution_modes: ExecutionModes::exact_only(),
+            estimated_cost: None,
+            prefer_hint: None,
+        };
+
+        let token = capability.capability_token();
+
+        assert_eq!(token.definition_id, 7);
+        assert_eq!(token.generation_id, 13);
+        assert_eq!(token.root_version, 5);
+        assert!(capability.tail_summary.has_pending_rows());
+        assert!(!token.is_generation_stale(13));
+        assert!(token.is_generation_stale(14));
+        assert_eq!(
+            token.capability_state,
+            SearchCapabilityState::NotQueryable {
+                reason: SearchNotQueryableReason::TailOverBudget,
+            }
+        );
+        assert!(!token.is_queryable());
     }
 }

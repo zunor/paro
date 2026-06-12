@@ -12,6 +12,7 @@ use crate::index::sparse::SparseVectorIndex;
 use crate::index::{
     BitmapIndex, BloomFilterIndex, IndexConstraintType, MmapVectorStorage, PageRange,
 };
+use crate::metrics::storage_metrics;
 use crate::rowset::column::OrdinalIndexReader;
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{CompressionType, PagePointer, PageReadOptions};
@@ -46,6 +47,7 @@ impl Segment {
                 file_path, e
             ))
         })?;
+        storage_metrics().record_segment_file_open();
 
         let file_size = file
             .metadata()
@@ -434,9 +436,10 @@ impl Segment {
             let dim = if let LogicalType::Array(_, d) = col.logical_type {
                 d
             } else {
-                return Err(paro_error::data_corrupted(
-                    "HNSW index on non-vector column",
-                ));
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW index on non-vector column {} with type {:?}",
+                    meta.column_id, col.logical_type
+                )));
             };
 
             let vector_storage = std::sync::Arc::new(MmapVectorStorage::open_range(

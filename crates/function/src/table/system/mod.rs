@@ -23,6 +23,7 @@
 //! - `paro_storage_info(table)` - Segment/column storage observability ✅
 //! - `paro_wal_metrics()` - WAL/apply queue observability ✅
 //! - `paro_transaction_metrics()` - Transaction pipeline observability ✅
+//! - `paro_search_metrics()` - Search derived-state observability ✅
 //! - `paro_commit_frontiers()` - Commit frontier observability ✅
 //! - `paro_commit_poison()` - Commit poison/admission observability ✅
 //!
@@ -45,6 +46,7 @@ pub mod paro_pg_prepared_statements;
 pub mod paro_pg_settings;
 pub mod paro_property_graphs;
 pub mod paro_schemas;
+pub mod paro_search_metrics;
 pub mod paro_storage_info;
 pub mod paro_tables;
 pub mod paro_temporary_files;
@@ -68,6 +70,7 @@ pub use paro_pg_prepared_statements::create_paro_pg_prepared_statements_function
 pub use paro_pg_settings::create_paro_pg_settings_function_set;
 pub use paro_property_graphs::create_paro_property_graphs_function_set;
 pub use paro_schemas::create_paro_schemas_function_set;
+pub use paro_search_metrics::create_paro_search_metrics_function_set;
 pub use paro_storage_info::create_paro_storage_info_function_set;
 pub use paro_tables::create_paro_tables_function_set;
 pub use paro_temporary_files::create_paro_temporary_files_function_set;

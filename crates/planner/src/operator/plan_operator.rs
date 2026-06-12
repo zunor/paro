@@ -986,8 +986,8 @@ mod tests {
     use paro_function::copy::{register_copy_functions, CopyFunctionBindData, CopyOptions};
     use paro_parser::ast::CopySource;
     use paro_storage::search::{
-        CoverageState, ExecutionModes, GenerationStats, HnswIntent, NormalizedSearchRequest,
-        ProjectionSpec, SearchCapability, SearchIndexKind, SearchIntent, SearchRequestMode,
+        HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIndexKind, SearchIntent,
+        SearchRequestMode,
     };
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
@@ -1528,19 +1528,14 @@ mod tests {
                         column_id: 1,
                         query_vector: vec![0.1, 0.2],
                     }),
-                    capability: SearchCapability {
+                    token: paro_storage::search::CapabilityToken {
                         definition_id: 1,
-                        table_id: 10,
-                        kind: SearchIndexKind::Hnsw,
                         generation_id: 1,
-                        coverage: CoverageState::Complete,
-                        config_fingerprint: 0,
-                        generation_stats: GenerationStats::default(),
-                        execution_modes: ExecutionModes::default(),
-                        estimated_cost: None,
-                        prefer_hint: None,
-                        indexed_through_ts: 0,
+                        root_version: 1,
+                        capability_state: paro_storage::search::SearchCapabilityState::Queryable,
                     },
+                    kind: SearchIndexKind::Hnsw,
+                    estimated_cost: None,
                 },
                 confidence: crate::operator::Confidence::High,
             },

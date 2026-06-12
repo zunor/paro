@@ -249,6 +249,7 @@ pub struct DatabaseHandle {
     journal_next_lsn: AtomicU64,
     buffer_pool: Arc<BufferPool>,
     storage_manager: RwLock<Option<Box<dyn StorageManager>>>,
+    task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
     compaction: CompactionDriver,
     checkpoint_coordinator: CheckpointCoordinator,
     checkpoint_trigger: CheckpointTriggerState,
@@ -312,6 +313,7 @@ impl DatabaseHandle {
             journal_next_lsn: AtomicU64::new(1),
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
+            task_scheduler: RwLock::new(None),
             compaction: CompactionDriver::new(buffer_pool),
             checkpoint_coordinator: CheckpointCoordinator::new(),
             checkpoint_trigger: CheckpointTriggerState::default(),
@@ -540,7 +542,9 @@ impl DatabaseHandle {
 
     /// Bind the instance task scheduler for background maintenance tasks.
     pub fn bind_task_scheduler(self: &Arc<Self>, scheduler: Arc<TaskScheduler>) {
+        *self.task_scheduler.write() = Some(scheduler.clone());
         self.compaction.bind_scheduler(scheduler);
+        self.bind_tablet_runtime_services();
         self.ensure_checkpoint_background_runner();
     }
 
@@ -1232,6 +1236,7 @@ impl DatabaseHandle {
         let observer = self.checkpoint_coordinator.compaction_publish_observer();
         let journal = self.journal_coordinator();
         let apply_runtime = self.journal_apply_runtime();
+        let task_scheduler = self.task_scheduler.read().clone();
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
             .catalog
@@ -1255,6 +1260,7 @@ impl DatabaseHandle {
                         .bind_checkpoint_publish_observer(observer.clone());
                     storage.bind_journal_coordinator(Some(Arc::clone(&journal)));
                     storage.bind_journal_apply_runtime(Some(Arc::clone(&apply_runtime)));
+                    storage.bind_search_task_scheduler(task_scheduler.clone());
                 }
             }
         }

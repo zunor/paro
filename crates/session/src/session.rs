@@ -341,7 +341,7 @@ impl Session {
                         read_tracking_safe_snapshot_preferred_count: manager_metrics
                             .read_tracking_safe_snapshot_preferred_count,
                         derived_index_lag_ts: storage_metric_snapshot.derived_index_lag_ts,
-                        derived_delta_merge_cost: storage_metric_snapshot.derived_delta_merge_cost,
+                        tail_exact_merge_cost: storage_metric_snapshot.tail_exact_merge_cost,
                         commit_participant_count: backpressure_metrics.participant_count as u64,
                         inflight_batch_conflict_reject_count: sequencer_metrics
                             .reject_in_batch_write_conflict,

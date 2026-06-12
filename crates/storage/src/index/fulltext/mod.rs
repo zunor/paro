@@ -7,7 +7,6 @@
 
 pub mod bm25;
 pub mod builder;
-pub mod compaction;
 pub mod inverted_index;
 pub mod persistence;
 pub mod posting_list;

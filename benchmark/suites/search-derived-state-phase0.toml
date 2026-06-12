@@ -1,0 +1,15 @@
+name = "search-derived-state-phase0"
+description = "Search derived-state Phase 0 benchmark suite"
+
+[[include]]
+workload = "search_derived_state_phase0"
+queries = [
+  "fulltext_topk",
+  "fulltext_project_payload",
+  "fulltext_project_fixed_payload",
+  "fulltext_project_low_cardinality_payload",
+  "fulltext_project_nullable_payload",
+  "fulltext_project_multi_payload",
+  "sparse_topk",
+  "hnsw_topk",
+]

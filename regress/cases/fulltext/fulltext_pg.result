@@ -65,6 +65,7 @@ id
 1
 2
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_docs
@@ -83,6 +84,12 @@ PROJECTION  (rows=0)
     ->  PROJECTION  (rows=0)
       Output: id, __paro_hidden_1
       ->  FULLTEXT_SCAN on public.ft_docs  (rows=4)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 3
+        Mode: Filter
 
 CREATE TABLE ft_rank (id INT, content VARCHAR);
 CREATE TABLE

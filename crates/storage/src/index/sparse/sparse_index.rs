@@ -108,10 +108,66 @@ impl IndicesTracker {
         Ok(remapped)
     }
 
+    pub(crate) fn remap_vector_into(
+        &self,
+        vector: &SparseVector,
+        out: &mut SparseVector,
+    ) -> Result<()> {
+        if vector.dims.len() != vector.weights.len() {
+            return Err(paro_error::invalid_input(
+                "IndicesTracker: dims/weights length mismatch",
+            ));
+        }
+
+        out.dims.clear();
+        out.weights.clear();
+        out.dims.reserve(vector.dims.len());
+        out.weights.reserve(vector.weights.len());
+
+        let mut placeholder = self.map.len() as DimensionId;
+        let mut previous = None;
+        let mut sorted_unique = true;
+        for (dim, weight) in vector
+            .dims
+            .iter()
+            .copied()
+            .zip(vector.weights.iter().copied())
+        {
+            let remapped = match self.map.get(&dim) {
+                Some(id) => *id,
+                None => {
+                    placeholder = placeholder.saturating_add(1);
+                    placeholder
+                }
+            };
+            if previous.is_some_and(|prev| prev >= remapped) {
+                sorted_unique = false;
+            }
+            previous = Some(remapped);
+            out.dims.push(remapped);
+            out.weights.push(weight);
+        }
+
+        if sorted_unique {
+            Ok(())
+        } else {
+            out.sort_by_dim()
+        }
+    }
+
     /// Register dimensions in the vector, then remap using updated mapping.
     pub fn register_and_remap(&mut self, vector: &SparseVector) -> Result<SparseVector> {
         self.register_vector(vector);
         self.remap_vector(vector)
+    }
+
+    pub(crate) fn register_and_remap_into(
+        &mut self,
+        vector: &SparseVector,
+        out: &mut SparseVector,
+    ) -> Result<()> {
+        self.register_vector(vector);
+        self.remap_vector_into(vector, out)
     }
 }
 
@@ -191,6 +247,19 @@ impl SparseVectorIndex {
         Ok(())
     }
 
+    pub(crate) fn upsert_with_remap_scratch(
+        &mut self,
+        doc_id: PointOffset,
+        vector: &SparseVector,
+        remap_scratch: &mut SparseVector,
+    ) -> Result<()> {
+        self.indices
+            .register_and_remap_into(vector, remap_scratch)?;
+        self.inverted_index.upsert(doc_id, remap_scratch)?;
+        self.num_vectors = self.num_vectors.max(doc_id as usize + 1);
+        Ok(())
+    }
+
     /// Upsert a vector with an optional old vector for cleanup.
     pub fn upsert_with_old(
         &mut self,
@@ -203,6 +272,16 @@ impl SparseVectorIndex {
             self.inverted_index.remove(doc_id, &old_remapped)?;
         }
         self.upsert(doc_id, vector)
+    }
+
+    /// Remove a vector that was previously indexed for `doc_id`.
+    pub fn remove(&mut self, doc_id: PointOffset, vector: &SparseVector) -> Result<()> {
+        let remapped = self.indices.remap_vector(vector)?;
+        self.inverted_index.remove(doc_id, &remapped)
+    }
+
+    pub(crate) fn set_num_vectors(&mut self, num_vectors: usize) {
+        self.num_vectors = num_vectors;
     }
 
     /// Remap a query vector without registering new dimensions.

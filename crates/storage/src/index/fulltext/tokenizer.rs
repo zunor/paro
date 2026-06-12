@@ -182,6 +182,30 @@ fn collect_basic_word_surfaces(text: &str, out: &mut Vec<SurfaceToken>) {
     flush_alnum_surface_token(&mut buffer, &mut token_start, text.len(), out);
 }
 
+fn flush_alnum_token(buffer: &mut String, position: &mut TokenPosition, out: &mut Vec<Token>) {
+    if buffer.is_empty() {
+        return;
+    }
+    out.push(Token::new(buffer.to_lowercase(), *position));
+    *position = position.saturating_add(1);
+    buffer.clear();
+}
+
+fn collect_basic_word_tokens(text: &str, out: &mut Vec<Token>) {
+    let mut buffer = String::new();
+    let mut position = out.len() as TokenPosition;
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            buffer.push(ch);
+        } else {
+            flush_alnum_token(&mut buffer, &mut position, out);
+        }
+    }
+
+    flush_alnum_token(&mut buffer, &mut position, out);
+}
+
 fn collect_script_boundary_surfaces<F>(text: &str, out: &mut Vec<SurfaceToken>, is_script_char: F)
 where
     F: Fn(char) -> bool,
@@ -385,9 +409,7 @@ impl DefaultTokenizer {
 
 impl Tokenizer for DefaultTokenizer {
     fn tokenize(&self, text: &str, out: &mut Vec<Token>) {
-        let mut surface_tokens = Vec::new();
-        collect_basic_word_surfaces(text, &mut surface_tokens);
-        append_surface_tokens(&surface_tokens, out);
+        collect_basic_word_tokens(text, out);
     }
 
     fn tokenize_spanned(&self, text: &str, out: &mut Vec<SpannedToken>) {

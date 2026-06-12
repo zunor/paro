@@ -37,7 +37,12 @@ pub(crate) fn append_with_transaction(
         if !art_columns.is_empty() {
             txn.register_pending_art_columns(tablet.tablet_id(), art_columns)?;
         }
-        txn.append_to_tablet(view.command_id(), tablet, chunk, table.search_write_plan()?)?;
+        txn.append_to_tablet(
+            view.command_id(),
+            tablet,
+            chunk,
+            table.search_write_context()?,
+        )?;
         return Ok(());
     }
 
@@ -49,13 +54,13 @@ fn append_direct(table: &TableHandle, chunk: &Chunk) -> Result<()> {
     // execution and must arrive with an active transaction.
     let tablet = table.tablet();
     let art_columns = table.declared_art_columns();
-    let search_write_plan = table.search_write_plan()?;
+    let search_write_context = table.search_write_context()?;
 
-    let mut writer = DeltaWriter::open_with_allocator_and_search_plan(
+    let mut writer = DeltaWriter::open_with_allocator_and_search_context(
         tablet.clone(),
         now_micros(),
         chunk.allocator().clone(),
-        search_write_plan,
+        search_write_context,
     )?;
     if tablet
         .schema()
@@ -99,11 +104,12 @@ pub(crate) fn append_partial_with_transaction(
     }
 
     let tablet = table.tablet();
-    let mut writer = DeltaWriter::open_partial_with_allocator(
+    let mut writer = DeltaWriter::open_partial_with_allocator_and_search_context(
         tablet,
         now_micros(),
         partial_column_indices,
         chunk.allocator().clone(),
+        table.search_write_context()?,
     )?;
     let base_row_ids: Vec<RowID> = base_row_ids.iter().copied().map(RowID::from_raw).collect();
     writer.write_partial_chunk(chunk, &base_row_ids)?;

@@ -5,15 +5,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::index::hnsw::types::SearchParams;
-use crate::index::hnsw::{DistanceMetric, PreparedQuery};
+use crate::index::hnsw::{DistanceMetric, HnswIndex, PreparedQuery};
+use crate::index::MmapVectorStorage;
 use crate::index::PredicateTree;
+use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
+use crate::search::artifact::ArtifactLocation;
 use crate::search::capability::SearchIndexKind;
 use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
-use crate::search::delta_merge::{ensure_search_delta_merge_budget, DeltaMergeQueryShape};
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
+use crate::search::sidecar::{
+    SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+};
+use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
 use crate::search::telemetry::{
     GenerationTelemetryEvent, NoopSearchTelemetryCollector, QueryTelemetryEvent,
@@ -25,8 +31,8 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
-use super::budget::{ResourceBudget, SearchBatchConfig};
-use super::cursor::PhysicalRowRef;
+use crate::search::budget::{ResourceBudget, SearchBatchConfig};
+use crate::search::cursor::PhysicalRowRef;
 
 pub(crate) struct VectorSearchProvider {
     tablet: TabletRef,
@@ -71,11 +77,11 @@ impl VectorSearchProvider {
 
         let vector_dim = resolve_vector_dim(&self.column_types, self.column_id)?;
         validate_query_dim(&self.query, vector_dim)?;
-        ensure_search_delta_merge_budget(
+        ensure_tail_exact_merge_budget(
             &snapshot,
             SearchIndexKind::Hnsw,
             self.column_id as u32,
-            DeltaMergeQueryShape::Hnsw {
+            TailExactMergeQueryShape::Hnsw {
                 dimension: vector_dim,
                 ef: self.params.ef,
                 top_k: self.k,
@@ -84,6 +90,9 @@ impl VectorSearchProvider {
         let distance = resolve_distance_metric(&self.tablet, self.column_id);
         let prepared_query = distance.prepare(&self.query);
         let cursor = VectorSearchCursor {
+            sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
+                self.tablet.data_dir().clone(),
+            ))),
             snapshot: snapshot.clone(),
             tablet: self.tablet,
             query: self.query,
@@ -125,6 +134,7 @@ enum VectorCursorState {
 }
 
 struct VectorSearchCursor {
+    sidecar_cache: Arc<SidecarReaderCache>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     query: Vec<f32>,
@@ -193,6 +203,7 @@ impl VectorSearchCursor {
             rows_returned: ranked_rows.len(),
             peak_heap_items,
             degraded_segments,
+            degraded_score_reasons: Vec::new(),
             elapsed: started_at.elapsed(),
         });
         Ok(ranked_rows)
@@ -243,6 +254,32 @@ impl VectorSearchCursor {
                             .collect()
                     };
                     (ranked_rows, false)
+                });
+        }
+
+        if let Some(index) = open_sidecar_hnsw_index(
+            &self.snapshot,
+            self.sidecar_cache.as_ref(),
+            visible_segment,
+            self.storage_col_id,
+            self.vector_dim,
+        )? {
+            let filter_bitmap = visible_segment
+                .segment
+                .build_filter_bitmap_with_epoch(snapshot_version, self.predicate.as_ref())?;
+            if filter_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.is_empty())
+            {
+                return Ok((Vec::new(), false));
+            }
+            return index
+                .search_one(&self.query, self.k, &self.params, filter_bitmap.as_ref())
+                .map(|points| {
+                    (
+                        hnsw_ranked_rows_from_points(&self.snapshot, visible_segment, points),
+                        false,
+                    )
                 });
         }
 
@@ -297,6 +334,83 @@ impl VectorSearchCursor {
         }
 
         Ok((collector.into_sorted_rows(), true))
+    }
+}
+
+fn open_sidecar_hnsw_index(
+    snapshot: &SearchReadSnapshot,
+    cache: &SidecarReaderCache,
+    visible_segment: &VisibleSegment,
+    column_id: u32,
+    vector_dim: usize,
+) -> Result<Option<HnswIndex>> {
+    let Some(artifact) =
+        snapshot.artifact_for_segment(SearchIndexKind::Hnsw, column_id, visible_segment)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        artifact.location,
+        ArtifactLocation::SidecarArtifactFile { .. }
+    ) {
+        return Ok(None);
+    }
+
+    let column_meta = visible_segment
+        .segment
+        .get_column_meta(column_id)
+        .ok_or_else(|| {
+            paro_error::column_not_found(format!(
+                "column {} not found in segment {}",
+                column_id, visible_segment.segment_id
+            ))
+        })?;
+    let vector_storage = Arc::new(MmapVectorStorage::open_range(
+        visible_segment.segment.file_path(),
+        column_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
+        column_meta.num_rows * vector_dim as u64 * std::mem::size_of::<f32>() as u64,
+        vector_dim,
+    )?);
+    let cached = cache.open(SidecarReaderRequest {
+        location: &artifact.location,
+        artifact_format_version: artifact.artifact_format_version,
+        provider: SearchIndexKind::Hnsw,
+        codec: SIDECAR_PACKAGE_CODEC,
+    })?;
+    HnswIndex::deserialize(cached.bytes(), vector_storage).map(Some)
+}
+
+fn hnsw_ranked_rows_from_points(
+    snapshot: &SearchReadSnapshot,
+    visible_segment: &VisibleSegment,
+    points: Vec<crate::index::hnsw::ScoredPoint>,
+) -> Vec<RankedRow> {
+    if snapshot.has_overlay_delete_vectors() {
+        points
+            .into_iter()
+            .filter_map(|point| {
+                let row = PhysicalRowRef::new(
+                    visible_segment.rowset_id,
+                    visible_segment.segment_id,
+                    point.idx as u32,
+                );
+                (!snapshot.is_overlay_deleted(row)).then(|| RankedRow::new(row, point.score))
+            })
+            .collect()
+    } else {
+        points
+            .into_iter()
+            .map(|point| {
+                RankedRow::new(
+                    PhysicalRowRef::new(
+                        visible_segment.rowset_id,
+                        visible_segment.segment_id,
+                        point.idx as u32,
+                    ),
+                    point.score,
+                )
+            })
+            .collect()
     }
 }
 

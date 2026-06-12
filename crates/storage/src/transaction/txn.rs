@@ -5,7 +5,7 @@
 //!
 //! Coordinates undo tracking, staged writes, commit, rollback, and cleanup.
 
-use crate::search::write_path::SearchWritePlan;
+use crate::search::write_path::SearchWriteContext;
 use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef};
 use crate::transaction::undo_buffer::{ActiveTransactionState, UndoBuffer};
 use crate::transaction::write_buffer::{
@@ -631,7 +631,7 @@ impl Transaction {
         command_id: CommandId,
         tablet: TabletRef,
         chunk: &Chunk,
-        search_write_plan: SearchWritePlan,
+        search_write_context: SearchWriteContext,
     ) -> Result<()> {
         if chunk.size() == 0 {
             return Ok(());
@@ -657,7 +657,7 @@ impl Transaction {
             command_id,
             tablet,
             chunk.allocator().clone(),
-            search_write_plan,
+            search_write_context,
             chunk.get_allocation_size() as u64,
             |writer| writer.write_chunk(chunk),
         )?;
@@ -678,7 +678,7 @@ impl Transaction {
         command_id: CommandId,
         tablet: TabletRef,
         allocator: Arc<dyn paro_common::allocator::Allocator>,
-        search_write_plan: SearchWritePlan,
+        search_write_context: SearchWriteContext,
         estimated_new_bytes: u64,
         f: F,
     ) -> Result<R>
@@ -691,7 +691,7 @@ impl Transaction {
             self.read_ts(),
             tablet,
             allocator,
-            search_write_plan,
+            search_write_context,
             estimated_new_bytes,
             f,
         )?;
@@ -1656,7 +1656,7 @@ mod tests {
             CommandId::new(0),
             tablet.clone(),
             &test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]),
-            SearchWritePlan::default(),
+            SearchWriteContext::default(),
         )
         .expect("append first batch");
         let mark = txn.mark_savepoint().expect("mark savepoint");
@@ -1664,7 +1664,7 @@ mod tests {
             CommandId::new(1),
             tablet,
             &test_chunk_from_vectors(vec![test_i32_vector(&[3, 4]), test_i32_vector(&[30, 40])]),
-            SearchWritePlan::default(),
+            SearchWriteContext::default(),
         )
         .expect("append second batch");
 

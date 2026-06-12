@@ -20,6 +20,11 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::index::PredicateTree;
+use paro_storage::search::{
+    CapabilityToken, FullTextIntent, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
+    NormalizedSearchRequest, ProjectionSpec, SearchCapabilityState, SearchIntent,
+    SearchRequestMode,
+};
 
 use super::*;
 
@@ -582,6 +587,75 @@ fn arena_generator_lowers_row_literal_union_all_to_values() {
     };
     assert_eq!(spec.expressions.len(), 2);
     assert_eq!(spec.output_names.as_ref(), ["v"]);
+}
+
+#[test]
+fn arena_generator_lowers_search_scan_with_planned_token() {
+    let ctx = BindContext::new();
+    let get = test_get();
+    let intent = SearchIntent::FullText(FullTextIntent {
+        column_id: 2,
+        query: "graph".to_string(),
+        query_kind: FullTextQueryKind::Legacy,
+        query_stats: FullTextQueryStats::new(1),
+        config: "simple".to_string(),
+        score_mode: FullTextScoreMode::Bm25,
+    });
+    let token = CapabilityToken {
+        definition_id: 42,
+        generation_id: 7,
+        root_version: 11,
+        capability_state: SearchCapabilityState::Queryable,
+    };
+    let score_expr = Expression::Constant(ConstantExpression::new(
+        Value::Float(0.75),
+        LogicalType::Float,
+    ));
+    let search = LogicalSearchScan::new(
+        get,
+        NormalizedSearchRequest {
+            table_id: 1,
+            mode: SearchRequestMode::TopK { limit: 5 },
+            predicate: None,
+            projections: ProjectionSpec {
+                columns: vec![2],
+                include_score: true,
+            },
+            intents: vec![intent.clone()],
+            fusion: None,
+        },
+        SearchDecision::IndexScan {
+            candidate: SearchCandidate {
+                intent,
+                token: token.clone(),
+                kind: paro_storage::search::SearchIndexKind::FullText,
+                estimated_cost: None,
+            },
+            confidence: paro_planner::operator::Confidence::High,
+        },
+        vec![ref_expr(2, LogicalType::Varchar), score_expr.clone()],
+        9,
+        Vec::new(),
+        Vec::new(),
+        1,
+        score_expr,
+        false,
+        5,
+    )
+    .with_output_names(vec!["c".to_string(), "score".to_string()]);
+    let plan = LogicalPlan::new(&ctx, LogicalOperator::SearchScan(search));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let physical = generator.generate(&plan).expect("search scan should lower");
+
+    let PhysicalNodeKind::FullTextSearch(spec) = &physical.node(physical.root).kind else {
+        panic!("search scan should lower to fulltext source");
+    };
+    assert_eq!(spec.capability_token, token);
+    assert_eq!(spec.column_id, 2);
+    assert_eq!(spec.projected_columns.as_ref(), [2]);
+    assert!(spec.emit_score);
+    assert_eq!(spec.output_names.as_ref(), ["c", "score"]);
 }
 
 fn test_get() -> Get {

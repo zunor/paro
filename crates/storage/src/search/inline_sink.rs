@@ -1,0 +1,864 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Writer-side search artifact contracts.
+//!
+//! These types are intentionally storage-owned. `RowsetWriter` can feed the
+//! same logical chunk it is already writing into provider sinks without making
+//! providers reopen freshly-written segments.
+
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+use paro_common::error::{self as paro_error, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::rowset::{ColumnData, RowsetId, RowsetSharedPtr};
+use crate::tablet::{ColumnId, TabletColumn};
+
+use super::artifact::ArtifactFileId;
+use super::capability::{
+    SearchArtifactRef, SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind,
+};
+use super::stats::{
+    ConfigFingerprint, FullTextProviderStats, HnswProviderStats, ProviderVariantId,
+    SearchArtifactStats, SearchDefinitionId, SearchGenerationId, SearchProviderStats, SegmentId,
+    SparseProviderStats, TableId,
+};
+use super::tail::TailPendingEntry;
+
+/// Logical chunk image consumed by an inline search sink.
+///
+/// The chunk is append-only from the sink's point of view. Replace/delete
+/// semantics belong to tail metadata, not to provider-specific chunk parsing.
+#[derive(Clone, Copy)]
+pub struct SegmentChunkInput<'a> {
+    pub base_row_id: u32,
+    pub columns: &'a [ColumnData],
+    pub column_ids: Option<&'a [ColumnId]>,
+}
+
+/// Provider sink opened for a single segment.
+pub trait SegmentChunkSink: Send {
+    fn append_chunk(&mut self, input: SegmentChunkInput<'_>) -> Result<()>;
+
+    fn mark_savepoint(&mut self) -> Result<SegmentSinkSavepoint>;
+
+    fn rollback_to_savepoint(&mut self, savepoint: &SegmentSinkSavepoint) -> Result<()>;
+
+    fn finish(self: Box<Self>) -> Result<InlineArtifactBuildResult>;
+
+    fn abort(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentSinkSavepoint {
+    pub rows_seen: u64,
+    pub bytes_buffered: u64,
+    pub entries_seen: u64,
+    pub state_id: u64,
+}
+
+pub trait InlineArtifactBuilder: Send + Sync {
+    fn open_sink(&self, ctx: &SegmentFlushCtx<'_>) -> Result<Box<dyn SegmentChunkSink>>;
+}
+
+#[derive(Debug, Default)]
+pub struct HnswSegmentInlineArtifactBuilder;
+
+impl InlineArtifactBuilder for HnswSegmentInlineArtifactBuilder {
+    fn open_sink(&self, _ctx: &SegmentFlushCtx<'_>) -> Result<Box<dyn SegmentChunkSink>> {
+        Err(paro_error::internal(
+            "HNSW inline artifacts are built by SegmentWriter after RowsetWriter admission",
+        ))
+    }
+}
+
+#[derive(Clone)]
+pub struct SearchInlineBuilderEntry {
+    pub definition: SearchIndexDefinition,
+    pub generation_id: SearchGenerationId,
+    pub freshness_policy: SearchFreshnessPolicy,
+    pub builder: Arc<dyn InlineArtifactBuilder>,
+}
+
+impl SearchInlineBuilderEntry {
+    pub fn new(
+        definition: SearchIndexDefinition,
+        generation_id: SearchGenerationId,
+        freshness_policy: SearchFreshnessPolicy,
+        builder: Arc<dyn InlineArtifactBuilder>,
+    ) -> Self {
+        Self {
+            definition,
+            generation_id,
+            freshness_policy,
+            builder,
+        }
+    }
+
+    pub const fn flush_mode(&self) -> FlushSearchMode {
+        self.freshness_policy.default_flush_mode()
+    }
+}
+
+impl fmt::Debug for SearchInlineBuilderEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchInlineBuilderEntry")
+            .field("definition_id", &self.definition.definition_id)
+            .field("generation_id", &self.generation_id)
+            .field("generation_kind", &self.definition.kind)
+            .field("column_ids", &self.definition.column_ids)
+            .field("freshness_policy", &self.freshness_policy)
+            .field("flush_mode", &self.flush_mode())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub struct SearchInlineBuilderSet {
+    entries: Arc<[SearchInlineBuilderEntry]>,
+    admission: Option<Arc<dyn SearchAdmission>>,
+}
+
+impl SearchInlineBuilderSet {
+    pub fn new(
+        entries: Vec<SearchInlineBuilderEntry>,
+        admission: Option<Arc<dyn SearchAdmission>>,
+    ) -> Self {
+        Self {
+            entries: entries.into_boxed_slice().into(),
+            admission,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Vec::new(), None)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn entries(&self) -> &[SearchInlineBuilderEntry] {
+        &self.entries
+    }
+
+    pub fn admission(&self) -> Option<&Arc<dyn SearchAdmission>> {
+        self.admission.as_ref()
+    }
+}
+
+impl Default for SearchInlineBuilderSet {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl fmt::Debug for SearchInlineBuilderSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchInlineBuilderSet")
+            .field("entries", &self.entries)
+            .field("has_admission", &self.admission.is_some())
+            .finish()
+    }
+}
+
+pub trait SidecarArtifactBuilder: Send + Sync {
+    fn estimate_cost(&self, input: &SidecarBuildInput) -> CostEstimate;
+
+    fn build(
+        &self,
+        input: SidecarBuildInput,
+        budget: &BuildBudget,
+    ) -> Result<SidecarArtifactBuildResult>;
+}
+
+pub struct SegmentFlushCtx<'a> {
+    pub rowset_id: RowsetId,
+    pub segment_id: SegmentId,
+    pub definition: &'a SearchIndexDefinition,
+    pub generation_id: SearchGenerationId,
+    pub flush_mode: FlushSearchMode,
+    pub admission: Option<AdmissionGrant>,
+    pub staging_dir: &'a Path,
+    pub column_schema: &'a [TabletColumn],
+}
+
+pub struct SidecarBuildInput {
+    pub definition: SearchIndexDefinition,
+    pub generation_id: SearchGenerationId,
+    pub tail_window: Vec<TailPendingEntry>,
+    pub rowset_refs: Vec<RowsetSharedPtr>,
+    pub snapshot_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildBudget {
+    pub cost_envelope: MaintenanceCost,
+    pub deadline: Option<Instant>,
+    pub grant_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaintenanceCost {
+    pub cpu_ns: u64,
+    pub io_read_bytes: u64,
+    pub io_write_bytes: u64,
+    pub memory_peak_bytes: u64,
+    pub publish_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaintenanceBenefit {
+    pub expected_open_cost_saved_us: u64,
+    pub expected_tail_rows_drained: u64,
+    pub expected_artifact_bytes_reclaimed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CostEstimate {
+    pub cost: MaintenanceCost,
+    pub benefit: MaintenanceBenefit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineArtifactBuildResult {
+    pub blobs: Vec<InlineArtifactBlob>,
+    pub stats_delta: Option<SearchStatsDelta>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineArtifactBlob {
+    pub definition_id: SearchDefinitionId,
+    pub generation_id: SearchGenerationId,
+    pub column_id: ColumnId,
+    pub kind: SearchIndexKind,
+    pub bytes: Vec<u8>,
+    pub stats: SearchArtifactStats,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidecarArtifactBuildResult {
+    pub artifact_refs: Vec<SearchArtifactRef>,
+    pub stats_delta: Option<SearchStatsDelta>,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushSearchMode {
+    InlineRequired,
+    InlineIfAdmitted,
+    TailOnly,
+}
+
+impl SearchFreshnessPolicy {
+    pub const fn default_flush_mode(self) -> FlushSearchMode {
+        match self {
+            Self::Required => FlushSearchMode::InlineRequired,
+            Self::BoundedLag { .. } => FlushSearchMode::InlineIfAdmitted,
+            Self::Opportunistic => FlushSearchMode::TailOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineAdmissionRequest {
+    pub table_id: TableId,
+    pub definition_id: SearchDefinitionId,
+    pub provider: SearchIndexKind,
+    pub flush_mode: FlushSearchMode,
+    pub estimated_cost: MaintenanceCost,
+    pub row_count: u64,
+    pub hnsw_inline: Option<HnswInlineBuildEstimate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    Proceed(AdmissionGrant),
+    Wait {
+        deadline: Instant,
+        reason: AdmissionWaitReason,
+    },
+    Reject {
+        reason: AdmissionRejectReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionGrant {
+    pub budget: MaintenanceCost,
+    pub valid_until: Instant,
+    pub grant_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionWaitReason {
+    CpuBudget,
+    IoBudget,
+    MemoryBudget,
+    ProviderConcurrency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRejectReason {
+    RequiredBudgetUnavailable,
+    InvalidRequest,
+    InlineThresholdExceeded,
+    ProviderDisabled,
+}
+
+pub trait SearchAdmission: Send + Sync {
+    fn request_inline_batch(
+        &self,
+        reqs: &[InlineAdmissionRequest],
+    ) -> Result<Vec<AdmissionDecision>>;
+
+    fn release(&self, grant_id: u64);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderConfig {
+    pub kind: SearchIndexKind,
+    pub raw_config: Value,
+    pub config_fingerprint: ConfigFingerprint,
+}
+
+impl ProviderConfig {
+    pub fn from_definition(definition: &SearchIndexDefinition) -> Self {
+        Self {
+            kind: definition.kind,
+            raw_config: definition.provider_config.clone(),
+            config_fingerprint: definition.config_fingerprint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderStatsProfile {
+    pub provider_kind: SearchIndexKind,
+    pub provider_variant: ProviderVariantId,
+    pub artifact_format_version: u32,
+    pub scoring_fingerprint: u64,
+    pub config_fingerprint: ConfigFingerprint,
+}
+
+impl ProviderStatsProfile {
+    pub fn compatible_with_config(
+        &self,
+        config: &ProviderConfig,
+        provider_variant: ProviderVariantId,
+        artifact_format_version: u32,
+        scoring_fingerprint: u64,
+    ) -> bool {
+        self.provider_kind == config.kind
+            && self.provider_variant == provider_variant
+            && self.artifact_format_version == artifact_format_version
+            && self.scoring_fingerprint == scoring_fingerprint
+            && self.config_fingerprint == config.config_fingerprint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SearchStatsDelta {
+    FullText(FullTextStatsDelta),
+    Sparse(SparseStatsDelta),
+    Hnsw(HnswStatsDelta),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FullTextStatsDelta {
+    pub stats: FullTextProviderStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SparseStatsDelta {
+    pub row_count: u64,
+    pub nnz: u64,
+    pub posting_fanout: u64,
+    pub unique_dimensions: u64,
+    pub l2_norm_sum: f64,
+    pub max_l2_norm: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HnswStatsDelta {
+    pub vector_count: u64,
+    pub dimension: u32,
+    pub max_level: u32,
+    pub m: u32,
+    pub ef_construction: u32,
+    pub graph_memory_bytes: u64,
+    pub vector_storage_bytes: u64,
+    pub total_graph_links: u64,
+    pub level0_graph_links: u64,
+    pub avg_level0_degree: f32,
+    pub max_level0_degree: u32,
+}
+
+impl SearchStatsDelta {
+    pub fn provider_stats(&self) -> Option<SearchProviderStats> {
+        match self {
+            Self::FullText(delta) => Some(SearchProviderStats::FullText(delta.stats.clone())),
+            Self::Sparse(delta) => Some(SearchProviderStats::Sparse(SparseProviderStats {
+                row_count: delta.row_count,
+                nnz: delta.nnz,
+                posting_fanout: delta.posting_fanout,
+                unique_dimensions: delta.unique_dimensions,
+                avg_vector_nnz: if delta.row_count == 0 {
+                    0.0
+                } else {
+                    delta.nnz as f32 / delta.row_count as f32
+                },
+                l2_norm_sum: delta.l2_norm_sum,
+                max_l2_norm: delta.max_l2_norm,
+            })),
+            Self::Hnsw(delta) => Some(SearchProviderStats::Hnsw(HnswProviderStats {
+                vector_count: delta.vector_count,
+                dimension: delta.dimension,
+                max_level: delta.max_level,
+                m: delta.m,
+                ef_construction: delta.ef_construction,
+                graph_memory_bytes: delta.graph_memory_bytes,
+                vector_storage_bytes: delta.vector_storage_bytes,
+                total_graph_links: delta.total_graph_links,
+                level0_graph_links: delta.level0_graph_links,
+                avg_level0_degree: delta.avg_level0_degree,
+                max_level0_degree: delta.max_level0_degree,
+            })),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswInlineThreshold {
+    pub max_vector_count: u64,
+    pub max_graph_memory_bytes: u64,
+    pub max_dimension: u32,
+}
+
+impl HnswInlineThreshold {
+    pub const DEFAULT: Self = Self {
+        max_vector_count: 4_096,
+        max_graph_memory_bytes: 64 * 1024 * 1024,
+        max_dimension: 1_536,
+    };
+
+    pub const fn allows(
+        self,
+        vector_count: u64,
+        estimated_graph_memory_bytes: u64,
+        dimension: u32,
+    ) -> bool {
+        vector_count <= self.max_vector_count
+            && estimated_graph_memory_bytes <= self.max_graph_memory_bytes
+            && dimension <= self.max_dimension
+    }
+
+    pub fn from_provider_config_value(provider_config: &Value) -> Self {
+        let threshold = provider_config
+            .get("inline_threshold")
+            .unwrap_or(provider_config);
+        Self {
+            max_vector_count: read_u64_config(threshold, "max_vector_count")
+                .unwrap_or(Self::DEFAULT.max_vector_count),
+            max_graph_memory_bytes: read_u64_config(threshold, "max_graph_memory_bytes")
+                .unwrap_or(Self::DEFAULT.max_graph_memory_bytes),
+            max_dimension: read_u64_config(threshold, "max_dimension")
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(Self::DEFAULT.max_dimension),
+        }
+    }
+
+    pub fn estimate_graph_memory_bytes(vector_count: u64, dimension: u32, m: u32) -> u64 {
+        let m = u64::from(m.max(1));
+        let link_bytes = std::mem::size_of::<u32>() as u64;
+        let level0_links = m.saturating_mul(2);
+        let upper_level_links = m;
+        let graph_links = vector_count
+            .saturating_mul(level0_links.saturating_add(upper_level_links))
+            .saturating_mul(link_bytes);
+        let entry_overhead = vector_count.saturating_mul(16);
+        let build_frontier = vector_count
+            .saturating_mul(u64::from(dimension.max(1)))
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        graph_links
+            .saturating_add(entry_overhead)
+            .saturating_add(build_frontier)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswInlineBuildEstimate {
+    pub vector_count: u64,
+    pub dimension: u32,
+    pub estimated_graph_memory_bytes: u64,
+    pub threshold: HnswInlineThreshold,
+}
+
+impl HnswInlineBuildEstimate {
+    pub fn from_definition(
+        definition: &SearchIndexDefinition,
+        vector_count: u64,
+        dimension: u32,
+    ) -> Option<Self> {
+        if definition.kind != SearchIndexKind::Hnsw {
+            return None;
+        }
+        let threshold =
+            HnswInlineThreshold::from_provider_config_value(&definition.provider_config);
+        let dimension = if dimension == 0 {
+            read_u64_config(&definition.provider_config, "dimension")
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default()
+        } else {
+            dimension
+        };
+        let m = read_u64_config(&definition.provider_config, "m")
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(16);
+        Some(Self {
+            vector_count,
+            dimension,
+            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
+                vector_count,
+                dimension,
+                m,
+            ),
+            threshold,
+        })
+    }
+
+    pub const fn allows_inline(self) -> bool {
+        self.threshold.allows(
+            self.vector_count,
+            self.estimated_graph_memory_bytes,
+            self.dimension,
+        )
+    }
+}
+
+pub type SidecarArtifactFileId = ArtifactFileId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarArtifactLocation {
+    pub file_id: SidecarArtifactFileId,
+    pub offset: u64,
+    pub len: u64,
+    pub checksum: u64,
+}
+
+fn read_u64_config(config: &Value, key: &str) -> Option<u64> {
+    config
+        .get(key)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use paro_common::error::{self as paro_error, Result};
+    use serde_json::json;
+
+    use super::{
+        AdmissionDecision, AdmissionGrant, AdmissionRejectReason, AdmissionWaitReason,
+        FlushSearchMode, FullTextStatsDelta, HnswInlineBuildEstimate, HnswInlineThreshold,
+        HnswStatsDelta, InlineAdmissionRequest, InlineArtifactBuilder, MaintenanceCost,
+        ProviderConfig, ProviderStatsProfile, SearchAdmission, SearchFreshnessPolicy,
+        SearchInlineBuilderEntry, SearchInlineBuilderSet, SearchStatsDelta, SegmentChunkSink,
+        SegmentFlushCtx, SparseStatsDelta,
+    };
+    use crate::search::{SearchIndexDefinition, SearchIndexKind};
+
+    struct NoopInlineBuilder;
+
+    impl InlineArtifactBuilder for NoopInlineBuilder {
+        fn open_sink(&self, _ctx: &SegmentFlushCtx<'_>) -> Result<Box<dyn SegmentChunkSink>> {
+            Err(paro_error::internal(
+                "noop inline builder is only used as a typed test fixture",
+            ))
+        }
+    }
+
+    #[test]
+    fn freshness_policy_maps_to_write_mode_without_provider_config_fingerprint() {
+        assert_eq!(
+            SearchFreshnessPolicy::Required.default_flush_mode(),
+            FlushSearchMode::InlineRequired
+        );
+        assert_eq!(
+            SearchFreshnessPolicy::BoundedLag {
+                max_tail_rows: 128,
+                max_lag_millis: 1_000,
+            }
+            .default_flush_mode(),
+            FlushSearchMode::InlineIfAdmitted
+        );
+        assert_eq!(
+            SearchFreshnessPolicy::Opportunistic.default_flush_mode(),
+            FlushSearchMode::TailOnly
+        );
+    }
+
+    #[test]
+    fn hnsw_inline_threshold_uses_all_three_dimensions() {
+        let threshold = HnswInlineThreshold::DEFAULT;
+        assert!(threshold.allows(4_096, 64 * 1024 * 1024, 1_536));
+        assert!(!threshold.allows(4_097, 64 * 1024 * 1024, 1_536));
+        assert!(!threshold.allows(4_096, 64 * 1024 * 1024 + 1, 1_536));
+        assert!(!threshold.allows(4_096, 64 * 1024 * 1024, 1_537));
+    }
+
+    #[test]
+    fn hnsw_inline_threshold_comes_from_provider_config() {
+        let definition = SearchIndexDefinition {
+            definition_id: 1,
+            table_id: 2,
+            name: "vec_hnsw".to_string(),
+            kind: SearchIndexKind::Hnsw,
+            column_ids: vec![3],
+            expression: None,
+            provider_config: json!({
+                "m": 8,
+                "ef_construct": 64,
+                "inline_threshold": {
+                    "max_vector_count": 128,
+                    "max_graph_memory_bytes": 64,
+                    "max_dimension": 4
+                }
+            }),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
+            config_fingerprint: 99,
+        };
+
+        let threshold =
+            HnswInlineThreshold::from_provider_config_value(&definition.provider_config);
+        assert_eq!(threshold.max_vector_count, 128);
+        assert_eq!(threshold.max_graph_memory_bytes, 64);
+        assert_eq!(threshold.max_dimension, 4);
+
+        let estimate =
+            HnswInlineBuildEstimate::from_definition(&definition, 16, 4).expect("hnsw estimate");
+        assert_eq!(estimate.threshold, threshold);
+        assert!(!estimate.allows_inline());
+
+        let roomy = HnswInlineBuildEstimate {
+            threshold: HnswInlineThreshold {
+                max_vector_count: 16,
+                max_graph_memory_bytes: estimate.estimated_graph_memory_bytes,
+                max_dimension: 4,
+            },
+            ..estimate
+        };
+        assert!(roomy.allows_inline());
+    }
+
+    #[test]
+    fn builder_set_is_an_immutable_rowset_writer_contract() {
+        let definition = SearchIndexDefinition {
+            definition_id: 7,
+            table_id: 11,
+            name: "docs_fts".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![3],
+            expression: None,
+            provider_config: json!({"config": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::BoundedLag {
+                max_tail_rows: 64,
+                max_lag_millis: 250,
+            },
+            config_fingerprint: 99,
+        };
+        let entry = SearchInlineBuilderEntry::new(
+            definition,
+            13,
+            SearchFreshnessPolicy::BoundedLag {
+                max_tail_rows: 64,
+                max_lag_millis: 250,
+            },
+            Arc::new(NoopInlineBuilder),
+        );
+
+        let set = SearchInlineBuilderSet::new(vec![entry], None);
+
+        assert_eq!(set.len(), 1);
+        assert!(!set.is_empty());
+        assert!(set.admission().is_none());
+        assert_eq!(
+            set.entries()[0].flush_mode(),
+            FlushSearchMode::InlineIfAdmitted
+        );
+    }
+
+    #[test]
+    fn provider_profile_compatibility_uses_all_stable_keys() {
+        let definition = SearchIndexDefinition {
+            definition_id: 7,
+            table_id: 11,
+            name: "docs_fts".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![3],
+            expression: None,
+            provider_config: json!({"tokenizer": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+            config_fingerprint: 99,
+        };
+        let config = ProviderConfig::from_definition(&definition);
+        let profile = ProviderStatsProfile {
+            provider_kind: SearchIndexKind::FullText,
+            provider_variant: 1,
+            artifact_format_version: 2,
+            scoring_fingerprint: 3,
+            config_fingerprint: 99,
+        };
+
+        assert!(profile.compatible_with_config(&config, 1, 2, 3));
+        assert!(!profile.compatible_with_config(&config, 2, 2, 3));
+        assert!(!profile.compatible_with_config(&config, 1, 3, 3));
+        assert!(!profile.compatible_with_config(&config, 1, 2, 4));
+        assert!(!profile.compatible_with_config(
+            &ProviderConfig {
+                config_fingerprint: 100,
+                ..config
+            },
+            1,
+            2,
+            3
+        ));
+    }
+
+    #[test]
+    fn search_stats_delta_variants_keep_provider_stats_boundaries() {
+        let fulltext = SearchStatsDelta::FullText(FullTextStatsDelta {
+            stats: Default::default(),
+        });
+        let sparse = SearchStatsDelta::Sparse(SparseStatsDelta {
+            row_count: 10,
+            nnz: 32,
+            posting_fanout: 7,
+            unique_dimensions: 5,
+            l2_norm_sum: 12.5,
+            max_l2_norm: 3.0,
+        });
+        let hnsw = SearchStatsDelta::Hnsw(HnswStatsDelta {
+            vector_count: 4,
+            dimension: 128,
+            max_level: 2,
+            m: 16,
+            ef_construction: 100,
+            graph_memory_bytes: 4096,
+            vector_storage_bytes: 2048,
+            total_graph_links: 96,
+            level0_graph_links: 64,
+            avg_level0_degree: 16.0,
+            max_level0_degree: 32,
+        });
+
+        assert!(fulltext.provider_stats().is_some());
+        assert!(sparse.provider_stats().is_some());
+        assert!(hnsw.provider_stats().is_some());
+
+        let encoded = serde_json::to_value(&sparse).unwrap();
+        let decoded: SearchStatsDelta = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, sparse);
+    }
+
+    struct RecordingAdmission;
+
+    impl SearchAdmission for RecordingAdmission {
+        fn request_inline_batch(
+            &self,
+            reqs: &[InlineAdmissionRequest],
+        ) -> Result<Vec<AdmissionDecision>> {
+            Ok(reqs
+                .iter()
+                .map(|req| match req.flush_mode {
+                    FlushSearchMode::InlineRequired => AdmissionDecision::Proceed(AdmissionGrant {
+                        budget: req.estimated_cost,
+                        valid_until: Instant::now(),
+                        grant_id: req.definition_id,
+                    }),
+                    FlushSearchMode::InlineIfAdmitted => AdmissionDecision::Wait {
+                        deadline: Instant::now(),
+                        reason: AdmissionWaitReason::MemoryBudget,
+                    },
+                    FlushSearchMode::TailOnly => AdmissionDecision::Reject {
+                        reason: AdmissionRejectReason::InvalidRequest,
+                    },
+                })
+                .collect())
+        }
+
+        fn release(&self, _grant_id: u64) {}
+    }
+
+    #[test]
+    fn search_admission_batch_decisions_match_request_order() {
+        let admission = RecordingAdmission;
+        let reqs = vec![
+            InlineAdmissionRequest {
+                table_id: 1,
+                definition_id: 11,
+                provider: SearchIndexKind::FullText,
+                flush_mode: FlushSearchMode::InlineRequired,
+                estimated_cost: MaintenanceCost {
+                    cpu_ns: 100,
+                    ..Default::default()
+                },
+                row_count: 10,
+                hnsw_inline: None,
+            },
+            InlineAdmissionRequest {
+                table_id: 1,
+                definition_id: 12,
+                provider: SearchIndexKind::Sparse,
+                flush_mode: FlushSearchMode::InlineIfAdmitted,
+                estimated_cost: Default::default(),
+                row_count: 10,
+                hnsw_inline: None,
+            },
+            InlineAdmissionRequest {
+                table_id: 1,
+                definition_id: 13,
+                provider: SearchIndexKind::Hnsw,
+                flush_mode: FlushSearchMode::TailOnly,
+                estimated_cost: Default::default(),
+                row_count: 10,
+                hnsw_inline: None,
+            },
+        ];
+
+        let decisions = admission.request_inline_batch(&reqs).unwrap();
+
+        assert_eq!(decisions.len(), reqs.len());
+        assert!(matches!(
+            decisions[0],
+            AdmissionDecision::Proceed(AdmissionGrant { grant_id: 11, .. })
+        ));
+        assert!(matches!(
+            decisions[1],
+            AdmissionDecision::Wait {
+                reason: AdmissionWaitReason::MemoryBudget,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decisions[2],
+            AdmissionDecision::Reject {
+                reason: AdmissionRejectReason::InvalidRequest,
+            }
+        ));
+    }
+}

@@ -182,6 +182,7 @@ pub(crate) fn populate_system_table_function_data(
         "paro_storage_info" => populate_paro_storage_info(global_state, ctx),
         "paro_wal_metrics" => populate_paro_wal_metrics(global_state, ctx),
         "paro_transaction_metrics" => populate_paro_transaction_metrics(global_state, ctx),
+        "paro_search_metrics" => populate_paro_search_metrics(global_state),
         "paro_commit_frontiers" => populate_paro_commit_frontiers(global_state, ctx),
         "paro_commit_poison" => populate_paro_commit_poison(global_state, ctx),
         "paro_property_graphs" => populate_paro_property_graphs(global_state, ctx),
@@ -1216,7 +1217,7 @@ fn populate_paro_transaction_metrics(
                 metrics.read_tracking_safe_snapshot_preferred_count,
             ),
             derived_index_lag_ts: u64_to_i64(metrics.derived_index_lag_ts),
-            derived_delta_merge_cost: u64_to_i64(metrics.derived_delta_merge_cost),
+            tail_exact_merge_cost: u64_to_i64(metrics.tail_exact_merge_cost),
             commit_participant_count: u64_to_i64(metrics.commit_participant_count),
             inflight_batch_conflict_reject_count: u64_to_i64(
                 metrics.inflight_batch_conflict_reject_count,
@@ -1229,6 +1230,749 @@ fn populate_paro_transaction_metrics(
     }
 
     populate_transaction_metric_data(state, entries);
+}
+
+fn populate_paro_search_metrics(global_state: &mut dyn GlobalTableFunctionState) {
+    use paro_function::table::system::paro_search_metrics::{
+        populate_search_metric_data, ParoSearchMetricsGlobalState,
+    };
+    use paro_storage::metrics::storage_metrics;
+    use paro_storage::search::SEARCH_METRIC_DESCRIPTORS;
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoSearchMetricsGlobalState>()
+    else {
+        return;
+    };
+
+    let snapshot = storage_metrics().snapshot();
+    let mut entries = Vec::new();
+    for descriptor in SEARCH_METRIC_DESCRIPTORS {
+        if is_generation_metric(descriptor.name) {
+            if snapshot.search_generation_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_generation_by_key {
+                let labels = SearchMetricLabels {
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    generation_metric_value(descriptor.name, &series.counters),
+                    generation_metric_buckets(descriptor.name, &series.counters),
+                );
+            }
+            continue;
+        }
+
+        if is_artifact_gc_delay_metric(descriptor.name) {
+            if snapshot.search_artifact_gc_delay_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_artifact_gc_delay_by_key {
+                let labels = SearchMetricLabels {
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    reason: series.key.reason.clone(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    0,
+                    Some(&series.counters.delay_us_buckets),
+                );
+            }
+            continue;
+        }
+
+        if is_sidecar_build_metric(descriptor.name) {
+            if snapshot.search_sidecar_build_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_sidecar_build_by_key {
+                let labels = SearchMetricLabels {
+                    definition_id: u64_to_i64(series.key.definition_id),
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    sidecar_build_metric_value(descriptor.name, &series.counters),
+                    sidecar_build_metric_buckets(descriptor.name, &series.counters),
+                );
+            }
+            continue;
+        }
+
+        if is_sidecar_reader_metric(descriptor.name) {
+            if snapshot.search_sidecar_reader_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_sidecar_reader_by_key {
+                let labels = SearchMetricLabels {
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    codec: series.key.codec.clone(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    sidecar_reader_metric_value(descriptor.name, &series.counters),
+                    None,
+                );
+            }
+            continue;
+        }
+
+        if is_tail_metric(descriptor.name) {
+            if snapshot.search_tail_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_tail_by_key {
+                let labels = SearchMetricLabels {
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    tail_metric_value(descriptor.name, &series.counters),
+                    None,
+                );
+            }
+            continue;
+        }
+
+        if is_tail_rejected_metric(descriptor.name) {
+            if snapshot.search_tail_rejected_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_tail_rejected_by_key {
+                let labels = SearchMetricLabels {
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    reason: series.key.reason.clone(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    series.rejected_total,
+                    None,
+                );
+            }
+            continue;
+        }
+
+        if is_fulltext_degraded_score_metric(descriptor.name) {
+            if snapshot.search_fulltext_degraded_score_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_fulltext_degraded_score_by_key {
+                let labels = SearchMetricLabels {
+                    table_id: u64_to_i64(series.key.table_id),
+                    reason: series.key.reason.clone(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    series.degraded_queries,
+                    None,
+                );
+            }
+            continue;
+        }
+
+        if is_manifest_metric(descriptor.name) {
+            if snapshot.search_manifest_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_manifest_by_key {
+                let labels = SearchMetricLabels {
+                    codec: series.key.codec.clone(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    manifest_metric_value(descriptor.name, &series.counters),
+                    manifest_metric_buckets(descriptor.name, &series.counters),
+                );
+            }
+            continue;
+        }
+
+        if is_inline_build_metric(descriptor.name) {
+            if snapshot.search_inline_build_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_inline_build_by_key {
+                let labels = SearchMetricLabels {
+                    definition_id: u64_to_i64(series.key.definition_id),
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    inline_build_metric_value(descriptor.name, &series.counters),
+                    inline_build_metric_buckets(descriptor.name, &series.counters),
+                );
+            }
+            continue;
+        }
+
+        if is_inline_build_failure_metric(descriptor.name) {
+            if snapshot.search_inline_build_failures_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_inline_build_failures_by_key {
+                let labels = SearchMetricLabels {
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    reason: series.key.reason.clone(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    series.failures_total,
+                    None,
+                );
+            }
+            continue;
+        }
+
+        if is_row_fetch_metric(descriptor.name) {
+            if snapshot.search_row_fetch_by_key.is_empty() {
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &SearchMetricLabels::default(),
+                    0,
+                    None,
+                );
+                continue;
+            }
+
+            for series in &snapshot.search_row_fetch_by_key {
+                let labels = SearchMetricLabels {
+                    table_id: u64_to_i64(series.key.table_id),
+                    provider: search_provider_label(series.key.provider).to_string(),
+                    ..Default::default()
+                };
+                push_search_metric_entries(
+                    &mut entries,
+                    descriptor,
+                    &labels,
+                    row_fetch_metric_value(descriptor.name, &series.counters),
+                    row_fetch_metric_buckets(descriptor.name, &series.counters),
+                );
+            }
+            continue;
+        }
+
+        push_search_metric_entries(
+            &mut entries,
+            descriptor,
+            &SearchMetricLabels::default(),
+            search_metric_value(descriptor.name, &snapshot),
+            None,
+        );
+    }
+
+    populate_search_metric_data(state, entries);
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchMetricLabels {
+    table_id: i64,
+    definition_id: i64,
+    provider: String,
+    reason: String,
+    codec: String,
+}
+
+fn push_search_metric_entries(
+    entries: &mut Vec<paro_function::table::system::paro_search_metrics::SearchMetricData>,
+    descriptor: &paro_storage::search::SearchMetricDescriptor,
+    labels: &SearchMetricLabels,
+    scalar_value: u64,
+    bucket_values: Option<&[u64]>,
+) {
+    let dimensions = metric_dimensions_label(descriptor.dimensions);
+    match descriptor.metric_type {
+        paro_storage::search::SearchMetricType::Histogram => {
+            for (bucket_idx, upper_bound) in descriptor.buckets_us.iter().enumerate() {
+                entries.push(search_metric_data(
+                    descriptor,
+                    labels,
+                    &dimensions,
+                    u64_to_i64(*upper_bound),
+                    format!("<={upper_bound}us"),
+                    bucket_values
+                        .and_then(|values| values.get(bucket_idx))
+                        .copied()
+                        .unwrap_or(0),
+                ));
+            }
+            entries.push(search_metric_data(
+                descriptor,
+                labels,
+                &dimensions,
+                i64::MAX,
+                "+Inf".to_string(),
+                bucket_values
+                    .and_then(|values| values.get(descriptor.buckets_us.len()))
+                    .copied()
+                    .unwrap_or(0),
+            ));
+        }
+        paro_storage::search::SearchMetricType::Counter
+        | paro_storage::search::SearchMetricType::Gauge => {
+            entries.push(search_metric_data(
+                descriptor,
+                labels,
+                &dimensions,
+                -1,
+                String::new(),
+                scalar_value,
+            ));
+        }
+    }
+}
+
+fn search_metric_data(
+    descriptor: &paro_storage::search::SearchMetricDescriptor,
+    labels: &SearchMetricLabels,
+    dimensions: &str,
+    bucket_le_us: i64,
+    bucket_label: String,
+    value: u64,
+) -> paro_function::table::system::paro_search_metrics::SearchMetricData {
+    paro_function::table::system::paro_search_metrics::SearchMetricData {
+        metric_name: descriptor.name.to_string(),
+        metric_type: metric_type_label(descriptor.metric_type).to_string(),
+        unit: metric_unit_label(descriptor.unit).to_string(),
+        dimensions: dimensions.to_string(),
+        table_id: labels.table_id,
+        definition_id: labels.definition_id,
+        provider: labels.provider.clone(),
+        reason: labels.reason.clone(),
+        codec: labels.codec.clone(),
+        bucket_le_us,
+        bucket_label,
+        value: u64_to_i64(value),
+    }
+}
+
+fn metric_type_label(metric_type: paro_storage::search::SearchMetricType) -> &'static str {
+    match metric_type {
+        paro_storage::search::SearchMetricType::Counter => "counter",
+        paro_storage::search::SearchMetricType::Gauge => "gauge",
+        paro_storage::search::SearchMetricType::Histogram => "histogram",
+    }
+}
+
+fn metric_unit_label(unit: paro_storage::search::SearchMetricUnit) -> &'static str {
+    match unit {
+        paro_storage::search::SearchMetricUnit::Count => "count",
+        paro_storage::search::SearchMetricUnit::Rows => "rows",
+        paro_storage::search::SearchMetricUnit::Bytes => "bytes",
+        paro_storage::search::SearchMetricUnit::Microseconds => "microseconds",
+        paro_storage::search::SearchMetricUnit::Percent => "percent",
+    }
+}
+
+fn metric_dimension_label(dimension: paro_storage::search::SearchMetricDimension) -> &'static str {
+    match dimension {
+        paro_storage::search::SearchMetricDimension::Global => "global",
+        paro_storage::search::SearchMetricDimension::Table => "table",
+        paro_storage::search::SearchMetricDimension::Definition => "definition",
+        paro_storage::search::SearchMetricDimension::Provider => "provider",
+        paro_storage::search::SearchMetricDimension::Reason => "reason",
+        paro_storage::search::SearchMetricDimension::Codec => "codec",
+    }
+}
+
+fn metric_dimensions_label(dimensions: &[paro_storage::search::SearchMetricDimension]) -> String {
+    dimensions
+        .iter()
+        .map(|dimension| metric_dimension_label(*dimension))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn search_provider_label(kind: SearchIndexKind) -> &'static str {
+    match kind {
+        SearchIndexKind::Hnsw => "hnsw",
+        SearchIndexKind::Sparse => "sparse",
+        SearchIndexKind::FullText => "fulltext",
+    }
+}
+
+fn is_manifest_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_manifest_publish_latency_us"
+            | "search_manifest_publish_cas_retries_total"
+            | "search_manifest_open_latency_us"
+            | "search_manifest_delta_count"
+            | "search_manifest_open_bytes_total"
+    )
+}
+
+fn is_tail_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_tail_rows"
+            | "search_tail_bytes"
+            | "search_tail_backlog_tier"
+            | "search_tail_exact_merge_rows_total"
+    )
+}
+
+fn is_tail_rejected_metric(name: &str) -> bool {
+    matches!(name, "search_tail_exact_merge_rejected_total")
+}
+
+fn is_fulltext_degraded_score_metric(name: &str) -> bool {
+    matches!(name, "search_fulltext_degraded_score_queries")
+}
+
+fn is_generation_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_generation_retired_total"
+            | "search_generation_retired_bytes_total"
+            | "search_generation_lease_hold_time_us"
+    )
+}
+
+fn is_artifact_gc_delay_metric(name: &str) -> bool {
+    matches!(name, "search_artifact_gc_delay_us")
+}
+
+fn is_inline_build_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_inline_build_rows_total"
+            | "search_inline_build_bytes_total"
+            | "search_inline_build_latency_us"
+            | "search_inline_build_cpu_us_total"
+    )
+}
+
+fn is_inline_build_failure_metric(name: &str) -> bool {
+    matches!(name, "search_inline_build_failures_total")
+}
+
+fn is_sidecar_build_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_sidecar_build_rows_total"
+            | "search_sidecar_build_read_bytes_total"
+            | "search_sidecar_build_write_bytes_total"
+            | "search_sidecar_build_artifact_bytes_total"
+            | "search_sidecar_build_latency_us"
+    )
+}
+
+fn is_sidecar_reader_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_sidecar_reader_open_count_total"
+            | "search_sidecar_reader_cache_hits_total"
+            | "search_sidecar_reader_cache_misses_total"
+            | "search_sidecar_reader_mmap_bytes"
+            | "search_sidecar_reader_format_dispatch_total"
+    )
+}
+
+fn is_row_fetch_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "search_row_fetch_batches_total"
+            | "search_row_fetch_rows_total"
+            | "search_row_fetch_projected_columns_total"
+            | "search_row_fetch_segment_groups_total"
+            | "search_row_fetch_column_batches_total"
+            | "search_row_fetch_fixed_width_column_batches_total"
+            | "search_row_fetch_varlen_column_batches_total"
+            | "search_row_fetch_projected_bytes_total"
+            | "search_row_fetch_latency_us"
+            | "search_row_fetch_latency_us_total"
+            | "column_read_by_rowids_page_run_seeks_total"
+    )
+}
+
+fn search_metric_value(
+    name: &str,
+    snapshot: &paro_storage::metrics::StorageMetricsSnapshot,
+) -> u64 {
+    match name {
+        "search_row_fetch_batches_total" => snapshot.search_row_fetch_batches_total,
+        "search_row_fetch_rows_total" => snapshot.search_row_fetch_rows_total,
+        "search_row_fetch_projected_columns_total" => {
+            snapshot.search_row_fetch_projected_columns_total
+        }
+        "search_row_fetch_segment_groups_total" => snapshot.search_row_fetch_segment_groups_total,
+        "search_row_fetch_column_batches_total" => snapshot.search_row_fetch_column_batches_total,
+        "search_row_fetch_fixed_width_column_batches_total" => {
+            snapshot.search_row_fetch_fixed_width_column_batches_total
+        }
+        "search_row_fetch_varlen_column_batches_total" => {
+            snapshot.search_row_fetch_varlen_column_batches_total
+        }
+        "search_row_fetch_projected_bytes_total" => snapshot.search_row_fetch_projected_bytes_total,
+        "search_row_fetch_latency_us_total" => snapshot.search_row_fetch_latency_us_total,
+        "column_read_by_rowids_page_run_seeks_total" => {
+            snapshot.column_read_by_rowids_page_run_seeks_total
+        }
+        _ => 0,
+    }
+}
+
+fn generation_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchGenerationMetricCounters,
+) -> u64 {
+    match name {
+        "search_generation_retired_total" => counters.retired_total,
+        "search_generation_retired_bytes_total" => counters.retired_bytes_total,
+        _ => 0,
+    }
+}
+
+fn generation_metric_buckets<'a>(
+    name: &str,
+    counters: &'a paro_storage::metrics::SearchGenerationMetricCounters,
+) -> Option<&'a [u64]> {
+    match name {
+        "search_generation_lease_hold_time_us" => Some(&counters.lease_hold_time_us_buckets),
+        _ => None,
+    }
+}
+
+fn sidecar_build_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchSidecarBuildMetricCounters,
+) -> u64 {
+    match name {
+        "search_sidecar_build_rows_total" => counters.rows_total,
+        "search_sidecar_build_read_bytes_total" => counters.read_bytes_total,
+        "search_sidecar_build_write_bytes_total" => counters.write_bytes_total,
+        "search_sidecar_build_artifact_bytes_total" => counters.artifact_bytes_total,
+        _ => 0,
+    }
+}
+
+fn sidecar_build_metric_buckets<'a>(
+    name: &str,
+    counters: &'a paro_storage::metrics::SearchSidecarBuildMetricCounters,
+) -> Option<&'a [u64]> {
+    match name {
+        "search_sidecar_build_latency_us" => Some(&counters.latency_us_buckets),
+        _ => None,
+    }
+}
+
+fn tail_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchTailMetricCounters,
+) -> u64 {
+    match name {
+        "search_tail_rows" => counters.tail_rows,
+        "search_tail_bytes" => counters.tail_bytes,
+        "search_tail_backlog_tier" => counters.tail_backlog_tier,
+        "search_tail_exact_merge_rows_total" => counters.exact_merge_rows_total,
+        _ => 0,
+    }
+}
+
+fn sidecar_reader_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchSidecarReaderMetricCounters,
+) -> u64 {
+    match name {
+        "search_sidecar_reader_open_count_total" => counters.open_count_total,
+        "search_sidecar_reader_cache_hits_total" => counters.cache_hits_total,
+        "search_sidecar_reader_cache_misses_total" => counters.cache_misses_total,
+        "search_sidecar_reader_mmap_bytes" => counters.mmap_bytes,
+        "search_sidecar_reader_format_dispatch_total" => counters.format_dispatch_total,
+        _ => 0,
+    }
+}
+
+fn manifest_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchManifestMetricCounters,
+) -> u64 {
+    match name {
+        "search_manifest_publish_cas_retries_total" => counters.publish_cas_retries_total,
+        "search_manifest_delta_count" => counters.delta_count,
+        "search_manifest_open_bytes_total" => counters.open_bytes_total,
+        _ => 0,
+    }
+}
+
+fn manifest_metric_buckets<'a>(
+    name: &str,
+    counters: &'a paro_storage::metrics::SearchManifestMetricCounters,
+) -> Option<&'a [u64]> {
+    match name {
+        "search_manifest_publish_latency_us" => Some(&counters.publish_latency_us_buckets),
+        "search_manifest_open_latency_us" => Some(&counters.open_latency_us_buckets),
+        _ => None,
+    }
+}
+
+fn inline_build_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchInlineBuildMetricCounters,
+) -> u64 {
+    match name {
+        "search_inline_build_rows_total" => counters.rows_total,
+        "search_inline_build_bytes_total" => counters.bytes_total,
+        "search_inline_build_cpu_us_total" => counters.cpu_us_total,
+        _ => 0,
+    }
+}
+
+fn inline_build_metric_buckets<'a>(
+    name: &str,
+    counters: &'a paro_storage::metrics::SearchInlineBuildMetricCounters,
+) -> Option<&'a [u64]> {
+    match name {
+        "search_inline_build_latency_us" => Some(&counters.latency_us_buckets),
+        _ => None,
+    }
+}
+
+fn row_fetch_metric_value(
+    name: &str,
+    counters: &paro_storage::metrics::SearchRowFetchMetricCounters,
+) -> u64 {
+    match name {
+        "search_row_fetch_batches_total" => counters.batches_total,
+        "search_row_fetch_rows_total" => counters.rows_total,
+        "search_row_fetch_projected_columns_total" => counters.projected_columns_total,
+        "search_row_fetch_segment_groups_total" => counters.segment_groups_total,
+        "search_row_fetch_column_batches_total" => counters.column_batches_total,
+        "search_row_fetch_fixed_width_column_batches_total" => {
+            counters.fixed_width_column_batches_total
+        }
+        "search_row_fetch_varlen_column_batches_total" => counters.varlen_column_batches_total,
+        "search_row_fetch_projected_bytes_total" => counters.projected_bytes_total,
+        "search_row_fetch_latency_us_total" => counters.latency_us_total,
+        "column_read_by_rowids_page_run_seeks_total" => {
+            counters.column_read_by_rowids_page_run_seeks_total
+        }
+        _ => 0,
+    }
+}
+
+fn row_fetch_metric_buckets<'a>(
+    name: &str,
+    counters: &'a paro_storage::metrics::SearchRowFetchMetricCounters,
+) -> Option<&'a [u64]> {
+    match name {
+        "search_row_fetch_latency_us" => Some(&counters.latency_us_buckets),
+        _ => None,
+    }
 }
 
 fn populate_paro_commit_frontiers(

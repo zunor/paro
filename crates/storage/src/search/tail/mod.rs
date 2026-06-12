@@ -11,14 +11,27 @@ use crate::tablet::ColumnId;
 use super::capability::SearchIndexKind;
 use super::stats::SegmentId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub mod exact_merge;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TailEntryId(pub u64);
+
+impl TailEntryId {
+    pub const UNASSIGNED: Self = Self(0);
+
+    pub const fn is_assigned(self) -> bool {
+        self.0 != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TailMutationKind {
     Append,
     Replace,
     Delete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TailRowImageRef {
     WholeRowset,
     PartialRowset {
@@ -29,10 +42,12 @@ pub enum TailRowImageRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailPendingEntry {
+    pub entry_id: TailEntryId,
     pub rowset_id: RowsetId,
     pub segment_ids: Vec<SegmentId>,
     pub mutation: TailMutationKind,
     pub row_count: u64,
+    pub byte_count: u64,
     pub row_image_ref: Option<TailRowImageRef>,
 }
 
@@ -78,6 +93,14 @@ impl TailPendingSet {
             .sum()
     }
 
+    pub fn coverage_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.mutation != TailMutationKind::Delete)
+            .map(|entry| entry.byte_count)
+            .sum()
+    }
+
     pub fn delete_rows(&self) -> u64 {
         self.entries
             .iter()
@@ -99,31 +122,31 @@ impl TailPendingSet {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExactTailMergePolicy {
+pub struct TailExactMergePolicy {
     pub supported: bool,
     pub soft_row_limit: u64,
     pub hard_row_limit: u64,
 }
 
-impl ExactTailMergePolicy {
+impl TailExactMergePolicy {
     pub const fn exact_tail_merge_enabled(self, tail_rows: u64) -> bool {
         self.supported && tail_rows <= self.hard_row_limit
     }
 }
 
-pub const fn provider_tail_merge_policy(kind: SearchIndexKind) -> ExactTailMergePolicy {
+pub const fn provider_tail_exact_merge_policy(kind: SearchIndexKind) -> TailExactMergePolicy {
     match kind {
-        SearchIndexKind::Hnsw => ExactTailMergePolicy {
+        SearchIndexKind::Hnsw => TailExactMergePolicy {
             supported: true,
             soft_row_limit: 4_096,
             hard_row_limit: 16_384,
         },
-        SearchIndexKind::Sparse => ExactTailMergePolicy {
+        SearchIndexKind::Sparse => TailExactMergePolicy {
             supported: true,
             soft_row_limit: 32_768,
             hard_row_limit: 131_072,
         },
-        SearchIndexKind::FullText => ExactTailMergePolicy {
+        SearchIndexKind::FullText => TailExactMergePolicy {
             supported: true,
             soft_row_limit: 16_384,
             hard_row_limit: 65_536,
@@ -134,8 +157,8 @@ pub const fn provider_tail_merge_policy(kind: SearchIndexKind) -> ExactTailMerge
 #[cfg(test)]
 mod tests {
     use super::{
-        provider_tail_merge_policy, TailMutationKind, TailPendingEntry, TailPendingSet,
-        TailRowImageRef,
+        provider_tail_exact_merge_policy, TailEntryId, TailMutationKind, TailPendingEntry,
+        TailPendingSet, TailRowImageRef,
     };
     use crate::search::capability::SearchIndexKind;
 
@@ -144,27 +167,33 @@ mod tests {
         let tail = TailPendingSet {
             entries: vec![
                 TailPendingEntry {
+                    entry_id: TailEntryId(1),
                     rowset_id: 1,
                     segment_ids: vec![0, 1],
                     mutation: TailMutationKind::Append,
                     row_count: 10,
+                    byte_count: 1000,
                     row_image_ref: Some(TailRowImageRef::WholeRowset),
                 },
                 TailPendingEntry {
+                    entry_id: TailEntryId(2),
                     rowset_id: 2,
                     segment_ids: vec![0],
                     mutation: TailMutationKind::Replace,
                     row_count: 3,
+                    byte_count: 300,
                     row_image_ref: Some(TailRowImageRef::PartialRowset {
                         touched_columns: vec![1],
                         base_rowids_segments: vec![0],
                     }),
                 },
                 TailPendingEntry {
+                    entry_id: TailEntryId(3),
                     rowset_id: 1,
                     segment_ids: vec![0],
                     mutation: TailMutationKind::Delete,
                     row_count: 4,
+                    byte_count: 400,
                     row_image_ref: None,
                 },
             ],
@@ -173,19 +202,20 @@ mod tests {
         assert_eq!(tail.coverage_rowsets(), 2);
         assert_eq!(tail.coverage_segments(), 3);
         assert_eq!(tail.coverage_rows(), 13);
+        assert_eq!(tail.coverage_bytes(), 1300);
         assert_eq!(tail.delete_rows(), 4);
     }
 
     #[test]
     fn provider_policies_encode_tail_merge_thresholds() {
-        let hnsw = provider_tail_merge_policy(SearchIndexKind::Hnsw);
+        let hnsw = provider_tail_exact_merge_policy(SearchIndexKind::Hnsw);
         assert!(hnsw.exact_tail_merge_enabled(2_048));
         assert!(!hnsw.exact_tail_merge_enabled(32_768));
 
-        let sparse = provider_tail_merge_policy(SearchIndexKind::Sparse);
+        let sparse = provider_tail_exact_merge_policy(SearchIndexKind::Sparse);
         assert!(sparse.exact_tail_merge_enabled(65_536));
 
-        let fulltext = provider_tail_merge_policy(SearchIndexKind::FullText);
+        let fulltext = provider_tail_exact_merge_policy(SearchIndexKind::FullText);
         assert!(fulltext.exact_tail_merge_enabled(8_192));
         assert!(!fulltext.exact_tail_merge_enabled(100_000));
     }

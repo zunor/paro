@@ -1848,6 +1848,7 @@ dependencies = [
  "crc32c",
  "crossbeam",
  "divan",
+ "libc",
  "lz4_flex",
  "memmap2",
  "parking_lot",

@@ -4,42 +4,77 @@
 //! Shared search contracts.
 //!
 //! Phase 0 establishes a single storage-owned contract surface that later
-//! planner/executor/storage refactors can converge on. The provider-specific
-//! batch implementations still live here temporarily as crate-private modules,
-//! but new cross-layer work should build on the typed contracts re-exported
-//! below rather than on the legacy runtime/declared helpers.
+//! planner/executor/storage refactors can converge on. Provider implementations
+//! live under `providers/`; new cross-layer work should build on the typed
+//! contracts re-exported below rather than on legacy runtime/declared helpers.
 
 pub mod artifact;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod budget;
 pub mod capability;
 pub mod cursor;
-pub mod delta_merge;
+pub(crate) mod definition;
+pub(crate) mod generation;
+pub mod inline_sink;
+pub(crate) mod lifecycle;
+pub mod maintenance;
+pub mod posting_stream;
+pub(crate) mod providers;
 pub mod request;
+pub mod sidecar;
+pub(crate) mod sidecar_builder;
 pub mod stats;
 pub mod tail;
 pub mod telemetry;
 
-pub use artifact::{ArtifactGcContext, ArtifactGcPolicy, ArtifactLocation, GcDecision};
+pub use artifact::{
+    ArtifactFileId, ArtifactGcContext, ArtifactGcPolicy, ArtifactLocation, GcDecision,
+    SegmentPagePointer,
+};
 pub use budget::{ResourceBudget, ResourceContext, SearchBatchConfig};
 pub use capability::{
-    ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchCapability, SearchGeneration,
-    SearchIndexDefinition, SearchIndexKind, SearchPlanCandidate, SequentialCapability,
+    ArtifactSegmentRef, CapabilityToken, CoverageState, SearchArtifactRef, SearchCapability,
+    SearchCapabilityState, SearchDefinitionOrigin, SearchFreshnessPolicy, SearchGeneration,
+    SearchIndexDefinition, SearchIndexKind, SearchNotQueryableReason, SearchPlanCandidate,
+    SearchTailSummary, SequentialCapability,
 };
 pub use cursor::{
     CandidateBatch, GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot,
-    OpenedSearchCursor, PhysicalRowRef, SearchBatchState, SearchCursor, SearchProvider,
-    SearchReadSnapshot, SearchRowHandle, TableReadLease, TableReadSnapshot,
+    OpenSearchCursorResult, OpenedSearchCursor, PhysicalRowRef, SearchBatchState, SearchCursor,
+    SearchProvider, SearchReadSnapshot, SearchRowHandle, TableReadLease, TableReadSnapshot,
 };
-pub use delta_merge::{DeltaMergeBudget, DeltaMergeCost, DeltaMergeQueryShape, SearchDeltaWindow};
-pub use registry::{
-    DefinitionMaintenanceReport, SearchBootstrapReport, SearchGenerationCoverage,
-    SearchMaintenanceAction, SearchMaintenanceReport,
+pub use generation::coverage::SearchGenerationCoverage;
+pub use inline_sink::{
+    AdmissionDecision, AdmissionGrant, AdmissionRejectReason, AdmissionWaitReason, BuildBudget,
+    CostEstimate, FlushSearchMode, FullTextStatsDelta, HnswInlineBuildEstimate,
+    HnswInlineThreshold, HnswStatsDelta, InlineAdmissionRequest, InlineArtifactBlob,
+    InlineArtifactBuildResult, InlineArtifactBuilder, MaintenanceBenefit, MaintenanceCost,
+    ProviderConfig, ProviderStatsProfile, SearchAdmission, SearchInlineBuilderEntry,
+    SearchInlineBuilderSet, SearchStatsDelta, SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx,
+    SegmentSinkSavepoint, SidecarArtifactBuildResult, SidecarArtifactBuilder,
+    SidecarArtifactFileId, SidecarArtifactLocation, SidecarBuildInput, SparseStatsDelta,
 };
+pub use lifecycle::bootstrap::SearchBootstrapReport;
+pub use maintenance::{
+    DefinitionMaintenanceReport, HnswMaintenanceRequest, HnswMaintenanceRowsetRef,
+    MaintenanceAdmissionDecision, MaintenanceAdmissionReason, MaintenanceFairnessKey,
+    ProviderMaintenanceRequest, SearchMaintenanceAction, SearchMaintenanceReport,
+};
+pub use posting_stream::{
+    CandidateStreamStep, PostingCandidateStream, PostingPruningHint, SearchScore,
+};
+pub use providers::fulltext::inline::FullTextInlineArtifactBuilder;
+pub use providers::sparse::inline::SparseInlineArtifactBuilder;
 pub use request::{
     analyze_fulltext_query_stats, build_fulltext_query_stats, normalize_fulltext_config,
     FullTextIntent, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode, FusionStrategy,
     HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIntent, SearchRequestMode,
     SparseIntent,
+};
+pub use sidecar::{
+    SidecarArtifactStore, SidecarCachedArtifact, SidecarMappedPackage, SidecarPackageWriter,
+    SidecarReaderCache, SidecarReaderCacheKey, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 pub use stats::{
     BuildEpoch, BuildWatermarks, CatchUpBacklogTier, ConfigFingerprint, ExecutionModes,
@@ -48,18 +83,22 @@ pub use stats::{
     SearchDefinitionId, SearchExecutionMode, SearchGenerationId, SearchProviderStats,
     SearchSourceId, SegmentId, TableId,
 };
+pub use tail::exact_merge::{
+    TailExactMergeBudget, TailExactMergeCost, TailExactMergeQueryShape, TailWindow,
+};
 pub use tail::{
-    provider_tail_merge_policy, ExactTailMergePolicy, TailMutationKind, TailPendingEntry,
-    TailPendingSet, TailRowImageRef,
+    provider_tail_exact_merge_policy, TailEntryId, TailExactMergePolicy, TailMutationKind,
+    TailPendingEntry, TailPendingSet, TailRowImageRef,
+};
+pub use telemetry::{
+    SearchMetricDescriptor, SearchMetricDimension, SearchMetricType, SearchMetricUnit,
+    SEARCH_BUILD_LATENCY_BUCKETS_US, SEARCH_LATENCY_BUCKETS_US, SEARCH_METRIC_DESCRIPTORS,
 };
 
-pub(crate) mod fulltext_search;
 pub(crate) mod manifest;
 pub(crate) mod registry;
 pub(crate) mod row_fetch;
 pub(crate) mod segment_dispatch;
-pub(crate) mod sparse_search;
 pub(crate) mod tail_merge;
 pub(crate) mod topk_merge;
-pub(crate) mod vector_search;
 pub(crate) mod write_path;

@@ -10,9 +10,10 @@ use paro_storage::index::fulltext::query_parser::{
     parse_phraseto_tsquery, parse_plainto_tsquery, parse_query, parse_to_tsquery,
     parse_websearch_to_tsquery, ParsedQuery,
 };
-use paro_storage::index::fulltext::text_index::GlobalFullTextStats;
 use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer};
-use paro_storage::search::{ResourceBudget, SearchBatchConfig, SearchRequestMode};
+use paro_storage::search::{
+    CapabilityToken, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig, SearchRequestMode,
+};
 use paro_storage::table::table_handle::TableHandle;
 use paro_transaction::TableId;
 
@@ -79,13 +80,25 @@ fn create_search_driver(
             SearchSourceSpecRef::Vector(spec) => {
                 let table = search_storage_table(&spec.table, "vector search")?;
                 record_search_table_read(ctx, &table);
-                let opened = table.open_vector_search_cursor_for_view(
-                    spec.column_id,
-                    &spec.query_vector,
-                    spec.k,
-                    spec.params,
-                    spec.predicate.clone(),
-                    &ctx.query.transaction,
+                let opened = open_planned_search_cursor(
+                    &spec.capability_token,
+                    "vector search",
+                    |token| {
+                        table.open_vector_search_cursor_with_token_for_view(
+                            token,
+                            spec.column_id,
+                            &spec.query_vector,
+                            spec.k,
+                            spec.params,
+                            spec.predicate.clone(),
+                            &ctx.query.transaction,
+                        )
+                    },
+                    || {
+                        table
+                            .vector_capability(spec.column_id as u32)
+                            .map(|capability| capability.capability_token())
+                    },
                 )?;
                 (
                     table,
@@ -99,12 +112,24 @@ fn create_search_driver(
             SearchSourceSpecRef::Sparse(spec) => {
                 let table = search_storage_table(&spec.table, "sparse vector search")?;
                 record_search_table_read(ctx, &table);
-                let opened = table.open_sparse_vector_search_cursor_for_view(
-                    spec.column_id,
-                    &spec.query_vector,
-                    spec.k,
-                    spec.predicate.clone(),
-                    &ctx.query.transaction,
+                let opened = open_planned_search_cursor(
+                    &spec.capability_token,
+                    "sparse vector search",
+                    |token| {
+                        table.open_sparse_vector_search_cursor_with_token_for_view(
+                            token,
+                            spec.column_id,
+                            &spec.query_vector,
+                            spec.k,
+                            spec.predicate.clone(),
+                            &ctx.query.transaction,
+                        )
+                    },
+                    || {
+                        table
+                            .sparse_capability(spec.column_id as u32)
+                            .map(|capability| capability.capability_token())
+                    },
                 )?;
                 (
                     table,
@@ -120,24 +145,47 @@ fn create_search_driver(
                 record_search_table_read(ctx, &table);
                 let parsed = parse_fulltext_query(spec)?;
                 let opened = match &spec.mode {
-                    SearchRequestMode::Filter => table.open_fulltext_filter_cursor_for_view(
-                        spec.column_id,
-                        &parsed,
-                        &spec.config,
-                        spec.predicate.clone(),
-                        &ctx.query.transaction,
+                    SearchRequestMode::Filter => open_planned_search_cursor(
+                        &spec.capability_token,
+                        "fulltext filter search",
+                        |token| {
+                            table.open_fulltext_filter_cursor_with_token_for_view(
+                                token,
+                                spec.column_id,
+                                &parsed,
+                                &spec.config,
+                                spec.predicate.clone(),
+                                &ctx.query.transaction,
+                            )
+                        },
+                        || {
+                            table
+                                .fulltext_capability(spec.column_id as u32, &spec.config)
+                                .map(|capability| capability.capability_token())
+                        },
                     )?,
-                    SearchRequestMode::TopK { limit } => table
-                        .open_fulltext_search_cursor_for_view(
-                            spec.column_id,
-                            &parsed,
-                            *limit,
-                            &spec.config,
-                            spec.predicate.clone(),
-                            collect_fulltext_stats(&table, spec),
-                            spec.score_mode,
-                            &ctx.query.transaction,
-                        )?,
+                    SearchRequestMode::TopK { limit } => open_planned_search_cursor(
+                        &spec.capability_token,
+                        "fulltext top-k search",
+                        |token| {
+                            table.open_fulltext_search_cursor_with_token_for_view(
+                                token,
+                                spec.column_id,
+                                &parsed,
+                                *limit,
+                                &spec.config,
+                                spec.predicate.clone(),
+                                None,
+                                spec.score_mode,
+                                &ctx.query.transaction,
+                            )
+                        },
+                        || {
+                            table
+                                .fulltext_capability(spec.column_id as u32, &spec.config)
+                                .map(|capability| capability.capability_token())
+                        },
+                    )?,
                 };
                 let row_limit_hint = match &spec.mode {
                     SearchRequestMode::Filter => 1024,
@@ -240,14 +288,38 @@ fn parse_fulltext_query_with_tokenizer(
     }
 }
 
-fn collect_fulltext_stats(
-    table: &Arc<TableHandle>,
-    spec: &FullTextSearchSpec,
-) -> Option<GlobalFullTextStats> {
-    table
-        .fulltext_capability(spec.column_id as u32, &spec.config)?
-        .generation_stats
-        .fulltext_global_stats()
+fn open_planned_search_cursor<T>(
+    planned_token: &CapabilityToken,
+    context: &str,
+    mut open_with_token: impl FnMut(&CapabilityToken) -> Result<OpenSearchCursorResult<T>>,
+    resolve_current_token: impl FnOnce() -> Option<CapabilityToken>,
+) -> Result<T> {
+    match open_with_token(planned_token)? {
+        OpenSearchCursorResult::Opened(opened) => Ok(opened),
+        OpenSearchCursorResult::NotQueryable => search_not_queryable_error(context),
+        OpenSearchCursorResult::CapabilityTokenStale => {
+            let refreshed = resolve_current_token().ok_or_else(|| {
+                paro_error::object_not_found(
+                    "Search capability",
+                    format!("{context} current capability not found"),
+                )
+            })?;
+            match open_with_token(&refreshed)? {
+                OpenSearchCursorResult::Opened(opened) => Ok(opened),
+                OpenSearchCursorResult::CapabilityTokenStale => Err(paro_error::internal(format!(
+                    "{context} refreshed capability token is stale"
+                ))),
+                OpenSearchCursorResult::NotQueryable => search_not_queryable_error(context),
+            }
+        }
+    }
+}
+
+fn search_not_queryable_error<T>(context: &str) -> Result<T> {
+    Err(paro_error::object_not_found(
+        "Search generation",
+        format!("{context} planned capability is not queryable"),
+    ))
 }
 
 pub(crate) fn poll_search_next(
@@ -288,5 +360,88 @@ fn search_local(local: &mut SourceLocal) -> Result<&mut SearchSourceLocal> {
     match local {
         SourceLocal::Search(state) => Ok(state),
         _ => Err(paro_error::internal("search source local state mismatch")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_storage::search::{SearchCapabilityState, SearchNotQueryableReason};
+
+    fn queryable_token(generation_id: u64) -> CapabilityToken {
+        CapabilityToken {
+            definition_id: 7,
+            generation_id,
+            root_version: generation_id,
+            capability_state: SearchCapabilityState::Queryable,
+        }
+    }
+
+    #[test]
+    fn planned_search_cursor_reresolves_stale_capability_token() {
+        let planned = queryable_token(1);
+        let refreshed = queryable_token(2);
+        let mut opened_generations = Vec::new();
+
+        let opened = open_planned_search_cursor(
+            &planned,
+            "fulltext top-k search",
+            |token| {
+                opened_generations.push(token.generation_id);
+                if token.generation_id == planned.generation_id {
+                    Ok(OpenSearchCursorResult::CapabilityTokenStale)
+                } else {
+                    Ok(OpenSearchCursorResult::Opened(42))
+                }
+            },
+            || Some(refreshed),
+        )
+        .expect("stale token should be re-resolved");
+
+        assert_eq!(opened, 42);
+        assert_eq!(opened_generations, vec![1, 2]);
+    }
+
+    #[test]
+    fn planned_search_cursor_reports_missing_capability_after_stale_token() {
+        let planned = queryable_token(1);
+
+        let err = open_planned_search_cursor::<i32>(
+            &planned,
+            "vector search",
+            |_token| Ok(OpenSearchCursorResult::CapabilityTokenStale),
+            || None,
+        )
+        .expect_err("missing refreshed capability should fail");
+
+        assert!(
+            err.to_string().contains("current capability not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn planned_search_cursor_preserves_not_queryable_after_refresh() {
+        let planned = queryable_token(1);
+        let mut refreshed = queryable_token(2);
+        refreshed.capability_state = SearchCapabilityState::NotQueryable {
+            reason: SearchNotQueryableReason::TailOverBudget,
+        };
+
+        let err = open_planned_search_cursor::<i32>(
+            &planned,
+            "sparse vector search",
+            |token| {
+                if token.generation_id == planned.generation_id {
+                    Ok(OpenSearchCursorResult::CapabilityTokenStale)
+                } else {
+                    Ok(OpenSearchCursorResult::NotQueryable)
+                }
+            },
+            || Some(refreshed),
+        )
+        .expect_err("not queryable refreshed token should fail");
+
+        assert!(err.to_string().contains("not queryable"), "{err}");
     }
 }

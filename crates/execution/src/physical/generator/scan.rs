@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::sync::Arc;
+
+use paro_catalog::entry::TableCatalogEntry;
 use paro_storage::index::{collect_predicate_columns, PredicateTree};
 
 impl PhysicalPlanGenerator {
@@ -235,6 +238,61 @@ impl PhysicalPlanGenerator {
         Ok((PhysicalNodeKind::TopN(spec), vec![child]))
     }
 
+    pub(crate) fn lower_search_scan(
+        &mut self,
+        scan: &LogicalSearchScan,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        let table =
+            scan.get.get_table().cloned().ok_or_else(|| {
+                paro_error::internal("Get missing table reference for search scan")
+            })?;
+        let candidate = selected_search_candidate(&scan.decision)?;
+        let (predicate, residual) = search_scan_predicate(scan)?;
+        if !residual.is_empty() {
+            return Ok((
+                self.unsupported(
+                    "SEARCH_SCAN",
+                    "residual search predicates require a typed filter node above the search source",
+                ),
+                Vec::new(),
+            ));
+        }
+        let (projected_columns, emit_score) = direct_search_projection(scan)?;
+        let output_names = align_output_names(
+            scan.output_names.clone(),
+            scan.get_types().len(),
+            "search scan output",
+        )?
+        .into_boxed_slice();
+        let output_types = scan.get_types().into_boxed_slice();
+        let source = search_source_spec_for_candidate(
+            table.clone(),
+            candidate,
+            scan,
+            predicate,
+            projected_columns,
+            emit_score,
+            output_names.clone(),
+            output_types.clone(),
+        )?;
+
+        if matches!(scan.decision, SearchDecision::Adaptive { .. }) {
+            return Ok((
+                PhysicalNodeKind::AdaptiveSearch(AdaptiveSearchSpec {
+                    table,
+                    request: scan.request.clone(),
+                    decision: scan.decision.clone(),
+                    selected: Box::new(source),
+                    output_names,
+                    output_types,
+                }),
+                Vec::new(),
+            ));
+        }
+
+        Ok((physical_search_source_kind(source), Vec::new()))
+    }
+
     pub(crate) fn lower_order(
         &mut self,
         order: &LogicalOrder,
@@ -255,6 +313,119 @@ impl PhysicalPlanGenerator {
             output_types: output_types.into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Sort(spec), vec![child]))
+    }
+}
+
+fn selected_search_candidate(decision: &SearchDecision) -> Result<&SearchCandidate> {
+    match decision {
+        SearchDecision::IndexScan { candidate, .. } => Ok(candidate),
+        SearchDecision::Adaptive { candidates, .. } => candidates.first().ok_or_else(|| {
+            paro_error::internal("adaptive search decision has no index candidates")
+        }),
+    }
+}
+
+fn search_scan_predicate(
+    scan: &LogicalSearchScan,
+) -> Result<(Option<PredicateTree>, Vec<Expression>)> {
+    let (predicate_tree, mut residual) =
+        predicate_builder::build_predicate_tree(&scan.absorbed_predicates, &scan.get)?;
+    residual.extend(scan.residual_predicates.clone());
+    Ok((predicate_tree, residual))
+}
+
+fn direct_search_projection(scan: &LogicalSearchScan) -> Result<(Box<[usize]>, bool)> {
+    if scan.score_projection_index + 1 != scan.projections.len() {
+        return Err(paro_error::internal(
+            "search source requires the score projection to be the final output column",
+        ));
+    }
+
+    let mut projected_columns = Vec::with_capacity(scan.projections.len().saturating_sub(1));
+    for (idx, expr) in scan.projections.iter().enumerate() {
+        if idx == scan.score_projection_index {
+            continue;
+        }
+        let column_id = direct_projection_column(expr, &scan.get).ok_or_else(|| {
+            paro_error::internal(
+                "search source can only lower direct base-column projections before score",
+            )
+        })?;
+        projected_columns.push(column_id);
+    }
+    Ok((projected_columns.into_boxed_slice(), true))
+}
+
+fn direct_projection_column(expr: &Expression, get: &Get) -> Option<usize> {
+    let source_index = match expr {
+        Expression::Reference(reference) => reference.index,
+        Expression::ColumnRef(column) => column.binding.column_index,
+        _ => return None,
+    };
+    get.column_ids.get(source_index).copied()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_source_spec_for_candidate(
+    table: Arc<TableCatalogEntry>,
+    candidate: &SearchCandidate,
+    scan: &LogicalSearchScan,
+    predicate: Option<PredicateTree>,
+    projected_columns: Box<[usize]>,
+    emit_score: bool,
+    output_names: Box<[String]>,
+    output_types: Box<[LogicalType]>,
+) -> Result<SearchSourceSpec> {
+    match &candidate.intent {
+        SearchIntent::Hnsw(intent) => Ok(SearchSourceSpec::Vector(VectorSearchSpec {
+            table,
+            capability_token: candidate.token.clone(),
+            column_id: intent.column_id as usize,
+            query_vector: intent.query_vector.clone(),
+            k: scan.limit,
+            params: paro_storage::index::hnsw::types::SearchParams::default(),
+            predicate,
+            projected_columns,
+            emit_score,
+            output_names,
+            output_types,
+        })),
+        SearchIntent::Sparse(intent) => Ok(SearchSourceSpec::Sparse(SparseVectorSearchSpec {
+            table,
+            capability_token: candidate.token.clone(),
+            column_id: intent.column_id as usize,
+            query_vector: intent.query_vector.clone(),
+            k: scan.limit,
+            predicate,
+            projected_columns,
+            emit_score,
+            output_names,
+            output_types,
+        })),
+        SearchIntent::FullText(intent) => Ok(SearchSourceSpec::FullText(FullTextSearchSpec {
+            table,
+            capability_token: candidate.token.clone(),
+            column_id: intent.column_id as usize,
+            query: intent.query.clone(),
+            query_kind: intent.query_kind,
+            query_stats: intent.query_stats,
+            config: intent.config.clone(),
+            score_mode: intent.score_mode,
+            mode: SearchRequestMode::TopK { limit: scan.limit },
+            predicate,
+            projected_columns,
+            emit_score,
+            output_names,
+            output_types,
+        })),
+    }
+}
+
+fn physical_search_source_kind(source: SearchSourceSpec) -> PhysicalNodeKind {
+    match source {
+        SearchSourceSpec::Vector(spec) => PhysicalNodeKind::VectorSearch(spec),
+        SearchSourceSpec::Sparse(spec) => PhysicalNodeKind::SparseVectorSearch(spec),
+        SearchSourceSpec::FullText(spec) => PhysicalNodeKind::FullTextSearch(spec),
     }
 }
 

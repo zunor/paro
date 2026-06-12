@@ -8,10 +8,11 @@
 use crate::compaction::compaction_manager::CompactionManager;
 use crate::search::registry::SearchIndexRegistry;
 use crate::table::runtime_indexes::RuntimeIndexes;
-use crate::tablet::{Tablet, TabletRef};
+use crate::tablet::{RowsetPublishObserver, Tablet, TabletRef};
 use paro_common::types::LogicalType;
 use paro_journal::wal::write_ahead_log::WriteAheadLog;
 use paro_journal::{JournalApplyRuntime, JournalCoordinator};
+use paro_scheduler::scheduler::TaskScheduler;
 use std::sync::{Arc, Weak};
 
 #[derive(Debug, Clone)]
@@ -28,7 +29,7 @@ pub struct TableHandle {
     runtime_tablet: TabletRef,
     column_types: Vec<LogicalType>,
     pub(crate) runtime_indexes: RuntimeIndexes,
-    pub(crate) search_registry: SearchIndexRegistry,
+    pub(crate) search_registry: Arc<SearchIndexRegistry>,
     compaction_manager: std::sync::RwLock<Option<Weak<CompactionManager>>>,
 }
 
@@ -44,8 +45,11 @@ pub struct TableColumnSpec {
 impl TableHandle {
     pub(crate) fn from_runtime_tablet(tablet: Tablet, column_types: Vec<LogicalType>) -> Self {
         let runtime_tablet = Arc::new(tablet);
+        let search_registry = Arc::new(SearchIndexRegistry::new(runtime_tablet.clone()));
+        let search_publish_observer: Arc<dyn RowsetPublishObserver> = search_registry.clone();
+        runtime_tablet.bind_rowset_publish_observer(Arc::downgrade(&search_publish_observer));
         Self {
-            search_registry: SearchIndexRegistry::new(runtime_tablet.clone()),
+            search_registry,
             runtime_tablet,
             column_types,
             runtime_indexes: RuntimeIndexes::new(),
@@ -55,6 +59,10 @@ impl TableHandle {
 
     pub fn bind_compaction_manager(&self, manager: &Arc<CompactionManager>) {
         *self.compaction_manager.write().unwrap() = Some(Arc::downgrade(manager));
+    }
+
+    pub fn bind_search_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
+        self.search_registry.bind_task_scheduler(scheduler);
     }
 
     pub fn bound_compaction_manager(&self) -> Option<Arc<CompactionManager>> {

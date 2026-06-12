@@ -15,6 +15,7 @@ INSERT 0 5
 CREATE INDEX idx_ft_exec_mode_split ON ft_exec_mode_split USING GIN (to_tsvector('simple', content));
 CREATE INDEX
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_exec_mode_split
@@ -23,7 +24,14 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=5)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Column: 1
+    Mode: Filter
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_exec_mode_split
@@ -42,6 +50,12 @@ PROJECTION  (rows=1)
     ->  PROJECTION  (rows=1)
       Output: id, __paro_hidden_1
       ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=5)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 1
+        Mode: Filter
 
 SELECT id
 FROM ft_exec_mode_split

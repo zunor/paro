@@ -99,8 +99,6 @@ fn ensure_default_rebuilders_registered() {
         // Best-effort registration; ignore duplicate errors.
         let _ = crate::index::art::compaction::register_art_rebuilder();
         let _ = crate::index::hnsw::compaction::register_hnsw_rebuilder();
-        let _ = crate::index::fulltext::compaction::register_fulltext_rebuilder();
-        let _ = crate::index::sparse::compaction::register_sparse_rebuilder();
     });
 }
 
@@ -171,29 +169,11 @@ pub fn rebuild_compaction_indexes(
 
 fn load_generation_context(tablet: &Tablet) -> Result<CompactionGenerationContext> {
     let manifests = ManifestStore::new(tablet.data_dir().to_path_buf());
-    let definitions_dir = manifests
-        .definition_dir(0)
-        .parent()
-        .map(|path| path.to_path_buf())
-        .ok_or_else(|| paro_error::internal("resolve search definition directory"))?;
-    if !definitions_dir.exists() {
-        return Ok(CompactionGenerationContext::default());
-    }
-
     let mut active_generations = Vec::new();
-    for entry in std::fs::read_dir(&definitions_dir).map_err(|err| {
-        paro_error::io_error(format!("scan {}: {}", definitions_dir.display(), err))
-    })? {
-        let entry = entry.map_err(paro_error::io)?;
-        if !entry.file_type().map_err(paro_error::io)?.is_dir() {
-            continue;
-        }
-        let Ok(definition_id) = entry.file_name().to_string_lossy().parse::<u64>() else {
-            continue;
-        };
-        if let Some(manifest) = manifests.load_manifest(definition_id)? {
+    for head in tablet.search_generation_heads() {
+        if let Some(manifest) = manifests.load_manifest_for_head(&head)? {
             active_generations.push(ActiveSearchGeneration {
-                definition_id,
+                definition_id: head.definition_id,
                 generation_id: manifest.root.generation_id,
             });
         }

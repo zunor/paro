@@ -12,6 +12,7 @@ use super::segment_iterator::SegmentIterator;
 use crate::buffer::{PageCache, Prefetcher};
 use crate::codec::physical_layout::fixed_row_width;
 use crate::index::short_key::ShortKeyIndexDecoder;
+use crate::metrics::storage_metrics;
 use crate::rowset::column::{
     ColumnBatch, ColumnIterator, ColumnReader, ColumnReaderMeta, ColumnReaderOptions,
     SharedColumnReader,
@@ -323,6 +324,7 @@ impl Segment {
                 let file = File::open(&self.file_path).map_err(|e| {
                     paro_error::io_error(format!("Failed to open segment file: {}", e))
                 })?;
+                storage_metrics().record_segment_file_open();
                 return reader.new_iterator(
                     CloneFile(file),
                     prefetcher,
@@ -335,6 +337,7 @@ impl Segment {
         if let Some(reader) = readers.get(&column_id) {
             let file = File::open(&self.file_path)
                 .map_err(|e| paro_error::io_error(format!("Failed to open segment file: {}", e)))?;
+            storage_metrics().record_segment_file_open();
             return reader.new_iterator(CloneFile(file), prefetcher, Some(self.file_path.clone()));
         }
 
@@ -344,6 +347,7 @@ impl Segment {
 
         let file = File::open(&self.file_path)
             .map_err(|e| paro_error::io_error(format!("Failed to open segment file: {}", e)))?;
+        storage_metrics().record_segment_file_open();
 
         let logical_type = self
             .schema
@@ -396,6 +400,7 @@ impl Segment {
             })?;
             let mut file = File::open(&self.file_path)
                 .map_err(|e| paro_error::io_error(format!("Failed to open segment file: {}", e)))?;
+            storage_metrics().record_segment_file_open();
             file.seek(SeekFrom::Start(ptr.offset)).map_err(|e| {
                 paro_error::io_error(format!("Failed to seek to short key index: {}", e))
             })?;

@@ -200,6 +200,21 @@ fn validate_art_index_definition(
     Ok(())
 }
 
+fn validate_sparse_index_definition(column_types: &[LogicalType]) -> Result<()> {
+    if column_types.len() != 1 {
+        return Err(paro_error::invalid_input(
+            "Sparse vector index supports only a single binary sparse row image column",
+        ));
+    }
+    if !matches!(column_types[0], LogicalType::Blob) {
+        return Err(paro_error::not_supported(format!(
+            "Sparse vector index requires Blob binary sparse row image input; use sparse_vector(...) to materialize source text first, got {:?}",
+            column_types[0]
+        )));
+    }
+    Ok(())
+}
+
 /// Bind a CREATE INDEX statement
 pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<BoundStatementKind> {
     // 1. Resolve table name
@@ -310,6 +325,9 @@ pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<B
             &column_ids,
             stmt.is_unique,
         )?;
+    }
+    if index_type == IndexType::Sparse {
+        validate_sparse_index_definition(&column_types)?;
     }
 
     // 9. Determine constraint type
@@ -498,6 +516,45 @@ mod tests {
             err.to_string().contains("idx_orders_customer_existing"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn bind_create_sparse_index_requires_blob_row_image() {
+        let mut binder = test_binder_with_public_table("docs", &[("tokens", LogicalType::Varchar)]);
+
+        let err = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_docs_sparse ON docs (tokens) mode = sparse",
+            ),
+        )
+        .expect_err("Sparse index over Varchar should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Blob binary sparse row image input"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_create_sparse_index_accepts_blob_row_image() {
+        let mut binder = test_binder_with_public_table("docs", &[("tokens", LogicalType::Blob)]);
+
+        let bound = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_docs_sparse ON docs (tokens) mode = sparse",
+            ),
+        )
+        .expect("Sparse index over Blob row image should bind");
+
+        let BoundStatementKind::CreateIndex(bound) = bound else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(bound.info.index_type, IndexType::Sparse);
+        assert_eq!(bound.info.column_ids, vec![LogicalIndex::new(0)]);
+        assert_eq!(bound.info.column_types, vec![LogicalType::Blob]);
     }
 
     #[test]

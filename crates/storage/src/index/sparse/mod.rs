@@ -6,7 +6,6 @@
 //! Building blocks for sparse vector indexing (posting lists, inverted index, etc.).
 
 mod builder;
-pub mod compaction;
 mod inverted_index;
 mod persistence;
 mod posting_list;

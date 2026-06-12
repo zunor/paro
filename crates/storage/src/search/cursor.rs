@@ -11,13 +11,13 @@ use paro_common::error::{self as paro_error, Result};
 use paro_transaction::{DerivedLagLease, RetentionLeaseInfo};
 
 use super::budget::{ResourceBudget, SearchBatchConfig};
-use super::capability::{CoverageState, SearchArtifactRef};
-use super::delta_merge::SearchDeltaWindow;
+use super::capability::{CoverageState, SearchArtifactRef, SearchIndexKind};
 use super::request::NormalizedSearchRequest;
 use super::stats::{
     BuildEpoch, GenerationMaintenanceState, GenerationStats, SearchDefinitionId,
     SearchGenerationId, SearchSourceId, SegmentId, TableId,
 };
+use super::tail::exact_merge::TailWindow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableReadSnapshot {
@@ -256,22 +256,24 @@ pub struct GenerationReadSnapshot {
 #[derive(Debug, Clone)]
 pub struct SearchReadSnapshot {
     pub table: TableReadSnapshot,
+    pub provider_kind: SearchIndexKind,
     pub generation: GenerationReadSnapshot,
     pub table_lease: Arc<TableReadLease>,
     pub generation_lease: Arc<GenerationReadLease>,
     derived_lag_lease: Option<Arc<DerivedLagLease>>,
     overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
-    delta_window: SearchDeltaWindow,
+    tail_window: TailWindow,
 }
 
 impl SearchReadSnapshot {
     pub fn new(
         table: TableReadSnapshot,
+        provider_kind: SearchIndexKind,
         generation: GenerationReadSnapshot,
         table_lease: Arc<TableReadLease>,
         generation_lease: Arc<GenerationReadLease>,
     ) -> Self {
-        let delta_window = SearchDeltaWindow::from_segments(
+        let tail_window = TailWindow::from_segments(
             generation.indexed_through_ts,
             table.visible_version,
             table_lease.visible_segments(),
@@ -279,12 +281,13 @@ impl SearchReadSnapshot {
         );
         Self {
             table,
+            provider_kind,
             generation,
             table_lease,
             generation_lease,
             derived_lag_lease: None,
             overlay_delete_vectors: None,
-            delta_window,
+            tail_window,
         }
     }
 
@@ -314,11 +317,25 @@ impl SearchReadSnapshot {
         self.overlay_delete_vectors.is_some()
     }
 
-    pub fn delta_window(&self) -> SearchDeltaWindow {
-        self.delta_window
+    pub fn tail_window(&self) -> TailWindow {
+        self.tail_window
     }
 
-    pub(crate) fn is_delta_segment(&self, segment: &VisibleSegment) -> bool {
+    pub(crate) fn artifact_for_segment(
+        &self,
+        kind: SearchIndexKind,
+        column_id: u32,
+        segment: &VisibleSegment,
+    ) -> Option<&SearchArtifactRef> {
+        self.generation.artifacts.artifacts.iter().find(|artifact| {
+            artifact.kind == kind
+                && artifact.column_id == column_id
+                && artifact.segment.rowset_id == segment.rowset_id
+                && artifact.segment.segment_id == segment.segment_id
+        })
+    }
+
+    pub(crate) fn is_tail_segment(&self, segment: &VisibleSegment) -> bool {
         if self.table_lease.is_overlay_rowset(segment.rowset_id) {
             return true;
         }
@@ -414,6 +431,13 @@ pub struct OpenedSearchCursor {
     pub cursor: Box<dyn SearchCursor>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpenSearchCursorResult<T> {
+    Opened(T),
+    CapabilityTokenStale,
+    NotQueryable,
+}
+
 impl std::fmt::Debug for OpenedSearchCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenedSearchCursor")
@@ -447,7 +471,7 @@ mod tests {
         CandidateBatch, GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot,
         PhysicalRowRef, SearchReadSnapshot, TableReadLease,
     };
-    use crate::search::capability::CoverageState;
+    use crate::search::capability::{CoverageState, SearchIndexKind};
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats};
     use crate::table::table_factory::TableFactory;
     use paro_common::types::LogicalType;
@@ -505,9 +529,14 @@ mod tests {
                 .lease_derived_lag_range(CommitTs::new(3), CommitTs::new(derived_lag_target))
                 .expect("lease derived lag"),
         );
-        let snapshot =
-            SearchReadSnapshot::new(table_snapshot, generation, table_lease, generation_lease)
-                .with_derived_lag_lease(Some(derived_lag_lease));
+        let snapshot = SearchReadSnapshot::new(
+            table_snapshot,
+            SearchIndexKind::Hnsw,
+            generation,
+            table_lease,
+            generation_lease,
+        )
+        .with_derived_lag_lease(Some(derived_lag_lease));
         assert_eq!(snapshot.table_lease.table_id, table.tablet_id());
         assert_eq!(
             snapshot.table_lease.pinned_visible_version(),

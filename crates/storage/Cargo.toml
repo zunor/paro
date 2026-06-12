@@ -67,6 +67,7 @@ parking_lot = { workspace = true }
 memmap2 = "0.9.9"
 smallvec = "1.13"
 paro-scheduler = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }
@@ -88,6 +89,30 @@ harness = false
 
 [[bench]]
 name = "primary_key_dml"
+harness = false
+
+[[bench]]
+name = "search_manifest_open"
+harness = false
+
+[[bench]]
+name = "search_foreground_io"
+harness = false
+
+[[bench]]
+name = "search_maintenance_scheduler"
+harness = false
+
+[[bench]]
+name = "search_row_fetch"
+harness = false
+
+[[bench]]
+name = "search_sidecar_open"
+harness = false
+
+[[bench]]
+name = "search_write_amplification"
 harness = false
 
 [[bench]]

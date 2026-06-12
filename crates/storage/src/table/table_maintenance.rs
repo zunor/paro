@@ -3,7 +3,7 @@
 
 use super::table_handle::TableHandle;
 use crate::compaction::compaction_manager::allocate_compaction_job_id;
-use crate::compaction::execution::job_orchestrator::run_job;
+use crate::compaction::execution::job_orchestrator::run_job_with_search_inline_builders;
 use crate::compaction::plan::CompactionPlanner;
 use crate::compaction::publish::record::CompactionPublishRecord;
 use crate::table::runtime_indexes::RuntimeIndexes;
@@ -155,12 +155,18 @@ impl TableHandle {
         let Some(plan) = CompactionPlanner::plan(&self.tablet())? else {
             return Ok(false);
         };
-        run_job(
+        let search_inline_builders = self.search_write_context()?.inline_builders;
+        let compacted = run_job_with_search_inline_builders(
             &self.tablet(),
             Arc::new(plan),
             allocate_compaction_job_id(),
             Arc::new(default_allocator()),
-        )
+            search_inline_builders,
+        )?;
+        if compacted {
+            self.search_registry.refresh_after_rowset_replacement()?;
+        }
+        Ok(compacted)
     }
 
     /// Validate that the committed rowset version graph is internally legal.

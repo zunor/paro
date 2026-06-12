@@ -12,6 +12,7 @@ use crate::compaction::publish::record::{
 use crate::primary_key::{DeleteVector, PrimaryKeySerializer};
 use crate::rowid_resolver;
 use crate::rowset::{Rowset, RowsetSharedPtr, RowsetWriterBuilder, SegmentIterator};
+use crate::search::SearchInlineBuilderSet;
 use crate::tablet::{tablet_schema::KeysType, ColumnId, PhysicalRowRef, Tablet};
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
@@ -28,6 +29,22 @@ impl PrimaryKeyMerger {
         plan: Arc<CompactionPlan>,
         workspace: CompactionWorkspace,
         allocator: Arc<dyn Allocator>,
+    ) -> Result<Option<CompactionBuildOutput>> {
+        Self::build_with_search_inline_builders(
+            tablet,
+            plan,
+            workspace,
+            allocator,
+            SearchInlineBuilderSet::default(),
+        )
+    }
+
+    pub fn build_with_search_inline_builders(
+        tablet: &Tablet,
+        plan: Arc<CompactionPlan>,
+        workspace: CompactionWorkspace,
+        allocator: Arc<dyn Allocator>,
+        search_inline_builders: SearchInlineBuilderSet,
     ) -> Result<Option<CompactionBuildOutput>> {
         if plan.input_rowsets.is_empty() {
             return Ok(None);
@@ -50,6 +67,7 @@ impl PrimaryKeyMerger {
         )
         .rowset_id(plan.output_rowset_id)
         .build_hnsw_indexes(false)
+        .search_inline_builders(search_inline_builders)
         .build()?;
 
         let serializer = PrimaryKeySerializer::from_schema_ref(&schema)?;

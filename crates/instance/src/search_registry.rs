@@ -3,7 +3,7 @@
 
 use paro_catalog::entry::{IndexCatalogEntry, IndexType};
 use paro_common::error::{self as paro_error, Result};
-use paro_storage::search::{SearchIndexDefinition, SearchIndexKind};
+use paro_storage::search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
 use paro_storage::table::table_handle::TableHandle;
 use serde_json::{json, Value};
 
@@ -58,6 +58,7 @@ pub(crate) fn search_definition_from_entry(
         kind,
         column_ids: column_ids.clone(),
         expression: expression.clone(),
+        freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
         config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
             kind,
             &column_ids,
@@ -103,7 +104,7 @@ fn search_provider_config(storage: &TableHandle, entry: &IndexCatalogEntry) -> R
                 "distance": column.hnsw_distance,
             }))
         }
-        IndexType::Sparse => Ok(json!({})),
+        IndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
         IndexType::FullText => {
             let config = entry
                 .fulltext_binding()

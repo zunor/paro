@@ -9,6 +9,7 @@ INSERT INTO ft_coverage_guard VALUES
     (2, 'noise');
 INSERT 0 2
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_coverage_guard
@@ -22,7 +23,14 @@ PROJECTION  (rows=0)
     ->  PROJECTION  (rows=0)
       Output: id, __paro_hidden_1
       ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 1
+        Mode: Filter
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_coverage_guard
@@ -41,6 +49,12 @@ PROJECTION  (rows=0)
     ->  PROJECTION  (rows=0)
       Output: id, __paro_hidden_1
       ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 1
+        Mode: Filter
 
 SELECT id
 FROM ft_coverage_guard

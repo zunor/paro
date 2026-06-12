@@ -7,6 +7,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use super::cursor::{CandidateBatch, PhysicalRowRef};
+use super::posting_stream::PostingPruningHint;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RankedRow {
@@ -91,6 +92,19 @@ impl TopKCollector {
         self.heap.len()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn min_competitive_score(&self) -> Option<f32> {
+        if self.limit == 0 || self.heap.len() < self.limit {
+            return None;
+        }
+        self.heap.peek().map(|entry| entry.0.score)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn pruning_hint(&self, remaining_limit: Option<usize>) -> PostingPruningHint {
+        PostingPruningHint::new(self.min_competitive_score(), remaining_limit)
+    }
+
     pub(crate) fn into_sorted_rows(self) -> Vec<RankedRow> {
         self.heap
             .into_sorted_vec()
@@ -110,5 +124,32 @@ pub(crate) fn ranked_rows_to_batch(rows: Vec<RankedRow>) -> CandidateBatch {
     CandidateBatch {
         rows: physical_rows,
         scores,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topk_collector_exposes_min_competitive_score_when_full() {
+        let mut collector = TopKCollector::new(2);
+        assert_eq!(collector.min_competitive_score(), None);
+
+        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 0), 0.2));
+        assert_eq!(collector.min_competitive_score(), None);
+
+        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 1), 0.4));
+        assert_eq!(collector.min_competitive_score(), Some(0.2));
+
+        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 2), 0.1));
+        assert_eq!(collector.min_competitive_score(), Some(0.2));
+
+        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 3), 0.6));
+        assert_eq!(collector.min_competitive_score(), Some(0.4));
+
+        let hint = collector.pruning_hint(Some(16));
+        assert_eq!(hint.min_competitive_score, Some(0.4));
+        assert_eq!(hint.remaining_limit, Some(16));
     }
 }

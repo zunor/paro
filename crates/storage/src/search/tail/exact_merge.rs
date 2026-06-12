@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Query-time delta merge admission for deferred derived search state.
+//! Query-time exact tail merge admission for deferred derived search state.
 
 use crate::search::capability::{CoverageState, SearchIndexKind};
 use crate::search::cursor::{PhysicalRowRef, SearchReadSnapshot, VisibleSegment};
@@ -9,10 +9,10 @@ use paro_common::error::{self as paro_error, Result};
 
 use crate::metrics::storage_metrics;
 
-use super::tail::provider_tail_merge_policy;
+use super::provider_tail_exact_merge_policy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SearchDeltaWindow {
+pub struct TailWindow {
     pub indexed_through_ts: u64,
     pub target_ts: u64,
     pub committed_rows: u64,
@@ -23,7 +23,7 @@ pub struct SearchDeltaWindow {
     pub own_write_bytes: u64,
 }
 
-impl SearchDeltaWindow {
+impl TailWindow {
     pub(crate) fn from_segments(
         indexed_through_ts: u64,
         visible_version: i64,
@@ -101,9 +101,9 @@ fn estimated_rowset_bytes(rowset: &crate::rowset::RowsetSharedPtr) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DeltaMergeCost {
-    pub delta_rows: u64,
-    pub delta_bytes: u64,
+pub struct TailExactMergeCost {
+    pub tail_rows: u64,
+    pub tail_bytes: u64,
     pub cpu_ops: u64,
     pub memory_bytes: u64,
     pub io_bytes: u64,
@@ -111,37 +111,37 @@ pub struct DeltaMergeCost {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeltaMergeBudget {
-    pub max_delta_merge_rows: u64,
-    pub max_delta_merge_bytes: u64,
+pub struct TailExactMergeBudget {
+    pub max_tail_exact_merge_rows: u64,
+    pub max_tail_exact_merge_bytes: u64,
     pub max_cpu_ops: u64,
     pub max_memory_bytes: u64,
     pub max_io_bytes: u64,
     pub max_latency_weight: u64,
 }
 
-impl DeltaMergeBudget {
+impl TailExactMergeBudget {
     pub const fn for_search_kind(kind: SearchIndexKind) -> Self {
         match kind {
             SearchIndexKind::Hnsw => Self {
-                max_delta_merge_rows: 16_384,
-                max_delta_merge_bytes: 32 * 1024 * 1024,
+                max_tail_exact_merge_rows: 16_384,
+                max_tail_exact_merge_bytes: 32 * 1024 * 1024,
                 max_cpu_ops: 256 * 1024 * 1024,
                 max_memory_bytes: 16 * 1024 * 1024,
                 max_io_bytes: 32 * 1024 * 1024,
                 max_latency_weight: 192 * 1024 * 1024,
             },
             SearchIndexKind::Sparse => Self {
-                max_delta_merge_rows: 131_072,
-                max_delta_merge_bytes: 96 * 1024 * 1024,
+                max_tail_exact_merge_rows: 131_072,
+                max_tail_exact_merge_bytes: 96 * 1024 * 1024,
                 max_cpu_ops: 96 * 1024 * 1024,
                 max_memory_bytes: 32 * 1024 * 1024,
                 max_io_bytes: 96 * 1024 * 1024,
                 max_latency_weight: 96 * 1024 * 1024,
             },
             SearchIndexKind::FullText => Self {
-                max_delta_merge_rows: 65_536,
-                max_delta_merge_bytes: 64 * 1024 * 1024,
+                max_tail_exact_merge_rows: 65_536,
+                max_tail_exact_merge_bytes: 64 * 1024 * 1024,
                 max_cpu_ops: 64 * 1024 * 1024,
                 max_memory_bytes: 24 * 1024 * 1024,
                 max_io_bytes: 64 * 1024 * 1024,
@@ -150,10 +150,14 @@ impl DeltaMergeBudget {
         }
     }
 
-    fn first_violation(&self, cost: DeltaMergeCost) -> Option<(&'static str, u64, u64)> {
+    fn first_violation(&self, cost: TailExactMergeCost) -> Option<(&'static str, u64, u64)> {
         [
-            ("delta_rows", cost.delta_rows, self.max_delta_merge_rows),
-            ("delta_bytes", cost.delta_bytes, self.max_delta_merge_bytes),
+            ("tail_rows", cost.tail_rows, self.max_tail_exact_merge_rows),
+            (
+                "tail_bytes",
+                cost.tail_bytes,
+                self.max_tail_exact_merge_bytes,
+            ),
             ("cpu_ops", cost.cpu_ops, self.max_cpu_ops),
             ("memory_bytes", cost.memory_bytes, self.max_memory_bytes),
             ("io_bytes", cost.io_bytes, self.max_io_bytes),
@@ -169,7 +173,7 @@ impl DeltaMergeBudget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeltaMergeQueryShape {
+pub enum TailExactMergeQueryShape {
     FullText {
         query_terms: usize,
         top_k: usize,
@@ -185,41 +189,45 @@ pub enum DeltaMergeQueryShape {
     },
 }
 
-pub(crate) fn ensure_search_delta_merge_budget(
+pub(crate) fn ensure_tail_exact_merge_budget(
     snapshot: &SearchReadSnapshot,
     kind: SearchIndexKind,
     column_id: u32,
-    shape: DeltaMergeQueryShape,
-) -> Result<DeltaMergeCost> {
-    let cost = estimate_search_delta_merge_cost(snapshot, kind, column_id, shape)?;
-    storage_metrics().record_derived_delta_merge_cost(cost.latency_weight);
-    let budget = DeltaMergeBudget::for_search_kind(kind);
+    shape: TailExactMergeQueryShape,
+) -> Result<TailExactMergeCost> {
+    let cost = estimate_tail_exact_merge_cost(snapshot, kind, column_id, shape)?;
+    storage_metrics().record_tail_exact_merge_cost(cost.latency_weight);
+    let budget = TailExactMergeBudget::for_search_kind(kind);
     if let Some((field, actual, limit)) = budget.first_violation(cost) {
+        storage_metrics().record_search_tail_exact_merge_rejected(kind, field);
         return Err(paro_error::not_supported(format!(
-            "{kind:?} deferred delta merge exceeds {field} budget ({actual} > {limit}); keep the derived state required or run catch-up maintenance"
+            "{kind:?} exact tail merge exceeds {field} budget ({actual} > {limit}); keep the derived state required or run catch-up maintenance"
         )));
     }
+    storage_metrics().add_search_tail_exact_merge_rows(kind, cost.tail_rows);
     Ok(cost)
 }
 
-pub(crate) fn estimate_search_delta_merge_cost(
+pub(crate) fn estimate_tail_exact_merge_cost(
     snapshot: &SearchReadSnapshot,
     kind: SearchIndexKind,
     column_id: u32,
-    shape: DeltaMergeQueryShape,
-) -> Result<DeltaMergeCost> {
-    let window = snapshot.delta_window();
+    shape: TailExactMergeQueryShape,
+) -> Result<TailExactMergeCost> {
+    let window = snapshot.tail_window();
     if window.is_empty() {
-        return Ok(DeltaMergeCost::default());
+        return Ok(TailExactMergeCost::default());
     }
-    if !coverage_allows_delta_merge(&snapshot.generation.coverage) {
+    if !coverage_allows_tail_exact_merge(&snapshot.generation.coverage) {
+        storage_metrics().record_search_tail_exact_merge_rejected(kind, "coverage");
         return Err(paro_error::not_supported(format!(
-            "{kind:?} generation coverage does not expose exact delta merge; keep it required"
+            "{kind:?} generation coverage does not expose exact tail merge; keep it required"
         )));
     }
-    if !provider_tail_merge_policy(kind).exact_tail_merge_enabled(window.total_rows()) {
+    if !provider_tail_exact_merge_policy(kind).exact_tail_merge_enabled(window.total_rows()) {
+        storage_metrics().record_search_tail_exact_merge_rejected(kind, "hard_limit");
         return Err(paro_error::not_supported(format!(
-            "{kind:?} deferred delta rows {} exceed exact merge hard limit",
+            "{kind:?} tail rows {} exceed exact merge hard limit",
             window.total_rows()
         )));
     }
@@ -227,7 +235,7 @@ pub(crate) fn estimate_search_delta_merge_cost(
     let mut exact_rows = 0u64;
     let mut indexed_rows = 0u64;
     for segment in snapshot.table_lease.visible_segments() {
-        if !snapshot.is_delta_segment(segment) {
+        if !snapshot.is_tail_segment(segment) {
             continue;
         }
         let rows = segment.segment.num_rows();
@@ -239,7 +247,7 @@ pub(crate) fn estimate_search_delta_merge_cost(
     }
 
     let cpu_ops = match shape {
-        DeltaMergeQueryShape::FullText { query_terms, top_k } => {
+        TailExactMergeQueryShape::FullText { query_terms, top_k } => {
             let terms = query_terms.max(1) as u64;
             let heap = top_k.max(1) as u64;
             exact_rows
@@ -248,7 +256,7 @@ pub(crate) fn estimate_search_delta_merge_cost(
                 .saturating_add(indexed_rows.saturating_mul(terms))
                 .saturating_add(heap.saturating_mul(8))
         }
-        DeltaMergeQueryShape::Sparse { query_terms, top_k } => {
+        TailExactMergeQueryShape::Sparse { query_terms, top_k } => {
             let terms = query_terms.max(1) as u64;
             exact_rows
                 .saturating_mul(terms)
@@ -256,7 +264,7 @@ pub(crate) fn estimate_search_delta_merge_cost(
                 .saturating_add(indexed_rows.saturating_mul(terms))
                 .saturating_add((top_k.max(1) as u64).saturating_mul(4))
         }
-        DeltaMergeQueryShape::Hnsw {
+        TailExactMergeQueryShape::Hnsw {
             dimension,
             ef,
             top_k,
@@ -277,9 +285,9 @@ pub(crate) fn estimate_search_delta_merge_cost(
         .saturating_mul(row_ref_bytes)
         .saturating_add((snapshot.table_lease.visible_segment_count() as u64).saturating_mul(64));
     let io_bytes = window.total_bytes();
-    Ok(DeltaMergeCost {
-        delta_rows: window.total_rows(),
-        delta_bytes: window.total_bytes(),
+    Ok(TailExactMergeCost {
+        tail_rows: window.total_rows(),
+        tail_bytes: window.total_bytes(),
         cpu_ops,
         memory_bytes,
         io_bytes,
@@ -289,7 +297,7 @@ pub(crate) fn estimate_search_delta_merge_cost(
     })
 }
 
-fn coverage_allows_delta_merge(coverage: &CoverageState) -> bool {
+fn coverage_allows_tail_exact_merge(coverage: &CoverageState) -> bool {
     coverage.supports_exact_tail_merge()
 }
 
@@ -311,8 +319,8 @@ mod tests {
     use crate::search::capability::SearchIndexKind;
 
     #[test]
-    fn search_delta_window_splits_committed_and_own_write_rows() {
-        let mut window = SearchDeltaWindow {
+    fn tail_window_splits_committed_and_own_write_rows() {
+        let mut window = TailWindow {
             indexed_through_ts: 10,
             target_ts: 15,
             committed_rows: 7,
@@ -335,20 +343,20 @@ mod tests {
 
     #[test]
     fn hnsw_budget_is_stricter_than_sparse_budget() {
-        let hnsw = DeltaMergeBudget::for_search_kind(SearchIndexKind::Hnsw);
-        let sparse = DeltaMergeBudget::for_search_kind(SearchIndexKind::Sparse);
+        let hnsw = TailExactMergeBudget::for_search_kind(SearchIndexKind::Hnsw);
+        let sparse = TailExactMergeBudget::for_search_kind(SearchIndexKind::Sparse);
 
-        assert!(hnsw.max_delta_merge_rows < sparse.max_delta_merge_rows);
+        assert!(hnsw.max_tail_exact_merge_rows < sparse.max_tail_exact_merge_rows);
         assert!(hnsw
-            .first_violation(DeltaMergeCost {
-                delta_rows: hnsw.max_delta_merge_rows + 1,
-                ..DeltaMergeCost::default()
+            .first_violation(TailExactMergeCost {
+                tail_rows: hnsw.max_tail_exact_merge_rows + 1,
+                ..TailExactMergeCost::default()
             })
             .is_some());
         assert!(sparse
-            .first_violation(DeltaMergeCost {
-                delta_rows: hnsw.max_delta_merge_rows + 1,
-                ..DeltaMergeCost::default()
+            .first_violation(TailExactMergeCost {
+                tail_rows: hnsw.max_tail_exact_merge_rows + 1,
+                ..TailExactMergeCost::default()
             })
             .is_none());
     }

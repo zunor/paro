@@ -19,6 +19,7 @@ CREATE INDEX idx_search_opt_docs_fts
 ON search_opt_docs USING GIN (to_tsvector('simple', content));
 CREATE INDEX
 
+-- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
 SELECT id
 FROM search_opt_docs
@@ -40,6 +41,12 @@ PROJECTION  (rows=0)
       Cardinality: [0, 0, 1]
       Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
       ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: Queryable
+        Column: 2
+        Mode: Filter
         Cardinality: [4, 4, 4]
         Output Schema: id INTEGER, content VARCHAR
 
@@ -52,6 +59,7 @@ id
 1
 2
 
+-- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
 SELECT id
 FROM search_opt_docs
@@ -63,6 +71,12 @@ PROJECTION  (rows=0)
   Cardinality: [0, 0, 1]
   Output Schema: id INTEGER
   ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Column: 2
+    Mode: Filter
     Cardinality: [4, 4, 4]
     Output Schema: id INTEGER, category VARCHAR, content VARCHAR
 

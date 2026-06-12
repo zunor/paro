@@ -487,6 +487,51 @@ pub fn get_vector_norm_functions() -> ScalarFunctionSet {
 // Sparse Vector Distance
 // ============================================================================
 
+fn sparse_vector_from_value(vector: &Vector, row: usize) -> Result<Option<SparseVector>> {
+    if vector.is_null(row) {
+        return Ok(None);
+    }
+    match vector.logical_type() {
+        LogicalType::Blob => {
+            let bytes = vector
+                .get_blob(row)
+                .ok_or_else(|| paro_error::data_corrupted("missing sparse Blob row image"))?;
+            SparseVector::from_row_image_v1(bytes).map(Some)
+        }
+        LogicalType::Varchar | LogicalType::VarcharCollation(_) => {
+            let text = vector
+                .get_string(row)
+                .ok_or_else(|| paro_error::data_corrupted("missing sparse text value"))?;
+            SparseVector::parse(text).map(Some)
+        }
+        other => Err(paro_error::invalid_input(format!(
+            "sparse vector function expects Blob row image or Varchar text, got {:?}",
+            other
+        ))),
+    }
+}
+
+fn sparse_vector_fn(
+    input: &Chunk,
+    _state: &dyn ExpressionState,
+    result: &mut Vector,
+) -> Result<()> {
+    let count = input.size();
+    result.set_count(count);
+    let input_vec = &input.data[0];
+
+    for i in 0..count {
+        let Some(vector) = sparse_vector_from_value(input_vec, i)? else {
+            result.set_null(i, true);
+            continue;
+        };
+        let bytes = vector.to_row_image_v1()?;
+        result.set_blob(i, &bytes);
+    }
+
+    Ok(())
+}
+
 fn sparse_distance_fn(
     input: &Chunk,
     _state: &dyn ExpressionState,
@@ -504,11 +549,14 @@ fn sparse_distance_fn(
             continue;
         }
 
-        let s1 = v1_vec.get_string(i).unwrap();
-        let s2 = v2_vec.get_string(i).unwrap();
-
-        let sv1 = SparseVector::parse(s1)?;
-        let sv2 = SparseVector::parse(s2)?;
+        let Some(sv1) = sparse_vector_from_value(v1_vec, i)? else {
+            result.set_null(i, true);
+            continue;
+        };
+        let Some(sv2) = sparse_vector_from_value(v2_vec, i)? else {
+            result.set_null(i, true);
+            continue;
+        };
 
         let dist = match sv1.dot(&sv2) {
             Some(score) => score,
@@ -520,6 +568,27 @@ fn sparse_distance_fn(
     Ok(())
 }
 
+/// Get the `sparse_vector` function set.
+pub fn get_sparse_vector_functions() -> ScalarFunctionSet {
+    let mut set = ScalarFunctionSet::new("sparse_vector".to_string());
+
+    set.add_function(ScalarFunction::new(
+        "sparse_vector".to_string(),
+        vec![LogicalType::Varchar],
+        LogicalType::Blob,
+        sparse_vector_fn,
+    ));
+
+    set.add_function(ScalarFunction::new(
+        "sparse_vector".to_string(),
+        vec![LogicalType::Blob],
+        LogicalType::Blob,
+        sparse_vector_fn,
+    ));
+
+    set
+}
+
 /// Get the `sparse_distance` function set.
 pub fn get_sparse_distance_functions() -> ScalarFunctionSet {
     let mut set = ScalarFunctionSet::new("sparse_distance".to_string());
@@ -527,6 +596,27 @@ pub fn get_sparse_distance_functions() -> ScalarFunctionSet {
     set.add_function(ScalarFunction::new(
         "sparse_distance".to_string(),
         vec![LogicalType::Varchar, LogicalType::Varchar],
+        LogicalType::Float,
+        sparse_distance_fn,
+    ));
+
+    set.add_function(ScalarFunction::new(
+        "sparse_distance".to_string(),
+        vec![LogicalType::Blob, LogicalType::Blob],
+        LogicalType::Float,
+        sparse_distance_fn,
+    ));
+
+    set.add_function(ScalarFunction::new(
+        "sparse_distance".to_string(),
+        vec![LogicalType::Blob, LogicalType::Varchar],
+        LogicalType::Float,
+        sparse_distance_fn,
+    ));
+
+    set.add_function(ScalarFunction::new(
+        "sparse_distance".to_string(),
+        vec![LogicalType::Varchar, LogicalType::Blob],
         LogicalType::Float,
         sparse_distance_fn,
     ));
@@ -572,6 +662,69 @@ mod tests {
             dims,
             paro_common::test_utils::test_allocator(),
         )
+    }
+
+    fn blob_vector(values: &[Vec<u8>]) -> Vector {
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut vector =
+            Vector::try_new(LogicalType::Blob, values.len(), allocator).expect("blob vector");
+        for (idx, value) in values.iter().enumerate() {
+            vector.set_blob(idx, value);
+        }
+        vector.set_count(values.len());
+        vector
+    }
+
+    #[test]
+    fn test_sparse_vector_returns_binary_row_image() {
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_string_vector(&[
+                "{3:0.5,1:1.0}",
+                "{2:2.0}",
+            ])],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = Vector::try_new(
+            LogicalType::Blob,
+            input.size(),
+            paro_common::test_utils::test_allocator(),
+        )
+        .unwrap();
+
+        sparse_vector_fn(&input, &MockState, &mut result).unwrap();
+
+        let first = SparseVector::from_row_image_v1(result.get_blob(0).unwrap()).unwrap();
+        let second = SparseVector::from_row_image_v1(result.get_blob(1).unwrap()).unwrap();
+        assert_eq!(first.dims, vec![1, 3]);
+        assert_eq!(first.weights, vec![1.0, 0.5]);
+        assert_eq!(second.dims, vec![2]);
+        assert_eq!(second.weights, vec![2.0]);
+    }
+
+    #[test]
+    fn test_sparse_distance_accepts_binary_row_image() {
+        let left = SparseVector::new(vec![1, 3], vec![1.0, 0.5])
+            .unwrap()
+            .to_row_image_v1()
+            .unwrap();
+        let right = SparseVector::new(vec![1, 2], vec![2.0, 1.0])
+            .unwrap()
+            .to_row_image_v1()
+            .unwrap();
+        let input = Chunk::from_vectors(
+            vec![blob_vector(&[left]), blob_vector(&[right])],
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = Vector::try_new(
+            LogicalType::Float,
+            input.size(),
+            paro_common::test_utils::test_allocator(),
+        )
+        .unwrap();
+
+        sparse_distance_fn(&input, &MockState, &mut result).unwrap();
+
+        assert_eq!(result.get_f32(0), Some(2.0));
     }
 
     #[test]

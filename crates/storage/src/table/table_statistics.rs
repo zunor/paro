@@ -102,6 +102,19 @@ impl TableHandle {
                         merged.storage_size_bytes = merged
                             .storage_size_bytes
                             .saturating_add(stats.storage_size_bytes);
+                        merged.total_graph_links = merged
+                            .total_graph_links
+                            .saturating_add(stats.total_graph_links);
+                        merged.level0_graph_links = merged
+                            .level0_graph_links
+                            .saturating_add(stats.level0_graph_links);
+                        merged.max_level0_degree =
+                            merged.max_level0_degree.max(stats.max_level0_degree);
+                        merged.avg_level0_degree = if merged.num_indexed_vectors == 0 {
+                            0.0
+                        } else {
+                            merged.level0_graph_links as f32 / merged.num_indexed_vectors as f32
+                        };
                         merged
                     }
                 });

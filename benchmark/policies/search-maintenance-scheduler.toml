@@ -1,0 +1,67 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "search-maintenance-scheduler"
+version = 1
+enforcement = "shadow"
+
+[[sources]]
+name = "search-maintenance-scheduler"
+type = "divan_bench"
+crate = "paro-storage"
+bench = "search_maintenance_scheduler"
+measurement_class = "rust_micro"
+required = true
+
+[metrics]
+required = [
+  "p50",
+  "p99",
+  "throughput_per_second",
+  "audit_required_dispatch_delay_ms_p99",
+  "audit_opportunistic_tasks_before_required_p99",
+  "audit_queued_task_count_p99",
+  "audit_required_admitted_p99",
+]
+
+[thresholds]
+latency_regression_percent = 10.0
+resource_regression_percent = 20.0
+throughput_min_ratio = 0.90
+
+[noise_floors]
+latency_ms = 0.0
+p99_latency_ms = 0.0
+short_query_latency_ms = 0.0
+short_query_max_p50_ms = 0.0
+tail_sample_min_count = 30
+resource_kb = 0.0
+rss_kb = 0.0
+
+[absolute_max]
+"required_catch_up_preempts_64_opportunistic.audit_required_dispatch_delay_ms_p99" = 100.0
+"required_catch_up_preempts_64_opportunistic.audit_opportunistic_tasks_before_required_p99" = 0.0
+"required_catch_up_preempts_64_opportunistic.audit_queued_task_count_p99" = 65.0
+"required_catch_up_preempts_64_opportunistic.audit_required_admitted_p99" = 1.0
+
+[absolute_min]
+"required_catch_up_preempts_64_opportunistic.audit_required_admitted_p99" = 1.0
+
+[statistics]
+model = "mann_whitney_rolling_p95_holm"
+family_alpha_first_run = 0.05
+family_alpha_confirmed = 0.01
+false_positive_target = 0.02
+true_positive_target = 0.95
+
+[calibration]
+source = "archive"
+min_clean_observations_sql_macro = 30
+min_clean_observations_rust_micro = 30
+rolling_window_sql_macro = 30
+rolling_window_rust_micro = 30
+noise_floor_formula = "directional_rolling_p95_delta"
+
+[coverage]
+new_query_staging_days = 14

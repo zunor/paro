@@ -4,7 +4,7 @@
 use super::segment::Segment;
 use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
-use crate::index::fulltext::text_index::GlobalFullTextStats;
+use crate::index::fulltext::text_index::FullTextScoringStats;
 use crate::index::hnsw::{PreparedQuery, ScoredPoint, SearchParams};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
@@ -175,7 +175,7 @@ impl Segment {
         query: &ParsedQuery,
         top_k: usize,
         predicate_tree: Option<&PredicateTree>,
-        global_stats: Option<&GlobalFullTextStats>,
+        scoring_stats: Option<&FullTextScoringStats>,
         score_mode: FullTextScoreMode,
     ) -> Result<Vec<ScoredPoint>> {
         self.fulltext_search_with_epoch(
@@ -184,7 +184,7 @@ impl Segment {
             top_k,
             self.rowset_gen,
             predicate_tree,
-            global_stats,
+            scoring_stats,
             score_mode,
         )
     }
@@ -197,7 +197,7 @@ impl Segment {
         top_k: usize,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
-        global_stats: Option<&GlobalFullTextStats>,
+        scoring_stats: Option<&FullTextScoringStats>,
         score_mode: FullTextScoreMode,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
@@ -213,7 +213,7 @@ impl Segment {
             query,
             top_k,
             filter_bitmap.as_ref(),
-            global_stats,
+            scoring_stats,
             score_mode,
         ))
     }
@@ -225,7 +225,7 @@ impl Segment {
         query_text: &str,
         top_k: usize,
         predicate_tree: Option<&PredicateTree>,
-        global_stats: Option<&GlobalFullTextStats>,
+        scoring_stats: Option<&FullTextScoringStats>,
     ) -> Result<Vec<ScoredPoint>> {
         self.fulltext_search_text_with_epoch(
             column_id,
@@ -233,7 +233,7 @@ impl Segment {
             top_k,
             self.rowset_gen,
             predicate_tree,
-            global_stats,
+            scoring_stats,
             FullTextScoreMode::Bm25,
         )
     }
@@ -246,7 +246,7 @@ impl Segment {
         top_k: usize,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
-        global_stats: Option<&GlobalFullTextStats>,
+        scoring_stats: Option<&FullTextScoringStats>,
         score_mode: FullTextScoreMode,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
@@ -259,7 +259,7 @@ impl Segment {
             top_k,
             snapshot_epoch,
             predicate_tree,
-            global_stats,
+            scoring_stats,
             score_mode,
         )
     }

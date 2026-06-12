@@ -202,6 +202,19 @@ pub struct TabletMeta {
 
     /// Durable mutation identities already reflected by this tablet snapshot.
     applied_mutations: Vec<AppliedMutationMeta>,
+
+    /// Durable search generation heads whose referenced manifest roots are
+    /// visible for this tablet snapshot.
+    search_generation_heads: Vec<SearchGenerationHeadMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchGenerationHeadMeta {
+    pub definition_id: u64,
+    pub generation_id: u64,
+    pub root_version: u64,
+    pub config_fingerprint: u64,
+    pub root_file_name: String,
 }
 
 impl TabletMeta {
@@ -244,6 +257,7 @@ impl TabletMeta {
             rowset_catalog_slice: None,
             rowset_maintenance_ids: Vec::new(),
             applied_mutations: Vec::new(),
+            search_generation_heads: Vec::new(),
         })
     }
 
@@ -354,6 +368,10 @@ impl TabletMeta {
         &self.applied_mutations
     }
 
+    pub fn search_generation_heads(&self) -> &[SearchGenerationHeadMeta] {
+        &self.search_generation_heads
+    }
+
     // ==================== Setters ====================
 
     /// Set shard ID
@@ -412,6 +430,31 @@ impl TabletMeta {
         });
         mutations.dedup();
         self.applied_mutations = mutations;
+    }
+
+    pub fn set_search_generation_heads(&mut self, mut heads: Vec<SearchGenerationHeadMeta>) {
+        heads.sort_by_key(|head| head.definition_id);
+        heads.dedup_by_key(|head| head.definition_id);
+        self.search_generation_heads = heads;
+    }
+
+    pub fn upsert_search_generation_head(&mut self, head: SearchGenerationHeadMeta) {
+        match self
+            .search_generation_heads
+            .binary_search_by_key(&head.definition_id, |existing| existing.definition_id)
+        {
+            Ok(index) => self.search_generation_heads[index] = head,
+            Err(index) => self.search_generation_heads.insert(index, head),
+        }
+    }
+
+    pub fn remove_search_generation_head(&mut self, definition_id: u64) {
+        if let Ok(index) = self
+            .search_generation_heads
+            .binary_search_by_key(&definition_id, |head| head.definition_id)
+        {
+            self.search_generation_heads.remove(index);
+        }
     }
 
     // ==================== Rowset Management ====================
@@ -546,6 +589,16 @@ impl TabletMeta {
             data.extend_from_slice(&entry.tablet_id.to_le_bytes());
             data.push(entry.mutation_kind as u8);
             data.extend_from_slice(&entry.artifact_id.to_le_bytes());
+        }
+        data.extend_from_slice(&(self.search_generation_heads.len() as u32).to_le_bytes());
+        for head in &self.search_generation_heads {
+            data.extend_from_slice(&head.definition_id.to_le_bytes());
+            data.extend_from_slice(&head.generation_id.to_le_bytes());
+            data.extend_from_slice(&head.root_version.to_le_bytes());
+            data.extend_from_slice(&head.config_fingerprint.to_le_bytes());
+            let name = head.root_file_name.as_bytes();
+            data.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            data.extend_from_slice(name);
         }
 
         Ok(data)
@@ -803,6 +856,38 @@ impl TabletMeta {
             Vec::new()
         };
 
+        let search_generation_heads = if offset < data.len() {
+            let head_count = read_u32(data, &mut offset)? as usize;
+            let mut heads = Vec::with_capacity(head_count);
+            for _ in 0..head_count {
+                let definition_id = read_u64(data, &mut offset)?;
+                let generation_id = read_u64(data, &mut offset)?;
+                let root_version = read_u64(data, &mut offset)?;
+                let config_fingerprint = read_u64(data, &mut offset)?;
+                let name_len = read_u32(data, &mut offset)? as usize;
+                if offset + name_len > data.len() {
+                    return Err(paro_error::internal(
+                        "TabletMeta: truncated search generation head root file name",
+                    ));
+                }
+                let root_file_name =
+                    String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
+                offset += name_len;
+                heads.push(SearchGenerationHeadMeta {
+                    definition_id,
+                    generation_id,
+                    root_version,
+                    config_fingerprint,
+                    root_file_name,
+                });
+            }
+            heads.sort_by_key(|head| head.definition_id);
+            heads.dedup_by_key(|head| head.definition_id);
+            heads
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             tablet_id,
             table_id,
@@ -825,6 +910,7 @@ impl TabletMeta {
             rowset_catalog_slice,
             rowset_maintenance_ids,
             applied_mutations,
+            search_generation_heads,
         })
     }
 
@@ -1039,6 +1125,13 @@ mod tests {
             mutation_kind: AppliedMutationKind::ApplyDeletePatch,
             artifact_id: 99,
         }]);
+        meta.set_search_generation_heads(vec![SearchGenerationHeadMeta {
+            definition_id: 42,
+            generation_id: 1,
+            root_version: 7,
+            config_fingerprint: 99,
+            root_file_name: "manifest_root_g1_v7.json".to_string(),
+        }]);
 
         let bytes = meta.serialize().unwrap();
         let restored = TabletMeta::deserialize(&bytes).unwrap();
@@ -1079,6 +1172,16 @@ mod tests {
                 tablet_id: 1,
                 mutation_kind: AppliedMutationKind::ApplyDeletePatch,
                 artifact_id: 99,
+            }]
+        );
+        assert_eq!(
+            restored.search_generation_heads(),
+            &[SearchGenerationHeadMeta {
+                definition_id: 42,
+                generation_id: 1,
+                root_version: 7,
+                config_fingerprint: 99,
+                root_file_name: "manifest_root_g1_v7.json".to_string(),
             }]
         );
         assert!(restored.schema().is_some());

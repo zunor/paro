@@ -207,22 +207,6 @@ impl PhysicalPlanGenerator {
             scan.get.get_table().cloned().ok_or_else(|| {
                 paro_error::internal("Get missing table reference for fulltext scan")
             })?;
-        let table_data = table
-            .get_storage()
-            .ok_or_else(|| paro_error::internal("Table storage unavailable for fulltext scan"))?;
-        let Some(capability) = table_data.search_capability(&candidate.intent) else {
-            return Err(paro_error::internal(format!(
-                "planned fulltext capability is no longer available: {:?}",
-                candidate.intent
-            )));
-        };
-        if !capability.is_queryable() {
-            return Err(paro_error::internal(format!(
-                "planned fulltext capability is no longer queryable: {:?}",
-                candidate.intent
-            )));
-        }
-
         let (predicate_tree, mut residual) =
             predicate_builder::build_predicate_tree(&scan.other_predicates, &scan.get)?;
         let (runtime_tree, mut runtime_residual) = predicate_builder::build_predicate_tree(
@@ -244,6 +228,7 @@ impl PhysicalPlanGenerator {
 
         let spec = FullTextSearchSpec {
             table,
+            capability_token: candidate.token.clone(),
             column_id: intent.column_id as usize,
             query: intent.query.clone(),
             query_kind: intent.query_kind,

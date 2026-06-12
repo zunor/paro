@@ -36,7 +36,10 @@ use crate::index::hnsw::{DistanceMetric, HnswBuildStopCheck, HnswConfig};
 use crate::index::short_key::{ShortKeyFooter, ShortKeyIndexBuilder};
 use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
 use crate::rowset::encoding::FieldType;
-use crate::rowset::page::{CompressionType, PagePointer};
+use crate::rowset::page::{
+    CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, NoCompressionCodec, PageFooter,
+    PageIO, PagePointer, ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
+};
 use crate::rowset::segment_statistics::{ColumnSegmentStatistics, SegmentStatistics};
 use crate::rowset::RowsetId;
 use crate::tablet::{ColumnId, TabletColumn, TabletSchemaRef};
@@ -194,6 +197,7 @@ impl SegmentWriterOptions {
 }
 
 /// Column data to be written
+#[derive(Clone)]
 pub struct ColumnData {
     /// Raw data bytes
     pub data: Bytes,
@@ -237,6 +241,21 @@ struct ColumnWriterState {
     field_type: FieldType,
     /// Whether nullable
     is_nullable: bool,
+}
+
+/// Segment-local secondary index page produced before the segment footer is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentInlineIndexPage<'a> {
+    pub column_id: ColumnId,
+    pub kind: SegmentInlineIndexKind,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentInlineIndexKind {
+    Hnsw,
+    Sparse,
+    FullText,
 }
 
 /// SegmentWriter writes a complete Segment file
@@ -666,18 +685,32 @@ impl SegmentWriter {
     }
 
     /// Finalize the segment and return the Segment instance (used for horizontal compaction)
-    pub fn finalize(mut self) -> Result<Segment> {
+    pub fn finalize(self) -> Result<Segment> {
+        self.finalize_with_inline_index_pages(&[])
+    }
+
+    pub fn finalize_with_inline_index_pages(
+        mut self,
+        inline_index_pages: &[SegmentInlineIndexPage<'_>],
+    ) -> Result<Segment> {
         if self.finalized {
             return Err(paro_error::internal("SegmentWriter already finalized"));
         }
 
         self.init_column_writers()?;
         self.do_finalize_columns()?;
-        self.finalize_footer()
+        self.finalize_footer_with_inline_index_pages(inline_index_pages)
     }
 
     /// Finalize segment footer and return Segment (used for vertical compaction)
-    pub fn finalize_footer(mut self) -> Result<Segment> {
+    pub fn finalize_footer(self) -> Result<Segment> {
+        self.finalize_footer_with_inline_index_pages(&[])
+    }
+
+    pub fn finalize_footer_with_inline_index_pages(
+        mut self,
+        inline_index_pages: &[SegmentInlineIndexPage<'_>],
+    ) -> Result<Segment> {
         if self.finalized {
             return Err(paro_error::internal("SegmentWriter already finalized"));
         }
@@ -699,8 +732,11 @@ impl SegmentWriter {
                 (None, None)
             };
 
+        let mut column_metas = self.partial_column_metas.clone();
+        self.write_inline_index_pages(&mut column_metas, inline_index_pages)?;
+
         // Create and write footer
-        let mut footer = SegmentFooter::new(self.num_rows, self.partial_column_metas.clone());
+        let mut footer = SegmentFooter::new(self.num_rows, column_metas);
         footer.short_key_index_pointer = short_key_index_pointer;
         footer.short_key_index_footer = short_key_index_footer;
 
@@ -742,6 +778,47 @@ impl SegmentWriter {
         Ok(segment)
     }
 
+    fn write_inline_index_pages(
+        &mut self,
+        column_metas: &mut [ColumnMeta],
+        inline_index_pages: &[SegmentInlineIndexPage<'_>],
+    ) -> Result<()> {
+        if inline_index_pages.is_empty() {
+            return Ok(());
+        }
+        let num_entries = u32::try_from(self.num_rows).map_err(|_| {
+            paro_error::out_of_range("inline index page entry count exceeds u32 range")
+        })?;
+        for page in inline_index_pages {
+            if page.bytes.is_empty() {
+                continue;
+            }
+            let meta = column_metas
+                .iter_mut()
+                .find(|meta| meta.column_id == page.column_id)
+                .ok_or_else(|| {
+                    paro_error::column_not_found(format!(
+                        "column {} missing from segment {} inline index page",
+                        page.column_id, self.segment_id
+                    ))
+                })?;
+            if has_inline_index_pointer(meta, page.kind) {
+                return Err(paro_error::invalid_input(format!(
+                    "duplicate {:?} inline index page for column {} in segment {}",
+                    page.kind, page.column_id, self.segment_id
+                )));
+            }
+            let pointer = write_index_page(
+                &mut self.file_writer,
+                meta.compression,
+                page.bytes,
+                num_entries,
+            )?;
+            set_inline_index_pointer(meta, page.kind, pointer);
+        }
+        Ok(())
+    }
+
     /// Serialize short key index to bytes
     fn serialize_short_key_index(&self) -> (Vec<u8>, ShortKeyFooter) {
         let mut builder = ShortKeyIndexBuilder::new(self.segment_id, 1);
@@ -774,6 +851,62 @@ impl SegmentWriter {
     /// Check if the writer has been finalized
     pub fn is_finalized(&self) -> bool {
         self.finalized
+    }
+}
+
+fn has_inline_index_pointer(meta: &ColumnMeta, kind: SegmentInlineIndexKind) -> bool {
+    match kind {
+        SegmentInlineIndexKind::Hnsw => meta.hnsw_index_pointer.is_some(),
+        SegmentInlineIndexKind::Sparse => meta.sparse_index_pointer.is_some(),
+        SegmentInlineIndexKind::FullText => meta.fulltext_index_pointer.is_some(),
+    }
+}
+
+fn set_inline_index_pointer(
+    meta: &mut ColumnMeta,
+    kind: SegmentInlineIndexKind,
+    pointer: PagePointer,
+) {
+    match kind {
+        SegmentInlineIndexKind::Hnsw => meta.hnsw_index_pointer = Some(pointer),
+        SegmentInlineIndexKind::Sparse => meta.sparse_index_pointer = Some(pointer),
+        SegmentInlineIndexKind::FullText => meta.fulltext_index_pointer = Some(pointer),
+    }
+}
+
+fn write_index_page<W: Write + Seek>(
+    writer: &mut W,
+    compression: CompressionType,
+    body: &[u8],
+    num_entries: u32,
+) -> Result<PagePointer> {
+    let footer = PageFooter::Index(IndexPageFooter {
+        num_entries,
+        page_type: IndexPageType::Leaf,
+    });
+
+    match compression {
+        CompressionType::None => PageIO::compress_and_write_page(
+            Some(&NoCompressionCodec),
+            DEFAULT_MIN_SPACE_SAVING,
+            writer,
+            body,
+            &footer,
+        ),
+        CompressionType::Lz4 => PageIO::compress_and_write_page(
+            Some(&Lz4Codec),
+            DEFAULT_MIN_SPACE_SAVING,
+            writer,
+            body,
+            &footer,
+        ),
+        CompressionType::Zstd => PageIO::compress_and_write_page(
+            Some(&ZstdCodec::default()),
+            DEFAULT_MIN_SPACE_SAVING,
+            writer,
+            body,
+            &footer,
+        ),
     }
 }
 

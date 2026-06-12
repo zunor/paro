@@ -8,11 +8,14 @@ use crate::index::fulltext::text_index::GlobalFullTextStats;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
-use crate::search::cursor::{CandidateBatch, GenerationReadLease, OpenedSearchCursor};
-use crate::search::fulltext_search::{FullTextFilterProvider, FullTextTopKProvider};
+use crate::search::capability::{CapabilityToken, SearchCapability, SearchIndexKind};
+use crate::search::cursor::{
+    CandidateBatch, GenerationReadLease, OpenSearchCursorResult, OpenedSearchCursor,
+};
+use crate::search::providers::fulltext::search::{FullTextFilterProvider, FullTextTopKProvider};
+use crate::search::providers::hnsw::search::VectorSearchProvider;
+use crate::search::providers::sparse::search::SparseSearchProvider;
 use crate::search::row_fetch::materialize_candidate_batch;
-use crate::search::sparse_search::SparseSearchProvider;
-use crate::search::vector_search::VectorSearchProvider;
 use crate::search::{SearchReadSnapshot, TableReadLease};
 use crate::transaction::overlay_reader::TxnOverlayReader;
 use paro_common::chunk::Chunk;
@@ -38,65 +41,99 @@ impl TableHandle {
 
     pub(crate) fn open_search_snapshot(
         &self,
-        definition_id: u64,
-        table_id: u64,
+        capability: &SearchCapability,
         visible_version: i64,
     ) -> Result<SearchReadSnapshot> {
-        let generation = self
-            .open_search_generation_snapshot(definition_id)?
-            .ok_or_else(|| {
-                paro_error::object_not_found(
-                    "Search generation",
-                    format!("definition_id={definition_id}"),
-                )
-            })?;
-        let generation_lease = GenerationReadLease::from_snapshot(&generation);
-        let derived_lag_lease =
-            self.lease_search_derived_lag(generation.indexed_through_ts, visible_version)?;
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&self.tablet(), table_id, visible_version)?;
-        Ok(
-            SearchReadSnapshot::new(table_snapshot, generation, table_lease, generation_lease)
-                .with_derived_lag_lease(derived_lag_lease),
-        )
+        let token = capability.capability_token();
+        match self.open_search_snapshot_with_token_result(
+            capability.kind,
+            &token,
+            visible_version,
+            None,
+        )? {
+            OpenSearchCursorResult::Opened(snapshot) => Ok(snapshot),
+            OpenSearchCursorResult::CapabilityTokenStale => Err(paro_error::internal(format!(
+                "search capability token stale for definition {} generation {}",
+                token.definition_id, token.generation_id
+            ))),
+            OpenSearchCursorResult::NotQueryable => Err(paro_error::object_not_found(
+                "Search generation",
+                format!("definition_id={} not queryable", token.definition_id),
+            )),
+        }
     }
 
     fn open_search_snapshot_with_overlay(
         &self,
-        definition_id: u64,
-        table_id: u64,
+        capability: &SearchCapability,
         visible_version: i64,
         overlay: Option<&TxnOverlayReader>,
     ) -> Result<SearchReadSnapshot> {
         if overlay.is_none() {
-            return self.open_search_snapshot(definition_id, table_id, visible_version);
+            return self.open_search_snapshot(capability, visible_version);
         }
 
-        let generation = self
-            .open_search_generation_snapshot(definition_id)?
-            .ok_or_else(|| {
-                paro_error::object_not_found(
-                    "Search generation",
-                    format!("definition_id={definition_id}"),
-                )
-            })?;
+        let token = capability.capability_token();
+        match self.open_search_snapshot_with_token_result(
+            capability.kind,
+            &token,
+            visible_version,
+            overlay,
+        )? {
+            OpenSearchCursorResult::Opened(snapshot) => Ok(snapshot),
+            OpenSearchCursorResult::CapabilityTokenStale => Err(paro_error::internal(format!(
+                "search capability token stale for definition {} generation {}",
+                token.definition_id, token.generation_id
+            ))),
+            OpenSearchCursorResult::NotQueryable => Err(paro_error::object_not_found(
+                "Search generation",
+                format!("definition_id={} not queryable", token.definition_id),
+            )),
+        }
+    }
+
+    fn open_search_snapshot_with_token_result(
+        &self,
+        kind: SearchIndexKind,
+        token: &CapabilityToken,
+        visible_version: i64,
+        overlay: Option<&TxnOverlayReader>,
+    ) -> Result<OpenSearchCursorResult<SearchReadSnapshot>> {
+        let generation = match self.open_search_generation_snapshot_with_token(token)? {
+            OpenSearchCursorResult::Opened(generation) => generation,
+            OpenSearchCursorResult::CapabilityTokenStale => {
+                return Ok(OpenSearchCursorResult::CapabilityTokenStale);
+            }
+            OpenSearchCursorResult::NotQueryable => {
+                return Ok(OpenSearchCursorResult::NotQueryable);
+            }
+        };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let derived_lag_lease =
             self.lease_search_derived_lag(generation.indexed_through_ts, visible_version)?;
         let overlay_rowsets = overlay
             .map(TxnOverlayReader::all_rowsets)
             .unwrap_or_default();
-        let (table_snapshot, table_lease) = TableReadLease::open_with_overlay_rowsets(
-            &self.tablet(),
-            table_id,
-            visible_version,
-            overlay_rowsets,
-        )?;
-        Ok(
-            SearchReadSnapshot::new(table_snapshot, generation, table_lease, generation_lease)
-                .with_derived_lag_lease(derived_lag_lease)
-                .with_overlay_delete_vectors(overlay.and_then(TxnOverlayReader::delete_vectors)),
+        let (table_snapshot, table_lease) = if overlay_rowsets.is_empty() {
+            TableReadLease::open(&self.tablet(), self.table_id(), visible_version)?
+        } else {
+            TableReadLease::open_with_overlay_rowsets(
+                &self.tablet(),
+                self.table_id(),
+                visible_version,
+                overlay_rowsets,
+            )?
+        };
+        let snapshot = SearchReadSnapshot::new(
+            table_snapshot,
+            kind,
+            generation,
+            table_lease,
+            generation_lease,
         )
+        .with_derived_lag_lease(derived_lag_lease)
+        .with_overlay_delete_vectors(overlay.and_then(TxnOverlayReader::delete_vectors));
+        Ok(OpenSearchCursorResult::Opened(snapshot))
     }
 
     pub fn open_vector_search_cursor(
@@ -111,11 +148,7 @@ impl TableHandle {
         let capability = self
             .vector_capability(column_id as u32)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "vector"))?;
-        let snapshot = self.open_search_snapshot(
-            capability.definition_id,
-            capability.table_id,
-            visible_version,
-        )?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
         VectorSearchProvider::new(
             self.tablet(),
             self.types(),
@@ -142,8 +175,7 @@ impl TableHandle {
             .ok_or_else(|| paro_error::object_not_found("Search capability", "vector"))?;
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = self.open_search_snapshot_with_overlay(
-            capability.definition_id,
-            capability.table_id,
+            &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
         )?;
@@ -159,6 +191,44 @@ impl TableHandle {
         .open(snapshot)
     }
 
+    pub fn open_vector_search_cursor_with_token_for_view(
+        &self,
+        token: &CapabilityToken,
+        column_id: usize,
+        query: &[f32],
+        k: usize,
+        params: SearchParams,
+        predicate: Option<PredicateTree>,
+        view: &TransactionView,
+    ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
+        let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
+        let snapshot = match self.open_search_snapshot_with_token_result(
+            SearchIndexKind::Hnsw,
+            token,
+            view.visible_version_i64(),
+            overlay.as_ref(),
+        )? {
+            OpenSearchCursorResult::Opened(snapshot) => snapshot,
+            OpenSearchCursorResult::CapabilityTokenStale => {
+                return Ok(OpenSearchCursorResult::CapabilityTokenStale);
+            }
+            OpenSearchCursorResult::NotQueryable => {
+                return Ok(OpenSearchCursorResult::NotQueryable);
+            }
+        };
+        VectorSearchProvider::new(
+            self.tablet(),
+            self.types(),
+            column_id,
+            query,
+            k,
+            params,
+            predicate,
+        )
+        .open(snapshot)
+        .map(OpenSearchCursorResult::Opened)
+    }
+
     pub fn open_sparse_vector_search_cursor(
         &self,
         column_id: usize,
@@ -170,12 +240,37 @@ impl TableHandle {
         let capability = self
             .sparse_capability(column_id as u32)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "sparse"))?;
-        let snapshot = self.open_search_snapshot(
-            capability.definition_id,
-            capability.table_id,
-            visible_version,
-        )?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
         SparseSearchProvider::new(self.tablet(), column_id, query, k, predicate).open(snapshot)
+    }
+
+    pub fn open_sparse_vector_search_cursor_with_token_for_view(
+        &self,
+        token: &CapabilityToken,
+        column_id: usize,
+        query: &SparseVector,
+        k: usize,
+        predicate: Option<PredicateTree>,
+        view: &TransactionView,
+    ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
+        let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
+        let snapshot = match self.open_search_snapshot_with_token_result(
+            SearchIndexKind::Sparse,
+            token,
+            view.visible_version_i64(),
+            overlay.as_ref(),
+        )? {
+            OpenSearchCursorResult::Opened(snapshot) => snapshot,
+            OpenSearchCursorResult::CapabilityTokenStale => {
+                return Ok(OpenSearchCursorResult::CapabilityTokenStale);
+            }
+            OpenSearchCursorResult::NotQueryable => {
+                return Ok(OpenSearchCursorResult::NotQueryable);
+            }
+        };
+        SparseSearchProvider::new(self.tablet(), column_id, query, k, predicate)
+            .open(snapshot)
+            .map(OpenSearchCursorResult::Opened)
     }
 
     pub fn open_sparse_vector_search_cursor_for_view(
@@ -191,8 +286,7 @@ impl TableHandle {
             .ok_or_else(|| paro_error::object_not_found("Search capability", "sparse"))?;
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = self.open_search_snapshot_with_overlay(
-            capability.definition_id,
-            capability.table_id,
+            &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
         )?;
@@ -210,13 +304,38 @@ impl TableHandle {
         let capability = self
             .fulltext_capability(column_id as u32, config)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
-        let snapshot = self.open_search_snapshot(
-            capability.definition_id,
-            capability.table_id,
-            visible_version,
-        )?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
         FullTextFilterProvider::new(self.tablet(), column_id, query, config, predicate)
             .open(snapshot)
+    }
+
+    pub fn open_fulltext_filter_cursor_with_token_for_view(
+        &self,
+        token: &CapabilityToken,
+        column_id: usize,
+        query: &ParsedQuery,
+        config: &str,
+        predicate: Option<PredicateTree>,
+        view: &TransactionView,
+    ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
+        let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
+        let snapshot = match self.open_search_snapshot_with_token_result(
+            SearchIndexKind::FullText,
+            token,
+            view.visible_version_i64(),
+            overlay.as_ref(),
+        )? {
+            OpenSearchCursorResult::Opened(snapshot) => snapshot,
+            OpenSearchCursorResult::CapabilityTokenStale => {
+                return Ok(OpenSearchCursorResult::CapabilityTokenStale);
+            }
+            OpenSearchCursorResult::NotQueryable => {
+                return Ok(OpenSearchCursorResult::NotQueryable);
+            }
+        };
+        FullTextFilterProvider::new(self.tablet(), column_id, query, config, predicate)
+            .open(snapshot)
+            .map(OpenSearchCursorResult::Opened)
     }
 
     pub fn open_fulltext_filter_cursor_for_view(
@@ -232,8 +351,7 @@ impl TableHandle {
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = self.open_search_snapshot_with_overlay(
-            capability.definition_id,
-            capability.table_id,
+            &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
         )?;
@@ -257,11 +375,7 @@ impl TableHandle {
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
         let global_stats =
             global_stats.or_else(|| capability.generation_stats.fulltext_global_stats());
-        let snapshot = self.open_search_snapshot(
-            capability.definition_id,
-            capability.table_id,
-            visible_version,
-        )?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
         FullTextTopKProvider::new(
             self.tablet(),
             column_id,
@@ -273,6 +387,49 @@ impl TableHandle {
             score_mode,
         )
         .open(snapshot)
+    }
+
+    pub fn open_fulltext_search_cursor_with_token_for_view(
+        &self,
+        token: &CapabilityToken,
+        column_id: usize,
+        query: &ParsedQuery,
+        k: usize,
+        config: &str,
+        predicate: Option<PredicateTree>,
+        global_stats: Option<GlobalFullTextStats>,
+        score_mode: FullTextScoreMode,
+        view: &TransactionView,
+    ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
+        let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
+        let snapshot = match self.open_search_snapshot_with_token_result(
+            SearchIndexKind::FullText,
+            token,
+            view.visible_version_i64(),
+            overlay.as_ref(),
+        )? {
+            OpenSearchCursorResult::Opened(snapshot) => snapshot,
+            OpenSearchCursorResult::CapabilityTokenStale => {
+                return Ok(OpenSearchCursorResult::CapabilityTokenStale);
+            }
+            OpenSearchCursorResult::NotQueryable => {
+                return Ok(OpenSearchCursorResult::NotQueryable);
+            }
+        };
+        let global_stats =
+            global_stats.or_else(|| snapshot.generation.generation_stats.fulltext_global_stats());
+        FullTextTopKProvider::new(
+            self.tablet(),
+            column_id,
+            query,
+            k,
+            config,
+            predicate,
+            global_stats,
+            score_mode,
+        )
+        .open(snapshot)
+        .map(OpenSearchCursorResult::Opened)
     }
 
     pub fn open_fulltext_search_cursor_for_view(
@@ -293,8 +450,7 @@ impl TableHandle {
             global_stats.or_else(|| capability.generation_stats.fulltext_global_stats());
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = self.open_search_snapshot_with_overlay(
-            capability.definition_id,
-            capability.table_id,
+            &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
         )?;

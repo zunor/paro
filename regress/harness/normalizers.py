@@ -15,6 +15,9 @@ _BYTES_FIELD_RE = re.compile(
     r"\b(Memory|Disk|Peak Memory|Temp Storage|Total Temp Storage):\s*[\d.]+\s*(?:B|kB|MB|GB|TB)\b"
 )
 _ROUTINE_ID_RE = re.compile(r"(\bRoutine(?:s)?:\s+[^\[]+)\[(\d+)@(\d+)\]")
+_SEARCH_EXPLAIN_ID_RE = re.compile(
+    r"(\bSearch (Definition|Generation|Root):\s*)\d+\b"
+)
 _EXTERNAL_LATENCY_RE = re.compile(
     r"Latency\(us\):\s*acquire=\d+\s+queue=\d+\s+kernel=\d+\s+encode_decode=\d+"
 )
@@ -124,6 +127,16 @@ def normalize_explain_routine_ids(lines: list[str]) -> list[str]:
     return result
 
 
+def normalize_explain_search_ids(lines: list[str]) -> list[str]:
+    """Normalize volatile search catalog/generation ids in EXPLAIN output."""
+
+    def _replace(match: re.Match[str]) -> str:
+        label = match.group(2).lower()
+        return f"{match.group(1)}<search-{label}-id>"
+
+    return [_SEARCH_EXPLAIN_ID_RE.sub(_replace, line) for line in lines]
+
+
 def normalize_explain_external_runtime(lines: list[str]) -> list[str]:
     """Normalize volatile external runtime latency fields in EXPLAIN output."""
     result: list[str] = []
@@ -206,6 +219,7 @@ def normalize_python_runtime_retry_hint(lines: list[str]) -> list[str]:
 # stable: normalize runtime byte volatility for spill/memory observability.
 # stable: normalize repo-local regress fixture/report absolute paths.
 # stable: normalize volatile transaction/catalog ids in concurrency errors.
+# stable: normalize volatile search definition/generation/root ids in EXPLAIN output.
 # transitional: legacy alias kept for gradual migration from explain_runtime.
 NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_operator_timing": normalize_explain_operator_timing,
@@ -213,6 +227,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_summary_timing": normalize_explain_summary_timing,
     "explain_runtime_bytes": normalize_explain_runtime_bytes,
     "explain_routine_ids": normalize_explain_routine_ids,
+    "explain_search_ids": normalize_explain_search_ids,
     "explain_external_runtime": normalize_explain_external_runtime,
     "explain_runtime": normalize_explain_runtime,
     "copy_rowcount": normalize_copy_rowcount,
@@ -254,6 +269,7 @@ __all__ = [
     "normalize_explain_routine_ids",
     "normalize_explain_runtime",
     "normalize_explain_runtime_bytes",
+    "normalize_explain_search_ids",
     "normalize_explain_summary_timing",
     "normalize_python_runtime_retry_hint",
     "normalize_regress_paths",

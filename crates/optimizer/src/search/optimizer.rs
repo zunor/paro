@@ -315,10 +315,13 @@ fn build_search_candidate(
     estimated_cost: f64,
     estimated_rows: u64,
 ) -> SearchCandidate {
-    let capability = capability.with_estimated_cost(
-        PlannedSearchCostEstimate::new(estimated_cost).with_rows(estimated_rows),
-    );
-    SearchCandidate { intent, capability }
+    let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost).with_rows(estimated_rows);
+    SearchCandidate {
+        intent,
+        token: capability.capability_token(),
+        kind: capability.kind,
+        estimated_cost: Some(estimated_cost),
+    }
 }
 
 fn build_sequential_capability(table_id: u64, estimated_rows: u64) -> SequentialCapability {
@@ -1003,19 +1006,14 @@ mod tests {
                     column_id: 1,
                     query_vector: vec![1.0, 2.0],
                 }),
-                capability: paro_storage::search::SearchCapability {
+                token: paro_storage::search::CapabilityToken {
                     definition_id: 1,
-                    table_id: 7,
-                    kind: paro_storage::search::SearchIndexKind::Hnsw,
                     generation_id: 2,
-                    coverage: paro_storage::search::CoverageState::Complete,
-                    config_fingerprint: 0,
-                    generation_stats: Default::default(),
-                    execution_modes: Default::default(),
-                    estimated_cost: Some(PlannedSearchCostEstimate::new(95.0)),
-                    prefer_hint: None,
-                    indexed_through_ts: 0,
+                    root_version: 1,
+                    capability_state: paro_storage::search::SearchCapabilityState::Queryable,
                 },
+                kind: paro_storage::search::SearchIndexKind::Hnsw,
+                estimated_cost: Some(PlannedSearchCostEstimate::new(95.0)),
             },
             build_sequential_capability(7, 100),
         );
@@ -1084,19 +1082,14 @@ mod tests {
                         config: "simple".to_string(),
                         score_mode: FullTextScoreMode::Bm25,
                     }),
-                    capability: paro_storage::search::SearchCapability {
+                    token: paro_storage::search::CapabilityToken {
                         definition_id: 1,
-                        table_id: 1,
-                        kind: paro_storage::search::SearchIndexKind::FullText,
                         generation_id: 1,
-                        coverage: paro_storage::search::CoverageState::Complete,
-                        config_fingerprint: 0,
-                        generation_stats: Default::default(),
-                        execution_modes: Default::default(),
-                        estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
-                        prefer_hint: None,
-                        indexed_through_ts: 0,
+                        root_version: 1,
+                        capability_state: paro_storage::search::SearchCapabilityState::Queryable,
                     },
+                    kind: paro_storage::search::SearchIndexKind::FullText,
+                    estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
                 },
                 confidence: Confidence::High,
             },

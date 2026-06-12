@@ -8,6 +8,7 @@ use crate::compaction::execution::workspace::{
 };
 use crate::compaction::plan::types::{CompactionPlan, MergeSemantics};
 use crate::rowset::RowsetWriterBuilder;
+use crate::search::SearchInlineBuilderSet;
 use crate::tablet::Tablet;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
@@ -24,6 +25,22 @@ impl RowsetMerger {
         workspace: CompactionWorkspace,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Option<CompactionBuildOutput>> {
+        Self::build_with_search_inline_builders(
+            tablet,
+            plan,
+            workspace,
+            allocator,
+            SearchInlineBuilderSet::default(),
+        )
+    }
+
+    pub fn build_with_search_inline_builders(
+        tablet: &Tablet,
+        plan: Arc<CompactionPlan>,
+        workspace: CompactionWorkspace,
+        allocator: Arc<dyn Allocator>,
+        search_inline_builders: SearchInlineBuilderSet,
+    ) -> Result<Option<CompactionBuildOutput>> {
         let schema = tablet
             .schema()
             .ok_or_else(|| paro_error::internal("No schema"))?;
@@ -33,9 +50,13 @@ impl RowsetMerger {
         }
 
         match plan.merge_semantics {
-            MergeSemantics::Deduplicate => {
-                PrimaryKeyMerger::build(tablet, plan, workspace, allocator)
-            }
+            MergeSemantics::Deduplicate => PrimaryKeyMerger::build_with_search_inline_builders(
+                tablet,
+                plan,
+                workspace,
+                allocator,
+                search_inline_builders,
+            ),
             MergeSemantics::Append | MergeSemantics::Aggregate => {
                 let mut writer = RowsetWriterBuilder::new(
                     schema.clone(),
@@ -45,6 +66,7 @@ impl RowsetMerger {
                 )
                 .rowset_id(plan.output_rowset_id)
                 .build_hnsw_indexes(false)
+                .search_inline_builders(search_inline_builders)
                 .build()?;
 
                 for input in &plan.input_rowsets {

@@ -5,7 +5,7 @@ mod location;
 
 use serde::{Deserialize, Serialize};
 
-pub use location::ArtifactLocation;
+pub use location::{ArtifactFileId, ArtifactLocation, SegmentPagePointer};
 
 use super::stats::SearchProviderStats;
 
@@ -37,7 +37,10 @@ pub trait ArtifactGcPolicy: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactGcContext, ArtifactGcPolicy, GcDecision};
+    use super::{
+        ArtifactFileId, ArtifactGcContext, ArtifactGcPolicy, ArtifactLocation, GcDecision,
+        SegmentPagePointer,
+    };
 
     struct RebuildWhenDeleteHeavy;
 
@@ -68,5 +71,45 @@ mod tests {
             }),
             GcDecision::Skip
         );
+    }
+
+    #[test]
+    fn artifact_location_uses_typed_inline_page_and_sidecar_file_id() {
+        let inline = ArtifactLocation::Inline {
+            page: SegmentPagePointer {
+                rowset_id: 10,
+                segment_id: 2,
+                column_id: 3,
+                page_offset: 128,
+                page_len: 4096,
+                checksum: 42,
+            },
+        };
+        let sidecar = ArtifactLocation::SidecarArtifactFile {
+            file_id: ArtifactFileId {
+                definition_id: 7,
+                generation_id: 9,
+                package_index: 1,
+            },
+            offset: 128,
+            len: 4096,
+            checksum: 42,
+        };
+
+        assert!(matches!(inline, ArtifactLocation::Inline { .. }));
+        assert!(matches!(
+            sidecar,
+            ArtifactLocation::SidecarArtifactFile {
+                file_id: ArtifactFileId {
+                    definition_id: 7,
+                    generation_id: 9,
+                    package_index: 1
+                },
+                offset: 128,
+                len: 4096,
+                checksum: 42,
+                ..
+            }
+        ));
     }
 }

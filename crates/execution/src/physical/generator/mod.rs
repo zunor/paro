@@ -24,8 +24,9 @@ use paro_planner::operator::{
     GraphScan as LogicalGraphScan, Insert as LogicalInsert, Limit as LogicalLimit,
     LogicalExternalProject, LogicalExternalTable, LogicalOperator,
     MaterializedCTE as LogicalMaterializedCte, Order as LogicalOrder,
-    Projection as LogicalProjection, RecursiveCTE as LogicalRecursiveCte, SearchDecision,
-    SetOpType, SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
+    Projection as LogicalProjection, RecursiveCTE as LogicalRecursiveCte, SearchCandidate,
+    SearchDecision, SearchScan as LogicalSearchScan, SetOpType,
+    SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
     TopN as LogicalTopN, Update as LogicalUpdate, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
@@ -38,14 +39,15 @@ use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
 use super::row_type::RowType;
 use super::specs::{
-    AggregateSpec, ClassicIeJoinSpec, CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec,
-    CteScanSpec, DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget,
-    DummyScanSpec, EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec,
-    FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping, GraphScanSpec,
-    GraphShortestPathSpec, HashJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec,
+    AdaptiveSearchSpec, AggregateSpec, ClassicIeJoinSpec, CopyToFileSpec, CreateIndexUtilitySpec,
+    CrossProductSpec, CteScanSpec, DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec,
+    DelimScanTarget, DummyScanSpec, EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec,
+    FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping,
+    GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec,
     NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind, ProjectSpec, RecursiveCteSpec,
-    RowsetScanSpec, SortRangeJoinSpec, SortSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec,
-    UpdateSpec, UtilitySpec, ValuesSpec, WindowSpec,
+    RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec,
+    TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec,
+    VectorSearchSpec, WindowSpec,
 };
 
 mod predicate_builder;
@@ -121,6 +123,7 @@ impl PhysicalPlanGenerator {
             LogicalOperator::Limit(limit) => self.lower_limit(limit)?,
             LogicalOperator::Order(order) => self.lower_order(order)?,
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,
+            LogicalOperator::SearchScan(scan) => self.lower_search_scan(scan)?,
             LogicalOperator::Aggregate(aggregate) => self.lower_aggregate(aggregate)?,
             LogicalOperator::Distinct(distinct) => self.lower_distinct(distinct)?,
             LogicalOperator::Join(join) => {
