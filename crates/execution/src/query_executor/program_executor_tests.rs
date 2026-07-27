@@ -320,7 +320,7 @@ fn fetch_driven_aggregate_dag_keeps_root_output_bounded() {
 #[test]
 fn completed_output_parallel_scheduler_consumes_chunk_morsels() {
     let allocator = paro_common::test_utils::test_allocator();
-    let chunks = (0..8).map(|value| i32_chunk(&[value])).collect::<Vec<_>>();
+    let chunks = (0..64).map(|value| i32_chunk(&[value])).collect::<Vec<_>>();
     let output_type = LogicalType::Integer;
     let row_type = RowType::new(vec!["v".to_string()], vec![output_type.clone()]);
     let chunk_spec = ChunkScanSpec {
@@ -384,7 +384,7 @@ fn completed_output_parallel_scheduler_consumes_chunk_morsels() {
         values.push(chunk.column(0).unwrap().get_i32(0).unwrap());
     }
     values.sort_unstable();
-    assert_eq!(values, (0..8).collect::<Vec<_>>());
+    assert_eq!(values, (0..64).collect::<Vec<_>>());
 }
 
 #[test]

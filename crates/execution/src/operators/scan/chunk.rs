@@ -1,7 +1,6 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
@@ -21,7 +20,6 @@ impl ChunkSourceExec {
     pub(crate) fn create_global(&self, _ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
         Ok(SourceGlobal::Chunk(Arc::new(ChunkSourceGlobal {
             chunks: Arc::clone(&self.spec.chunks),
-            next_chunk: Default::default(),
         })))
     }
 
@@ -43,15 +41,14 @@ impl ChunkSourceExec {
     ) -> Result<SourcePoll> {
         let global = global.chunk()?;
         let local = local.chunk_mut()?;
-        if local.assigned_chunk_consumed {
+        if local
+            .assigned_chunk_end
+            .is_some_and(|end| local.next_chunk >= end)
+        {
             return Ok(SourcePoll::Finished);
         }
-        let idx = if let Some(idx) = local.assigned_chunk {
-            local.assigned_chunk_consumed = true;
-            idx
-        } else {
-            global.next_chunk.fetch_add(1, Ordering::AcqRel)
-        };
+        let idx = local.next_chunk;
+        local.next_chunk += 1;
         let Some(chunk) = global.chunks.get(idx) else {
             return Ok(SourcePoll::Finished);
         };

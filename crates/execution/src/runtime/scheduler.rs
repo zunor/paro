@@ -130,14 +130,15 @@ impl<'a> PipelineScheduler<'a> {
 
     fn run_pipeline(&mut self, pipeline: PipelineId) -> Result<()> {
         let runtime = self.create_runtime(pipeline)?;
-        let Some(morsels) = source_morsels(&runtime.source_global) else {
+        let Some(source_work) = source_work(&runtime.source_global) else {
             return self.run_single_pipeline(runtime, 0, 1);
         };
-        let total_threads = self.pipeline_thread_count(pipeline, morsels.len());
-        if total_threads <= 1 || morsels.len() <= 1 {
+        let total_threads = self.pipeline_thread_count(pipeline, source_work.morsel_count());
+        if total_threads <= 1 || source_work.morsel_count() <= 1 {
             return self.run_single_pipeline(runtime, 0, 1);
         }
 
+        let morsels = source_work.into_task_morsels(total_threads);
         self.run_parallel_data_tasks(runtime.clone(), morsels, total_threads)?;
         self.run_finish_task(runtime, total_threads)
     }
@@ -317,9 +318,67 @@ struct WorkUnitId(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceMorsel {
-    RowsetSegment { segment_idx: usize },
-    Chunk { chunk_idx: usize },
+    RowsetSegments { start: usize, end: usize },
+    Chunks { start: usize, end: usize },
     SortEmit { task_idx: usize },
+}
+
+impl SourceMorsel {
+    fn morsel_count(self) -> usize {
+        match self {
+            Self::RowsetSegments { start, end } | Self::Chunks { start, end } => end - start,
+            Self::SortEmit { .. } => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceWork {
+    RowsetSegments { count: usize },
+    Chunks { count: usize },
+    SortEmit { task_count: usize },
+}
+
+// Keep enough independent work for load balancing without making task-state
+// construction scale with the number of source morsels.
+const DATA_TASKS_PER_THREAD: usize = 4;
+
+impl SourceWork {
+    fn morsel_count(self) -> usize {
+        match self {
+            Self::RowsetSegments { count } | Self::Chunks { count } => count,
+            Self::SortEmit { task_count } => task_count,
+        }
+    }
+
+    fn into_task_morsels(self, total_threads: usize) -> Vec<SourceMorsel> {
+        match self {
+            Self::RowsetSegments { count } => partition_morsel_ranges(count, total_threads)
+                .map(|(start, end)| SourceMorsel::RowsetSegments { start, end })
+                .collect(),
+            Self::Chunks { count } => partition_morsel_ranges(count, total_threads)
+                .map(|(start, end)| SourceMorsel::Chunks { start, end })
+                .collect(),
+            Self::SortEmit { task_count } => (0..task_count)
+                .map(|task_idx| SourceMorsel::SortEmit { task_idx })
+                .collect(),
+        }
+    }
+}
+
+fn partition_morsel_ranges(
+    morsel_count: usize,
+    total_threads: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let task_count = morsel_count.min(total_threads.saturating_mul(DATA_TASKS_PER_THREAD));
+    let divisor = task_count.max(1);
+    let morsels_per_task = morsel_count / divisor;
+    let remainder = morsel_count % divisor;
+    (0..task_count).map(move |task_idx| {
+        let start = task_idx * morsels_per_task + task_idx.min(remainder);
+        let end = start + morsels_per_task + usize::from(task_idx < remainder);
+        (start, end)
+    })
 }
 
 const PROFILE_MORSEL_ROWSET_SEGMENT: &str = "rowset_segment";
@@ -746,7 +805,7 @@ impl PipelineWorkerTask {
                 source_node_id,
                 ExplainRuntimeStats {
                     scheduler_worker_count: Some(1),
-                    scheduler_morsel_count: Some(1),
+                    scheduler_morsel_count: self.morsel.map(|morsel| morsel.morsel_count() as u64),
                     ..ExplainRuntimeStats::default()
                 },
             );
@@ -925,18 +984,14 @@ fn as_scheduler_task(task: PipelineWorkerTask) -> Arc<ParkingMutex<dyn Task>> {
     Arc::new(ParkingMutex::new(task))
 }
 
-fn source_morsels(source: &SourceGlobal) -> Option<Vec<SourceMorsel>> {
+fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
     match source {
-        SourceGlobal::Rowset(global) => Some(
-            (0..global.segments.len())
-                .map(|segment_idx| SourceMorsel::RowsetSegment { segment_idx })
-                .collect(),
-        ),
-        SourceGlobal::Chunk(global) => Some(
-            (0..global.chunks.len())
-                .map(|chunk_idx| SourceMorsel::Chunk { chunk_idx })
-                .collect(),
-        ),
+        SourceGlobal::Rowset(global) => Some(SourceWork::RowsetSegments {
+            count: global.segments.len(),
+        }),
+        SourceGlobal::Chunk(global) => Some(SourceWork::Chunks {
+            count: global.chunks.len(),
+        }),
         SourceGlobal::SortEmit(global) => {
             let task_count = global
                 .handle
@@ -950,11 +1005,7 @@ fn source_morsels(source: &SourceGlobal) -> Option<Vec<SourceMorsel>> {
                 })
                 .unwrap_or(1)
                 .max(1);
-            Some(
-                (0..task_count)
-                    .map(|task_idx| SourceMorsel::SortEmit { task_idx })
-                    .collect(),
-            )
+            Some(SourceWork::SortEmit { task_count })
         }
         _ => None,
     }
@@ -962,12 +1013,12 @@ fn source_morsels(source: &SourceGlobal) -> Option<Vec<SourceMorsel>> {
 
 fn assign_source_morsel(source: &mut SourceLocal, morsel: SourceMorsel) -> Result<()> {
     match (source, morsel) {
-        (SourceLocal::Rowset(local), SourceMorsel::RowsetSegment { segment_idx }) => {
-            local.assign_segment_morsel(segment_idx);
+        (SourceLocal::Rowset(local), SourceMorsel::RowsetSegments { start, end }) => {
+            local.assign_segment_range(start, end);
             Ok(())
         }
-        (SourceLocal::Chunk(local), SourceMorsel::Chunk { chunk_idx }) => {
-            local.assign_chunk_morsel(chunk_idx);
+        (SourceLocal::Chunk(local), SourceMorsel::Chunks { start, end }) => {
+            local.assign_chunk_range(start, end);
             Ok(())
         }
         (SourceLocal::SortEmit(_), SourceMorsel::SortEmit { .. }) => Ok(()),
@@ -981,17 +1032,13 @@ fn assign_source_morsel(source: &mut SourceLocal, morsel: SourceMorsel) -> Resul
 
 fn profile_morsel_range_from_work(work: WorkUnit) -> Option<ProfileMorselRange> {
     match work.kind {
-        WorkUnitKind::Morsel(SourceMorsel::RowsetSegment { segment_idx }) => {
-            Some(ProfileMorselRange::new(
-                PROFILE_MORSEL_ROWSET_SEGMENT,
-                segment_idx as u64,
-                segment_idx as u64 + 1,
-            ))
-        }
-        WorkUnitKind::Morsel(SourceMorsel::Chunk { chunk_idx }) => Some(ProfileMorselRange::new(
+        WorkUnitKind::Morsel(SourceMorsel::RowsetSegments { start, end }) => Some(
+            ProfileMorselRange::new(PROFILE_MORSEL_ROWSET_SEGMENT, start as u64, end as u64),
+        ),
+        WorkUnitKind::Morsel(SourceMorsel::Chunks { start, end }) => Some(ProfileMorselRange::new(
             PROFILE_MORSEL_CHUNK,
-            chunk_idx as u64,
-            chunk_idx as u64 + 1,
+            start as u64,
+            end as u64,
         )),
         WorkUnitKind::Morsel(SourceMorsel::SortEmit { task_idx }) => Some(ProfileMorselRange::new(
             PROFILE_MORSEL_SORT_EMIT,
@@ -1048,6 +1095,50 @@ mod tests {
             payload: PipelineId::new(1),
         });
         assert_eq!(heap.pop().unwrap().payload, PipelineId::new(1));
+    }
+
+    #[test]
+    fn source_work_batches_many_morsels_into_bounded_contiguous_ranges() {
+        let morsels = SourceWork::Chunks { count: 1_024 }.into_task_morsels(4);
+
+        assert_eq!(morsels.len(), 4 * DATA_TASKS_PER_THREAD);
+        assert_eq!(
+            morsels.first(),
+            Some(&SourceMorsel::Chunks { start: 0, end: 64 })
+        );
+        assert_eq!(
+            morsels.last(),
+            Some(&SourceMorsel::Chunks {
+                start: 960,
+                end: 1_024,
+            })
+        );
+        assert_eq!(
+            morsels
+                .iter()
+                .copied()
+                .map(SourceMorsel::morsel_count)
+                .sum::<usize>(),
+            1_024
+        );
+        assert!(morsels.windows(2).all(|pair| match pair {
+            [SourceMorsel::Chunks { end, .. }, SourceMorsel::Chunks { start, .. }] => end == start,
+            _ => false,
+        }));
+
+        let uneven = SourceWork::RowsetSegments { count: 19 }.into_task_morsels(4);
+        assert_eq!(uneven.len(), 16);
+        assert_eq!(
+            uneven
+                .iter()
+                .copied()
+                .map(SourceMorsel::morsel_count)
+                .collect::<Vec<_>>(),
+            [vec![2; 3], vec![1; 13]].concat()
+        );
+        assert!(SourceWork::Chunks { count: 0 }
+            .into_task_morsels(4)
+            .is_empty());
     }
 
     #[test]
