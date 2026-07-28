@@ -130,6 +130,13 @@ impl VectorBuffer {
         self.inner.as_ref().map(|inner| Arc::as_ptr(inner) as usize)
     }
 
+    #[inline]
+    pub(crate) fn is_uniquely_owned(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(|inner| Arc::strong_count(inner) == 1)
+    }
+
     pub(crate) fn collect_allocation_size(&self, allocations: &mut AllocationSet) -> usize {
         match self.allocation_identity() {
             Some(identity) => allocations.add(identity, self.size()),

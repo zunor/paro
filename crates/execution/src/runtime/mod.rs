@@ -167,9 +167,9 @@ pub use scheduling_policy::{
     ReadyEntry, ReadyQueuePolicy, WakeStormPolicy,
 };
 pub use scratch::{
-    ChunkLayout, ChunkLease, ExpressionScratchArena, ExpressionScratchLease, PendingChunkState,
-    PipelineScratch, PipelineScratchLayout, PipelineTaskState, SinkResumeState, TaskMemoryGrants,
-    TransformResumeState,
+    ChunkLayout, ChunkLayoutKind, ChunkLease, ExpressionScratchArena, ExpressionScratchLease,
+    PendingChunkState, PipelineScratch, PipelineScratchLayout, PipelineTaskState, SinkResumeState,
+    TaskMemoryGrants, TransformResumeState,
 };
 pub use sink::{
     CancelReason, ClientResultSinkExec, CopyToFileSinkExec, CteMaterializeSinkExec, DeleteSinkExec,

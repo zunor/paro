@@ -50,23 +50,26 @@ pub fn apply_cleanup_descriptor(
             recursive,
         } => {
             let path = path_from_components(path_components);
-            if !path.exists() {
-                return Ok(());
-            }
-            if *recursive {
-                std::fs::remove_dir_all(&path).map_err(|err| {
-                    paro_error::internal(format!(
-                        "cleanup remove_dir_all {}: {}",
-                        path.display(),
-                        err
-                    ))
-                })?;
+            let result = if *recursive {
+                std::fs::remove_dir_all(&path)
             } else {
-                std::fs::remove_dir(&path).map_err(|err| {
-                    paro_error::internal(format!("cleanup remove_dir {}: {}", path.display(), err))
-                })?;
+                std::fs::remove_dir(&path)
+            };
+            match result {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => {
+                    let operation = if *recursive {
+                        "remove_dir_all"
+                    } else {
+                        "remove_dir"
+                    };
+                    Err(paro_error::internal(format!(
+                        "cleanup {operation} {}: {err}",
+                        path.display()
+                    )))
+                }
             }
-            Ok(())
         }
         CleanupDescriptor::ShutdownTablet {
             tablet_id,
@@ -135,6 +138,22 @@ mod tests {
         let mut queue = DescriptorCleanupQueue::default();
         queue.enqueue(11, std::iter::empty());
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn remove_directory_cleanup_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("removed-twice");
+        std::fs::create_dir_all(&path).unwrap();
+        let cleanup = CleanupDescriptor::RemoveDirectory {
+            path_components: vec![path.to_string_lossy().to_string()],
+            recursive: true,
+        };
+
+        apply_cleanup_descriptor(&cleanup, None).unwrap();
+        apply_cleanup_descriptor(&cleanup, None).unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]

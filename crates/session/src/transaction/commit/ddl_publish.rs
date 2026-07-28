@@ -19,7 +19,7 @@ use paro_common::types::LogicalType;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::{
     index::{
-        graph::{GraphProjectionIndex, GraphStorageGeneration},
+        graph::{lock_graph_artifact_io, GraphProjectionIndex, GraphStorageGeneration},
         BoundIndex,
     },
     search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind},
@@ -44,7 +44,19 @@ pub(super) fn build_apply_descriptor_phase(
     database: Arc<DatabaseHandle>,
     descriptors: Vec<ApplyDescriptor>,
 ) -> CommitApplyWork {
+    let coordinates_graph_artifacts = descriptors.iter().any(|descriptor| {
+        matches!(
+            descriptor,
+            ApplyDescriptor::PublishStagedArtifact(
+                StagedArtifactDescriptor::PropertyGraphBuild { .. }
+            ) | ApplyDescriptor::RuntimeTransition(
+                RuntimeTransitionDescriptor::RegisterGraphRuntime { .. }
+                    | RuntimeTransitionDescriptor::UnregisterGraphRuntime { .. }
+            )
+        )
+    });
     Box::new(move |commit_id| {
+        let _graph_artifact_guard = coordinates_graph_artifacts.then(lock_graph_artifact_io);
         for descriptor in descriptors {
             match descriptor {
                 ApplyDescriptor::PublishStagedArtifact(artifact) => {

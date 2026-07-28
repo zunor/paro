@@ -7,7 +7,7 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
+use paro_common::vector::VectorSelection;
 use paro_function::scalar::FunctionExecContext;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
@@ -124,29 +124,11 @@ impl FilterTransformExec {
             return Ok(TransformPoll::Output);
         }
 
-        let output_types = local
-            .output_types
-            .as_deref()
-            .expect("filter output types initialized");
-        if output.column_count() != output_types.len() || output.capacity() < selected_count.max(1)
-        {
-            *output = Chunk::try_initialize(
-                &output_types,
-                selected_count.max(1),
-                ctx.query.allocator(MemoryTag::BaseTable),
-            )?;
-        } else {
-            output.try_reset(output.allocator().clone())?;
-        }
-
-        for output_idx in 0..output_types.len() {
-            let input_idx = filter_input_column(&local.projection, output_idx);
-            output.data[output_idx] = Arc::new(Vector::try_dictionary(
-                Arc::clone(&input.data[input_idx]),
-                &*selection,
-            )?);
-        }
-        output.try_set_cardinality(selected_count)?;
+        output.try_reference_selection(
+            input,
+            &local.projection,
+            VectorSelection::from(&*selection),
+        )?;
         Ok(TransformPoll::Output)
     }
 

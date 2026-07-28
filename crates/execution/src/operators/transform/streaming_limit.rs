@@ -3,12 +3,10 @@
 
 use std::sync::Arc;
 
-use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::vector::Vector;
-use paro_function::scalar::FunctionExecContext;
+use paro_common::vector::VectorSelection;
 use paro_planner::expression::Expression;
 
 use crate::physical::specs::LimitSpec;
@@ -45,7 +43,7 @@ impl StreamingLimitTransformExec {
 
     pub(crate) fn transform(
         &self,
-        ctx: &mut OperatorCallContext,
+        _ctx: &mut OperatorCallContext,
         global: &TransformGlobal,
         local: &mut TransformLocal,
         input: &Chunk,
@@ -88,20 +86,7 @@ impl StreamingLimitTransformExec {
         if start == 0 && count == input.size() {
             output.reference(input);
         } else {
-            let mut scratch = ctx.scratch.expr();
-            let selection = scratch.selection(count, ctx.query.allocator(MemoryTag::BaseTable))?;
-            for idx in 0..count {
-                selection.set(idx, start + idx);
-            }
-            let mut vectors = Vec::with_capacity(input.column_count());
-            for column in &input.data {
-                vectors.push(Arc::new(Vector::try_dictionary(
-                    Arc::clone(column),
-                    &*selection,
-                )?));
-            }
-            *output = Chunk::from_arc_vectors(vectors, input.allocator().clone());
-            output.try_set_cardinality(count)?;
+            output.try_reference_selection(input, &[], VectorSelection::range(start, count))?;
         }
         local.emitted = local.emitted.saturating_add(count);
         Ok(TransformPoll::Output)
