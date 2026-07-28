@@ -577,7 +577,6 @@ mod tests {
             .arg("--nocapture")
             .env("PARO_SUBQUERY_CASE", case)
             .env("PARO_SUBQUERY_MODE", mode)
-            .env("RUST_MIN_STACK", "33554432")
             .output()
             .expect("run subquery probe subprocess")
     }

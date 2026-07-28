@@ -13,6 +13,7 @@
 use crate::binder::ir::statement::BoundStatementKind;
 use crate::binder::Binder;
 use crate::plan::LogicalPlan;
+use crate::stack::maybe_grow_planner_stack;
 use crate::verify::verify_physical_planner_invariants;
 use paro_common::error::Result;
 use paro_common::logging::targets;
@@ -131,6 +132,10 @@ impl Planner {
     ///
     /// Returns an error if binding or planning fails.
     pub fn create_plan(&mut self, stmt: Statement) -> Result<()> {
+        maybe_grow_planner_stack(|| self.create_plan_inner(stmt))
+    }
+
+    fn create_plan_inner(&mut self, stmt: Statement) -> Result<()> {
         let started_at = Instant::now();
         debug!(target: targets::PLANNER, "Planning started");
 

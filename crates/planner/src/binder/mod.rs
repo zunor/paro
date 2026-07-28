@@ -22,6 +22,7 @@ use crate::binder::ir::BoundStatementKind;
 use crate::expression::{ConstantExpression, Expression};
 use crate::operator::LogicalOperator;
 use crate::plan::{LogicalPlan, PlannedStatement};
+use crate::stack::maybe_grow_planner_stack;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogObjectId, Dependency, DependencyList, DependencyType};
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -388,6 +389,10 @@ impl Binder {
 
     /// Bind a SQL statement.
     pub fn bind(&mut self, statement: AstStatement) -> Result<PlannedStatement> {
+        maybe_grow_planner_stack(|| self.bind_inner(statement))
+    }
+
+    fn bind_inner(&mut self, statement: AstStatement) -> Result<PlannedStatement> {
         let bound_statement = self.bind_statement_kind(statement)?;
 
         let names = bound_statement.names();
@@ -398,6 +403,10 @@ impl Binder {
     }
 
     pub fn create_plan(&mut self, statement: BoundStatementKind) -> Result<LogicalPlan> {
+        maybe_grow_planner_stack(|| self.create_plan_inner(statement))
+    }
+
+    fn create_plan_inner(&mut self, statement: BoundStatementKind) -> Result<LogicalPlan> {
         let operator = match statement {
             BoundStatementKind::Query(node) => self.plan_query(*node),
             BoundStatementKind::Insert(info) => self.plan_insert(info),

@@ -170,7 +170,6 @@ mod tests {
             .arg("binder::plan::from::dispatcher::tests::lateral_probe_harness")
             .arg("--nocapture")
             .env("PARO_LATERAL_CASE", case)
-            .env("RUST_MIN_STACK", "33554432")
             .output()
             .expect("run lateral probe subprocess")
     }

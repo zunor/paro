@@ -30,6 +30,7 @@ paro-storage = { workspace = true }
 ethnum = { workspace = true }
 itertools = { workspace = true }
 tracing = { workspace = true }
+stacker = { workspace = true }
 
 [dev-dependencies]
 paro-context = { workspace = true, features = ["test-support"] }

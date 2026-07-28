@@ -1772,6 +1772,7 @@ dependencies = [
  "paro-instance",
  "paro-parser",
  "paro-storage",
+ "stacker",
  "tracing",
 ]
 
