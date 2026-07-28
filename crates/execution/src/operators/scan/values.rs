@@ -26,10 +26,15 @@ impl ValuesSourceExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
-        _global: &SourceGlobal,
+        ctx: &mut PipelineInitContext,
+        global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        Ok(SourceLocal::Values(ValuesSourceLocal::default()))
+        global.values()?;
+        Ok(SourceLocal::Values(ValuesSourceLocal::try_new(
+            ctx,
+            &self.spec.expressions,
+            &self.spec.output_types,
+        )?))
     }
 
     pub(crate) fn poll_next(
@@ -42,14 +47,6 @@ impl ValuesSourceExec {
         let SourceLocal::Values(local) = local else {
             return Err(paro_error::internal("values source local state mismatch"));
         };
-        poll_expression_rows(
-            ctx,
-            &self.spec.expressions,
-            &self.spec.output_types,
-            &mut local.cursor,
-            &mut local.scalar_scratch,
-            output,
-            "VALUES",
-        )
+        poll_expression_rows(ctx, &self.spec.expressions, local, output)
     }
 }

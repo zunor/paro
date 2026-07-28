@@ -273,6 +273,19 @@ impl ExpressionExecutor {
         version: ExpressionProgramVersion,
     ) -> Self {
         let physical = Self::cached_program(exprs, version);
+        Self::from_physical(physical)
+    }
+
+    pub(crate) fn with_expression_refs_for_session(
+        exprs: &[&Expression],
+        session: &paro_context::StatementContext,
+    ) -> Self {
+        let physical =
+            Self::cached_program_refs(exprs, ExpressionProgramVersion::from_session(session));
+        Self::from_physical(physical)
+    }
+
+    fn from_physical(physical: Arc<PhysicalExpressionProgram>) -> Self {
         let states = (0..physical.unique_root_count())
             .map(|root_idx| Self::initialize(physical.unique_root(root_idx)))
             .collect();
@@ -303,6 +316,16 @@ impl ExpressionExecutor {
         THREAD_LOCAL_PROGRAM_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             cache.get_or_compile(exprs, version)
+        })
+    }
+
+    fn cached_program_refs(
+        exprs: &[&Expression],
+        version: ExpressionProgramVersion,
+    ) -> Arc<PhysicalExpressionProgram> {
+        THREAD_LOCAL_PROGRAM_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.get_or_compile_refs(exprs, version)
         })
     }
 

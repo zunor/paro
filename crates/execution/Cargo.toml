@@ -106,3 +106,7 @@ harness = false
 [[bench]]
 name = "materialized_source"
 harness = false
+
+[[bench]]
+name = "expression_rows_source"
+harness = false
