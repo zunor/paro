@@ -806,9 +806,7 @@ pub struct NljUnmatchedSourceExec {
 impl NljUnmatchedSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
         Ok(SourceGlobal::Materialized(Arc::new(
-            MaterializedSourceGlobal {
-                handle: ctx.handles.get(self.handle)?,
-            },
+            MaterializedSourceGlobal::new(ctx.handles.get(self.handle)?),
         )))
     }
 
@@ -834,13 +832,7 @@ impl NljUnmatchedSourceExec {
         let SourceLocal::NljUnmatched(local) = local else {
             return Err(paro_error::internal("NLJ unmatched source local mismatch"));
         };
-        if !global.handle.is_sealed() {
-            return Err(paro_error::internal("NLJ unmatched before seal"));
-        }
-        let build_chunks = global
-            .handle
-            .sealed_chunks()
-            .ok_or_else(|| paro_error::internal("NLJ unmatched build chunks missing"))?;
+        let build_chunks = global.sealed_chunks()?;
         let found_bits = global.handle.found_bits();
 
         ensure_source_output(output, &self.output_types, VECTOR_SIZE)?;

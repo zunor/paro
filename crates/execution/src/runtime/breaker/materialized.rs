@@ -4,11 +4,11 @@
 //! Generic materialization breaker handle.
 //!
 //! Writers append task-local chunks during `merge_local()`, then `finish()`
-//! seals the handle into immutable chunk storage. Emit sources read sealed
-//! chunks with an atomic cursor, so the source hot path does not lock the
-//! producer-side collection.
+//! seals the handle into immutable chunk storage. Consumers capture that
+//! immutable snapshot in their operator-global state, keeping read cursors and
+//! synchronization out of the producer-owned handle.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -54,7 +54,6 @@ pub struct MaterializedHandle {
     metadata: BreakerHandleMetadata,
     pending_chunks: Mutex<Vec<Chunk>>,
     sealed_chunks: Mutex<Option<Arc<[Chunk]>>>,
-    next_chunk: AtomicUsize,
     sealed: AtomicBool,
     cleanup: CleanupState,
     found_bits: Mutex<Option<FoundBits>>,
@@ -66,7 +65,6 @@ impl MaterializedHandle {
             metadata,
             pending_chunks: Mutex::new(Vec::new()),
             sealed_chunks: Mutex::new(None),
-            next_chunk: AtomicUsize::new(0),
             sealed: AtomicBool::new(false),
             cleanup: CleanupState::default(),
             found_bits: Mutex::new(None),
@@ -140,13 +138,7 @@ impl MaterializedHandle {
         self.pending_chunks.lock().clear();
         *self.sealed_chunks.lock() = None;
         *self.found_bits.lock() = None;
-        self.next_chunk.store(0, Ordering::Release);
         self.sealed.store(false, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn next_chunk_index(&self) -> usize {
-        self.next_chunk.fetch_add(1, Ordering::AcqRel)
     }
 
     #[inline]
@@ -210,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_handle_seals_chunks_for_lock_free_read_cursor() {
+    fn materialized_handle_seals_chunks_into_an_immutable_snapshot() {
         let handle = MaterializedHandle::new(metadata());
         let vector =
             Vector::try_from_i32(&[1, 2, 3], paro_common::test_utils::test_allocator()).unwrap();
@@ -224,8 +216,6 @@ mod tests {
         handle.seal().unwrap();
         assert!(handle.is_sealed());
         assert_eq!(handle.sealed_chunk_count(), 1);
-        assert_eq!(handle.next_chunk_index(), 0);
-        assert_eq!(handle.next_chunk_index(), 1);
     }
 
     #[test]
@@ -242,7 +232,6 @@ mod tests {
         let found_bits = handle.initialize_found_bits_for_chunks(sealed.as_ref());
         found_bits.mark(0);
         assert!(found_bits.is_marked(0));
-        assert_eq!(handle.next_chunk_index(), 0);
 
         handle.reset_for_reuse();
 
@@ -250,7 +239,6 @@ mod tests {
         assert_eq!(handle.pending_chunk_count(), 0);
         assert_eq!(handle.sealed_chunk_count(), 0);
         assert!(handle.found_bits().is_none());
-        assert_eq!(handle.next_chunk_index(), 0);
 
         let vector = Vector::try_from_i32(&[4], paro_common::test_utils::test_allocator()).unwrap();
         let mut chunks = vec![paro_common::test_utils::test_chunk_from_vectors(vec![

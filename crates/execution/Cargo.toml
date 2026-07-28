@@ -102,3 +102,7 @@ harness = false
 [[bench]]
 name = "scheduler_morsel_dispatch"
 harness = false
+
+[[bench]]
+name = "materialized_source"
+harness = false

@@ -3,7 +3,8 @@
 
 //! Typed materialized breaker source/sink adapter.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -24,17 +25,71 @@ pub struct MaterializedSourceExec {
 #[derive(Debug)]
 pub struct MaterializedSourceGlobal {
     pub handle: Arc<MaterializedHandle>,
+    chunks: OnceLock<Arc<[Chunk]>>,
+    next_chunk: AtomicUsize,
+}
+
+impl MaterializedSourceGlobal {
+    pub(crate) fn new(handle: Arc<MaterializedHandle>) -> Self {
+        Self {
+            handle,
+            chunks: OnceLock::new(),
+            next_chunk: AtomicUsize::new(0),
+        }
+    }
+
+    /// Capture the immutable producer snapshot once for this consumer runtime.
+    ///
+    /// Runtime globals may be created before their producer runs, so snapshot
+    /// binding is lazy. Once bound, polling never returns to the resettable
+    /// producer handle and remains valid for this execution attempt.
+    pub(crate) fn sealed_chunks(&self) -> Result<&Arc<[Chunk]>> {
+        if let Some(chunks) = self.chunks.get() {
+            return Ok(chunks);
+        }
+        if !self.handle.is_sealed() {
+            return Err(paro_error::internal(
+                "materialized source was scheduled before producer sealed the handle",
+            ));
+        }
+        let chunks = self
+            .handle
+            .sealed_chunks()
+            .ok_or_else(|| paro_error::internal("sealed materialized source chunks are missing"))?;
+        let _ = self.chunks.set(chunks);
+        Ok(self
+            .chunks
+            .get()
+            .expect("materialized source snapshot initialized above"))
+    }
+
+    #[inline]
+    fn next_chunk_index(&self) -> usize {
+        self.next_chunk.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Default)]
-pub struct MaterializedSourceLocal;
+pub struct MaterializedSourceLocal {
+    chunks: Option<Arc<[Chunk]>>,
+}
+
+impl MaterializedSourceLocal {
+    fn sealed_chunks(&mut self, global: &MaterializedSourceGlobal) -> Result<&Arc<[Chunk]>> {
+        if self.chunks.is_none() {
+            self.chunks = Some(Arc::clone(global.sealed_chunks()?));
+        }
+        Ok(self
+            .chunks
+            .as_ref()
+            .expect("materialized task snapshot initialized above"))
+    }
+}
 
 impl MaterializedSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
         Ok(SourceGlobal::Materialized(Arc::new(
-            MaterializedSourceGlobal {
-                handle: ctx.handles.get(self.handle)?,
-            },
+            MaterializedSourceGlobal::new(ctx.handles.get(self.handle)?),
         )))
     }
 
@@ -43,27 +98,25 @@ impl MaterializedSourceExec {
         _ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        Ok(SourceLocal::Materialized(MaterializedSourceLocal))
+        Ok(SourceLocal::Materialized(MaterializedSourceLocal::default()))
     }
 
     pub(crate) fn poll_next(
         &self,
         ctx: &mut OperatorCallContext,
         global: &SourceGlobal,
-        _local: &mut SourceLocal,
+        local: &mut SourceLocal,
         output: &mut Chunk,
     ) -> Result<SourcePoll> {
         ctx.cancel.check()?;
         let global = global.materialized()?;
-        if !global.handle.is_sealed() {
+        let SourceLocal::Materialized(local) = local else {
             return Err(paro_error::internal(
-                "materialized source was scheduled before producer sealed the handle",
+                "materialized source local state mismatch",
             ));
-        }
-        let Some(chunks) = global.handle.sealed_chunks() else {
-            return Ok(SourcePoll::Finished);
         };
-        let idx = global.handle.next_chunk_index();
+        let chunks = local.sealed_chunks(global)?;
+        let idx = global.next_chunk_index();
         let Some(chunk) = chunks.get(idx) else {
             return Ok(SourcePoll::Finished);
         };
@@ -171,5 +224,85 @@ impl MaterializeSinkExec {
         };
         global.handle.seal()?;
         Ok(FinishPoll::Done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::types::LogicalType;
+    use paro_common::vector::Vector;
+
+    use crate::physical::properties::PipelineProperties;
+    use crate::physical::row_type::RowType;
+    use crate::pipeline::handles::{BreakerHandleId, BreakerHandleKind};
+    use crate::runtime::breaker::BreakerHandleMetadata;
+
+    use super::*;
+
+    fn materialized_handle() -> Arc<MaterializedHandle> {
+        Arc::new(MaterializedHandle::new(BreakerHandleMetadata {
+            id: BreakerHandleId::new(0),
+            kind: BreakerHandleKind::Materialized,
+            row_type: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+            producer: None,
+            consumers: Box::new([]),
+            properties: PipelineProperties::default(),
+        }))
+    }
+
+    fn chunk(value: i32) -> Chunk {
+        let allocator = paro_common::test_utils::test_allocator();
+        Chunk::from_vectors(
+            vec![Vector::try_from_i32(&[value], allocator.clone()).expect("test vector")],
+            allocator,
+        )
+    }
+
+    fn publish(handle: &MaterializedHandle, values: &[i32]) {
+        let mut chunks = values.iter().copied().map(chunk).collect::<Vec<_>>();
+        handle.append_chunks(&mut chunks).expect("append chunks");
+        handle.seal().expect("seal chunks");
+    }
+
+    #[test]
+    fn materialized_source_globals_own_independent_scan_cursors() {
+        let handle = materialized_handle();
+        publish(handle.as_ref(), &[10, 20]);
+        let first = MaterializedSourceGlobal::new(Arc::clone(&handle));
+        let second = MaterializedSourceGlobal::new(handle);
+
+        assert_eq!(first.next_chunk_index(), 0);
+        assert_eq!(first.next_chunk_index(), 1);
+        assert_eq!(second.next_chunk_index(), 0);
+        assert_eq!(first.sealed_chunks().unwrap().len(), 2);
+        assert_eq!(second.sealed_chunks().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn materialized_source_snapshot_is_scoped_to_one_runtime() {
+        let handle = materialized_handle();
+        publish(handle.as_ref(), &[10]);
+        let first_runtime = MaterializedSourceGlobal::new(Arc::clone(&handle));
+        let first_snapshot = first_runtime.sealed_chunks().unwrap();
+        assert_eq!(first_snapshot[0].column(0).unwrap().get_i32(0), Some(10));
+
+        handle.reset_for_reuse();
+        publish(handle.as_ref(), &[20]);
+        let second_runtime = MaterializedSourceGlobal::new(handle);
+
+        assert_eq!(
+            first_runtime.sealed_chunks().unwrap()[0]
+                .column(0)
+                .unwrap()
+                .get_i32(0),
+            Some(10)
+        );
+        assert_eq!(
+            second_runtime.sealed_chunks().unwrap()[0]
+                .column(0)
+                .unwrap()
+                .get_i32(0),
+            Some(20)
+        );
     }
 }
