@@ -8,11 +8,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VectorSelection, VECTOR_SIZE};
 
-use crate::runtime::breaker::{HandleRef, MaterializedHandle};
+use crate::runtime::breaker::{HandleRef, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
-use crate::runtime::state::{
-    BreakerHandleGlobal, CrossProductProbeTransformLocal, TransformGlobal, TransformLocal,
-};
+use crate::runtime::state::{CrossProductProbeTransformLocal, TransformGlobal, TransformLocal};
 use crate::runtime::transform::{TransformFinishPoll, TransformFlushPoll, TransformPoll};
 
 #[derive(Debug, Clone)]
@@ -25,9 +23,7 @@ pub struct CrossProductProbeTransformExec {
 impl CrossProductProbeTransformExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
         Ok(TransformGlobal::CrossProductProbe(Arc::new(
-            BreakerHandleGlobal {
-                handle: ctx.handles.get(self.handle)?,
-            },
+            MaterializedReader::new(ctx.handles.get(self.handle)?, "cross product probe"),
         )))
     }
 
@@ -60,19 +56,11 @@ impl CrossProductProbeTransformExec {
                 "cross product probe transform local state mismatch",
             ));
         };
-        if !global.handle.is_sealed() {
-            return Err(paro_error::internal(
-                "cross product probe scheduled before build handle finalized",
-            ));
-        }
+        let build_chunks = global.sealed_chunks()?;
         if input.is_empty() {
             output.try_set_cardinality(0)?;
             return Ok(TransformPoll::NeedMoreInput);
         }
-        let build_chunks = global
-            .handle
-            .sealed_chunks()
-            .ok_or_else(|| paro_error::internal("sealed cross product build chunks missing"))?;
         if build_chunks.iter().all(Chunk::is_empty) {
             output.try_set_cardinality(0)?;
             return Ok(TransformPoll::NeedMoreInput);

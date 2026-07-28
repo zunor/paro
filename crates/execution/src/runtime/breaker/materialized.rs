@@ -4,12 +4,14 @@
 //! Generic materialization breaker handle.
 //!
 //! Writers append task-local chunks during `merge_local()`, then `finish()`
-//! seals the handle into immutable chunk storage. Emit sources read sealed
-//! chunks with an atomic cursor, so the source hot path does not lock the
-//! producer-side collection.
+//! seals the handle into immutable chunk storage. Consumers capture that
+//! immutable snapshot in their operator-global state, keeping read cursors and
+//! synchronization out of the producer-owned handle.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
@@ -54,10 +56,68 @@ pub struct MaterializedHandle {
     metadata: BreakerHandleMetadata,
     pending_chunks: Mutex<Vec<Chunk>>,
     sealed_chunks: Mutex<Option<Arc<[Chunk]>>>,
-    next_chunk: AtomicUsize,
+    #[cfg(test)]
+    sealed_chunk_reads: AtomicUsize,
     sealed: AtomicBool,
     cleanup: CleanupState,
     found_bits: Mutex<Option<FoundBits>>,
+}
+
+/// Runtime-scoped reader for one immutable materialized-handle snapshot.
+///
+/// Pipeline globals may be created before their producer runs, so the snapshot
+/// is bound lazily after sealing. Keeping the cache outside `MaterializedHandle`
+/// is important: recursive execution resets and reuses the producer handle,
+/// while each new pipeline runtime gets a fresh reader for that iteration.
+#[derive(Debug)]
+pub struct MaterializedReader {
+    handle: Arc<MaterializedHandle>,
+    consumer: &'static str,
+    chunks: OnceLock<Arc<[Chunk]>>,
+}
+
+impl MaterializedReader {
+    pub fn new(handle: Arc<MaterializedHandle>, consumer: &'static str) -> Self {
+        Self {
+            handle,
+            consumer,
+            chunks: OnceLock::new(),
+        }
+    }
+
+    pub fn initialize_found_bits_for_chunks(&self, chunks: &[Chunk]) -> FoundBits {
+        self.handle.initialize_found_bits_for_chunks(chunks)
+    }
+
+    pub fn found_bits(&self) -> Option<FoundBits> {
+        self.handle.found_bits()
+    }
+
+    /// Binds and returns this runtime's immutable snapshot.
+    ///
+    /// A sealed handle without chunks violates the publication invariant:
+    /// `MaterializedHandle::seal` stores the snapshot before its release-store
+    /// to `sealed`, and readers acquire-load that flag here. Recursive resets
+    /// are scheduled only after the prior runtime has stopped polling.
+    pub fn sealed_chunks(&self) -> Result<&Arc<[Chunk]>> {
+        if let Some(chunks) = self.chunks.get() {
+            return Ok(chunks);
+        }
+        if !self.handle.is_sealed() {
+            return Err(paro_error::internal(format!(
+                "{} was scheduled before producer sealed the handle",
+                self.consumer
+            )));
+        }
+        let chunks = self.handle.sealed_chunks().ok_or_else(|| {
+            paro_error::internal(format!("sealed {} chunks are missing", self.consumer))
+        })?;
+        let _ = self.chunks.set(chunks);
+        Ok(self
+            .chunks
+            .get()
+            .expect("materialized reader snapshot initialized above"))
+    }
 }
 
 impl MaterializedHandle {
@@ -66,7 +126,8 @@ impl MaterializedHandle {
             metadata,
             pending_chunks: Mutex::new(Vec::new()),
             sealed_chunks: Mutex::new(None),
-            next_chunk: AtomicUsize::new(0),
+            #[cfg(test)]
+            sealed_chunk_reads: AtomicUsize::new(0),
             sealed: AtomicBool::new(false),
             cleanup: CleanupState::default(),
             found_bits: Mutex::new(None),
@@ -129,7 +190,14 @@ impl MaterializedHandle {
 
     #[inline]
     pub fn sealed_chunks(&self) -> Option<Arc<[Chunk]>> {
+        #[cfg(test)]
+        self.sealed_chunk_reads.fetch_add(1, Ordering::Relaxed);
         self.sealed_chunks.lock().clone()
+    }
+
+    #[cfg(test)]
+    fn sealed_chunk_read_count(&self) -> usize {
+        self.sealed_chunk_reads.load(Ordering::Relaxed)
     }
 
     pub fn reset_for_reuse(&self) {
@@ -140,13 +208,7 @@ impl MaterializedHandle {
         self.pending_chunks.lock().clear();
         *self.sealed_chunks.lock() = None;
         *self.found_bits.lock() = None;
-        self.next_chunk.store(0, Ordering::Release);
         self.sealed.store(false, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn next_chunk_index(&self) -> usize {
-        self.next_chunk.fetch_add(1, Ordering::AcqRel)
     }
 
     #[inline]
@@ -210,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_handle_seals_chunks_for_lock_free_read_cursor() {
+    fn materialized_handle_seals_chunks_into_an_immutable_snapshot() {
         let handle = MaterializedHandle::new(metadata());
         let vector =
             Vector::try_from_i32(&[1, 2, 3], paro_common::test_utils::test_allocator()).unwrap();
@@ -224,8 +286,6 @@ mod tests {
         handle.seal().unwrap();
         assert!(handle.is_sealed());
         assert_eq!(handle.sealed_chunk_count(), 1);
-        assert_eq!(handle.next_chunk_index(), 0);
-        assert_eq!(handle.next_chunk_index(), 1);
     }
 
     #[test]
@@ -242,7 +302,6 @@ mod tests {
         let found_bits = handle.initialize_found_bits_for_chunks(sealed.as_ref());
         found_bits.mark(0);
         assert!(found_bits.is_marked(0));
-        assert_eq!(handle.next_chunk_index(), 0);
 
         handle.reset_for_reuse();
 
@@ -250,7 +309,6 @@ mod tests {
         assert_eq!(handle.pending_chunk_count(), 0);
         assert_eq!(handle.sealed_chunk_count(), 0);
         assert!(handle.found_bits().is_none());
-        assert_eq!(handle.next_chunk_index(), 0);
 
         let vector = Vector::try_from_i32(&[4], paro_common::test_utils::test_allocator()).unwrap();
         let mut chunks = vec![paro_common::test_utils::test_chunk_from_vectors(vec![
@@ -259,5 +317,48 @@ mod tests {
         handle.append_chunks(&mut chunks).unwrap();
         handle.seal().unwrap();
         assert_eq!(handle.sealed_chunk_count(), 1);
+    }
+
+    #[test]
+    fn materialized_reader_binds_once_and_is_scoped_to_one_runtime() {
+        let handle = Arc::new(MaterializedHandle::new(metadata()));
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut chunks = vec![paro_common::test_utils::test_chunk_from_vectors(vec![
+            Vector::try_from_i32(&[10], allocator.clone()).unwrap(),
+        ])];
+        handle.append_chunks(&mut chunks).unwrap();
+        handle.seal().unwrap();
+
+        let first_runtime = MaterializedReader::new(Arc::clone(&handle), "test consumer");
+        let first_snapshot = first_runtime.sealed_chunks().unwrap();
+        assert!(std::ptr::eq(
+            first_snapshot,
+            first_runtime.sealed_chunks().unwrap()
+        ));
+        assert_eq!(handle.sealed_chunk_read_count(), 1);
+
+        handle.reset_for_reuse();
+        let mut chunks = vec![paro_common::test_utils::test_chunk_from_vectors(vec![
+            Vector::try_from_i32(&[20], allocator).unwrap(),
+        ])];
+        handle.append_chunks(&mut chunks).unwrap();
+        handle.seal().unwrap();
+
+        assert_eq!(
+            first_runtime.sealed_chunks().unwrap()[0]
+                .column(0)
+                .unwrap()
+                .get_i32(0),
+            Some(10)
+        );
+        let second_runtime = MaterializedReader::new(Arc::clone(&handle), "test consumer");
+        assert_eq!(
+            second_runtime.sealed_chunks().unwrap()[0]
+                .column(0)
+                .unwrap()
+                .get_i32(0),
+            Some(20)
+        );
+        assert_eq!(handle.sealed_chunk_read_count(), 2);
     }
 }

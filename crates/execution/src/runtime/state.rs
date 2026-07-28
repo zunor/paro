@@ -13,7 +13,7 @@ use std::sync::Arc;
 use paro_common::error::{self as paro_error, Result};
 
 use super::breaker::{
-    AggregateHandle, CteHandle, DelimHandle, JoinBuildHandle, MaterializedHandle,
+    AggregateHandle, CteHandle, DelimHandle, JoinBuildHandle, MaterializedReader,
     RecursiveTableHandle, SetOperationHandle, SortHandle, TopNHandle, WindowHandle,
 };
 pub use super::breaker::{
@@ -306,7 +306,7 @@ pub enum TransformGlobal {
     HashJoinProbe(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     NestedLoopJoinProbe(Arc<crate::operators::join::nested_loop::runtime::NljProbeGlobal>),
     SortRangeJoinProbe(Arc<crate::operators::join::sort_range::SortRangeJoinProbeGlobal>),
-    CrossProductProbe(Arc<BreakerHandleGlobal<MaterializedHandle>>),
+    CrossProductProbe(Arc<MaterializedReader>),
     ExternalProject(Arc<ExternalProjectTransformGlobal>),
     GraphExpand(Arc<GraphExpandTransformGlobal>),
     GraphShortestPath(Arc<GraphShortestPathTransformGlobal>),
