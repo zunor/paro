@@ -124,6 +124,17 @@ impl ExpressionRowsExecutor {
             )));
         }
 
+        let column_count = self.output_types.len();
+        for (offset, row) in rows[start_row..end_row].iter().enumerate() {
+            if row.len() != column_count {
+                return Err(paro_error::internal(format!(
+                    "expression row {} has {} expressions but output has {column_count} columns",
+                    start_row + offset,
+                    row.len()
+                )));
+            }
+        }
+
         if output.column_count() != self.output_types.len() || output.capacity() < row_count.max(1)
         {
             *output = Chunk::try_initialize(
@@ -135,7 +146,6 @@ impl ExpressionRowsExecutor {
             output.try_reset(output.allocator().clone())?;
         }
 
-        let column_count = self.output_types.len();
         for output_row in 0..row_count {
             let source_row = start_row + output_row;
             let root_base = source_row.checked_mul(column_count).ok_or_else(|| {
@@ -161,7 +171,7 @@ impl ExpressionRowsExecutor {
                             ))
                         }
                     };
-                    if !try_write_scalar_value(target, output_row, value)? {
+                    if !target.try_set_scalar_value(output_row, value)? {
                         return Err(paro_error::internal(
                             "direct expression row root has unsupported runtime value",
                         ));
@@ -235,51 +245,6 @@ fn direct_parameter_type(ty: &LogicalType) -> bool {
             | LogicalType::Struct(..)
             | LogicalType::Unknown
     )
-}
-
-fn try_write_scalar_value(target: &mut Vector, row: usize, value: &Value) -> Result<bool> {
-    match value {
-        Value::Null(_) => target.try_set_null(row, true)?,
-        Value::Boolean(value) => target.set_bool(row, *value),
-        Value::TinyInt(value) => target.set_i8(row, *value),
-        Value::SmallInt(value) => target.set_i16(row, *value),
-        Value::Integer(value) => target.set_i32(row, *value),
-        Value::BigInt(value) => target.set_i64(row, *value),
-        Value::HugeInt(value) => target.set_i128(row, *value),
-        Value::UTinyInt(value) => target.set_u8(row, *value),
-        Value::USmallInt(value) => target.set_u16(row, *value),
-        Value::UInteger(value) => target.set_u32(row, *value),
-        Value::UBigInt(value) => target.set_u64(row, *value),
-        Value::UHugeInt(value) | Value::Uuid(value) => target.set_u128(row, *value),
-        Value::Float(value) => target.set_f32(row, *value),
-        Value::Double(value) => target.set_f64(row, *value),
-        Value::Decimal(value, value_precision, _) if decimal_precision(target) <= 18 => {
-            let value = i64::try_from(*value).map_err(|_| {
-                paro_error::internal(format!(
-                    "decimal expression row value with source precision {value_precision} exceeds i64"
-                ))
-            })?;
-            target.set_i64(row, value);
-        }
-        Value::Decimal(value, _, _) => target.set_i128(row, *value),
-        Value::Varchar(value) => target.try_set_string(row, value)?,
-        Value::Blob(value) => target.try_set_blob(row, value)?,
-        Value::Date(value) => target.set_i32(row, *value),
-        Value::Time(value) | Value::Timestamp(value) | Value::TimestampTz(value) => {
-            target.set_i64(row, *value)
-        }
-        Value::Interval(..) | Value::Array(..) | Value::List(..) | Value::Struct(..) => {
-            return Ok(false)
-        }
-    }
-    Ok(true)
-}
-
-fn decimal_precision(target: &Vector) -> u8 {
-    match target.logical_type() {
-        LogicalType::Decimal { precision, .. } => *precision,
-        _ => u8::MAX,
-    }
 }
 
 #[cfg(test)]
@@ -461,5 +426,35 @@ mod tests {
         .expect_err("malformed expression rows should fail");
 
         assert!(error.to_string().contains("has 1 expressions"));
+    }
+
+    #[test]
+    fn changed_row_width_fails_before_batch_execution() {
+        let rows = vec![row(vec![constant(Value::Integer(1), LogicalType::Integer)])];
+        let types = [LogicalType::Integer];
+        let query = query(ParameterBindings::empty());
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut executor = ExpressionRowsExecutor::try_new(
+            &rows,
+            &types,
+            query.session.as_ref(),
+            Arc::clone(&allocator),
+        )
+        .expect("expression row executor");
+        let malformed_rows = vec![row(vec![])];
+        let mut output = Chunk::try_initialize(&types, 1, allocator).expect("output chunk");
+
+        let error = executor
+            .execute_batch(
+                0,
+                1,
+                &malformed_rows,
+                query.params.as_ref(),
+                &query,
+                &mut output,
+            )
+            .expect_err("changed row width should fail before indexing");
+
+        assert!(error.to_string().contains("row 0 has 0 expressions"));
     }
 }

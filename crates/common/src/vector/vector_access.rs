@@ -458,51 +458,14 @@ impl Vector {
 
     /// Set value at index from a Value object.
     pub fn set_value(&mut self, idx: usize, val: &Value) {
-        if val.is_null() {
-            self.validity_mut().set_null(idx);
+        if self
+            .try_set_scalar_value(idx, val)
+            .expect("vector scalar value write failed")
+        {
             return;
         }
         self.validity_mut().set_valid(idx);
         match val {
-            Value::Boolean(v) => self.set_bool(idx, *v),
-            Value::TinyInt(v) => self.set_i8(idx, *v),
-            Value::SmallInt(v) => self.set_i16(idx, *v),
-            Value::Integer(v) => self.set_i32(idx, *v),
-            Value::BigInt(v) => self.set_i64(idx, *v),
-            Value::HugeInt(v) => self.set_i128(idx, *v),
-            Value::UTinyInt(v) => self.set_u8(idx, *v),
-            Value::USmallInt(v) => self.set_u16(idx, *v),
-            Value::UInteger(v) => self.set_u32(idx, *v),
-            Value::UBigInt(v) => self.set_u64(idx, *v),
-            Value::UHugeInt(v) => self.set_u128(idx, *v),
-            Value::Uuid(v) => self.set_u128(idx, *v),
-            Value::Float(v) => self.set_f32(idx, *v),
-            Value::Double(v) => self.set_f64(idx, *v),
-            Value::Decimal(v, precision, _scale) => {
-                if *precision <= 18 {
-                    let narrow =
-                        i64::try_from(*v).expect("Decimal value exceeds i64 range for precision");
-                    self.set_i64(idx, narrow);
-                } else {
-                    self.set_i128(idx, *v);
-                }
-            }
-            Value::Varchar(v) => self.set_string(idx, v),
-            Value::Blob(v) => self.set_blob(idx, v),
-            Value::Date(v) => self.set_i32(idx, *v),
-            Value::Timestamp(v) => self.set_i64(idx, *v),
-            Value::TimestampTz(v) => self.set_i64(idx, *v),
-            Value::Time(v) => self.set_i64(idx, *v),
-            Value::Interval(months, days, micros) => {
-                // Interval is stored as: months (i32), days (i32), micros (i64) = 16 bytes
-                unsafe {
-                    let base = self.buffer.data().add(idx * 16);
-                    *(base as *mut i32) = *months;
-                    *(base.add(4) as *mut i32) = *days;
-                    *(base.add(8) as *mut i64) = *micros;
-                }
-            }
-            Value::Null(_) => self.validity_mut().set_null(idx),
             Value::List(children, child_type) => {
                 if !matches!(self.logical_type, LogicalType::List(_)) {
                     self.validity_mut().set_null(idx);
@@ -593,7 +556,63 @@ impl Vector {
                     }
                 }
             }
+            _ => unreachable!("scalar values are handled by try_set_scalar_value"),
         }
+    }
+
+    /// Try to write a scalar runtime value at `idx`.
+    ///
+    /// Returns `Ok(false)` for nested values so callers can route those through
+    /// their dedicated vector kernels. Variable-length allocation failures are
+    /// propagated to the caller.
+    pub fn try_set_scalar_value(&mut self, idx: usize, val: &Value) -> Result<bool> {
+        match val {
+            Value::Boolean(v) => self.set_bool(idx, *v),
+            Value::TinyInt(v) => self.set_i8(idx, *v),
+            Value::SmallInt(v) => self.set_i16(idx, *v),
+            Value::Integer(v) => self.set_i32(idx, *v),
+            Value::BigInt(v) => self.set_i64(idx, *v),
+            Value::HugeInt(v) => self.set_i128(idx, *v),
+            Value::UTinyInt(v) => self.set_u8(idx, *v),
+            Value::USmallInt(v) => self.set_u16(idx, *v),
+            Value::UInteger(v) => self.set_u32(idx, *v),
+            Value::UBigInt(v) => self.set_u64(idx, *v),
+            Value::UHugeInt(v) => self.set_u128(idx, *v),
+            Value::Uuid(v) => self.set_u128(idx, *v),
+            Value::Float(v) => self.set_f32(idx, *v),
+            Value::Double(v) => self.set_f64(idx, *v),
+            Value::Decimal(v, precision, _scale) => {
+                if *precision <= 18 {
+                    let narrow = i64::try_from(*v).map_err(|_| {
+                        paro_error::internal("Decimal value exceeds i64 range for precision")
+                    })?;
+                    self.set_i64(idx, narrow);
+                } else {
+                    self.set_i128(idx, *v);
+                }
+            }
+            Value::Varchar(v) => self.try_set_string(idx, v)?,
+            Value::Blob(v) => self.try_set_blob(idx, v)?,
+            Value::Date(v) => self.set_i32(idx, *v),
+            Value::Timestamp(v) => self.set_i64(idx, *v),
+            Value::TimestampTz(v) => self.set_i64(idx, *v),
+            Value::Time(v) => self.set_i64(idx, *v),
+            Value::Interval(months, days, micros) => {
+                // Interval is stored as: months (i32), days (i32), micros (i64) = 16 bytes
+                unsafe {
+                    let base = self.buffer.data().add(idx * 16);
+                    *(base as *mut i32) = *months;
+                    *(base.add(4) as *mut i32) = *days;
+                    *(base.add(8) as *mut i64) = *micros;
+                }
+                self.validity_mut().set_valid(idx);
+            }
+            Value::Null(_) => self.try_set_null(idx, true)?,
+            Value::List(..) | Value::Struct(..) | Value::Array(..) => {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Set i64 value at index.
