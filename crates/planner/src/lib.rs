@@ -11,5 +11,6 @@ pub mod expression;
 pub mod operator;
 pub mod plan;
 pub mod planner;
+mod stack;
 pub mod verify;
 pub mod visitor;

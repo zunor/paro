@@ -10,6 +10,7 @@ use crate::binder::ir::{
 };
 use crate::binder::plan::subquery::{split_child_correlated_columns, CorrelationBoundaryMode};
 use crate::binder::Binder;
+use crate::stack::maybe_grow_planner_stack;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{OrderByExpr, SetExpr, SetOperator};
@@ -32,6 +33,10 @@ impl Binder {
 
     /// Bind a Query (BoundSelect, BoundValues, or BoundSetOperation).
     pub fn bind_query(&mut self, statement: paro_parser::ast::Query) -> Result<BoundQuery> {
+        maybe_grow_planner_stack(|| self.bind_query_inner(statement))
+    }
+
+    fn bind_query_inner(&mut self, statement: paro_parser::ast::Query) -> Result<BoundQuery> {
         let mut registered_ctes = Vec::new();
 
         // First, register any CTEs from the WITH clause
