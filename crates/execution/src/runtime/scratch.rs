@@ -123,11 +123,12 @@ pub struct ExpressionScratchArena {
 #[derive(Debug, Default)]
 struct SelectionScratchPool {
     slots: Vec<SelectionVector>,
-    // FIFO consumers release older published views first, so a round-robin
-    // cursor finds the next reusable buffer in O(1) without scanning an
-    // unbounded completed-output backlog.
     next_slot: usize,
 }
+
+// Keep lookup cost and task-local retained memory bounded. Published views own
+// their buffers independently, so replacing a shared cache entry is safe.
+const SELECTION_SCRATCH_CACHE_CAPACITY: usize = 4;
 
 impl SelectionScratchPool {
     fn lease(
@@ -136,23 +137,36 @@ impl SelectionScratchPool {
         allocator: Arc<dyn Allocator>,
     ) -> Result<&mut SelectionVector> {
         let required = capacity.max(1);
-        let slot_idx = if self.slots.is_empty() {
+        let slot_count = self.slots.len();
+        let mut reusable = None;
+        let mut resizable = None;
+
+        for offset in 0..slot_count {
+            let candidate = (self.next_slot + offset) % slot_count;
+            let slot = &self.slots[candidate];
+            if !slot.is_uniquely_owned() {
+                continue;
+            }
+            if slot.capacity() >= required {
+                reusable = Some(candidate);
+                break;
+            }
+            resizable.get_or_insert(candidate);
+        }
+
+        let slot_idx = if let Some(candidate) = reusable {
+            candidate
+        } else if let Some(candidate) = resizable {
+            self.slots[candidate] = SelectionVector::try_with_capacity(required, allocator)?;
+            candidate
+        } else if slot_count < SELECTION_SCRATCH_CACHE_CAPACITY {
             self.slots
                 .push(SelectionVector::try_with_capacity(required, allocator)?);
-            0
+            slot_count
         } else {
-            let candidate = self.next_slot.min(self.slots.len() - 1);
-            if self.slots[candidate].is_uniquely_owned() {
-                if self.slots[candidate].capacity() < required {
-                    self.slots[candidate] =
-                        SelectionVector::try_with_capacity(required, allocator)?;
-                }
-                candidate
-            } else {
-                self.slots
-                    .push(SelectionVector::try_with_capacity(required, allocator)?);
-                self.slots.len() - 1
-            }
+            let candidate = self.next_slot;
+            self.slots[candidate] = SelectionVector::try_with_capacity(required, allocator)?;
+            candidate
         };
         self.next_slot = (slot_idx + 1) % self.slots.len();
         let slot = &mut self.slots[slot_idx];
@@ -395,6 +409,63 @@ mod tests {
                 .allocation_identity()
         };
         assert_eq!(reused_id, first_id);
+    }
+
+    #[test]
+    fn selection_scratch_reuses_non_fifo_release() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut arena = ExpressionScratchArena::default();
+        let first = {
+            let mut lease = arena.lease();
+            lease
+                .selection(8, allocator.clone())
+                .expect("first selection lease")
+                .clone()
+        };
+        let second_id = {
+            let mut lease = arena.lease();
+            lease
+                .selection(8, allocator.clone())
+                .expect("second selection lease")
+                .allocation_identity()
+        };
+
+        let reused_id = {
+            let mut lease = arena.lease();
+            lease
+                .selection(8, allocator)
+                .expect("non-FIFO selection lease")
+                .allocation_identity()
+        };
+
+        assert_eq!(reused_id, second_id);
+        assert_eq!(arena.selection.slots.len(), 2);
+        drop(first);
+    }
+
+    #[test]
+    fn selection_scratch_cache_stays_bounded_with_live_views() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut arena = ExpressionScratchArena::default();
+        let published_count = SELECTION_SCRATCH_CACHE_CAPACITY * 3;
+        let mut published = Vec::with_capacity(published_count);
+
+        for value in 0..published_count {
+            let mut lease = arena.lease();
+            let selection = lease
+                .selection(1, allocator.clone())
+                .expect("selection lease");
+            selection.set(0, value);
+            published.push(selection.clone());
+        }
+
+        assert_eq!(
+            arena.selection.slots.len(),
+            SELECTION_SCRATCH_CACHE_CAPACITY
+        );
+        for (value, selection) in published.iter().enumerate() {
+            assert_eq!(selection.get(0), value);
+        }
     }
 
     #[test]
