@@ -4,14 +4,14 @@
 //! Typed materialized breaker source/sink adapter.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
 use crate::physical::properties::RequiredProperties;
 
-use super::{HandleRef, MaterializedHandle};
+use super::{FoundBits, HandleRef, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
 use crate::runtime::source::SourcePoll;
@@ -24,16 +24,14 @@ pub struct MaterializedSourceExec {
 
 #[derive(Debug)]
 pub struct MaterializedSourceGlobal {
-    pub handle: Arc<MaterializedHandle>,
-    chunks: OnceLock<Arc<[Chunk]>>,
+    reader: MaterializedReader,
     next_chunk: AtomicUsize,
 }
 
 impl MaterializedSourceGlobal {
     pub(crate) fn new(handle: Arc<MaterializedHandle>) -> Self {
         Self {
-            handle,
-            chunks: OnceLock::new(),
+            reader: MaterializedReader::new(handle, "materialized source"),
             next_chunk: AtomicUsize::new(0),
         }
     }
@@ -44,33 +42,26 @@ impl MaterializedSourceGlobal {
     /// binding is lazy. Once bound, polling never returns to the resettable
     /// producer handle and remains valid for this execution attempt.
     pub(crate) fn sealed_chunks(&self) -> Result<&Arc<[Chunk]>> {
-        if let Some(chunks) = self.chunks.get() {
-            return Ok(chunks);
-        }
-        if !self.handle.is_sealed() {
-            return Err(paro_error::internal(
-                "materialized source was scheduled before producer sealed the handle",
-            ));
-        }
-        let chunks = self
-            .handle
-            .sealed_chunks()
-            .ok_or_else(|| paro_error::internal("sealed materialized source chunks are missing"))?;
-        let _ = self.chunks.set(chunks);
-        Ok(self
-            .chunks
-            .get()
-            .expect("materialized source snapshot initialized above"))
+        self.reader.sealed_chunks()
+    }
+
+    #[inline]
+    pub(crate) fn found_bits(&self) -> Option<FoundBits> {
+        self.reader.found_bits()
     }
 
     #[inline]
     fn next_chunk_index(&self) -> usize {
+        // Snapshot publication is handled by MaterializedReader. This atomic
+        // only assigns distinct immutable chunk indices to source tasks.
         self.next_chunk.fetch_add(1, Ordering::Relaxed)
     }
 }
 
 #[derive(Debug, Default)]
 pub struct MaterializedSourceLocal {
+    // Deliberately keep a task-local Arc lease: this removes even the
+    // OnceLock acquire-load from the per-chunk polling path.
     chunks: Option<Arc<[Chunk]>>,
 }
 

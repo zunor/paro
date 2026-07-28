@@ -38,7 +38,7 @@ pub use join::{
     JoinBuildSpillBuffer, JoinBuildStats, JoinExternalModeConfig, JoinPartitionSet,
     JoinProbeSpillBuffer, JoinRuntimeFilterSketch, JoinSpillState, JoinSpillStats, ProbeSpillSet,
 };
-pub use materialized::{FoundBits, MaterializedHandle};
+pub use materialized::{FoundBits, MaterializedHandle, MaterializedReader};
 pub use recursive::{RecursiveDedupSet, RecursiveTableHandle};
 pub use registry::{
     BreakerHandleMetadata, BreakerHandleRegistry, HandleRef, RuntimeBreakerHandle,

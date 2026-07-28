@@ -28,7 +28,7 @@ use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::nested_loop::runtime::compare_with_nulls;
 use crate::operators::output::ensure_transform_output;
-use crate::runtime::breaker::{FoundBits, HandleRef, MaterializedHandle};
+use crate::runtime::breaker::{FoundBits, HandleRef, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
@@ -67,7 +67,7 @@ pub struct ClassicIeJoinSourceExec {
 
 #[derive(Debug)]
 pub struct SortRangeJoinProbeGlobal {
-    pub handle: Arc<MaterializedHandle>,
+    reader: MaterializedReader,
     needs_found_bits: bool,
     found_bits: Mutex<Option<FoundBits>>,
     index: OnceLock<Arc<SortRangeJoinIndex>>,
@@ -75,8 +75,8 @@ pub struct SortRangeJoinProbeGlobal {
 
 #[derive(Debug)]
 pub struct ClassicIeJoinSourceGlobal {
-    left: Arc<MaterializedHandle>,
-    right: Arc<MaterializedHandle>,
+    left: MaterializedReader,
+    right: MaterializedReader,
     cursor: Mutex<Option<ClassicIeJoinCursor>>,
 }
 
@@ -87,7 +87,7 @@ impl SortRangeJoinProbeGlobal {
         }
         let mut bits = self.found_bits.lock();
         if bits.is_none() {
-            *bits = Some(self.handle.initialize_found_bits_for_chunks(build_chunks));
+            *bits = Some(self.reader.initialize_found_bits_for_chunks(build_chunks));
         }
     }
 
@@ -196,7 +196,7 @@ impl SortRangeJoinProbeTransformExec {
         let handle = ctx.handles.get(self.handle)?;
         Ok(TransformGlobal::SortRangeJoinProbe(Arc::new(
             SortRangeJoinProbeGlobal {
-                handle,
+                reader: MaterializedReader::new(handle, "sort-range join probe"),
                 needs_found_bits: self.uses_found_bits(),
                 found_bits: Mutex::new(None),
                 index: OnceLock::new(),
@@ -246,15 +246,7 @@ impl SortRangeJoinProbeTransformExec {
                 "sort-range join probe local state mismatch",
             ));
         };
-        if !global.handle.is_sealed() {
-            return Err(paro_error::internal(
-                "sort-range join probe before build sealed",
-            ));
-        }
-        let build_chunks = global
-            .handle
-            .sealed_chunks()
-            .ok_or_else(|| paro_error::internal("sealed sort-range join build chunks missing"))?;
+        let build_chunks = global.reader.sealed_chunks()?;
 
         if input.is_empty() {
             output.try_set_cardinality(0)?;
@@ -892,8 +884,14 @@ impl ClassicIeJoinSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
         Ok(SourceGlobal::ClassicIeJoin(Arc::new(
             ClassicIeJoinSourceGlobal {
-                left: ctx.handles.get(self.left_handle)?,
-                right: ctx.handles.get(self.right_handle)?,
+                left: MaterializedReader::new(
+                    ctx.handles.get(self.left_handle)?,
+                    "classic IE join left input",
+                ),
+                right: MaterializedReader::new(
+                    ctx.handles.get(self.right_handle)?,
+                    "classic IE join right input",
+                ),
                 cursor: Mutex::new(None),
             },
         )))
@@ -920,11 +918,6 @@ impl ClassicIeJoinSourceExec {
                 "classic IE join source global state mismatch",
             ));
         };
-        if !global.left.is_sealed() || !global.right.is_sealed() {
-            return Err(paro_error::internal(
-                "classic IE join source scheduled before both inputs were sealed",
-            ));
-        }
         ensure_transform_output(output, &self.output_types, VECTOR_SIZE)?;
         let mut guard = global.cursor.lock();
         if guard.is_none() {
@@ -977,12 +970,8 @@ impl ClassicIeJoinSourceExec {
             )));
         }
 
-        let left_chunks = global.left.sealed_chunks().ok_or_else(|| {
-            paro_error::internal("classic IE join left input chunks missing after seal")
-        })?;
-        let right_chunks = global.right.sealed_chunks().ok_or_else(|| {
-            paro_error::internal("classic IE join right input chunks missing after seal")
-        })?;
+        let left_chunks = Arc::clone(global.left.sealed_chunks()?);
+        let right_chunks = Arc::clone(global.right.sealed_chunks()?);
         let left_keys =
             evaluate_classic_ie_join_side_keys(ctx, &left_chunks, &self.conditions, true)?;
         let right_keys =

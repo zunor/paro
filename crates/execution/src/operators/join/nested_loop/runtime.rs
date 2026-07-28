@@ -31,7 +31,7 @@ use crate::expression_executor::executor::ExpressionExecutor;
 
 use crate::operators::output::ensure_source_output;
 use crate::operators::output::ensure_transform_output;
-use crate::runtime::breaker::{FoundBits, HandleRef, MaterializedHandle};
+use crate::runtime::breaker::{FoundBits, HandleRef, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
@@ -59,7 +59,7 @@ pub struct NestedLoopJoinProbeTransformExec {
 
 #[derive(Debug)]
 pub struct NljProbeGlobal {
-    pub handle: Arc<MaterializedHandle>,
+    reader: MaterializedReader,
     pub needs_found_bits: bool,
     found_bits: Mutex<Option<FoundBits>>,
 }
@@ -71,7 +71,7 @@ impl NljProbeGlobal {
         }
         let mut bits = self.found_bits.lock();
         if bits.is_none() {
-            *bits = Some(self.handle.initialize_found_bits_for_chunks(build_chunks));
+            *bits = Some(self.reader.initialize_found_bits_for_chunks(build_chunks));
         }
     }
 
@@ -87,7 +87,7 @@ impl NestedLoopJoinProbeTransformExec {
         let handle = ctx.handles.get(self.handle)?;
         Ok(TransformGlobal::NestedLoopJoinProbe(Arc::new(
             NljProbeGlobal {
-                handle,
+                reader: MaterializedReader::new(handle, "NLJ probe"),
                 needs_found_bits: self.uses_found_bits(),
                 found_bits: Mutex::new(None),
             },
@@ -150,13 +150,7 @@ impl NestedLoopJoinProbeTransformExec {
         let TransformLocal::NestedLoopJoinProbe(local) = local else {
             return Err(paro_error::internal("NLJ probe local state mismatch"));
         };
-        if !global.handle.is_sealed() {
-            return Err(paro_error::internal("NLJ probe before build sealed"));
-        }
-        let build_chunks = global
-            .handle
-            .sealed_chunks()
-            .ok_or_else(|| paro_error::internal("sealed NLJ build chunks missing"))?;
+        let build_chunks = global.reader.sealed_chunks()?;
 
         if input.is_empty() {
             output.try_set_cardinality(0)?;
@@ -833,7 +827,7 @@ impl NljUnmatchedSourceExec {
             return Err(paro_error::internal("NLJ unmatched source local mismatch"));
         };
         let build_chunks = global.sealed_chunks()?;
-        let found_bits = global.handle.found_bits();
+        let found_bits = global.found_bits();
 
         ensure_source_output(output, &self.output_types, VECTOR_SIZE)?;
         let left_null_count = self.left_output_types.len();
