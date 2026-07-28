@@ -157,16 +157,16 @@ impl RowsetSourceExec {
         loop {
             ctx.cancel.check()?;
             if local.reader.is_none() {
-                if local.assigned_segment_consumed {
-                    return Ok(SourcePoll::Finished);
-                }
-                let segment_idx = if let Some(segment_idx) = local.assigned_segment {
-                    local.assigned_segment_consumed = true;
+                let segment_idx = if let Some(end) = local.assigned_segment_end {
+                    if local.next_morsel >= end {
+                        return Ok(SourcePoll::Finished);
+                    }
+                    let segment_idx = local.next_morsel;
+                    local.next_morsel += 1;
                     segment_idx
                 } else {
                     global.next_segment.fetch_add(1, Ordering::AcqRel)
                 };
-                local.next_morsel = segment_idx;
                 let Some((rowset, segment)) = global.segments.get(segment_idx) else {
                     return Ok(SourcePoll::Finished);
                 };

@@ -10,7 +10,6 @@
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -611,11 +610,10 @@ impl SourceCursorBench {
     }
 
     fn run_once(&mut self) -> usize {
-        self.global
-            .chunk()
-            .expect("source global should be chunk scan")
-            .next_chunk
-            .store(0, Ordering::Release);
+        self.local
+            .chunk_mut()
+            .expect("source local should be chunk scan")
+            .next_chunk = 0;
 
         let mut rows = 0usize;
         loop {

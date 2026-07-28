@@ -33,16 +33,15 @@ pub struct RowsetSourceGlobal {
 #[derive(Debug, Default)]
 pub struct RowsetSourceLocal {
     pub next_morsel: usize,
-    pub assigned_segment: Option<usize>,
-    pub assigned_segment_consumed: bool,
+    pub assigned_segment_end: Option<usize>,
     pub reader: Option<TabletReader>,
 }
 
 impl RowsetSourceLocal {
-    pub fn assign_segment_morsel(&mut self, segment_idx: usize) {
-        self.assigned_segment = Some(segment_idx);
-        self.assigned_segment_consumed = false;
-        self.next_morsel = segment_idx;
+    pub fn assign_segment_range(&mut self, start: usize, end: usize) {
+        debug_assert!(start < end);
+        self.next_morsel = start;
+        self.assigned_segment_end = Some(end);
     }
 }
 
@@ -60,19 +59,19 @@ pub struct ValuesSourceLocal {
 #[derive(Debug)]
 pub struct ChunkSourceGlobal {
     pub chunks: Arc<[Chunk]>,
-    pub next_chunk: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
 pub struct ChunkSourceLocal {
-    pub assigned_chunk: Option<usize>,
-    pub assigned_chunk_consumed: bool,
+    pub next_chunk: usize,
+    pub assigned_chunk_end: Option<usize>,
 }
 
 impl ChunkSourceLocal {
-    pub fn assign_chunk_morsel(&mut self, chunk_idx: usize) {
-        self.assigned_chunk = Some(chunk_idx);
-        self.assigned_chunk_consumed = false;
+    pub fn assign_chunk_range(&mut self, start: usize, end: usize) {
+        debug_assert!(start < end);
+        self.next_chunk = start;
+        self.assigned_chunk_end = Some(end);
     }
 }
 
