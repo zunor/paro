@@ -215,6 +215,60 @@ impl Chunk {
         }
     }
 
+    /// Replace this chunk with a zero-copy selected view of another chunk.
+    ///
+    /// Unlike [`Self::try_slice`], this does not first install the source
+    /// columns in `self`. View-producing operators can therefore reuse their
+    /// output slot without materializing temporary flat vectors between
+    /// batches. An empty `column_ids` slice selects every source column.
+    pub fn try_reference_selection(
+        &mut self,
+        other: &Self,
+        column_ids: &[usize],
+        selection: VectorSelection,
+    ) -> Result<()> {
+        let count = selection.len();
+        debug_assert!(
+            (0..count).all(|idx| selection.physical_index(idx) < other.count),
+            "selected chunk view row is out of bounds"
+        );
+        let output_len = if column_ids.is_empty() {
+            other.column_count()
+        } else {
+            column_ids.len()
+        };
+
+        for output_idx in 0..output_len {
+            let source_idx = if column_ids.is_empty() {
+                output_idx
+            } else {
+                column_ids[output_idx]
+            };
+            let source = other.data.get(source_idx).ok_or_else(|| {
+                crate::error::internal(format!(
+                    "selected chunk view column {source_idx} is out of bounds for {} columns",
+                    other.column_count()
+                ))
+            })?;
+            let selected = Arc::new(Vector::try_gather_ref(
+                Arc::clone(source),
+                selection.clone(),
+            )?);
+            if output_idx < self.data.len() {
+                self.data[output_idx] = selected;
+            } else {
+                self.data.push(selected);
+            }
+        }
+        self.data.truncate(output_len);
+        self.count = count;
+        self.capacity = other.capacity.max(count);
+        self.initial_capacity = self.capacity;
+        self.reset_state = None;
+        self.allocator = other.allocator.clone();
+        Ok(())
+    }
+
     pub fn move_from(&mut self, other: &mut Self) {
         self.count = other.count;
         self.capacity = other.capacity;

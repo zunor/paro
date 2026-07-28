@@ -990,6 +990,45 @@ fn test_slice_reuses_selection_allocation_across_columns() {
 }
 
 #[test]
+fn test_reference_selection_replaces_view_without_materialized_output_buffers() {
+    let source = make_int_string_chunk(&[10, 20, 30], &["ten", "twenty", "thirty"]);
+    let selection = crate::test_utils::test_selection(vec![2, 0]);
+    let selection_allocation = selection.allocation_identity();
+    let mut view = Chunk::try_init_empty(
+        &[LogicalType::Varchar, LogicalType::Integer],
+        source.allocator().clone(),
+    )
+    .expect("view chunk should initialize");
+
+    view.try_reference_selection(
+        &source,
+        &[1, 0],
+        crate::vector::VectorSelection::from(&selection),
+    )
+    .expect("selected view should initialize");
+
+    assert_eq!(view.size(), 2);
+    assert_eq!(view.get_value(0, 0), Some(Value::Varchar("thirty".into())));
+    assert_eq!(view.get_value(1, 1), Some(Value::Integer(10)));
+    assert_eq!(
+        view.column(0)
+            .unwrap()
+            .sel_vector()
+            .unwrap()
+            .allocation_identity(),
+        selection_allocation
+    );
+    assert_eq!(
+        view.column(1)
+            .unwrap()
+            .sel_vector()
+            .unwrap()
+            .allocation_identity(),
+        selection_allocation
+    );
+}
+
+#[test]
 fn test_slice_collapses_nested_dictionary() {
     let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
     let dict = Arc::new(crate::test_utils::test_dictionary(base, vec![3, 1, 2]));

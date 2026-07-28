@@ -741,7 +741,7 @@ fn scratch_layout_for(
     let mut transform_layouts = Vec::with_capacity(spec.transforms.len());
     for transform in &spec.transforms {
         current = transform.output_row_type(&current);
-        transform_layouts.push(chunk_layout(&current));
+        transform_layouts.push(transform_chunk_layout(transform, &current));
     }
     Ok(PipelineScratchLayout::new(
         chunk_layout(&source),
@@ -752,6 +752,15 @@ fn scratch_layout_for(
 
 fn chunk_layout(row_type: &RowType) -> ChunkLayout {
     ChunkLayout::new(row_type.types.to_vec(), VECTOR_SIZE)
+}
+
+fn transform_chunk_layout(transform: &TransformSpec, row_type: &RowType) -> ChunkLayout {
+    match transform {
+        TransformSpec::Filter(_) | TransformSpec::Limit(_) => {
+            ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
+        }
+        _ => chunk_layout(row_type),
+    }
 }
 
 fn source_output_row_type(
@@ -1121,6 +1130,18 @@ mod tests {
         );
         assert_eq!(program.scratch.source_output.types.len(), 2);
         assert_eq!(program.scratch.transform_outputs.len(), 3);
+        assert_eq!(
+            program.scratch.transform_outputs[0].kind,
+            crate::runtime::ChunkLayoutKind::View
+        );
+        assert_eq!(
+            program.scratch.transform_outputs[1].kind,
+            crate::runtime::ChunkLayoutKind::Materialized
+        );
+        assert_eq!(
+            program.scratch.transform_outputs[2].kind,
+            crate::runtime::ChunkLayoutKind::View
+        );
         assert_eq!(program.scratch.transform_outputs[1].types, output.types);
     }
 

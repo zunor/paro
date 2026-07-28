@@ -179,6 +179,15 @@ impl SelectionVector {
         self.buffer.allocation_identity()
     }
 
+    /// Whether the backing index buffer can be mutated without copy-on-write.
+    ///
+    /// Runtime scratch pools use this to avoid taking an exclusive copy of a
+    /// selection that is still referenced by a zero-copy dictionary result.
+    #[inline]
+    pub fn is_uniquely_owned(&self) -> bool {
+        self.buffer.is_uniquely_owned()
+    }
+
     pub fn allocation_size(&self) -> usize {
         self.buffer.size()
     }

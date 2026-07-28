@@ -21,6 +21,13 @@ use super::state::{SinkLocal, SourceLocal, TransformLocal};
 pub struct ChunkLayout {
     pub types: Box<[LogicalType]>,
     pub capacity: usize,
+    pub kind: ChunkLayoutKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkLayoutKind {
+    Materialized,
+    View,
 }
 
 impl ChunkLayout {
@@ -28,11 +35,29 @@ impl ChunkLayout {
         Self {
             types: types.into(),
             capacity,
+            kind: ChunkLayoutKind::Materialized,
+        }
+    }
+
+    pub fn view(types: impl Into<Box<[LogicalType]>>, capacity: usize) -> Self {
+        Self {
+            types: types.into(),
+            capacity,
+            kind: ChunkLayoutKind::View,
         }
     }
 
     pub fn create_chunk(&self, allocator: Arc<dyn Allocator>) -> Result<Chunk> {
-        Chunk::try_initialize(&self.types, self.capacity, allocator)
+        match self.kind {
+            ChunkLayoutKind::Materialized => {
+                Chunk::try_initialize(&self.types, self.capacity, allocator)
+            }
+            ChunkLayoutKind::View => {
+                let mut chunk = Chunk::try_init_empty(&self.types, allocator)?;
+                chunk.set_capacity(self.capacity);
+                Ok(chunk)
+            }
+        }
     }
 }
 
@@ -91,8 +116,49 @@ pub struct ExpressionScratchArena {
     // of per-operator locals. Decoded-vector and scalar arenas follow the same
     // borrow boundary in later streaming phases.
     generation: u64,
-    selection: Option<SelectionVector>,
-    selection_aux: Option<SelectionVector>,
+    selection: SelectionScratchPool,
+    selection_aux: SelectionScratchPool,
+}
+
+#[derive(Debug, Default)]
+struct SelectionScratchPool {
+    slots: Vec<SelectionVector>,
+    // FIFO consumers release older published views first, so a round-robin
+    // cursor finds the next reusable buffer in O(1) without scanning an
+    // unbounded completed-output backlog.
+    next_slot: usize,
+}
+
+impl SelectionScratchPool {
+    fn lease(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<&mut SelectionVector> {
+        let required = capacity.max(1);
+        let slot_idx = if self.slots.is_empty() {
+            self.slots
+                .push(SelectionVector::try_with_capacity(required, allocator)?);
+            0
+        } else {
+            let candidate = self.next_slot.min(self.slots.len() - 1);
+            if self.slots[candidate].is_uniquely_owned() {
+                if self.slots[candidate].capacity() < required {
+                    self.slots[candidate] =
+                        SelectionVector::try_with_capacity(required, allocator)?;
+                }
+                candidate
+            } else {
+                self.slots
+                    .push(SelectionVector::try_with_capacity(required, allocator)?);
+                self.slots.len() - 1
+            }
+        };
+        self.next_slot = (slot_idx + 1) % self.slots.len();
+        let slot = &mut self.slots[slot_idx];
+        slot.set_len(capacity);
+        Ok(slot)
+    }
 }
 
 impl ExpressionScratchArena {
@@ -128,7 +194,7 @@ impl ExpressionScratchLease<'_> {
         capacity: usize,
         allocator: Arc<dyn Allocator>,
     ) -> Result<&mut SelectionVector> {
-        selection_slot(&mut self.arena.selection, capacity, allocator)
+        self.arena.selection.lease(capacity, allocator)
     }
 
     pub fn selection_aux(
@@ -136,7 +202,7 @@ impl ExpressionScratchLease<'_> {
         capacity: usize,
         allocator: Arc<dyn Allocator>,
     ) -> Result<&mut SelectionVector> {
-        selection_slot(&mut self.arena.selection_aux, capacity, allocator)
+        self.arena.selection_aux.lease(capacity, allocator)
     }
 
     pub fn selection_pair(
@@ -144,36 +210,10 @@ impl ExpressionScratchLease<'_> {
         capacity: usize,
         allocator: Arc<dyn Allocator>,
     ) -> Result<(&mut SelectionVector, &mut SelectionVector)> {
-        selection_slot(&mut self.arena.selection, capacity, allocator.clone())?;
-        selection_slot(&mut self.arena.selection_aux, capacity, allocator)?;
-        Ok((
-            self.arena
-                .selection
-                .as_mut()
-                .expect("primary selection scratch initialized"),
-            self.arena
-                .selection_aux
-                .as_mut()
-                .expect("secondary selection scratch initialized"),
-        ))
+        let primary = self.arena.selection.lease(capacity, allocator.clone())?;
+        let auxiliary = self.arena.selection_aux.lease(capacity, allocator)?;
+        Ok((primary, auxiliary))
     }
-}
-
-fn selection_slot(
-    slot: &mut Option<SelectionVector>,
-    capacity: usize,
-    allocator: Arc<dyn Allocator>,
-) -> Result<&mut SelectionVector> {
-    let required = capacity.max(1);
-    if slot
-        .as_ref()
-        .is_none_or(|selection| selection.capacity() < required)
-    {
-        *slot = Some(SelectionVector::try_with_capacity(required, allocator)?);
-    }
-    let selection = slot.as_mut().expect("selection scratch initialized");
-    selection.set_len(capacity);
-    Ok(selection)
 }
 
 #[derive(Debug)]
@@ -311,6 +351,50 @@ mod tests {
         assert_eq!(scratch.transform_chunks.len(), 1);
         assert_eq!(scratch.transform_chunks[0].column_count(), 1);
         assert_eq!(scratch.transform_chunks[0].types(), &[LogicalType::Boolean]);
+    }
+
+    #[test]
+    fn view_layout_avoids_materialized_vector_storage() {
+        let layout = ChunkLayout::view(vec![LogicalType::Integer], 8);
+        let chunk = layout
+            .create_chunk(paro_common::test_utils::test_allocator())
+            .expect("view scratch allocation");
+
+        assert_eq!(chunk.column_count(), 1);
+        assert_eq!(chunk.capacity(), 8);
+        assert_eq!(chunk.get_allocation_size(), 0);
+    }
+
+    #[test]
+    fn selection_scratch_rotates_while_published_view_is_live() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut arena = ExpressionScratchArena::default();
+        let (first_id, published) = {
+            let mut lease = arena.lease();
+            let selection = lease
+                .selection(8, allocator.clone())
+                .expect("first selection lease");
+            (selection.allocation_identity(), selection.clone())
+        };
+
+        let second_id = {
+            let mut lease = arena.lease();
+            lease
+                .selection(8, allocator.clone())
+                .expect("second selection lease")
+                .allocation_identity()
+        };
+        assert_ne!(second_id, first_id);
+
+        drop(published);
+        let reused_id = {
+            let mut lease = arena.lease();
+            lease
+                .selection(8, allocator)
+                .expect("reused selection lease")
+                .allocation_identity()
+        };
+        assert_eq!(reused_id, first_id);
     }
 
     #[test]
