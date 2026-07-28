@@ -14,14 +14,14 @@ use super::property_graph_support::{
 };
 use paro_catalog::catalog::Catalog;
 use paro_catalog::database_catalog::ParoCatalog;
-use paro_catalog::entry::{graph_schema_fingerprint, PropertyGraphCatalogEntry};
+use paro_catalog::entry::{graph_schema_fingerprint, CatalogEntry, PropertyGraphCatalogEntry};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_context::{GraphIndexProvider, GraphRegistry};
 use paro_storage::index::graph::{
-    DeltaAdjacency, GraphManifest, GraphProjectionIndex, GraphState, GraphStatistics,
-    GraphStorageGeneration, VertexBuildInput,
+    lock_graph_artifact_io, DeltaAdjacency, GraphManifest, GraphProjectionIndex, GraphState,
+    GraphStatistics, GraphStorageGeneration, VertexBuildInput,
 };
 use paro_storage::metrics::storage_metrics;
 use std::collections::{HashMap, HashSet};
@@ -49,7 +49,6 @@ struct GraphMaintenanceState {
 static GRAPH_BACKGROUND_MAINTENANCE: LazyLock<Mutex<HashMap<String, GraphMaintenanceState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static GRAPH_REBUILD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static GRAPH_REBUILD_IO_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug)]
 enum DeltaPlan {
@@ -433,9 +432,41 @@ pub(crate) fn refresh_scanned_graph(
     background_graph_entry: Option<Arc<PropertyGraphCatalogEntry>>,
     background_visible_start_time: u64,
 ) -> Result<()> {
-    let _graph_rebuild_guard = GRAPH_REBUILD_IO_GUARD
-        .lock()
-        .expect("graph rebuild I/O mutex poisoned");
+    let _graph_artifact_guard = lock_graph_artifact_io();
+    refresh_scanned_graph_locked(
+        graph_id,
+        graph_index,
+        graph_registry,
+        db_path,
+        graph_name,
+        schema_fingerprint,
+        scanned,
+        valid_through_ts,
+        refresh_policy,
+        background_catalog,
+        background_graph_index,
+        background_graph_registry,
+        background_graph_entry,
+        background_visible_start_time,
+    )
+}
+
+fn refresh_scanned_graph_locked(
+    graph_id: &GraphId,
+    graph_index: &dyn GraphIndexProvider,
+    graph_registry: &dyn GraphRegistry,
+    db_path: &str,
+    graph_name: &str,
+    schema_fingerprint: &str,
+    scanned: &ScannedGraphInputs,
+    valid_through_ts: u64,
+    refresh_policy: GraphRefreshPolicy,
+    background_catalog: Option<Arc<ParoCatalog>>,
+    background_graph_index: Option<Arc<dyn GraphIndexProvider>>,
+    background_graph_registry: Option<Arc<dyn GraphRegistry>>,
+    background_graph_entry: Option<Arc<PropertyGraphCatalogEntry>>,
+    background_visible_start_time: u64,
+) -> Result<()> {
     let Some(snapshot) = graph_index.snapshot(graph_id) else {
         persist_and_publish_rebuild(
             graph_id,
@@ -596,7 +627,13 @@ pub fn refresh_property_graph_committed(
         &graph_info.schema,
         &graph_info.graph_name,
     );
-    refresh_scanned_graph(
+    let _graph_artifact_guard = lock_graph_artifact_io();
+    if !property_graph_entry_is_current(catalog.as_ref(), graph_entry.as_ref())
+        || graph_index.snapshot(&graph_id).is_none()
+    {
+        return Ok(());
+    }
+    refresh_scanned_graph_locked(
         &graph_id,
         graph_index.as_ref(),
         graph_registry.as_ref(),
@@ -621,32 +658,23 @@ pub fn rebuild_property_graph_committed(
     graph_entry: Arc<PropertyGraphCatalogEntry>,
     visible_start_time: u64,
 ) -> Result<()> {
-    let _graph_rebuild_guard = GRAPH_REBUILD_IO_GUARD
-        .lock()
-        .expect("graph rebuild I/O mutex poisoned");
+    let _graph_artifact_guard = lock_graph_artifact_io();
     let graph_info = graph_entry.info.clone();
-    let committed_txn = CatalogSnapshot::default();
-    let Ok(schema) = catalog.get_schema(&committed_txn, &graph_info.schema) else {
-        return Ok(());
-    };
-    if schema
-        .get_property_graph(&committed_txn, &graph_info.graph_name)
-        .is_err()
-    {
+    if !property_graph_entry_is_current(catalog.as_ref(), graph_entry.as_ref()) {
         return Ok(());
     }
-    let schema_fingerprint = graph_schema_fingerprint(&graph_info);
-    let visible_txn = CatalogSnapshot::read_only(visible_start_time);
-    let scanned = scan_graph_inputs_with_catalog(catalog.as_ref(), &visible_txn, &graph_info)?;
     let graph_id = GraphId::new(
         &graph_info.catalog,
         &graph_info.schema,
         &graph_info.graph_name,
     );
-    let next_generation_id = graph_index
-        .snapshot(&graph_id)
-        .map(|snapshot| snapshot.generation_id().saturating_add(1))
-        .unwrap_or(0);
+    let Some(snapshot) = graph_index.snapshot(&graph_id) else {
+        return Ok(());
+    };
+    let schema_fingerprint = graph_schema_fingerprint(&graph_info);
+    let visible_txn = CatalogSnapshot::read_only(visible_start_time);
+    let scanned = scan_graph_inputs_with_catalog(catalog.as_ref(), &visible_txn, &graph_info)?;
+    let next_generation_id = snapshot.generation_id().saturating_add(1);
     persist_and_publish_rebuild(
         &graph_id,
         graph_index.as_ref(),
@@ -666,6 +694,10 @@ pub fn mark_property_graph_stale(
     graph_registry: &dyn GraphRegistry,
     graph_entry: &PropertyGraphCatalogEntry,
 ) -> Result<()> {
+    let _graph_artifact_guard = lock_graph_artifact_io();
+    if !property_graph_entry_is_current(catalog, graph_entry) {
+        return Ok(());
+    }
     let graph_name = &graph_entry.info.graph_name;
     let graph_id = GraphId::new(
         &graph_entry.info.catalog,
@@ -711,4 +743,17 @@ pub fn mark_property_graph_stale(
     }
 
     Ok(())
+}
+
+fn property_graph_entry_is_current(
+    catalog: &ParoCatalog,
+    graph_entry: &PropertyGraphCatalogEntry,
+) -> bool {
+    let committed_txn = CatalogSnapshot::default();
+    let Ok(schema) = catalog.get_schema(&committed_txn, &graph_entry.info.schema) else {
+        return false;
+    };
+    schema
+        .get_property_graph(&committed_txn, &graph_entry.info.graph_name)
+        .is_ok_and(|current| current.object_id() == graph_entry.object_id())
 }
