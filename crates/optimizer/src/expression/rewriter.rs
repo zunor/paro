@@ -8,6 +8,7 @@ use std::ops::ControlFlow;
 use paro_planner::expression::Expression;
 use paro_planner::operator::LogicalOperator;
 use paro_planner::plan::LogicalPlan;
+use paro_planner::visitor::enumerate_expressions;
 
 use crate::rules::rule::{Rule, RuleResult};
 
@@ -63,171 +64,13 @@ impl ExpressionRewriter {
         // for the `Rule::apply` context slot so we never clone a full [`LogicalOperator`].
         let rule_ctx = LogicalOperator::DummyScan;
 
-        match op {
-            LogicalOperator::Filter(filter) => {
-                let new_exprs: Vec<_> = filter
-                    .expressions
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                filter.expressions = new_exprs;
-            }
-            LogicalOperator::Projection(proj) => {
-                let new_exprs: Vec<_> = proj
-                    .expressions
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                proj.expressions = new_exprs;
-            }
-            LogicalOperator::ExternalProject(project) => {
-                for expr in &mut project.expressions {
-                    expr.expression = self.rewrite_expression(expr.expression.clone(), &rule_ctx);
-                }
-            }
-            LogicalOperator::ExternalTable(table) => {
-                table.call_expression =
-                    self.rewrite_expression(table.call_expression.clone(), &rule_ctx);
-            }
-            LogicalOperator::Aggregate(agg) => {
-                let new_groups: Vec<_> = agg
-                    .groups
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                let new_aggs: Vec<_> = agg
-                    .aggregates
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                agg.groups = new_groups;
-                agg.aggregates = new_aggs;
-                agg.recompute_returned_types();
-            }
-            LogicalOperator::Join(join) => {
-                use paro_planner::operator::Join;
-                match join {
-                    Join::Comparison(cj) => {
-                        for cond in &mut cj.conditions {
-                            cond.left = self.rewrite_expression(cond.left.clone(), &rule_ctx);
-                            cond.right = self.rewrite_expression(cond.right.clone(), &rule_ctx);
-                        }
-                    }
-                    Join::Any(aj) => {
-                        aj.condition = self.rewrite_expression(aj.condition.clone(), &rule_ctx);
-                    }
-                    Join::Cross(_) => {}
-                }
-            }
-            LogicalOperator::Order(order) => {
-                for order_by in &mut order.orders {
-                    order_by.expression =
-                        self.rewrite_expression(order_by.expression.clone(), &rule_ctx);
-                }
-            }
-            LogicalOperator::TopN(topn) => {
-                for order_by in &mut topn.orders {
-                    order_by.expression =
-                        self.rewrite_expression(order_by.expression.clone(), &rule_ctx);
-                }
-            }
-            LogicalOperator::Window(window) => {
-                // Window expressions are WindowExpression, not Expression
-                // We need to rewrite the children inside each window expression
-                for window_expr in &mut window.expressions {
-                    let new_children: Vec<_> = window_expr
-                        .children
-                        .iter()
-                        .map(|c| self.rewrite_expression(c.clone(), &rule_ctx))
-                        .collect();
-                    window_expr.children = new_children;
+        enumerate_expressions(op, |expr| {
+            *expr = self.rewrite_expression(expr.clone(), &rule_ctx);
+        });
 
-                    let new_partitions: Vec<_> = window_expr
-                        .partitions
-                        .iter()
-                        .map(|p| self.rewrite_expression(p.clone(), &rule_ctx))
-                        .collect();
-                    window_expr.partitions = new_partitions;
-
-                    for order in &mut window_expr.orders {
-                        order.expression =
-                            self.rewrite_expression(order.expression.clone(), &rule_ctx);
-                    }
-                }
-            }
-            LogicalOperator::EmptyResult(_) => {}
-            LogicalOperator::Update(update) => {
-                let new_exprs: Vec<_> = update
-                    .expressions
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                update.expressions = new_exprs;
-            }
-            LogicalOperator::SearchScan(search) => {
-                search.projections = search
-                    .projections
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                search.absorbed_predicates = search
-                    .absorbed_predicates
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                search.residual_predicates = search
-                    .residual_predicates
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                search.score_expression =
-                    self.rewrite_expression(search.score_expression.clone(), &rule_ctx);
-            }
-            LogicalOperator::FullTextFilterScan(scan) => {
-                scan.match_expression =
-                    self.rewrite_expression(scan.match_expression.clone(), &rule_ctx);
-                scan.other_predicates = scan
-                    .other_predicates
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-                scan.residual_predicates = scan
-                    .residual_predicates
-                    .iter()
-                    .map(|expr| self.rewrite_expression(expr.clone(), &rule_ctx))
-                    .collect();
-            }
-            // Operators without expressions to rewrite
-            LogicalOperator::Get(_)
-            | LogicalOperator::Limit(_)
-            | LogicalOperator::ExpressionGet(_)
-            | LogicalOperator::DelimGet(_)
-            | LogicalOperator::DependentJoin(_)
-            | LogicalOperator::SetOperation(_)
-            | LogicalOperator::Distinct(_)
-            | LogicalOperator::Explain(_)
-            | LogicalOperator::MaterializedCTE(_)
-            | LogicalOperator::RecursiveCTE(_)
-            | LogicalOperator::CTERef(_)
-            | LogicalOperator::TableFunctionGet(_)
-            | LogicalOperator::Insert(_)
-            | LogicalOperator::Delete(_)
-            | LogicalOperator::CopyTo(_)
-            | LogicalOperator::Alter(_)
-            | LogicalOperator::CreateTable(_)
-            | LogicalOperator::CreateRoutine(_)
-            | LogicalOperator::CreateSequence(_)
-            | LogicalOperator::CreateSchema(_)
-            | LogicalOperator::CreateIndex(_)
-            | LogicalOperator::CreateView(_)
-            | LogicalOperator::CreatePropertyGraph(_)
-            | LogicalOperator::DropPropertyGraph(_)
-            | LogicalOperator::RefreshPropertyGraph(_)
-            | LogicalOperator::Drop(_)
-            | LogicalOperator::GraphMatch(_)
-            | LogicalOperator::GraphScan(_)
-            | LogicalOperator::GraphExpand(_)
-            | LogicalOperator::DummyScan => {}
+        // Aggregate output types are derived from their rewritten roots.
+        if let LogicalOperator::Aggregate(aggregate) = op {
+            aggregate.recompute_returned_types();
         }
     }
 
@@ -373,6 +216,7 @@ impl Default for ExpressionRewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::constant_folding::ConstantFoldingRule;
     use crate::rules::expression_matcher::{
         ComparisonExpressionMatcher, ConstantExpressionMatcher, ExpressionMatcher,
         FoldableConstantMatcher,
@@ -381,7 +225,7 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ComparisonExpression, ComparisonType, ConstantExpression};
-    use paro_planner::operator::{Filter, Projection};
+    use paro_planner::operator::{Distinct, ExpressionGet, Filter, Limit, Projection};
 
     /// A test rule that adds 1 to integer constants less than 100.
     /// This prevents infinite loops by only applying to small values.
@@ -661,6 +505,81 @@ mod tests {
                 assert_eq!(c.value, Value::Integer(100));
             }
         }
+    }
+
+    #[test]
+    fn test_visit_operator_expression_get() {
+        let mut rewriter = ExpressionRewriter::new();
+        rewriter.add_rule(Box::new(ConstantFoldingRule::new()));
+
+        let foldable = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            make_constant(42),
+            make_constant(42),
+        ));
+        let mut op = LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![vec![foldable]],
+            vec!["col0".to_string()],
+            vec![LogicalType::Boolean],
+        ));
+
+        rewriter.visit_operator(&mut op);
+
+        let LogicalOperator::ExpressionGet(values) = op else {
+            panic!("expected expression get");
+        };
+        let Expression::Constant(constant) = &values.expressions[0][0] else {
+            panic!("expected foldable VALUES root to be rewritten");
+        };
+        assert_eq!(constant.value, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_visit_canonical_operator_expression_roots() {
+        let mut rewriter = ExpressionRewriter::new();
+        rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
+
+        let values = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![vec![make_constant(97)]],
+            vec!["col0".to_string()],
+            vec![LogicalType::Integer],
+        )));
+        let distinct = LogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::distinct_on(
+            vec![make_constant(98)],
+            values,
+        )));
+        let mut op = LogicalOperator::Limit(Limit::new(
+            distinct,
+            Some(make_constant(99)),
+            Some(make_constant(99)),
+        ));
+
+        rewriter.visit_operator(&mut op);
+
+        let LogicalOperator::Limit(limit) = op else {
+            panic!("expected limit");
+        };
+        assert_constant_integer(limit.limit.as_ref(), 100);
+        assert_constant_integer(limit.offset.as_ref(), 100);
+
+        let LogicalOperator::Distinct(distinct) = &limit.child.operator else {
+            panic!("expected distinct");
+        };
+        assert_constant_integer(distinct.distinct_targets.first(), 100);
+
+        let LogicalOperator::ExpressionGet(values) = &distinct.child.operator else {
+            panic!("expected expression get");
+        };
+        assert_constant_integer(values.expressions[0].first(), 100);
+    }
+
+    fn assert_constant_integer(expr: Option<&Expression>, expected: i32) {
+        let Some(Expression::Constant(constant)) = expr else {
+            panic!("expected integer constant");
+        };
+        assert_eq!(constant.value, Value::Integer(expected));
     }
 
     #[test]
