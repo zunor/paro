@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::expression::{Expression, WindowFrameBound};
+use crate::expression::{Expression, WindowExpression, WindowFrameBound};
 
 pub struct ExpressionIterator;
 
@@ -52,21 +52,7 @@ impl ExpressionIterator {
                 }
             }
             Expression::Window(e) => {
-                for child in &e.children {
-                    f(child);
-                }
-                for partition in &e.partitions {
-                    f(partition);
-                }
-                for order in &e.orders {
-                    f(&order.expression);
-                }
-                if let WindowFrameBound::Offset(expr) = &e.frame.start_bound {
-                    f(expr);
-                }
-                if let WindowFrameBound::Offset(expr) = &e.frame.end_bound {
-                    f(expr);
-                }
+                Self::enumerate_window_children(e, f);
             }
             Expression::Constant(_)
             | Expression::ColumnRef(_)
@@ -121,26 +107,51 @@ impl ExpressionIterator {
                 }
             }
             Expression::Window(e) => {
-                for child in &mut e.children {
-                    f(child);
-                }
-                for partition in &mut e.partitions {
-                    f(partition);
-                }
-                for order in &mut e.orders {
-                    f(&mut order.expression);
-                }
-                if let WindowFrameBound::Offset(expr) = &mut e.frame.start_bound {
-                    f(expr);
-                }
-                if let WindowFrameBound::Offset(expr) = &mut e.frame.end_bound {
-                    f(expr);
-                }
+                Self::enumerate_window_children_mut(e, f);
             }
             Expression::Constant(_)
             | Expression::ColumnRef(_)
             | Expression::Parameter(_)
             | Expression::Reference(_) => {}
+        }
+    }
+
+    pub fn enumerate_window_children(window: &WindowExpression, mut f: impl FnMut(&Expression)) {
+        for child in &window.children {
+            f(child);
+        }
+        for partition in &window.partitions {
+            f(partition);
+        }
+        for order in &window.orders {
+            f(&order.expression);
+        }
+        if let WindowFrameBound::Offset(expr) = &window.frame.start_bound {
+            f(expr);
+        }
+        if let WindowFrameBound::Offset(expr) = &window.frame.end_bound {
+            f(expr);
+        }
+    }
+
+    pub fn enumerate_window_children_mut(
+        window: &mut WindowExpression,
+        mut f: impl FnMut(&mut Expression),
+    ) {
+        for child in &mut window.children {
+            f(child);
+        }
+        for partition in &mut window.partitions {
+            f(partition);
+        }
+        for order in &mut window.orders {
+            f(&mut order.expression);
+        }
+        if let WindowFrameBound::Offset(expr) = &mut window.frame.start_bound {
+            f(expr);
+        }
+        if let WindowFrameBound::Offset(expr) = &mut window.frame.end_bound {
+            f(expr);
         }
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use paro_planner::expression::Expression;
+use paro_planner::expression::{Expression, ExpressionIterator};
 use paro_planner::operator::{Join, JoinType, LogicalOperator, LogicalOperatorType};
 
 use crate::join_order::query_graph::FilterInfo;
@@ -245,80 +245,18 @@ impl RelationManager {
                 bindings.clear();
                 false
             }
-            Expression::Constant(_) | Expression::Parameter(_) => true,
-            Expression::Function(func) => {
-                for child in &func.children {
-                    if !self.extract_bindings(child, bindings) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Expression::Cast(cast) => self.extract_bindings(&cast.child, bindings),
-            Expression::Conjunction(conj) => {
-                for child in &conj.children {
-                    if !self.extract_bindings(child, bindings) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Expression::Comparison(comp) => {
-                self.extract_bindings(&comp.left, bindings)
-                    && self.extract_bindings(&comp.right, bindings)
-            }
-            Expression::Operator(op) => {
-                for child in &op.children {
-                    if !self.extract_bindings(child, bindings) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Expression::Case(case) => {
-                self.extract_bindings(&case.check, bindings)
-                    && self.extract_bindings(&case.result_if_true, bindings)
-                    && self.extract_bindings(&case.result_if_false, bindings)
-            }
-            Expression::Aggregate(agg) => {
-                for child in &agg.children {
-                    if !self.extract_bindings(child, bindings) {
-                        return false;
-                    }
-                }
-                if let Some(filter) = &agg.filter {
-                    if !self.extract_bindings(filter, bindings) {
-                        return false;
-                    }
-                }
-                for order in &agg.order_bys {
-                    if !self.extract_bindings(&order.expression, bindings) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Expression::Window(window) => {
-                for child in &window.children {
-                    if !self.extract_bindings(child, bindings) {
-                        return false;
-                    }
-                }
-                for partition in &window.partitions {
-                    if !self.extract_bindings(partition, bindings) {
-                        return false;
-                    }
-                }
-                for order in &window.orders {
-                    if !self.extract_bindings(&order.expression, bindings) {
-                        return false;
-                    }
-                }
-                true
-            }
             Expression::Subquery(_) => {
                 // Subqueries cannot be reordered
                 false
+            }
+            _ => {
+                let mut reorderable = true;
+                ExpressionIterator::enumerate_children(expression, |child| {
+                    if reorderable && !self.extract_bindings(child, bindings) {
+                        reorderable = false;
+                    }
+                });
+                reorderable
             }
         }
     }
@@ -559,6 +497,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
+        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use paro_planner::operator::{
         ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
@@ -602,6 +541,31 @@ mod tests {
     fn test_relation_manager_new() {
         let manager = RelationManager::new();
         assert_eq!(manager.num_relations(), 0);
+    }
+
+    #[test]
+    fn test_extract_bindings_visits_window_frame_offsets() {
+        let mut manager = RelationManager::new();
+        manager.add_relation(create_test_get(7), None, RelationStats::new());
+        let expression = Expression::Window(WindowExpression {
+            function: paro_function::window::WindowFunction::row_number(),
+            children: vec![],
+            partitions: vec![],
+            orders: vec![],
+            frame: WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(create_column_ref(7, 0))),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
+        });
+        let mut bindings = HashSet::new();
+
+        assert!(manager.extract_bindings(&expression, &mut bindings));
+        assert_eq!(bindings, HashSet::from([0]));
     }
 
     #[test]

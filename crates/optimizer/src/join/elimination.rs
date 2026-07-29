@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use paro_catalog::entry::ConstraintType;
-use paro_planner::expression::{Expression, WindowExpression, WindowFrameBound};
+use paro_planner::expression::{Expression, ExpressionIterator, WindowExpression};
 use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator, Projection,
 };
@@ -529,62 +529,20 @@ fn collect_bindings_from_window_expr(
     expression: &WindowExpression,
     bindings: &mut HashSet<ColumnBinding>,
 ) {
-    collect_bindings_from_exprs(&expression.children, bindings);
-    collect_bindings_from_exprs(&expression.partitions, bindings);
-    for order in &expression.orders {
-        collect_bindings_from_expr(&order.expression, bindings);
-    }
-    if let WindowFrameBound::Offset(expr) = &expression.frame.start_bound {
-        collect_bindings_from_expr(expr, bindings);
-    }
-    if let WindowFrameBound::Offset(expr) = &expression.frame.end_bound {
-        collect_bindings_from_expr(expr, bindings);
-    }
+    ExpressionIterator::enumerate_window_children(expression, |child| {
+        collect_bindings_from_expr(child, bindings);
+    });
 }
 
 fn collect_bindings_from_expr(expr: &Expression, bindings: &mut HashSet<ColumnBinding>) {
-    match expr {
-        Expression::ColumnRef(column_ref) => {
-            bindings.insert(column_ref.binding);
-        }
-        Expression::Aggregate(aggregate) => {
-            collect_bindings_from_exprs(&aggregate.children, bindings);
-            if let Some(filter) = &aggregate.filter {
-                collect_bindings_from_expr(filter, bindings);
-            }
-            for order_by in &aggregate.order_bys {
-                collect_bindings_from_expr(&order_by.expression, bindings);
-            }
-        }
-        Expression::Case(case_expr) => {
-            collect_bindings_from_expr(&case_expr.check, bindings);
-            collect_bindings_from_expr(&case_expr.result_if_true, bindings);
-            collect_bindings_from_expr(&case_expr.result_if_false, bindings);
-        }
-        Expression::Cast(cast_expr) => {
-            collect_bindings_from_expr(&cast_expr.child, bindings);
-        }
-        Expression::Comparison(comparison) => {
-            collect_bindings_from_expr(&comparison.left, bindings);
-            collect_bindings_from_expr(&comparison.right, bindings);
-        }
-        Expression::Conjunction(conjunction) => {
-            collect_bindings_from_exprs(&conjunction.children, bindings);
-        }
-        Expression::Function(function) => {
-            collect_bindings_from_exprs(&function.children, bindings);
-        }
-        Expression::Operator(operator) => {
-            collect_bindings_from_exprs(&operator.children, bindings);
-        }
-        Expression::Subquery(subquery) => {
-            collect_bindings_from_exprs(&subquery.children, bindings);
-        }
-        Expression::Window(window) => {
-            collect_bindings_from_window_expr(window, bindings);
-        }
-        Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
+    if let Expression::ColumnRef(column_ref) = expr {
+        bindings.insert(column_ref.binding);
+        return;
     }
+
+    ExpressionIterator::enumerate_children(expr, |child| {
+        collect_bindings_from_expr(child, bindings);
+    });
 }
 
 #[cfg(test)]

@@ -37,3 +37,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }
+divan = { workspace = true }
+
+[[bench]]
+name = "expression_rewriter"
+harness = false

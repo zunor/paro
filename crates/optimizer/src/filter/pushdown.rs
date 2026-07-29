@@ -7,7 +7,9 @@ use std::collections::HashSet;
 
 use paro_planner::expression::ComparisonType;
 use paro_planner::expression::ConjunctionType;
-use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, Expression};
+use paro_planner::expression::{
+    ColumnRefExpression, ComparisonExpression, Expression, ExpressionIterator,
+};
 use paro_planner::operator::empty_result::EmptyResult;
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{
@@ -44,67 +46,14 @@ impl Filter {
 
     /// Recursively extract table bindings from an expression.
     fn extract_bindings_from_expr(expr: &Expression, bindings: &mut HashSet<usize>) {
-        match expr {
-            Expression::ColumnRef(col) => {
-                bindings.insert(col.binding.table_index);
-            }
-            Expression::Comparison(comp) => {
-                Self::extract_bindings_from_expr(&comp.left, bindings);
-                Self::extract_bindings_from_expr(&comp.right, bindings);
-            }
-            Expression::Conjunction(conj) => {
-                for child in &conj.children {
-                    Self::extract_bindings_from_expr(child, bindings);
-                }
-            }
-            Expression::Function(func) => {
-                for child in &func.children {
-                    Self::extract_bindings_from_expr(child, bindings);
-                }
-            }
-            Expression::Cast(cast) => {
-                Self::extract_bindings_from_expr(&cast.child, bindings);
-            }
-            Expression::Operator(op) => {
-                for child in &op.children {
-                    Self::extract_bindings_from_expr(child, bindings);
-                }
-            }
-            Expression::Case(case) => {
-                Self::extract_bindings_from_expr(&case.check, bindings);
-                Self::extract_bindings_from_expr(&case.result_if_true, bindings);
-                Self::extract_bindings_from_expr(&case.result_if_false, bindings);
-            }
-            Expression::Aggregate(agg) => {
-                for child in &agg.children {
-                    Self::extract_bindings_from_expr(child, bindings);
-                }
-                if let Some(filter) = &agg.filter {
-                    Self::extract_bindings_from_expr(filter, bindings);
-                }
-                for order in &agg.order_bys {
-                    Self::extract_bindings_from_expr(&order.expression, bindings);
-                }
-            }
-            Expression::Window(win) => {
-                for child in &win.children {
-                    Self::extract_bindings_from_expr(child, bindings);
-                }
-                for part in &win.partitions {
-                    Self::extract_bindings_from_expr(part, bindings);
-                }
-                for order in &win.orders {
-                    Self::extract_bindings_from_expr(&order.expression, bindings);
-                }
-            }
-            Expression::Subquery(sub) => {
-                for child in &sub.children {
-                    Self::extract_bindings_from_expr(child, bindings);
-                }
-            }
-            // Constants, parameters, and references don't have table bindings.
-            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
+        if let Expression::ColumnRef(column) = expr {
+            bindings.insert(column.binding.table_index);
+            return;
         }
+
+        ExpressionIterator::enumerate_children(expr, |child| {
+            Self::extract_bindings_from_expr(child, bindings);
+        });
     }
 }
 
@@ -897,74 +846,21 @@ impl FilterPushdown {
 }
 
 fn projection_reference_crosses_execution_boundary(proj: &Projection, expr: &Expression) -> bool {
-    match expr {
-        Expression::ColumnRef(col) => {
-            col.binding.table_index == proj.table_index
-                && proj
-                    .expressions
-                    .get(col.binding.column_index)
-                    .is_some_and(Expression::contains_external_routine)
-        }
-        Expression::Function(func) => func
-            .children
-            .iter()
-            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
-        Expression::Cast(cast) => {
-            projection_reference_crosses_execution_boundary(proj, cast.child.as_ref())
-        }
-        Expression::Comparison(comp) => {
-            projection_reference_crosses_execution_boundary(proj, comp.left.as_ref())
-                || projection_reference_crosses_execution_boundary(proj, comp.right.as_ref())
-        }
-        Expression::Conjunction(conj) => conj
-            .children
-            .iter()
-            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
-        Expression::Operator(op) => op
-            .children
-            .iter()
-            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
-        Expression::Case(case) => {
-            projection_reference_crosses_execution_boundary(proj, case.check.as_ref())
-                || projection_reference_crosses_execution_boundary(
-                    proj,
-                    case.result_if_true.as_ref(),
-                )
-                || projection_reference_crosses_execution_boundary(
-                    proj,
-                    case.result_if_false.as_ref(),
-                )
-        }
-        Expression::Aggregate(agg) => {
-            agg.children
-                .iter()
-                .any(|child| projection_reference_crosses_execution_boundary(proj, child))
-                || agg.filter.as_ref().is_some_and(|filter| {
-                    projection_reference_crosses_execution_boundary(proj, filter.as_ref())
-                })
-                || agg.order_bys.iter().any(|order| {
-                    projection_reference_crosses_execution_boundary(proj, &order.expression)
-                })
-        }
-        Expression::Window(window) => {
-            window
-                .children
-                .iter()
-                .any(|child| projection_reference_crosses_execution_boundary(proj, child))
-                || window
-                    .partitions
-                    .iter()
-                    .any(|part| projection_reference_crosses_execution_boundary(proj, part))
-                || window.orders.iter().any(|order| {
-                    projection_reference_crosses_execution_boundary(proj, &order.expression)
-                })
-        }
-        Expression::Subquery(subquery) => subquery
-            .children
-            .iter()
-            .any(|child| projection_reference_crosses_execution_boundary(proj, child)),
-        Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => false,
+    if let Expression::ColumnRef(column) = expr {
+        return column.binding.table_index == proj.table_index
+            && proj
+                .expressions
+                .get(column.binding.column_index)
+                .is_some_and(Expression::contains_external_routine);
     }
+
+    let mut crosses_boundary = false;
+    ExpressionIterator::enumerate_children(expr, |child| {
+        if !crosses_boundary {
+            crosses_boundary = projection_reference_crosses_execution_boundary(proj, child);
+        }
+    });
+    crosses_boundary
 }
 
 impl Default for FilterPushdown {
@@ -976,10 +872,16 @@ impl Default for FilterPushdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::chunk::Chunk;
+    use paro_common::error::Result;
     use paro_common::types::LogicalType;
+    use paro_common::vector::Vector;
+    use paro_external::routine::boundary::PlacementClass;
+    use paro_function::scalar::{ExpressionState, ScalarFunction};
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ComparisonExpression, ComparisonType, ConjunctionExpression, ConstantExpression,
+        FunctionExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use paro_planner::operator::{
         ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
@@ -1005,6 +907,49 @@ mod tests {
         Expression::Constant(ConstantExpression {
             value: paro_common::runtime_value::Value::Integer(value),
             return_type: LogicalType::Integer,
+        })
+    }
+
+    fn noop_scalar_execute(
+        _input: &Chunk,
+        _state: &dyn ExpressionState,
+        _result: &mut Vector,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn external_call() -> Expression {
+        let function = ScalarFunction::new(
+            "external_test".to_string(),
+            vec![],
+            LogicalType::Integer,
+            noop_scalar_execute,
+        );
+        let mut expression = FunctionExpression::new(function, vec![], LogicalType::Integer);
+        expression
+            .routine_meta
+            .as_mut()
+            .expect("builtin routine metadata")
+            .boundary
+            .placement = PlacementClass::External;
+        Expression::Function(expression)
+    }
+
+    fn window_with_start_offset(offset: Expression) -> Expression {
+        Expression::Window(WindowExpression {
+            function: paro_function::window::WindowFunction::row_number(),
+            children: vec![],
+            partitions: vec![],
+            orders: vec![],
+            frame: WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(offset)),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
         })
     }
 
@@ -1091,6 +1036,32 @@ mod tests {
         assert!(filter.bindings.contains(&0));
         assert!(filter.bindings.contains(&1));
         assert_eq!(filter.bindings.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_extract_bindings_visits_window_frame_offsets() {
+        let filter = Filter::new(window_with_start_offset(make_column_ref(7, 0)));
+
+        assert_eq!(filter.bindings, HashSet::from([7]));
+    }
+
+    #[test]
+    fn test_external_routine_detection_visits_window_frame_offsets() {
+        let expression = window_with_start_offset(external_call());
+
+        assert!(expression.contains_external_routine());
+    }
+
+    #[test]
+    fn test_projection_boundary_check_visits_window_frame_offsets() {
+        let ctx = BindContext::new();
+        let projection = Projection::new(7, plan(&ctx, make_get(0)), vec![external_call()]);
+        let expression = window_with_start_offset(make_column_ref(7, 0));
+
+        assert!(projection_reference_crosses_execution_boundary(
+            &projection,
+            &expression
+        ));
     }
 
     #[test]
