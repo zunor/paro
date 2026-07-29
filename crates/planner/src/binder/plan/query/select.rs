@@ -133,6 +133,13 @@ impl Binder {
         // =================================================================
         // 6. Window functions
         // =================================================================
+        for expression in &mut node.select_list {
+            expression.extract_windows_in_place(&mut node.windows, node.window_index);
+        }
+        if let Some(qualify) = &mut node.qualify_clause {
+            qualify.extract_windows_in_place(&mut node.windows, node.window_index);
+        }
+
         if !node.windows.is_empty() {
             // Handle subqueries in window expressions
             for expr in &mut node.windows {

@@ -30,8 +30,9 @@ FROM window_spill_test;
 QUERY PLAN
 PROJECTION  (rows=32)
   Output: part, id, score, rn
-  ->  ROWSET_SCAN on public.window_spill_test  (rows=32)
-    Columns: part, id, score
+  ->  WINDOW  (rows=32)
+    ->  ROWSET_SCAN on public.window_spill_test  (rows=32)
+      Columns: part, id, score
 
 SET force_external = DEFAULT;
 SET
@@ -50,10 +51,11 @@ WHERE part IN (1, 2);
 QUERY PLAN
 PROJECTION  (rows=6)
   Output: part, id, score, rn, rk, lead_score, lag_score
-  ->  ROWSET_SCAN on public.window_spill_test  (rows=6)
-    Columns: part, id, score
-    Pushed Predicate: col#0 = 1 OR col#0 = 2
-    Late Materialize: auto
+  ->  WINDOW  (rows=6)
+    ->  ROWSET_SCAN on public.window_spill_test  (rows=6)
+      Columns: part, id, score
+      Pushed Predicate: col#0 = 1 OR col#0 = 2
+      Late Materialize: auto
 
 CREATE TABLE window_large_partition_test (part INT, id INT, payload VARCHAR);
 CREATE TABLE
@@ -101,5 +103,6 @@ FROM window_large_partition_test;
 QUERY PLAN
 PROJECTION  (rows=69)
   Output: part, id, rn
-  ->  ROWSET_SCAN on public.window_large_partition_test  (rows=69)
-    Columns: part, id
+  ->  WINDOW  (rows=69)
+    ->  ROWSET_SCAN on public.window_large_partition_test  (rows=69)
+      Columns: part, id

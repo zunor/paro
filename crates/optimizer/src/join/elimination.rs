@@ -156,11 +156,9 @@ impl JoinElimination {
             LogicalOperator::Window(mut window) => {
                 let mut child_required =
                     filter_required_bindings(required_bindings, window.child.as_ref());
-                let child_binding_count = window.child.get_column_bindings().len();
 
                 for (idx, expression) in window.expressions.iter().enumerate() {
-                    let window_binding =
-                        ColumnBinding::new(window.window_index, child_binding_count + idx);
+                    let window_binding = ColumnBinding::new(window.window_index, idx);
                     if required_bindings.contains(&window_binding) {
                         collect_bindings_from_window_expr(expression, &mut child_required);
                     }

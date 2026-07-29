@@ -833,7 +833,7 @@ impl DependentJoinFlattener {
         let window_index = self.next_table_index();
         let window = LogicalOperator::Window(Window::new(window_index, vec![row_number], child));
         let window_plan = binder.wrap_plan(window);
-        let row_number_binding = ColumnBinding::new(window_index, child_column_count);
+        let row_number_binding = ColumnBinding::new(window_index, 0);
         let row_number_ref = || {
             Expression::ColumnRef(ColumnRefExpression::new(
                 row_number_binding,

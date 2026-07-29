@@ -221,6 +221,22 @@ impl Binder {
             });
         }
 
+        let mut bound_qualify = qualify_clause;
+        if let Some(expr) = bound_qualify {
+            let e = expr.extract_aggregates(&mut aggregates, groups.group_expressions.len());
+            let replaced = e.replace_groups(&groups.group_expressions);
+            bound_qualify = Some(if group_count > 0 || !aggregates.is_empty() {
+                Self::replace_aggregate_references_with_column_refs(
+                    replaced,
+                    group_index,
+                    group_count,
+                    aggregate_index,
+                )
+            } else {
+                replaced
+            });
+        }
+
         if let Some(orders) = &mut bound_order_by {
             for order in orders.iter_mut() {
                 let e = std::mem::replace(
@@ -286,8 +302,8 @@ impl Binder {
             prune_index,
             column_count,
             need_prune,
-            qualify_clause,
-            windows: Vec::new(), // Window functions extracted during binding
+            qualify_clause: bound_qualify,
+            windows: Vec::new(), // Window functions are extracted once their child plan is known.
         };
 
         Ok(bound_node)

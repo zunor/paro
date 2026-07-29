@@ -1,0 +1,50 @@
+SELECT x, row_number() OVER (ORDER BY x) AS rn
+FROM (VALUES (3), (1), (2)) AS values_input(x)
+ORDER BY x;
+x	rn
+1	1
+2	2
+3	3
+
+SELECT
+    category,
+    sum(x) AS total,
+    row_number() OVER (ORDER BY sum(x) DESC) AS rn
+FROM (
+    VALUES ('A', 1),
+           ('A', 2),
+           ('B', 7),
+           ('C', 4)
+) AS aggregate_input(category, x)
+GROUP BY category
+ORDER BY category;
+category	total	rn
+A	3	3
+B	7	1
+C	4	2
+
+EXPLAIN SELECT x, row_number() OVER (ORDER BY x) AS rn
+FROM (VALUES (3), (1), (2)) AS qualify_input(x)
+QUALIFY row_number() OVER (ORDER BY x) <= 2
+ORDER BY x;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: x, rn
+  ->  ORDER_BY  (rows=1)
+    Sort Key: #2 ASC NULLS LAST
+    ->  PROJECTION  (rows=1)
+      Output: x, rn, __paro_hidden_1
+      ->  FILTER  (rows=1)
+        Filter: #1 <= 2
+        ->  WINDOW  (rows=3)
+          ->  PROJECTION  (rows=3)
+            Output: x
+            ->  VALUES  (rows=3)
+
+SELECT x, row_number() OVER (ORDER BY x) AS rn
+FROM (VALUES (3), (1), (2)) AS qualify_input(x)
+QUALIFY row_number() OVER (ORDER BY x) <= 2
+ORDER BY x;
+x	rn
+1	1
+2	2
