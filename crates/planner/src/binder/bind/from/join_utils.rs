@@ -208,95 +208,15 @@ pub fn get_expression_side(
         Expression::ColumnRef(col) => {
             JoinSide::get_side(col.binding.table_index, left_bindings, right_bindings)
         }
-        Expression::Constant(_) | Expression::Parameter(_) => JoinSide::None,
-        Expression::Function(func) => {
-            let mut side = JoinSide::None;
-            for child in &func.children {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(child, left_bindings, right_bindings),
-                );
-            }
-            side
-        }
-        Expression::Cast(cast) => get_expression_side(&cast.child, left_bindings, right_bindings),
-        Expression::Conjunction(conj) => {
-            let mut side = JoinSide::None;
-            for child in &conj.children {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(child, left_bindings, right_bindings),
-                );
-            }
-            side
-        }
-        Expression::Comparison(comp) => {
-            let left_side = get_expression_side(&comp.left, left_bindings, right_bindings);
-            let right_side = get_expression_side(&comp.right, left_bindings, right_bindings);
-            JoinSide::combine(left_side, right_side)
-        }
-        Expression::Operator(op) => {
-            let mut side = JoinSide::None;
-            for child in &op.children {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(child, left_bindings, right_bindings),
-                );
-            }
-            side
-        }
-        Expression::Case(case) => {
-            let check_side = get_expression_side(&case.check, left_bindings, right_bindings);
-            let true_side =
-                get_expression_side(&case.result_if_true, left_bindings, right_bindings);
-            let false_side =
-                get_expression_side(&case.result_if_false, left_bindings, right_bindings);
-            JoinSide::combine(JoinSide::combine(check_side, true_side), false_side)
-        }
-        Expression::Reference(_) => JoinSide::None,
-        Expression::Aggregate(agg) => {
-            let mut side = JoinSide::None;
-            for child in &agg.children {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(child, left_bindings, right_bindings),
-                );
-            }
-            if let Some(filter) = &agg.filter {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(filter, left_bindings, right_bindings),
-                );
-            }
-            for order in &agg.order_bys {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(&order.expression, left_bindings, right_bindings),
-                );
-            }
-            side
-        }
         Expression::Subquery(_) => JoinSide::Both,
-        Expression::Window(window) => {
+        _ => {
             let mut side = JoinSide::None;
-            for child in &window.children {
+            ExpressionIterator::enumerate_children(expr, |child| {
                 side = JoinSide::combine(
                     side,
                     get_expression_side(child, left_bindings, right_bindings),
                 );
-            }
-            for partition in &window.partitions {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(partition, left_bindings, right_bindings),
-                );
-            }
-            for order in &window.orders {
-                side = JoinSide::combine(
-                    side,
-                    get_expression_side(&order.expression, left_bindings, right_bindings),
-                );
-            }
+            });
             side
         }
     }
@@ -416,11 +336,13 @@ mod tests {
 
     use paro_common::types::LogicalType;
 
-    use super::extract_join_condition;
+    use super::{extract_join_condition, get_expression_side};
     use crate::expression::{
-        ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
+        ColumnRefExpression, ComparisonExpression, ComparisonType, Expression, WindowExpression,
+        WindowFrame, WindowFrameBound, WindowFrameType,
     };
-    use crate::operator::{ColumnBinding, JoinComparisonType};
+    use crate::operator::{ColumnBinding, JoinComparisonType, JoinSide};
+    use paro_function::window::WindowFunction;
 
     fn col(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(ColumnRefExpression::new(
@@ -460,5 +382,29 @@ mod tests {
             }
             other => panic!("expected column refs, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn get_expression_side_visits_window_frame_offsets() {
+        let expression = Expression::Window(WindowExpression {
+            function: WindowFunction::row_number(),
+            children: vec![],
+            partitions: vec![],
+            orders: vec![],
+            frame: WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
+        });
+
+        assert_eq!(
+            get_expression_side(&expression, &HashSet::from([6]), &HashSet::from([7])),
+            JoinSide::Right
+        );
     }
 }

@@ -341,208 +341,47 @@ impl Binder {
     ///
     /// in this logical phase.
     fn replace_aggregate_references_with_column_refs(
-        expr: Expression,
+        mut expr: Expression,
         group_index: usize,
         group_count: usize,
         aggregate_index: usize,
     ) -> Expression {
-        match expr {
-            Expression::Reference(reference) => {
-                let (table_index, column_index) = if reference.index < group_count {
-                    (group_index, reference.index)
-                } else {
-                    (aggregate_index, reference.index - group_count)
-                };
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(table_index, column_index),
-                    reference.return_type,
-                ))
-            }
-            Expression::Function(mut function) => {
-                function.children = function
-                    .children
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                Expression::Function(function)
-            }
-            Expression::Cast(mut cast) => {
-                cast.child = Box::new(Self::replace_aggregate_references_with_column_refs(
-                    *cast.child,
-                    group_index,
-                    group_count,
-                    aggregate_index,
-                ));
-                Expression::Cast(cast)
-            }
-            Expression::Conjunction(mut conjunction) => {
-                conjunction.children = conjunction
-                    .children
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                Expression::Conjunction(conjunction)
-            }
-            Expression::Case(mut case) => {
-                case.check = Box::new(Self::replace_aggregate_references_with_column_refs(
-                    *case.check,
-                    group_index,
-                    group_count,
-                    aggregate_index,
-                ));
-                case.result_if_true =
-                    Box::new(Self::replace_aggregate_references_with_column_refs(
-                        *case.result_if_true,
-                        group_index,
-                        group_count,
-                        aggregate_index,
-                    ));
-                case.result_if_false =
-                    Box::new(Self::replace_aggregate_references_with_column_refs(
-                        *case.result_if_false,
-                        group_index,
-                        group_count,
-                        aggregate_index,
-                    ));
-                Expression::Case(case)
-            }
-            Expression::Comparison(mut comparison) => {
-                comparison.left = Box::new(Self::replace_aggregate_references_with_column_refs(
-                    *comparison.left,
-                    group_index,
-                    group_count,
-                    aggregate_index,
-                ));
-                comparison.right = Box::new(Self::replace_aggregate_references_with_column_refs(
-                    *comparison.right,
-                    group_index,
-                    group_count,
-                    aggregate_index,
-                ));
-                Expression::Comparison(comparison)
-            }
-            Expression::Operator(mut operator) => {
-                operator.children = operator
-                    .children
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                Expression::Operator(operator)
-            }
-            Expression::Aggregate(mut aggregate) => {
-                aggregate.children = aggregate
-                    .children
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                aggregate.filter = aggregate.filter.map(|filter| {
-                    Box::new(Self::replace_aggregate_references_with_column_refs(
-                        *filter,
-                        group_index,
-                        group_count,
-                        aggregate_index,
-                    ))
-                });
-                aggregate.order_bys = aggregate
-                    .order_bys
-                    .into_iter()
-                    .map(|mut order| {
-                        order.expression = Self::replace_aggregate_references_with_column_refs(
-                            order.expression,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        );
-                        order
-                    })
-                    .collect();
-                Expression::Aggregate(aggregate)
-            }
-            Expression::Subquery(mut subquery) => {
-                subquery.children = subquery
-                    .children
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                Expression::Subquery(subquery)
-            }
-            Expression::Window(mut window) => {
-                window.children = window
-                    .children
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                window.partitions = window
-                    .partitions
-                    .into_iter()
-                    .map(|child| {
-                        Self::replace_aggregate_references_with_column_refs(
-                            child,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        )
-                    })
-                    .collect();
-                window.orders = window
-                    .orders
-                    .into_iter()
-                    .map(|mut order| {
-                        order.expression = Self::replace_aggregate_references_with_column_refs(
-                            order.expression,
-                            group_index,
-                            group_count,
-                            aggregate_index,
-                        );
-                        order
-                    })
-                    .collect();
-                Expression::Window(window)
-            }
-            Expression::Constant(_) | Expression::Parameter(_) | Expression::ColumnRef(_) => expr,
+        Self::replace_aggregate_references_in_place(
+            &mut expr,
+            group_index,
+            group_count,
+            aggregate_index,
+        );
+        expr
+    }
+
+    fn replace_aggregate_references_in_place(
+        expr: &mut Expression,
+        group_index: usize,
+        group_count: usize,
+        aggregate_index: usize,
+    ) {
+        if let Expression::Reference(reference) = expr {
+            let (table_index, column_index) = if reference.index < group_count {
+                (group_index, reference.index)
+            } else {
+                (aggregate_index, reference.index - group_count)
+            };
+            *expr = Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                reference.return_type.clone(),
+            ));
+            return;
         }
+
+        ExpressionIterator::enumerate_children_mut(expr, |child| {
+            Self::replace_aggregate_references_in_place(
+                child,
+                group_index,
+                group_count,
+                aggregate_index,
+            );
+        });
     }
 
     /// Expand star expressions in SELECT list.
@@ -1086,5 +925,76 @@ impl Binder {
         }
 
         Ok(Some(orders))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Binder;
+    use crate::binder::ir::OrderByNode;
+    use crate::expression::{ColumnRefExpression, Expression, WindowExpression, WindowFrame};
+    use crate::operator::ColumnBinding;
+    use paro_common::types::LogicalType;
+    use paro_function::window::WindowFunction;
+
+    fn row_number(partition_column: usize) -> Expression {
+        Expression::Window(WindowExpression {
+            function: WindowFunction::row_number(),
+            children: vec![],
+            partitions: vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(10, partition_column),
+                LogicalType::Integer,
+            ))],
+            orders: vec![],
+            frame: WindowFrame::default(),
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
+        })
+    }
+
+    #[test]
+    fn simplify_order_by_preserves_windows_with_different_partitions() {
+        let mut orders = vec![
+            OrderByNode {
+                expression: row_number(0),
+                ascending: true,
+                nulls_first: false,
+            },
+            OrderByNode {
+                expression: row_number(1),
+                ascending: true,
+                nulls_first: false,
+            },
+        ];
+
+        Binder::simplify_order_by(&mut orders);
+
+        assert_eq!(orders.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_reference_replacement_visits_window_frame_offsets() {
+        let mut window = row_number(0);
+        let Expression::Window(expression) = &mut window else {
+            unreachable!();
+        };
+        expression.frame.start_bound =
+            crate::expression::WindowFrameBound::Offset(Box::new(Expression::Reference(
+                crate::expression::ReferenceExpression::new(1, LogicalType::Integer),
+            )));
+
+        let replaced = Binder::replace_aggregate_references_with_column_refs(window, 20, 1, 30);
+
+        let Expression::Window(expression) = replaced else {
+            panic!("expected window expression");
+        };
+        let crate::expression::WindowFrameBound::Offset(offset) = expression.frame.start_bound
+        else {
+            panic!("expected window frame offset");
+        };
+        let Expression::ColumnRef(column) = *offset else {
+            panic!("expected column reference");
+        };
+        assert_eq!(column.binding, ColumnBinding::new(30, 0));
     }
 }

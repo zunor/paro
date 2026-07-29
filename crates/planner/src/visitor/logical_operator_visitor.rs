@@ -270,27 +270,8 @@ where
             }
         }
         LogicalOperator::Window(window) => {
-            // Window expressions contain Expression children that need to be enumerated
             for window_expr in &mut window.expressions {
-                // Enumerate function arguments
-                for child in &mut window_expr.children {
-                    callback(child);
-                }
-                // Enumerate PARTITION BY expressions
-                for partition in &mut window_expr.partitions {
-                    callback(partition);
-                }
-                // Enumerate ORDER BY expressions
-                for order in &mut window_expr.orders {
-                    callback(&mut order.expression);
-                }
-                // Enumerate frame bound expressions if they are offsets
-                if let WindowFrameBound::Offset(ref mut expr) = window_expr.frame.start_bound {
-                    callback(expr);
-                }
-                if let WindowFrameBound::Offset(ref mut expr) = window_expr.frame.end_bound {
-                    callback(expr);
-                }
+                ExpressionIterator::enumerate_window_children_mut(window_expr, &mut callback);
             }
         }
         LogicalOperator::Explain(_) => {

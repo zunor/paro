@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use paro_common::error::Result;
-use paro_planner::expression::{ColumnRefExpression, Expression};
+use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
 use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
 
@@ -216,66 +216,12 @@ impl ColumnLifetimeAnalyzer {
     }
 
     fn visit_expression(&mut self, expr: &Expression) {
-        match expr {
-            Expression::ColumnRef(col_ref) => {
-                self.add_binding(col_ref);
-            }
-            Expression::Function(func) => {
-                for child in &func.children {
-                    self.visit_expression(child);
-                }
-            }
-            Expression::Cast(cast) => {
-                self.visit_expression(&cast.child);
-            }
-            Expression::Conjunction(conj) => {
-                for child in &conj.children {
-                    self.visit_expression(child);
-                }
-            }
-            Expression::Case(case) => {
-                self.visit_expression(&case.check);
-                self.visit_expression(&case.result_if_true);
-                self.visit_expression(&case.result_if_false);
-            }
-            Expression::Comparison(comp) => {
-                self.visit_expression(&comp.left);
-                self.visit_expression(&comp.right);
-            }
-            Expression::Operator(op) => {
-                for child in &op.children {
-                    self.visit_expression(child);
-                }
-            }
-            Expression::Aggregate(agg) => {
-                for child in &agg.children {
-                    self.visit_expression(child);
-                }
-                if let Some(filter) = &agg.filter {
-                    self.visit_expression(filter);
-                }
-                for order in &agg.order_bys {
-                    self.visit_expression(&order.expression);
-                }
-            }
-            Expression::Window(window) => {
-                for child in &window.children {
-                    self.visit_expression(child);
-                }
-                for partition in &window.partitions {
-                    self.visit_expression(partition);
-                }
-                for order in &window.orders {
-                    self.visit_expression(&order.expression);
-                }
-            }
-            Expression::Subquery(subquery) => {
-                for child in &subquery.children {
-                    self.visit_expression(child);
-                }
-            }
-            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
+        if let Expression::ColumnRef(column_ref) = expr {
+            self.add_binding(column_ref);
+            return;
         }
+
+        ExpressionIterator::enumerate_children(expr, |child| self.visit_expression(child));
     }
 
     fn add_binding(&mut self, col_ref: &ColumnRefExpression) {
@@ -349,65 +295,52 @@ impl ColumnLifetimeAnalyzer {
     }
 
     pub fn extract_column_bindings(expr: &Expression, bindings: &mut Vec<ColumnBinding>) {
-        match expr {
-            Expression::ColumnRef(col_ref) => {
-                bindings.push(col_ref.binding);
-            }
-            Expression::Function(func) => {
-                for child in &func.children {
-                    Self::extract_column_bindings(child, bindings);
-                }
-            }
-            Expression::Cast(cast) => {
-                Self::extract_column_bindings(&cast.child, bindings);
-            }
-            Expression::Conjunction(conj) => {
-                for child in &conj.children {
-                    Self::extract_column_bindings(child, bindings);
-                }
-            }
-            Expression::Case(case) => {
-                Self::extract_column_bindings(&case.check, bindings);
-                Self::extract_column_bindings(&case.result_if_true, bindings);
-                Self::extract_column_bindings(&case.result_if_false, bindings);
-            }
-            Expression::Comparison(comp) => {
-                Self::extract_column_bindings(&comp.left, bindings);
-                Self::extract_column_bindings(&comp.right, bindings);
-            }
-            Expression::Operator(op) => {
-                for child in &op.children {
-                    Self::extract_column_bindings(child, bindings);
-                }
-            }
-            Expression::Aggregate(agg) => {
-                for child in &agg.children {
-                    Self::extract_column_bindings(child, bindings);
-                }
-                if let Some(filter) = &agg.filter {
-                    Self::extract_column_bindings(filter, bindings);
-                }
-                for order in &agg.order_bys {
-                    Self::extract_column_bindings(&order.expression, bindings);
-                }
-            }
-            Expression::Window(window) => {
-                for child in &window.children {
-                    Self::extract_column_bindings(child, bindings);
-                }
-                for partition in &window.partitions {
-                    Self::extract_column_bindings(partition, bindings);
-                }
-                for order in &window.orders {
-                    Self::extract_column_bindings(&order.expression, bindings);
-                }
-            }
-            Expression::Subquery(subquery) => {
-                for child in &subquery.children {
-                    Self::extract_column_bindings(child, bindings);
-                }
-            }
-            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
+        if let Expression::ColumnRef(column_ref) = expr {
+            bindings.push(column_ref.binding);
+            return;
         }
+
+        ExpressionIterator::enumerate_children(expr, |child| {
+            Self::extract_column_bindings(child, bindings);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ColumnLifetimeAnalyzer;
+    use paro_common::types::LogicalType;
+    use paro_function::window::WindowFunction;
+    use paro_planner::expression::{
+        ColumnRefExpression, Expression, WindowExpression, WindowFrame, WindowFrameBound,
+        WindowFrameType,
+    };
+    use paro_planner::operator::ColumnBinding;
+
+    #[test]
+    fn extract_column_bindings_visits_window_frame_offsets() {
+        let expected = ColumnBinding::new(7, 3);
+        let expression = Expression::Window(WindowExpression {
+            function: WindowFunction::row_number(),
+            children: vec![],
+            partitions: vec![],
+            orders: vec![],
+            frame: WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(Expression::ColumnRef(
+                    ColumnRefExpression::new(expected, LogicalType::Integer),
+                ))),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
+        });
+        let mut bindings = Vec::new();
+
+        ColumnLifetimeAnalyzer::extract_column_bindings(&expression, &mut bindings);
+
+        assert_eq!(bindings, vec![expected]);
     }
 }

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::binder::context::BindContext;
-use paro_planner::expression::{ColumnRefExpression, Expression};
+use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
 use paro_planner::operator::{Join, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
 
@@ -308,17 +308,15 @@ impl Verifier {
                 }
             }
             LogicalOperator::Window(window) => {
-                for expr in &window.expressions {
-                    for child in &expr.children {
-                        self.verify_expression(child)?;
-                    }
-                    for child in &expr.partitions {
-                        self.verify_expression(child)?;
-                    }
-                    for node in &expr.orders {
-                        self.verify_expression(&node.expression)?;
-                    }
+                let mut result = Ok(());
+                for expression in &window.expressions {
+                    ExpressionIterator::enumerate_window_children(expression, |child| {
+                        if result.is_ok() {
+                            result = self.verify_expression(child);
+                        }
+                    });
                 }
+                result?;
             }
             LogicalOperator::ExpressionGet(get) => {
                 for row in &get.expressions {
@@ -346,67 +344,17 @@ impl Verifier {
     }
 
     fn verify_expression(&self, expr: &Expression) -> Result<()> {
-        match expr {
-            Expression::ColumnRef(col) => {
-                self.verify_column_ref(col)?;
-            }
-            Expression::Function(func) => {
-                for child in &func.children {
-                    self.verify_expression(child)?;
-                }
-            }
-            Expression::Cast(cast) => {
-                self.verify_expression(&cast.child)?;
-            }
-            Expression::Conjunction(conj) => {
-                for child in &conj.children {
-                    self.verify_expression(child)?;
-                }
-            }
-            Expression::Case(case) => {
-                self.verify_expression(&case.check)?;
-                self.verify_expression(&case.result_if_true)?;
-                self.verify_expression(&case.result_if_false)?;
-            }
-            Expression::Comparison(comp) => {
-                self.verify_expression(&comp.left)?;
-                self.verify_expression(&comp.right)?;
-            }
-            Expression::Operator(op) => {
-                for child in &op.children {
-                    self.verify_expression(child)?;
-                }
-            }
-            Expression::Aggregate(agg) => {
-                for child in &agg.children {
-                    self.verify_expression(child)?;
-                }
-                if let Some(filter) = &agg.filter {
-                    self.verify_expression(filter)?;
-                }
-                for order in &agg.order_bys {
-                    self.verify_expression(&order.expression)?;
-                }
-            }
-            Expression::Subquery(subquery) => {
-                for child in &subquery.children {
-                    self.verify_expression(child)?;
-                }
-            }
-            Expression::Window(window) => {
-                for child in &window.children {
-                    self.verify_expression(child)?;
-                }
-                for child in &window.partitions {
-                    self.verify_expression(child)?;
-                }
-                for order in &window.orders {
-                    self.verify_expression(&order.expression)?;
-                }
-            }
-            Expression::Constant(_) | Expression::Parameter(_) | Expression::Reference(_) => {}
+        if let Expression::ColumnRef(column) = expr {
+            return self.verify_column_ref(column);
         }
-        Ok(())
+
+        let mut result = Ok(());
+        ExpressionIterator::enumerate_children(expr, |child| {
+            if result.is_ok() {
+                result = self.verify_expression(child);
+            }
+        });
+        result
     }
 
     fn verify_column_ref(&self, _col: &ColumnRefExpression) -> Result<()> {

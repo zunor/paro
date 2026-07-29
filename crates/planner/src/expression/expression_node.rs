@@ -10,8 +10,9 @@ use paro_external::routine::identity::RoutineCallIdentity;
 
 use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
-    ConjunctionExpression, ConstantExpression, FunctionExpression, OperatorExpression,
-    ParameterExpression, ReferenceExpression, SubqueryExpression, WindowExpression,
+    ConjunctionExpression, ConstantExpression, ExpressionIterator, FunctionExpression,
+    OperatorExpression, ParameterExpression, ReferenceExpression, SubqueryExpression,
+    WindowExpression, WindowFrameBound,
 };
 
 /// Expression represents a semantic-aware version of a SQL expression.
@@ -67,253 +68,61 @@ impl Expression {
     }
 
     pub fn contains_external_routine(&self) -> bool {
-        match self {
-            Expression::Function(expr) => {
-                expr.crosses_execution_boundary()
-                    || expr.children.iter().any(Self::contains_external_routine)
-            }
-            Expression::Cast(expr) => expr.child.contains_external_routine(),
-            Expression::Conjunction(expr) => {
-                expr.children.iter().any(Self::contains_external_routine)
-            }
-            Expression::Case(expr) => {
-                expr.check.contains_external_routine()
-                    || expr.result_if_true.contains_external_routine()
-                    || expr.result_if_false.contains_external_routine()
-            }
-            Expression::Comparison(expr) => {
-                expr.left.contains_external_routine() || expr.right.contains_external_routine()
-            }
-            Expression::Operator(expr) => expr.children.iter().any(Self::contains_external_routine),
-            Expression::Parameter(_) => false,
-            Expression::Aggregate(expr) => {
-                expr.children.iter().any(Self::contains_external_routine)
-                    || expr
-                        .filter
-                        .as_ref()
-                        .is_some_and(|filter| filter.contains_external_routine())
-                    || expr
-                        .order_bys
-                        .iter()
-                        .any(|order| order.expression.contains_external_routine())
-            }
-            Expression::Subquery(expr) => expr.children.iter().any(Self::contains_external_routine),
-            Expression::Window(expr) => {
-                expr.children.iter().any(Self::contains_external_routine)
-                    || expr.partitions.iter().any(Self::contains_external_routine)
-                    || expr
-                        .orders
-                        .iter()
-                        .any(|order| order.expression.contains_external_routine())
-            }
-            Expression::Constant(_) | Expression::ColumnRef(_) | Expression::Reference(_) => false,
+        if matches!(self, Expression::Function(expr) if expr.crosses_execution_boundary()) {
+            return true;
         }
+
+        let mut contains_external = false;
+        ExpressionIterator::enumerate_children(self, |child| {
+            if !contains_external {
+                contains_external = child.contains_external_routine();
+            }
+        });
+        contains_external
     }
 
     /// Recursively replace ColumnRef expressions using the provided mapping function.
-    pub fn replace_column_ref<F>(self, f: &F) -> Expression
+    pub fn replace_column_ref<F>(mut self, f: &F) -> Expression
     where
         F: Fn(&ColumnRefExpression) -> Option<Expression>,
     {
-        match self {
-            Expression::ColumnRef(ref expr) => {
-                if let Some(new_expr) = f(expr) {
-                    new_expr
-                } else {
-                    self
-                }
+        self.replace_column_ref_in_place(f);
+        self
+    }
+
+    fn replace_column_ref_in_place<F>(&mut self, f: &F)
+    where
+        F: Fn(&ColumnRefExpression) -> Option<Expression>,
+    {
+        if let Expression::ColumnRef(column_ref) = self {
+            if let Some(replacement) = f(column_ref) {
+                *self = replacement;
             }
-            Expression::Function(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                Expression::Function(expr)
-            }
-            Expression::Cast(mut expr) => {
-                expr.child = Box::new(expr.child.replace_column_ref(f));
-                Expression::Cast(expr)
-            }
-            Expression::Conjunction(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                Expression::Conjunction(expr)
-            }
-            Expression::Case(mut expr) => {
-                expr.check = Box::new(expr.check.replace_column_ref(f));
-                expr.result_if_true = Box::new(expr.result_if_true.replace_column_ref(f));
-                expr.result_if_false = Box::new(expr.result_if_false.replace_column_ref(f));
-                Expression::Case(expr)
-            }
-            Expression::Comparison(mut expr) => {
-                expr.left = Box::new(expr.left.replace_column_ref(f));
-                expr.right = Box::new(expr.right.replace_column_ref(f));
-                Expression::Comparison(expr)
-            }
-            Expression::Operator(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                Expression::Operator(expr)
-            }
-            Expression::Parameter(_) => self,
-            Expression::Aggregate(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                expr.filter = expr
-                    .filter
-                    .map(|filter| Box::new(filter.replace_column_ref(f)));
-                expr.order_bys = expr
-                    .order_bys
-                    .into_iter()
-                    .map(|mut order| {
-                        order.expression = order.expression.replace_column_ref(f);
-                        order
-                    })
-                    .collect();
-                Expression::Aggregate(expr)
-            }
-            Expression::Subquery(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                Expression::Subquery(expr)
-            }
-            Expression::Window(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                expr.partitions = expr
-                    .partitions
-                    .into_iter()
-                    .map(|c| c.replace_column_ref(f))
-                    .collect();
-                expr.orders = expr
-                    .orders
-                    .into_iter()
-                    .map(|mut o| {
-                        o.expression = o.expression.replace_column_ref(f);
-                        o
-                    })
-                    .collect();
-                Expression::Window(expr)
-            }
-            _ => self,
+            return;
         }
+
+        ExpressionIterator::enumerate_children_mut(self, |child| {
+            child.replace_column_ref_in_place(f);
+        });
     }
 
     /// Recursively replace expressions that match grouping expressions with BoundReferenceExpressions.
-    pub fn replace_groups(self, groups: &[Expression]) -> Expression {
+    pub fn replace_groups(mut self, groups: &[Expression]) -> Expression {
+        self.replace_groups_in_place(groups);
+        self
+    }
+
+    fn replace_groups_in_place(&mut self, groups: &[Expression]) {
         for (i, group) in groups.iter().enumerate() {
             if self.equals(group) {
-                return Expression::Reference(ReferenceExpression::new(i, self.return_type()));
+                *self = Expression::Reference(ReferenceExpression::new(i, self.return_type()));
+                return;
             }
         }
 
-        match self {
-            Expression::Function(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                Expression::Function(expr)
-            }
-            Expression::Cast(mut expr) => {
-                expr.child = Box::new(expr.child.replace_groups(groups));
-                Expression::Cast(expr)
-            }
-            Expression::Conjunction(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                Expression::Conjunction(expr)
-            }
-            Expression::Case(mut expr) => {
-                expr.check = Box::new(expr.check.replace_groups(groups));
-                expr.result_if_true = Box::new(expr.result_if_true.replace_groups(groups));
-                expr.result_if_false = Box::new(expr.result_if_false.replace_groups(groups));
-                Expression::Case(expr)
-            }
-            Expression::Comparison(mut expr) => {
-                expr.left = Box::new(expr.left.replace_groups(groups));
-                expr.right = Box::new(expr.right.replace_groups(groups));
-                Expression::Comparison(expr)
-            }
-            Expression::Operator(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                Expression::Operator(expr)
-            }
-            Expression::Parameter(_) => self,
-            Expression::Aggregate(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                expr.filter = expr
-                    .filter
-                    .map(|filter| Box::new(filter.replace_groups(groups)));
-                expr.order_bys = expr
-                    .order_bys
-                    .into_iter()
-                    .map(|mut order| {
-                        order.expression = order.expression.replace_groups(groups);
-                        order
-                    })
-                    .collect();
-                Expression::Aggregate(expr)
-            }
-            Expression::Subquery(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                Expression::Subquery(expr)
-            }
-            Expression::Window(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                expr.partitions = expr
-                    .partitions
-                    .into_iter()
-                    .map(|c| c.replace_groups(groups))
-                    .collect();
-                expr.orders = expr
-                    .orders
-                    .into_iter()
-                    .map(|mut o| {
-                        o.expression = o.expression.replace_groups(groups);
-                        o
-                    })
-                    .collect();
-                Expression::Window(expr)
-            }
-            _ => self,
-        }
+        ExpressionIterator::enumerate_children_mut(self, |child| {
+            child.replace_groups_in_place(groups);
+        });
     }
 
     /// Recursively find all aggregate expressions and replace them with BoundReferenceExpressions.
@@ -457,15 +266,42 @@ impl Expression {
             }
             (Expression::Window(a), Expression::Window(b)) => {
                 a.function.name == b.function.name
+                    && a.function.function_type == b.function.function_type
                     && a.function.arguments == b.function.arguments
                     && a.children.len() == b.children.len()
                     && a.children
                         .iter()
                         .zip(&b.children)
                         .all(|(ca, cb)| ca.equals(cb))
+                    && a.partitions.len() == b.partitions.len()
+                    && a.partitions
+                        .iter()
+                        .zip(&b.partitions)
+                        .all(|(pa, pb)| pa.equals(pb))
+                    && a.orders.len() == b.orders.len()
+                    && a.orders.iter().zip(&b.orders).all(|(ao, bo)| {
+                        ao.ascending == bo.ascending
+                            && ao.nulls_first == bo.nulls_first
+                            && ao.expression.equals(&bo.expression)
+                    })
+                    && a.frame.frame_type == b.frame.frame_type
+                    && a.frame.start_is_preceding == b.frame.start_is_preceding
+                    && a.frame.end_is_preceding == b.frame.end_is_preceding
+                    && window_frame_bounds_equal(&a.frame.start_bound, &b.frame.start_bound)
+                    && window_frame_bounds_equal(&a.frame.end_bound, &b.frame.end_bound)
+                    && a.ignore_nulls == b.ignore_nulls
             }
             _ => false,
         }
+    }
+}
+
+fn window_frame_bounds_equal(left: &WindowFrameBound, right: &WindowFrameBound) -> bool {
+    match (left, right) {
+        (WindowFrameBound::Unbounded, WindowFrameBound::Unbounded)
+        | (WindowFrameBound::CurrentRow, WindowFrameBound::CurrentRow) => true,
+        (WindowFrameBound::Offset(left), WindowFrameBound::Offset(right)) => left.equals(right),
+        _ => false,
     }
 }
 
@@ -477,5 +313,121 @@ fn routine_identities_equal(
     match (left, right) {
         (Some(left), Some(right)) => left == right,
         _ => fallback(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Expression;
+    use crate::expression::{
+        ColumnRefExpression, ConstantExpression, OrderByExpression, ReferenceExpression,
+        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+    };
+    use crate::operator::ColumnBinding;
+    use paro_common::runtime_value::Value;
+    use paro_common::types::LogicalType;
+    use paro_function::window::WindowFunction;
+
+    fn int_column(column_index: usize) -> Expression {
+        Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(10, column_index),
+            LogicalType::Integer,
+        ))
+    }
+
+    fn int_constant(value: i32) -> Expression {
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(value),
+            LogicalType::Integer,
+        ))
+    }
+
+    fn window_expression(start_bound: WindowFrameBound) -> Expression {
+        Expression::Window(WindowExpression {
+            function: WindowFunction::first_value(LogicalType::Integer),
+            children: vec![int_column(0)],
+            partitions: vec![int_column(1)],
+            orders: vec![OrderByExpression {
+                expression: int_column(2),
+                ascending: true,
+                nulls_first: false,
+            }],
+            frame: WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound,
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            ignore_nulls: false,
+            return_type: LogicalType::Integer,
+        })
+    }
+
+    #[test]
+    fn replace_column_ref_visits_window_frame_offsets() {
+        let rewritten = window_expression(WindowFrameBound::Offset(Box::new(int_column(3))))
+            .replace_column_ref(&|column| {
+                (column.binding.column_index == 3).then(|| int_constant(7))
+            });
+
+        let Expression::Window(window) = rewritten else {
+            panic!("expected window expression");
+        };
+        let WindowFrameBound::Offset(offset) = window.frame.start_bound else {
+            panic!("expected frame offset");
+        };
+        assert!(matches!(*offset, Expression::Constant(_)));
+    }
+
+    #[test]
+    fn replace_groups_visits_window_frame_offsets() {
+        let rewritten = window_expression(WindowFrameBound::Offset(Box::new(int_column(3))))
+            .replace_groups(&[int_column(3)]);
+
+        let Expression::Window(window) = rewritten else {
+            panic!("expected window expression");
+        };
+        let WindowFrameBound::Offset(offset) = window.frame.start_bound else {
+            panic!("expected frame offset");
+        };
+        assert!(matches!(
+            *offset,
+            Expression::Reference(ReferenceExpression { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn window_equality_includes_window_semantics() {
+        let original = window_expression(WindowFrameBound::Offset(Box::new(int_constant(1))));
+        assert!(original.equals(&original.clone()));
+
+        let mut different_partition = original.clone();
+        let Expression::Window(window) = &mut different_partition else {
+            unreachable!();
+        };
+        window.partitions[0] = int_column(9);
+        assert!(!original.equals(&different_partition));
+
+        let mut different_order = original.clone();
+        let Expression::Window(window) = &mut different_order else {
+            unreachable!();
+        };
+        window.orders[0].ascending = false;
+        assert!(!original.equals(&different_order));
+
+        let mut different_frame = original.clone();
+        let Expression::Window(window) = &mut different_frame else {
+            unreachable!();
+        };
+        window.frame.start_bound = WindowFrameBound::Offset(Box::new(int_constant(2)));
+        assert!(!original.equals(&different_frame));
+
+        let mut different_null_treatment = original.clone();
+        let Expression::Window(window) = &mut different_null_treatment else {
+            unreachable!();
+        };
+        window.ignore_nulls = true;
+        assert!(!original.equals(&different_null_treatment));
     }
 }
