@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use paro_planner::expression::Expression;
+use paro_planner::expression::{Expression, ExpressionIterator};
 use paro_planner::operator::LogicalOperator;
 use paro_planner::plan::LogicalPlan;
 use paro_planner::visitor::enumerate_expressions;
@@ -65,7 +65,7 @@ impl ExpressionRewriter {
         let rule_ctx = LogicalOperator::DummyScan;
 
         enumerate_expressions(op, |expr| {
-            *expr = self.rewrite_expression(expr.clone(), &rule_ctx);
+            self.rewrite_expression(expr, &rule_ctx);
         });
 
         // Aggregate output types are derived from their rewritten roots.
@@ -75,42 +75,41 @@ impl ExpressionRewriter {
     }
 
     /// Rewrite an expression by applying rules until fixed point.
-    fn rewrite_expression(&self, mut expr: Expression, op: &LogicalOperator) -> Expression {
+    fn rewrite_expression(&self, expr: &mut Expression, op: &LogicalOperator) {
         loop {
             let mut changes_made = false;
-            expr = self.apply_rules(expr, op, &mut changes_made, true);
+            self.apply_rules(expr, op, &mut changes_made, true);
             if !changes_made {
                 break;
             }
         }
-        expr
     }
 
     /// Apply rules to an expression and its children.
     fn apply_rules(
         &self,
-        expr: Expression,
+        expr: &mut Expression,
         op: &LogicalOperator,
         changes_made: &mut bool,
         is_root: bool,
-    ) -> Expression {
+    ) {
         // Try to apply each rule to this expression
-        let current_expr = expr;
-
         for rule in &self.rules {
             let mut bindings = Vec::new();
-            if rule.matcher().matches(&current_expr, &mut bindings) {
+            if rule.matcher().matches(expr, &mut bindings) {
                 // Rule matches, try to apply it
                 match rule.apply(op, bindings, is_root) {
                     RuleResult::Changed(new_expr) => {
                         *changes_made = true;
                         // Re-run rules on the new expression
-                        return self.apply_rules(*new_expr, op, changes_made, is_root);
+                        *expr = *new_expr;
+                        self.apply_rules(expr, op, changes_made, is_root);
+                        return;
                     }
                     RuleResult::Rerun => {
                         *changes_made = true;
                         // Re-run rules on the same expression
-                        return current_expr;
+                        return;
                     }
                     RuleResult::NoChange => {
                         // Continue to next rule
@@ -120,90 +119,9 @@ impl ExpressionRewriter {
         }
 
         // No rule applied, recursively process children
-        self.apply_rules_to_children(current_expr, op, changes_made)
-    }
-
-    /// Apply rules to children of an expression.
-    fn apply_rules_to_children(
-        &self,
-        expr: Expression,
-        op: &LogicalOperator,
-        changes_made: &mut bool,
-    ) -> Expression {
-        match expr {
-            Expression::Function(mut func) => {
-                for child in &mut func.children {
-                    *child = self.apply_rules(child.clone(), op, changes_made, false);
-                }
-                Expression::Function(func)
-            }
-            Expression::Cast(mut cast) => {
-                *cast.child = self.apply_rules(*cast.child, op, changes_made, false);
-                Expression::Cast(cast)
-            }
-            Expression::Conjunction(mut conj) => {
-                for child in &mut conj.children {
-                    *child = self.apply_rules(child.clone(), op, changes_made, false);
-                }
-                Expression::Conjunction(conj)
-            }
-            Expression::Case(mut case) => {
-                *case.check = self.apply_rules(*case.check, op, changes_made, false);
-                *case.result_if_true =
-                    self.apply_rules(*case.result_if_true, op, changes_made, false);
-                *case.result_if_false =
-                    self.apply_rules(*case.result_if_false, op, changes_made, false);
-                Expression::Case(case)
-            }
-            Expression::Comparison(mut comp) => {
-                *comp.left = self.apply_rules(*comp.left, op, changes_made, false);
-                *comp.right = self.apply_rules(*comp.right, op, changes_made, false);
-                Expression::Comparison(comp)
-            }
-            Expression::Operator(mut op_expr) => {
-                for child in &mut op_expr.children {
-                    *child = self.apply_rules(child.clone(), op, changes_made, false);
-                }
-                Expression::Operator(op_expr)
-            }
-            Expression::Aggregate(mut agg) => {
-                for child in &mut agg.children {
-                    *child = self.apply_rules(child.clone(), op, changes_made, false);
-                }
-                if let Some(filter) = &mut agg.filter {
-                    **filter = self.apply_rules((**filter).clone(), op, changes_made, false);
-                }
-                for order in &mut agg.order_bys {
-                    order.expression =
-                        self.apply_rules(order.expression.clone(), op, changes_made, false);
-                }
-                Expression::Aggregate(agg)
-            }
-            Expression::Window(mut window) => {
-                for child in &mut window.children {
-                    *child = self.apply_rules(child.clone(), op, changes_made, false);
-                }
-                for partition in &mut window.partitions {
-                    *partition = self.apply_rules(partition.clone(), op, changes_made, false);
-                }
-                for order in &mut window.orders {
-                    order.expression =
-                        self.apply_rules(order.expression.clone(), op, changes_made, false);
-                }
-                Expression::Window(window)
-            }
-            Expression::Subquery(mut subq) => {
-                for child in &mut subq.children {
-                    *child = self.apply_rules(child.clone(), op, changes_made, false);
-                }
-                Expression::Subquery(subq)
-            }
-            // Leaf expressions have no children
-            Expression::Constant(_)
-            | Expression::Parameter(_)
-            | Expression::ColumnRef(_)
-            | Expression::Reference(_) => expr,
-        }
+        ExpressionIterator::enumerate_children_mut(expr, |child| {
+            self.apply_rules(child, op, changes_made, false);
+        });
     }
 }
 
@@ -224,7 +142,11 @@ mod tests {
     use crate::rules::rule::{Rule, RuleResult};
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ComparisonExpression, ComparisonType, ConstantExpression};
+    use paro_function::window::WindowFunction;
+    use paro_planner::expression::{
+        ComparisonExpression, ComparisonType, ConstantExpression, WindowExpression, WindowFrame,
+        WindowFrameBound, WindowFrameType,
+    };
     use paro_planner::operator::{Distinct, ExpressionGet, Filter, Limit, Projection};
 
     /// A test rule that adds 1 to integer constants less than 100.
@@ -361,13 +283,13 @@ mod tests {
     #[test]
     fn test_expression_rewriter_no_rules() {
         let rewriter = ExpressionRewriter::new();
-        let expr = make_constant(42);
+        let mut expr = make_constant(42);
         let op = LogicalOperator::DummyScan;
 
-        let result = rewriter.rewrite_expression(expr.clone(), &op);
+        rewriter.rewrite_expression(&mut expr, &op);
 
         // Without rules, expression should be unchanged
-        if let Expression::Constant(c) = result {
+        if let Expression::Constant(c) = expr {
             assert_eq!(c.value, Value::Integer(42));
         } else {
             panic!("Expected constant expression");
@@ -380,13 +302,13 @@ mod tests {
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
         // Start with 99, should increment to 100 and stop
-        let expr = make_constant(99);
+        let mut expr = make_constant(99);
         let op = LogicalOperator::DummyScan;
 
-        let result = rewriter.rewrite_expression(expr, &op);
+        rewriter.rewrite_expression(&mut expr, &op);
 
         // Rule should increment 99 to 100
-        if let Expression::Constant(c) = result {
+        if let Expression::Constant(c) = expr {
             assert_eq!(c.value, Value::Integer(100));
         } else {
             panic!("Expected constant expression");
@@ -399,17 +321,17 @@ mod tests {
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
         // Create comparison: 98 = 99
-        let expr = Expression::Comparison(ComparisonExpression::new(
+        let mut expr = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             make_constant(98),
             make_constant(99),
         ));
         let op = LogicalOperator::DummyScan;
 
-        let result = rewriter.rewrite_expression(expr, &op);
+        rewriter.rewrite_expression(&mut expr, &op);
 
         // Both constants should be incremented to 100
-        if let Expression::Comparison(comp) = result {
+        if let Expression::Comparison(comp) = expr {
             if let Expression::Constant(left) = &*comp.left {
                 assert_eq!(left.value, Value::Integer(100));
             } else {
@@ -426,22 +348,57 @@ mod tests {
     }
 
     #[test]
+    fn test_expression_rewriter_visits_window_frame_offsets() {
+        let mut rewriter = ExpressionRewriter::new();
+        rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
+
+        let mut expr = Expression::Window(WindowExpression {
+            function: WindowFunction::row_number(),
+            children: Vec::new(),
+            partitions: Vec::new(),
+            orders: Vec::new(),
+            frame: WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(make_constant(98))),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::Offset(Box::new(make_constant(99))),
+                end_is_preceding: false,
+            },
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
+        });
+
+        rewriter.rewrite_expression(&mut expr, &LogicalOperator::DummyScan);
+        let Expression::Window(window) = expr else {
+            panic!("expected window expression");
+        };
+        let WindowFrameBound::Offset(start) = &window.frame.start_bound else {
+            panic!("expected start offset");
+        };
+        let WindowFrameBound::Offset(end) = &window.frame.end_bound else {
+            panic!("expected end offset");
+        };
+        assert_constant_integer(Some(start), 100);
+        assert_constant_integer(Some(end), 100);
+    }
+
+    #[test]
     fn test_expression_rewriter_self_equality() {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(SelfEqualityRule::new()));
 
         // Create comparison: 42 = 42
-        let expr = Expression::Comparison(ComparisonExpression::new(
+        let mut expr = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             make_constant(42),
             make_constant(42),
         ));
         let op = LogicalOperator::DummyScan;
 
-        let result = rewriter.rewrite_expression(expr, &op);
+        rewriter.rewrite_expression(&mut expr, &op);
 
         // Should be simplified to true
-        if let Expression::Constant(c) = result {
+        if let Expression::Constant(c) = expr {
             assert_eq!(c.value, Value::Boolean(true));
         } else {
             panic!("Expected constant true");
@@ -588,17 +545,17 @@ mod tests {
         rewriter.add_rule(Box::new(ConstantComparisonFoldingRule::new()));
 
         // Create comparison: 42 = 42 (should fold to true)
-        let expr = Expression::Comparison(ComparisonExpression::new(
+        let mut expr = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             make_constant(42),
             make_constant(42),
         ));
         let op = LogicalOperator::DummyScan;
 
-        let result = rewriter.rewrite_expression(expr, &op);
+        rewriter.rewrite_expression(&mut expr, &op);
 
         // Should be folded to true
-        if let Expression::Constant(c) = result {
+        if let Expression::Constant(c) = expr {
             assert_eq!(c.value, Value::Boolean(true));
         } else {
             panic!("Expected constant true");

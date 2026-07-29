@@ -1712,6 +1712,7 @@ dependencies = [
 name = "paro-optimizer"
 version = "0.1.0"
 dependencies = [
+ "divan",
  "paro-catalog",
  "paro-common",
  "paro-context",
