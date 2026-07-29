@@ -28,11 +28,15 @@ impl ExpressionSourceExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         global: &SourceGlobal,
     ) -> Result<SourceLocal> {
         global.expression()?;
-        Ok(SourceLocal::Expression(ExpressionSourceLocal::default()))
+        Ok(SourceLocal::Expression(ExpressionSourceLocal::try_new(
+            ctx,
+            &self.spec.expressions,
+            &self.spec.output_types,
+        )?))
     }
 
     pub(crate) fn poll_next(
@@ -47,14 +51,6 @@ impl ExpressionSourceExec {
                 "expression source local state mismatch",
             ));
         };
-        poll_expression_rows(
-            ctx,
-            &self.spec.expressions,
-            &self.spec.output_types,
-            &mut local.cursor,
-            &mut local.scalar_scratch,
-            output,
-            "EXPRESSION",
-        )
+        poll_expression_rows(ctx, &self.spec.expressions, local, output)
     }
 }

@@ -11,4 +11,9 @@ SELECT 42 AS answer;
 SELECT 1 + 0;
 SELECT count(*) FROM t_const;
 
+-- VALUES rows must be cast to the common column type before execution.
+VALUES (1), (100000000000);
+VALUES (1), (2.5);
+VALUES (-1), (100000000000);
+
 DROP TABLE IF EXISTS t_const;

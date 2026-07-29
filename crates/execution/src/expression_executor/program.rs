@@ -67,8 +67,12 @@ pub struct ExpressionProgramCacheKey {
 
 impl ExpressionProgramCacheKey {
     pub fn new(exprs: &[Expression], version: &ExpressionProgramVersion) -> Self {
+        Self::from_fingerprints(expression_list_fingerprints(exprs), version)
+    }
+
+    fn from_fingerprints(root_fingerprints: Vec<u64>, version: &ExpressionProgramVersion) -> Self {
         Self {
-            root_fingerprints: expression_list_fingerprints(exprs).into_boxed_slice(),
+            root_fingerprints: root_fingerprints.into_boxed_slice(),
             backend: version.backend,
             physical_semantics_version: version.physical_semantics_version,
             visible_generation: version.visible_generation,
@@ -123,6 +127,37 @@ impl ExpressionProgramCache {
         version: ExpressionProgramVersion,
     ) -> Arc<PhysicalExpressionProgram> {
         let key = ExpressionProgramCacheKey::new(exprs, &version);
+        self.get_or_compile_with(key, |root_fingerprints| {
+            PhysicalExpressionProgram::compile_with_fingerprints(exprs, version, root_fingerprints)
+        })
+    }
+
+    pub(crate) fn get_or_compile_refs(
+        &mut self,
+        exprs: &[&Expression],
+        version: ExpressionProgramVersion,
+    ) -> Arc<PhysicalExpressionProgram> {
+        let key = ExpressionProgramCacheKey::from_fingerprints(
+            exprs
+                .iter()
+                .map(|expr| expression_fingerprint(expr))
+                .collect(),
+            &version,
+        );
+        self.get_or_compile_with(key, |root_fingerprints| {
+            PhysicalExpressionProgram::compile_refs_with_fingerprints(
+                exprs,
+                version,
+                root_fingerprints,
+            )
+        })
+    }
+
+    fn get_or_compile_with(
+        &mut self,
+        key: ExpressionProgramCacheKey,
+        compile: impl FnOnce(Vec<u64>) -> PhysicalExpressionProgram,
+    ) -> Arc<PhysicalExpressionProgram> {
         let epoch = self.next_epoch();
         if let Some(entry) = self.programs.get_mut(&key) {
             self.hits += 1;
@@ -133,11 +168,7 @@ impl ExpressionProgramCache {
             return program;
         }
         self.misses += 1;
-        let program = Arc::new(PhysicalExpressionProgram::compile_with_fingerprints(
-            exprs,
-            version,
-            key.root_fingerprints.to_vec(),
-        ));
+        let program = Arc::new(compile(key.root_fingerprints.to_vec()));
         self.programs.insert(
             key.clone(),
             CachedProgramEntry {
@@ -502,15 +533,40 @@ impl PhysicalExpressionProgram {
         version: ExpressionProgramVersion,
         root_fingerprints: Vec<u64>,
     ) -> Self {
-        let shared_candidates = SharedExpressionCandidates::from_expressions(exprs);
+        Self::compile_iter(exprs.iter(), exprs.len(), version, root_fingerprints)
+    }
+
+    fn compile_refs_with_fingerprints(
+        exprs: &[&Expression],
+        version: ExpressionProgramVersion,
+        root_fingerprints: Vec<u64>,
+    ) -> Self {
+        Self::compile_iter(
+            exprs.iter().copied(),
+            exprs.len(),
+            version,
+            root_fingerprints,
+        )
+    }
+
+    fn compile_iter<'a, I>(
+        exprs: I,
+        root_count: usize,
+        version: ExpressionProgramVersion,
+        root_fingerprints: Vec<u64>,
+    ) -> Self
+    where
+        I: Iterator<Item = &'a Expression> + Clone,
+    {
+        let shared_candidates = SharedExpressionCandidates::from_expressions(exprs.clone());
         let mut compiler = ProgramCompiler::new(shared_candidates);
-        let mut root_to_unique = Vec::with_capacity(exprs.len());
-        let mut root_first_output = Vec::with_capacity(exprs.len());
+        let mut root_to_unique = Vec::with_capacity(root_count);
+        let mut root_first_output = Vec::with_capacity(root_count);
         let mut unique_by_key = HashMap::new();
         let mut roots = Vec::new();
 
-        debug_assert_eq!(exprs.len(), root_fingerprints.len());
-        for (expr, root_fingerprint) in exprs.iter().zip(root_fingerprints.iter().copied()) {
+        debug_assert_eq!(root_count, root_fingerprints.len());
+        for (expr, root_fingerprint) in exprs.zip(root_fingerprints.iter().copied()) {
             let compiled = compiler.compile_expression(expr);
             if compiled.cse_safe {
                 let unique = *unique_by_key.entry(root_fingerprint).or_insert_with(|| {
@@ -945,7 +1001,7 @@ struct SharedExpressionCandidates {
 }
 
 impl SharedExpressionCandidates {
-    fn from_expressions(exprs: &[Expression]) -> Self {
+    fn from_expressions<'a>(exprs: impl Iterator<Item = &'a Expression>) -> Self {
         let mut counts = HashMap::<u64, (usize, LogicalType)>::new();
         for expr in exprs {
             count_cse_candidates(expr, &mut counts);

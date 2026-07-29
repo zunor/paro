@@ -455,6 +455,23 @@ impl LogicalType {
             }
         }
 
+        // Fixed arrays of different lengths cannot be cast to one another, but
+        // both have a lossless common representation as a variable-length list.
+        // This also covers empty array literals (size 0) mixed with non-empty
+        // arrays in VALUES and other common-type inference sites.
+        if let (
+            LogicalType::Array(left_child, left_size),
+            LogicalType::Array(right_child, right_size),
+        ) = (left, right)
+        {
+            if left_size != right_size {
+                return LogicalType::List(Box::new(Self::max_logical_type(
+                    left_child,
+                    right_child,
+                )));
+            }
+        }
+
         if left == right {
             return left.clone();
         }
@@ -940,6 +957,22 @@ mod tests {
         assert_eq!(
             LogicalType::max_logical_type(&LogicalType::IntegerLiteral(1), &LogicalType::Double),
             LogicalType::Double
+        );
+
+        // Differently sized arrays share a variable-length list type.
+        assert_eq!(
+            LogicalType::max_logical_type(
+                &LogicalType::Array(Box::new(LogicalType::Integer), 3),
+                &LogicalType::Array(Box::new(LogicalType::BigInt), 2),
+            ),
+            LogicalType::List(Box::new(LogicalType::BigInt))
+        );
+        assert_eq!(
+            LogicalType::max_logical_type(
+                &LogicalType::Array(Box::new(LogicalType::Null), 0),
+                &LogicalType::Array(Box::new(LogicalType::Boolean), 2),
+            ),
+            LogicalType::List(Box::new(LogicalType::Boolean))
         );
     }
 

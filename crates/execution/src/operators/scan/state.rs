@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
-use paro_common::vector::Vector;
 use paro_function::table::{GlobalTableFunctionState, LocalTableFunctionState};
 use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentSharedPtr};
@@ -50,11 +49,7 @@ pub struct ValuesSourceGlobal {
     pub row_count: usize,
 }
 
-#[derive(Debug, Default)]
-pub struct ValuesSourceLocal {
-    pub cursor: usize,
-    pub scalar_scratch: Vec<Vector>,
-}
+pub type ValuesSourceLocal = super::expression_rows::ExpressionRowsSourceLocal;
 
 #[derive(Debug)]
 pub struct ChunkSourceGlobal {
@@ -80,11 +75,7 @@ pub struct ExpressionSourceGlobal {
     pub row_count: usize,
 }
 
-#[derive(Debug, Default)]
-pub struct ExpressionSourceLocal {
-    pub cursor: usize,
-    pub scalar_scratch: Vec<Vector>,
-}
+pub type ExpressionSourceLocal = super::expression_rows::ExpressionRowsSourceLocal;
 
 pub struct TableFunctionSourceGlobal {
     pub bind_data: Arc<TableFunctionBindDataWrapper>,

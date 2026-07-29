@@ -75,19 +75,7 @@ impl BoundQuery {
                 }
             }
             BoundQuery::Values(n) => {
-                for row in &mut n.values {
-                    for (i, target_type) in target_types.iter().enumerate() {
-                        if row[i].return_type() != *target_type {
-                            row[i] = CastExpression::add_explicit_cast(
-                                row[i].clone(),
-                                target_type.clone(),
-                                cast_functions,
-                                false,
-                            )?;
-                        }
-                    }
-                }
-                n.types = target_types.to_vec();
+                n.cast_rows_to_types(target_types, cast_functions)?;
             }
             BoundQuery::SetOperation(n) => {
                 n.left.cast_to_types(target_types, cast_functions)?;
@@ -209,4 +197,39 @@ pub struct BoundValues {
     pub values: Vec<Vec<Expression>>,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
+}
+
+impl BoundValues {
+    /// Align every row expression with the declared column types.
+    ///
+    /// `types` describes the common type of each VALUES column, so leaving a
+    /// narrower expression in an individual row would make the logical schema
+    /// disagree with the expression matrix consumed by execution.
+    pub(crate) fn cast_rows_to_types(
+        &mut self,
+        target_types: &[LogicalType],
+        cast_functions: &CastFunctionSet,
+    ) -> Result<()> {
+        for (row_idx, row) in self.values.iter_mut().enumerate() {
+            if row.len() != target_types.len() {
+                return Err(paro_error::internal(format!(
+                    "VALUES row {row_idx} has {} expressions but schema has {} columns",
+                    row.len(),
+                    target_types.len()
+                )));
+            }
+            for (expression, target_type) in row.iter_mut().zip(target_types) {
+                if expression.return_type() != *target_type {
+                    *expression = CastExpression::add_explicit_cast(
+                        expression.clone(),
+                        target_type.clone(),
+                        cast_functions,
+                        false,
+                    )?;
+                }
+            }
+        }
+        self.types = target_types.to_vec();
+        Ok(())
+    }
 }

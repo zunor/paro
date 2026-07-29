@@ -9,6 +9,7 @@ mod predicate;
 mod program;
 
 pub mod executor;
+pub(crate) mod rows;
 pub mod physical {
     pub use super::program::{
         expression_fingerprint, expression_list_fingerprints, ExpressionBackend,
