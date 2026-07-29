@@ -40,12 +40,25 @@ enum CompiledRowsPlan {
     /// general expression engine. Keeping this as a distinct plan avoids an
     /// empty physical program, per-cell dispatch metadata, and scalar scratch.
     Direct,
-    General {
-        executor: ExpressionExecutor,
-        dummy_input: Chunk,
-        scalar_scratch: Vec<Vector>,
-        root_to_dynamic: Box<[usize]>,
-    },
+    General(GeneralRowsPlan),
+}
+
+#[derive(Debug)]
+struct GeneralRowsPlan {
+    executor: ExpressionExecutor,
+    dummy_input: Chunk,
+    scalar_scratch: Vec<Vector>,
+    root_to_dynamic: Box<[usize]>,
+}
+
+struct ExpressionRowsBatch<'a> {
+    start_row: usize,
+    row_count: usize,
+    rows: &'a [Box<[Expression]>],
+    params: &'a ParameterBindings,
+    runtime: &'a dyn FunctionExecContext,
+    output_types: &'a [LogicalType],
+    output: &'a mut Chunk,
 }
 
 impl ExpressionRowsExecutor {
@@ -111,12 +124,12 @@ impl ExpressionRowsExecutor {
                 .iter()
                 .map(|ty| Vector::try_new(ty.clone(), 1, Arc::clone(&allocator)))
                 .collect::<Result<Vec<_>>>()?;
-            CompiledRowsPlan::General {
+            CompiledRowsPlan::General(GeneralRowsPlan {
                 executor,
                 dummy_input,
                 scalar_scratch,
                 root_to_dynamic: root_to_dynamic.into_boxed_slice(),
-            }
+            })
         } else {
             CompiledRowsPlan::Direct
         };
@@ -176,35 +189,20 @@ impl ExpressionRowsExecutor {
             output.try_reset(output.allocator().clone())?;
         }
 
+        let mut batch = ExpressionRowsBatch {
+            start_row,
+            row_count,
+            rows,
+            params,
+            runtime,
+            output_types: &self.output_types,
+            output,
+        };
         match &mut self.plan {
-            CompiledRowsPlan::Direct => execute_direct_batch(
-                start_row,
-                row_count,
-                rows,
-                params,
-                &self.output_types,
-                output,
-            )?,
-            CompiledRowsPlan::General {
-                executor,
-                dummy_input,
-                scalar_scratch,
-                root_to_dynamic,
-            } => execute_general_batch(
-                start_row,
-                row_count,
-                rows,
-                params,
-                runtime,
-                output,
-                executor,
-                dummy_input,
-                scalar_scratch,
-                root_to_dynamic,
-                column_count,
-            )?,
+            CompiledRowsPlan::Direct => execute_direct_batch(&mut batch)?,
+            CompiledRowsPlan::General(plan) => plan.execute_batch(&mut batch)?,
         }
-        output.try_set_cardinality(row_count)?;
+        batch.output.try_set_cardinality(row_count)?;
         Ok(())
     }
 
@@ -213,88 +211,86 @@ impl ExpressionRowsExecutor {
     }
 }
 
-fn execute_direct_batch(
-    start_row: usize,
-    row_count: usize,
-    rows: &[Box<[Expression]>],
-    params: &ParameterBindings,
-    output_types: &[LogicalType],
-    output: &mut Chunk,
-) -> Result<()> {
+fn execute_direct_batch(batch: &mut ExpressionRowsBatch<'_>) -> Result<()> {
     // Direct roots are side-effect free, so columns can be filled independently.
     // Acquiring each mutable vector once removes an Arc uniqueness check and a
     // column lookup from every cell in the matrix.
-    for (column_idx, target) in output.data.iter_mut().enumerate() {
+    for (column_idx, target) in batch.output.data.iter_mut().enumerate() {
         let target = Vector::try_make_arc_mut(target)?;
-        for output_row in 0..row_count {
-            let source_row = start_row + output_row;
-            let expression = &rows[source_row][column_idx];
-            let value = direct_root_value(expression, params)?;
-            if !target.try_set_scalar_value(output_row, value)? {
-                return Err(paro_error::internal(format!(
-                    "direct expression row root for {:?} has unsupported runtime value",
-                    output_types[column_idx]
-                )));
-            }
+        for output_row in 0..batch.row_count {
+            let source_row = batch.start_row + output_row;
+            write_direct_root(
+                target,
+                output_row,
+                &batch.rows[source_row][column_idx],
+                batch.params,
+                &batch.output_types[column_idx],
+            )?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_general_batch(
-    start_row: usize,
-    row_count: usize,
-    rows: &[Box<[Expression]>],
-    params: &ParameterBindings,
-    runtime: &dyn FunctionExecContext,
-    output: &mut Chunk,
-    executor: &mut ExpressionExecutor,
-    dummy_input: &Chunk,
-    scalar_scratch: &mut [Vector],
-    root_to_dynamic: &[usize],
-    column_count: usize,
-) -> Result<()> {
-    // Preserve row-major evaluation for general roots: bound functions can be
-    // volatile or have side effects even when neighboring roots are direct.
-    for output_row in 0..row_count {
-        let source_row = start_row + output_row;
-        let root_base = source_row
-            .checked_mul(column_count)
-            .ok_or_else(|| paro_error::internal("expression row root index overflowed usize"))?;
-        for column_idx in 0..column_count {
-            let target = output
-                .data
-                .get_mut(column_idx)
-                .ok_or_else(|| paro_error::internal("expression row output column is missing"))?;
-            let target = Vector::try_make_arc_mut(target)?;
-            let root_idx = root_base + column_idx;
-            let dynamic_idx = root_to_dynamic[root_idx];
-            if dynamic_idx == DIRECT_ROOT {
-                let value = direct_root_value(&rows[source_row][column_idx], params)?;
-                if !target.try_set_scalar_value(output_row, value)? {
-                    return Err(paro_error::internal(
-                        "direct expression row root has unsupported runtime value",
-                    ));
+impl GeneralRowsPlan {
+    fn execute_batch(&mut self, batch: &mut ExpressionRowsBatch<'_>) -> Result<()> {
+        let column_count = batch.output_types.len();
+        // Preserve row-major evaluation for general roots: bound functions can be
+        // volatile or have side effects even when neighboring roots are direct.
+        for output_row in 0..batch.row_count {
+            let source_row = batch.start_row + output_row;
+            let root_base = source_row.checked_mul(column_count).ok_or_else(|| {
+                paro_error::internal("expression row root index overflowed usize")
+            })?;
+            for column_idx in 0..column_count {
+                let target = batch.output.data.get_mut(column_idx).ok_or_else(|| {
+                    paro_error::internal("expression row output column is missing")
+                })?;
+                let target = Vector::try_make_arc_mut(target)?;
+                let root_idx = root_base + column_idx;
+                let dynamic_idx = self.root_to_dynamic[root_idx];
+                if dynamic_idx == DIRECT_ROOT {
+                    write_direct_root(
+                        target,
+                        output_row,
+                        &batch.rows[source_row][column_idx],
+                        batch.params,
+                        &batch.output_types[column_idx],
+                    )?;
+                    continue;
                 }
-                continue;
-            }
 
-            let scalar = &mut scalar_scratch[column_idx];
-            scalar.try_reset_for_execution(1, runtime.allocator(MemoryTag::BaseTable))?;
-            scalar.try_set_count(1)?;
-            executor.execute_kernel_into(
-                dynamic_idx,
-                VectorKernelInput::from_eval_input(crate::runtime::ExpressionEvalInput {
-                    params,
-                    columns: dummy_input,
-                })
-                .with_count(1),
-                runtime,
-                scalar,
-            )?;
-            target.try_copy_at(output_row, scalar, 0)?;
+                let scalar = &mut self.scalar_scratch[column_idx];
+                scalar.try_reset_for_execution(1, batch.runtime.allocator(MemoryTag::BaseTable))?;
+                scalar.try_set_count(1)?;
+                self.executor.execute_kernel_into(
+                    dynamic_idx,
+                    VectorKernelInput::from_eval_input(crate::runtime::ExpressionEvalInput {
+                        params: batch.params,
+                        columns: &self.dummy_input,
+                    })
+                    .with_count(1),
+                    batch.runtime,
+                    scalar,
+                )?;
+                target.try_copy_at(output_row, scalar, 0)?;
+            }
         }
+        Ok(())
+    }
+}
+
+fn write_direct_root(
+    target: &mut Vector,
+    output_row: usize,
+    expression: &Expression,
+    params: &ParameterBindings,
+    output_type: &LogicalType,
+) -> Result<()> {
+    let value = direct_root_value(expression, params)?;
+    if !target.try_set_scalar_value(output_row, value)? {
+        return Err(paro_error::internal(format!(
+            "direct expression row root for {output_type:?} has unsupported runtime value"
+        )));
     }
     Ok(())
 }
@@ -514,7 +510,7 @@ mod tests {
             Arc::clone(&allocator),
         )
         .expect("expression row executor");
-        assert!(matches!(&executor.plan, CompiledRowsPlan::General { .. }));
+        assert!(matches!(&executor.plan, CompiledRowsPlan::General(_)));
         let mut output = Chunk::try_initialize(&types, 1, allocator).expect("output chunk");
 
         executor
