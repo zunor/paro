@@ -4,10 +4,10 @@
 //! Compiled execution for row-oriented expression matrices.
 //!
 //! SQL `VALUES` and expression scans store one expression list per output row,
-//! while the execution engine consumes columnar chunks. This adapter maps the
-//! complete matrix once, compiles its dynamic roots as one physical expression
+//! while the execution engine consumes columnar chunks. This adapter validates
+//! the complete matrix once, compiles dynamic roots as one physical expression
 //! program, retains local state for the source task, and writes literal and
-//! parameter roots directly into columns without boxing through
+//! parameter-only matrices directly into columns without boxing through
 //! [`Value`](paro_common::runtime_value::Value).
 
 use std::sync::Arc;
@@ -29,12 +29,36 @@ const DIRECT_ROOT: usize = usize::MAX;
 
 #[derive(Debug)]
 pub(crate) struct ExpressionRowsExecutor {
+    plan: CompiledRowsPlan,
+    output_types: Box<[LogicalType]>,
+    row_count: usize,
+}
+
+#[derive(Debug)]
+enum CompiledRowsPlan {
+    /// Every root is a literal or parameter and can be written without the
+    /// general expression engine. Keeping this as a distinct plan avoids an
+    /// empty physical program, per-cell dispatch metadata, and scalar scratch.
+    Direct,
+    General(GeneralRowsPlan),
+}
+
+#[derive(Debug)]
+struct GeneralRowsPlan {
     executor: ExpressionExecutor,
     dummy_input: Chunk,
     scalar_scratch: Vec<Vector>,
-    output_types: Box<[LogicalType]>,
     root_to_dynamic: Box<[usize]>,
+}
+
+struct ExpressionRowsBatch<'a> {
+    start_row: usize,
     row_count: usize,
+    rows: &'a [Box<[Expression]>],
+    params: &'a ParameterBindings,
+    runtime: &'a dyn FunctionExecContext,
+    output_types: &'a [LogicalType],
+    output: &'a mut Chunk,
 }
 
 impl ExpressionRowsExecutor {
@@ -48,8 +72,9 @@ impl ExpressionRowsExecutor {
         let expected_roots = rows.len().checked_mul(column_count).ok_or_else(|| {
             paro_error::internal("expression row matrix dimensions overflowed usize")
         })?;
-        let mut expression_refs = Vec::with_capacity(expected_roots);
-        let mut root_to_dynamic = Vec::with_capacity(expected_roots);
+        let mut expression_refs = Vec::new();
+        let mut root_to_dynamic = None::<Vec<usize>>;
+        let mut root_idx = 0usize;
         for (row_idx, row) in rows.iter().enumerate() {
             if row.len() != column_count {
                 return Err(paro_error::internal(format!(
@@ -69,31 +94,49 @@ impl ExpressionRowsExecutor {
                     )));
                 }
                 if can_write_direct(expression) {
-                    root_to_dynamic.push(DIRECT_ROOT);
+                    if let Some(mapping) = &mut root_to_dynamic {
+                        mapping.push(DIRECT_ROOT);
+                    }
                 } else {
-                    root_to_dynamic.push(expression_refs.len());
+                    let dynamic_idx = expression_refs.len();
+                    root_to_dynamic
+                        .get_or_insert_with(|| {
+                            let mut mapping = Vec::with_capacity(expected_roots);
+                            mapping.resize(root_idx, DIRECT_ROOT);
+                            mapping
+                        })
+                        .push(dynamic_idx);
                     expression_refs.push(expression);
                 }
+                root_idx += 1;
             }
         }
 
-        let executor =
-            ExpressionExecutor::with_expression_refs_for_session(&expression_refs, session);
-        debug_assert_eq!(executor.expression_count(), expression_refs.len());
+        debug_assert_eq!(root_idx, expected_roots);
+        let plan = if let Some(root_to_dynamic) = root_to_dynamic {
+            let executor =
+                ExpressionExecutor::with_expression_refs_for_session(&expression_refs, session);
+            debug_assert_eq!(executor.expression_count(), expression_refs.len());
 
-        let mut dummy_input = Chunk::try_init_empty(&[], Arc::clone(&allocator))?;
-        dummy_input.try_set_cardinality(1)?;
-        let scalar_scratch = output_types
-            .iter()
-            .map(|ty| Vector::try_new(ty.clone(), 1, Arc::clone(&allocator)))
-            .collect::<Result<Vec<_>>>()?;
+            let mut dummy_input = Chunk::try_init_empty(&[], Arc::clone(&allocator))?;
+            dummy_input.try_set_cardinality(1)?;
+            let scalar_scratch = output_types
+                .iter()
+                .map(|ty| Vector::try_new(ty.clone(), 1, Arc::clone(&allocator)))
+                .collect::<Result<Vec<_>>>()?;
+            CompiledRowsPlan::General(GeneralRowsPlan {
+                executor,
+                dummy_input,
+                scalar_scratch,
+                root_to_dynamic: root_to_dynamic.into_boxed_slice(),
+            })
+        } else {
+            CompiledRowsPlan::Direct
+        };
 
         Ok(Self {
-            executor,
-            dummy_input,
-            scalar_scratch,
+            plan,
             output_types: output_types.to_vec().into_boxed_slice(),
-            root_to_dynamic: root_to_dynamic.into_boxed_slice(),
             row_count: rows.len(),
         })
     }
@@ -146,61 +189,122 @@ impl ExpressionRowsExecutor {
             output.try_reset(output.allocator().clone())?;
         }
 
-        for output_row in 0..row_count {
-            let source_row = start_row + output_row;
+        let mut batch = ExpressionRowsBatch {
+            start_row,
+            row_count,
+            rows,
+            params,
+            runtime,
+            output_types: &self.output_types,
+            output,
+        };
+        match &mut self.plan {
+            CompiledRowsPlan::Direct => execute_direct_batch(&mut batch)?,
+            CompiledRowsPlan::General(plan) => plan.execute_batch(&mut batch)?,
+        }
+        batch.output.try_set_cardinality(row_count)?;
+        Ok(())
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
+
+fn execute_direct_batch(batch: &mut ExpressionRowsBatch<'_>) -> Result<()> {
+    // Direct roots are side-effect free, so columns can be filled independently.
+    // Acquiring each mutable vector once removes an Arc uniqueness check and a
+    // column lookup from every cell in the matrix.
+    for (column_idx, target) in batch.output.data.iter_mut().enumerate() {
+        let target = Vector::try_make_arc_mut(target)?;
+        for output_row in 0..batch.row_count {
+            let source_row = batch.start_row + output_row;
+            write_direct_root(
+                target,
+                output_row,
+                &batch.rows[source_row][column_idx],
+                batch.params,
+                &batch.output_types[column_idx],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl GeneralRowsPlan {
+    fn execute_batch(&mut self, batch: &mut ExpressionRowsBatch<'_>) -> Result<()> {
+        let column_count = batch.output_types.len();
+        // Preserve row-major evaluation for general roots: bound functions can be
+        // volatile or have side effects even when neighboring roots are direct.
+        for output_row in 0..batch.row_count {
+            let source_row = batch.start_row + output_row;
             let root_base = source_row.checked_mul(column_count).ok_or_else(|| {
                 paro_error::internal("expression row root index overflowed usize")
             })?;
             for column_idx in 0..column_count {
-                let target = output.data.get_mut(column_idx).ok_or_else(|| {
+                let target = batch.output.data.get_mut(column_idx).ok_or_else(|| {
                     paro_error::internal("expression row output column is missing")
                 })?;
                 let target = Vector::try_make_arc_mut(target)?;
                 let root_idx = root_base + column_idx;
                 let dynamic_idx = self.root_to_dynamic[root_idx];
                 if dynamic_idx == DIRECT_ROOT {
-                    let expression = &rows[source_row][column_idx];
-                    let value = match expression {
-                        Expression::Constant(expression) => &expression.value,
-                        Expression::Parameter(expression) => {
-                            params.value_for_slot(&expression.slot)?
-                        }
-                        _ => {
-                            return Err(paro_error::internal(
-                                "direct expression row root is not constant or parameter",
-                            ))
-                        }
-                    };
-                    if !target.try_set_scalar_value(output_row, value)? {
-                        return Err(paro_error::internal(
-                            "direct expression row root has unsupported runtime value",
-                        ));
-                    }
+                    write_direct_root(
+                        target,
+                        output_row,
+                        &batch.rows[source_row][column_idx],
+                        batch.params,
+                        &batch.output_types[column_idx],
+                    )?;
                     continue;
                 }
 
                 let scalar = &mut self.scalar_scratch[column_idx];
-                scalar.try_reset_for_execution(1, runtime.allocator(MemoryTag::BaseTable))?;
+                scalar.try_reset_for_execution(1, batch.runtime.allocator(MemoryTag::BaseTable))?;
                 scalar.try_set_count(1)?;
                 self.executor.execute_kernel_into(
                     dynamic_idx,
                     VectorKernelInput::from_eval_input(crate::runtime::ExpressionEvalInput {
-                        params,
+                        params: batch.params,
                         columns: &self.dummy_input,
                     })
                     .with_count(1),
-                    runtime,
+                    batch.runtime,
                     scalar,
                 )?;
                 target.try_copy_at(output_row, scalar, 0)?;
             }
         }
-        output.try_set_cardinality(row_count)?;
         Ok(())
     }
+}
 
-    pub(crate) fn row_count(&self) -> usize {
-        self.row_count
+fn write_direct_root(
+    target: &mut Vector,
+    output_row: usize,
+    expression: &Expression,
+    params: &ParameterBindings,
+    output_type: &LogicalType,
+) -> Result<()> {
+    let value = direct_root_value(expression, params)?;
+    if !target.try_set_scalar_value(output_row, value)? {
+        return Err(paro_error::internal(format!(
+            "direct expression row root for {output_type:?} has unsupported runtime value"
+        )));
+    }
+    Ok(())
+}
+
+fn direct_root_value<'a>(
+    expression: &'a Expression,
+    params: &'a ParameterBindings,
+) -> Result<&'a Value> {
+    match expression {
+        Expression::Constant(expression) => Ok(&expression.value),
+        Expression::Parameter(expression) => params.value_for_slot(&expression.slot),
+        _ => Err(paro_error::internal(
+            "direct expression row root is not constant or parameter",
+        )),
     }
 }
 
@@ -306,6 +410,7 @@ mod tests {
             Arc::clone(&allocator),
         )
         .expect("expression row executor");
+        assert!(matches!(&executor.plan, CompiledRowsPlan::Direct));
         let mut output = Chunk::try_initialize(&types, 2, allocator).expect("output chunk");
 
         executor
@@ -350,6 +455,7 @@ mod tests {
             Arc::clone(&allocator),
         )
         .expect("expression row executor");
+        assert!(matches!(&executor.plan, CompiledRowsPlan::Direct));
         let mut output = Chunk::try_initialize(&types, 1, allocator).expect("output chunk");
 
         executor
@@ -373,6 +479,7 @@ mod tests {
     fn complex_and_nested_roots_keep_general_executor_semantics() {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 2);
         let rows = vec![row(vec![
+            constant(Value::BigInt(3), LogicalType::BigInt),
             Expression::Comparison(ComparisonExpression::new(
                 ComparisonType::Equal,
                 constant(Value::Integer(9), LogicalType::Integer),
@@ -386,8 +493,14 @@ mod tests {
                 ),
                 array_type.clone(),
             ),
+            constant(Value::Varchar("tail".into()), LogicalType::Varchar),
         ])];
-        let types = [LogicalType::Boolean, array_type.clone()];
+        let types = [
+            LogicalType::BigInt,
+            LogicalType::Boolean,
+            array_type.clone(),
+            LogicalType::Varchar,
+        ];
         let query = query(ParameterBindings::empty());
         let allocator = paro_common::test_utils::test_allocator();
         let mut executor = ExpressionRowsExecutor::try_new(
@@ -397,20 +510,23 @@ mod tests {
             Arc::clone(&allocator),
         )
         .expect("expression row executor");
+        assert!(matches!(&executor.plan, CompiledRowsPlan::General(_)));
         let mut output = Chunk::try_initialize(&types, 1, allocator).expect("output chunk");
 
         executor
             .execute_batch(0, 1, &rows, query.params.as_ref(), &query, &mut output)
             .expect("general expression row evaluation");
-        assert_eq!(output.get_value(0, 0), Some(Value::Boolean(true)));
+        assert_eq!(output.get_value(0, 0), Some(Value::BigInt(3)));
+        assert_eq!(output.get_value(1, 0), Some(Value::Boolean(true)));
         assert_eq!(
-            output.get_value(1, 0),
+            output.get_value(2, 0),
             Some(Value::Array(
                 vec![Value::Integer(4), Value::Integer(5)],
                 LogicalType::Integer,
                 2,
             ))
         );
+        assert_eq!(output.get_value(3, 0), Some(Value::Varchar("tail".into())));
     }
 
     #[test]
