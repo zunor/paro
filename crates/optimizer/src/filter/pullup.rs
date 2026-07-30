@@ -15,6 +15,8 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 
+use crate::expression::join_has_evaluation_fence;
+
 /// Filter pullup optimizer.
 ///
 /// Pulls filter predicates up through the logical plan tree,
@@ -103,6 +105,15 @@ impl FilterPullup {
             child, expressions, ..
         } = filter;
         if self.can_pullup {
+            if expressions
+                .iter()
+                .any(|expr| expr.evaluation_properties().is_reorder_fence())
+            {
+                let mut child_pullup = FilterPullup::new();
+                let child = child_pullup.rewrite_plan(*child);
+                return LogicalOperator::Filter(Filter::new(child, expressions));
+            }
+
             let plan = self.rewrite_plan(*child);
             for expr in expressions {
                 self.filters_expr_pullup.push(expr);
@@ -119,7 +130,13 @@ impl FilterPullup {
         proj.child = Box::new(self.rewrite_plan(*proj.child));
 
         if !self.filters_expr_pullup.is_empty() {
-            if !self.can_add_column {
+            if proj
+                .expressions
+                .iter()
+                .any(|expr| expr.evaluation_properties().is_reorder_fence())
+            {
+                self.materialize_pullup_below_projection(&mut proj);
+            } else if !self.can_add_column {
                 // Special treatment for operators that cannot add columns
                 // (e.g., INTERSECT, EXCEPT, DISTINCT)
                 self.project_set_operation(&mut proj);
@@ -160,17 +177,21 @@ impl FilterPullup {
         // If new columns were added, we must revert and create a filter below
         if copy_proj_expressions.len() > original_len {
             // Revert: create filter below projection
-            let filters = std::mem::take(&mut self.filters_expr_pullup);
-            let child = std::mem::replace(
-                &mut *proj.child,
-                LogicalPlan::synthetic(LogicalOperator::DummyScan),
-            );
-            *proj.child = Self::generate_pullup_filter(child, filters);
+            self.materialize_pullup_below_projection(proj);
             return;
         }
 
         // Replace the filter bindings
         self.filters_expr_pullup = changed_filter_expressions;
+    }
+
+    fn materialize_pullup_below_projection(&mut self, proj: &mut Projection) {
+        let filters = std::mem::take(&mut self.filters_expr_pullup);
+        let child = std::mem::replace(
+            &mut *proj.child,
+            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        );
+        *proj.child = Self::generate_pullup_filter(child, filters);
     }
 
     /// Replace column bindings in an expression to reference the projection output.
@@ -248,6 +269,10 @@ impl FilterPullup {
 
     /// Pull up through a Join operator.
     fn pullup_join(&mut self, join: Join) -> LogicalOperator {
+        if join_has_evaluation_fence(&join) {
+            return self.finish_pullup(LogicalOperator::Join(join));
+        }
+
         match join {
             Join::Comparison(cj) => match cj.join_type {
                 JoinType::Inner => self.pullup_inner_join(cj),
@@ -619,8 +644,8 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::ComparisonType;
-    use paro_planner::expression::ConstantExpression;
-    use paro_planner::operator::Get;
+    use paro_planner::expression::{ConstantExpression, FunctionExpression};
+    use paro_planner::operator::{Get, JoinComparisonType, JoinCondition};
 
     fn plan(ctx: &BindContext, op: LogicalOperator) -> LogicalPlan {
         LogicalPlan::new(ctx, op)
@@ -657,6 +682,19 @@ mod tests {
             table_index,
             vec!["col0".to_string(), "col1".to_string()],
             vec![LogicalType::Integer, LogicalType::Varchar],
+        ))
+    }
+
+    fn volatile_call() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Double,
         ))
     }
 
@@ -698,6 +736,23 @@ mod tests {
         let result = pullup.rewrite(op);
 
         // Filter should remain in place
+        assert!(matches!(result, LogicalOperator::Filter(_)));
+        assert!(pullup.filters_expr_pullup.is_empty());
+    }
+
+    #[test]
+    fn test_volatile_filter_is_not_pulled_up() {
+        let ctx = BindContext::new();
+        let filter_expr = make_comparison(
+            ComparisonType::GreaterThan,
+            make_column_ref(0, 0),
+            volatile_call(),
+        );
+        let filter = Filter::new(plan(&ctx, make_get(0)), vec![filter_expr]);
+
+        let mut pullup = FilterPullup::with_settings(true, true);
+        let result = pullup.rewrite(LogicalOperator::Filter(filter));
+
         assert!(matches!(result, LogicalOperator::Filter(_)));
         assert!(pullup.filters_expr_pullup.is_empty());
     }
@@ -807,6 +862,25 @@ mod tests {
     }
 
     #[test]
+    fn test_volatile_inner_join_condition_is_not_pulled_into_filter() {
+        let ctx = BindContext::new();
+        let join = ComparisonJoin::new(
+            JoinType::Inner,
+            plan(&ctx, make_get(0)),
+            plan(&ctx, make_get(1)),
+            vec![JoinCondition::new(
+                make_column_ref(0, 0),
+                volatile_call(),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = FilterPullup::new().rewrite(LogicalOperator::Join(Join::Comparison(join)));
+
+        assert!(matches!(result, LogicalOperator::Join(Join::Comparison(_))));
+    }
+
+    #[test]
     fn test_pullup_projection() {
         let ctx = BindContext::new();
         // Create: Projection(Filter(Get))
@@ -835,6 +909,34 @@ mod tests {
             _ => panic!("Expected Projection operator"),
         }
         assert_eq!(pullup.filters_expr_pullup.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_stays_below_volatile_projection() {
+        let ctx = BindContext::new();
+        let filter_expr = make_comparison(
+            ComparisonType::GreaterThan,
+            make_column_ref(0, 0),
+            make_constant(5),
+        );
+        let filter = Filter::new(plan(&ctx, make_get(0)), vec![filter_expr]);
+        let projection = Projection::new(
+            1,
+            plan(&ctx, LogicalOperator::Filter(filter)),
+            vec![volatile_call()],
+        );
+
+        let mut pullup = FilterPullup::with_settings(true, true);
+        let result = pullup.rewrite(LogicalOperator::Projection(projection));
+
+        let LogicalOperator::Projection(projection) = result else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            projection.child.operator,
+            LogicalOperator::Filter(_)
+        ));
+        assert!(pullup.filters_expr_pullup.is_empty());
     }
 
     #[test]

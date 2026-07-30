@@ -28,7 +28,7 @@ impl ReorderFilter {
         } = plan;
         let operator = match operator {
             LogicalOperator::Filter(mut filter) => {
-                filter.expressions = reorder_with_external_fences(filter.expressions, ctx);
+                filter.expressions = reorder_with_evaluation_fences(filter.expressions, ctx);
                 LogicalOperator::Filter(filter)
             }
             other => other,
@@ -41,7 +41,7 @@ impl ReorderFilter {
     }
 }
 
-fn reorder_with_external_fences(
+fn reorder_with_evaluation_fences(
     expressions: Vec<Expression>,
     ctx: &OptimizationContext,
 ) -> Vec<Expression> {
@@ -49,7 +49,7 @@ fn reorder_with_external_fences(
     let mut native_segment = Vec::new();
 
     for expr in expressions {
-        if expr.contains_external_routine() {
+        if expr.evaluation_properties().is_reorder_fence() {
             sort_filter_segment(&mut native_segment, ctx);
             reordered.append(&mut native_segment);
             reordered.push(expr);
@@ -89,6 +89,7 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+        FunctionExpression,
     };
     use paro_planner::operator::{ColumnBinding, ExpressionGet, Filter, LogicalOperator};
 
@@ -135,6 +136,19 @@ mod tests {
         Expression::Comparison(ComparisonExpression::new(comparison_type, left, right))
     }
 
+    fn volatile_expression() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Double,
+        ))
+    }
+
     #[test]
     fn reorders_filter_expressions_by_estimated_selectivity() {
         let bind_context = BindContext::new();
@@ -172,5 +186,49 @@ mod tests {
         };
         assert!(filter.expressions[0].equals(&equality_predicate));
         assert!(filter.expressions[1].equals(&range_predicate));
+    }
+
+    #[test]
+    fn volatile_expression_fences_filter_reordering() {
+        let bind_context = BindContext::new();
+        let range_predicate = comparison(
+            ComparisonType::GreaterThan,
+            int_column(0, 0),
+            int_constant(10),
+        );
+        let volatile = volatile_expression();
+        let equality_predicate =
+            comparison(ComparisonType::Equal, int_column(0, 0), int_constant(42));
+        let plan = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Filter(Filter::new(
+                integer_get(&bind_context, 0),
+                vec![
+                    range_predicate.clone(),
+                    volatile.clone(),
+                    equality_predicate.clone(),
+                ],
+            )),
+        );
+        let ctx = OptimizationContext {
+            session: make_test_session(),
+            bind_context: bind_context.clone(),
+            column_stats: Default::default(),
+            graph_stats: GraphStatsCache::with_loader(Arc::new(EmptyGraphStatsLoader)),
+            cost_model: CostModel::default(),
+            verify_enabled: true,
+            profiler: PipelineProfiler::default(),
+        };
+
+        let rewritten = ReorderFilter::new()
+            .rewrite(plan, &ctx)
+            .expect("rewrite succeeds");
+
+        let LogicalOperator::Filter(filter) = rewritten.operator else {
+            panic!("expected filter");
+        };
+        assert!(filter.expressions[0].equals(&range_predicate));
+        assert!(filter.expressions[1].equals(&volatile));
+        assert!(filter.expressions[2].equals(&equality_predicate));
     }
 }

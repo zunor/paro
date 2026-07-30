@@ -118,7 +118,10 @@ impl<'a> RemoveUnusedColumns<'a> {
 
         for (old_idx, expr) in expressions.drain(..).enumerate() {
             let binding = ColumnBinding::new(table_idx, old_idx);
-            if self.is_referenced(&binding) || self.everything_referenced {
+            if self.is_referenced(&binding)
+                || self.everything_referenced
+                || !expr.evaluation_properties().can_share_evaluation()
+            {
                 // Column is referenced, keep it
                 if old_idx != new_col_idx {
                     // Column index changed, need to remap
@@ -218,7 +221,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     for (old_agg_idx, agg_expr) in agg.aggregates.drain(..).enumerate() {
                         let binding = ColumnBinding::new(agg.aggregate_index, old_agg_idx);
 
-                        if self.is_referenced(&binding) {
+                        if self.is_referenced(&binding)
+                            || !agg_expr.evaluation_properties().can_share_evaluation()
+                        {
                             if old_agg_idx != new_agg_idx {
                                 // Binding changed, update via replace_binding
                                 let new_binding =
@@ -435,7 +440,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     for cond in cj.conditions.drain(..) {
                         let is_duplicate = unique_conditions.iter().any(
                             |existing: &paro_planner::operator::JoinCondition| {
-                                existing.comparison == cond.comparison
+                                cond.left.evaluation_properties().can_share_evaluation()
+                                    && cond.right.evaluation_properties().can_share_evaluation()
+                                    && existing.comparison == cond.comparison
                                     && existing.left.equals(&cond.left)
                                     && existing.right.equals(&cond.right)
                             },
@@ -618,7 +625,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     let mut retained = Vec::new();
                     for (old_index, expression) in window.expressions.drain(..).enumerate() {
                         let old_binding = ColumnBinding::new(window.window_index, old_index);
-                        if self.is_referenced(&old_binding) {
+                        if self.is_referenced(&old_binding)
+                            || !expression.evaluation_properties().can_share_evaluation()
+                        {
                             let new_index = retained.len();
                             if old_index != new_index {
                                 self.replace_binding(
@@ -745,7 +754,12 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
 
                     for col_idx in 0..expr_get.types.len() {
                         let binding = ColumnBinding::new(expr_get.table_index, col_idx);
-                        if self.is_referenced(&binding) {
+                        let preserves_evaluation = expr_get.expressions.iter().any(|row| {
+                            row.get(col_idx).is_some_and(|expr| {
+                                !expr.evaluation_properties().can_share_evaluation()
+                            })
+                        });
+                        if self.is_referenced(&binding) || preserves_evaluation {
                             referenced_cols[col_idx] = true;
                         }
                     }

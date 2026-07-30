@@ -17,6 +17,7 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 
+use crate::expression::join_has_evaluation_fence;
 use crate::filter::combiner::{FilterCombiner, FilterResult};
 /// A filter with its table bindings extracted.
 #[derive(Debug)]
@@ -233,7 +234,19 @@ impl FilterPushdown {
 
     /// Push down through a Filter operator.
     fn pushdown_filter(&mut self, filter: PlannerFilter) -> LogicalOperator {
-        // Add all filter expressions to the pushdown set
+        if filter
+            .expressions
+            .iter()
+            .any(|expr| expr.evaluation_properties().is_reorder_fence())
+        {
+            // A fenced predicate is also a barrier for predicates arriving from an outer filter:
+            // pushing those below it can change how often the fenced expression is evaluated.
+            let mut child_pushdown = FilterPushdown::new();
+            let child = child_pushdown.rewrite_plan(*filter.child);
+            let result = LogicalOperator::Filter(PlannerFilter::new(child, filter.expressions));
+            return self.push_final_filters(result);
+        }
+
         for expr in filter.expressions {
             let result = self.add_filter(expr);
             if result == FilterResult::Unsatisfiable {
@@ -262,8 +275,7 @@ impl FilterPushdown {
         let mut remaining_filters = Vec::new();
 
         for filter in self.filters.drain(..) {
-            // Check if filter references volatile expressions
-            if Self::is_volatile_through_projection(&proj, &filter.filter) {
+            if Self::has_evaluation_fence_through_projection(&proj, &filter.filter) {
                 remaining_filters.push(filter.filter);
             } else {
                 // Replace projection bindings in the filter
@@ -293,9 +305,17 @@ impl FilterPushdown {
         }
     }
 
-    /// Check if a filter is volatile through a projection.
-    fn is_volatile_through_projection(proj: &Projection, expr: &Expression) -> bool {
-        if expr.contains_external_routine() {
+    /// Check whether moving a predicate below a projection could duplicate, eliminate, or reorder
+    /// an observable evaluation.
+    fn has_evaluation_fence_through_projection(proj: &Projection, expr: &Expression) -> bool {
+        if expr.evaluation_properties().is_reorder_fence() {
+            return true;
+        }
+        if proj
+            .expressions
+            .iter()
+            .any(|projected| !projected.evaluation_properties().can_share_evaluation())
+        {
             return true;
         }
         projection_reference_crosses_execution_boundary(proj, expr)
@@ -316,6 +336,10 @@ impl FilterPushdown {
 
     /// Push down through a Join operator.
     fn pushdown_join(&mut self, join: Join) -> LogicalOperator {
+        if join_has_evaluation_fence(&join) {
+            return self.finish_pushdown(LogicalOperator::Join(join));
+        }
+
         // Get table bindings for left and right sides
         let left_bindings = Self::get_table_bindings_plan(join.left());
         let right_bindings = Self::get_table_bindings_plan(join.right());
@@ -771,20 +795,12 @@ impl FilterPushdown {
 
     /// Push down through a Limit operator.
     fn pushdown_limit(&mut self, mut limit: paro_planner::operator::Limit) -> LogicalOperator {
-        // Limit passes through all filters
-        // Note: This is safe because filters don't change the order of rows
+        // LIMIT is a cardinality boundary: filtering its input can replace rows that the LIMIT
+        // would otherwise have selected. Keep caller predicates above it while still optimizing
+        // the child with an independent pushdown pass.
         let mut child_pushdown = FilterPushdown::new();
-
-        for filter in self.filters.drain(..) {
-            if child_pushdown.add_filter(filter.filter) == FilterResult::Unsatisfiable {
-                return LogicalOperator::DummyScan;
-            }
-        }
-
-        child_pushdown.generate_filters();
         limit.child = Box::new(child_pushdown.rewrite_plan(*limit.child));
-
-        LogicalOperator::Limit(limit)
+        self.push_final_filters(LogicalOperator::Limit(limit))
     }
 
     /// Push down through a Window operator.
@@ -877,7 +893,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
     use paro_external::routine::boundary::PlacementClass;
-    use paro_function::scalar::{ExpressionState, ScalarFunction};
+    use paro_function::scalar::{ExpressionState, FunctionStability, ScalarFunction};
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ComparisonExpression, ComparisonType, ConjunctionExpression, ConstantExpression,
@@ -933,6 +949,21 @@ mod tests {
             .boundary
             .placement = PlacementClass::External;
         Expression::Function(expression)
+    }
+
+    fn volatile_call() -> Expression {
+        let function = ScalarFunction::new(
+            "volatile_test".to_string(),
+            vec![],
+            LogicalType::Integer,
+            noop_scalar_execute,
+        )
+        .with_stability(FunctionStability::Volatile);
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Integer,
+        ))
     }
 
     fn window_with_start_offset(offset: Expression) -> Expression {
@@ -1129,6 +1160,31 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_stays_above_volatile_projection() {
+        let ctx = BindContext::new();
+        let projection = Projection::new(1, plan(&ctx, make_get(0)), vec![volatile_call()]);
+        let filter_expr = make_comparison(
+            ComparisonType::GreaterThan,
+            make_column_ref(1, 0),
+            make_constant(5),
+        );
+        let filter = PlannerFilter::new(
+            plan(&ctx, LogicalOperator::Projection(projection)),
+            vec![filter_expr],
+        );
+
+        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
+
+        let LogicalOperator::Filter(filter) = result else {
+            panic!("expected evaluation fence above volatile projection");
+        };
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::Projection(_)
+        ));
+    }
+
+    #[test]
     fn test_pushdown_through_cross_product() {
         let ctx = BindContext::new();
         // Create: Filter(Cross(Get0, Get1))
@@ -1165,6 +1221,50 @@ mod tests {
             }
             _ => panic!("Expected Cross product"),
         }
+    }
+
+    #[test]
+    fn test_volatile_filter_stays_above_cross_product() {
+        let ctx = BindContext::new();
+        let cross = CrossProduct::new(plan(&ctx, make_get(0)), plan(&ctx, make_get(1)));
+        let filter_expr = make_comparison(
+            ComparisonType::GreaterThan,
+            make_column_ref(0, 0),
+            volatile_call(),
+        );
+        let filter = PlannerFilter::new(
+            plan(&ctx, LogicalOperator::Join(Join::Cross(cross))),
+            vec![filter_expr],
+        );
+
+        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
+
+        let LogicalOperator::Filter(filter) = result else {
+            panic!("expected volatile predicate to remain above cross product");
+        };
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::Join(Join::Cross(_))
+        ));
+    }
+
+    #[test]
+    fn test_volatile_inner_join_condition_is_not_converted_to_input_filter() {
+        let ctx = BindContext::new();
+        let join = ComparisonJoin::new(
+            JoinType::Inner,
+            plan(&ctx, make_get(0)),
+            plan(&ctx, make_get(1)),
+            vec![JoinCondition::new(
+                make_column_ref(0, 0),
+                volatile_call(),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = FilterPushdown::new().rewrite(LogicalOperator::Join(Join::Comparison(join)));
+
+        assert!(matches!(result, LogicalOperator::Join(Join::Comparison(_))));
     }
 
     #[test]
@@ -1237,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pushdown_through_limit() {
+    fn test_filter_stays_above_limit() {
         let ctx = BindContext::new();
         let get = make_get(0);
         let limit =
@@ -1255,15 +1355,12 @@ mod tests {
         let mut pushdown = FilterPushdown::new();
         let result = pushdown.rewrite(op);
 
-        // Filter should be pushed through Limit
+        // Filtering before LIMIT can select replacement rows, so the predicate must stay above it.
         match result {
-            LogicalOperator::Limit(l) => match l.child.operator {
-                LogicalOperator::Filter(f) => {
-                    assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
-                }
-                _ => panic!("Expected Filter under Limit"),
-            },
-            _ => panic!("Expected Limit operator"),
+            LogicalOperator::Filter(filter) => {
+                assert!(matches!(filter.child.operator, LogicalOperator::Limit(_)));
+            }
+            _ => panic!("Expected Filter above Limit"),
         }
     }
 

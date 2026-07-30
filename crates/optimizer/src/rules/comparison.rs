@@ -4,9 +4,9 @@
 //! Simplify comparison expressions.
 //!
 //! Supported rewrites include:
-//! - Comparison with NULL returns NULL (except IS DISTINCT FROM)
-//! - `x = x` → `true` (for non-nullable x)
-//! - `x <> x` → `false` (for non-nullable x)
+//! - Value-reference comparison with NULL returns NULL (except IS DISTINCT FROM)
+//! - `x IS DISTINCT FROM x` → `false` for value references
+//! - `x IS NOT DISTINCT FROM x` → `true` for value references
 //! - `NOT (x > y)` → `x <= y`
 //! - `NOT (x >= y)` → `x < y`
 //! - `NOT (x < y)` → `x >= y`
@@ -102,11 +102,16 @@ impl Rule for ComparisonSimplificationRule {
 
 /// Simplify a comparison expression.
 fn simplify_comparison(comp: &ComparisonExpression) -> RuleResult {
-    // Check for comparison with NULL constant
+    // Only values without an owned evaluation may be elided. The executor evaluates both sides of
+    // a comparison, so folding a function or cast against NULL could suppress side effects or an
+    // error.
     let left_is_null = is_null_constant(&comp.left);
     let right_is_null = is_null_constant(&comp.right);
 
-    if left_is_null || right_is_null {
+    if (left_is_null || right_is_null)
+        && comp.left.is_passive_value()
+        && comp.right.is_passive_value()
+    {
         // Comparison with NULL returns NULL (except for IS DISTINCT FROM / IS NOT DISTINCT FROM)
         match comp.comparison_type {
             ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => {
@@ -121,8 +126,7 @@ fn simplify_comparison(comp: &ComparisonExpression) -> RuleResult {
                 })))
             }
         }
-    } else if expressions_equal(&comp.left, &comp.right) {
-        // x = x, x <> x, etc.
+    } else if is_null_safe_self_comparison(comp) {
         simplify_self_comparison(comp.comparison_type)
     } else {
         RuleResult::NoChange
@@ -158,17 +162,10 @@ fn simplify_not_comparison(inner: &Expression) -> RuleResult {
 
 /// Simplify self-comparison (x op x).
 fn simplify_self_comparison(comp_type: ComparisonType) -> RuleResult {
-    // Note: This assumes x is not NULL. For nullable columns, x = x could be NULL.
-    // A more complete implementation would check nullability.
     let result = match comp_type {
-        ComparisonType::Equal => Some(true),              // x = x → true
-        ComparisonType::NotEqual => Some(false),          // x <> x → false
-        ComparisonType::LessThan => Some(false),          // x < x → false
-        ComparisonType::LessThanOrEqual => Some(true),    // x <= x → true
-        ComparisonType::GreaterThan => Some(false),       // x > x → false
-        ComparisonType::GreaterThanOrEqual => Some(true), // x >= x → true
-        ComparisonType::DistinctFrom => Some(false),      // x IS DISTINCT FROM x → false
-        ComparisonType::NotDistinctFrom => Some(true),    // x IS NOT DISTINCT FROM x → true
+        ComparisonType::DistinctFrom => Some(false),
+        ComparisonType::NotDistinctFrom => Some(true),
+        _ => None,
     };
 
     match result {
@@ -185,9 +182,15 @@ fn is_null_constant(expr: &Expression) -> bool {
     matches!(expr, Expression::Constant(c) if c.value.is_null())
 }
 
-/// Check if two expressions are structurally equal.
-fn expressions_equal(left: &Expression, right: &Expression) -> bool {
-    left.equals(right)
+/// Structural equality is sufficient only for null-safe comparisons of values that do not own an
+/// evaluation. Function and composite expressions may be volatile, side-effecting, or erroring;
+/// folding those would incorrectly remove both evaluations.
+fn is_null_safe_self_comparison(comp: &ComparisonExpression) -> bool {
+    matches!(
+        comp.comparison_type,
+        ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom
+    ) && comp.left.is_passive_value()
+        && comp.left.equals(&comp.right)
 }
 
 #[cfg(test)]
@@ -195,6 +198,7 @@ mod tests {
     use super::*;
     use crate::rules::expression_matcher::ExpressionMatcher;
     use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::expression::FunctionExpression;
     use paro_planner::expression::OperatorExpression;
 
     fn make_constant(value: i32) -> Expression {
@@ -235,6 +239,19 @@ mod tests {
             OperatorType::Not,
             child,
             LogicalType::Boolean,
+        ))
+    }
+
+    fn make_volatile_call() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Double,
         ))
     }
 
@@ -283,6 +300,25 @@ mod tests {
     }
 
     #[test]
+    fn test_null_comparison_does_not_elide_volatile_evaluation() {
+        let rule = ComparisonSimplificationRule::new();
+        let expr = make_comparison(
+            ComparisonType::Equal,
+            make_volatile_call(),
+            Expression::Constant(ConstantExpression {
+                value: Value::Null(LogicalType::Double),
+                return_type: LogicalType::Double,
+            }),
+        );
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
+    }
+
+    #[test]
     fn test_distinct_from_with_null_no_change() {
         let rule = ComparisonSimplificationRule::new();
 
@@ -302,10 +338,11 @@ mod tests {
     }
 
     #[test]
-    fn test_self_comparison_equal() {
+    fn test_nullable_self_comparison_equal_is_not_simplified() {
         let rule = ComparisonSimplificationRule::new();
 
-        // x = x → true
+        // Column nullability is not encoded in the bound expression, so x = x
+        // must retain SQL's UNKNOWN result when x is NULL.
         let col = make_column_ref(0, 0);
         let expr = make_comparison(ComparisonType::Equal, col.clone(), col);
         let mut bindings = Vec::new();
@@ -314,22 +351,13 @@ mod tests {
         let dummy_op = LogicalOperator::DummyScan;
         let result = rule.apply(&dummy_op, bindings, false);
 
-        match result {
-            RuleResult::Changed(expr) => match *expr {
-                Expression::Constant(c) => {
-                    assert_eq!(c.value, Value::Boolean(true));
-                }
-                _ => panic!("Expected Constant"),
-            },
-            _ => panic!("Expected Changed result with true"),
-        }
+        assert!(matches!(result, RuleResult::NoChange));
     }
 
     #[test]
-    fn test_self_comparison_not_equal() {
+    fn test_nullable_self_comparison_not_equal_is_not_simplified() {
         let rule = ComparisonSimplificationRule::new();
 
-        // x <> x → false
         let col = make_column_ref(0, 0);
         let expr = make_comparison(ComparisonType::NotEqual, col.clone(), col);
         let mut bindings = Vec::new();
@@ -338,22 +366,13 @@ mod tests {
         let dummy_op = LogicalOperator::DummyScan;
         let result = rule.apply(&dummy_op, bindings, false);
 
-        match result {
-            RuleResult::Changed(expr) => match *expr {
-                Expression::Constant(c) => {
-                    assert_eq!(c.value, Value::Boolean(false));
-                }
-                _ => panic!("Expected Constant"),
-            },
-            _ => panic!("Expected Changed result with false"),
-        }
+        assert!(matches!(result, RuleResult::NoChange));
     }
 
     #[test]
-    fn test_self_comparison_less_than() {
+    fn test_nullable_self_comparison_less_than_is_not_simplified() {
         let rule = ComparisonSimplificationRule::new();
 
-        // x < x → false
         let col = make_column_ref(0, 0);
         let expr = make_comparison(ComparisonType::LessThan, col.clone(), col);
         let mut bindings = Vec::new();
@@ -362,15 +381,39 @@ mod tests {
         let dummy_op = LogicalOperator::DummyScan;
         let result = rule.apply(&dummy_op, bindings, false);
 
-        match result {
-            RuleResult::Changed(expr) => match *expr {
-                Expression::Constant(c) => {
-                    assert_eq!(c.value, Value::Boolean(false));
-                }
-                _ => panic!("Expected Constant"),
-            },
-            _ => panic!("Expected Changed result with false"),
-        }
+        assert!(matches!(result, RuleResult::NoChange));
+    }
+
+    #[test]
+    fn test_null_safe_self_comparison_is_simplified() {
+        let rule = ComparisonSimplificationRule::new();
+        let col = make_column_ref(0, 0);
+        let expr = make_comparison(ComparisonType::DistinctFrom, col.clone(), col);
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        let RuleResult::Changed(expr) = result else {
+            panic!("expected null-safe self comparison to be simplified");
+        };
+        let Expression::Constant(constant) = *expr else {
+            panic!("expected constant result");
+        };
+        assert_eq!(constant.value, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_volatile_self_comparison_is_not_simplified() {
+        let rule = ComparisonSimplificationRule::new();
+        let call = make_volatile_call();
+        let expr = make_comparison(ComparisonType::DistinctFrom, call.clone(), call);
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
     }
 
     #[test]

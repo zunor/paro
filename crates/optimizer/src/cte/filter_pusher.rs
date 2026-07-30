@@ -137,6 +137,13 @@ fn build_or_filter(
     let mut refs = Vec::new();
 
     for filtered_ref in &info.filtered_refs {
+        if filtered_ref
+            .filters
+            .iter()
+            .any(|filter| filter.evaluation_properties().is_reorder_fence())
+        {
+            return None;
+        }
         if filtered_ref.old_bindings.len() != new_bindings.len() {
             continue;
         }
@@ -177,12 +184,13 @@ fn build_or_filter(
 
 #[cfg(test)]
 mod tests {
-    use super::CTEFilterPusher;
+    use super::{build_or_filter, CTEFilterPusher, FilteredCTERef, MaterializedCTEInfo};
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::CTEMaterialize;
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+        FunctionExpression,
     };
     use paro_planner::operator::{CTERef, ExpressionGet, Filter, LogicalOperator, MaterializedCTE};
     use paro_planner::plan::LogicalPlan;
@@ -256,5 +264,34 @@ mod tests {
             }
             other => panic!("expected materialized cte, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn does_not_copy_volatile_filters_into_cte_producer() {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        let random = || {
+            Expression::Function(FunctionExpression::new(
+                function.clone(),
+                vec![],
+                LogicalType::Double,
+            ))
+        };
+        let info = MaterializedCTEInfo {
+            all_refs_are_filtered: true,
+            filtered_refs: vec![FilteredCTERef {
+                old_bindings: vec![],
+                filters: vec![Expression::Comparison(ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    random(),
+                    random(),
+                ))],
+            }],
+        };
+
+        assert!(build_or_filter(&info, &[]).is_none());
     }
 }

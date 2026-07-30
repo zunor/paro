@@ -4,7 +4,9 @@
 //! Push constant `LIMIT` nodes below projections when the rewrite is cheap.
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::{LogicalOperator, LogicalOperatorType};
+use paro_planner::operator::LogicalOperator;
+#[cfg(test)]
+use paro_planner::operator::LogicalOperatorType;
 use paro_planner::plan::LogicalPlan;
 
 pub struct LimitPushdown;
@@ -37,7 +39,14 @@ impl LimitPushdown {
             return false;
         };
 
-        if limit.child.operator.op_type() != LogicalOperatorType::Projection {
+        let LogicalOperator::Projection(projection) = &limit.child.operator else {
+            return false;
+        };
+        if projection
+            .expressions
+            .iter()
+            .any(|expr| !expr.evaluation_properties().can_share_evaluation())
+        {
             return false;
         }
 
@@ -130,7 +139,7 @@ mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ConstantExpression, Expression};
+    use paro_planner::expression::{ConstantExpression, Expression, FunctionExpression};
     use paro_planner::operator::{Get, Limit, Projection};
 
     fn create_test_get() -> LogicalOperator {
@@ -172,6 +181,23 @@ mod tests {
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
             child: Box::new(LogicalPlan::synthetic(child)),
         })
+    }
+
+    fn create_volatile_projection(child: LogicalOperator) -> LogicalOperator {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        LogicalOperator::Projection(Projection::new(
+            1,
+            LogicalPlan::synthetic(child),
+            vec![Expression::Function(FunctionExpression::new(
+                function,
+                vec![],
+                LogicalType::Double,
+            ))],
+        ))
     }
 
     #[test]
@@ -233,6 +259,18 @@ mod tests {
             LogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             Some(create_constant_expr(-1)),
+        ));
+
+        assert!(!LimitPushdown::can_optimize(&limit));
+    }
+
+    #[test]
+    fn test_cannot_push_limit_through_volatile_projection() {
+        let projection = create_volatile_projection(create_test_get());
+        let limit = LogicalOperator::Limit(Limit::new(
+            LogicalPlan::synthetic(projection),
+            Some(create_constant_expr(10)),
+            None,
         ));
 
         assert!(!LimitPushdown::can_optimize(&limit));

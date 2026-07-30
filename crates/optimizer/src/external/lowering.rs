@@ -67,6 +67,50 @@ impl LayerMapping {
     }
 }
 
+/// Replaces calls collected for one external layer while preserving occurrence identity.
+///
+/// Shareable calls may repeatedly use the first matching binding. Volatile or side-effecting calls
+/// consume their mappings in traversal order, so structurally equal occurrences remain distinct.
+struct LayerExpressionRewriter<'a> {
+    mappings: &'a [LayerMapping],
+    consumed: Vec<bool>,
+}
+
+impl<'a> LayerExpressionRewriter<'a> {
+    fn new(mappings: &'a [LayerMapping]) -> Self {
+        Self {
+            mappings,
+            consumed: vec![false; mappings.len()],
+        }
+    }
+
+    fn rewrite(&mut self, mut expression: Expression) -> Expression {
+        if let Some(index) = self.mapping_index(&expression) {
+            return self.mappings[index].replacement();
+        }
+
+        ExpressionIterator::enumerate_children_mut(&mut expression, |child| {
+            *child = self.rewrite(child.clone());
+        });
+        expression
+    }
+
+    fn mapping_index(&mut self, expression: &Expression) -> Option<usize> {
+        let shareable = expression.evaluation_properties().can_share_evaluation();
+        let index = self
+            .mappings
+            .iter()
+            .enumerate()
+            .position(|(index, mapping)| {
+                (shareable || !self.consumed[index]) && expression.equals(&mapping.expression)
+            })?;
+        if !shareable {
+            self.consumed[index] = true;
+        }
+        Some(index)
+    }
+}
+
 impl<'a> ExternalRoutineLowerer<'a> {
     fn new(bind_context: &'a BindContext) -> Self {
         Self {
@@ -287,10 +331,10 @@ impl<'a> ExternalRoutineLowerer<'a> {
                     left_layer.reused_calls,
                 )?;
                 join.left = Box::new(child);
+                let mut rewriter = LayerExpressionRewriter::new(&mappings);
                 for condition in &mut join.conditions {
-                    condition.left = rewrite_layer_in_expression(condition.left.clone(), &mappings);
-                    condition.right =
-                        rewrite_layer_in_expression(condition.right.clone(), &mappings);
+                    condition.left = rewriter.rewrite(condition.left.clone());
+                    condition.right = rewriter.rewrite(condition.right.clone());
                 }
             }
 
@@ -301,10 +345,10 @@ impl<'a> ExternalRoutineLowerer<'a> {
                     right_layer.reused_calls,
                 )?;
                 join.right = Box::new(child);
+                let mut rewriter = LayerExpressionRewriter::new(&mappings);
                 for condition in &mut join.conditions {
-                    condition.left = rewrite_layer_in_expression(condition.left.clone(), &mappings);
-                    condition.right =
-                        rewrite_layer_in_expression(condition.right.clone(), &mappings);
+                    condition.left = rewriter.rewrite(condition.left.clone());
+                    condition.right = rewriter.rewrite(condition.right.clone());
                 }
             }
         }
@@ -337,7 +381,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
                     left_layer.reused_calls,
                 )?;
                 join.left = Box::new(child);
-                join.condition = rewrite_layer_in_expression(join.condition, &mappings);
+                join.condition = LayerExpressionRewriter::new(&mappings).rewrite(join.condition);
             }
 
             if !right_layer.calls.is_empty() {
@@ -347,7 +391,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
                     right_layer.reused_calls,
                 )?;
                 join.right = Box::new(child);
-                join.condition = rewrite_layer_in_expression(join.condition, &mappings);
+                join.condition = LayerExpressionRewriter::new(&mappings).rewrite(join.condition);
             }
         }
 
@@ -384,8 +428,9 @@ impl<'a> ExternalRoutineLowerer<'a> {
 
             let (wrapped_child, mappings) =
                 self.wrap_external_layer(child, layer.calls, layer.reused_calls)?;
+            let mut rewriter = LayerExpressionRewriter::new(&mappings);
             for expr in expressions.iter_mut() {
-                *expr = rewrite_layer_in_expression(expr.clone(), &mappings);
+                *expr = rewriter.rewrite(expr.clone());
             }
             child = wrapped_child;
         }
@@ -711,126 +756,12 @@ fn push_unique_expression(
     expression: &Expression,
     reused_calls: &mut usize,
 ) {
-    if target.iter().any(|existing| existing.equals(expression)) {
+    if expression.evaluation_properties().can_share_evaluation()
+        && target.iter().any(|existing| existing.equals(expression))
+    {
         *reused_calls += 1;
     } else {
         target.push(expression.clone());
-    }
-}
-
-fn rewrite_layer_in_expression(expression: Expression, mappings: &[LayerMapping]) -> Expression {
-    if let Some(mapping) = mappings
-        .iter()
-        .find(|mapping| expression.equals(&mapping.expression))
-    {
-        return mapping.replacement();
-    }
-
-    match expression {
-        Expression::Function(mut function) => {
-            function.children = function
-                .children
-                .into_iter()
-                .map(|child| rewrite_layer_in_expression(child, mappings))
-                .collect();
-            Expression::Function(function)
-        }
-        Expression::Cast(mut cast) => {
-            cast.child = Box::new(rewrite_layer_in_expression(*cast.child, mappings));
-            Expression::Cast(cast)
-        }
-        Expression::Conjunction(mut conjunction) => {
-            conjunction.children = conjunction
-                .children
-                .into_iter()
-                .map(|child| rewrite_layer_in_expression(child, mappings))
-                .collect();
-            Expression::Conjunction(conjunction)
-        }
-        Expression::Case(mut case) => {
-            case.check = Box::new(rewrite_layer_in_expression(*case.check, mappings));
-            case.result_if_true =
-                Box::new(rewrite_layer_in_expression(*case.result_if_true, mappings));
-            case.result_if_false =
-                Box::new(rewrite_layer_in_expression(*case.result_if_false, mappings));
-            Expression::Case(case)
-        }
-        Expression::Comparison(mut comparison) => {
-            comparison.left = Box::new(rewrite_layer_in_expression(*comparison.left, mappings));
-            comparison.right = Box::new(rewrite_layer_in_expression(*comparison.right, mappings));
-            Expression::Comparison(comparison)
-        }
-        Expression::Operator(mut operator) => {
-            operator.children = operator
-                .children
-                .into_iter()
-                .map(|child| rewrite_layer_in_expression(child, mappings))
-                .collect();
-            Expression::Operator(operator)
-        }
-        Expression::Aggregate(mut aggregate) => {
-            aggregate.children = aggregate
-                .children
-                .into_iter()
-                .map(|child| rewrite_layer_in_expression(child, mappings))
-                .collect();
-            aggregate.filter = aggregate
-                .filter
-                .map(|filter| Box::new(rewrite_layer_in_expression(*filter, mappings)));
-            aggregate.order_bys = aggregate
-                .order_bys
-                .into_iter()
-                .map(|mut order| {
-                    order.expression = rewrite_layer_in_expression(order.expression, mappings);
-                    order
-                })
-                .collect();
-            Expression::Aggregate(aggregate)
-        }
-        Expression::Subquery(mut subquery) => {
-            subquery.children = subquery
-                .children
-                .into_iter()
-                .map(|child| rewrite_layer_in_expression(child, mappings))
-                .collect();
-            Expression::Subquery(subquery)
-        }
-        Expression::Window(mut window) => {
-            window.children = window
-                .children
-                .into_iter()
-                .map(|child| rewrite_layer_in_expression(child, mappings))
-                .collect();
-            window.partitions = window
-                .partitions
-                .into_iter()
-                .map(|partition| rewrite_layer_in_expression(partition, mappings))
-                .collect();
-            window.orders = window
-                .orders
-                .into_iter()
-                .map(|mut order| {
-                    order.expression = rewrite_layer_in_expression(order.expression, mappings);
-                    order
-                })
-                .collect();
-            if let paro_planner::expression::WindowFrameBound::Offset(offset) =
-                window.frame.start_bound
-            {
-                window.frame.start_bound = paro_planner::expression::WindowFrameBound::Offset(
-                    Box::new(rewrite_layer_in_expression(*offset, mappings)),
-                );
-            }
-            if let paro_planner::expression::WindowFrameBound::Offset(offset) =
-                window.frame.end_bound
-            {
-                window.frame.end_bound = paro_planner::expression::WindowFrameBound::Offset(
-                    Box::new(rewrite_layer_in_expression(*offset, mappings)),
-                );
-            }
-            Expression::Window(window)
-        }
-        other => other,
     }
 }
 
@@ -924,7 +855,9 @@ mod tests {
         RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
         RowSemantics,
     };
-    use paro_function::scalar::{ExpressionState, ScalarFunction};
+    use paro_function::scalar::{
+        ExpressionState, FunctionSideEffects, FunctionStability, ScalarFunction,
+    };
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::OrderByNode;
     use paro_planner::expression::{
@@ -1017,6 +950,27 @@ mod tests {
         )
     }
 
+    fn volatile_external_call(
+        name: &str,
+        arguments: Vec<Expression>,
+        return_type: LogicalType,
+    ) -> Expression {
+        let mut expression = external_call(name, arguments, return_type);
+        let Expression::Function(function) = &mut expression else {
+            unreachable!();
+        };
+        function.function.stability = FunctionStability::Volatile;
+        function.function.side_effects = FunctionSideEffects::HasSideEffects;
+        let semantics = &mut function
+            .routine_meta
+            .as_mut()
+            .expect("external routine metadata")
+            .semantics;
+        semantics.stability = RoutineStability::Volatile;
+        semantics.side_effects = RoutineSideEffects::HasSideEffects;
+        expression
+    }
+
     fn expression_get(bind_context: &BindContext, table_index: usize) -> LogicalPlan {
         LogicalPlan::new(
             bind_context,
@@ -1069,6 +1023,32 @@ mod tests {
             }
             other => panic!("expected temp ref, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lowers_identical_volatile_external_calls_independently() {
+        let bind_context = BindContext::new();
+        let child = expression_get(&bind_context, 1);
+        let external =
+            volatile_external_call("py_next", vec![int_column(1, 0)], LogicalType::Integer);
+        let projection = Projection::new(2, child, vec![external.clone(), external]);
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
+
+        let lowered = lower(plan, &bind_context);
+        let LogicalOperator::Projection(projection) = lowered.plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::ExternalProject(project) = projection.child.operator else {
+            panic!("expected external project");
+        };
+
+        assert_eq!(project.expressions.len(), 2);
+        let [Expression::ColumnRef(first), Expression::ColumnRef(second)] =
+            projection.expressions.as_slice()
+        else {
+            panic!("expected distinct external result references");
+        };
+        assert_ne!(first.binding, second.binding);
     }
 
     #[test]

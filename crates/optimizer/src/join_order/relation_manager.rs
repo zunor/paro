@@ -9,6 +9,7 @@ use std::sync::Arc;
 use paro_planner::expression::{Expression, ExpressionIterator};
 use paro_planner::operator::{Join, JoinType, LogicalOperator, LogicalOperatorType};
 
+use crate::expression::join_tree_has_evaluation_fence;
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::JoinRelationSetManager;
 
@@ -314,7 +315,7 @@ impl RelationManager {
 
     /// Check if a join is reorderable.
     pub fn join_is_reorderable(join: &Join) -> bool {
-        if Self::join_contains_delim_get(join) {
+        if Self::join_contains_delim_get(join) || join_tree_has_evaluation_fence(join) {
             return false;
         }
 
@@ -496,8 +497,9 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{
-        ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
-        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+        CaseExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
+        ConstantExpression, FunctionExpression, WindowExpression, WindowFrame, WindowFrameBound,
+        WindowFrameType,
     };
     use paro_planner::operator::{
         ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
@@ -535,6 +537,31 @@ mod tests {
             scan_order: None,
             runtime_filter_expressions: Vec::new(),
         })
+    }
+
+    fn volatile_expression_with_column(table_index: usize) -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        let random = || {
+            Expression::Function(FunctionExpression::new(
+                function.clone(),
+                vec![],
+                LogicalType::Double,
+            ))
+        };
+        Expression::Case(CaseExpression::new(
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                random(),
+                random(),
+            )),
+            create_column_ref(table_index, 0),
+            create_column_ref(table_index, 0),
+            LogicalType::Integer,
+        ))
     }
 
     #[test]
@@ -832,6 +859,24 @@ mod tests {
                     ColumnBinding::new(99, 0),
                     LogicalType::Integer,
                 )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        assert!(!RelationManager::join_is_reorderable(&Join::Comparison(
+            join
+        )));
+    }
+
+    #[test]
+    fn test_join_with_volatile_condition_is_not_reorderable() {
+        let join = ComparisonJoin::new(
+            JoinType::Inner,
+            LogicalPlan::synthetic(create_test_get(0)),
+            LogicalPlan::synthetic(create_test_get(1)),
+            vec![JoinCondition::new(
+                create_column_ref(0, 0),
+                volatile_expression_with_column(1),
                 JoinComparisonType::Equal,
             )],
         );

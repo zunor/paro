@@ -1,0 +1,121 @@
+SELECT
+  v,
+  v = v AS self_equal,
+  v <> v AS self_not_equal,
+  v <= v AS self_less_equal,
+  v IS DISTINCT FROM v AS self_distinct,
+  v IS NOT DISTINCT FROM v AS self_not_distinct
+FROM (VALUES (NULL::INTEGER), (1)) AS values_with_null(v)
+ORDER BY v NULLS FIRST;
+v	self_equal	self_not_equal	self_less_equal	self_distinct	self_not_distinct
+NULL	NULL	NULL	NULL	false	true
+1	true	false	true	false	true
+
+SELECT v, v * 0 AS product
+FROM (VALUES (NULL::INTEGER), (2)) AS nullable_integer(v)
+ORDER BY v NULLS FIRST;
+v	product
+NULL	NULL
+2	0
+
+SELECT label, v, v * 0.0::DOUBLE AS product
+FROM (
+  VALUES
+    (1, NULL::DOUBLE),
+    (2, 'nan'::DOUBLE),
+    (3, 'inf'::DOUBLE),
+    (4, '-inf'::DOUBLE),
+    (5, '-1'::DOUBLE),
+    (6, 1.0::DOUBLE)
+) AS floating_values(label, v)
+ORDER BY label;
+label	v	product
+1	NULL	NULL
+2	nan	nan
+3	inf	nan
+4	-inf	nan
+5	-1.000000	0.000000
+6	1.000000	0.000000
+
+SELECT label, numerator / divisor AS quotient, numerator % divisor AS remainder
+FROM (
+  VALUES
+    (1, 10::INTEGER, 2::INTEGER),
+    (2, 10::INTEGER, 0::INTEGER),
+    (3, NULL::INTEGER, 0::INTEGER),
+    (4, '-2147483648'::INTEGER, '-1'::INTEGER)
+) AS integer_division(label, numerator, divisor)
+ORDER BY label;
+label	quotient	remainder
+1	5	0
+2	NULL	NULL
+3	NULL	NULL
+4	NULL	NULL
+
+SELECT label, numerator / divisor AS quotient, numerator % divisor AS remainder
+FROM (
+  VALUES
+    (1, 1.0::DOUBLE, 2.0::DOUBLE),
+    (2, 1.0::DOUBLE, 0.0::DOUBLE),
+    (3, 0.0::DOUBLE, 0.0::DOUBLE),
+    (4, NULL::DOUBLE, 0.0::DOUBLE)
+) AS floating_division(label, numerator, divisor)
+ORDER BY label;
+label	quotient	remainder
+1	0.500000	1.000000
+2	NULL	NULL
+3	NULL	NULL
+4	NULL	NULL
+
+EXPLAIN
+SELECT random() = random() AS independent_calls;
+QUERY PLAN
+PROJECTION
+  Output: independent_calls
+  ->  DUMMY_SCAN
+
+EXPLAIN
+SELECT r
+FROM (
+  SELECT random() AS r
+  FROM generate_series(1, 100)
+) AS volatile_projection
+WHERE r < 0.5;
+QUERY PLAN
+PROJECTION  (rows=30)
+  Output: r
+  ->  PROJECTION  (rows=30)
+    Output: r
+    ->  FILTER  (rows=30)
+      Filter: #0 < 0.5
+      ->  PROJECTION  (rows=100)
+        Output: r
+        ->  TABLE_FUNCTION_SCAN  (rows=100)
+
+EXPLAIN
+SELECT count(*)
+FROM (
+  SELECT random() AS r
+  FROM generate_series(1, 100)
+) AS volatile_projection;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*)
+    Output: aggr_0
+    ->  PROJECTION  (rows=100)
+      Output: 42
+      ->  PROJECTION  (rows=100)
+        Output: r
+        ->  TABLE_FUNCTION_SCAN  (rows=100)
+
+SELECT v
+FROM (
+  SELECT v
+  FROM generate_series(1, 10) AS generated(v)
+  LIMIT 5
+) AS limited
+WHERE v > 5
+ORDER BY v;
+v

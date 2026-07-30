@@ -92,6 +92,21 @@ impl GraphPredicatePushdown {
             _ => unreachable!(),
         };
 
+        if proj
+            .expressions
+            .iter()
+            .any(|expr| !expr.evaluation_properties().can_share_evaluation())
+            || filter
+                .expressions
+                .iter()
+                .any(|expr| expr.evaluation_properties().is_reorder_fence())
+        {
+            return LogicalOperator::Filter(Filter::new(
+                LogicalPlan::synthetic(LogicalOperator::Projection(proj)),
+                filter.expressions,
+            ));
+        }
+
         // Split all filter predicates by AND
         let mut all_preds = Vec::new();
         for expr in filter.expressions {
@@ -112,7 +127,9 @@ impl GraphPredicatePushdown {
         let mut graph_chain = *proj.child;
         let mut unpushed = Vec::new();
         for pred in remapped {
-            if !Self::push_into_chain(&mut graph_chain, pred.clone()) {
+            if pred.evaluation_properties().is_reorder_fence()
+                || !Self::push_into_chain(&mut graph_chain, pred.clone())
+            {
                 unpushed.push(pred);
             }
         }
@@ -155,7 +172,9 @@ impl GraphPredicatePushdown {
         let mut graph_chain = *filter.child;
         let mut remaining = Vec::new();
         for pred in all_preds {
-            if !Self::push_into_chain(&mut graph_chain, pred.clone()) {
+            if pred.evaluation_properties().is_reorder_fence()
+                || !Self::push_into_chain(&mut graph_chain, pred.clone())
+            {
                 remaining.push(pred);
             }
         }
@@ -322,7 +341,13 @@ impl GraphPredicatePushdown {
             if col.binding.table_index == proj.table_index
                 && col.binding.column_index < proj.expressions.len()
             {
-                Some(proj.expressions[col.binding.column_index].clone())
+                let projected = &proj.expressions[col.binding.column_index];
+                if projected.evaluation_properties().is_reorder_fence() {
+                    success.set(false);
+                    None
+                } else {
+                    Some(projected.clone())
+                }
             } else {
                 success.set(false);
                 None
