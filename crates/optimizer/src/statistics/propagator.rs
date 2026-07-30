@@ -8,19 +8,65 @@ use crate::filter::pushdown::FilterPushdown;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
+use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+    WindowExpression,
 };
 use paro_planner::operator::{
     empty_result::EmptyResult, ColumnBinding, Filter, Join, JoinComparisonType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StringStats};
+use paro_storage::statistics::{
+    BaseStatistics, ColumnStatistics, NumericStats, StatsInfo, StringStats,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 fn column_statistics_arc(base: BaseStatistics) -> Arc<ColumnStatistics> {
     Arc::new(ColumnStatistics::new(base))
+}
+
+fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
+    let return_type = expression.return_type();
+    let mut statistics = BaseStatistics::create_unknown(return_type.clone());
+
+    // Only publish bounds guaranteed by function semantics. Node cardinalities are estimates, not
+    // correctness bounds, so they must never become window min/max values used for filter pruning.
+    match (expression.function.function_type, &return_type) {
+        (
+            WindowFunctionType::RowNumber
+            | WindowFunctionType::Rank
+            | WindowFunctionType::DenseRank,
+            LogicalType::BigInt,
+        ) => {
+            statistics.set(StatsInfo::CannotHaveNullValues);
+            NumericStats::set_min(&mut statistics, &Value::BigInt(1));
+            NumericStats::set_max(&mut statistics, &Value::BigInt(i64::MAX));
+        }
+        (WindowFunctionType::PercentRank | WindowFunctionType::CumeDist, LogicalType::Double) => {
+            statistics.set(StatsInfo::CannotHaveNullValues);
+            NumericStats::set_min(&mut statistics, &Value::Double(0.0));
+            NumericStats::set_max(&mut statistics, &Value::Double(1.0));
+        }
+        (
+            WindowFunctionType::RowNumber
+            | WindowFunctionType::Rank
+            | WindowFunctionType::DenseRank
+            | WindowFunctionType::PercentRank
+            | WindowFunctionType::CumeDist
+            | WindowFunctionType::Ntile
+            | WindowFunctionType::Lead
+            | WindowFunctionType::Lag
+            | WindowFunctionType::FirstValue
+            | WindowFunctionType::LastValue
+            | WindowFunctionType::NthValue
+            | WindowFunctionType::Aggregate,
+            _,
+        ) => {}
+    }
+
+    statistics
 }
 
 /// Propagates column statistics through the logical plan.
@@ -490,9 +536,7 @@ impl StatisticsPropagator {
                     };
                     self.statistics_map.insert(
                         binding,
-                        column_statistics_arc(BaseStatistics::create_unknown(
-                            expression.return_type(),
-                        )),
+                        column_statistics_arc(window_output_statistics(expression)),
                     );
                 }
                 LogicalOperator::Window(window)
@@ -967,8 +1011,50 @@ mod tests {
                 .get(&binding)
                 .unwrap_or_else(|| panic!("missing statistics for {binding:?}"));
             assert_eq!(stats.statistics().get_type(), &LogicalType::BigInt);
-            assert!(stats.statistics().can_have_null());
+            assert!(!stats.statistics().can_have_null());
             assert!(stats.statistics().can_have_no_null());
+            assert_eq!(stats.statistics().min_value(), Some(Value::BigInt(1)));
+            assert_eq!(
+                stats.statistics().max_value(),
+                Some(Value::BigInt(i64::MAX))
+            );
         }
+    }
+
+    #[test]
+    fn window_statistics_only_publish_function_intrinsic_facts() {
+        let cume_dist = WindowFunction::cume_dist();
+        let cume_dist = WindowExpression {
+            frame: WindowFrame::get_default_frame(&cume_dist),
+            return_type: cume_dist.return_type.clone(),
+            function: cume_dist,
+            children: Vec::new(),
+            partitions: Vec::new(),
+            orders: Vec::new(),
+            ignore_nulls: false,
+        };
+        let cume_dist_stats = window_output_statistics(&cume_dist);
+        assert!(!cume_dist_stats.can_have_null());
+        assert_eq!(cume_dist_stats.min_value(), Some(Value::Double(0.0)));
+        assert_eq!(cume_dist_stats.max_value(), Some(Value::Double(1.0)));
+
+        let ntile = WindowFunction::ntile();
+        let ntile = WindowExpression {
+            frame: WindowFrame::get_default_frame(&ntile),
+            return_type: ntile.return_type.clone(),
+            function: ntile,
+            children: vec![Expression::Constant(ConstantExpression::new(
+                Value::BigInt(4),
+                LogicalType::BigInt,
+            ))],
+            partitions: Vec::new(),
+            orders: Vec::new(),
+            ignore_nulls: false,
+        };
+        let ntile_stats = window_output_statistics(&ntile);
+        assert!(ntile_stats.can_have_null());
+        assert!(ntile_stats.can_have_no_null());
+        assert_eq!(ntile_stats.min_value(), None);
+        assert_eq!(ntile_stats.max_value(), None);
     }
 }
