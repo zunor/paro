@@ -668,7 +668,7 @@ mod tests {
     #[serial_test::serial]
     fn sidecar_reader_cache_uses_content_checksum_and_format_version_identity() {
         let _metrics_guard = crate::metrics::storage_metrics_test_guard();
-        storage_metrics().reset_for_tests();
+        const TEST_CODEC: &str = "test-cache-content-identity";
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = SidecarArtifactStore::new(temp_dir.path());
 
@@ -695,7 +695,7 @@ mod tests {
                 location: &first_location,
                 artifact_format_version: 1,
                 provider: SearchIndexKind::FullText,
-                codec: "scar-v1",
+                codec: TEST_CODEC,
             })
             .unwrap();
         let second = cache
@@ -703,7 +703,7 @@ mod tests {
                 location: &second_location,
                 artifact_format_version: 1,
                 provider: SearchIndexKind::FullText,
-                codec: "scar-v1",
+                codec: TEST_CODEC,
             })
             .unwrap();
 
@@ -716,16 +716,21 @@ mod tests {
                 location: &second_location,
                 artifact_format_version: 2,
                 provider: SearchIndexKind::FullText,
-                codec: "scar-v1",
+                codec: TEST_CODEC,
             })
             .unwrap_err();
         assert!(err.to_string().contains("open search sidecar package"));
 
         let snapshot = storage_metrics().snapshot();
-        assert_eq!(snapshot.search_sidecar_reader_by_key.len(), 1);
-        let series = &snapshot.search_sidecar_reader_by_key[0];
+        let series = snapshot
+            .search_sidecar_reader_by_key
+            .iter()
+            .find(|series| {
+                series.key.provider == SearchIndexKind::FullText && series.key.codec == TEST_CODEC
+            })
+            .expect("content identity test sidecar reader metrics");
         assert_eq!(series.key.provider, SearchIndexKind::FullText);
-        assert_eq!(series.key.codec, "scar-v1");
+        assert_eq!(series.key.codec, TEST_CODEC);
         assert_eq!(series.counters.format_dispatch_total, 3);
         assert_eq!(series.counters.cache_misses_total, 2);
         assert_eq!(series.counters.cache_hits_total, 1);
@@ -737,7 +742,7 @@ mod tests {
     #[serial_test::serial]
     fn sidecar_reader_cache_reuses_package_mmap_for_multiple_artifacts() {
         let _metrics_guard = crate::metrics::storage_metrics_test_guard();
-        storage_metrics().reset_for_tests();
+        const TEST_CODEC: &str = "test-cache-package-reuse";
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = SidecarArtifactStore::new(temp_dir.path());
         let file_id = SidecarArtifactStore::default_shard_file_id(23, 5);
@@ -752,7 +757,7 @@ mod tests {
                 location: &first_location,
                 artifact_format_version: 1,
                 provider: SearchIndexKind::Sparse,
-                codec: "scar-v1",
+                codec: TEST_CODEC,
             })
             .unwrap();
         let second = cache
@@ -760,7 +765,7 @@ mod tests {
                 location: &second_location,
                 artifact_format_version: 1,
                 provider: SearchIndexKind::Sparse,
-                codec: "scar-v1",
+                codec: TEST_CODEC,
             })
             .unwrap();
         let first_again = cache
@@ -768,7 +773,7 @@ mod tests {
                 location: &first_location,
                 artifact_format_version: 1,
                 provider: SearchIndexKind::Sparse,
-                codec: "scar-v1",
+                codec: TEST_CODEC,
             })
             .unwrap();
 
@@ -779,8 +784,13 @@ mod tests {
         assert_eq!(cache.package_count(), 1);
 
         let snapshot = storage_metrics().snapshot();
-        assert_eq!(snapshot.search_sidecar_reader_by_key.len(), 1);
-        let series = &snapshot.search_sidecar_reader_by_key[0];
+        let series = snapshot
+            .search_sidecar_reader_by_key
+            .iter()
+            .find(|series| {
+                series.key.provider == SearchIndexKind::Sparse && series.key.codec == TEST_CODEC
+            })
+            .expect("package reuse test sidecar reader metrics");
         assert_eq!(series.key.provider, SearchIndexKind::Sparse);
         assert_eq!(series.counters.format_dispatch_total, 3);
         assert_eq!(series.counters.cache_misses_total, 2);

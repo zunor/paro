@@ -235,7 +235,7 @@ mod tests {
             delta_paths: Vec::new(),
             materialized_state_path: None,
             embedded_materialized_state: false,
-            artifacts: GenerationArtifactSet::default(),
+            artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries,
         }
     }
