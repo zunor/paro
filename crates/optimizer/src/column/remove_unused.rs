@@ -187,6 +187,22 @@ impl<'a> RemoveUnusedColumns<'a> {
 impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
     fn visit_logical_plan(&mut self, plan: &mut LogicalPlan) {
         self.visit_operator(&mut plan.operator);
+
+        // Window is cardinality-preserving and only appends computed columns. Once pruning has
+        // removed every window expression, retaining the operator would enter the window runtime
+        // for a pure pass-through. Preserve the child's plan identity and metadata when removing
+        // that no-op boundary.
+        if matches!(
+            &plan.operator,
+            LogicalOperator::Window(window) if window.expressions.is_empty()
+        ) {
+            let LogicalOperator::Window(window) =
+                std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan)
+            else {
+                unreachable!("empty-window guard must match the replaced operator");
+            };
+            *plan = *window.child;
+        }
     }
 
     fn visit_operator(&mut self, op: &mut LogicalOperator) {

@@ -480,11 +480,20 @@ impl StatisticsPropagator {
                 Join::Cross(cross) => LogicalOperator::Join(Join::Cross(cross)),
             },
             LogicalOperator::Window(window) => {
-                for (i, _expr) in window.expressions.iter().enumerate() {
-                    let _binding = ColumnBinding {
+                for (i, expression) in window.expressions.iter().enumerate() {
+                    // Window output ranges depend on partition cardinality and frame semantics.
+                    // Until those estimates are available, publish type-correct unknown statistics
+                    // so downstream projections and CTEs retain a complete statistics chain.
+                    let binding = ColumnBinding {
                         table_index: window.window_index,
                         column_index: i,
                     };
+                    self.statistics_map.insert(
+                        binding,
+                        column_statistics_arc(BaseStatistics::create_unknown(
+                            expression.return_type(),
+                        )),
+                    );
                 }
                 LogicalOperator::Window(window)
             }
@@ -855,8 +864,10 @@ mod tests {
     use std::sync::Arc;
 
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_function::window::WindowFunction;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::operator::ExpressionGet;
+    use paro_planner::expression::{WindowExpression, WindowFrame};
+    use paro_planner::operator::{ExpressionGet, Projection, Window};
 
     use super::*;
 
@@ -898,6 +909,66 @@ mod tests {
                 assert_eq!(empty.child.output_names(), vec!["quota".to_string()]);
             }
             other => panic!("expected schema-preserving EmptyResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_outputs_keep_statistics_available_to_parent_projections() {
+        let bind_context = BindContext::new();
+        let input = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Projection(Projection::new(
+                7,
+                LogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+                vec![Expression::Constant(ConstantExpression::new(
+                    Value::Integer(11),
+                    LogicalType::Integer,
+                ))],
+            )),
+        );
+        let function = WindowFunction::row_number();
+        let window = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Window(Window::new(
+                20,
+                vec![WindowExpression {
+                    frame: WindowFrame::get_default_frame(&function),
+                    function,
+                    children: Vec::new(),
+                    partitions: vec![Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(7, 0),
+                        LogicalType::Integer,
+                    ))],
+                    orders: Vec::new(),
+                    ignore_nulls: false,
+                    return_type: LogicalType::BigInt,
+                }],
+                input,
+            )),
+        );
+        let root = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                window,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(20, 0),
+                    LogicalType::BigInt,
+                ))],
+            )),
+        );
+
+        let mut propagator = StatisticsPropagator::new();
+        propagator.propagate(make_test_session(), root);
+
+        for binding in [ColumnBinding::new(20, 0), ColumnBinding::new(30, 0)] {
+            let stats = propagator
+                .statistics_map()
+                .get(&binding)
+                .unwrap_or_else(|| panic!("missing statistics for {binding:?}"));
+            assert_eq!(stats.statistics().get_type(), &LogicalType::BigInt);
+            assert!(stats.statistics().can_have_null());
+            assert!(stats.statistics().can_have_no_null());
         }
     }
 }

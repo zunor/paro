@@ -30,3 +30,11 @@ SELECT x, row_number() OVER (ORDER BY x) AS rn
 FROM (VALUES (3), (1), (2)) AS qualify_input(x)
 QUALIFY row_number() OVER (ORDER BY x) <= 2
 ORDER BY x;
+
+-- Pruning the only window output should remove the now-empty window operator.
+EXPLAIN SELECT x
+FROM (
+    SELECT x, row_number() OVER (ORDER BY x) AS unused_rn
+    FROM (VALUES (3), (1), (2)) AS unused_window_input(x)
+) AS unused_window
+ORDER BY x;
