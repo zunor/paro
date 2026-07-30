@@ -9,7 +9,7 @@ use paro_context::StatementContext;
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_planner::binder::Binder;
 use paro_planner::expression::{
-    AggregateExpression, ColumnRefExpression, ConstantExpression, Expression,
+    AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, ExpressionIterator,
 };
 use paro_planner::operator::{ColumnBinding, LogicalOperator, Projection};
 use paro_planner::plan::LogicalPlan;
@@ -187,6 +187,22 @@ impl<'a> RemoveUnusedColumns<'a> {
 impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
     fn visit_logical_plan(&mut self, plan: &mut LogicalPlan) {
         self.visit_operator(&mut plan.operator);
+
+        // Window is cardinality-preserving and only appends computed columns. Once pruning has
+        // removed every window expression, retaining the operator would enter the window runtime
+        // for a pure pass-through. Preserve the child's plan identity and metadata when removing
+        // that no-op boundary.
+        if matches!(
+            &plan.operator,
+            LogicalOperator::Window(window) if window.expressions.is_empty()
+        ) {
+            let LogicalOperator::Window(window) =
+                std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan)
+            else {
+                unreachable!("empty-window guard must match the replaced operator");
+            };
+            *plan = *window.child;
+        }
     }
 
     fn visit_operator(&mut self, op: &mut LogicalOperator) {
@@ -598,27 +614,37 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 }
             }
             LogicalOperator::Window(window) => {
-                // Window-specific pruning is not implemented yet, so preserve the
-                // full child output while still tracking expression references.
-                let mut child_optimizer = RemoveUnusedColumns::new(self.binder, self.session, true);
-
-                // Collect references from window expressions
-                for win_expr in &mut window.expressions {
-                    for child in &mut win_expr.children {
-                        child_optimizer.visit_expression(child);
+                if !self.everything_referenced {
+                    let mut retained = Vec::new();
+                    for (old_index, expression) in window.expressions.drain(..).enumerate() {
+                        let old_binding = ColumnBinding::new(window.window_index, old_index);
+                        if self.is_referenced(&old_binding) {
+                            let new_index = retained.len();
+                            if old_index != new_index {
+                                self.replace_binding(
+                                    old_binding,
+                                    ColumnBinding::new(window.window_index, new_index),
+                                );
+                            }
+                            retained.push(expression);
+                        }
                     }
-                    for partition in &mut win_expr.partitions {
-                        child_optimizer.visit_expression(partition);
-                    }
-                    for order in &mut win_expr.orders {
-                        child_optimizer.visit_expression(&mut order.expression);
-                    }
+                    window.expressions = retained;
                 }
 
-                // Recurse into child
+                // Window is append-only: parent references to child columns pass through, while
+                // every retained window expression contributes its own child requirements.
+                let mut child_optimizer =
+                    RemoveUnusedColumns::new(self.binder, self.session, self.everything_referenced);
+                child_optimizer.column_references = std::mem::take(&mut self.column_references);
+                for window_expression in &mut window.expressions {
+                    ExpressionIterator::enumerate_window_children_mut(window_expression, |child| {
+                        child_optimizer.visit_expression(child)
+                    });
+                }
+
                 child_optimizer.visit_logical_plan(&mut window.child);
 
-                // Use replace_binding to directly update bindings via raw pointers
                 for replacement in &child_optimizer.replacements {
                     child_optimizer
                         .replace_binding(replacement.old_binding, replacement.new_binding);

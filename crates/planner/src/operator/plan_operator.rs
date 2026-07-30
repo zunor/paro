@@ -742,9 +742,8 @@ impl LogicalOperator {
             LogicalOperator::Window(window) => {
                 // Window adds new columns to child's bindings
                 let mut bindings = window.child.get_column_bindings();
-                let base = bindings.len();
                 for i in 0..window.expressions.len() {
-                    bindings.push(ColumnBinding::new(window.window_index, base + i));
+                    bindings.push(ColumnBinding::new(window.window_index, i));
                 }
                 bindings
             }
@@ -973,7 +972,9 @@ mod tests {
     use super::*;
     use crate::binder::context::BindContext;
     use crate::binder::ir::CTEMaterialize;
-    use crate::expression::{AggregateExpression, ConstantExpression, Expression};
+    use crate::expression::{
+        AggregateExpression, ConstantExpression, Expression, WindowExpression, WindowFrame,
+    };
     use crate::operator::{
         Aggregate, AnyJoin, ComparisonJoin, DelimGet, DependentJoin, EmptyResult, ExpandDirection,
         Explain, ExplainSpec, ExpressionGet, Join, JoinType, SearchCandidate, SearchDecision,
@@ -984,6 +985,7 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::copy::{register_copy_functions, CopyFunctionBindData, CopyOptions};
+    use paro_function::window::WindowFunction;
     use paro_parser::ast::CopySource;
     use paro_storage::search::{
         HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIndexKind, SearchIntent,
@@ -1498,6 +1500,37 @@ mod tests {
             ]
         );
         assert_eq!(op.get_table_index(), vec![30, 31, 32]);
+    }
+
+    #[test]
+    fn window_column_bindings_are_local_to_window_operator() {
+        let function = WindowFunction::row_number();
+        let window = Window::new(
+            77,
+            vec![WindowExpression {
+                frame: WindowFrame::get_default_frame(&function),
+                function,
+                children: Vec::new(),
+                partitions: Vec::new(),
+                orders: Vec::new(),
+                ignore_nulls: false,
+                return_type: LogicalType::BigInt,
+            }],
+            lp(expression_get(
+                10,
+                vec![LogicalType::Integer, LogicalType::Boolean],
+            )),
+        );
+        let op = LogicalOperator::Window(window);
+
+        assert_eq!(
+            op.get_column_bindings(),
+            vec![
+                ColumnBinding::new(10, 0),
+                ColumnBinding::new(10, 1),
+                ColumnBinding::new(77, 0),
+            ]
+        );
     }
 
     #[test]

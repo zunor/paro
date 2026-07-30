@@ -14,6 +14,7 @@ use super::{
     OperatorExpression, ParameterExpression, ReferenceExpression, SubqueryExpression,
     WindowExpression, WindowFrameBound,
 };
+use crate::operator::ColumnBinding;
 
 /// Expression represents a semantic-aware version of a SQL expression.
 #[derive(Debug, Clone)]
@@ -127,57 +128,60 @@ impl Expression {
 
     /// Recursively find all aggregate expressions and replace them with BoundReferenceExpressions.
     pub fn extract_aggregates(self, aggregates: &mut Vec<Expression>, offset: usize) -> Expression {
-        match self {
-            Expression::Aggregate(agg) => {
-                let index = offset + aggregates.len();
-                let return_type = agg.return_type.clone();
-                aggregates.push(Expression::Aggregate(agg));
-                Expression::Reference(ReferenceExpression::new(index, return_type))
-            }
-            Expression::Function(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.extract_aggregates(aggregates, offset))
-                    .collect();
-                Expression::Function(expr)
-            }
-            Expression::Operator(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.extract_aggregates(aggregates, offset))
-                    .collect();
-                Expression::Operator(expr)
-            }
-            Expression::Comparison(mut expr) => {
-                expr.left = Box::new(expr.left.extract_aggregates(aggregates, offset));
-                expr.right = Box::new(expr.right.extract_aggregates(aggregates, offset));
-                Expression::Comparison(expr)
-            }
-            Expression::Cast(mut expr) => {
-                expr.child = Box::new(expr.child.extract_aggregates(aggregates, offset));
-                Expression::Cast(expr)
-            }
-            Expression::Conjunction(mut expr) => {
-                expr.children = expr
-                    .children
-                    .into_iter()
-                    .map(|c| c.extract_aggregates(aggregates, offset))
-                    .collect();
-                Expression::Conjunction(expr)
-            }
-            Expression::Case(mut expr) => {
-                expr.check = Box::new(expr.check.extract_aggregates(aggregates, offset));
-                expr.result_if_true =
-                    Box::new(expr.result_if_true.extract_aggregates(aggregates, offset));
-                expr.result_if_false =
-                    Box::new(expr.result_if_false.extract_aggregates(aggregates, offset));
-                Expression::Case(expr)
-            }
-            Expression::Parameter(_) => self,
-            _ => self,
+        let mut expression = self;
+        expression.extract_aggregates_in_place(aggregates, offset);
+        expression
+    }
+
+    /// Extract aggregates through every scalar-expression child, including window clauses.
+    ///
+    /// A subquery is a query-level boundary: aggregates owned by its plan must not be hoisted into
+    /// the surrounding SELECT.
+    pub fn extract_aggregates_in_place(&mut self, aggregates: &mut Vec<Expression>, offset: usize) {
+        if let Expression::Aggregate(aggregate) = self {
+            let index = offset + aggregates.len();
+            let return_type = aggregate.return_type.clone();
+            let replacement = Expression::Reference(ReferenceExpression::new(index, return_type));
+            aggregates.push(std::mem::replace(self, replacement));
+            return;
         }
+        if matches!(self, Expression::Subquery(_)) {
+            return;
+        }
+
+        ExpressionIterator::enumerate_children_mut(self, |child| {
+            child.extract_aggregates_in_place(aggregates, offset);
+        });
+    }
+
+    /// Hoist window expressions into a window operator and replace uses with its output binding.
+    ///
+    /// Window bindings use a producer-local column index. The physical position is resolved after
+    /// the child plan has been finalized, so subquery planning cannot invalidate the binding.
+    pub fn extract_windows_in_place(&mut self, windows: &mut Vec<Expression>, window_index: usize) {
+        if matches!(self, Expression::Window(_)) {
+            let return_type = self.return_type();
+            let existing = windows.iter().position(|window| window.equals(self));
+            let output_index = existing.unwrap_or(windows.len());
+            let replacement = Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(window_index, output_index),
+                return_type,
+            ));
+
+            if existing.is_some() {
+                *self = replacement;
+            } else {
+                windows.push(std::mem::replace(self, replacement));
+            }
+            return;
+        }
+        if matches!(self, Expression::Subquery(_)) {
+            return;
+        }
+
+        ExpressionIterator::enumerate_children_mut(self, |child| {
+            child.extract_windows_in_place(windows, window_index);
+        });
     }
 
     /// Check if two expressions are semantically equal.
@@ -320,12 +324,13 @@ fn routine_identities_equal(
 mod tests {
     use super::Expression;
     use crate::expression::{
-        ColumnRefExpression, ConstantExpression, OrderByExpression, ReferenceExpression,
-        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+        AggregateExpression, ColumnRefExpression, ConstantExpression, OrderByExpression,
+        ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use crate::operator::ColumnBinding;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
+    use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::window::WindowFunction;
 
     fn int_column(column_index: usize) -> Expression {
@@ -395,6 +400,51 @@ mod tests {
             *offset,
             Expression::Reference(ReferenceExpression { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn extract_aggregates_visits_window_clauses() {
+        let aggregate = Expression::Aggregate(AggregateExpression::new(
+            get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        ));
+        let mut expression = window_expression(WindowFrameBound::CurrentRow);
+        let Expression::Window(window) = &mut expression else {
+            unreachable!();
+        };
+        window.orders[0].expression = aggregate;
+
+        let mut aggregates = Vec::new();
+        expression.extract_aggregates_in_place(&mut aggregates, 3);
+
+        assert_eq!(aggregates.len(), 1);
+        assert!(matches!(aggregates[0], Expression::Aggregate(_)));
+        let Expression::Window(window) = expression else {
+            panic!("expected window expression");
+        };
+        assert!(matches!(
+            window.orders[0].expression,
+            Expression::Reference(ReferenceExpression { index: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn extract_windows_reuses_semantically_equal_outputs() {
+        let mut first = window_expression(WindowFrameBound::CurrentRow);
+        let mut second = first.clone();
+        let mut windows = Vec::new();
+
+        first.extract_windows_in_place(&mut windows, 42);
+        second.extract_windows_in_place(&mut windows, 42);
+
+        assert_eq!(windows.len(), 1);
+        for expression in [first, second] {
+            let Expression::ColumnRef(column) = expression else {
+                panic!("expected window output reference");
+            };
+            assert_eq!(column.binding, ColumnBinding::new(42, 0));
+        }
     }
 
     #[test]

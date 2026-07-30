@@ -175,7 +175,7 @@ fn validate_window_spec(spec: &WindowSpec) -> Result<()> {
     validate_window_expression(first)?;
     for (idx, expr) in spec.expressions.iter().enumerate().skip(1) {
         validate_window_expression(expr)?;
-        if !same_window_layout(first, expr) {
+        if !first.has_same_layout(expr) {
             return Err(paro_error::not_implemented(format!(
                 "Window breaker requires one partition/order layout per WindowSpec; \
                  expression 0 and expression {idx} use different layouts"
@@ -204,45 +204,6 @@ fn validate_direct_value_expression(expr: &Expression, context: &str) -> Result<
         _ => Err(paro_error::not_implemented(format!(
             "{context} currently supports direct references and constants only"
         ))),
-    }
-}
-
-fn same_window_layout(left: &WindowExpression, right: &WindowExpression) -> bool {
-    same_expressions(&left.partitions, &right.partitions)
-        && same_order_expressions(&left.orders, &right.orders)
-}
-
-fn same_expressions(left: &[Expression], right: &[Expression]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| same_direct_value_expression(left, right))
-}
-
-fn same_order_expressions(left: &[OrderByExpression], right: &[OrderByExpression]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.ascending == right.ascending
-                && left.nulls_first == right.nulls_first
-                && same_direct_value_expression(&left.expression, &right.expression)
-        })
-}
-
-fn same_direct_value_expression(left: &Expression, right: &Expression) -> bool {
-    match (left, right) {
-        (Expression::Constant(left), Expression::Constant(right)) => {
-            left.return_type == right.return_type && left.value == right.value
-        }
-        (Expression::Reference(left), Expression::Reference(right)) => {
-            left.index == right.index && left.return_type == right.return_type
-        }
-        (Expression::ColumnRef(left), Expression::ColumnRef(right)) => {
-            left.binding == right.binding
-                && left.return_type == right.return_type
-                && left.depth == right.depth
-        }
-        _ => false,
     }
 }
 
