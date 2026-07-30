@@ -94,3 +94,123 @@ ORDER BY x;
 category	x	category_rn
 A	3	2
 B	4	2
+
+SELECT
+    x,
+    last_value(x) OVER (ORDER BY x) AS default_last,
+    first_value(x) OVER (
+        ORDER BY x ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING
+    ) AS framed_first,
+    last_value(x) OVER (
+        ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+    ) AS framed_last,
+    nth_value(x, 2) OVER (
+        ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING
+    ) AS framed_nth,
+    nth_value(x, x) OVER (
+        ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS dynamic_nth
+FROM (VALUES (1), (2), (3), (4)) AS framed_input(x)
+ORDER BY x;
+x	default_last	framed_first	framed_last	framed_nth	dynamic_nth
+1	1	2	NULL	2	1
+2	2	3	1	3	2
+3	3	4	2	4	3
+4	4	NULL	3	NULL	4
+
+SELECT
+    seq,
+    x,
+    first_value(x) RESPECT NULLS OVER (
+        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS first_respect,
+    first_value(x) IGNORE NULLS OVER (
+        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS first_ignore,
+    last_value(x) RESPECT NULLS OVER (
+        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS last_respect,
+    last_value(x) IGNORE NULLS OVER (
+        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS last_ignore,
+    nth_value(x, 2) RESPECT NULLS OVER (
+        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS nth_respect,
+    nth_value(x, 2) IGNORE NULLS OVER (
+        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS nth_ignore
+FROM (VALUES (1, NULL), (2, 10), (3, 20), (4, NULL)) AS null_input(seq, x)
+ORDER BY seq;
+seq	x	first_respect	first_ignore	last_respect	last_ignore	nth_respect	nth_ignore
+1	NULL	NULL	10	NULL	20	10	20
+2	10	NULL	10	NULL	20	10	20
+3	20	NULL	10	NULL	20	10	20
+4	NULL	NULL	10	NULL	20	10	20
+
+SELECT
+    x,
+    ntile(4) OVER (ORDER BY x) AS four_buckets,
+    ntile(12) OVER (ORDER BY x) AS excess_buckets,
+    ntile(NULL) OVER (ORDER BY x) AS null_buckets
+FROM (
+    VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)
+) AS ntile_input(x)
+ORDER BY x;
+x	four_buckets	excess_buckets	null_buckets
+1	1	1	NULL
+2	1	2	NULL
+3	1	3	NULL
+4	2	4	NULL
+5	2	5	NULL
+6	2	6	NULL
+7	3	7	NULL
+8	3	8	NULL
+9	4	9	NULL
+10	4	10	NULL
+
+SELECT
+    seq,
+    x,
+    offset_value,
+    lead(x, offset_value, -1) OVER (ORDER BY seq) AS dynamic_lead
+FROM (
+    VALUES (1, 10, 1), (2, 20, 2), (3, 30, 0), (4, 40, NULL)
+) AS dynamic_offset_input(seq, x, offset_value)
+ORDER BY seq;
+seq	x	offset_value	dynamic_lead
+1	10	1	20
+2	20	2	40
+3	30	0	30
+4	40	NULL	NULL
+
+SELECT
+    seq,
+    x,
+    lead(x, 1, 99) IGNORE NULLS OVER (ORDER BY seq) AS next_non_null,
+    lag(x, 1, 99) IGNORE NULLS OVER (ORDER BY seq) AS previous_non_null,
+    lead(x, 0, 99) IGNORE NULLS OVER (ORDER BY seq) AS current_value
+FROM (VALUES (1, NULL), (2, 10), (3, NULL), (4, 20)) AS navigation_input(seq, x)
+ORDER BY seq;
+seq	x	next_non_null	previous_non_null	current_value
+1	NULL	10	99	NULL
+2	10	20	99	10
+3	NULL	20	10	NULL
+4	20	99	10	20
+
+SELECT ntile(0) OVER () FROM (VALUES (1)) AS invalid_ntile_input(x);
+ERROR: argument of ntile must be greater than zero (SQLSTATE=22023)
+
+SELECT last_value(x) OVER (
+    ORDER BY x ROWS BETWEEN -1 PRECEDING AND CURRENT ROW
+) FROM (VALUES (1)) AS negative_frame_input(x);
+ERROR: window frame offset must not be negative (SQLSTATE=22023)
+
+SELECT last_value(x) OVER (
+    ORDER BY x ROWS BETWEEN NULL PRECEDING AND CURRENT ROW
+) FROM (VALUES (1)) AS null_frame_input(x);
+ERROR: window frame offset must not be null (SQLSTATE=22023)
+
+SELECT last_value(x) OVER (
+    ORDER BY x ROWS BETWEEN CURRENT ROW AND 1 PRECEDING
+) FROM (VALUES (1)) AS invalid_frame_input(x);
+ERROR: frame starting from current row cannot have preceding rows (SQLSTATE=42P20)

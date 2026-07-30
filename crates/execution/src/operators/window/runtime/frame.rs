@@ -1,17 +1,236 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Aggregate window frame kernel for the breaker runtime.
+//! Shared window frame kernel for the breaker runtime.
+
+use std::ops::Range;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
     Expression, OrderByExpression, WindowExpression, WindowFrameBound, WindowFrameType,
 };
 
-use super::{are_peers, value_from_expr, value_to_i64, WindowPartition, WindowRowKey};
+use super::{
+    are_peers, value_from_expr, value_is_null_from_expr, value_to_i64, WindowPartition,
+    WindowRowKey,
+};
+
+/// Materialized frame ranges for every row in one partition.
+///
+/// Ranges are stored relative to the partition. This keeps the aggregate fast
+/// paths indexable without translation while `absolute_range` provides the
+/// global row-key range used by generic aggregate and value functions.
+pub(super) struct WindowFrameIndex {
+    partition: WindowPartition,
+    ranges: Vec<Range<usize>>,
+}
+
+impl WindowFrameIndex {
+    pub(super) fn build(
+        chunks: &[Chunk],
+        sorted_keys: &[WindowRowKey],
+        partition: WindowPartition,
+        expr: &WindowExpression,
+    ) -> Result<Self> {
+        let peer_ranges = (expr.frame.frame_type == WindowFrameType::Range)
+            .then(|| build_peer_ranges(chunks, sorted_keys, partition, &expr.orders));
+        let mut ranges = Vec::with_capacity(partition.end - partition.start);
+        for absolute_idx in partition.start..partition.end {
+            let row = absolute_idx - partition.start;
+            ranges.push(frame_range(
+                chunks,
+                &sorted_keys[absolute_idx],
+                row,
+                partition.end - partition.start,
+                peer_ranges
+                    .as_ref()
+                    .map(|ranges| ranges[row].clone())
+                    .unwrap_or(row..row + 1),
+                expr,
+            )?);
+        }
+        Ok(Self { partition, ranges })
+    }
+
+    pub(super) fn absolute_range(&self, absolute_idx: usize) -> Range<usize> {
+        let relative = self.relative_range(absolute_idx);
+        (self.partition.start + relative.start)..(self.partition.start + relative.end)
+    }
+
+    pub(super) fn relative_range(&self, absolute_idx: usize) -> Range<usize> {
+        self.ranges[absolute_idx - self.partition.start].clone()
+    }
+
+    fn relative_ranges(&self) -> &[Range<usize>] {
+        &self.ranges
+    }
+}
+
+/// Row positions needed to navigate one window value expression.
+///
+/// Indexing non-NULL rows once prevents `IGNORE NULLS` from rescanning every row
+/// in large overlapping frames or partition-relative LEAD/LAG lookups. Binary
+/// searches locate targets without retaining a boxed copy of every value.
+pub(super) struct WindowValueIndex {
+    partition: WindowPartition,
+    non_null_rows: Vec<usize>,
+}
+
+impl WindowValueIndex {
+    pub(super) fn build(
+        chunks: &[Chunk],
+        sorted_keys: &[WindowRowKey],
+        partition: WindowPartition,
+        expr: &WindowExpression,
+    ) -> Result<Self> {
+        let child = expr.children.first().ok_or_else(|| {
+            paro_error::internal("frame value window function requires an argument")
+        })?;
+        let non_null_rows = if expr.ignore_nulls {
+            sorted_keys[partition.start..partition.end]
+                .iter()
+                .enumerate()
+                .filter_map(|(row, key)| {
+                    (!value_is_null_from_expr(chunks, key, child)).then_some(row)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            partition,
+            non_null_rows,
+        })
+    }
+
+    pub(super) fn evaluate(
+        &self,
+        chunks: &[Chunk],
+        sorted_keys: &[WindowRowKey],
+        frame: Range<usize>,
+        current_row: usize,
+        expr: &WindowExpression,
+    ) -> Result<Value> {
+        let null = || Value::Null(expr.return_type.clone());
+        let row = match expr.function.function_type {
+            WindowFunctionType::FirstValue => self.row_from_head(&frame, 0, expr.ignore_nulls),
+            WindowFunctionType::LastValue => self.row_from_tail(&frame, expr.ignore_nulls),
+            WindowFunctionType::NthValue => {
+                let Some(offset) = expr.children.get(1) else {
+                    return Err(paro_error::internal("NTH_VALUE requires an offset"));
+                };
+                let value = value_from_expr(chunks, &sorted_keys[current_row], offset);
+                if value.is_null() {
+                    return Ok(null());
+                }
+                let value = value_to_i64(&value).ok_or_else(|| {
+                    paro_error::invalid_input("argument of nth_value must be an integer")
+                })?;
+                if value <= 0 {
+                    return Err(paro_error::invalid_input(
+                        "argument of nth_value must be greater than zero",
+                    ));
+                }
+                let nth = usize::try_from(value - 1).map_err(|_| {
+                    paro_error::invalid_input(
+                        "argument of nth_value is outside the supported range",
+                    )
+                })?;
+                self.row_from_head(&frame, nth, expr.ignore_nulls)
+            }
+            other => {
+                return Err(paro_error::internal(format!(
+                    "frame value kernel cannot execute {other}"
+                )))
+            }
+        };
+        Ok(row
+            .map(|row| {
+                value_from_expr(
+                    chunks,
+                    &sorted_keys[self.partition.start + row],
+                    &expr.children[0],
+                )
+            })
+            .unwrap_or_else(null))
+    }
+
+    /// Find a LEAD/LAG target relative to the current row.
+    ///
+    /// A negative offset reverses the function's normal direction. Under
+    /// `IGNORE NULLS`, offset zero still addresses the current row, while a
+    /// non-zero offset counts only non-NULL argument rows after/before it.
+    pub(super) fn row_from_current(
+        &self,
+        current_row: usize,
+        offset: i64,
+        function_moves_forward: bool,
+        ignore_nulls: bool,
+    ) -> Option<usize> {
+        let current = current_row.checked_sub(self.partition.start)?;
+        let partition_len = self.partition.end - self.partition.start;
+        if current >= partition_len {
+            return None;
+        }
+        if offset == 0 {
+            return Some(current);
+        }
+
+        let distance = usize::try_from(offset.unsigned_abs()).ok()?;
+        let moves_forward = function_moves_forward == offset.is_positive();
+        if !ignore_nulls {
+            return if moves_forward {
+                current
+                    .checked_add(distance)
+                    .filter(|&row| row < partition_len)
+            } else {
+                current.checked_sub(distance)
+            };
+        }
+
+        if moves_forward {
+            let first = self.non_null_rows.partition_point(|&row| row <= current);
+            first
+                .checked_add(distance - 1)
+                .and_then(|idx| self.non_null_rows.get(idx))
+                .copied()
+        } else {
+            let end = self.non_null_rows.partition_point(|&row| row < current);
+            end.checked_sub(distance)
+                .and_then(|idx| self.non_null_rows.get(idx))
+                .copied()
+        }
+    }
+
+    fn row_from_head(&self, frame: &Range<usize>, nth: usize, ignore_nulls: bool) -> Option<usize> {
+        if !ignore_nulls {
+            return frame.start.checked_add(nth).filter(|&row| row < frame.end);
+        }
+
+        let first = self.non_null_rows.partition_point(|&row| row < frame.start);
+        first
+            .checked_add(nth)
+            .and_then(|idx| self.non_null_rows.get(idx))
+            .copied()
+            .filter(|&row| row < frame.end)
+    }
+
+    fn row_from_tail(&self, frame: &Range<usize>, ignore_nulls: bool) -> Option<usize> {
+        if !ignore_nulls {
+            return frame.end.checked_sub(1).filter(|&row| row >= frame.start);
+        }
+
+        let end = self.non_null_rows.partition_point(|&row| row < frame.end);
+        self.non_null_rows[..end]
+            .last()
+            .copied()
+            .filter(|&row| row >= frame.start)
+    }
+}
 
 pub(super) fn aggregate_frame_is_partition_constant(expr: &WindowExpression) -> bool {
     if expr.frame.frame_type != WindowFrameType::Range || !expr.orders.is_empty() {
@@ -31,27 +250,24 @@ pub(super) fn aggregate_frame_is_partition_constant(expr: &WindowExpression) -> 
 pub(super) fn aggregate_window_value(
     chunks: &[Chunk],
     sorted_keys: &[WindowRowKey],
-    partition: WindowPartition,
+    frame: Range<usize>,
     expr: &WindowExpression,
-    absolute_idx: usize,
 ) -> Result<Value> {
-    let (frame_start, frame_end) =
-        frame_bounds(chunks, sorted_keys, partition, expr, absolute_idx)?;
     match aggregate_frame_function(&expr.function.name) {
         Some(AggregateFrameFunction::Count) => {
-            aggregate_count(chunks, sorted_keys, frame_start, frame_end, expr)
+            aggregate_count(chunks, sorted_keys, frame.start, frame.end, expr)
         }
         Some(AggregateFrameFunction::Sum) => {
-            aggregate_sum(chunks, sorted_keys, frame_start, frame_end, expr)
+            aggregate_sum(chunks, sorted_keys, frame.start, frame.end, expr)
         }
         Some(AggregateFrameFunction::Avg) => {
-            aggregate_avg(chunks, sorted_keys, frame_start, frame_end, expr)
+            aggregate_avg(chunks, sorted_keys, frame.start, frame.end, expr)
         }
         Some(AggregateFrameFunction::Min) => {
-            aggregate_min_max(chunks, sorted_keys, frame_start, frame_end, expr, false)
+            aggregate_min_max(chunks, sorted_keys, frame.start, frame.end, expr, false)
         }
         Some(AggregateFrameFunction::Max) => {
-            aggregate_min_max(chunks, sorted_keys, frame_start, frame_end, expr, true)
+            aggregate_min_max(chunks, sorted_keys, frame.start, frame.end, expr, true)
         }
         None => Err(paro_error::not_implemented(format!(
             "Aggregate window function '{}' is not supported by the window breaker frame kernel",
@@ -65,6 +281,7 @@ pub(super) fn try_aggregate_partition_fast(
     sorted_keys: &[WindowRowKey],
     partition: WindowPartition,
     expr: &WindowExpression,
+    frames: &WindowFrameIndex,
 ) -> Result<Option<Vec<Value>>> {
     if expr.frame.frame_type != WindowFrameType::Rows {
         return Ok(None);
@@ -76,41 +293,28 @@ pub(super) fn try_aggregate_partition_fast(
         return Ok(None);
     }
 
-    let partition_len = partition.end.saturating_sub(partition.start);
-    let mut starts = Vec::with_capacity(partition_len);
-    let mut ends = Vec::with_capacity(partition_len);
-    for absolute_idx in partition.start..partition.end {
-        let (start, end) = frame_bounds(chunks, sorted_keys, partition, expr, absolute_idx)?;
-        starts.push(start - partition.start);
-        ends.push(end - partition.start);
-    }
+    let ranges = frames.relative_ranges();
 
     match function {
         AggregateFrameFunction::Count if expr.children.is_empty() => {
-            Ok(Some(fast_count_star(&starts, &ends)))
+            Ok(Some(fast_count_star(ranges)))
         }
         AggregateFrameFunction::Count => {
             let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(Some(fast_count_values(&starts, &ends, &values)))
+            Ok(Some(fast_count_values(ranges, &values)))
         }
         AggregateFrameFunction::Sum => {
             let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(fast_sum_values(&starts, &ends, &values, &expr.return_type))
+            Ok(fast_sum_values(ranges, &values, &expr.return_type))
         }
         AggregateFrameFunction::Avg => {
             let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(Some(fast_avg_values(
-                &starts,
-                &ends,
-                &values,
-                &expr.return_type,
-            )))
+            Ok(Some(fast_avg_values(ranges, &values, &expr.return_type)))
         }
         AggregateFrameFunction::Min | AggregateFrameFunction::Max => {
             let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
             Ok(Some(fast_min_max_values(
-                &starts,
-                &ends,
+                ranges,
                 &values,
                 &expr.return_type,
                 function == AggregateFrameFunction::Max,
@@ -144,26 +348,27 @@ fn aggregate_frame_function(name: &str) -> Option<AggregateFrameFunction> {
     }
 }
 
-fn frame_bounds(
+fn frame_range(
     chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    partition: WindowPartition,
+    key: &WindowRowKey,
+    row: usize,
+    partition_len: usize,
+    peer_range: Range<usize>,
     expr: &WindowExpression,
-    absolute_idx: usize,
-) -> Result<(usize, usize)> {
-    let row = absolute_idx - partition.start;
-    let peer = || peer_bounds(chunks, sorted_keys, partition, absolute_idx, &expr.orders);
+) -> Result<Range<usize>> {
     let start = match &expr.frame.start_bound {
-        WindowFrameBound::Unbounded if expr.frame.start_is_preceding => partition.start,
-        WindowFrameBound::Unbounded => partition.end,
-        WindowFrameBound::CurrentRow if expr.frame.frame_type == WindowFrameType::Range => peer().0,
-        WindowFrameBound::CurrentRow => absolute_idx,
+        WindowFrameBound::Unbounded if expr.frame.start_is_preceding => 0,
+        WindowFrameBound::Unbounded => partition_len,
+        WindowFrameBound::CurrentRow if expr.frame.frame_type == WindowFrameType::Range => {
+            peer_range.start
+        }
+        WindowFrameBound::CurrentRow => row,
         WindowFrameBound::Offset(offset) if expr.frame.frame_type == WindowFrameType::Rows => {
-            let offset = frame_offset(chunks, &sorted_keys[absolute_idx], offset)?;
+            let offset = frame_offset(chunks, key, offset)?;
             if expr.frame.start_is_preceding {
-                partition.start + row.saturating_sub(offset)
+                row.saturating_sub(offset)
             } else {
-                (absolute_idx + offset).min(partition.end)
+                row.saturating_add(offset).min(partition_len)
             }
         }
         WindowFrameBound::Offset(_) => {
@@ -173,16 +378,24 @@ fn frame_bounds(
         }
     };
     let end = match &expr.frame.end_bound {
-        WindowFrameBound::Unbounded if expr.frame.end_is_preceding => partition.start,
-        WindowFrameBound::Unbounded => partition.end,
-        WindowFrameBound::CurrentRow if expr.frame.frame_type == WindowFrameType::Range => peer().1,
-        WindowFrameBound::CurrentRow => absolute_idx + 1,
+        WindowFrameBound::Unbounded if expr.frame.end_is_preceding => 0,
+        WindowFrameBound::Unbounded => partition_len,
+        WindowFrameBound::CurrentRow if expr.frame.frame_type == WindowFrameType::Range => {
+            peer_range.end
+        }
+        WindowFrameBound::CurrentRow => row + 1,
         WindowFrameBound::Offset(offset) if expr.frame.frame_type == WindowFrameType::Rows => {
-            let offset = frame_offset(chunks, &sorted_keys[absolute_idx], offset)?;
+            let offset = frame_offset(chunks, key, offset)?;
             if expr.frame.end_is_preceding {
-                partition.start + row.saturating_sub(offset) + 1
+                if offset > row {
+                    0
+                } else {
+                    row - offset + 1
+                }
             } else {
-                (absolute_idx + offset + 1).min(partition.end)
+                row.saturating_add(offset)
+                    .saturating_add(1)
+                    .min(partition_len)
             }
         }
         WindowFrameBound::Offset(_) => {
@@ -191,7 +404,13 @@ fn frame_bounds(
             ))
         }
     };
-    Ok((start.min(partition.end), end.min(partition.end).max(start)))
+    let start = start.min(partition_len);
+    let end = end.min(partition_len);
+    Ok(if start < end {
+        start..end
+    } else {
+        start..start
+    })
 }
 
 fn partition_argument_values(
@@ -210,31 +429,28 @@ fn partition_argument_values(
         .collect())
 }
 
-fn fast_count_star(starts: &[usize], ends: &[usize]) -> Vec<Value> {
-    starts
+fn fast_count_star(ranges: &[Range<usize>]) -> Vec<Value> {
+    ranges
         .iter()
-        .zip(ends)
-        .map(|(&start, &end)| Value::BigInt(end.saturating_sub(start) as i64))
+        .map(|range| Value::BigInt(range.len() as i64))
         .collect()
 }
 
-fn fast_count_values(starts: &[usize], ends: &[usize], values: &[Value]) -> Vec<Value> {
+fn fast_count_values(ranges: &[Range<usize>], values: &[Value]) -> Vec<Value> {
     let mut prefix = Vec::with_capacity(values.len() + 1);
     prefix.push(0i64);
     for value in values {
         let next = prefix.last().copied().unwrap_or(0) + i64::from(!value.is_null());
         prefix.push(next);
     }
-    starts
+    ranges
         .iter()
-        .zip(ends)
-        .map(|(&start, &end)| Value::BigInt(prefix[end] - prefix[start]))
+        .map(|range| Value::BigInt(prefix[range.end] - prefix[range.start]))
         .collect()
 }
 
 fn fast_sum_values(
-    starts: &[usize],
-    ends: &[usize],
+    ranges: &[Range<usize>],
     values: &[Value],
     return_type: &LogicalType,
 ) -> Option<Vec<Value>> {
@@ -268,17 +484,16 @@ fn fast_sum_values(
     }
 
     Some(
-        starts
+        ranges
             .iter()
-            .zip(ends)
-            .map(|(&start, &end)| {
-                if counts[end] == counts[start] {
+            .map(|range| {
+                if counts[range.end] == counts[range.start] {
                     return Value::Null(return_type.clone());
                 }
                 number_value_for_type(
                     return_type,
-                    int_prefix[end] - int_prefix[start],
-                    float_prefix[end] - float_prefix[start],
+                    int_prefix[range.end] - int_prefix[range.start],
+                    float_prefix[range.end] - float_prefix[range.start],
                     use_float,
                 )
             })
@@ -287,8 +502,7 @@ fn fast_sum_values(
 }
 
 fn fast_avg_values(
-    starts: &[usize],
-    ends: &[usize],
+    ranges: &[Range<usize>],
     values: &[Value],
     return_type: &LogicalType,
 ) -> Vec<Value> {
@@ -306,34 +520,31 @@ fn fast_avg_values(
         counts.push(count);
         sums.push(sum);
     }
-    starts
+    ranges
         .iter()
-        .zip(ends)
-        .map(|(&start, &end)| {
-            let count = counts[end] - counts[start];
+        .map(|range| {
+            let count = counts[range.end] - counts[range.start];
             if count == 0 {
                 Value::Null(return_type.clone())
             } else {
-                Value::Double((sums[end] - sums[start]) / count as f64)
+                Value::Double((sums[range.end] - sums[range.start]) / count as f64)
             }
         })
         .collect()
 }
 
 fn fast_min_max_values(
-    starts: &[usize],
-    ends: &[usize],
+    ranges: &[Range<usize>],
     values: &[Value],
     return_type: &LogicalType,
     is_max: bool,
 ) -> Result<Vec<Value>> {
     let sparse = MinMaxSparseTable::new(values, is_max)?;
-    starts
+    ranges
         .iter()
-        .zip(ends)
-        .map(|(&start, &end)| {
+        .map(|range| {
             Ok(sparse
-                .query(values, start, end)?
+                .query(values, range.start, range.end)?
                 .map(|idx| values[idx].clone())
                 .unwrap_or_else(|| Value::Null(return_type.clone())))
         })
@@ -427,46 +638,48 @@ fn better_index(
 
 fn frame_offset(chunks: &[Chunk], key: &WindowRowKey, expr: &Expression) -> Result<usize> {
     let value = value_from_expr(chunks, key, expr);
-    value_to_i64(&value)
-        .and_then(|value| usize::try_from(value.max(0)).ok())
-        .ok_or_else(|| {
-            paro_error::not_implemented("window frame offset must be a non-negative integer")
-        })
+    if value.is_null() {
+        return Err(paro_error::invalid_input(
+            "window frame offset must not be null",
+        ));
+    }
+    let offset = value_to_i64(&value)
+        .ok_or_else(|| paro_error::invalid_input("window frame offset must be an integer"))?;
+    usize::try_from(offset)
+        .map_err(|_| paro_error::invalid_input("window frame offset must not be negative"))
 }
 
-fn peer_bounds(
+fn build_peer_ranges(
     chunks: &[Chunk],
     sorted_keys: &[WindowRowKey],
     partition: WindowPartition,
-    absolute_idx: usize,
     orders: &[OrderByExpression],
-) -> (usize, usize) {
+) -> Vec<Range<usize>> {
+    let partition_len = partition.end - partition.start;
     if orders.is_empty() {
-        return (partition.start, partition.end);
+        return vec![0..partition_len; partition_len];
     }
-    let mut start = absolute_idx;
-    while start > partition.start
-        && are_peers(
-            chunks,
-            &sorted_keys[start - 1],
-            &sorted_keys[absolute_idx],
-            orders,
-        )
-    {
-        start -= 1;
+
+    let mut peer_ranges = vec![0..0; partition_len];
+    let mut peer_start = 0;
+    while peer_start < partition_len {
+        let mut peer_end = peer_start + 1;
+        while peer_end < partition_len
+            && are_peers(
+                chunks,
+                &sorted_keys[partition.start + peer_start],
+                &sorted_keys[partition.start + peer_end],
+                orders,
+            )
+        {
+            peer_end += 1;
+        }
+        for range in &mut peer_ranges[peer_start..peer_end] {
+            *range = peer_start..peer_end;
+        }
+        peer_start = peer_end;
     }
-    let mut end = absolute_idx + 1;
-    while end < partition.end
-        && are_peers(
-            chunks,
-            &sorted_keys[absolute_idx],
-            &sorted_keys[end],
-            orders,
-        )
-    {
-        end += 1;
-    }
-    (start, end)
+    peer_ranges
 }
 
 fn aggregate_count(
