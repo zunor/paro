@@ -2215,7 +2215,11 @@ mod tests {
             .create_schema_with_snapshot(&write_txn, "post_recovery_schema")
             .unwrap();
         let created = catalog.get_schema(&txn, "post_recovery_schema").unwrap();
-        assert_eq!(created.base.object_id.raw(), replay_watermark);
+        // The allocator is shared process-wide, so concurrent catalog work may consume IDs after
+        // the watermark is observed. Recovery guarantees monotonicity past the replayed maximum,
+        // not that this catalog receives the immediately adjacent ID.
+        assert!(created.base.object_id.raw() >= replay_watermark);
+        assert!(created.base.object_id.raw() > replayed_schema_oid);
     }
 
     #[test]
@@ -2407,7 +2411,8 @@ mod tests {
             .create_schema_with_snapshot(&write_txn, "after_drop_replay")
             .unwrap();
         let created = catalog.get_schema(&read_txn, "after_drop_replay").unwrap();
-        assert_eq!(created.base.object_id.raw(), next_object_id);
+        assert!(created.base.object_id.raw() >= next_object_id);
+        assert!(created.base.object_id.raw() > replayed_object_id);
     }
 
     #[test]
