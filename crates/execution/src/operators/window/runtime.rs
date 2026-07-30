@@ -16,7 +16,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_function::window::WindowFunctionType;
-use paro_planner::expression::{Expression, OrderByExpression, WindowExpression};
+use paro_planner::expression::{Expression, OrderByExpression, WindowExpression, WindowFrameBound};
 
 use crate::physical::specs::WindowSpec;
 
@@ -194,6 +194,12 @@ fn validate_window_expression(expr: &WindowExpression) -> Result<()> {
     }
     for child in &expr.children {
         validate_direct_value_expression(child, "window function argument")?;
+    }
+    if let WindowFrameBound::Offset(offset) = &expr.frame.start_bound {
+        validate_direct_value_expression(offset, "window frame start")?;
+    }
+    if let WindowFrameBound::Offset(offset) = &expr.frame.end_bound {
+        validate_direct_value_expression(offset, "window frame end")?;
     }
     Ok(())
 }
@@ -465,61 +471,30 @@ fn write_partition_expression_results(
             }
         }
         WindowFunctionType::Ntile => {
-            let n = ntile_bucket_count(chunks, sorted_keys, partition, expr).max(0) as usize;
-            if n == 0 {
+            let Some(bucket_count) = ntile_bucket_count(chunks, sorted_keys, partition, expr)?
+            else {
                 let null = Value::Null(expr.return_type.clone());
                 for absolute_idx in partition.start..partition.end {
                     output.set_window_value(expr_idx, absolute_idx, &null);
                 }
                 return Ok(());
-            }
+            };
             for absolute_idx in partition.start..partition.end {
-                let idx = absolute_idx - partition.start;
+                let row = absolute_idx - partition.start;
                 output.set_window_i64(
                     expr_idx,
                     absolute_idx,
-                    ((idx * n / partition_size) + 1) as i64,
+                    ntile_bucket(row, partition_size, bucket_count) as i64,
                 );
             }
         }
         WindowFunctionType::Lead | WindowFunctionType::Lag => {
-            write_lead_lag(chunks, sorted_keys, partition, expr_idx, expr, output);
+            write_lead_lag(chunks, sorted_keys, partition, expr_idx, expr, output)?;
         }
-        WindowFunctionType::FirstValue => {
-            let value = if partition.start < partition.end {
-                value_argument(chunks, &sorted_keys[partition.start], expr)
-            } else {
-                Value::Null(expr.return_type.clone())
-            };
-            for absolute_idx in partition.start..partition.end {
-                output.set_window_value(expr_idx, absolute_idx, &value);
-            }
-        }
-        WindowFunctionType::LastValue => {
-            let value = if partition.start < partition.end {
-                value_argument(chunks, &sorted_keys[partition.end - 1], expr)
-            } else {
-                Value::Null(expr.return_type.clone())
-            };
-            for absolute_idx in partition.start..partition.end {
-                output.set_window_value(expr_idx, absolute_idx, &value);
-            }
-        }
-        WindowFunctionType::NthValue => {
-            let n = expr
-                .children
-                .get(1)
-                .map(|child| value_from_expr(chunks, &sorted_keys[partition.start], child))
-                .and_then(|value| value_to_i64(&value))
-                .unwrap_or(1);
-            let value = if n > 0 && (n as usize) <= partition_size {
-                value_argument(chunks, &sorted_keys[partition.start + n as usize - 1], expr)
-            } else {
-                Value::Null(expr.return_type.clone())
-            };
-            for absolute_idx in partition.start..partition.end {
-                output.set_window_value(expr_idx, absolute_idx, &value);
-            }
+        WindowFunctionType::FirstValue
+        | WindowFunctionType::LastValue
+        | WindowFunctionType::NthValue => {
+            write_frame_value_results(chunks, sorted_keys, partition, expr_idx, expr, output)?;
         }
         WindowFunctionType::Aggregate => {
             write_aggregate_results(chunks, sorted_keys, partition, expr_idx, expr, output)?;
@@ -535,39 +510,42 @@ fn write_lead_lag(
     expr_idx: usize,
     expr: &WindowExpression,
     output: &mut WindowOutputBuilder,
-) {
-    let partition_size = partition.end - partition.start;
+) -> Result<()> {
     let is_lead = expr.function.function_type == WindowFunctionType::Lead;
-    let offset = expr
-        .children
-        .get(1)
-        .map(|child| value_from_expr(chunks, &sorted_keys[partition.start], child))
-        .and_then(|value| value_to_i64(&value))
-        .unwrap_or(1);
+    let values = frame::WindowValueIndex::build(chunks, sorted_keys, partition, expr)?;
 
     for absolute_idx in partition.start..partition.end {
-        let idx = absolute_idx - partition.start;
-        let target = if is_lead {
-            idx as i64 + offset
+        let offset = if let Some(offset) = expr.children.get(1) {
+            let value = value_from_expr(chunks, &sorted_keys[absolute_idx], offset);
+            if value.is_null() {
+                let null = Value::Null(expr.return_type.clone());
+                output.set_window_value(expr_idx, absolute_idx, &null);
+                continue;
+            }
+            value_to_i64(&value).ok_or_else(|| {
+                paro_error::invalid_input(format!(
+                    "offset argument of {} must be an integer",
+                    expr.function.name
+                ))
+            })?
         } else {
-            idx as i64 - offset
+            1
         };
-        let value = if target < 0 || target >= partition_size as i64 {
+        let value = if let Some(target) =
+            values.row_from_current(absolute_idx, offset, is_lead, expr.ignore_nulls)
+        {
+            value_argument(chunks, &sorted_keys[partition.start + target], expr)
+        } else {
             let default = expr
                 .children
                 .get(2)
-                .map(|child| value_from_expr(chunks, &sorted_keys[partition.start + idx], child))
+                .map(|child| value_from_expr(chunks, &sorted_keys[absolute_idx], child))
                 .unwrap_or_else(|| Value::Null(expr.return_type.clone()));
             default
-        } else {
-            value_argument(
-                chunks,
-                &sorted_keys[partition.start + target as usize],
-                expr,
-            )
         };
         output.set_window_value(expr_idx, absolute_idx, &value);
     }
+    Ok(())
 }
 
 fn write_aggregate_results(
@@ -579,15 +557,21 @@ fn write_aggregate_results(
     output: &mut WindowOutputBuilder,
 ) -> Result<()> {
     if frame::aggregate_frame_is_partition_constant(expr) {
-        let value =
-            frame::aggregate_window_value(chunks, sorted_keys, partition, expr, partition.start)?;
+        let value = frame::aggregate_window_value(
+            chunks,
+            sorted_keys,
+            partition.start..partition.end,
+            expr,
+        )?;
         for absolute_idx in partition.start..partition.end {
             output.set_window_value(expr_idx, absolute_idx, &value);
         }
         return Ok(());
     }
 
-    if let Some(values) = frame::try_aggregate_partition_fast(chunks, sorted_keys, partition, expr)?
+    let frames = frame::WindowFrameIndex::build(chunks, sorted_keys, partition, expr)?;
+    if let Some(values) =
+        frame::try_aggregate_partition_fast(chunks, sorted_keys, partition, expr, &frames)?
     {
         for (row_offset, value) in values.iter().enumerate() {
             output.set_window_value(expr_idx, partition.start + row_offset, value);
@@ -596,8 +580,35 @@ fn write_aggregate_results(
     }
 
     for absolute_idx in partition.start..partition.end {
-        let value =
-            frame::aggregate_window_value(chunks, sorted_keys, partition, expr, absolute_idx)?;
+        let value = frame::aggregate_window_value(
+            chunks,
+            sorted_keys,
+            frames.absolute_range(absolute_idx),
+            expr,
+        )?;
+        output.set_window_value(expr_idx, absolute_idx, &value);
+    }
+    Ok(())
+}
+
+fn write_frame_value_results(
+    chunks: &[Chunk],
+    sorted_keys: &[WindowRowKey],
+    partition: WindowPartition,
+    expr_idx: usize,
+    expr: &WindowExpression,
+    output: &mut WindowOutputBuilder,
+) -> Result<()> {
+    let frames = frame::WindowFrameIndex::build(chunks, sorted_keys, partition, expr)?;
+    let values = frame::WindowValueIndex::build(chunks, sorted_keys, partition, expr)?;
+    for absolute_idx in partition.start..partition.end {
+        let value = values.evaluate(
+            chunks,
+            sorted_keys,
+            frames.relative_range(absolute_idx),
+            absolute_idx,
+            expr,
+        )?;
         output.set_window_value(expr_idx, absolute_idx, &value);
     }
     Ok(())
@@ -608,12 +619,47 @@ fn ntile_bucket_count(
     sorted_keys: &[WindowRowKey],
     partition: WindowPartition,
     expr: &WindowExpression,
-) -> i64 {
-    expr.children
+) -> Result<Option<usize>> {
+    let argument = expr
+        .children
         .first()
-        .map(|child| value_from_expr(chunks, &sorted_keys[partition.start], child))
-        .and_then(|value| value_to_i64(&value))
-        .unwrap_or(1)
+        .ok_or_else(|| paro_error::internal("NTILE requires a bucket-count argument"))?;
+    let value = value_from_expr(chunks, &sorted_keys[partition.start], argument);
+    if value.is_null() {
+        return Ok(None);
+    }
+    let count = value_to_i64(&value)
+        .ok_or_else(|| paro_error::invalid_input("argument of ntile must be an integer"))?;
+    if count <= 0 {
+        return Err(paro_error::invalid_input(
+            "argument of ntile must be greater than zero",
+        ));
+    }
+    usize::try_from(count)
+        .map(Some)
+        .map_err(|_| paro_error::invalid_input("argument of ntile is outside the supported range"))
+}
+
+/// Return the one-based SQL NTILE bucket for a zero-based row.
+///
+/// The remainder belongs to the leading buckets. Keeping the calculation in
+/// quotient/remainder form also avoids the `row * bucket_count` overflow of a
+/// proportional formula.
+fn ntile_bucket(row: usize, row_count: usize, bucket_count: usize) -> usize {
+    debug_assert!(row < row_count);
+    debug_assert!(bucket_count > 0);
+
+    let smaller_bucket_size = row_count / bucket_count;
+    let larger_bucket_count = row_count % bucket_count;
+    let larger_bucket_size = smaller_bucket_size + 1;
+    let rows_in_larger_buckets = larger_bucket_count * larger_bucket_size;
+
+    if row < rows_in_larger_buckets {
+        row / larger_bucket_size + 1
+    } else {
+        debug_assert!(smaller_bucket_size > 0);
+        larger_bucket_count + (row - rows_in_larger_buckets) / smaller_bucket_size + 1
+    }
 }
 
 fn value_argument(chunks: &[Chunk], key: &WindowRowKey, expr: &WindowExpression) -> Value {
@@ -634,6 +680,25 @@ fn value_to_i64(value: &Value) -> Option<i64> {
         Value::UInteger(value) => Some(*value as i64),
         Value::UBigInt(value) => i64::try_from(*value).ok(),
         _ => None,
+    }
+}
+
+fn value_is_null_from_expr(chunks: &[Chunk], key: &WindowRowKey, expr: &Expression) -> bool {
+    match expr {
+        Expression::Constant(constant) => constant.value.is_null(),
+        Expression::Reference(reference) => chunks
+            .get(key.chunk_idx)
+            .and_then(|chunk| chunk.column(reference.index))
+            .map(|vector| vector.is_null(key.row_idx))
+            .unwrap_or(true),
+        Expression::ColumnRef(column) => chunks
+            .get(key.chunk_idx)
+            .and_then(|chunk| chunk.column(column.binding.column_index))
+            .map(|vector| vector.is_null(key.row_idx))
+            .unwrap_or(true),
+        _ => unreachable!(
+            "window runtime received an expression that validation should have rejected: {expr:?}"
+        ),
     }
 }
 

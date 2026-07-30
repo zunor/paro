@@ -206,6 +206,7 @@ fn bind_window_frame(
 ) -> Result<WindowFrame> {
     match frame {
         Some(frame) => {
+            validate_window_frame_bounds(&frame)?;
             let frame_type = match frame.units {
                 WindowFrameUnits::Rows => WindowFrameType::Rows,
                 WindowFrameUnits::Range => WindowFrameType::Range,
@@ -228,6 +229,39 @@ fn bind_window_frame(
             Ok(get_default_frame(func))
         }
     }
+}
+
+/// Reject structurally impossible frame extents before binding their offsets.
+///
+/// Offset values within the same direction can still produce an empty frame
+/// (for example, `1 PRECEDING` through `2 PRECEDING`) and are intentionally
+/// left to execution. These checks cover only orderings forbidden by SQL.
+fn validate_window_frame_bounds(frame: &AstWindowFrame) -> Result<()> {
+    use AstWindowFrameBound::{CurrentRow, Following, Preceding};
+
+    if matches!(&frame.start_bound, Following(None)) {
+        return Err(paro_error::windowing_error(
+            "frame start cannot be UNBOUNDED FOLLOWING",
+        ));
+    }
+    if matches!(&frame.end_bound, Preceding(None)) {
+        return Err(paro_error::windowing_error(
+            "frame end cannot be UNBOUNDED PRECEDING",
+        ));
+    }
+    if matches!(&frame.start_bound, CurrentRow) && matches!(&frame.end_bound, Preceding(Some(_))) {
+        return Err(paro_error::windowing_error(
+            "frame starting from current row cannot have preceding rows",
+        ));
+    }
+    if matches!(&frame.start_bound, Following(Some(_)))
+        && matches!(&frame.end_bound, CurrentRow | Preceding(Some(_)))
+    {
+        return Err(paro_error::windowing_error(
+            "frame starting from following row cannot have preceding rows",
+        ));
+    }
+    Ok(())
 }
 
 /// Bind a single frame bound.
@@ -253,4 +287,74 @@ fn bind_frame_bound(
 /// Get default frame for a window function.
 fn get_default_frame(func: &WindowFunction) -> WindowFrame {
     WindowFrame::get_default_frame(func)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_parser::ast::Literal;
+
+    fn offset_bound(following: bool) -> AstWindowFrameBound {
+        let offset = Box::new(Expr::Literal {
+            span: None,
+            value: Literal::UInt64(1),
+        });
+        if following {
+            AstWindowFrameBound::Following(Some(offset))
+        } else {
+            AstWindowFrameBound::Preceding(Some(offset))
+        }
+    }
+
+    fn frame(start_bound: AstWindowFrameBound, end_bound: AstWindowFrameBound) -> AstWindowFrame {
+        AstWindowFrame {
+            units: WindowFrameUnits::Rows,
+            start_bound,
+            end_bound,
+        }
+    }
+
+    #[test]
+    fn rejects_structurally_invalid_window_frames() {
+        let cases = [
+            (
+                frame(
+                    AstWindowFrameBound::Following(None),
+                    AstWindowFrameBound::Following(None),
+                ),
+                "frame start cannot be UNBOUNDED FOLLOWING",
+            ),
+            (
+                frame(
+                    AstWindowFrameBound::Preceding(None),
+                    AstWindowFrameBound::Preceding(None),
+                ),
+                "frame end cannot be UNBOUNDED PRECEDING",
+            ),
+            (
+                frame(AstWindowFrameBound::CurrentRow, offset_bound(false)),
+                "frame starting from current row cannot have preceding rows",
+            ),
+            (
+                frame(offset_bound(true), AstWindowFrameBound::CurrentRow),
+                "frame starting from following row cannot have preceding rows",
+            ),
+            (
+                frame(offset_bound(true), offset_bound(false)),
+                "frame starting from following row cannot have preceding rows",
+            ),
+        ];
+
+        for (frame, expected) in cases {
+            let error = validate_window_frame_bounds(&frame).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn allows_offset_frames_that_can_be_empty_at_execution() {
+        let frame = frame(offset_bound(false), offset_bound(false));
+        validate_window_frame_bounds(&frame)
+            .expect("same-direction offsets are structurally valid");
+    }
 }
