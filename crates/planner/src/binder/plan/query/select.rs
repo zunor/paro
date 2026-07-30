@@ -20,13 +20,59 @@
 use crate::binder::ir::{BoundSelect, BoundValues, DistinctType};
 use crate::binder::ir::{DistinctModifier, OrderByNode};
 use crate::binder::Binder;
-use crate::expression::{ColumnRefExpression, Expression};
+use crate::expression::{ColumnRefExpression, Expression, ExpressionIterator, WindowExpression};
 use crate::operator::{
     Aggregate, ColumnBinding, Distinct, ExpressionGet, Filter, Limit, LogicalOperator, Order,
     Projection,
 };
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+
+fn group_window_expressions(
+    expressions: Vec<(usize, WindowExpression)>,
+) -> Vec<Vec<(usize, WindowExpression)>> {
+    let mut groups: Vec<Vec<(usize, WindowExpression)>> = Vec::new();
+    for (original_index, expression) in expressions {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group[0].1.has_same_layout(&expression))
+        {
+            group.push((original_index, expression));
+        } else {
+            groups.push(vec![(original_index, expression)]);
+        }
+    }
+    groups
+}
+
+fn remap_window_bindings(
+    expression: &mut Expression,
+    placeholder_index: usize,
+    output_bindings: &[ColumnBinding],
+) -> Result<()> {
+    if let Expression::ColumnRef(column) = expression {
+        if column.binding.table_index == placeholder_index {
+            column.binding = output_bindings
+                .get(column.binding.column_index)
+                .copied()
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Window output {} has no layout binding",
+                        column.binding.column_index
+                    ))
+                })?;
+        }
+        return Ok(());
+    }
+
+    let mut result = Ok(());
+    ExpressionIterator::enumerate_children_mut(expression, |child| {
+        if result.is_ok() {
+            result = remap_window_bindings(child, placeholder_index, output_bindings);
+        }
+    });
+    result
+}
 
 impl Binder {
     /// Create a filter operator with a condition.
@@ -146,26 +192,61 @@ impl Binder {
                 self.plan_subqueries(expr, &mut root)?;
             }
 
-            // Extract WindowExpression from Expression::Window variants
-            let window_exprs: Vec<crate::expression::WindowExpression> = node
+            let indexed_windows = node
                 .windows
                 .drain(..)
-                .filter_map(|expr| {
-                    if let Expression::Window(win_expr) = expr {
-                        Some(win_expr)
-                    } else {
-                        None
-                    }
+                .enumerate()
+                .map(|(original_index, expression)| match expression {
+                    Expression::Window(window) => Ok((original_index, window)),
+                    other => Err(paro_error::internal(format!(
+                        "Window extraction produced a non-window expression: {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
+            let output_count = indexed_windows.len();
+            let groups = group_window_expressions(indexed_windows);
+            let mut output_bindings = vec![None; output_count];
+            let mut planned_groups = Vec::with_capacity(groups.len());
 
-            if !window_exprs.is_empty() {
-                // Create the Window operator
-                let window = crate::operator::Window::new(
-                    node.window_index,
-                    window_exprs,
-                    self.wrap_plan(root),
-                );
+            for (group_index, group) in groups.into_iter().enumerate() {
+                let window_index = if group_index == 0 {
+                    node.window_index
+                } else {
+                    self.bind_context.generate_table_index()
+                };
+                let mut expressions = Vec::with_capacity(group.len());
+                for (local_index, (original_index, expression)) in group.into_iter().enumerate() {
+                    output_bindings[original_index] =
+                        Some(ColumnBinding::new(window_index, local_index));
+                    expressions.push(expression);
+                }
+                planned_groups.push((window_index, expressions));
+            }
+
+            let output_bindings = output_bindings
+                .into_iter()
+                .enumerate()
+                .map(|(index, binding)| {
+                    binding.ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Window output {index} was not assigned to a layout"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for expression in &mut node.select_list {
+                remap_window_bindings(expression, node.window_index, &output_bindings)?;
+            }
+            if let Some(qualify) = &mut node.qualify_clause {
+                remap_window_bindings(qualify, node.window_index, &output_bindings)?;
+            }
+
+            // Each physical window runtime owns one partition/order layout. Stack groups so prior
+            // outputs remain attached to their rows while the next group applies its own ordering.
+            for (window_index, expressions) in planned_groups {
+                let window =
+                    crate::operator::Window::new(window_index, expressions, self.wrap_plan(root));
                 root = LogicalOperator::Window(window);
             }
         }
@@ -294,5 +375,48 @@ impl Binder {
     pub(crate) fn plan_values(&mut self, node: BoundValues) -> Result<LogicalOperator> {
         let op = ExpressionGet::new(node.projection_index, node.values, node.names, node.types);
         Ok(LogicalOperator::ExpressionGet(op))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_window_expressions;
+    use crate::expression::{ColumnRefExpression, Expression, WindowExpression, WindowFrame};
+    use crate::operator::ColumnBinding;
+    use paro_common::types::LogicalType;
+    use paro_function::window::WindowFunction;
+
+    fn row_number(partition_column: usize) -> WindowExpression {
+        WindowExpression {
+            function: WindowFunction::row_number(),
+            children: Vec::new(),
+            partitions: vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(10, partition_column),
+                LogicalType::Integer,
+            ))],
+            orders: Vec::new(),
+            frame: WindowFrame::default(),
+            ignore_nulls: false,
+            return_type: LogicalType::BigInt,
+        }
+    }
+
+    #[test]
+    fn window_groups_are_stable_and_combine_equal_layouts() {
+        let groups = group_window_expressions(vec![
+            (0, row_number(0)),
+            (1, row_number(1)),
+            (2, row_number(0)),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0]
+                .iter()
+                .map(|(original_index, _)| *original_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(groups[1][0].0, 1);
     }
 }

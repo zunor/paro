@@ -92,6 +92,25 @@ impl WindowExpression {
     pub fn return_type(&self) -> LogicalType {
         self.return_type.clone()
     }
+
+    /// Whether two window expressions can share one physical partition/order layout.
+    ///
+    /// Function arguments, frames, and NULL treatment may differ without requiring another sort.
+    /// Partition and order expressions, including sort direction and NULL placement, must match.
+    pub fn has_same_layout(&self, other: &Self) -> bool {
+        self.partitions.len() == other.partitions.len()
+            && self
+                .partitions
+                .iter()
+                .zip(&other.partitions)
+                .all(|(left, right)| left.equals(right))
+            && self.orders.len() == other.orders.len()
+            && self.orders.iter().zip(&other.orders).all(|(left, right)| {
+                left.ascending == right.ascending
+                    && left.nulls_first == right.nulls_first
+                    && left.expression.equals(&right.expression)
+            })
+    }
 }
 
 impl WindowFrame {

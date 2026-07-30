@@ -38,3 +38,24 @@ FROM (
     FROM (VALUES (3), (1), (2)) AS unused_window_input(x)
 ) AS unused_window
 ORDER BY x;
+
+-- Different partition/order layouts require separate window runtimes, with each output binding
+-- preserved through the stacked operators.
+SELECT
+    category,
+    x,
+    row_number() OVER (PARTITION BY category ORDER BY x) AS category_rn,
+    row_number() OVER (ORDER BY x DESC) AS global_desc_rn,
+    rank() OVER (PARTITION BY category ORDER BY x) AS category_rank
+FROM (VALUES ('A', 1), ('A', 3), ('B', 2), ('B', 4)) AS mixed_layout_input(category, x)
+ORDER BY x;
+
+-- QUALIFY references must be remapped when their window uses a different runtime layout
+-- from the windows projected by SELECT.
+SELECT
+    category,
+    x,
+    row_number() OVER (PARTITION BY category ORDER BY x) AS category_rn
+FROM (VALUES ('A', 1), ('A', 3), ('B', 2), ('B', 4)) AS mixed_qualify_input(category, x)
+QUALIFY row_number() OVER (ORDER BY x DESC) <= 2
+ORDER BY x;
