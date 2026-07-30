@@ -303,7 +303,7 @@ pub(crate) fn generation_read_snapshot(
     let artifacts = state
         .manifest
         .as_ref()
-        .map(|manifest| Arc::new(manifest.artifacts.clone()))
+        .map(|manifest| manifest.artifacts.clone())
         .unwrap_or_else(|| Arc::new(GenerationArtifactSet::default()));
 
     Some(GenerationReadSnapshot {

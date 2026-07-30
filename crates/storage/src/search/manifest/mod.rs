@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::metrics::storage_metrics;
@@ -188,7 +189,10 @@ pub(crate) struct LoadedManifest {
     pub delta_paths: Vec<PathBuf>,
     pub materialized_state_path: Option<PathBuf>,
     pub embedded_materialized_state: bool,
-    pub artifacts: GenerationArtifactSet,
+    /// Shared by immutable registry snapshots, query leases, and the retirement queue.
+    /// Keeping one ownership token makes artifact reclamation wait for every reader and
+    /// keeps copy-on-write view publication from cloning the complete artifact list.
+    pub artifacts: Arc<GenerationArtifactSet>,
     pub tail_pending_entries: Vec<TailPendingEntry>,
 }
 
@@ -449,7 +453,7 @@ impl ManifestStore {
             delta_paths,
             materialized_state_path,
             embedded_materialized_state,
-            artifacts: materialized.artifacts,
+            artifacts: Arc::new(materialized.artifacts),
             tail_pending_entries: materialized.tail_pending_entries,
         };
         storage_metrics()
@@ -488,7 +492,7 @@ impl ManifestStore {
                 .map(|file| definition_dir.join(&file.file_name)),
             embedded_materialized_state: false,
             root,
-            artifacts,
+            artifacts: Arc::new(artifacts),
             tail_pending_entries,
         }
     }

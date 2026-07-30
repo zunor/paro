@@ -1,10 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -67,6 +67,7 @@ use super::tail::{TailEntryId, TailMutationKind, TailPendingSet};
 use super::write_path::SearchWriteContext;
 
 const REQUIRED_FRESHNESS_WAIT_SWEEPS: usize = 32;
+const DEFINITION_LOCK_SHARDS: usize = 64;
 
 #[derive(Debug)]
 struct RetiredManifest {
@@ -79,8 +80,15 @@ struct RetiredManifest {
 pub(crate) struct SearchIndexRegistry {
     tablet: TabletRef,
     manifests: ManifestStore,
+    /// Readers load immutable snapshots without taking a lock.
     view: ArcSwap<SearchView>,
-    publish_locks: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    /// Serializes only the final copy-on-write publication into `view`.
+    view_write_lock: Mutex<()>,
+    /// Serializes definition membership changes (install/drop/seed replacement).
+    lifecycle_lock: Mutex<()>,
+    /// Bounded per-definition exclusion for manifest/head work. Lifecycle code locks
+    /// shards in ascending order before taking `view_write_lock`.
+    definition_locks: [Mutex<()>; DEFINITION_LOCK_SHARDS],
     retired: Mutex<Vec<RetiredManifest>>,
     maintenance_scheduler: Arc<MaintenanceScheduler>,
     hnsw_task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
@@ -158,7 +166,9 @@ impl SearchIndexRegistry {
             manifests: ManifestStore::new(tablet.data_dir().to_path_buf()),
             tablet,
             view: ArcSwap::from_pointee(SearchView::default()),
-            publish_locks: Mutex::new(HashMap::new()),
+            view_write_lock: Mutex::new(()),
+            lifecycle_lock: Mutex::new(()),
+            definition_locks: std::array::from_fn(|_| Mutex::new(())),
             retired: Mutex::new(Vec::new()),
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
             hnsw_task_scheduler: RwLock::new(None),
@@ -197,27 +207,49 @@ impl SearchIndexRegistry {
     }
 
     pub(crate) fn drop_definition(&self, definition_id: u64) -> Result<()> {
+        let lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| paro_error::internal("lock search definition lifecycle"))?;
+        let initial = self.view.load_full();
+        let Some(initial_state) = initial.definitions.get(&definition_id).cloned() else {
+            return Ok(());
+        };
+        let restored_seed = if initial_state.origin.is_catalog_index()
+            && initial_state.definition.kind == SearchIndexKind::Hnsw
+        {
+            self.restored_schema_seed_state(&initial_state.definition)?
+        } else {
+            None
+        };
+        drop(initial_state);
+        drop(initial);
+        let definition_guards = self.lock_definitions(
+            std::iter::once(definition_id)
+                .chain(restored_seed.as_ref().map(|(seed_id, _)| *seed_id)),
+        )?;
         let current = self.view.load_full();
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(());
         };
+        drop(current);
 
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-        next.definitions.remove(&definition_id);
+        self.tablet.remove_search_generation_head(definition_id)?;
         self.retire_manifest(state.definition.kind, state.manifest.as_ref());
         self.manifests
             .remove_paths(&self.manifests.definition_paths(definition_id));
-        self.tablet.remove_search_generation_head(definition_id)?;
 
-        let restored_seed_definition_id =
-            if state.origin.is_catalog_index() && state.definition.kind == SearchIndexKind::Hnsw {
-                self.restore_schema_seed_if_needed(&mut next, &state.definition)?
-            } else {
-                None
-            };
-
-        self.view.store(Arc::new(next));
+        let restored_seed_definition_id = restored_seed.as_ref().map(|(seed_id, _)| *seed_id);
+        self.mutate_view(|view| {
+            view.definitions.remove(&definition_id);
+            if let Some((seed_id, seed_state)) = restored_seed {
+                view.definitions.entry(seed_id).or_insert(seed_state);
+            }
+            Ok((true, ()))
+        })?;
+        drop(state);
+        drop(definition_guards);
+        drop(lifecycle_guard);
         if let Some(seed_definition_id) = restored_seed_definition_id {
             self.refresh_definition(seed_definition_id)?;
         }
@@ -392,11 +424,12 @@ impl SearchIndexRegistry {
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(0);
         };
+        drop(current);
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(0);
         };
         if state.definition.kind == SearchIndexKind::Hnsw {
-            return self.catch_up_hnsw_definition_locked(current, state);
+            return self.catch_up_hnsw_definition_locked(state);
         }
         if !matches!(
             state.definition.kind,
@@ -459,20 +492,14 @@ impl SearchIndexRegistry {
             }
         };
         persist_head_for_state(&self.tablet, &self.manifests, &next_state)?;
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-        next.definitions.insert(definition_id, next_state.clone());
-        self.view.store(Arc::new(next));
+        self.publish_definition_state(&state, next_state.clone())?;
+        drop(state);
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
         Ok(touched)
     }
 
-    fn catch_up_hnsw_definition_locked(
-        &self,
-        current: Arc<SearchView>,
-        state: SearchDefinitionState,
-    ) -> Result<usize> {
+    fn catch_up_hnsw_definition_locked(&self, state: SearchDefinitionState) -> Result<usize> {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(0);
         };
@@ -537,11 +564,8 @@ impl SearchIndexRegistry {
             }
         };
         persist_head_for_state(&self.tablet, &self.manifests, &next_state)?;
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-        next.definitions
-            .insert(state.definition.definition_id, next_state.clone());
-        self.view.store(Arc::new(next));
+        self.publish_definition_state(&state, next_state.clone())?;
+        drop(state);
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
         Ok(touched)
@@ -571,6 +595,10 @@ impl SearchIndexRegistry {
     }
 
     pub(crate) fn maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
+        // A lease can outlive the publication that retired its artifacts. Revisit the
+        // queue even when this sweep finds no definition work, including after the last
+        // definition was dropped.
+        self.sweep_retired();
         self.ensure_fresh();
         let current = self.view.load_full();
         let definition_ids = current.definitions.keys().copied().collect::<Vec<_>>();
@@ -718,6 +746,7 @@ impl SearchIndexRegistry {
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(0);
         };
+        drop(current);
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(0);
         };
@@ -784,10 +813,8 @@ impl SearchIndexRegistry {
             }
         };
         persist_head_for_state(&self.tablet, &self.manifests, &next_state)?;
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-        next.definitions.insert(definition_id, next_state.clone());
-        self.view.store(Arc::new(next));
+        self.publish_definition_state(&state, next_state.clone())?;
+        drop(state);
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
         Ok(repacked_count)
@@ -818,12 +845,9 @@ impl SearchIndexRegistry {
         let Some(loaded) = self.manifests.load_manifest_for_head(&head)? else {
             return Ok(false);
         };
-        let next_state = state.with_manifest(loaded);
+        let next_state = state.clone().with_manifest(loaded);
         persist_head_for_state(&self.tablet, &self.manifests, &next_state)?;
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-        next.definitions.insert(definition_id, next_state.clone());
-        self.view.store(Arc::new(next));
+        self.publish_definition_state(&state, next_state.clone())?;
         record_tail_metrics_for_state(&next_state);
         Ok(true)
     }
@@ -894,6 +918,7 @@ impl SearchIndexRegistry {
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(None);
         };
+        drop(current);
 
         let visible_version = self.tablet.max_version();
         if !force
@@ -914,10 +939,8 @@ impl SearchIndexRegistry {
             true,
         )?;
         persist_head_for_state(&self.tablet, &self.manifests, &next_state)?;
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-        next.definitions.insert(definition_id, next_state.clone());
-        self.view.store(Arc::new(next));
+        self.publish_definition_state(&state, next_state.clone())?;
+        drop(state);
         self.sweep_retired();
         Ok(next_state.capability)
     }
@@ -985,17 +1008,13 @@ impl SearchIndexRegistry {
         origin: SearchDefinitionOrigin,
     ) -> Result<()> {
         validate_definition(&definition, &self.tablet)?;
-        let definition_lock = self.definition_lock(definition.definition_id);
-        let guard = definition_lock
+        let lifecycle_guard = self
+            .lifecycle_lock
             .lock()
-            .map_err(|_| paro_error::internal("lock search definition update"))?;
-
-        let current = self.view.load_full();
-        let mut next = (*current).clone();
-        next.version = next.version.saturating_add(1);
-
-        if origin.is_catalog_index() {
-            let duplicate_seed_ids = next
+            .map_err(|_| paro_error::internal("lock search definition lifecycle"))?;
+        let duplicate_seed_ids = if origin.is_catalog_index() {
+            self.view
+                .load()
                 .definitions
                 .iter()
                 .filter_map(|(definition_id, state)| {
@@ -1012,15 +1031,13 @@ impl SearchIndexRegistry {
                         None
                     }
                 })
-                .collect::<Vec<_>>();
-            for duplicate_seed_id in duplicate_seed_ids {
-                if let Some(seed_state) = next.definitions.remove(&duplicate_seed_id) {
-                    self.retire_manifest(seed_state.definition.kind, seed_state.manifest.as_ref());
-                    self.manifests
-                        .remove_paths(&self.manifests.definition_paths(duplicate_seed_id));
-                }
-            }
-        }
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let definition_guards = self.lock_definitions(
+            std::iter::once(definition.definition_id).chain(duplicate_seed_ids.iter().copied()),
+        )?;
 
         let mut state = SearchDefinitionState::new(definition.clone(), origin);
         if let Some(loaded) = self.load_manifest_for_definition(definition.definition_id)? {
@@ -1029,9 +1046,24 @@ impl SearchIndexRegistry {
                 record_tail_metrics_for_state(&state);
             }
         }
-        next.definitions.insert(definition.definition_id, state);
-        self.view.store(Arc::new(next));
-        drop(guard);
+        let removed_seed_states = self.mutate_view(|view| {
+            let mut removed = Vec::new();
+            for duplicate_seed_id in &duplicate_seed_ids {
+                if let Some(seed_state) = view.definitions.remove(duplicate_seed_id) {
+                    removed.push((*duplicate_seed_id, seed_state));
+                }
+            }
+            view.definitions.insert(definition.definition_id, state);
+            Ok((true, removed))
+        })?;
+        for (duplicate_seed_id, seed_state) in removed_seed_states {
+            self.retire_manifest(seed_state.definition.kind, seed_state.manifest.as_ref());
+            self.manifests
+                .remove_paths(&self.manifests.definition_paths(duplicate_seed_id));
+        }
+        drop(definition_guards);
+        drop(lifecycle_guard);
+        self.sweep_retired();
         let _ = self.refresh_definition(definition.definition_id);
         Ok(())
     }
@@ -1220,9 +1252,9 @@ impl SearchIndexRegistry {
             delta_paths: Vec::new(),
             materialized_state_path: None,
             embedded_materialized_state: false,
-            artifacts: GenerationArtifactSet {
+            artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: assign_generation_id(snapshot.artifacts, generation_id),
-            },
+            }),
             tail_pending_entries: snapshot.tail_pending.entries,
         };
 
@@ -1347,7 +1379,7 @@ impl SearchIndexRegistry {
             self.manifests.remove_paths(&[delta_path]);
             return Err(err);
         }
-        let mut artifacts = current_manifest.artifacts.clone();
+        let mut artifacts = (*current_manifest.artifacts).clone();
         artifacts.artifacts.extend(added_artifacts);
         let loaded = self.manifests.materialize_loaded_manifest(
             definition_id,
@@ -1690,7 +1722,7 @@ impl SearchIndexRegistry {
             return Err(err);
         }
 
-        let mut artifacts = current_manifest.artifacts.clone();
+        let mut artifacts = (*current_manifest.artifacts).clone();
         artifacts.artifacts.extend(added_artifacts);
         let loaded = self.manifests.materialize_loaded_manifest(
             definition_id,
@@ -1980,7 +2012,7 @@ impl SearchIndexRegistry {
             return Err(err);
         }
 
-        let mut artifacts = current_manifest.artifacts.clone();
+        let mut artifacts = (*current_manifest.artifacts).clone();
         artifacts.artifacts.extend(added_artifacts);
         let loaded = self.manifests.materialize_loaded_manifest(
             definition_id,
@@ -2009,12 +2041,81 @@ impl SearchIndexRegistry {
         Ok(Some(next_state))
     }
 
-    fn definition_lock(&self, definition_id: u64) -> Arc<Mutex<()>> {
-        let mut guard = self.publish_locks.lock().expect("search publish locks");
-        guard
-            .entry(definition_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn mutate_view<R>(
+        &self,
+        mutation: impl FnOnce(&mut SearchView) -> Result<(bool, R)>,
+    ) -> Result<R> {
+        // Expensive artifact and manifest work must happen before this boundary. Cloning
+        // from the latest snapshot while holding one short writer lock preserves updates
+        // published concurrently for other definitions without blocking readers.
+        let _guard = self
+            .view_write_lock
+            .lock()
+            .map_err(|_| paro_error::internal("lock search view writer"))?;
+        let current = self.view.load_full();
+        let mut next = (*current).clone();
+        let (changed, result) = mutation(&mut next)?;
+        if changed {
+            next.version = current.version.saturating_add(1);
+            self.view.store(Arc::new(next));
+        }
+        Ok(result)
+    }
+
+    fn publish_definition_state(
+        &self,
+        expected: &SearchDefinitionState,
+        next_state: SearchDefinitionState,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            expected.definition.definition_id,
+            next_state.definition.definition_id
+        );
+        let definition_id = expected.definition.definition_id;
+        let published = self.mutate_view(|view| {
+            let still_current = view.definitions.get(&definition_id).is_some_and(|state| {
+                state.definition == expected.definition && state.origin == expected.origin
+            });
+            if !still_current {
+                return Ok((false, false));
+            }
+            view.definitions.insert(definition_id, next_state);
+            Ok((true, true))
+        })?;
+        if published {
+            Ok(())
+        } else {
+            Err(paro_error::internal(format!(
+                "search definition {definition_id} changed while its publish lock was held"
+            )))
+        }
+    }
+
+    fn definition_lock(&self, definition_id: u64) -> &Mutex<()> {
+        let shard = (definition_id % DEFINITION_LOCK_SHARDS as u64) as usize;
+        &self.definition_locks[shard]
+    }
+
+    fn lock_definitions(
+        &self,
+        definition_ids: impl IntoIterator<Item = u64>,
+    ) -> Result<Vec<MutexGuard<'_, ()>>> {
+        let mut shards = definition_ids
+            .into_iter()
+            .map(|definition_id| (definition_id % DEFINITION_LOCK_SHARDS as u64) as usize)
+            .collect::<Vec<_>>();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+            .into_iter()
+            .map(|shard| {
+                self.definition_locks[shard].lock().map_err(|_| {
+                    paro_error::internal(format!(
+                        "lock search definition shard {shard} for lifecycle update"
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn retire_manifest(&self, provider: SearchIndexKind, manifest: Option<&LoadedManifest>) {
@@ -2057,7 +2158,7 @@ impl SearchIndexRegistry {
         storage_metrics().record_search_generation_retired(provider, bytes);
         let retired = RetiredManifest {
             provider,
-            artifacts: Arc::new(manifest.artifacts.clone()),
+            artifacts: manifest.artifacts.clone(),
             paths,
             retired_at: Instant::now(),
         };
@@ -2094,11 +2195,10 @@ impl SearchIndexRegistry {
         }
     }
 
-    fn restore_schema_seed_if_needed(
+    fn restored_schema_seed_state(
         &self,
-        view: &mut SearchView,
         definition: &SearchIndexDefinition,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(u64, SearchDefinitionState)>> {
         if definition.kind != SearchIndexKind::Hnsw || definition.column_ids.len() != 1 {
             return Ok(None);
         }
@@ -2111,12 +2211,10 @@ impl SearchIndexRegistry {
             return Ok(None);
         };
         let seed_definition_id = seed.definition_id;
-        view.definitions
-            .entry(seed.definition_id)
-            .or_insert_with(|| {
-                SearchDefinitionState::new(seed, SearchDefinitionOrigin::schema_seed(column_id))
-            });
-        Ok(Some(seed_definition_id))
+        Ok(Some((
+            seed_definition_id,
+            SearchDefinitionState::new(seed, SearchDefinitionOrigin::schema_seed(column_id)),
+        )))
     }
 
     fn seed_schema_hnsw_definitions(&self) {
@@ -2543,6 +2641,149 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_view_publications_preserve_distinct_definitions() {
+        const DEFINITION_COUNT: u64 = 16;
+
+        let root = TempDir::new().unwrap();
+        let table = create_table_without_default_indexes(root.path(), &[LogicalType::Varchar]);
+        let registry = Arc::clone(&table.search_registry);
+        registry
+            .mutate_view(|view| {
+                for definition_id in 1..=DEFINITION_COUNT {
+                    view.definitions.insert(
+                        definition_id,
+                        SearchDefinitionState::new(
+                            fulltext_test_definition(definition_id),
+                            SearchDefinitionOrigin::catalog(definition_id),
+                        ),
+                    );
+                }
+                Ok((true, ()))
+            })
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(DEFINITION_COUNT as usize));
+
+        std::thread::scope(|scope| {
+            for definition_id in 1..=DEFINITION_COUNT {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let expected = registry
+                        .view
+                        .load()
+                        .definitions
+                        .get(&definition_id)
+                        .cloned()
+                        .unwrap();
+                    let mut next = expected.clone();
+                    next.next_build_epoch = next.next_build_epoch.saturating_add(1);
+                    barrier.wait();
+                    registry.publish_definition_state(&expected, next).unwrap();
+                });
+            }
+        });
+
+        let view = registry.view.load();
+        assert_eq!(view.definitions.len(), DEFINITION_COUNT as usize);
+        assert_eq!(view.version, DEFINITION_COUNT + 1);
+        for definition_id in 1..=DEFINITION_COUNT {
+            assert_eq!(
+                view.definitions
+                    .get(&definition_id)
+                    .map(|state| state.next_build_epoch),
+                Some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn stale_definition_publication_cannot_resurrect_removed_definition() {
+        let root = TempDir::new().unwrap();
+        let table = create_table_without_default_indexes(root.path(), &[LogicalType::Varchar]);
+        let registry = table.search_registry();
+        let definition = fulltext_test_definition(101);
+        let state = SearchDefinitionState::new(definition, SearchDefinitionOrigin::catalog(101));
+        registry
+            .mutate_view(|view| {
+                view.definitions.insert(101, state);
+                Ok((true, ()))
+            })
+            .unwrap();
+
+        let stale = registry.view.load().definitions.get(&101).cloned().unwrap();
+        registry
+            .mutate_view(|view| {
+                view.definitions.remove(&101);
+                Ok((true, ()))
+            })
+            .unwrap();
+
+        let mut stale_refresh = stale.clone();
+        stale_refresh.next_build_epoch = stale_refresh.next_build_epoch.saturating_add(1);
+        assert!(registry
+            .publish_definition_state(&stale, stale_refresh)
+            .is_err());
+        assert!(!registry.view.load().definitions.contains_key(&101));
+    }
+
+    #[test]
+    fn active_generation_lease_delays_retired_artifact_reclamation() {
+        let root = TempDir::new().unwrap();
+        let table = create_table_without_default_indexes(root.path(), &[LogicalType::Varchar]);
+        let registry = table.search_registry();
+        let definition = fulltext_test_definition(102);
+        let definition_id = definition.definition_id;
+        let retired_path = root.path().join("leased-search-artifact");
+        std::fs::write(&retired_path, b"leased").unwrap();
+        let manifest = LoadedManifest {
+            root: GenerationManifestRoot {
+                definition_id,
+                generation_id: 1,
+                build_epoch: 1,
+                build_snapshot_version: 1,
+                indexed_through_ts: 1,
+                config_fingerprint: definition.config_fingerprint,
+                coverage: CoverageState::Complete,
+                generation_stats: GenerationStats::default(),
+                next_tail_entry_id: TailEntryId(1),
+                execution_modes: ExecutionModes::default(),
+                maintenance_state: GenerationMaintenanceState::default(),
+                root_version: 1,
+                checksum: 0,
+                shard_files: Vec::new(),
+                recent_delta_files: Vec::new(),
+                materialized_state_file: None,
+            },
+            root_path: root.path().join("manifest-root"),
+            shard_paths: Vec::new(),
+            delta_paths: Vec::new(),
+            materialized_state_path: None,
+            embedded_materialized_state: false,
+            artifacts: Arc::new(GenerationArtifactSet::default()),
+            tail_pending_entries: Vec::new(),
+        };
+        let state = SearchDefinitionState::new(
+            definition.clone(),
+            SearchDefinitionOrigin::catalog(definition_id),
+        )
+        .with_manifest(manifest);
+        let snapshot = generation_read_snapshot(definition_id, &state).unwrap();
+        let lease = super::super::cursor::GenerationReadLease::from_snapshot(&snapshot);
+        let manifest = state.manifest.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&snapshot.artifacts, &manifest.artifacts));
+
+        registry.retire_manifest_paths(definition.kind, manifest, vec![retired_path.clone()]);
+        drop(snapshot);
+        drop(state);
+        registry.sweep_retired();
+        assert!(retired_path.exists());
+
+        drop(lease);
+        registry.sweep_retired();
+        assert!(!retired_path.exists());
+    }
+
+    #[test]
     fn artifact_replacement_stats_rebuilds_irreversible_fulltext_summary() {
         let definition = fulltext_test_definition(91);
         let removed = fulltext_test_artifact(91, 1, 4, 8, 4, 8, 10);
@@ -2674,7 +2915,7 @@ mod tests {
             delta_paths: Vec::new(),
             materialized_state_path: None,
             embedded_materialized_state: false,
-            artifacts: GenerationArtifactSet::default(),
+            artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries: vec![existing_tail.clone()],
         };
         let mut snapshot_entries = vec![
@@ -3286,18 +3527,20 @@ mod tests {
             .capability_token();
         assert!(token.is_queryable());
 
-        let current = table.search_registry().view.load_full();
-        let mut next = (*current).clone();
-        let state = next
-            .definitions
-            .get_mut(&49)
-            .expect("definition state to tighten freshness");
-        state.definition.freshness_policy = SearchFreshnessPolicy::Required;
-        if let Some(capability) = state.capability.as_mut() {
-            capability.freshness_policy = SearchFreshnessPolicy::Required;
-        }
-        next.version = next.version.saturating_add(1);
-        table.search_registry().view.store(Arc::new(next));
+        table
+            .search_registry()
+            .mutate_view(|view| {
+                let state = view
+                    .definitions
+                    .get_mut(&49)
+                    .expect("definition state to tighten freshness");
+                state.definition.freshness_policy = SearchFreshnessPolicy::Required;
+                if let Some(capability) = state.capability.as_mut() {
+                    capability.freshness_policy = SearchFreshnessPolicy::Required;
+                }
+                Ok((true, ()))
+            })
+            .unwrap();
 
         assert!(matches!(
             table
@@ -4154,6 +4397,7 @@ mod tests {
         assert!(super::super::maintenance::sidecar_repack_needed(
             before_manifest
         ));
+        drop(before);
 
         let report = table.search_registry().maintenance_sweep().unwrap();
         let definition_report = report
@@ -4303,17 +4547,19 @@ mod tests {
                 .load_manifest(47)
                 .expect("load synthetic over-soft manifest")
                 .expect("manifest exists");
-            let current = table.search_registry().view.load_full();
-            let state = current
-                .definitions
-                .get(&47)
-                .expect("definition state")
-                .clone()
-                .with_manifest(loaded);
-            let mut next = (*current).clone();
-            next.version = next.version.saturating_add(1);
-            next.definitions.insert(47, state);
-            table.search_registry().view.store(Arc::new(next));
+            table
+                .search_registry()
+                .mutate_view(|view| {
+                    let state = view
+                        .definitions
+                        .get(&47)
+                        .expect("definition state")
+                        .clone()
+                        .with_manifest(loaded);
+                    view.definitions.insert(47, state);
+                    Ok((true, ()))
+                })
+                .unwrap();
         }
 
         let report = table.search_registry().maintenance_sweep().unwrap();
