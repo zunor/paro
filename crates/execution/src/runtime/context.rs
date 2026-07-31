@@ -253,7 +253,7 @@ impl FunctionExecContext for QueryRuntimeContext {
     }
 
     fn transaction_timestamp_micros(&self) -> Option<i64> {
-        Some(self.session.time.transaction_timestamp_micros())
+        self.session.time.transaction_timestamp_micros()
     }
 
     fn is_interrupted(&self) -> bool {

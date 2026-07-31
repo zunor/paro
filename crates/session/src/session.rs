@@ -1713,7 +1713,7 @@ mod tests {
         );
         assert_eq!(
             statement.time.transaction_started_at(),
-            transaction_started_at
+            Some(transaction_started_at)
         );
 
         let later_statement = session.freeze_statement_context(
@@ -1722,10 +1722,21 @@ mod tests {
         );
         assert_eq!(
             later_statement.time.transaction_started_at(),
-            transaction_started_at
+            Some(transaction_started_at)
         );
 
         session.rollback_transaction().unwrap();
+    }
+
+    #[test]
+    fn compile_context_does_not_invent_a_transaction_time() {
+        let instance = Instance::new_in_memory();
+        let session = Session::new(1, instance);
+
+        let context = session.freeze_query_context();
+
+        assert_eq!(context.time.transaction_started_at(), None);
+        assert_eq!(context.time.transaction_timestamp_micros(), None);
     }
 
     #[test]
