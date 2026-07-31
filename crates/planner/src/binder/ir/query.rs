@@ -15,6 +15,7 @@ use super::from::BoundFromItem;
 #[derive(Debug, Clone)]
 pub enum BoundQuery {
     With(Box<WithCTE>),
+    Modifiers(Box<BoundQueryModifiers>),
     Select(Box<BoundSelect>),
     Values(BoundValues),
     SetOperation(Box<BoundSetOperation>),
@@ -24,6 +25,7 @@ impl BoundQuery {
     pub fn names(&self) -> Vec<String> {
         match self {
             BoundQuery::With(n) => n.child.names(),
+            BoundQuery::Modifiers(n) => n.child.names(),
             BoundQuery::Select(n) => n.names.clone(),
             BoundQuery::Values(n) => n.names.clone(),
             BoundQuery::SetOperation(n) => n.names.clone(),
@@ -33,10 +35,49 @@ impl BoundQuery {
     pub fn types(&self) -> Vec<LogicalType> {
         match self {
             BoundQuery::With(n) => n.child.types(),
+            BoundQuery::Modifiers(n) => n.child.types(),
             BoundQuery::Select(n) => n.types.clone(),
             BoundQuery::Values(n) => n.types.clone(),
             BoundQuery::SetOperation(n) => n.types.clone(),
         }
+    }
+
+    /// Return the table index that owns this query's visible output bindings.
+    ///
+    /// Query modifiers preserve their child's bindings unless they finish with
+    /// a projection that removes hidden ORDER BY expressions.
+    pub fn output_table_index(&self) -> usize {
+        match self {
+            BoundQuery::With(n) => n.child.output_table_index(),
+            BoundQuery::Modifiers(n) => n
+                .prune_index
+                .unwrap_or_else(|| n.child.output_table_index()),
+            BoundQuery::Select(n) => n.projection_index,
+            BoundQuery::Values(n) => n.projection_index,
+            BoundQuery::SetOperation(n) => n.table_index,
+        }
+    }
+
+    pub fn with_modifiers(
+        self,
+        mut order_by: Option<Vec<OrderByNode>>,
+        limit: Option<LimitModifier>,
+        hnsw_ef_hint: Option<usize>,
+        prune_index: Option<usize>,
+    ) -> Self {
+        if order_by.as_ref().is_some_and(Vec::is_empty) {
+            order_by = None;
+        }
+        if order_by.is_none() && limit.is_none() && prune_index.is_none() {
+            return self;
+        }
+        BoundQuery::Modifiers(Box::new(BoundQueryModifiers {
+            child: Box::new(self),
+            order_by,
+            limit,
+            hnsw_ef_hint,
+            prune_index,
+        }))
     }
 
     pub fn cast_to_types(
@@ -60,6 +101,16 @@ impl BoundQuery {
         match self {
             BoundQuery::With(n) => {
                 n.child.cast_to_types(target_types, cast_functions)?;
+            }
+            BoundQuery::Modifiers(n) => {
+                n.child.cast_to_types(target_types, cast_functions)?;
+                for order in n.order_by.iter_mut().flatten() {
+                    if let Expression::ColumnRef(column) = &mut order.expression {
+                        if let Some(target_type) = target_types.get(column.binding.column_index) {
+                            column.return_type = target_type.clone();
+                        }
+                    }
+                }
             }
             BoundQuery::Select(n) => {
                 for (i, target_type) in target_types.iter().enumerate() {
@@ -85,6 +136,17 @@ impl BoundQuery {
         }
         Ok(())
     }
+}
+
+/// Query-level ORDER BY/LIMIT/OFFSET and the optional projection used to
+/// remove SELECT-only hidden sort expressions.
+#[derive(Debug, Clone)]
+pub struct BoundQueryModifiers {
+    pub child: Box<BoundQuery>,
+    pub order_by: Option<Vec<OrderByNode>>,
+    pub limit: Option<LimitModifier>,
+    pub hnsw_ef_hint: Option<usize>,
+    pub prune_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -140,9 +202,6 @@ pub struct BoundSelect {
     pub projection_index: usize,
     pub where_clause: Option<Expression>,
     pub distinct: Option<DistinctModifier>,
-    pub limit: Option<LimitModifier>,
-    pub order_by: Option<Vec<OrderByNode>>,
-    pub hnsw_ef_hint: Option<usize>,
     pub groups: Groups,
     pub aggregates: Vec<Expression>,
     pub having_clause: Option<Expression>,
@@ -151,9 +210,6 @@ pub struct BoundSelect {
     pub grouping_functions: Vec<Vec<usize>>,
     pub groupings_index: usize,
     pub window_index: usize,
-    pub prune_index: usize,
-    pub column_count: usize,
-    pub need_prune: bool,
     pub qualify_clause: Option<Expression>,
     pub windows: Vec<Expression>,
 }

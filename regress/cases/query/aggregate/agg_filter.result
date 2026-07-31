@@ -61,16 +61,14 @@ FROM (
 GROUP BY grp
 ORDER BY grp;
 QUERY PLAN
-PROJECTION  (rows=3)
-  Output: grp, sum_true, cnt_y_ge2
-  ->  ORDER_BY  (rows=3)
-    Sort Key: #3 ASC NULLS LAST
-    ->  PROJECTION  (rows=3)
-      Output: grp, sum_true, cnt_y_ge2, __paro_hidden_1
-      ->  AGGREGATE  (rows=3)
-        Group Key: #0
-        Aggregates: sum(#1) FILTER (WHERE #3), count(#1) FILTER (WHERE #2 >= 2)
-        Output: aggr_0, aggr_1, aggr_2
-        ->  PROJECTION  (rows=6)
-          Output: grp, x, y, flag
-          ->  VALUES  (rows=6)
+ORDER_BY  (rows=3)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=3)
+    Output: grp, sum_true, cnt_y_ge2
+    ->  AGGREGATE  (rows=3)
+      Group Key: #0
+      Aggregates: sum(#1) FILTER (WHERE #3), count(#1) FILTER (WHERE #2 >= 2)
+      Output: aggr_0, aggr_1, aggr_2
+      ->  PROJECTION  (rows=6)
+        Output: grp, x, y, flag
+        ->  VALUES  (rows=6)

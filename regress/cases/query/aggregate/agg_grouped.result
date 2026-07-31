@@ -72,16 +72,14 @@ FROM (
 GROUP BY grp
 ORDER BY grp;
 QUERY PLAN
-PROJECTION  (rows=3)
-  Output: grp, sum_x
-  ->  ORDER_BY  (rows=3)
-    Sort Key: #2 ASC NULLS LAST
-    ->  PROJECTION  (rows=3)
-      Output: grp, sum_x, __paro_hidden_1
-      ->  AGGREGATE  (rows=3)
-        Group Key: #0
-        Aggregates: sum(#1)
-        Output: aggr_0, aggr_1
-        ->  PROJECTION  (rows=5)
-          Output: grp, x
-          ->  VALUES  (rows=5)
+ORDER_BY  (rows=3)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=3)
+    Output: grp, sum_x
+    ->  AGGREGATE  (rows=3)
+      Group Key: #0
+      Aggregates: sum(#1)
+      Output: aggr_0, aggr_1
+      ->  PROJECTION  (rows=5)
+        Output: grp, x
+        ->  VALUES  (rows=5)

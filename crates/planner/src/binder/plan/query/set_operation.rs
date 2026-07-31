@@ -44,6 +44,7 @@ impl Binder {
                 }
                 Ok(root)
             }
+            BoundQuery::Modifiers(n) => self.plan_query_modifiers(*n),
             BoundQuery::Select(n) => self.plan_select(*n),
             BoundQuery::Values(n) => self.plan_values(n),
             BoundQuery::SetOperation(n) => self.plan_set_operation(*n),

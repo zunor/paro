@@ -24,7 +24,8 @@ use crate::binder::bind::{
     expr::{self, ExpressionBinder},
 };
 use crate::binder::ir::{
-    BoundFromItem, BoundSelect, DistinctModifier, GroupingSet, LimitModifier, OrderByNode,
+    BoundFromItem, BoundQuery, BoundSelect, DistinctModifier, GroupingSet, LimitModifier,
+    OrderByNode,
 };
 use crate::binder::{Binder, GroupingBindingContext};
 use crate::expression::*;
@@ -50,13 +51,13 @@ impl Binder {
     /// 8. HAVING clause (with HavingBinder)
     /// 9. QUALIFY clause (with QualifyBinder)
     /// 10. BindModifiers - finalize ORDER BY types
-    pub fn bind_select_stmt(
+    pub fn bind_select_query(
         &mut self,
         select: SelectStmt,
         order_by: &[OrderByExpr],
         limit: &[paro_parser::ast::Expr],
         offset: &Option<paro_parser::ast::Expr>,
-    ) -> Result<BoundSelect> {
+    ) -> Result<BoundQuery> {
         let mut aggregates = Vec::new();
         let hnsw_ef_hint = Self::extract_hnsw_ef_hint(select.hints.as_ref())?;
         let projection_index = self.bind_context.generate_table_index();
@@ -95,9 +96,12 @@ impl Binder {
                 }
                 // Record original expression (for alias resolution later)
                 bind_state.original_expressions.push(*expr.clone());
-                // Record in projection_map for expression matching
-                let expr_str = format!("{:?}", expr);
-                bind_state.add_projection(expr_str, i);
+                // Record both source and qualified forms. ORDER BY may spell
+                // the same selected expression with or without a table name.
+                bind_state.add_projection(expr.to_string(), i);
+                let mut qualified_expr = *expr.clone();
+                ExpressionBinder::qualify_column_names(self, &mut qualified_expr);
+                bind_state.add_projection(qualified_expr.to_string(), i);
             }
         }
 
@@ -121,6 +125,7 @@ impl Binder {
             &mut expanded_select_list,
             early_alias_lookup,
             &mut bind_state,
+            !select.distinct,
         )?;
 
         // =================================================================
@@ -174,7 +179,7 @@ impl Binder {
         // 11. BindModifiers - Finalize ORDER BY with types
         // =================================================================
         let bound_order_by = self.finalize_order_by(order_by_bindings, projection_index, &types)?;
-        let bound_distinct = self.bind_distinct(select.distinct, &bound_order_by)?;
+        let bound_distinct = Self::bind_distinct(select.distinct);
 
         // Make bound_order_by mutable for aggregate extraction
         let mut bound_order_by = bound_order_by;
@@ -288,9 +293,6 @@ impl Binder {
             projection_index,
             where_clause,
             distinct: bound_distinct,
-            limit: bound_limit,
-            order_by: bound_order_by,
-            hnsw_ef_hint,
             groups,
             aggregates,
             having_clause: bound_having,
@@ -299,14 +301,16 @@ impl Binder {
             grouping_functions,
             groupings_index,
             window_index,
-            prune_index,
-            column_count,
-            need_prune,
             qualify_clause: bound_qualify,
             windows: Vec::new(), // Window functions are extracted once their child plan is known.
         };
 
-        Ok(bound_node)
+        Ok(BoundQuery::Select(Box::new(bound_node)).with_modifiers(
+            bound_order_by,
+            bound_limit,
+            hnsw_ef_hint,
+            need_prune.then_some(prune_index),
+        ))
     }
 
     fn extract_hnsw_ef_hint(hints: Option<&Hint>) -> Result<Option<usize>> {
@@ -669,16 +673,8 @@ impl Binder {
     }
 
     /// Bind DISTINCT clause.
-    pub fn bind_distinct(
-        &mut self,
-        distinct: bool,
-        _order_by: &Option<Vec<OrderByNode>>,
-    ) -> Result<Option<DistinctModifier>> {
-        if distinct {
-            Ok(Some(DistinctModifier::distinct()))
-        } else {
-            Ok(None)
-        }
+    fn bind_distinct(distinct: bool) -> Option<DistinctModifier> {
+        distinct.then(DistinctModifier::distinct)
     }
 
     /// Bind GROUP BY clause (legacy - delegates to bind_group_by_with_binder).
@@ -895,20 +891,27 @@ impl Binder {
         select_list: &mut Vec<SelectTarget>,
         alias_lookup: AliasLookup,
         bind_state: &mut SelectBindState,
+        allow_extra_expressions: bool,
     ) -> Result<Option<Vec<(OrderByBinding, Option<bool>, Option<bool>)>>> {
         if order_by.is_empty() {
             return Ok(None);
         }
 
-        let mut order_binder =
-            OrderBinder::with_extra_list(self, bind_state, alias_lookup, select_list);
-
         let mut order_bindings = Vec::new();
-
-        for order in order_by {
-            // OrderBinder::bind returns OrderByBinding (index into SELECT list)
-            let order_binding = order_binder.bind(order.expr.clone())?;
-            order_bindings.push((order_binding, order.asc, order.nulls_first));
+        if allow_extra_expressions {
+            let mut order_binder =
+                OrderBinder::with_extra_list(self, bind_state, alias_lookup, select_list);
+            for order in order_by {
+                let order_binding = order_binder.bind(order.expr.clone())?;
+                order_bindings.push((order_binding, order.asc, order.nulls_first));
+            }
+        } else {
+            let mut order_binder = OrderBinder::new(self, bind_state, alias_lookup);
+            order_binder.set_query_component("SELECT DISTINCT ORDER BY".to_string());
+            for order in order_by {
+                let order_binding = order_binder.bind(order.expr.clone())?;
+                order_bindings.push((order_binding, order.asc, order.nulls_first));
+            }
         }
 
         Ok(Some(order_bindings))
@@ -930,12 +933,12 @@ impl Binder {
 
         for (order_binding, asc, nulls_first) in bindings {
             // Get the type for this index from the bound SELECT list
-            let return_type = if order_binding.index < select_list_types.len() {
-                select_list_types[order_binding.index].clone()
-            } else {
-                // This shouldn't happen if prepare_order_by worked correctly
-                LogicalType::Unknown
-            };
+            let return_type = select_list_types
+                .get(order_binding.index)
+                .cloned()
+                .ok_or_else(|| {
+                    paro_error::syntax("ORDER BY position is not in the query result")
+                })?;
 
             let bound_expr =
                 order_binding.to_bound_expression_with_type(projection_index, return_type);

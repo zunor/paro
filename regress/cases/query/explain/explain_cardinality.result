@@ -29,14 +29,14 @@ PROJECTION  (rows=2)
   Cardinality: [0, 2, 2]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=2)
-    Sort Key: #1 DESC NULLS FIRST, #2 ASC NULLS LAST
+    Sort Key: #1 DESC NULLS FIRST, #0 ASC NULLS LAST
     Limit: 2
     Cardinality: [0, 2, 2]
-    Output Schema: id INTEGER, __paro_hidden_1 INTEGER, __paro_hidden_2 INTEGER
+    Output Schema: id INTEGER, __paro_hidden_1 INTEGER
     ->  PROJECTION  (rows=2)
-      Output: id, __paro_hidden_1, __paro_hidden_2
+      Output: id, __paro_hidden_1
       Cardinality: [0, 2, 3]
-      Output Schema: id INTEGER, __paro_hidden_1 INTEGER, __paro_hidden_2 INTEGER
+      Output Schema: id INTEGER, __paro_hidden_1 INTEGER
       ->  ROWSET_SCAN on public.explain_cardinality_case  (rows=2)
         Columns: id, score
         Pushed Predicate: col#1 >= 20
@@ -53,7 +53,7 @@ ORDER BY score DESC, id
 LIMIT 2
 FORMAT JSON;
 QUERY PLAN
-{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"children":[{"estimated_cardinality":{"expected":2,"max":3,"min":0},"estimated_rows":2,"node_id":1,"operator":"ROWSET_SCAN","output_names":["id","score"],"properties":{"Columns":["id","score"],"Late Materialize":"auto","Pushed Predicate":"col#1 >= 20"},"relation":"public.explain_cardinality_case"}],"estimated_cardinality":{"expected":2,"max":3,"min":0},"estimated_rows":2,"node_id":2,"operator":"PROJECTION","output_names":["id","__paro_hidden_1","__paro_hidden_2"],"properties":{"Output":["id","__paro_hidden_1","__paro_hidden_2"]}}],"estimated_cardinality":{"expected":2,"max":2,"min":0},"estimated_rows":2,"node_id":3,"operator":"TOP_N","output_names":["id","__paro_hidden_1","__paro_hidden_2"],"properties":{"Limit":"2","Sort Key":"#1 DESC NULLS FIRST, #2 ASC NULLS LAST"}}],"estimated_cardinality":{"expected":2,"max":2,"min":0},"estimated_rows":2,"node_id":4,"operator":"PROJECTION","output_names":["id"],"properties":{"Output":["id"]}}}
+{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"children":[{"estimated_cardinality":{"expected":2,"max":3,"min":0},"estimated_rows":2,"node_id":1,"operator":"ROWSET_SCAN","output_names":["id","score"],"properties":{"Columns":["id","score"],"Late Materialize":"auto","Pushed Predicate":"col#1 >= 20"},"relation":"public.explain_cardinality_case"}],"estimated_cardinality":{"expected":2,"max":3,"min":0},"estimated_rows":2,"node_id":2,"operator":"PROJECTION","output_names":["id","__paro_hidden_1"],"properties":{"Output":["id","__paro_hidden_1"]}}],"estimated_cardinality":{"expected":2,"max":2,"min":0},"estimated_rows":2,"node_id":3,"operator":"TOP_N","output_names":["id","__paro_hidden_1"],"properties":{"Limit":"2","Sort Key":"#1 DESC NULLS FIRST, #0 ASC NULLS LAST"}}],"estimated_cardinality":{"expected":2,"max":2,"min":0},"estimated_rows":2,"node_id":4,"operator":"PROJECTION","output_names":["id"],"properties":{"Output":["id"]}}}
 
 SELECT id
 FROM explain_cardinality_case

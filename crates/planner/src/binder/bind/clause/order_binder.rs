@@ -131,12 +131,20 @@ impl<'a> OrderBinder<'a> {
             _ => {}
         }
 
-        // General case: first qualify column names
+        // Match the unqualified syntax first. A SELECT item such as `n` and
+        // its ORDER BY counterpart are the same output expression even when
+        // qualification later rewrites only the latter to `t.n`.
+        let expr_str = expr.to_string();
+        if let Some(index) = self.bind_state.get_projection_index(&expr_str) {
+            return Ok(self.create_projection_reference(&expr, index));
+        }
+
+        // General case: qualify column names and try the canonical form.
         let mut qualified_expr = expr.clone();
         ExpressionBinder::qualify_column_names(self.binder, &mut qualified_expr);
 
         // Check if the expression already exists in the projection
-        let expr_str = format!("{:?}", qualified_expr);
+        let expr_str = qualified_expr.to_string();
         if let Some(index) = self.bind_state.get_projection_index(&expr_str) {
             return Ok(self.create_projection_reference(&expr, index));
         }
@@ -144,10 +152,9 @@ impl<'a> OrderBinder<'a> {
         // Need to add the expression to the SELECT list
         if self.extra_list.is_none() {
             return Err(paro_error::syntax(format!(
-                "Could not {} by column \"{}\": add the expression/function to every SELECT, \
-                 or move the UNION into a FROM clause.",
-                self.query_component,
-                expr.to_string_simple()
+                "Could not resolve expression \"{}\" in {}: only query result columns can be used",
+                expr.to_string_simple(),
+                self.query_component
             )));
         }
 
@@ -232,7 +239,7 @@ impl<'a> OrderBinder<'a> {
         let extra_list = self.extra_list.as_mut().unwrap();
 
         // Record in projection map
-        let expr_str = format!("{:?}", expr);
+        let expr_str = expr.to_string();
         let index = extra_list.len();
         self.bind_state.add_projection(expr_str, index);
 
@@ -347,7 +354,7 @@ impl ExprAlias for Expr {
                 }
             }
             Expr::Literal { value, .. } => format!("{:?}", value),
-            _ => format!("{:?}", self),
+            _ => self.to_string(),
         }
     }
 }

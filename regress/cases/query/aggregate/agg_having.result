@@ -68,18 +68,16 @@ GROUP BY grp
 HAVING sum(x) >= 3
 ORDER BY grp;
 QUERY PLAN
-PROJECTION  (rows=1)
-  Output: grp, sum_x
-  ->  ORDER_BY  (rows=1)
-    Sort Key: #2 ASC NULLS LAST
-    ->  PROJECTION  (rows=1)
-      Output: grp, sum_x, __paro_hidden_1
-      ->  FILTER  (rows=1)
-        Filter: #1 >= 3
-        ->  AGGREGATE  (rows=3)
-          Group Key: #0
-          Aggregates: sum(#1)
-          Output: aggr_0, aggr_1
-          ->  PROJECTION  (rows=5)
-            Output: grp, x
-            ->  VALUES  (rows=5)
+ORDER_BY  (rows=1)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=1)
+    Output: grp, sum_x
+    ->  FILTER  (rows=1)
+      Filter: #1 >= 3
+      ->  AGGREGATE  (rows=3)
+        Group Key: #0
+        Aggregates: sum(#1)
+        Output: aggr_0, aggr_1
+        ->  PROJECTION  (rows=5)
+          Output: grp, x
+          ->  VALUES  (rows=5)

@@ -28,18 +28,16 @@ FROM (VALUES (3), (1), (2)) AS qualify_input(x)
 QUALIFY row_number() OVER (ORDER BY x) <= 2
 ORDER BY x;
 QUERY PLAN
-PROJECTION  (rows=1)
-  Output: x, rn
-  ->  ORDER_BY  (rows=1)
-    Sort Key: #2 ASC NULLS LAST
-    ->  PROJECTION  (rows=1)
-      Output: x, rn, __paro_hidden_1
-      ->  FILTER  (rows=1)
-        Filter: #1 <= 2
-        ->  WINDOW  (rows=3)
-          ->  PROJECTION  (rows=3)
-            Output: x
-            ->  VALUES  (rows=3)
+ORDER_BY  (rows=1)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=1)
+    Output: x, rn
+    ->  FILTER  (rows=1)
+      Filter: #1 <= 2
+      ->  WINDOW  (rows=3)
+        ->  PROJECTION  (rows=3)
+          Output: x
+          ->  VALUES  (rows=3)
 
 SELECT x, row_number() OVER (ORDER BY x) AS rn
 FROM (VALUES (3), (1), (2)) AS qualify_input(x)
@@ -56,19 +54,17 @@ FROM (
 ) AS unused_window
 ORDER BY x;
 QUERY PLAN
-PROJECTION  (rows=3)
-  Output: x
-  ->  ORDER_BY  (rows=3)
-    Sort Key: #1 ASC NULLS LAST
+ORDER_BY  (rows=3)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=3)
+    Output: x
     ->  PROJECTION  (rows=3)
-      Output: x, __paro_hidden_1
+      Output: x
       ->  PROJECTION  (rows=3)
         Output: x
         ->  PROJECTION  (rows=3)
           Output: x
-          ->  PROJECTION  (rows=3)
-            Output: x
-            ->  VALUES  (rows=3)
+          ->  VALUES  (rows=3)
 
 SELECT
     category,
