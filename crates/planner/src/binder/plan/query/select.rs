@@ -13,20 +13,18 @@
 //! - Projection operator creation
 //! - DISTINCT (regular)
 //! - DISTINCT ON
-//! - ORDER BY
-//! - LIMIT/OFFSET
-//! - need_prune (final projection to remove extra columns)
+//!
+//! Query-level ORDER BY, LIMIT/OFFSET, and hidden-column pruning are applied
+//! by `query::modifiers` after this SELECT body is planned.
 
+use crate::binder::ir::DistinctModifier;
 use crate::binder::ir::{BoundSelect, BoundValues, DistinctType};
-use crate::binder::ir::{DistinctModifier, OrderByNode};
 use crate::binder::Binder;
-use crate::expression::{ColumnRefExpression, Expression, ExpressionIterator, WindowExpression};
+use crate::expression::{Expression, ExpressionIterator, WindowExpression};
 use crate::operator::{
-    Aggregate, ColumnBinding, Distinct, ExpressionGet, Filter, Limit, LogicalOperator, Order,
-    Projection,
+    Aggregate, ColumnBinding, Distinct, ExpressionGet, Filter, LogicalOperator, Projection,
 };
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::LogicalType;
 
 fn group_window_expressions(
     expressions: Vec<(usize, WindowExpression)>,
@@ -106,8 +104,8 @@ impl Binder {
     /// 7. QUALIFY filter
     /// 8. Unnest operators
     /// 9. Projection (SELECT list)
-    /// 10. VisitQueryNode (ORDER BY, LIMIT)
-    /// 11. Prune projection (if need_prune)
+    ///
+    /// Query modifiers are planned by the enclosing `BoundQuery::Modifiers`.
     pub(crate) fn plan_select(&mut self, mut node: BoundSelect) -> Result<LogicalOperator> {
         // =================================================================
         // 1. FROM clause (or DummyScan if no FROM)
@@ -272,8 +270,6 @@ impl Binder {
         // The ORDER BY expressions are already BoundColumnRefExpressions pointing
         // to the projection's output indices.
         // =================================================================
-        let original_select_count = node.column_count;
-
         // Handle subqueries in SELECT list
         for expr in &mut node.select_list {
             self.plan_subqueries(expr, &mut root)?;
@@ -288,56 +284,10 @@ impl Binder {
         root = LogicalOperator::Projection(projection);
 
         // =================================================================
-        // 11. DISTINCT
+        // 10. DISTINCT
         // =================================================================
         if let Some(distinct_mod) = node.distinct {
-            root = self.plan_distinct_modifier(root, distinct_mod, node.order_by.take())?;
-        }
-
-        // =================================================================
-        // 12. ORDER BY
-        // =================================================================
-        if let Some(orders) = node.order_by {
-            let order_op = Order::new(self.wrap_plan(root), orders);
-            root = LogicalOperator::Order(order_op);
-        }
-
-        // =================================================================
-        // 13. LIMIT/OFFSET
-        // =================================================================
-        if let Some(limit_modifier) = node.limit {
-            let limit_op = Limit::new(
-                self.wrap_plan(root),
-                limit_modifier.limit,
-                limit_modifier.offset,
-            )
-            .with_hnsw_ef_hint(node.hnsw_ef_hint);
-            root = LogicalOperator::Limit(limit_op);
-        }
-
-        // =================================================================
-        // 14. Prune projection (if need_prune)
-        // This removes any extra columns added for ORDER BY
-        // =================================================================
-        if node.need_prune {
-            let final_proj_index = node.prune_index;
-            let final_select_list: Vec<Expression> = (0..original_select_count)
-                .map(|i| {
-                    let return_type = if i < node.types.len() {
-                        node.types[i].clone()
-                    } else {
-                        LogicalType::Unknown
-                    };
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(node.projection_index, i),
-                        return_type,
-                    ))
-                })
-                .collect();
-            let final_projection =
-                Projection::new(final_proj_index, self.wrap_plan(root), final_select_list)
-                    .with_output_names(node.names.clone());
-            root = LogicalOperator::Projection(final_projection);
+            root = self.plan_distinct_modifier(root, distinct_mod)?;
         }
 
         Ok(root)
@@ -349,7 +299,6 @@ impl Binder {
         &mut self,
         child: LogicalOperator,
         distinct_mod: DistinctModifier,
-        order_by: Option<Vec<OrderByNode>>,
     ) -> Result<LogicalOperator> {
         match distinct_mod.distinct_type {
             DistinctType::Distinct => {
@@ -358,15 +307,8 @@ impl Binder {
             }
             DistinctType::DistinctOn => {
                 let targets = distinct_mod.target_distincts;
-
-                if let Some(orders) = order_by {
-                    let distinct =
-                        Distinct::distinct_on_with_order(targets, orders, self.wrap_plan(child));
-                    Ok(LogicalOperator::Distinct(distinct))
-                } else {
-                    let distinct = Distinct::distinct_on(targets, self.wrap_plan(child));
-                    Ok(LogicalOperator::Distinct(distinct))
-                }
+                let distinct = Distinct::distinct_on(targets, self.wrap_plan(child));
+                Ok(LogicalOperator::Distinct(distinct))
             }
         }
     }

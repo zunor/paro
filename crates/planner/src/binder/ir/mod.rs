@@ -17,7 +17,7 @@ pub use from::{
     JoinType,
 };
 pub use query::{
-    BoundQuery, BoundSelect, BoundSetOperation, BoundValues, DistinctModifier, DistinctType,
-    GroupingSet, Groups, LimitModifier, OrderByNode, SetOperationType,
+    BoundQuery, BoundQueryModifiers, BoundSelect, BoundSetOperation, BoundValues, DistinctModifier,
+    DistinctType, GroupingSet, Groups, LimitModifier, OrderByNode, SetOperationType,
 };
 pub use statement::BoundStatementKind;
