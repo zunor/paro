@@ -312,12 +312,19 @@ impl TransactionManager {
     pub fn begin_transaction(&self) -> Result<Arc<Transaction>> {
         let started_at = Instant::now();
         self.ensure_recovery_admission_open()?;
-        let start_time = self
-            .commit_frontier
-            .published_commit_id()
-            .into_raw()
-            .saturating_add(1);
         let id = self.current_transaction_id.fetch_add(1, Ordering::SeqCst);
+        let (read_ts, handle) = self
+            .active_registry
+            .register_with_read_ts(TxnId::new(id), || {
+                ReadTs::new(
+                    self.commit_frontier
+                        .published_commit_id()
+                        .into_raw()
+                        .saturating_add(1),
+                )
+            })
+            .map_err(|e| paro_error::internal(format!("failed to register active txn: {e}")))?;
+        let start_time = read_ts.into_raw();
 
         let txn = Arc::new(Transaction::with_catalog_version_and_locks(
             id,
@@ -326,10 +333,6 @@ impl TransactionManager {
             Arc::clone(&self.lock_manager),
             self.lock_namespace,
         ));
-        let handle = self
-            .active_registry
-            .register(txn.txn_id(), txn.read_ts(), ReadTs::new(start_time))
-            .map_err(|e| paro_error::internal(format!("failed to register active txn: {e}")))?;
         txn.bind_active_registry_handle(handle)?;
         self.record_begin_latency(started_at.elapsed());
 

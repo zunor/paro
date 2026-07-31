@@ -46,8 +46,8 @@ use paro_journal::{JournalApplyRuntime, JournalCoordinator, MutationIdentity};
 use paro_transaction::{
     CommitTs, DatabaseId, DerivedLagLease, LayoutEpoch, LayoutEpochLease, LockAcquireError,
     LockMode, LockNamespace, LockRequest, LockResource, ReadSnapshotLease, ReadTs,
-    RetentionLeaseKind, RetentionRegistry, ShardedLockManager, TableId, TxnId, TxnLockSet,
-    MAX_TRANSACTION_ID,
+    RetentionLeaseKind, RetentionRegistry, RetentionWatermarks, ShardedLockManager, TableId, TxnId,
+    TxnLockSet, MAX_TRANSACTION_ID,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
@@ -1293,17 +1293,25 @@ impl Tablet {
 
     pub fn retired_pending_gc_statuses(&self) -> Vec<RetiredPendingGcStatus> {
         let min_active_visible_version = self.min_active_visible_version();
-        let retired = self.retired_pending_gc.read().unwrap();
-        let mut statuses = retired
-            .iter()
-            .map(|(&rowset_id, entry)| RetiredPendingGcStatus {
-                rowset_id,
-                version: entry.version,
-                barrier: self.retired_gc_barrier(entry, min_active_visible_version),
-                refs_by_reader: entry.rowset.ref_count(),
-                rssid_count: entry.rssids.len(),
-            })
-            .collect::<Vec<_>>();
+        let mut statuses = self
+            .retention_registry
+            .with_confirmed_watermarks(|watermarks| {
+                let retired = self.retired_pending_gc.read().unwrap();
+                retired
+                    .iter()
+                    .map(|(&rowset_id, entry)| RetiredPendingGcStatus {
+                        rowset_id,
+                        version: entry.version,
+                        barrier: self.retired_gc_barrier(
+                            entry,
+                            min_active_visible_version,
+                            watermarks,
+                        ),
+                        refs_by_reader: entry.rowset.ref_count(),
+                        rssid_count: entry.rssids.len(),
+                    })
+                    .collect::<Vec<_>>()
+            });
         statuses.sort_by_key(|status| status.rowset_id);
         statuses
     }
@@ -1312,8 +1320,8 @@ impl Tablet {
         &self,
         entry: &RetiredPendingGcEntry,
         min_active_visible_version: Option<i64>,
+        watermarks: RetentionWatermarks,
     ) -> RetiredGcBarrier {
-        let watermarks = self.retention_registry.confirmed_watermarks();
         let oldest_read_ts = watermarks.oldest_read_ts.into_raw();
         let read_floor_blocks = oldest_read_ts != MAX_TRANSACTION_ID
             && entry.version.end >= 0
@@ -1362,39 +1370,49 @@ impl Tablet {
     }
 
     fn sweep_retired_inputs(&self) {
-        let removable: Vec<u64> = self
-            .retired_pending_gc_statuses()
-            .into_iter()
-            .filter(|status| status.barrier == RetiredGcBarrier::Eligible)
-            .map(|status| status.rowset_id)
-            .collect();
-        if removable.is_empty() {
+        // Read-guard release is a hot path. This preflight is deliberately
+        // advisory: a concurrent compaction may publish a retired input after
+        // the check, in which case a later guard release or explicit sweep will
+        // collect it. The authoritative eligibility check remains below under
+        // the retention lifecycle barrier.
+        if self.retired_pending_gc.read().unwrap().is_empty() {
             return;
         }
 
-        let mut cleanup_paths = Vec::with_capacity(removable.len());
-        let mut removed_rssids = Vec::new();
-        {
-            let retired = self.retired_pending_gc.read().unwrap();
-            for rowset_id in &removable {
-                if let Some(entry) = retired.get(rowset_id) {
-                    cleanup_paths.push(entry.rowset.rowset_path().to_path_buf());
-                    removed_rssids.extend(entry.rssids.iter().copied());
-                }
-            }
-        }
+        let min_active_visible_version = self.min_active_visible_version();
+        let (cleanup_paths, removed_rssids) =
+            self.retention_registry
+                .with_confirmed_watermarks(|watermarks| {
+                    let mut retired = self.retired_pending_gc.write().unwrap();
+                    let removable: Vec<u64> = retired
+                        .iter()
+                        .filter_map(|(&rowset_id, entry)| {
+                            (self.retired_gc_barrier(entry, min_active_visible_version, watermarks)
+                                == RetiredGcBarrier::Eligible)
+                                .then_some(rowset_id)
+                        })
+                        .collect();
+                    if removable.is_empty() {
+                        return (Vec::new(), Vec::new());
+                    }
 
-        let mut retired = self.retired_pending_gc.write().unwrap();
-        let mut maintenance_ids = self.rowset_maintenance_ids.write().unwrap();
-        let mut rowsets_by_id = self.rowsets_by_id.write().unwrap();
-        for rowset_id in removable {
-            retired.remove(&rowset_id);
-            maintenance_ids.remove(&rowset_id);
-            rowsets_by_id.remove(&rowset_id);
+                    let mut cleanup_paths = Vec::with_capacity(removable.len());
+                    let mut removed_rssids = Vec::new();
+                    let mut maintenance_ids = self.rowset_maintenance_ids.write().unwrap();
+                    let mut rowsets_by_id = self.rowsets_by_id.write().unwrap();
+                    for rowset_id in removable {
+                        if let Some(entry) = retired.remove(&rowset_id) {
+                            cleanup_paths.push(entry.rowset.rowset_path().to_path_buf());
+                            removed_rssids.extend(entry.rssids.iter().copied());
+                        }
+                        maintenance_ids.remove(&rowset_id);
+                        rowsets_by_id.remove(&rowset_id);
+                    }
+                    (cleanup_paths, removed_rssids)
+                });
+        if cleanup_paths.is_empty() {
+            return;
         }
-        drop(rowsets_by_id);
-        drop(maintenance_ids);
-        drop(retired);
 
         self.rssid_manager.remove_many(&removed_rssids);
         let _ = self.save_meta();
@@ -3771,6 +3789,32 @@ mod tests {
             .map(|rowset| rowset.rowset_id())
             .collect();
         assert_eq!(checkpoint_ids, vec![10, 11]);
+    }
+
+    #[test]
+    fn empty_retired_set_does_not_confirm_watermarks_on_read_guard_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let tablet = Arc::new(
+            Tablet::new(
+                1,
+                100,
+                1000,
+                create_test_schema(),
+                dir.path().join("tablet"),
+                None,
+            )
+            .unwrap(),
+        );
+        let confirmed_epoch = tablet.retention_registry.confirmed_watermarks().epoch;
+
+        let read_guard = TabletReadGuard::pin(&tablet, 1).unwrap();
+        drop(read_guard);
+
+        assert_eq!(
+            tablet.retention_registry.watermarks().epoch,
+            confirmed_epoch,
+            "an empty retired set must not force a confirmed registry scan"
+        );
     }
 
     #[test]

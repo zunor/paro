@@ -5,6 +5,7 @@
 
 use crate::cache::CachePadded;
 use crate::error::{RegistryError, Result};
+use crate::lifecycle::RegistryLifecycle;
 use crate::sync::Mutex;
 use crate::types::{CommitTs, LayoutEpoch, ReadTs, SnapshotId, MAX_TRANSACTION_ID};
 use std::fmt;
@@ -126,9 +127,7 @@ struct RetentionRegistryInner {
     oldest_checkpoint_ts: AtomicU64,
     oldest_layout_epoch: AtomicU64,
     lease_counts: [AtomicU64; LEASE_KIND_COUNT],
-    lifecycle_epoch: AtomicU64,
-    confirmed_lifecycle_epoch: AtomicU64,
-    confirm_scan_lock: Mutex<()>,
+    lifecycle: RegistryLifecycle,
 }
 
 struct RetentionShard {
@@ -371,9 +370,7 @@ impl RetentionRegistry {
                 oldest_checkpoint_ts: AtomicU64::new(MAX_TRANSACTION_ID),
                 oldest_layout_epoch: AtomicU64::new(MAX_TRANSACTION_ID),
                 lease_counts: std::array::from_fn(|_| AtomicU64::new(0)),
-                lifecycle_epoch: AtomicU64::new(0),
-                confirmed_lifecycle_epoch: AtomicU64::new(u64::MAX),
-                confirm_scan_lock: Mutex::new(()),
+                lifecycle: RegistryLifecycle::new(),
             }),
         }
     }
@@ -479,34 +476,26 @@ impl RetentionRegistry {
     }
 
     pub fn watermarks(&self) -> RetentionWatermarks {
-        RetentionWatermarks {
-            oldest_read_ts: ReadTs::new(self.inner.oldest_read_ts.load(Ordering::Acquire)),
-            oldest_backfill_ts: CommitTs::new(
-                self.inner.oldest_backfill_ts.load(Ordering::Acquire),
-            ),
-            oldest_derived_delta_ts: CommitTs::new(
-                self.inner.oldest_derived_delta_ts.load(Ordering::Acquire),
-            ),
-            oldest_conflict_horizon: CommitTs::new(
-                self.inner.oldest_conflict_horizon.load(Ordering::Acquire),
-            ),
-            oldest_checkpoint_ts: CommitTs::new(
-                self.inner.oldest_checkpoint_ts.load(Ordering::Acquire),
-            ),
-            oldest_layout_epoch: self.inner.oldest_layout_epoch(),
-            lease_counts: std::array::from_fn(|idx| {
-                self.inner.lease_counts[idx].load(Ordering::Acquire)
-            }),
-            epoch: self.inner.watermark_epoch.load(Ordering::Acquire),
-        }
+        self.inner
+            .lifecycle
+            .read_consistent(|| self.inner.watermarks())
     }
 
     pub fn refresh_watermarks(&self) -> RetentionWatermarks {
-        self.inner.scan_and_publish()
+        let _snapshot = self.inner.lifecycle.snapshot();
+        self.inner.scan_and_confirm()
     }
 
     pub fn confirmed_watermarks(&self) -> RetentionWatermarks {
-        self.inner.confirmed_scan_and_publish()
+        self.with_confirmed_watermarks(|watermarks| watermarks)
+    }
+
+    /// Run an action against a confirmed watermark while preventing lease
+    /// changes from invalidating the reclamation decision before it completes.
+    /// The action must not re-enter this registry.
+    pub fn with_confirmed_watermarks<R>(&self, action: impl FnOnce(RetentionWatermarks) -> R) -> R {
+        let _snapshot = self.inner.lifecycle.snapshot();
+        action(self.inner.confirmed_scan_and_publish())
     }
 
     pub fn spawn_background_aggregator(&self, period: Duration) -> RetentionAggregator {
@@ -532,6 +521,7 @@ impl RetentionRegistry {
         commit_ts_ceiling: Option<u64>,
         layout_epoch_floor: Option<u64>,
     ) -> Result<RetentionLeaseHandle> {
+        let mut mutation = self.inner.lifecycle.begin_mutation();
         let shard_count = self.inner.shards.len();
         let start = self.inner.next_shard.fetch_add(1, Ordering::Relaxed) % shard_count;
         for offset in 0..shard_count {
@@ -543,6 +533,7 @@ impl RetentionRegistry {
                 commit_ts_ceiling,
                 layout_epoch_floor,
             )? {
+                mutation.mark_changed();
                 return Ok(RetentionLeaseHandle { slot: Some(slot) });
             }
         }
@@ -595,7 +586,6 @@ impl RetentionRegistry {
         self.inner.lease_counts[kind.index()].fetch_add(1, Ordering::AcqRel);
         self.inner
             .lower_watermark(kind, commit_ts_floor, layout_epoch_floor);
-        self.inner.mark_lifecycle_dirty();
 
         Ok(Some(RetentionSlotRef {
             registry: self.inner.clone(),
@@ -668,6 +658,7 @@ impl RetentionLeaseHandle {
 
 impl RetentionRegistryInner {
     fn release_slot(&self, slot_ref: &RetentionSlotRef) -> Result<()> {
+        let mut mutation = self.lifecycle.begin_mutation();
         let shard = self
             .shards
             .get(slot_ref.shard_index)
@@ -704,7 +695,7 @@ impl RetentionRegistryInner {
         let mut free = shard.free_slots.lock();
         free.push(slot_ref.slot_index);
         self.lease_counts[kind.index()].fetch_sub(1, Ordering::AcqRel);
-        self.mark_lifecycle_dirty();
+        mutation.mark_changed();
         Ok(())
     }
 
@@ -822,25 +813,17 @@ impl RetentionRegistryInner {
     }
 
     fn confirmed_scan_and_publish(&self) -> RetentionWatermarks {
-        loop {
-            let dirty_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
-            if self.confirmed_lifecycle_epoch.load(Ordering::Acquire) == dirty_epoch {
-                return self.watermarks();
-            }
-
-            let _guard = self.confirm_scan_lock.lock();
-            let dirty_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
-            if self.confirmed_lifecycle_epoch.load(Ordering::Acquire) == dirty_epoch {
-                return self.watermarks();
-            }
-
-            let watermarks = self.scan_and_publish();
-            if self.lifecycle_epoch.load(Ordering::Acquire) == dirty_epoch {
-                self.confirmed_lifecycle_epoch
-                    .store(dirty_epoch, Ordering::Release);
-                return watermarks;
-            }
+        let dirty_epoch = self.lifecycle.dirty_epoch();
+        if self.lifecycle.is_confirmed(dirty_epoch) {
+            return self.watermarks();
         }
+        self.scan_and_confirm()
+    }
+
+    fn scan_and_confirm(&self) -> RetentionWatermarks {
+        let watermarks = self.scan_and_publish();
+        self.lifecycle.confirm();
+        watermarks
     }
 
     fn watermarks(&self) -> RetentionWatermarks {
@@ -858,11 +841,6 @@ impl RetentionRegistryInner {
             lease_counts: std::array::from_fn(|idx| self.lease_counts[idx].load(Ordering::Acquire)),
             epoch: self.watermark_epoch.load(Ordering::Acquire),
         }
-    }
-
-    #[inline]
-    fn mark_lifecycle_dirty(&self) {
-        self.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     fn oldest_layout_epoch(&self) -> Option<LayoutEpoch> {
@@ -1065,6 +1043,7 @@ impl RetentionSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn typed_leases_publish_independent_watermarks() {
@@ -1193,5 +1172,47 @@ mod tests {
 
         let fourth = registry.confirmed_watermarks();
         assert_eq!(third.epoch, fourth.epoch);
+    }
+
+    #[test]
+    fn confirmed_action_blocks_new_lease_until_reclamation_finishes() {
+        let registry = RetentionRegistry::with_capacity(1, 4);
+        let snapshot_registry = registry.clone();
+        let (action_started_tx, action_started_rx) = mpsc::channel();
+        let (finish_action_tx, finish_action_rx) = mpsc::channel();
+        let action = thread::spawn(move || {
+            snapshot_registry.with_confirmed_watermarks(|watermarks| {
+                action_started_tx.send(()).unwrap();
+                finish_action_rx.recv().unwrap();
+                watermarks
+            })
+        });
+        action_started_rx.recv().unwrap();
+
+        let lease_registry = registry.clone();
+        let (lease_registered_tx, lease_registered_rx) = mpsc::channel();
+        let lease = thread::spawn(move || {
+            let lease = lease_registry.lease_read_snapshot(ReadTs::new(7)).unwrap();
+            lease_registered_tx.send(()).unwrap();
+            lease
+        });
+        assert!(lease_registered_rx
+            .recv_timeout(Duration::from_millis(25))
+            .is_err());
+
+        finish_action_tx.send(()).unwrap();
+        let watermarks = action.join().unwrap();
+        assert_eq!(watermarks.lease_count(RetentionLeaseKind::ReadSnapshot), 0);
+        lease_registered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let lease = lease.join().unwrap();
+        assert_eq!(
+            registry
+                .confirmed_watermarks()
+                .lease_count(RetentionLeaseKind::ReadSnapshot),
+            1
+        );
+        drop(lease);
     }
 }

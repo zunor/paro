@@ -205,14 +205,15 @@ impl WriteConflictIndex {
         published_ts: CommitTs,
         active_registry: &ActiveTxnRegistry,
     ) -> CommitTs {
-        let active_rw = active_registry.confirmed_oldest_active_rw_read_ts();
-        let active_rw_raw = active_rw.into_raw();
-        let candidate = if active_rw_raw == MAX_TRANSACTION_ID {
-            published_ts.into_raw()
-        } else {
-            published_ts.into_raw().min(active_rw_raw)
-        };
-        self.advance_horizon(CommitTs::new(candidate))
+        active_registry.with_confirmed_watermarks(|watermarks| {
+            let active_rw_raw = watermarks.oldest_active_rw_read_ts.into_raw();
+            let candidate = if active_rw_raw == MAX_TRANSACTION_ID {
+                published_ts.into_raw()
+            } else {
+                published_ts.into_raw().min(active_rw_raw)
+            };
+            self.advance_horizon(CommitTs::new(candidate))
+        })
     }
 
     pub fn advance_horizon(&self, target: CommitTs) -> CommitTs {

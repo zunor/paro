@@ -17,6 +17,10 @@ pub struct Mutex<T> {
     inner: mutex_impl::Mutex<T>,
 }
 
+pub struct RwLock<T> {
+    inner: mutex_impl::RwLock<T>,
+}
+
 pub struct Condvar {
     inner: condvar_impl::Condvar,
 }
@@ -25,6 +29,16 @@ pub struct Condvar {
 pub type MutexGuard<'a, T> = parking_lot::MutexGuard<'a, T>;
 #[cfg(not(feature = "runtime"))]
 pub type MutexGuard<'a, T> = std::sync::MutexGuard<'a, T>;
+
+#[cfg(feature = "runtime")]
+pub type RwLockReadGuard<'a, T> = parking_lot::RwLockReadGuard<'a, T>;
+#[cfg(not(feature = "runtime"))]
+pub type RwLockReadGuard<'a, T> = std::sync::RwLockReadGuard<'a, T>;
+
+#[cfg(feature = "runtime")]
+pub type RwLockWriteGuard<'a, T> = parking_lot::RwLockWriteGuard<'a, T>;
+#[cfg(not(feature = "runtime"))]
+pub type RwLockWriteGuard<'a, T> = std::sync::RwLockWriteGuard<'a, T>;
 
 impl<T> Mutex<T> {
     #[inline]
@@ -49,6 +63,37 @@ impl<T: Default> Default for Mutex<T> {
 impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mutex").finish_non_exhaustive()
+    }
+}
+
+impl<T> RwLock<T> {
+    #[inline]
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: mutex_impl::RwLock::new(value),
+        }
+    }
+
+    #[inline]
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        read_inner(&self.inner)
+    }
+
+    #[inline]
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        write_inner(&self.inner)
+    }
+}
+
+impl<T: Default> Default for RwLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for RwLock<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RwLock").finish_non_exhaustive()
     }
 }
 
@@ -109,6 +154,30 @@ fn lock_inner<T>(mutex: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T
 #[inline]
 fn lock_inner<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().expect("transaction mutex poisoned")
+}
+
+#[cfg(feature = "runtime")]
+#[inline]
+fn read_inner<T>(lock: &parking_lot::RwLock<T>) -> parking_lot::RwLockReadGuard<'_, T> {
+    lock.read()
+}
+
+#[cfg(not(feature = "runtime"))]
+#[inline]
+fn read_inner<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().expect("transaction rwlock poisoned")
+}
+
+#[cfg(feature = "runtime")]
+#[inline]
+fn write_inner<T>(lock: &parking_lot::RwLock<T>) -> parking_lot::RwLockWriteGuard<'_, T> {
+    lock.write()
+}
+
+#[cfg(not(feature = "runtime"))]
+#[inline]
+fn write_inner<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().expect("transaction rwlock poisoned")
 }
 
 #[cfg(feature = "runtime")]
