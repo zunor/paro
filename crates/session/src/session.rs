@@ -436,6 +436,9 @@ impl Session {
             ddl,
             settings: settings.clone(),
             options,
+            time: paro_context::StatementTimeContext::capture(
+                self.transaction.transaction_started_at(),
+            ),
             databases: Arc::new(AttachedDatabaseDirectory::new(
                 self.instance.database_registry().visible_generation(),
                 Some(self.current_database.name().to_string()),
@@ -1682,6 +1685,10 @@ mod tests {
         let mut session = Session::new(1, instance);
 
         session.begin_explicit_transaction().unwrap();
+        let transaction_started_at = session
+            .transaction
+            .transaction_started_at()
+            .expect("explicit transaction should own a wall-clock anchor");
 
         assert_eq!(
             session.transaction_id(),
@@ -1704,8 +1711,32 @@ mod tests {
             statement.catalog_txn_view().writer_id(),
             Some(paro_transaction::TRANSACTION_ID_START)
         );
+        assert_eq!(
+            statement.time.transaction_started_at(),
+            Some(transaction_started_at)
+        );
+
+        let later_statement = session.freeze_statement_context(
+            StatementOptions::default(),
+            StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+        );
+        assert_eq!(
+            later_statement.time.transaction_started_at(),
+            Some(transaction_started_at)
+        );
 
         session.rollback_transaction().unwrap();
+    }
+
+    #[test]
+    fn compile_context_does_not_invent_a_transaction_time() {
+        let instance = Instance::new_in_memory();
+        let session = Session::new(1, instance);
+
+        let context = session.freeze_query_context();
+
+        assert_eq!(context.time.transaction_started_at(), None);
+        assert_eq!(context.time.transaction_timestamp_micros(), None);
     }
 
     #[test]

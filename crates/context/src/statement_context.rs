@@ -4,8 +4,8 @@
 use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
     QueryResources, RuntimeLimits, SessionMetadataProvider, StatementAuthContext,
-    StatementCancellation, StatementEnvironment, StatementOptions, StatementView, TransactionView,
-    TxnAdmissionState, WriteGuard,
+    StatementCancellation, StatementEnvironment, StatementOptions, StatementTimeContext,
+    StatementView, TransactionView, TxnAdmissionState, WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -34,6 +34,7 @@ pub struct StatementContext {
     pub ddl: Option<Arc<dyn DdlApplyContext>>,
     pub settings: Arc<EffectiveSettings>,
     pub options: StatementOptions,
+    pub time: StatementTimeContext,
     pub databases: Arc<AttachedDatabaseDirectory>,
     pub limits: RuntimeLimits,
     pub cancellation: StatementCancellation,

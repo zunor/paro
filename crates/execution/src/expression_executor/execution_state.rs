@@ -43,6 +43,10 @@ impl FunctionExecContext for ExecutionContext<'_> {
         current_setting_from_context(self.session.as_ref(), key)
     }
 
+    fn transaction_timestamp_micros(&self) -> Option<i64> {
+        self.session.time.transaction_timestamp_micros()
+    }
+
     fn is_interrupted(&self) -> bool {
         ExecutionContext::is_interrupted(self)
     }
@@ -91,6 +95,10 @@ impl FunctionExecContext for BoundFunctionContext<'_> {
 
     fn current_setting(&self, key: &str) -> Option<String> {
         self.runtime.current_setting(key)
+    }
+
+    fn transaction_timestamp_micros(&self) -> Option<i64> {
+        self.runtime.transaction_timestamp_micros()
     }
 
     fn is_interrupted(&self) -> bool {

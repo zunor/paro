@@ -15,6 +15,7 @@ mod statement_cancellation;
 mod statement_context;
 mod statement_environment;
 mod statement_options;
+mod statement_time;
 mod statement_view;
 mod txn_admission;
 mod write_class;
@@ -58,6 +59,7 @@ pub use statement_cancellation::{
 pub use statement_context::{CompileEnvironmentKey, StatementContext};
 pub use statement_environment::{StatementAuthContext, StatementEnvironment};
 pub use statement_options::{ExplainOutputType, StatementOptions, StatementSource};
+pub use statement_time::StatementTimeContext;
 pub use statement_view::StatementView;
 pub use txn_admission::{
     catalog_object_resource, ddl_lock_requests, dml_table_lock_requests, schema_resource,

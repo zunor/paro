@@ -1,0 +1,24 @@
+DROP TABLE IF EXISTS transaction_time_anchor;
+DROP TABLE
+
+CREATE TABLE transaction_time_anchor (captured_at TIMESTAMP);
+CREATE TABLE
+
+BEGIN;
+BEGIN
+
+INSERT INTO transaction_time_anchor SELECT now();
+INSERT 0 1
+
+SELECT
+  captured_at = now() AS now_is_transaction_stable,
+  captured_at = current_timestamp() AS aliases_share_transaction_time
+FROM transaction_time_anchor;
+now_is_transaction_stable	aliases_share_transaction_time
+true	true
+
+ROLLBACK;
+ROLLBACK
+
+DROP TABLE transaction_time_anchor;
+DROP TABLE

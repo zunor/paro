@@ -14,6 +14,7 @@ use paro_transaction::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::prepared::store::PortalStoreMark;
 
@@ -39,6 +40,7 @@ pub struct SessionTransaction {
     isolation_level: IsolationLevel,
     read_only: bool,
     participant_states: ParticipantStateSet,
+    transaction_started_at: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -83,6 +85,7 @@ impl SessionTransaction {
             isolation_level: IsolationLevel::Serializable,
             read_only: false,
             participant_states: ParticipantStateSet::empty(),
+            transaction_started_at: None,
         }
     }
 
@@ -347,6 +350,7 @@ impl SessionTransaction {
         self.read_tracker = ReadTrackerHandle::noop();
         self.reset_characteristics_to_defaults();
         self.participant_states = ParticipantStateSet::empty();
+        self.transaction_started_at = None;
     }
 
     // ============================================================
@@ -361,6 +365,11 @@ impl SessionTransaction {
     /// Returns the start time of the active transaction, if any.
     pub fn start_time(&self) -> Option<u64> {
         self.active.as_ref().map(|t| t.read_ts().into_raw())
+    }
+
+    /// Returns the wall-clock anchor owned by the active transaction.
+    pub fn transaction_started_at(&self) -> Option<SystemTime> {
+        self.transaction_started_at
     }
 
     /// Returns the visible version of the active transaction, if any.
@@ -490,6 +499,23 @@ impl SessionTransaction {
         database_name: &str,
         read_tracking_policy: ReadTrackingPolicy,
     ) -> Result<Arc<Transaction>> {
+        self.begin_transaction_for_database_at(
+            manager,
+            database_id,
+            database_name,
+            read_tracking_policy,
+            SystemTime::now(),
+        )
+    }
+
+    fn begin_transaction_for_database_at(
+        &mut self,
+        manager: &TransactionManager,
+        database_id: DatabaseId,
+        database_name: &str,
+        read_tracking_policy: ReadTrackingPolicy,
+        transaction_started_at: SystemTime,
+    ) -> Result<Arc<Transaction>> {
         if self.active.is_some() {
             return Err(paro_error::transaction_active());
         }
@@ -502,6 +528,7 @@ impl SessionTransaction {
         self.participant_states =
             ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]);
         self.active = Some(txn.clone());
+        self.transaction_started_at = Some(transaction_started_at);
         Ok(txn)
     }
 
@@ -601,6 +628,7 @@ impl SessionTransaction {
     ) -> Result<()> {
         let auto_commit = self.auto_commit;
         let block_kind = self.block_kind;
+        let transaction_started_at = self.transaction_started_at.unwrap_or_else(SystemTime::now);
         if let Some(active) = self.active.take() {
             manager.rollback_transaction(active)?;
         }
@@ -614,8 +642,13 @@ impl SessionTransaction {
         self.write_guard.reset();
         self.savepoints.clear();
 
-        let txn =
-            self.begin_transaction_for_database(manager, database_id, database_name, policy)?;
+        let txn = self.begin_transaction_for_database_at(
+            manager,
+            database_id,
+            database_name,
+            policy,
+            transaction_started_at,
+        )?;
         txn.promote_to_read_write()?;
         self.auto_commit = auto_commit;
         self.block_kind = block_kind;
@@ -1000,12 +1033,14 @@ mod tests {
         // Set auto_commit to false (which starts a transaction)
         ctx.set_auto_commit(false, &manager).unwrap();
         assert!(!ctx.is_auto_commit());
+        assert!(ctx.transaction_started_at().is_some());
 
         // Clear transaction should reset auto_commit to true
         ctx.clear_transaction();
 
         assert!(ctx.is_auto_commit());
         assert!(!ctx.has_active_transaction());
+        assert!(ctx.transaction_started_at().is_none());
     }
 
     #[test]
@@ -1105,6 +1140,9 @@ mod tests {
         let manager = create_manager();
 
         let original = ctx.begin_transaction(&manager).unwrap().txn_id();
+        let original_started_at = ctx
+            .transaction_started_at()
+            .expect("active transaction should own a wall-clock anchor");
         let promotion = ctx
             .prepare_statement_read_tracking(&manager, ReadTrackingPolicy::RangeCritical)
             .unwrap();
@@ -1112,6 +1150,7 @@ mod tests {
 
         assert_eq!(promotion, ReadWritePromotion::MustRestartImplicitOk);
         assert_ne!(restarted.txn_id(), original);
+        assert_eq!(ctx.transaction_started_at(), Some(original_started_at));
         assert!(!restarted.is_read_only());
         assert_eq!(
             ctx.read_tracker().policy(),
@@ -1182,11 +1221,13 @@ mod tests {
 
         assert!(ctx.transaction_id().is_none());
         assert!(ctx.start_time().is_none());
+        assert!(ctx.transaction_started_at().is_none());
 
         let txn = ctx.begin_transaction(&manager).unwrap();
 
         assert_eq!(ctx.transaction_id(), Some(txn.id));
         assert_eq!(ctx.start_time(), Some(txn.start_time));
+        assert!(ctx.transaction_started_at().is_some());
     }
 
     // ============================================================

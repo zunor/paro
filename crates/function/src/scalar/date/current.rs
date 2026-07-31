@@ -13,40 +13,35 @@
 
 use crate::{ExpressionState, FunctionStability, ScalarFunction, ScalarFunctionSet};
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Microseconds per second
 const MICROS_PER_SECOND: i64 = 1_000_000;
 /// Microseconds per day
 const MICROS_PER_DAY: i64 = 24 * 60 * 60 * MICROS_PER_SECOND;
 
-/// Get current timestamp in microseconds since Unix epoch.
-fn get_current_timestamp_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+fn transaction_timestamp_micros(state: &dyn ExpressionState) -> Result<i64> {
+    state.transaction_timestamp_micros().ok_or_else(|| {
+        paro_error::internal("transaction timestamp is missing from function execution context")
+    })
 }
 
-/// Get current date as days since Unix epoch.
-fn get_current_date_days() -> i64 {
-    get_current_timestamp_micros() / MICROS_PER_DAY
+fn transaction_date_days(state: &dyn ExpressionState) -> Result<i64> {
+    Ok(transaction_timestamp_micros(state)?.div_euclid(MICROS_PER_DAY))
 }
 
-/// Get current time as microseconds since midnight.
-fn get_current_time_micros() -> i64 {
-    get_current_timestamp_micros() % MICROS_PER_DAY
+fn transaction_time_micros(state: &dyn ExpressionState) -> Result<i64> {
+    Ok(transaction_timestamp_micros(state)?.rem_euclid(MICROS_PER_DAY))
 }
 
 // ============================================================================
 // NOW() - Current timestamp
 // ============================================================================
 
-fn now_impl(_input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    let ts = get_current_timestamp_micros();
+fn now_impl(_input: &Chunk, state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
+    let ts = transaction_timestamp_micros(state)?;
     result.set_count(1);
     result.set_i64(0, ts);
     Ok(())
@@ -71,10 +66,10 @@ pub fn get_now_function() -> ScalarFunctionSet {
 
 fn current_date_impl(
     _input: &Chunk,
-    _state: &dyn ExpressionState,
+    state: &dyn ExpressionState,
     result: &mut Vector,
 ) -> Result<()> {
-    let days = get_current_date_days();
+    let days = transaction_date_days(state)?;
     result.set_count(1);
     result.set_i64(0, days);
     Ok(())
@@ -104,10 +99,10 @@ pub fn get_current_date_function() -> ScalarFunctionSet {
 
 fn current_time_impl(
     _input: &Chunk,
-    _state: &dyn ExpressionState,
+    state: &dyn ExpressionState,
     result: &mut Vector,
 ) -> Result<()> {
-    let time_micros = get_current_time_micros();
+    let time_micros = transaction_time_micros(state)?;
     result.set_count(1);
     result.set_i64(0, time_micros);
     Ok(())
@@ -164,6 +159,8 @@ mod tests {
     }
 
     // Mock ExpressionState for testing
+    const TEST_TRANSACTION_TIMESTAMP: i64 = 1_700_000_000_123_456;
+
     struct MockState;
     impl ExpressionState for MockState {
         fn current_database(&self) -> Option<&str> {
@@ -174,6 +171,9 @@ mod tests {
         }
         fn current_user(&self) -> Option<&str> {
             None
+        }
+        fn transaction_timestamp_micros(&self) -> Option<i64> {
+            Some(TEST_TRANSACTION_TIMESTAMP)
         }
         fn as_any(&self) -> &dyn Any {
             self
@@ -188,13 +188,8 @@ mod tests {
 
         now_impl(&chunk, &state, &mut result).unwrap();
 
-        // Result should have current timestamp
         let ts = result.get_i64(0).unwrap();
-        assert!(ts > 0); // Should be positive (after Unix epoch)
-
-        // Should be within reasonable range (after 2020)
-        let year_2020_micros = 1577836800_i64 * MICROS_PER_SECOND;
-        assert!(ts > year_2020_micros);
+        assert_eq!(ts, TEST_TRANSACTION_TIMESTAMP);
     }
 
     #[test]
@@ -205,12 +200,10 @@ mod tests {
 
         current_date_impl(&chunk, &state, &mut result).unwrap();
 
-        let days = result.get_i64(0).unwrap();
-        assert!(days > 0); // Should be positive (after Unix epoch)
-
-        // Should be within reasonable range (after 2020)
-        let year_2020_days = 18262_i64; // Days from 1970-01-01 to 2020-01-01
-        assert!(days > year_2020_days);
+        assert_eq!(
+            result.get_i64(0),
+            Some(TEST_TRANSACTION_TIMESTAMP.div_euclid(MICROS_PER_DAY))
+        );
     }
 
     #[test]
@@ -221,10 +214,37 @@ mod tests {
 
         current_time_impl(&chunk, &state, &mut result).unwrap();
 
-        let time_micros = result.get_i64(0).unwrap();
-        // Time should be between 0 and 24 hours in microseconds
-        assert!(time_micros >= 0);
-        assert!(time_micros < MICROS_PER_DAY);
+        assert_eq!(
+            result.get_i64(0),
+            Some(TEST_TRANSACTION_TIMESTAMP.rem_euclid(MICROS_PER_DAY))
+        );
+    }
+
+    #[test]
+    fn current_functions_require_a_transaction_time_anchor() {
+        struct MissingTimeState;
+        impl ExpressionState for MissingTimeState {
+            fn current_database(&self) -> Option<&str> {
+                None
+            }
+            fn current_schema(&self) -> Option<&str> {
+                None
+            }
+            fn current_user(&self) -> Option<&str> {
+                None
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Timestamp);
+        let error = now_impl(&create_test_chunk(), &MissingTimeState, &mut result)
+            .expect_err("time functions must not read the wall clock independently");
+
+        assert!(error
+            .to_string()
+            .contains("transaction timestamp is missing"));
     }
 
     #[test]
