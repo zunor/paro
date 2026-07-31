@@ -9,6 +9,7 @@
 //! configuration crates.
 
 mod cache;
+mod lifecycle;
 mod sync;
 
 pub mod active;

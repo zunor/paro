@@ -5,6 +5,7 @@
 
 use crate::cache::CachePadded;
 use crate::error::{RegistryError, Result};
+use crate::lifecycle::RegistryLifecycle;
 use crate::sync::Mutex;
 use crate::types::{ReadTs, TxnId, MAX_TRANSACTION_ID};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -104,9 +105,7 @@ struct ActiveTxnRegistryInner {
     oldest_active_rw_read_ts: AtomicU64,
     oldest_active_rw_start_ts: AtomicU64,
     active_rw_count: AtomicU64,
-    lifecycle_epoch: AtomicU64,
-    confirmed_lifecycle_epoch: AtomicU64,
-    confirm_scan_lock: Mutex<()>,
+    lifecycle: RegistryLifecycle,
 }
 
 struct ActiveTxnShard {
@@ -192,9 +191,7 @@ impl ActiveTxnRegistry {
                 oldest_active_rw_read_ts: AtomicU64::new(MAX_TRANSACTION_ID),
                 oldest_active_rw_start_ts: AtomicU64::new(MAX_TRANSACTION_ID),
                 active_rw_count: AtomicU64::new(0),
-                lifecycle_epoch: AtomicU64::new(0),
-                confirmed_lifecycle_epoch: AtomicU64::new(u64::MAX),
-                confirm_scan_lock: Mutex::new(()),
+                lifecycle: RegistryLifecycle::new(),
             }),
         }
     }
@@ -223,8 +220,29 @@ impl ActiveTxnRegistry {
         read_ts: ReadTs,
         start_ts: ReadTs,
     ) -> Result<ActiveTxnHandle> {
-        self.register_inner(txn_id, read_ts, start_ts, false)
-            .map(|slot| ActiveTxnHandle { slot: Some(slot) })
+        let mut mutation = self.inner.lifecycle.begin_mutation();
+        let slot = self.register_inner(txn_id, read_ts, start_ts, false)?;
+        mutation.mark_changed();
+        Ok(ActiveTxnHandle { slot: Some(slot) })
+    }
+
+    /// Sample and register a transaction boundary as one lifecycle operation.
+    ///
+    /// Confirmed watermark consumers cannot advance a reclamation horizon
+    /// between sampling the commit frontier and publishing the active slot.
+    pub fn register_with_read_ts<F>(
+        &self,
+        txn_id: TxnId,
+        sample_read_ts: F,
+    ) -> Result<(ReadTs, ActiveTxnHandle)>
+    where
+        F: FnOnce() -> ReadTs,
+    {
+        let mut mutation = self.inner.lifecycle.begin_mutation();
+        let read_ts = sample_read_ts();
+        let slot = self.register_inner(txn_id, read_ts, read_ts, false)?;
+        mutation.mark_changed();
+        Ok((read_ts, ActiveTxnHandle { slot: Some(slot) }))
     }
 
     pub fn register_read_write(
@@ -233,8 +251,10 @@ impl ActiveTxnRegistry {
         read_ts: ReadTs,
         start_ts: ReadTs,
     ) -> Result<ActiveRwTxnHandle> {
-        self.register_inner(txn_id, read_ts, start_ts, true)
-            .map(|slot| ActiveRwTxnHandle { slot: Some(slot) })
+        let mut mutation = self.inner.lifecycle.begin_mutation();
+        let slot = self.register_inner(txn_id, read_ts, start_ts, true)?;
+        mutation.mark_changed();
+        Ok(ActiveRwTxnHandle { slot: Some(slot) })
     }
 
     pub fn try_register_on_shard(
@@ -244,9 +264,12 @@ impl ActiveTxnRegistry {
         read_ts: ReadTs,
         start_ts: ReadTs,
     ) -> Result<ActiveTxnHandle> {
-        self.allocate_on_shard(shard_index, txn_id, read_ts, start_ts, false)?
-            .map(|slot| ActiveTxnHandle { slot: Some(slot) })
-            .ok_or(RegistryError::NoSlotAvailable)
+        let mut mutation = self.inner.lifecycle.begin_mutation();
+        let slot = self
+            .allocate_on_shard(shard_index, txn_id, read_ts, start_ts, false)?
+            .ok_or(RegistryError::NoSlotAvailable)?;
+        mutation.mark_changed();
+        Ok(ActiveTxnHandle { slot: Some(slot) })
     }
 
     pub fn try_register_read_write_on_shard(
@@ -256,51 +279,48 @@ impl ActiveTxnRegistry {
         read_ts: ReadTs,
         start_ts: ReadTs,
     ) -> Result<ActiveRwTxnHandle> {
-        self.allocate_on_shard(shard_index, txn_id, read_ts, start_ts, true)?
-            .map(|slot| ActiveRwTxnHandle { slot: Some(slot) })
-            .ok_or(RegistryError::NoSlotAvailable)
+        let mut mutation = self.inner.lifecycle.begin_mutation();
+        let slot = self
+            .allocate_on_shard(shard_index, txn_id, read_ts, start_ts, true)?
+            .ok_or(RegistryError::NoSlotAvailable)?;
+        mutation.mark_changed();
+        Ok(ActiveRwTxnHandle { slot: Some(slot) })
     }
 
     pub fn watermarks(&self) -> ActiveTxnWatermarks {
-        ActiveTxnWatermarks {
-            oldest_active_txn_id: TxnId::new(
-                self.inner.oldest_active_txn_id.load(Ordering::Acquire),
-            ),
-            oldest_active_read_ts: ReadTs::new(
-                self.inner.oldest_active_read_ts.load(Ordering::Acquire),
-            ),
-            oldest_active_start_ts: ReadTs::new(
-                self.inner.oldest_active_start_ts.load(Ordering::Acquire),
-            ),
-            active_count: self.inner.active_count.load(Ordering::Acquire),
-            oldest_active_rw_read_ts: ReadTs::new(
-                self.inner.oldest_active_rw_read_ts.load(Ordering::Acquire),
-            ),
-            oldest_active_rw_start_ts: ReadTs::new(
-                self.inner.oldest_active_rw_start_ts.load(Ordering::Acquire),
-            ),
-            active_rw_count: self.inner.active_rw_count.load(Ordering::Acquire),
-            epoch: self.inner.watermark_epoch.load(Ordering::Acquire),
-        }
+        self.inner
+            .lifecycle
+            .read_consistent(|| self.inner.watermarks())
     }
 
     pub fn contains_transaction(&self, txn_id: TxnId) -> bool {
         let txn_id = txn_id.into_raw();
-        self.inner.shards.iter().any(|shard| {
-            shard.slots.iter().any(|padded| {
-                let slot = &padded.0;
-                let state = ActiveTxnState::from_raw(slot.state.load(Ordering::Acquire));
-                state.is_active() && slot.txn_id.load(Ordering::Acquire) == txn_id
+        self.inner.lifecycle.read_consistent(|| {
+            self.inner.shards.iter().any(|shard| {
+                shard.slots.iter().any(|padded| {
+                    let slot = &padded.0;
+                    let state = ActiveTxnState::from_raw(slot.state.load(Ordering::Acquire));
+                    state.is_active() && slot.txn_id.load(Ordering::Acquire) == txn_id
+                })
             })
         })
     }
 
     pub fn refresh_watermarks(&self) -> ActiveTxnWatermarks {
-        self.inner.scan_and_publish()
+        let _snapshot = self.inner.lifecycle.snapshot();
+        self.inner.scan_and_confirm()
     }
 
     pub fn confirmed_watermarks(&self) -> ActiveTxnWatermarks {
-        self.inner.confirmed_scan_and_publish()
+        self.with_confirmed_watermarks(|watermarks| watermarks)
+    }
+
+    /// Run an action against a confirmed watermark while preventing lifecycle
+    /// changes from invalidating the reclamation decision before it completes.
+    /// The action must not re-enter this registry.
+    pub fn with_confirmed_watermarks<R>(&self, action: impl FnOnce(ActiveTxnWatermarks) -> R) -> R {
+        let _snapshot = self.inner.lifecycle.snapshot();
+        action(self.inner.confirmed_scan_and_publish())
     }
 
     pub fn confirmed_oldest_active_rw_read_ts(&self) -> ReadTs {
@@ -391,7 +411,6 @@ impl ActiveTxnRegistry {
             lower_atomic_min(&self.inner.oldest_active_rw_read_ts, read_ts.into_raw());
             lower_atomic_min(&self.inner.oldest_active_rw_start_ts, start_ts.into_raw());
         }
-        self.inner.mark_lifecycle_dirty();
 
         Ok(Some(ActiveSlotRef {
             registry: self.inner.clone(),
@@ -528,7 +547,9 @@ impl ActiveTxnRegistryInner {
     }
 
     fn promote_slot(&self, slot_ref: &ActiveSlotRef) -> Result<()> {
+        let mut mutation = self.lifecycle.begin_mutation();
         let slot = self.slot(slot_ref)?;
+        let mut changed = false;
 
         loop {
             let state = ActiveTxnState::from_raw(slot.state.load(Ordering::Acquire));
@@ -555,7 +576,7 @@ impl ActiveTxnRegistryInner {
                                 &self.oldest_active_rw_start_ts,
                                 slot.start_ts.load(Ordering::Acquire),
                             );
-                            self.mark_lifecycle_dirty();
+                            changed = true;
                             break;
                         }
                         Err(actual)
@@ -579,10 +600,14 @@ impl ActiveTxnRegistryInner {
             self.watermark_epoch.load(Ordering::Acquire),
             Ordering::Release,
         );
+        if changed {
+            mutation.mark_changed();
+        }
         Ok(())
     }
 
     fn release_slot(&self, slot_ref: &ActiveSlotRef) -> Result<()> {
+        let mut mutation = self.lifecycle.begin_mutation();
         let shard = self
             .shards
             .get(slot_ref.shard_index)
@@ -623,30 +648,22 @@ impl ActiveTxnRegistryInner {
         if was_read_write {
             self.active_rw_count.fetch_sub(1, Ordering::AcqRel);
         }
-        self.mark_lifecycle_dirty();
+        mutation.mark_changed();
         Ok(())
     }
 
     fn confirmed_scan_and_publish(&self) -> ActiveTxnWatermarks {
-        loop {
-            let dirty_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
-            if self.confirmed_lifecycle_epoch.load(Ordering::Acquire) == dirty_epoch {
-                return self.watermarks();
-            }
-
-            let _guard = self.confirm_scan_lock.lock();
-            let dirty_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
-            if self.confirmed_lifecycle_epoch.load(Ordering::Acquire) == dirty_epoch {
-                return self.watermarks();
-            }
-
-            let watermarks = self.scan_and_publish();
-            if self.lifecycle_epoch.load(Ordering::Acquire) == dirty_epoch {
-                self.confirmed_lifecycle_epoch
-                    .store(dirty_epoch, Ordering::Release);
-                return watermarks;
-            }
+        let dirty_epoch = self.lifecycle.dirty_epoch();
+        if self.lifecycle.is_confirmed(dirty_epoch) {
+            return self.watermarks();
         }
+        self.scan_and_confirm()
+    }
+
+    fn scan_and_confirm(&self) -> ActiveTxnWatermarks {
+        let watermarks = self.scan_and_publish();
+        self.lifecycle.confirm();
+        watermarks
     }
 
     fn scan_and_publish(&self) -> ActiveTxnWatermarks {
@@ -781,11 +798,6 @@ impl ActiveTxnRegistryInner {
         }
         Ok(slot)
     }
-
-    #[inline]
-    fn mark_lifecycle_dirty(&self) {
-        self.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
-    }
 }
 
 impl ActiveSlotRef {
@@ -875,6 +887,7 @@ fn release_handle_slot(slot: &mut Option<ActiveSlotRef>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn active_handle_promotes_and_releases_slot() {
@@ -961,6 +974,41 @@ mod tests {
 
         let fourth = registry.confirmed_watermarks();
         assert_eq!(third.epoch, fourth.epoch);
+    }
+
+    #[test]
+    fn watermark_snapshot_waits_for_frontier_sampling_registration() {
+        let registry = ActiveTxnRegistry::with_capacity(1, 4);
+        let registration_registry = registry.clone();
+        let (sampling_started_tx, sampling_started_rx) = mpsc::channel();
+        let (resume_sampling_tx, resume_sampling_rx) = mpsc::channel();
+
+        let registration = thread::spawn(move || {
+            registration_registry.register_with_read_ts(TxnId::new(1), || {
+                sampling_started_tx.send(()).unwrap();
+                resume_sampling_rx.recv().unwrap();
+                ReadTs::new(7)
+            })
+        });
+        sampling_started_rx.recv().unwrap();
+
+        let observer_registry = registry.clone();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let observer = thread::spawn(move || {
+            observed_tx.send(observer_registry.watermarks()).unwrap();
+        });
+        assert!(observed_rx.recv_timeout(Duration::from_millis(25)).is_err());
+
+        resume_sampling_tx.send(()).unwrap();
+        let (read_ts, handle) = registration.join().unwrap().unwrap();
+        let watermarks = observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        observer.join().unwrap();
+
+        assert_eq!(read_ts, ReadTs::new(7));
+        assert_eq!(watermarks.active_count, 1);
+        assert_eq!(watermarks.oldest_active_read_ts, ReadTs::new(7));
+        assert_eq!(watermarks.oldest_active_start_ts, ReadTs::new(7));
+        drop(handle);
     }
 
     #[test]
