@@ -252,6 +252,10 @@ impl FunctionExecContext for QueryRuntimeContext {
             .map(|value| paro_common::config::format_setting_value(&normalized_key, value))
     }
 
+    fn transaction_timestamp_micros(&self) -> Option<i64> {
+        Some(self.session.time.transaction_timestamp_micros())
+    }
+
     fn is_interrupted(&self) -> bool {
         self.session.is_interrupted()
     }

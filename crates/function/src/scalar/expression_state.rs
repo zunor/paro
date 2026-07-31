@@ -21,6 +21,15 @@ pub trait FunctionExecContext: Send + Sync {
         None
     }
 
+    /// Transaction wall-clock timestamp in microseconds since the Unix epoch.
+    ///
+    /// Runtime contexts provide this from their frozen transaction snapshot. The default keeps
+    /// lightweight function-only contexts source-compatible while allowing time functions to
+    /// reject execution without an explicit temporal anchor.
+    fn transaction_timestamp_micros(&self) -> Option<i64> {
+        None
+    }
+
     fn is_interrupted(&self) -> bool {
         false
     }
