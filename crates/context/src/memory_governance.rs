@@ -45,6 +45,14 @@ impl QueryMemoryBudgetSpec {
 pub trait QueryMemoryTarget: Send + Sync + fmt::Debug {
     fn capacity_bytes(&self) -> usize;
     fn set_capacity_bytes(&self, bytes: usize);
+    /// Atomically relinquish up to `bytes` of capacity that is not issued.
+    ///
+    /// Returns the amount removed from this target's capacity.
+    fn relinquish_unused_capacity(&self, bytes: usize) -> usize;
+    /// Atomically grant up to `bytes` without exceeding `max_capacity`.
+    ///
+    /// Returns the amount added to this target's capacity.
+    fn grant_capacity(&self, bytes: usize, max_capacity: usize) -> usize;
     fn issued_bytes(&self) -> usize;
     fn reclaimable_bytes(&self) -> usize;
     fn reclaim(&self, target_bytes: usize) -> MemoryResult<usize>;
@@ -94,7 +102,9 @@ pub trait QueryMemoryCoordinator: Send + Sync + fmt::Debug {
 
     fn unregister_query(&self, query_id: u64);
 
-    fn reclaim_for_query(
+    /// Transfer peer capacity, reclaiming memory when necessary, and return
+    /// the capacity actually granted to the requester.
+    fn request_additional_capacity(
         &self,
         requester_query_id: u64,
         target_bytes: usize,

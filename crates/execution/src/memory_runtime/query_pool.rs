@@ -21,10 +21,30 @@ use super::{
 };
 
 const DEFAULT_UNBOUNDED_QUERY_CAPACITY: usize = usize::MAX / 4;
+const CAPACITY_WRITE_LOCK: usize = 1usize << (usize::BITS - 1);
+const CAPACITY_READER_MASK: usize = CAPACITY_WRITE_LOCK - 1;
+
+struct CapacityReadGuard<'a>(&'a AtomicUsize);
+
+impl Drop for CapacityReadGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous & CAPACITY_READER_MASK > 0);
+    }
+}
+
+struct CapacityWriteGuard<'a>(&'a AtomicUsize);
+
+impl Drop for CapacityWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
 
 /// Per-query memory pool. Capacity checks use issued bytes, not observed usage.
 pub struct QueryMemoryPool {
     capacity_bytes: AtomicUsize,
+    capacity_gate: AtomicUsize,
     issued_bytes: AtomicUsize,
     published_used_bytes: AtomicUsize,
     non_revocable_bytes: AtomicUsize,
@@ -53,6 +73,7 @@ impl QueryMemoryPool {
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
             capacity_bytes: AtomicUsize::new(capacity_bytes),
+            capacity_gate: AtomicUsize::new(0),
             issued_bytes: AtomicUsize::new(0),
             published_used_bytes: AtomicUsize::new(0),
             non_revocable_bytes: AtomicUsize::new(0),
@@ -87,7 +108,85 @@ impl QueryMemoryPool {
     }
 
     pub fn set_capacity_bytes(&self, capacity_bytes: usize) {
+        let _guard = self.capacity_write_guard();
         self.capacity_bytes.store(capacity_bytes, Ordering::Release);
+    }
+
+    fn relinquish_unused_capacity(&self, target_bytes: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+
+        let _guard = self.capacity_write_guard();
+        let capacity = self.capacity_bytes.load(Ordering::Acquire);
+        let issued = self.issued_bytes.load(Ordering::Acquire);
+        let relinquished = target_bytes.min(capacity.saturating_sub(issued));
+        if relinquished > 0 {
+            self.capacity_bytes
+                .store(capacity - relinquished, Ordering::Release);
+        }
+        relinquished
+    }
+
+    fn grant_capacity(&self, target_bytes: usize, max_capacity: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+
+        let _guard = self.capacity_write_guard();
+        let capacity = self.capacity_bytes.load(Ordering::Acquire);
+        let granted = target_bytes.min(max_capacity.saturating_sub(capacity));
+        if granted > 0 {
+            self.capacity_bytes
+                .store(capacity + granted, Ordering::Release);
+        }
+        granted
+    }
+
+    fn capacity_read_guard(&self) -> CapacityReadGuard<'_> {
+        let mut state = self.capacity_gate.load(Ordering::Acquire);
+        loop {
+            if state & CAPACITY_WRITE_LOCK != 0
+                || state & CAPACITY_READER_MASK == CAPACITY_READER_MASK
+            {
+                std::hint::spin_loop();
+                state = self.capacity_gate.load(Ordering::Acquire);
+                continue;
+            }
+            match self.capacity_gate.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return CapacityReadGuard(&self.capacity_gate),
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    fn capacity_write_guard(&self) -> CapacityWriteGuard<'_> {
+        let mut state = self.capacity_gate.load(Ordering::Acquire);
+        loop {
+            if state & CAPACITY_WRITE_LOCK != 0 {
+                std::hint::spin_loop();
+                state = self.capacity_gate.load(Ordering::Acquire);
+                continue;
+            }
+            match self.capacity_gate.compare_exchange_weak(
+                state,
+                state | CAPACITY_WRITE_LOCK,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => state = actual,
+            }
+        }
+        while self.capacity_gate.load(Ordering::Acquire) != CAPACITY_WRITE_LOCK {
+            std::hint::spin_loop();
+        }
+        CapacityWriteGuard(&self.capacity_gate)
     }
 
     pub fn attach_registration(&self, registration: QueryMemoryRegistration) {
@@ -306,7 +405,7 @@ impl QueryMemoryPool {
                     if self.reclaim(target)? > 0 {
                         continue;
                     }
-                    if self.reclaim_from_peers(target)? > 0 {
+                    if self.request_peer_capacity(target)? > 0 {
                         continue;
                     }
                     return Err(err);
@@ -330,7 +429,7 @@ impl QueryMemoryPool {
             Err(err @ MemoryError::QuotaExhausted { .. }) => {
                 let target = quota_deficit(&err);
                 let Some(handle) = self.start_reclaim(target, interrupt)? else {
-                    if self.reclaim_from_peers(target)? > 0 {
+                    if self.request_peer_capacity(target)? > 0 {
                         self.try_grow(bytes)?;
                         return Ok(GrowOutcome::Granted);
                     }
@@ -342,7 +441,7 @@ impl QueryMemoryPool {
                         Ok(GrowOutcome::Granted)
                     }
                     Some(Ok(_)) => {
-                        if self.reclaim_from_peers(target)? > 0 {
+                        if self.request_peer_capacity(target)? > 0 {
                             self.try_grow(bytes)?;
                             Ok(GrowOutcome::Granted)
                         } else {
@@ -443,6 +542,10 @@ impl QueryMemoryPool {
     }
 
     fn try_issue(&self, bytes: usize) -> MemoryResult<()> {
+        // Capacity mutations take the write side of this gate. Keeping the
+        // read side across the issued CAS prevents a concurrent shrink from
+        // donating headroom that this request has already consumed.
+        let _guard = self.capacity_read_guard();
         let mut current = self.issued_bytes.load(Ordering::Relaxed);
         loop {
             let capacity = self.capacity_bytes();
@@ -503,7 +606,7 @@ impl QueryMemoryPool {
             .clone()
     }
 
-    fn reclaim_from_peers(&self, target_bytes: usize) -> MemoryResult<usize> {
+    fn request_peer_capacity(&self, target_bytes: usize) -> MemoryResult<usize> {
         struct PeerReclaimGuard<'a>(&'a AtomicBool);
 
         impl Drop for PeerReclaimGuard<'_> {
@@ -522,7 +625,7 @@ impl QueryMemoryPool {
         };
         registration
             .coordinator()
-            .reclaim_for_query(registration.query_id(), target_bytes)
+            .request_additional_capacity(registration.query_id(), target_bytes)
     }
 
     fn record_reclaim_stats(&self, stats: &ReclaimStats, started_at: Instant) {
@@ -547,6 +650,14 @@ impl QueryMemoryTarget for QueryMemoryPool {
 
     fn set_capacity_bytes(&self, bytes: usize) {
         QueryMemoryPool::set_capacity_bytes(self, bytes);
+    }
+
+    fn relinquish_unused_capacity(&self, bytes: usize) -> usize {
+        QueryMemoryPool::relinquish_unused_capacity(self, bytes)
+    }
+
+    fn grant_capacity(&self, bytes: usize, max_capacity: usize) -> usize {
+        QueryMemoryPool::grant_capacity(self, bytes, max_capacity)
     }
 
     fn issued_bytes(&self) -> usize {

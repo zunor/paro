@@ -120,13 +120,20 @@ impl Executor {
 
     fn create_query_memory_pool(&self) -> Arc<QueryMemoryPool> {
         let governance = self.session.query_governance();
-        // Workload governance may tighten a session limit, but it must never
-        // loosen the statement-scoped ceiling captured by the front end.
-        let hard_limit_bytes = governance
+        // Workload governance and the process buffer pool may tighten a
+        // session limit, but neither may loosen the statement-scoped ceiling
+        // captured by the front end. A zero physical limit means unbounded.
+        let configured_limit = governance
             .memory_quota
             .map(|quota| quota.min(self.session.limits.max_memory))
-            .unwrap_or(self.session.limits.max_memory)
-            .max(1);
+            .unwrap_or(self.session.limits.max_memory);
+        let physical_limit = self.session.buffer_manager().get_max_memory();
+        let hard_limit_bytes = if physical_limit == 0 {
+            configured_limit
+        } else {
+            configured_limit.min(physical_limit)
+        }
+        .max(1);
         let Some(coordinator) = self.session.query_memory_coordinator() else {
             return Arc::new(QueryMemoryPool::new(hard_limit_bytes));
         };
@@ -166,6 +173,22 @@ mod tests {
         let pool = Executor::new(context).create_query_memory_pool();
 
         assert_eq!(pool.capacity_bytes(), 4_096);
+    }
+
+    #[test]
+    fn query_pool_cannot_exceed_physical_limit_without_coordinator() {
+        let context = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits {
+                max_memory: 128 * 1024 * 1024,
+                ..RuntimeLimits::default()
+            })
+            .build();
+
+        let physical_limit = context.buffer_manager().get_max_memory();
+        let pool = Executor::new(context).create_query_memory_pool();
+
+        assert_eq!(physical_limit, 64 * 1024 * 1024);
+        assert_eq!(pool.capacity_bytes(), physical_limit);
     }
 
     #[test]

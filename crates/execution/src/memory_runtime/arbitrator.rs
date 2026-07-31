@@ -161,7 +161,7 @@ impl MemoryArbitrator {
         QueryMemoryRegistration::new(coordinator, query_id)
     }
 
-    fn reclaim_from_peers(
+    fn acquire_capacity_from_peers(
         &self,
         requester_query_id: u64,
         target_bytes: usize,
@@ -170,7 +170,7 @@ impl MemoryArbitrator {
             return Ok(0);
         }
 
-        let (requester, max_capacity, reclaim_target, mut peers) = {
+        let (requester, reclaim_target, mut peers) = {
             let mut registry = self
                 .registry
                 .lock()
@@ -199,27 +199,51 @@ impl MemoryArbitrator {
                     if *query_id == requester_query_id {
                         return None;
                     }
-                    entry
-                        .target
-                        .upgrade()
-                        .map(|target| (*query_id, target.reclaimable_bytes(), target))
+                    entry.target.upgrade().map(|target| {
+                        let reclaimable = target.reclaimable_bytes();
+                        let unused = target
+                            .capacity_bytes()
+                            .saturating_sub(target.issued_bytes());
+                        (
+                            *query_id,
+                            unused.saturating_add(reclaimable),
+                            reclaimable,
+                            target,
+                        )
+                    })
                 })
                 .collect();
-            (requester, max_capacity, reclaim_target, peers)
+            (requester, reclaim_target, peers)
         };
         peers.sort_by(|left, right| right.1.cmp(&left.1));
 
-        let mut reclaimed = 0usize;
+        let mut granted = 0usize;
         let mut first_error = None;
-        for (_, reclaimable, target) in peers {
-            if reclaimed >= reclaim_target {
+        for (peer_query_id, _, reclaimable, target) in peers {
+            if granted >= reclaim_target {
                 break;
             }
-            if reclaimable == 0 {
+            granted = granted.saturating_add(self.transfer_unused_capacity(
+                requester_query_id,
+                &requester,
+                peer_query_id,
+                &target,
+                reclaim_target - granted,
+            ));
+            if granted >= reclaim_target || reclaimable == 0 {
                 continue;
             }
-            match target.reclaim(reclaim_target - reclaimed) {
-                Ok(bytes) => reclaimed = reclaimed.saturating_add(bytes),
+
+            match target.reclaim(reclaim_target - granted) {
+                Ok(bytes) => {
+                    granted = granted.saturating_add(self.transfer_unused_capacity(
+                        requester_query_id,
+                        &requester,
+                        peer_query_id,
+                        &target,
+                        bytes.min(reclaim_target - granted),
+                    ));
+                }
                 Err(err) => {
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -228,21 +252,62 @@ impl MemoryArbitrator {
             }
         }
 
-        if reclaimed == 0 {
+        if granted == 0 {
             if let Some(err) = first_error {
                 return Err(err);
             }
         }
-        if reclaimed > 0 {
-            let credited = reclaimed.min(reclaim_target);
-            let target_capacity = requester
-                .capacity_bytes()
-                .saturating_add(credited)
-                .min(max_capacity);
-            requester.set_capacity_bytes(target_capacity);
-            return Ok(credited);
+        Ok(granted)
+    }
+
+    fn transfer_unused_capacity(
+        &self,
+        requester_query_id: u64,
+        requester: &Arc<dyn QueryMemoryTarget>,
+        peer_query_id: u64,
+        peer: &Arc<dyn QueryMemoryTarget>,
+        target_bytes: usize,
+    ) -> usize {
+        if target_bytes == 0 {
+            return 0;
         }
-        Ok(0)
+
+        // Capacity recomputation and peer transfers share the registry lock.
+        // Revalidate both registrations after running the peer's reclaimer so
+        // an unregistered target cannot donate capacity that was redistributed
+        // by a concurrent refresh.
+        let registry = self
+            .registry
+            .lock()
+            .expect("query memory registry lock poisoned");
+        let Some((max_capacity, registered_requester)) =
+            registry.queries.get(&requester_query_id).and_then(|entry| {
+                entry
+                    .target
+                    .upgrade()
+                    .map(|target| (entry.spec.desired_bytes(), target))
+            })
+        else {
+            return 0;
+        };
+        if !Arc::ptr_eq(&registered_requester, requester) {
+            return 0;
+        }
+        let Some(registered_peer) = registry
+            .queries
+            .get(&peer_query_id)
+            .and_then(|entry| entry.target.upgrade())
+        else {
+            return 0;
+        };
+        if !Arc::ptr_eq(&registered_peer, peer) {
+            return 0;
+        }
+
+        let requester_headroom = max_capacity.saturating_sub(requester.capacity_bytes());
+        let transferable = target_bytes.min(requester_headroom);
+        let relinquished = peer.relinquish_unused_capacity(transferable);
+        requester.grant_capacity(relinquished, max_capacity)
     }
 }
 
@@ -270,12 +335,12 @@ impl QueryMemoryCoordinator for MemoryArbitrator {
         self.refresh_query_capacities();
     }
 
-    fn reclaim_for_query(
+    fn request_additional_capacity(
         &self,
         requester_query_id: u64,
         target_bytes: usize,
     ) -> MemoryResult<usize> {
-        self.reclaim_from_peers(requester_query_id, target_bytes)
+        self.acquire_capacity_from_peers(requester_query_id, target_bytes)
     }
 
     fn available_for_queries(&self) -> usize {
