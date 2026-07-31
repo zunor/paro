@@ -551,7 +551,10 @@ fn test_compaction_crash_before_replace_restarts_from_persisted_meta() {
     let output = RowsetMerger::build(&tablet, Arc::new(plan), workspace, compaction_allocator())
         .unwrap()
         .expect("merge should produce staged output");
-    let staged_rowset_dir = match output {
+    // Keep the build output alive while checking the pre-crash state. Dropping
+    // it enqueues normal workspace cleanup, which is not part of this crash
+    // simulation and would race the existence assertion below.
+    let staged_rowset_dir = match &output {
         CompactionBuildOutput::Rowset(artifact) => artifact.workspace.rowset_dir.clone(),
         CompactionBuildOutput::PrimaryKey { .. } => panic!("expected duplicate-key output"),
     };
