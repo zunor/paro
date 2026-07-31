@@ -760,7 +760,10 @@ fn apply_threads(session: &mut Session, value: &Value) -> Result<()> {
 
 fn apply_memory_limit(session: &mut Session, value: &Value) -> Result<()> {
     let limit = value_to_usize(value, "memory_limit")?;
-    session.instance.set_memory_limit(limit)?;
+    // The instance buffer pool is the physical process-wide ceiling. A session
+    // setting must only resize memory owned by this session; statement pools
+    // receive the same limit through their frozen RuntimeLimits snapshot.
+    session.session_memory_budget().set_capacity_bytes(limit);
     Ok(())
 }
 
@@ -976,6 +979,41 @@ mod tests {
         assert_eq!(
             render_setting_value("max_temp_directory_size", &Value::BigInt(512_000_000)),
             "512MB"
+        );
+    }
+
+    #[test]
+    fn memory_limit_is_scoped_to_one_session() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let instance_limit = instance.get_buffer_manager().get_max_memory();
+        let session_default = instance.boot_config().initial_maximum_memory;
+        let session_limit = session_default / 2;
+        let mut first = crate::Session::new(1, instance.clone());
+        let second = crate::Session::new(2, instance.clone());
+
+        first
+            .set_session_setting("memory_limit", Value::BigInt(session_limit as i64))
+            .unwrap();
+
+        assert_eq!(
+            instance.get_buffer_manager().get_max_memory(),
+            instance_limit
+        );
+        assert_eq!(
+            first.session_memory_budget().capacity_bytes(),
+            session_limit
+        );
+        assert_eq!(
+            second.session_memory_budget().capacity_bytes(),
+            session_default
+        );
+        assert_eq!(
+            first.freeze_query_context().limits.max_memory,
+            session_limit
+        );
+        assert_eq!(
+            second.freeze_query_context().limits.max_memory,
+            session_default
         );
     }
 }

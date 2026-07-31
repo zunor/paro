@@ -120,22 +120,24 @@ impl Executor {
 
     fn create_query_memory_pool(&self) -> Arc<QueryMemoryPool> {
         let governance = self.session.query_governance();
+        // Workload governance may tighten a session limit, but it must never
+        // loosen the statement-scoped ceiling captured by the front end.
+        let hard_limit_bytes = governance
+            .memory_quota
+            .map(|quota| quota.min(self.session.limits.max_memory))
+            .unwrap_or(self.session.limits.max_memory)
+            .max(1);
         let Some(coordinator) = self.session.query_memory_coordinator() else {
-            let requested_bytes = governance.memory_quota.unwrap_or(usize::MAX / 4).max(1);
-            return Arc::new(QueryMemoryPool::new(requested_bytes));
+            return Arc::new(QueryMemoryPool::new(hard_limit_bytes));
         };
 
-        let requested_bytes = governance
-            .memory_quota
-            .unwrap_or_else(|| coordinator.available_for_queries())
-            .max(1);
-        let pool = Arc::new(QueryMemoryPool::new(requested_bytes));
+        let pool = Arc::new(QueryMemoryPool::new(hard_limit_bytes));
         let query_id = coordinator.next_query_id();
         let spec = QueryMemoryBudgetSpec::new(
             query_id,
             governance.query_group.clone(),
-            requested_bytes,
-            governance.memory_quota,
+            hard_limit_bytes,
+            Some(hard_limit_bytes),
         );
         let target: Arc<dyn QueryMemoryTarget> = pool.clone();
         let registration = coordinator
@@ -143,5 +145,46 @@ impl Executor {
             .register_query(spec, Arc::downgrade(&target));
         pool.attach_registration(registration);
         pool
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+    use paro_context::{RuntimeLimits, TestStatementContextBuilder};
+    use std::sync::Arc;
+
+    #[test]
+    fn query_pool_honors_statement_memory_limit_without_coordinator() {
+        let context = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits {
+                max_memory: 4_096,
+                ..RuntimeLimits::default()
+            })
+            .build();
+
+        let pool = Executor::new(context).create_query_memory_pool();
+
+        assert_eq!(pool.capacity_bytes(), 4_096);
+    }
+
+    #[test]
+    fn registered_query_pool_cannot_exceed_statement_memory_limit() {
+        let mut context = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits {
+                max_memory: 4_096,
+                ..RuntimeLimits::default()
+            })
+            .build();
+        let arbitrator = Arc::new(crate::memory_runtime::MemoryArbitrator::new(16_384));
+        let context_mut = Arc::make_mut(&mut context);
+        let services = Arc::make_mut(&mut context_mut.services);
+        services.governance.memory_quota = Some(8_192);
+        Arc::make_mut(&mut services.infra).query_memory_coordinator = Some(arbitrator);
+
+        let pool = Executor::new(context).create_query_memory_pool();
+
+        assert_eq!(pool.capacity_bytes(), 4_096);
+        assert!(pool.registered_query_id().is_some());
     }
 }

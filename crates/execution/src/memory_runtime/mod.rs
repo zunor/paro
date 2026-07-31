@@ -294,6 +294,41 @@ mod tests {
     }
 
     #[test]
+    fn query_pool_cannot_reclaim_past_its_hard_quota() {
+        let arbitrator = Arc::new(MemoryArbitrator::new(200));
+        let pool_a = Arc::new(QueryMemoryPool::new(100));
+        let target_a: Arc<dyn QueryMemoryTarget> = pool_a.clone();
+        let registration_a = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(1, Some("a".to_string()), 100, Some(100)),
+            Arc::downgrade(&target_a),
+        );
+        pool_a.attach_registration(registration_a);
+
+        let pool_b = Arc::new(QueryMemoryPool::new(200));
+        let target_b: Arc<dyn QueryMemoryTarget> = pool_b.clone();
+        let registration_b = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(2, Some("b".to_string()), 200, None),
+            Arc::downgrade(&target_b),
+        );
+        pool_b.attach_registration(registration_b);
+        pool_b.try_grow(100).unwrap();
+        pool_b.record_allocation(
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+            60,
+        );
+        pool_b.register_reclaimer(Arc::new(TestReclaimer {
+            pool: pool_b.clone(),
+            available: AtomicUsize::new(60),
+        }));
+
+        assert!(pool_a.try_grow(150).is_err());
+        assert_eq!(pool_a.capacity_bytes(), 100);
+        assert_eq!(pool_b.issued_bytes(), 100);
+    }
+
+    #[test]
     fn system_reserve_reduces_query_capacity_and_releases_on_drop() {
         let arbitrator = Arc::new(MemoryArbitrator::new(1_024));
         let reserve = Arc::new(SystemReserve::new(arbitrator.clone()));

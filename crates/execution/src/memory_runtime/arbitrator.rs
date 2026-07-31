@@ -170,7 +170,7 @@ impl MemoryArbitrator {
             return Ok(0);
         }
 
-        let mut peers: Vec<_> = {
+        let (requester, max_capacity, reclaim_target, mut peers) = {
             let mut registry = self
                 .registry
                 .lock()
@@ -178,7 +178,21 @@ impl MemoryArbitrator {
             registry
                 .queries
                 .retain(|_, entry| entry.target.upgrade().is_some());
-            registry
+            let Some(entry) = registry.queries.get(&requester_query_id) else {
+                return Ok(0);
+            };
+            let Some(requester) = entry.target.upgrade() else {
+                return Ok(0);
+            };
+            let max_capacity = entry.spec.desired_bytes();
+            // Peer reclaim redistributes existing capacity. It cannot create
+            // headroom beyond the requester's registered hard quota.
+            let reclaim_target =
+                target_bytes.min(max_capacity.saturating_sub(requester.capacity_bytes()));
+            if reclaim_target == 0 {
+                return Ok(0);
+            }
+            let peers: Vec<_> = registry
                 .queries
                 .iter()
                 .filter_map(|(query_id, entry)| {
@@ -190,20 +204,21 @@ impl MemoryArbitrator {
                         .upgrade()
                         .map(|target| (*query_id, target.reclaimable_bytes(), target))
                 })
-                .collect()
+                .collect();
+            (requester, max_capacity, reclaim_target, peers)
         };
         peers.sort_by(|left, right| right.1.cmp(&left.1));
 
         let mut reclaimed = 0usize;
         let mut first_error = None;
         for (_, reclaimable, target) in peers {
-            if reclaimed >= target_bytes {
+            if reclaimed >= reclaim_target {
                 break;
             }
             if reclaimable == 0 {
                 continue;
             }
-            match target.reclaim(target_bytes - reclaimed) {
+            match target.reclaim(reclaim_target - reclaimed) {
                 Ok(bytes) => reclaimed = reclaimed.saturating_add(bytes),
                 Err(err) => {
                     if first_error.is_none() {
@@ -219,25 +234,15 @@ impl MemoryArbitrator {
             }
         }
         if reclaimed > 0 {
-            let requester = {
-                let registry = self
-                    .registry
-                    .lock()
-                    .expect("query memory registry lock poisoned");
-                registry
-                    .queries
-                    .get(&requester_query_id)
-                    .and_then(|entry| entry.target.upgrade())
-            };
-            if let Some(requester) = requester {
-                let target_capacity = requester
-                    .capacity_bytes()
-                    .saturating_add(reclaimed)
-                    .max(requester.issued_bytes().saturating_add(target_bytes));
-                requester.set_capacity_bytes(target_capacity);
-            }
+            let credited = reclaimed.min(reclaim_target);
+            let target_capacity = requester
+                .capacity_bytes()
+                .saturating_add(credited)
+                .min(max_capacity);
+            requester.set_capacity_bytes(target_capacity);
+            return Ok(credited);
         }
-        Ok(reclaimed)
+        Ok(0)
     }
 }
 
