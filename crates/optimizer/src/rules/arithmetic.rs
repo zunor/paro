@@ -7,9 +7,13 @@
 //! - `x + 0` → `x`
 //! - `x - 0` → `x`
 //! - `x * 1` → `x`
-//! - `x * 0` → `0`
 //! - `x / 1` → `x`
-//! - `x / 0` → `NULL`
+//! - `x / 0` → `NULL` when evaluating `x` is passive
+//!
+//! These algebraic identities are restricted to integral expressions. IEEE floating-point
+//! arithmetic has observable signed-zero and non-finite behavior that the identities do not
+//! preserve. Multiplication by zero is intentionally not simplified: Paro expressions do not
+//! currently carry enough nullability information to distinguish `NULL * 0` from `x * 0`.
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -57,8 +61,9 @@ impl ExpressionMatcher for ArithmeticSimplificationMatcher {
             return false;
         }
 
-        // Only match numeric types
-        if !is_numeric_type(&func.return_type) {
+        // Algebraic identities are only sound for exact integral arithmetic. Constant folding
+        // still handles fully constant floating-point expressions using the runtime semantics.
+        if !is_integral_type(&func.return_type) {
             return false;
         }
 
@@ -67,8 +72,8 @@ impl ExpressionMatcher for ArithmeticSimplificationMatcher {
     }
 }
 
-/// Check if a type is numeric (integer or floating point).
-fn is_numeric_type(ty: &LogicalType) -> bool {
+/// Check whether a type uses exact integral arithmetic.
+fn is_integral_type(ty: &LogicalType) -> bool {
     matches!(
         ty,
         LogicalType::TinyInt
@@ -81,8 +86,6 @@ fn is_numeric_type(ty: &LogicalType) -> bool {
             | LogicalType::UInteger
             | LogicalType::UBigInt
             | LogicalType::UHugeInt
-            | LogicalType::Float
-            | LogicalType::Double
     )
 }
 
@@ -134,7 +137,7 @@ impl Rule for ArithmeticSimplificationRule {
 
         // Check for NULL in either operand
         if let Expression::Constant(c) = left {
-            if c.value.is_null() {
+            if c.value.is_null() && right.is_passive_value() {
                 return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
                     value: Value::Null(return_type),
                     return_type: func.return_type.clone(),
@@ -142,7 +145,7 @@ impl Rule for ArithmeticSimplificationRule {
             }
         }
         if let Expression::Constant(c) = right {
-            if c.value.is_null() {
+            if c.value.is_null() && left.is_passive_value() {
                 return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
                     value: Value::Null(return_type),
                     return_type: func.return_type.clone(),
@@ -152,7 +155,7 @@ impl Rule for ArithmeticSimplificationRule {
         match func.builtin_intrinsic() {
             Some(BuiltinIntrinsicId::Add) => simplify_add_expr(left, right),
             Some(BuiltinIntrinsicId::Subtract) => simplify_subtract_expr(left, right),
-            Some(BuiltinIntrinsicId::Multiply) => simplify_multiply_expr(left, right, &return_type),
+            Some(BuiltinIntrinsicId::Multiply) => simplify_multiply_expr(left, right),
             Some(BuiltinIntrinsicId::Divide | BuiltinIntrinsicId::IntegerDivide) => {
                 simplify_divide_expr(left, right, &return_type)
             }
@@ -193,34 +196,22 @@ fn simplify_subtract_expr(left: &Expression, right: &Expression) -> RuleResult {
     RuleResult::NoChange
 }
 
-/// Simplify multiplication: x * 1 = x, x * 0 = 0
-fn simplify_multiply_expr(
-    left: &Expression,
-    right: &Expression,
-    return_type: &LogicalType,
-) -> RuleResult {
+/// Simplify multiplication: x * 1 = x.
+///
+/// `x * 0` cannot become a non-null constant without proving that `x` is non-null. Keeping the
+/// expression also avoids applying integer algebra to future numeric types with wider value
+/// domains.
+fn simplify_multiply_expr(left: &Expression, right: &Expression) -> RuleResult {
     // Check right operand
     if let Expression::Constant(c) = right {
         if is_one(&c.value) {
             return RuleResult::Changed(Box::new(left.clone()));
-        }
-        if is_zero(&c.value) {
-            return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                value: make_zero(return_type),
-                return_type: return_type.clone(),
-            })));
         }
     }
     // Check left operand
     if let Expression::Constant(c) = left {
         if is_one(&c.value) {
             return RuleResult::Changed(Box::new(right.clone()));
-        }
-        if is_zero(&c.value) {
-            return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                value: make_zero(return_type),
-                return_type: return_type.clone(),
-            })));
         }
     }
     RuleResult::NoChange
@@ -237,7 +228,7 @@ fn simplify_divide_expr(
         if is_one(&c.value) {
             return RuleResult::Changed(Box::new(left.clone()));
         }
-        if is_zero(&c.value) {
+        if is_zero(&c.value) && left.is_passive_value() {
             return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
                 value: Value::Null(return_type.clone()),
                 return_type: return_type.clone(),
@@ -285,33 +276,15 @@ fn is_one(value: &Value) -> bool {
     }
 }
 
-/// Create a zero value of the given type.
-fn make_zero(ty: &LogicalType) -> Value {
-    match ty {
-        LogicalType::TinyInt => Value::TinyInt(0),
-        LogicalType::SmallInt => Value::SmallInt(0),
-        LogicalType::Integer => Value::Integer(0),
-        LogicalType::BigInt => Value::BigInt(0),
-        LogicalType::HugeInt => Value::HugeInt(0),
-        LogicalType::UTinyInt => Value::UTinyInt(0),
-        LogicalType::USmallInt => Value::USmallInt(0),
-        LogicalType::UInteger => Value::UInteger(0),
-        LogicalType::UBigInt => Value::UBigInt(0),
-        LogicalType::UHugeInt => Value::UHugeInt(0),
-        LogicalType::Float => Value::Float(0.0),
-        LogicalType::Double => Value::Double(0.0),
-        _ => Value::Integer(0), // fallback
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rules::expression_matcher::ExpressionMatcher;
     use paro_common::chunk::Chunk;
     use paro_common::vector::Vector;
-    use paro_function::scalar::{ExpressionState, ScalarFunction};
-    use paro_planner::expression::FunctionExpression;
+    use paro_function::scalar::{ExpressionState, FunctionStability, ScalarFunction};
+    use paro_planner::expression::{ColumnRefExpression, FunctionExpression};
+    use paro_planner::operator::ColumnBinding;
 
     fn dummy_fn(
         _input: &Chunk,
@@ -326,6 +299,13 @@ mod tests {
             value: Value::Integer(value),
             return_type: LogicalType::Integer,
         })
+    }
+
+    fn nullable_integer_value() -> Expression {
+        Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(0, 0),
+            LogicalType::Integer,
+        ))
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
@@ -376,6 +356,20 @@ mod tests {
                 dummy_fn,
             ),
             vec![left, right],
+            LogicalType::Integer,
+        ))
+    }
+
+    fn volatile_value() -> Expression {
+        Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
+                "volatile_value".to_string(),
+                vec![],
+                LogicalType::Integer,
+                dummy_fn,
+            )
+            .with_stability(FunctionStability::Volatile),
+            vec![],
             LogicalType::Integer,
         ))
     }
@@ -508,26 +502,55 @@ mod tests {
     }
 
     #[test]
-    fn test_multiply_by_zero() {
+    fn test_multiply_by_zero_does_not_erase_nullability() {
         let rule = ArithmeticSimplificationRule::new();
-
-        // 5 * 0 → 0
-        let expr = make_multiply(make_constant(5), make_constant(0));
+        let expr = make_multiply(nullable_integer_value(), make_constant(0));
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&expr, &mut bindings));
 
         let dummy_op = LogicalOperator::DummyScan;
         let result = rule.apply(&dummy_op, bindings, false);
 
-        match result {
-            RuleResult::Changed(expr) => match *expr {
-                Expression::Constant(c) => {
-                    assert_eq!(c.value, Value::Integer(0));
-                }
-                _ => panic!("Expected Constant"),
-            },
-            _ => panic!("Expected Changed result"),
-        }
+        assert!(matches!(result, RuleResult::NoChange));
+    }
+
+    #[test]
+    fn test_matcher_rejects_floating_point_identities() {
+        let matcher = ArithmeticSimplificationMatcher;
+        let expression = Expression::Function(FunctionExpression::new(
+            ScalarFunction::new(
+                "*".to_string(),
+                vec![LogicalType::Double, LogicalType::Double],
+                LogicalType::Double,
+                dummy_fn,
+            ),
+            vec![
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Double,
+                )),
+                Expression::Constant(ConstantExpression {
+                    value: Value::Double(0.0),
+                    return_type: LogicalType::Double,
+                }),
+            ],
+            LogicalType::Double,
+        ));
+        let mut bindings = Vec::new();
+
+        assert!(!matcher.matches(&expression, &mut bindings));
+    }
+
+    #[test]
+    fn test_multiply_by_zero_preserves_volatile_evaluation() {
+        let rule = ArithmeticSimplificationRule::new();
+        let expr = make_multiply(volatile_value(), make_constant(0));
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
     }
 
     #[test]
@@ -577,6 +600,18 @@ mod tests {
     }
 
     #[test]
+    fn test_divide_by_zero_preserves_volatile_evaluation() {
+        let rule = ArithmeticSimplificationRule::new();
+        let expr = make_divide(volatile_value(), make_constant(0));
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
+    }
+
+    #[test]
     fn test_arithmetic_with_null() {
         let rule = ArithmeticSimplificationRule::new();
 
@@ -601,6 +636,22 @@ mod tests {
             },
             _ => panic!("Expected Changed result with NULL"),
         }
+    }
+
+    #[test]
+    fn test_null_arithmetic_preserves_volatile_evaluation() {
+        let rule = ArithmeticSimplificationRule::new();
+        let null = Expression::Constant(ConstantExpression {
+            value: Value::Null(LogicalType::Integer),
+            return_type: LogicalType::Integer,
+        });
+        let expr = make_add(volatile_value(), null);
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
     }
 
     #[test]

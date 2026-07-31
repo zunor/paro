@@ -585,16 +585,17 @@ impl Binder {
         group_exprs: &mut Vec<Expression>,
         bound_expr: Expression,
     ) -> usize {
-        if let Some(existing_idx) = group_exprs
-            .iter()
-            .position(|existing| existing.equals(&bound_expr))
-        {
-            existing_idx
-        } else {
-            let new_idx = group_exprs.len();
-            group_exprs.push(bound_expr);
-            new_idx
+        if bound_expr.evaluation_properties().can_share_evaluation() {
+            if let Some(existing_idx) = group_exprs
+                .iter()
+                .position(|existing| existing.equals(&bound_expr))
+            {
+                return existing_idx;
+            }
         }
+        let new_idx = group_exprs.len();
+        group_exprs.push(bound_expr);
+        new_idx
     }
 
     fn expand_group_by_sets(group_by: GroupBy) -> Result<Vec<Vec<AstExpr>>> {
@@ -863,6 +864,14 @@ impl Binder {
             if matches!(order.expression, Expression::Constant(_)) {
                 continue;
             }
+            if !order
+                .expression
+                .evaluation_properties()
+                .can_share_evaluation()
+            {
+                new_orders.push(order);
+                continue;
+            }
             let mut is_duplicate = false;
             for existing_expr in &seen_expressions {
                 if order.expression.equals(existing_expr) {
@@ -948,7 +957,9 @@ impl Binder {
 mod tests {
     use super::Binder;
     use crate::binder::ir::OrderByNode;
-    use crate::expression::{ColumnRefExpression, Expression, WindowExpression, WindowFrame};
+    use crate::expression::{
+        ColumnRefExpression, Expression, FunctionExpression, WindowExpression, WindowFrame,
+    };
     use crate::operator::ColumnBinding;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
@@ -966,6 +977,19 @@ mod tests {
             ignore_nulls: false,
             return_type: LogicalType::BigInt,
         })
+    }
+
+    fn random_call() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Double,
+        ))
     }
 
     #[test]
@@ -986,6 +1010,39 @@ mod tests {
         Binder::simplify_order_by(&mut orders);
 
         assert_eq!(orders.len(), 2);
+    }
+
+    #[test]
+    fn simplify_order_by_preserves_duplicate_volatile_expressions() {
+        let random = random_call();
+        let mut orders = vec![
+            OrderByNode {
+                expression: random.clone(),
+                ascending: true,
+                nulls_first: false,
+            },
+            OrderByNode {
+                expression: random,
+                ascending: true,
+                nulls_first: false,
+            },
+        ];
+
+        Binder::simplify_order_by(&mut orders);
+
+        assert_eq!(orders.len(), 2);
+    }
+
+    #[test]
+    fn group_expression_dedup_preserves_volatile_calls() {
+        let random = random_call();
+        let mut groups = Vec::new();
+
+        let first = Binder::insert_or_get_group_expression(&mut groups, random.clone());
+        let second = Binder::insert_or_get_group_expression(&mut groups, random);
+
+        assert_eq!((first, second), (0, 1));
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]

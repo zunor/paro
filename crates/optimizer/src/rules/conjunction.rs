@@ -5,8 +5,8 @@
 //!
 //! Supported rewrites include:
 //! - `x AND true` → `x`
-//! - `x AND false` → `false`
-//! - `x OR true` → `true`
+//! - `x AND false` → `false` when the other inputs are passive
+//! - `x OR true` → `true` when the other inputs are passive
 //! - `x OR false` → `x`
 
 use paro_common::runtime_value::Value;
@@ -98,7 +98,24 @@ impl Rule for ConjunctionSimplificationRule {
 
 /// Simplify AND conjunction.
 fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
+    if conj.children.iter().any(|child| {
+        matches!(
+            child,
+            Expression::Constant(ConstantExpression {
+                value: Value::Boolean(false),
+                ..
+            })
+        )
+    }) && conj.children.iter().all(Expression::is_passive_value)
+    {
+        return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
+            value: Value::Boolean(false),
+            return_type: LogicalType::Boolean,
+        })));
+    }
+
     let mut remaining_children: Vec<Expression> = Vec::new();
+    let mut removed_identity = false;
 
     for child in &conj.children {
         match child {
@@ -106,17 +123,15 @@ fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
                 value: Value::Boolean(false),
                 ..
             }) => {
-                // FALSE in AND → entire expression is FALSE
-                return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                    value: Value::Boolean(false),
-                    return_type: LogicalType::Boolean,
-                })));
+                // Keep the absorbing value when another input owns an evaluation.
+                remaining_children.push(child.clone());
             }
             Expression::Constant(ConstantExpression {
                 value: Value::Boolean(true),
                 ..
             }) => {
                 // TRUE in AND → skip this child (remove it)
+                removed_identity = true;
             }
             _ => {
                 // Keep non-constant children
@@ -125,12 +140,32 @@ fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
         }
     }
 
+    if !removed_identity {
+        return RuleResult::NoChange;
+    }
     build_result(remaining_children, ConjunctionType::And, true)
 }
 
 /// Simplify OR conjunction.
 fn simplify_or(conj: &ConjunctionExpression) -> RuleResult {
+    if conj.children.iter().any(|child| {
+        matches!(
+            child,
+            Expression::Constant(ConstantExpression {
+                value: Value::Boolean(true),
+                ..
+            })
+        )
+    }) && conj.children.iter().all(Expression::is_passive_value)
+    {
+        return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
+            value: Value::Boolean(true),
+            return_type: LogicalType::Boolean,
+        })));
+    }
+
     let mut remaining_children: Vec<Expression> = Vec::new();
+    let mut removed_identity = false;
 
     for child in &conj.children {
         match child {
@@ -138,17 +173,15 @@ fn simplify_or(conj: &ConjunctionExpression) -> RuleResult {
                 value: Value::Boolean(true),
                 ..
             }) => {
-                // TRUE in OR → entire expression is TRUE
-                return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                    value: Value::Boolean(true),
-                    return_type: LogicalType::Boolean,
-                })));
+                // Keep the absorbing value when another input owns an evaluation.
+                remaining_children.push(child.clone());
             }
             Expression::Constant(ConstantExpression {
                 value: Value::Boolean(false),
                 ..
             }) => {
                 // FALSE in OR → skip this child (remove it)
+                removed_identity = true;
             }
             _ => {
                 // Keep non-constant children
@@ -157,6 +190,9 @@ fn simplify_or(conj: &ConjunctionExpression) -> RuleResult {
         }
     }
 
+    if !removed_identity {
+        return RuleResult::NoChange;
+    }
     build_result(remaining_children, ConjunctionType::Or, false)
 }
 
@@ -193,7 +229,9 @@ fn build_result(
 mod tests {
     use super::*;
     use crate::rules::expression_matcher::ExpressionMatcher;
-    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::expression::{
+        ColumnRefExpression, ComparisonExpression, ComparisonType, FunctionExpression,
+    };
 
     fn make_bool_constant(value: bool) -> Expression {
         Expression::Constant(ConstantExpression {
@@ -225,6 +263,26 @@ mod tests {
             conjunction_type: ConjunctionType::Or,
             children,
         })
+    }
+
+    fn volatile_bool() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        let random = || {
+            Expression::Function(FunctionExpression::new(
+                function.clone(),
+                vec![],
+                LogicalType::Double,
+            ))
+        };
+        Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            random(),
+            random(),
+        ))
     }
 
     #[test]
@@ -292,6 +350,18 @@ mod tests {
     }
 
     #[test]
+    fn test_and_false_preserves_volatile_evaluation() {
+        let rule = ConjunctionSimplificationRule::new();
+        let expr = make_and(vec![volatile_bool(), make_bool_constant(false)]);
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
+    }
+
+    #[test]
     fn test_or_with_true() {
         let rule = ConjunctionSimplificationRule::new();
 
@@ -312,6 +382,18 @@ mod tests {
             },
             _ => panic!("Expected Changed result with true"),
         }
+    }
+
+    #[test]
+    fn test_or_true_preserves_volatile_evaluation() {
+        let rule = ConjunctionSimplificationRule::new();
+        let expr = make_or(vec![volatile_bool(), make_bool_constant(true)]);
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(result, RuleResult::NoChange));
     }
 
     #[test]

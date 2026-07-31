@@ -14,9 +14,9 @@
 //! Supports all vector types: Flat, Constant, Dictionary, Sequence.
 
 use crate::scalar::executor::typed_loops::{
-    execute_binary_view, prepare_result, select_binary_view_into,
+    execute_binary_view, execute_nullable_binary_view, prepare_result, select_binary_view_into,
 };
-use crate::scalar::executor::BinaryOperator;
+use crate::scalar::executor::{BinaryOperator, NullableBinaryOperator};
 use paro_common::error::Result;
 use paro_common::vector::{SelectionVector, Vector, VectorType};
 
@@ -52,6 +52,38 @@ impl BinaryExecutor {
         }
     }
 
+    /// Execute a binary operator that can return SQL `NULL` for valid inputs.
+    ///
+    /// Input nulls are propagated as usual. A `None` returned by the operator marks only that
+    /// result row null, which lets arithmetic functions handle data-dependent invalid domains
+    /// without panicking or materializing dictionary/sequence inputs.
+    pub fn execute_nullable<LEFT, RIGHT, RESULT, OP>(
+        left: &Vector,
+        right: &Vector,
+        result: &mut Vector,
+        count: usize,
+    ) -> Result<()>
+    where
+        LEFT: Copy + 'static,
+        RIGHT: Copy + 'static,
+        RESULT: Copy,
+        OP: NullableBinaryOperator<LEFT, RIGHT, RESULT>,
+    {
+        if count == 0 {
+            prepare_result(result, VectorType::Flat, 0)?;
+            return Ok(());
+        }
+
+        if left.vector_type() == VectorType::Constant && right.vector_type() == VectorType::Constant
+        {
+            Self::execute_nullable_constant_constant::<LEFT, RIGHT, RESULT, OP>(
+                left, right, result, count,
+            )
+        } else {
+            execute_nullable_binary_view::<LEFT, RIGHT, RESULT, OP>(left, right, result, count)
+        }
+    }
+
     fn execute_constant_constant<LEFT, RIGHT, RESULT, OP>(
         left: &Vector,
         right: &Vector,
@@ -70,6 +102,35 @@ impl BinaryExecutor {
             let r_val = unsafe { *right.flat_data::<RIGHT>() };
             unsafe {
                 *result.flat_data_mut::<RESULT>() = OP::operation(l_val, r_val);
+            }
+        } else {
+            result.validity_mut().set_null(0);
+        }
+        Ok(())
+    }
+
+    fn execute_nullable_constant_constant<LEFT, RIGHT, RESULT, OP>(
+        left: &Vector,
+        right: &Vector,
+        result: &mut Vector,
+        count: usize,
+    ) -> Result<()>
+    where
+        LEFT: Copy + 'static,
+        RIGHT: Copy + 'static,
+        RESULT: Copy,
+        OP: NullableBinaryOperator<LEFT, RIGHT, RESULT>,
+    {
+        prepare_result(result, VectorType::Constant, count)?;
+        if left.validity().is_valid(0) && right.validity().is_valid(0) {
+            let left_value = unsafe { *left.flat_data::<LEFT>() };
+            let right_value = unsafe { *right.flat_data::<RIGHT>() };
+            if let Some(value) = OP::operation(left_value, right_value) {
+                unsafe {
+                    *result.flat_data_mut::<RESULT>() = value;
+                }
+            } else {
+                result.validity_mut().set_null(0);
             }
         } else {
             result.validity_mut().set_null(0);
@@ -135,6 +196,13 @@ mod tests {
     impl BinaryOperator<i64, i64, i64> for AddOpI64 {
         fn operation(left: i64, right: i64) -> i64 {
             left + right
+        }
+    }
+
+    struct CheckedDivideOp;
+    impl NullableBinaryOperator<i32, i32, i32> for CheckedDivideOp {
+        fn operation(left: i32, right: i32) -> Option<i32> {
+            left.checked_div(right)
         }
     }
 
@@ -375,6 +443,62 @@ mod tests {
         assert_eq!(result.get_i32(0), Some(11));
         assert!(result.is_null(1)); // null + 20 = null
         assert_eq!(result.get_i32(2), Some(33));
+    }
+
+    #[test]
+    fn test_execute_nullable_marks_invalid_domain_rows_null() {
+        let left = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[10, 20, 30],
+            paro_common::test_utils::test_allocator(),
+        );
+        let right_child = paro_common::test_utils::test_i32_vector_with_allocator(
+            &[2, 0],
+            paro_common::test_utils::test_allocator(),
+        );
+        let right = paro_common::test_utils::test_dictionary(Arc::new(right_child), vec![0, 1, 0]);
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, 3);
+
+        BinaryExecutor::execute_nullable::<i32, i32, i32, CheckedDivideOp>(
+            &left,
+            &right,
+            &mut result,
+            3,
+        )
+        .expect("nullable binary executor should succeed");
+
+        assert_eq!(result.get_i32(0), Some(5));
+        assert!(result.is_null(1));
+        assert_eq!(result.get_i32(2), Some(15));
+    }
+
+    #[test]
+    fn test_execute_nullable_preserves_constant_encoding() {
+        let left = paro_common::test_utils::test_constant_with_allocator(
+            LogicalType::Integer,
+            10i32,
+            4,
+            paro_common::test_utils::test_allocator(),
+        );
+        let right = paro_common::test_utils::test_constant_with_allocator(
+            LogicalType::Integer,
+            0i32,
+            4,
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, 4);
+
+        BinaryExecutor::execute_nullable::<i32, i32, i32, CheckedDivideOp>(
+            &left,
+            &right,
+            &mut result,
+            4,
+        )
+        .expect("nullable binary executor should succeed");
+
+        assert_eq!(result.vector_type(), VectorType::Constant);
+        assert!(result.is_null(0));
     }
 
     #[test]

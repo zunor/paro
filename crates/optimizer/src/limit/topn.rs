@@ -53,6 +53,13 @@ impl TopNOptimizer {
         let mut child = limit.child.as_ref();
         while child.operator.op_type() == LogicalOperatorType::Projection {
             if let LogicalOperator::Projection(proj) = &child.operator {
+                if proj
+                    .expressions
+                    .iter()
+                    .any(|expr| !expr.evaluation_properties().can_share_evaluation())
+                {
+                    return false;
+                }
                 child = proj.child.as_ref();
             } else {
                 break;
@@ -174,7 +181,7 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::binder::ir::OrderByNode;
-    use paro_planner::expression::{ConstantExpression, Expression};
+    use paro_planner::expression::{ConstantExpression, Expression, FunctionExpression};
     use paro_planner::operator::{Get, Limit, Order, Projection};
 
     fn create_test_get() -> LogicalOperator {
@@ -231,6 +238,23 @@ mod tests {
             )
             .with_output_names(vec!["id_alias".to_string(), "score_alias".to_string()]),
         )
+    }
+
+    fn create_volatile_projection(child: LogicalOperator) -> LogicalOperator {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        LogicalOperator::Projection(Projection::new(
+            42,
+            LogicalPlan::synthetic(child),
+            vec![Expression::Function(FunctionExpression::new(
+                function,
+                vec![],
+                LogicalType::Double,
+            ))],
+        ))
     }
 
     #[test]
@@ -301,6 +325,19 @@ mod tests {
             LogicalPlan::synthetic(order),
             Some(create_constant_expr(10)),
             Some(create_constant_expr(-5)),
+        ));
+
+        assert!(!TopNOptimizer::can_optimize(&limit));
+    }
+
+    #[test]
+    fn test_cannot_build_topn_through_volatile_projection() {
+        let order = create_order_by(create_test_get());
+        let projection = create_volatile_projection(order);
+        let limit = LogicalOperator::Limit(Limit::new(
+            LogicalPlan::synthetic(projection),
+            Some(create_constant_expr(10)),
+            None,
         ));
 
         assert!(!TopNOptimizer::can_optimize(&limit));

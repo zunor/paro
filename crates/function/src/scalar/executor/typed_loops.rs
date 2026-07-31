@@ -8,7 +8,9 @@ use paro_common::vector::{
     DataRef, SelectionRef, SelectionVector, ValidityRef, Vector, VectorType, VectorView,
 };
 
-use crate::scalar::executor::{BinaryOperator, TernaryOperator, UnaryOperator};
+use crate::scalar::executor::{
+    BinaryOperator, NullableBinaryOperator, TernaryOperator, UnaryOperator,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct SequenceMeta {
@@ -424,6 +426,108 @@ where
             );
         }
     }
+    Ok(())
+}
+
+/// Execute a binary operation whose valid inputs may produce a null result.
+///
+/// The ordinary binary loops can derive result validity solely from input validity. Nullable
+/// operators additionally need to inspect each value pair, so they use one selection-aware loop
+/// that covers flat, constant, dictionary, and sequence inputs without materializing them.
+pub(crate) fn execute_nullable_binary_view<LEFT, RIGHT, RESULT, OP>(
+    left: &Vector,
+    right: &Vector,
+    result: &mut Vector,
+    count: usize,
+) -> Result<()>
+where
+    LEFT: Copy + 'static,
+    RIGHT: Copy + 'static,
+    RESULT: Copy,
+    OP: NullableBinaryOperator<LEFT, RIGHT, RESULT>,
+{
+    prepare_result(result, VectorType::Flat, count)?;
+    if count == 0 {
+        return Ok(());
+    }
+
+    let left_view = left.try_to_view(count)?;
+    let right_view = right.try_to_view(count)?;
+    let result_data = unsafe { result.flat_data_mut::<RESULT>() };
+
+    // Keep the common all-valid pointer paths as tight as the ordinary binary executor. The
+    // selection-aware fallback below handles dictionary and sequence inputs.
+    if let (Some(left_ptr), Some(right_ptr)) =
+        (left_view.get_data::<LEFT>(), right_view.get_data::<RIGHT>())
+    {
+        match (left_view.sel(), right_view.sel()) {
+            (SelectionRef::Incremental { .. }, SelectionRef::Incremental { .. })
+                if validity_all_valid(left_view.validity())
+                    && validity_all_valid(right_view.validity()) =>
+            {
+                for row in 0..count {
+                    match OP::operation(unsafe { read_ptr(left_ptr, row) }, unsafe {
+                        read_ptr(right_ptr, row)
+                    }) {
+                        Some(value) => unsafe {
+                            *result_data.add(row) = value;
+                        },
+                        None => result.validity_mut().set_null(row),
+                    }
+                }
+                return Ok(());
+            }
+            (SelectionRef::Incremental { .. }, SelectionRef::Constant { .. })
+                if validity_all_valid(left_view.validity())
+                    && right_view.validity().is_valid(0) =>
+            {
+                let right_value = unsafe { read_ptr(right_ptr, 0) };
+                for row in 0..count {
+                    match OP::operation(unsafe { read_ptr(left_ptr, row) }, right_value) {
+                        Some(value) => unsafe {
+                            *result_data.add(row) = value;
+                        },
+                        None => result.validity_mut().set_null(row),
+                    }
+                }
+                return Ok(());
+            }
+            (SelectionRef::Constant { .. }, SelectionRef::Incremental { .. })
+                if left_view.validity().is_valid(0)
+                    && validity_all_valid(right_view.validity()) =>
+            {
+                let left_value = unsafe { read_ptr(left_ptr, 0) };
+                for row in 0..count {
+                    match OP::operation(left_value, unsafe { read_ptr(right_ptr, row) }) {
+                        Some(value) => unsafe {
+                            *result_data.add(row) = value;
+                        },
+                        None => result.validity_mut().set_null(row),
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    for row in 0..count {
+        if !left_view.is_valid(row) || !right_view.is_valid(row) {
+            result.validity_mut().set_null(row);
+            continue;
+        }
+
+        match OP::operation(
+            load_view_value::<LEFT>(&left_view, row),
+            load_view_value::<RIGHT>(&right_view, row),
+        ) {
+            Some(value) => unsafe {
+                *result_data.add(row) = value;
+            },
+            None => result.validity_mut().set_null(row),
+        }
+    }
+
     Ok(())
 }
 

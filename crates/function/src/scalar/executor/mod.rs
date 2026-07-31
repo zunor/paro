@@ -25,6 +25,15 @@ pub trait BinaryOperator<LEFT, RIGHT, RESULT> {
     fn operation(left: LEFT, right: RIGHT) -> RESULT;
 }
 
+/// A binary operator whose valid inputs can still produce SQL `NULL`.
+///
+/// This is distinct from [`BinaryOperator`]: input validity alone does not determine result
+/// validity for operations such as division and remainder, where a zero divisor yields `NULL`.
+pub trait NullableBinaryOperator<LEFT, RIGHT, RESULT> {
+    /// Return `None` when this input pair produces SQL `NULL`.
+    fn operation(left: LEFT, right: RIGHT) -> Option<RESULT>;
+}
+
 /// Trait for a ternary operator (e.g., BETWEEN, SUBSTR, CASE).
 pub trait TernaryOperator<A, B, C, RESULT> {
     /// The scalar operation logic.

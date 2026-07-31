@@ -391,30 +391,26 @@ fn evaluate_divide(values: &[Value], return_type: &LogicalType) -> Option<Value>
         return None;
     }
     match (&values[0], &values[1]) {
-        (Value::Integer(a), Value::Integer(b)) => {
-            if *b == 0 {
-                None // Division by zero
-            } else {
-                Some(Value::Integer(a / b))
-            }
-        }
-        (Value::BigInt(a), Value::BigInt(b)) => {
-            if *b == 0 {
-                None
-            } else {
-                Some(Value::BigInt(a / b))
-            }
-        }
+        (Value::Integer(a), Value::Integer(b)) => Some(
+            a.checked_div(*b)
+                .map(Value::Integer)
+                .unwrap_or_else(|| Value::Null(return_type.clone())),
+        ),
+        (Value::BigInt(a), Value::BigInt(b)) => Some(
+            a.checked_div(*b)
+                .map(Value::BigInt)
+                .unwrap_or_else(|| Value::Null(return_type.clone())),
+        ),
         (Value::Double(a), Value::Double(b)) => {
             if *b == 0.0 {
-                None
+                Some(Value::Null(return_type.clone()))
             } else {
                 Some(Value::Double(a / b))
             }
         }
         (Value::Float(a), Value::Float(b)) => {
             if *b == 0.0 {
-                None
+                Some(Value::Null(return_type.clone()))
             } else {
                 Some(Value::Float(a / b))
             }
@@ -433,18 +429,28 @@ fn evaluate_modulo(values: &[Value], return_type: &LogicalType) -> Option<Value>
         return None;
     }
     match (&values[0], &values[1]) {
-        (Value::Integer(a), Value::Integer(b)) => {
-            if *b == 0 {
-                None
+        (Value::Integer(a), Value::Integer(b)) => Some(
+            a.checked_rem(*b)
+                .map(Value::Integer)
+                .unwrap_or_else(|| Value::Null(return_type.clone())),
+        ),
+        (Value::BigInt(a), Value::BigInt(b)) => Some(
+            a.checked_rem(*b)
+                .map(Value::BigInt)
+                .unwrap_or_else(|| Value::Null(return_type.clone())),
+        ),
+        (Value::Double(a), Value::Double(b)) => {
+            if *b == 0.0 {
+                Some(Value::Null(return_type.clone()))
             } else {
-                Some(Value::Integer(a % b))
+                Some(Value::Double(a % b))
             }
         }
-        (Value::BigInt(a), Value::BigInt(b)) => {
-            if *b == 0 {
-                None
+        (Value::Float(a), Value::Float(b)) => {
+            if *b == 0.0 {
+                Some(Value::Null(return_type.clone()))
             } else {
-                Some(Value::BigInt(a % b))
+                Some(Value::Float(a % b))
             }
         }
         _ => {
@@ -677,10 +683,29 @@ mod tests {
         let result = evaluate_divide(&values, &LogicalType::Integer);
         assert_eq!(result, Some(Value::Integer(5)));
 
-        // Division by zero returns None
+        // Division by zero follows the runtime's null-on-invalid-domain contract.
         let values = vec![Value::Integer(10), Value::Integer(0)];
         let result = evaluate_divide(&values, &LogicalType::Integer);
-        assert_eq!(result, None);
+        assert_eq!(result, Some(Value::Null(LogicalType::Integer)));
+
+        let values = vec![Value::Double(10.0), Value::Double(0.0)];
+        let result = evaluate_divide(&values, &LogicalType::Double);
+        assert_eq!(result, Some(Value::Null(LogicalType::Double)));
+
+        let values = vec![Value::Integer(i32::MIN), Value::Integer(-1)];
+        let result = evaluate_divide(&values, &LogicalType::Integer);
+        assert_eq!(result, Some(Value::Null(LogicalType::Integer)));
+    }
+
+    #[test]
+    fn test_evaluate_modulo_invalid_domain() {
+        let values = vec![Value::Integer(10), Value::Integer(0)];
+        let result = evaluate_modulo(&values, &LogicalType::Integer);
+        assert_eq!(result, Some(Value::Null(LogicalType::Integer)));
+
+        let values = vec![Value::Double(10.0), Value::Double(0.0)];
+        let result = evaluate_modulo(&values, &LogicalType::Double);
+        assert_eq!(result, Some(Value::Null(LogicalType::Double)));
     }
 
     #[test]

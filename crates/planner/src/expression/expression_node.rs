@@ -161,7 +161,11 @@ impl Expression {
     pub fn extract_windows_in_place(&mut self, windows: &mut Vec<Expression>, window_index: usize) {
         if matches!(self, Expression::Window(_)) {
             let return_type = self.return_type();
-            let existing = windows.iter().position(|window| window.equals(self));
+            let existing = self
+                .evaluation_properties()
+                .can_share_evaluation()
+                .then(|| windows.iter().position(|window| window.equals(self)))
+                .flatten();
             let output_index = existing.unwrap_or(windows.len());
             let replacement = Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(window_index, output_index),
@@ -324,8 +328,9 @@ fn routine_identities_equal(
 mod tests {
     use super::Expression;
     use crate::expression::{
-        AggregateExpression, ColumnRefExpression, ConstantExpression, OrderByExpression,
-        ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+        AggregateExpression, ColumnRefExpression, ConstantExpression, FunctionExpression,
+        OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound,
+        WindowFrameType,
     };
     use crate::operator::ColumnBinding;
     use paro_common::runtime_value::Value;
@@ -344,6 +349,19 @@ mod tests {
         Expression::Constant(ConstantExpression::new(
             Value::Integer(value),
             LogicalType::Integer,
+        ))
+    }
+
+    fn random_call() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Double,
         ))
     }
 
@@ -445,6 +463,22 @@ mod tests {
             };
             assert_eq!(column.binding, ColumnBinding::new(42, 0));
         }
+    }
+
+    #[test]
+    fn extract_windows_preserves_volatile_evaluations() {
+        let mut first = window_expression(WindowFrameBound::CurrentRow);
+        let Expression::Window(window) = &mut first else {
+            unreachable!();
+        };
+        window.children = vec![random_call()];
+        let mut second = first.clone();
+        let mut windows = Vec::new();
+
+        first.extract_windows_in_place(&mut windows, 42);
+        second.extract_windows_in_place(&mut windows, 42);
+
+        assert_eq!(windows.len(), 2);
     }
 
     #[test]

@@ -42,17 +42,19 @@ impl CommonAggregateOptimizer {
         let mut changed = false;
 
         for (old_idx, expr) in std::mem::take(&mut aggr.aggregates).into_iter().enumerate() {
-            if let Some((new_idx, _)) = deduped
-                .iter()
-                .enumerate()
-                .find(|(_, existing)| existing.equals(&expr))
-            {
-                changed = true;
-                self.aggregate_map.insert(
-                    ColumnBinding::new(aggr.aggregate_index, old_idx),
-                    ColumnBinding::new(aggr.aggregate_index, new_idx),
-                );
-                continue;
+            if expr.evaluation_properties().can_share_evaluation() {
+                if let Some((new_idx, _)) = deduped
+                    .iter()
+                    .enumerate()
+                    .find(|(_, existing)| existing.equals(&expr))
+                {
+                    changed = true;
+                    self.aggregate_map.insert(
+                        ColumnBinding::new(aggr.aggregate_index, old_idx),
+                        ColumnBinding::new(aggr.aggregate_index, new_idx),
+                    );
+                    continue;
+                }
             }
 
             let new_idx = deduped.len();
@@ -108,5 +110,62 @@ impl LogicalOperatorVisitor for CommonAggregateOptimizer {
             expr.binding = *new_binding;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::types::LogicalType;
+    use paro_function::aggregate::distributive::count::get_count_function;
+    use paro_function::scalar::math::get_random_function;
+    use paro_planner::expression::{AggregateExpression, Expression, FunctionExpression};
+    use paro_planner::operator::{Aggregate, LogicalOperator};
+    use paro_planner::plan::LogicalPlan;
+
+    use super::CommonAggregateOptimizer;
+
+    fn count_of(expression: Expression) -> Expression {
+        let function = get_count_function()
+            .functions
+            .into_iter()
+            .find(|function| function.arguments == [LogicalType::Double])
+            .expect("count(double) overload");
+        Expression::Aggregate(AggregateExpression::new(
+            function,
+            vec![expression],
+            LogicalType::BigInt,
+        ))
+    }
+
+    fn random_call() -> Expression {
+        let function = get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload");
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![],
+            LogicalType::Double,
+        ))
+    }
+
+    #[test]
+    fn volatile_aggregate_inputs_are_not_deduplicated() {
+        let aggregate = count_of(random_call());
+        let mut operator = Aggregate::new(
+            1,
+            2,
+            3,
+            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![],
+            vec![],
+            vec![aggregate.clone(), aggregate],
+            vec![],
+        );
+
+        CommonAggregateOptimizer::new().extract_common_aggregates(&mut operator);
+
+        assert_eq!(operator.aggregates.len(), 2);
     }
 }
