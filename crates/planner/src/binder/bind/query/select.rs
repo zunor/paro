@@ -179,7 +179,7 @@ impl Binder {
         // 11. BindModifiers - Finalize ORDER BY with types
         // =================================================================
         let bound_order_by = self.finalize_order_by(order_by_bindings, projection_index, &types)?;
-        let bound_distinct = self.bind_distinct(select.distinct, &bound_order_by)?;
+        let bound_distinct = Self::bind_distinct(select.distinct);
 
         // Make bound_order_by mutable for aggregate extraction
         let mut bound_order_by = bound_order_by;
@@ -673,16 +673,8 @@ impl Binder {
     }
 
     /// Bind DISTINCT clause.
-    pub fn bind_distinct(
-        &mut self,
-        distinct: bool,
-        _order_by: &Option<Vec<OrderByNode>>,
-    ) -> Result<Option<DistinctModifier>> {
-        if distinct {
-            Ok(Some(DistinctModifier::distinct()))
-        } else {
-            Ok(None)
-        }
+    fn bind_distinct(distinct: bool) -> Option<DistinctModifier> {
+        distinct.then(DistinctModifier::distinct)
     }
 
     /// Bind GROUP BY clause (legacy - delegates to bind_group_by_with_binder).

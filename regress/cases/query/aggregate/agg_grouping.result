@@ -83,17 +83,15 @@ FROM (
 GROUP BY GROUPING SETS ((region), ())
 ORDER BY g_region, region;
 QUERY PLAN
-PROJECTION  (rows=3)
-  Output: g_region, region, sum_sales
-  ->  ORDER_BY  (rows=3)
-    Sort Key: #0 ASC NULLS LAST, #3 ASC NULLS LAST
-    ->  PROJECTION  (rows=3)
-      Output: g_region, region, sum_sales, __paro_hidden_1
-      ->  AGGREGATE  (rows=3)
-        Group Key: #0
-        Aggregates: sum(#1)
-        Grouping Sets: (0), ()
-        Output: aggr_0, aggr_1, aggr_2
-        ->  PROJECTION  (rows=3)
-          Output: region, sales
-          ->  VALUES  (rows=3)
+ORDER_BY  (rows=3)
+  Sort Key: #0 ASC NULLS LAST, #1 ASC NULLS LAST
+  ->  PROJECTION  (rows=3)
+    Output: g_region, region, sum_sales
+    ->  AGGREGATE  (rows=3)
+      Group Key: #0
+      Aggregates: sum(#1)
+      Grouping Sets: (0), ()
+      Output: aggr_0, aggr_1, aggr_2
+      ->  PROJECTION  (rows=3)
+        Output: region, sales
+        ->  VALUES  (rows=3)

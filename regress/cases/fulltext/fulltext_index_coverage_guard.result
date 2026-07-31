@@ -16,19 +16,17 @@ FROM ft_coverage_guard
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
 ORDER BY id;
 QUERY PLAN
-PROJECTION  (rows=0)
-  Output: id
-  ->  ORDER_BY  (rows=0)
-    Sort Key: #1 ASC NULLS LAST
-    ->  PROJECTION  (rows=0)
-      Output: id, __paro_hidden_1
-      ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
-        Search Definition: <search-definition-id>
-        Search Generation: <search-generation-id>
-        Search Root: <search-root-id>
-        Search Capability: Queryable
-        Column: 1
-        Mode: Filter
+ORDER_BY  (rows=0)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=0)
+    Output: id
+    ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
+      Search Definition: <search-definition-id>
+      Search Generation: <search-generation-id>
+      Search Root: <search-root-id>
+      Search Capability: Queryable
+      Column: 1
+      Mode: Filter
 
 -- @normalize explain_search_ids
 EXPLAIN

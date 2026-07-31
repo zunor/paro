@@ -33,8 +33,7 @@ PIPELINE 0
   SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=10000 loops=5)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -85,8 +84,7 @@ PIPELINE 0
   SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 peak_memory_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=10000 loops=5)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>

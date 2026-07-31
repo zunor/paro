@@ -58,14 +58,14 @@ PROJECTION  (rows=0)
   Cardinality: [0, 0, 1]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=0)
-    Sort Key: #1 DESC NULLS FIRST, #2 ASC NULLS LAST
+    Sort Key: #1 DESC NULLS FIRST, #0 ASC NULLS LAST
     Limit: 2
     Cardinality: [0, 0, 1]
-    Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
+    Output Schema: id INTEGER, __paro_hidden_1 FLOAT
     ->  PROJECTION  (rows=0)
-      Output: id, __paro_hidden_1, __paro_hidden_2
+      Output: id, __paro_hidden_1
       Cardinality: [0, 0, 1]
-      Output Schema: id INTEGER, __paro_hidden_1 FLOAT, __paro_hidden_2 INTEGER
+      Output Schema: id INTEGER, __paro_hidden_1 FLOAT
       ->  FULLTEXT_SCAN on public.obs_docs  (rows=3)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>

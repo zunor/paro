@@ -2,17 +2,15 @@ EXPLAIN
 WITH nums(v) AS (VALUES (1), (2), (3))
 SELECT v FROM nums WHERE v > 1 ORDER BY v;
 QUERY PLAN
-PROJECTION  (rows=1)
-  Output: v
-  ->  ORDER_BY  (rows=1)
-    Sort Key: #1 ASC NULLS LAST
+ORDER_BY  (rows=1)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=1)
+    Output: v
     ->  PROJECTION  (rows=1)
-      Output: v, __paro_hidden_1
-      ->  PROJECTION  (rows=1)
-        Output: expr_1
-        ->  FILTER  (rows=1)
-          Filter: #0 > 1
-          ->  VALUES  (rows=3)
+      Output: expr_1
+      ->  FILTER  (rows=1)
+        Filter: #0 > 1
+        ->  VALUES  (rows=3)
 
 EXPLAIN
 WITH nums(v) AS MATERIALIZED (VALUES (1), (2), (3))
@@ -25,17 +23,15 @@ MATERIALIZED_CTE
   ->  FILTER  (rows=1)
     Filter: #0 > 1
     ->  VALUES  (rows=3)
-  ->  PROJECTION
-    Output: v
-    ->  ORDER_BY
-      Sort Key: #1 ASC NULLS LAST
-      ->  PROJECTION
-        Output: v, __paro_hidden_1
-        ->  FILTER
-          Filter: #0 > 1
-          ->  CTE_SCAN
-            CTE Index: 0
-            Table Index: 8
+  ->  ORDER_BY
+    Sort Key: #0 ASC NULLS LAST
+    ->  PROJECTION
+      Output: v
+      ->  FILTER
+        Filter: #0 > 1
+        ->  CTE_SCAN
+          CTE Index: 0
+          Table Index: 8
 
 EXPLAIN
 WITH nums(v) AS NOT MATERIALIZED (VALUES (1), (2), (3))
