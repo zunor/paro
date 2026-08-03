@@ -81,6 +81,7 @@ pub use recovery::replay_handler::{
     needs_recovery, recover_database, recover_database_with_checkpoint, CatalogReplayHandler,
 };
 pub use runtime::connection_registry::{ConnectionHandle, ConnectionId, ConnectionRegistry};
+pub use runtime::copy_stdin::{CopyStdinMetrics, CopyStdinMetricsSnapshot, CopyStdinRejectReason};
 pub use runtime::object_cache::{ObjectCache, ObjectCacheEntry};
 pub use runtime::runtime_tuning::{RuntimeTuning, RuntimeTuningSnapshot};
 pub use runtime::session_registry::{

@@ -1660,7 +1660,6 @@ dependencies = [
  "paro-common",
  "paro-parser",
  "paro-storage",
- "rand 0.8.5",
  "regex",
  "serde_json",
 ]
@@ -1807,7 +1806,6 @@ dependencies = [
  "pgwire",
  "rand 0.8.5",
  "serde",
- "serial_test",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1835,7 +1833,6 @@ dependencies = [
  "paro-storage",
  "paro-transaction",
  "serde_json",
- "serial_test",
  "tokio",
  "tokio-util",
  "tracing",

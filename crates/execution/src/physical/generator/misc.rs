@@ -49,6 +49,7 @@ impl PhysicalPlanGenerator {
         }
         let spec = TableFunctionScanSpec {
             function: get.function.clone(),
+            bind_data: get.bind_data.clone(),
             table_index: get.table_index,
             arguments: get.arguments.clone().into_boxed_slice(),
             projection_ids: get

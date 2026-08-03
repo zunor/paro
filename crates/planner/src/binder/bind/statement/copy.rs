@@ -11,13 +11,13 @@ use crate::binder::bind::clause::WhereBinder;
 use crate::binder::ir::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
-use crate::expression::{ConstantExpression, Expression};
+use crate::expression::Expression;
 use crate::operator::{CopyTo, Filter, Insert, LogicalOperator, TableFunctionGet};
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_common::error::{self as paro_error, Result};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_function::copy::{CopyFormat, CopyOptions};
+use paro_function::copy::{CopyFormat, CopyFromSource, CopyOptions};
+use paro_function::table::BoundTableFunctionData;
 use paro_parser::ast::{
     ColumnID, ColumnRef, CopyDirection, CopySource, CopyStmt, CopyTarget, Expr, Identifier,
     Indirection, Query, SelectStmt, SelectTarget, SetExpr, TableReference,
@@ -121,13 +121,9 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
         }
     };
 
-    let source_path = match &stmt.source {
-        CopySource::File(path) => path.clone(),
-        CopySource::Stdin => {
-            return Err(paro_error::not_implemented(
-                "COPY FROM STDIN is not supported yet",
-            ))
-        }
+    let source = match &stmt.source {
+        CopySource::File(path) => CopyFromSource::File(path.clone()),
+        CopySource::Stdin => CopyFromSource::Stdin,
         CopySource::Stdout => {
             return Err(paro_error::syntax("COPY FROM cannot use STDOUT"));
         }
@@ -206,24 +202,8 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
     };
 
     let copy_function = lookup_copy_function(binder, format_name)?;
-    let _ = (copy_function.copy_from_bind)(&options, &column_names, &expected_types)?;
-
-    let (schema_value, schema_type) = build_schema_struct(&column_names, &expected_types);
-    let (options_value, options_type) = build_options_struct(&options);
-
-    let mut arguments = Vec::new();
-    arguments.push(Expression::Constant(ConstantExpression::new(
-        Value::Varchar(source_path),
-        LogicalType::Varchar,
-    )));
-    arguments.push(Expression::Constant(ConstantExpression::new(
-        schema_value,
-        schema_type,
-    )));
-    arguments.push(Expression::Constant(ConstantExpression::new(
-        options_value,
-        options_type,
-    )));
+    let bind_data =
+        (copy_function.copy_from_bind)(source, &options, &column_names, &expected_types)?;
 
     let table_index = binder.bind_context.generate_table_index();
     let table_function = Arc::new(copy_function.copy_from_function.clone());
@@ -233,8 +213,9 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
         table_index,
         column_names.clone(),
         expected_types.clone(),
-        arguments,
-    );
+        Vec::new(),
+    )
+    .with_bind_data(BoundTableFunctionData::new(bind_data));
 
     let mut source = LogicalOperator::TableFunctionGet(table_function_get);
     if let Some(expr) = where_clause {
@@ -285,130 +266,6 @@ fn bind_copy_from_where_clause(
 
     let mut where_binder = WhereBinder::new(&mut where_binder_ctx);
     where_binder.bind(where_clause)
-}
-
-fn build_schema_struct(names: &[String], types: &[LogicalType]) -> (Value, LogicalType) {
-    let mut fields = Vec::with_capacity(names.len());
-    let mut values = Vec::with_capacity(names.len());
-    for (name, ty) in names.iter().cloned().zip(types.iter().cloned()) {
-        fields.push((name, ty.clone()));
-        values.push(Value::Null(ty));
-    }
-    let struct_type = LogicalType::Struct(fields.clone());
-    (Value::Struct(values, fields), struct_type)
-}
-
-fn build_options_struct(options: &CopyOptions) -> (Value, LogicalType) {
-    let mut fields = Vec::new();
-    let mut values = Vec::new();
-
-    let format_str = match options.format {
-        CopyFormat::Csv => "csv",
-        CopyFormat::Text => "text",
-        CopyFormat::Binary => "binary",
-        CopyFormat::Ndjson => "ndjson",
-    };
-
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "format",
-        LogicalType::Varchar,
-        Value::Varchar(format_str.to_string()),
-    );
-
-    let delimiter = options
-        .delimiter
-        .clone()
-        .unwrap_or_else(|| match options.format {
-            CopyFormat::Csv => ",".to_string(),
-            CopyFormat::Text => "\t".to_string(),
-            CopyFormat::Binary => "\t".to_string(),
-            CopyFormat::Ndjson => "\n".to_string(),
-        });
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "delimiter",
-        LogicalType::Varchar,
-        Value::Varchar(delimiter),
-    );
-
-    let null_string = options.null_string.clone().unwrap_or_else(String::new);
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "null",
-        LogicalType::Varchar,
-        Value::Varchar(null_string),
-    );
-
-    let header = options.header.unwrap_or(false);
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "header",
-        LogicalType::Boolean,
-        Value::Boolean(header),
-    );
-
-    let quote_value = options
-        .quote
-        .map(|ch| Value::Varchar(ch.to_string()))
-        .unwrap_or_else(|| Value::Null(LogicalType::Varchar));
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "quote",
-        LogicalType::Varchar,
-        quote_value,
-    );
-
-    let escape_value = options
-        .escape
-        .map(|ch| Value::Varchar(ch.to_string()))
-        .unwrap_or_else(|| Value::Null(LogicalType::Varchar));
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "escape",
-        LogicalType::Varchar,
-        escape_value,
-    );
-
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "parallel",
-        LogicalType::Boolean,
-        Value::Boolean(options.parallel),
-    );
-
-    let parallel_workers_value = options
-        .parallel_workers
-        .map(|v| Value::BigInt(v as i64))
-        .unwrap_or_else(|| Value::Null(LogicalType::BigInt));
-    push_struct_field(
-        &mut fields,
-        &mut values,
-        "parallel_workers",
-        LogicalType::BigInt,
-        parallel_workers_value,
-    );
-
-    let struct_type = LogicalType::Struct(fields.clone());
-    (Value::Struct(values, fields), struct_type)
-}
-
-fn push_struct_field(
-    fields: &mut Vec<(String, LogicalType)>,
-    values: &mut Vec<Value>,
-    name: &str,
-    ty: LogicalType,
-    value: Value,
-) {
-    fields.push((name.to_string(), ty));
-    values.push(value);
 }
 
 fn lookup_copy_function(binder: &Binder, name: &str) -> Result<paro_function::copy::CopyFunction> {

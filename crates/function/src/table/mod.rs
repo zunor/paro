@@ -38,7 +38,6 @@ pub mod unnest;
 
 use std::any::Any;
 use std::fmt;
-#[cfg(test)]
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
@@ -119,11 +118,27 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
     fn buffer_manager(&self) -> Option<&dyn BufferManager> {
         None
     }
+
+    /// Return the COPY FROM STDIN source owned by the current statement.
+    fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
+        None
+    }
+}
+
+/// Query-owned byte source for COPY FROM STDIN table functions.
+///
+/// The protocol layer implements this trait so it can retain accounting and
+/// cancellation-related ownership for exactly as long as the query needs the
+/// payload. Table functions only see immutable bytes and never consult a
+/// process-wide registry.
+pub trait CopyStdinSource: Send + Sync {
+    fn as_bytes(&self) -> &[u8];
 }
 
 #[cfg(test)]
 pub(crate) struct TestTableFunctionRuntimeContext {
     buffer_manager: Option<Arc<dyn BufferManager>>,
+    copy_stdin_source: Option<Arc<dyn CopyStdinSource>>,
 }
 
 #[cfg(test)]
@@ -131,6 +146,14 @@ impl TestTableFunctionRuntimeContext {
     pub(crate) fn with_buffer_manager(buffer_manager: Arc<dyn BufferManager>) -> Self {
         Self {
             buffer_manager: Some(buffer_manager),
+            copy_stdin_source: None,
+        }
+    }
+
+    pub(crate) fn with_copy_stdin_source(source: Arc<dyn CopyStdinSource>) -> Self {
+        Self {
+            buffer_manager: None,
+            copy_stdin_source: Some(source),
         }
     }
 }
@@ -140,12 +163,17 @@ impl TableFunctionRuntimeContext for TestTableFunctionRuntimeContext {
     fn buffer_manager(&self) -> Option<&dyn BufferManager> {
         self.buffer_manager.as_deref()
     }
+
+    fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
+        self.copy_stdin_source.clone()
+    }
 }
 
 #[cfg(test)]
 static EMPTY_TABLE_FUNCTION_RUNTIME_CONTEXT: TestTableFunctionRuntimeContext =
     TestTableFunctionRuntimeContext {
         buffer_manager: None,
+        copy_stdin_source: None,
     };
 
 // ============================================================================
@@ -169,6 +197,35 @@ pub trait TableFunctionBindData: Send + Sync {
     /// Returns None if unknown.
     fn cardinality(&self) -> Option<usize> {
         None
+    }
+}
+
+/// Shareable bind data that has already been produced by the planner.
+///
+/// Ordinary table functions can still bind runtime arguments during pipeline
+/// initialization. Statement-specific operators such as COPY use this type to
+/// bind once and carry the result through logical and physical planning.
+#[derive(Clone)]
+pub struct BoundTableFunctionData(Arc<dyn TableFunctionBindData>);
+
+impl BoundTableFunctionData {
+    pub fn new(data: Box<dyn TableFunctionBindData>) -> Self {
+        Self(Arc::from(data))
+    }
+
+    pub fn as_ref(&self) -> &dyn TableFunctionBindData {
+        self.0.as_ref()
+    }
+
+    pub fn clone_box(&self) -> Box<dyn TableFunctionBindData> {
+        self.0.clone_box()
+    }
+}
+
+impl fmt::Debug for BoundTableFunctionData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundTableFunctionData")
+            .finish_non_exhaustive()
     }
 }
 
@@ -265,6 +322,15 @@ impl<'a> TableFunctionInitInput<'a> {
         self.runtime.buffer_manager().ok_or_else(|| {
             paro_error::internal(
                 "table function requires an instance-scoped buffer manager".to_string(),
+            )
+        })
+    }
+
+    /// Resolve the payload attached to the current COPY FROM STDIN statement.
+    pub fn copy_stdin_source(&self) -> Result<Arc<dyn CopyStdinSource>> {
+        self.runtime.copy_stdin_source().ok_or_else(|| {
+            paro_error::internal(
+                "COPY FROM STDIN table function requires statement-scoped input".to_string(),
             )
         })
     }

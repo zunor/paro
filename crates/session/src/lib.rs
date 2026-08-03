@@ -8,7 +8,6 @@ mod auth_policy;
 mod completion;
 mod completion_infer;
 mod config;
-mod copy_metrics;
 mod copy_protocol;
 mod ddl;
 mod dispatch;
@@ -27,9 +26,6 @@ pub use active_query::{ActiveQueryContext, QueryProgress};
 pub use completion::{DiscardCommand, StatementCompletion};
 pub use completion_infer::{infer_statement_completion, initial_statement_completion};
 pub use config::{ProfilerPrintFormat, ProfilingCoverage, SessionConfig};
-pub use copy_metrics::{
-    copy_stdin_metrics, CopyStdinMetrics, CopyStdinMetricsSnapshot, CopyStdinRejectReason,
-};
 pub use copy_protocol::{CopyInSpec, CopyProtocolSink, CopyProtocolSource, ProtocolResultSink};
 pub use ddl::SessionDdlBridge;
 pub use dispatch::{

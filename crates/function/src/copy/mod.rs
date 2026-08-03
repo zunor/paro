@@ -9,13 +9,20 @@ use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 
-use crate::table::TableFunction;
+use crate::table::{TableFunction, TableFunctionBindData};
 
 pub mod csv;
 pub mod json;
 pub mod options;
 
 pub use options::{CopyFormat, CopyOptions, ForceQuoteOption};
+
+/// Physical input selected by a COPY FROM statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyFromSource {
+    File(String),
+    Stdin,
+}
 
 /// Internal options for CopyFunction, produced during the bind phase.
 pub trait CopyFunctionBindData: Send + Sync + Debug {
@@ -58,8 +65,12 @@ pub struct CopyFunction {
     pub copy_to_finalize: fn(&dyn CopyFunctionBindData, &mut dyn CopyToGlobalState) -> Result<()>,
 
     // COPY FROM: Corresponding TableFunction
-    pub copy_from_bind:
-        fn(&CopyOptions, &[String], &[LogicalType]) -> Result<Box<dyn CopyFunctionBindData>>,
+    pub copy_from_bind: fn(
+        CopyFromSource,
+        &CopyOptions,
+        &[String],
+        &[LogicalType],
+    ) -> Result<Box<dyn TableFunctionBindData>>,
     pub copy_from_function: TableFunction,
 
     pub extension: String,

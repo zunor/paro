@@ -7,15 +7,14 @@
 //!
 //! ## Overview
 //! Provides a minimal CSV/TEXT reader for COPY FROM.
-//! The function accepts at least one argument (file path).
-//! COPY FROM supplies additional constant arguments for schema/options.
+//! Direct table-function calls bind a file path at runtime. COPY FROM binds an
+//! explicit file-or-STDIN source in the planner and carries it with the plan.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -23,100 +22,41 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 
-use crate::copy::CopyFormat;
+use crate::copy::{CopyFormat, CopyFromSource, CopyOptions};
 
 use super::{
-    GlobalTableFunctionState, LocalTableFunctionState, TableFunction, TableFunctionBindData,
-    TableFunctionBindInput, TableFunctionInitInput, TableFunctionInput, TableFunctionResult,
-    TableFunctionSet,
+    CopyStdinSource, GlobalTableFunctionState, LocalTableFunctionState, TableFunction,
+    TableFunctionBindData, TableFunctionBindInput, TableFunctionInitInput, TableFunctionInput,
+    TableFunctionResult, TableFunctionSet,
 };
 
-const COPY_STDIN_PREFIX: &str = "__paro_copy_stdin__://";
 const COPY_PARALLEL_SPLIT_MIN_BYTES: u64 = 1_048_576;
 const COPY_PARALLEL_MAX_WORKERS: usize = 32;
-static COPY_STDIN_REGISTRY: OnceLock<Mutex<HashMap<u128, Weak<Vec<u8>>>>> = OnceLock::new();
 
-fn stdin_registry() -> &'static Mutex<HashMap<u128, Weak<Vec<u8>>>> {
-    COPY_STDIN_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
+struct SharedCopyStdinSource(Arc<dyn CopyStdinSource>);
 
-/// Scoped registration for an in-memory COPY FROM STDIN payload.
-///
-/// The registration owns the payload while planning and execution initialize a
-/// reader. Readers share that allocation and may finish consuming it after the
-/// registration is dropped. Dropping the registration always removes the
-/// virtual path from the process-wide lookup directory.
-#[must_use = "the registration must remain alive while the COPY pipeline opens its reader"]
-pub struct CopyStdinPayloadRegistration {
-    id: u128,
-    path: String,
-    _payload: Arc<Vec<u8>>,
-}
-
-impl CopyStdinPayloadRegistration {
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-}
-
-impl Drop for CopyStdinPayloadRegistration {
-    fn drop(&mut self) {
-        let mut guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(&self.id);
-    }
-}
-
-pub fn register_copy_stdin_payload(data: Vec<u8>) -> CopyStdinPayloadRegistration {
-    let payload = Arc::new(data);
-    let mut guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
-    let id = loop {
-        let candidate = rand::random::<u128>();
-        if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(candidate) {
-            entry.insert(Arc::downgrade(&payload));
-            break candidate;
-        }
-    };
-    CopyStdinPayloadRegistration {
-        id,
-        path: format!("{COPY_STDIN_PREFIX}{id:032x}"),
-        _payload: payload,
-    }
-}
-
-fn copy_stdin_payload(path: &str) -> Result<Arc<Vec<u8>>> {
-    let id = path
-        .strip_prefix(COPY_STDIN_PREFIX)
-        .and_then(|id| u128::from_str_radix(id, 16).ok())
-        .ok_or_else(|| paro_error::io_error(format!("invalid COPY STDIN path: {path}")))?;
-    let guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
-    guard.get(&id).and_then(Weak::upgrade).ok_or_else(|| {
-        paro_error::io_error(format!("COPY STDIN payload expired or not found: {path}"))
-    })
-}
-
-struct SharedCopyStdinPayload(Arc<Vec<u8>>);
-
-impl AsRef<[u8]> for SharedCopyStdinPayload {
+impl AsRef<[u8]> for SharedCopyStdinSource {
     fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
+        self.0.as_bytes()
     }
 }
 
-pub(crate) fn open_csv_reader(path: &str) -> Result<Box<dyn BufRead + Send>> {
-    if is_copy_stdin_path(path) {
-        let payload = copy_stdin_payload(path)?;
-        return Ok(Box::new(BufReader::new(Cursor::new(
-            SharedCopyStdinPayload(payload),
-        ))));
+pub(crate) fn open_copy_reader(
+    source: &CopyFromSource,
+    input: &TableFunctionInitInput,
+) -> Result<Box<dyn BufRead + Send>> {
+    match source {
+        CopyFromSource::File(path) => open_file_reader(path),
+        CopyFromSource::Stdin => Ok(Box::new(BufReader::new(Cursor::new(
+            SharedCopyStdinSource(input.copy_stdin_source()?),
+        )))),
     }
+}
 
+fn open_file_reader(path: &str) -> Result<Box<dyn BufRead + Send>> {
     let file = File::open(path)
         .map_err(|e| paro_error::io_error(format!("Failed to open CSV file '{}': {}", path, e)))?;
     Ok(Box::new(BufReader::new(file)))
-}
-
-pub(crate) fn is_copy_stdin_path(path: &str) -> bool {
-    path.starts_with(COPY_STDIN_PREFIX)
 }
 
 #[derive(Clone, Debug)]
@@ -250,11 +190,49 @@ impl ReadCsvOptions {
             parallel_workers,
         })
     }
+
+    fn from_copy_options(options: &CopyOptions) -> Result<Self> {
+        if !matches!(options.format, CopyFormat::Csv | CopyFormat::Text) {
+            return Err(paro_error::invalid_parameter(
+                "read_csv COPY input requires CSV or TEXT format",
+            ));
+        }
+
+        let delimiter = options
+            .delimiter()
+            .expect("CSV/TEXT options always have a delimiter")
+            .to_string();
+        if delimiter.chars().count() != 1 {
+            return Err(paro_error::invalid_parameter(
+                "COPY delimiter must be a single character",
+            ));
+        }
+
+        let null_string = options
+            .null_string()
+            .expect("CSV/TEXT options always have a NULL marker")
+            .to_string();
+        let (quote, escape) = match options.format {
+            CopyFormat::Csv => (options.quote(), options.escape()),
+            CopyFormat::Text => (None, None),
+            CopyFormat::Binary | CopyFormat::Ndjson => unreachable!("format checked above"),
+        };
+
+        Ok(Self {
+            delimiter,
+            null_string,
+            header: options.header(),
+            quote,
+            escape,
+            parallel: options.parallel,
+            parallel_workers: options.parallel_workers,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
 struct ReadCsvBindData {
-    file_path: String,
+    source: CopyFromSource,
     options: ReadCsvOptions,
     types: Vec<LogicalType>,
     skip_header: bool,
@@ -405,13 +383,34 @@ fn read_csv_bind(
     return_names.extend(names.iter().cloned());
 
     let bind_data = ReadCsvBindData {
-        file_path,
+        source: CopyFromSource::File(file_path),
         options: options.clone(),
         types,
         skip_header: options.header,
     };
 
     Ok(Some(Box::new(bind_data)))
+}
+
+pub(crate) fn bind_copy_from(
+    source: CopyFromSource,
+    options: &CopyOptions,
+    names: &[String],
+    types: &[LogicalType],
+) -> Result<Box<dyn TableFunctionBindData>> {
+    if names.len() != types.len() {
+        return Err(paro_error::invalid_input(
+            "COPY FROM input names/types length mismatch",
+        ));
+    }
+    let options = ReadCsvOptions::from_copy_options(options)?;
+    let skip_header = options.header;
+    Ok(Box::new(ReadCsvBindData {
+        source,
+        options,
+        types: types.to_vec(),
+        skip_header,
+    }))
 }
 
 fn read_csv_init_global(
@@ -433,38 +432,32 @@ fn read_csv_init_global(
         .max(1);
 
     let can_parallel = bind_data.options.parallel
-        && !is_copy_stdin_path(&bind_data.file_path)
+        && matches!(&bind_data.source, CopyFromSource::File(_))
         && requested_workers > 1;
 
     if can_parallel {
-        let file_size = File::open(&bind_data.file_path)
+        let CopyFromSource::File(file_path) = &bind_data.source else {
+            unreachable!("parallel COPY source must be a file")
+        };
+        let file_size = File::open(file_path)
             .map_err(|e| {
-                paro_error::io_error(format!(
-                    "Failed to open CSV file '{}': {}",
-                    bind_data.file_path, e
-                ))
+                paro_error::io_error(format!("Failed to open CSV file '{}': {}", file_path, e))
             })?
             .metadata()
             .map_err(|e| {
-                paro_error::io_error(format!(
-                    "Failed to stat CSV file '{}': {}",
-                    bind_data.file_path, e
-                ))
+                paro_error::io_error(format!("Failed to stat CSV file '{}': {}", file_path, e))
             })?
             .len();
         let meets_size_threshold = file_size >= COPY_PARALLEL_SPLIT_MIN_BYTES
             || bind_data.options.parallel_workers.is_some();
 
         if meets_size_threshold {
-            let partitions = build_file_partitions(
-                &bind_data.file_path,
-                requested_workers,
-                bind_data.skip_header,
-            )?;
+            let partitions =
+                build_file_partitions(file_path, requested_workers, bind_data.skip_header)?;
             if partitions.len() > 1 {
                 let state = ReadCsvGlobalState {
                     mode: ReadCsvExecutionMode::Parallel(ReadCsvParallelState {
-                        file_path: bind_data.file_path.clone(),
+                        file_path: file_path.clone(),
                         partitions,
                         next_partition: AtomicUsize::new(0),
                     }),
@@ -474,7 +467,7 @@ fn read_csv_init_global(
         }
     }
 
-    let reader = open_csv_reader(&bind_data.file_path)?;
+    let reader = open_copy_reader(&bind_data.source, input)?;
     let state = ReadCsvGlobalState {
         mode: ReadCsvExecutionMode::Serial {
             reader: Mutex::new(ReadCsvReader {
@@ -1118,7 +1111,7 @@ fn decode_text_escapes(raw: &str) -> String {
 
 fn infer_schema(path: &str, options: &ReadCsvOptions) -> Result<(Vec<String>, Vec<LogicalType>)> {
     let mut reader = ReadCsvReader {
-        reader: open_csv_reader(path)?,
+        reader: open_file_reader(path)?,
         row_number: 0,
     };
     let mut buffer = String::new();
@@ -1361,34 +1354,36 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    struct TestCopyStdinSource(Vec<u8>);
+
+    impl CopyStdinSource for TestCopyStdinSource {
+        fn as_bytes(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+
     #[test]
-    fn copy_stdin_registration_is_scoped_and_shares_one_payload() {
-        let registration = register_copy_stdin_payload(b"1,alpha\n2,beta\n".to_vec());
-        let path = registration.path().to_string();
-        let first_lookup = copy_stdin_payload(&path).unwrap();
-        let second_lookup = copy_stdin_payload(&path).unwrap();
+    fn copy_stdin_reader_owns_its_statement_source() {
+        let mut reader = {
+            let runtime = super::super::TestTableFunctionRuntimeContext::with_copy_stdin_source(
+                Arc::new(TestCopyStdinSource(b"1,alpha\n2,beta\n".to_vec())),
+            );
+            let input = TableFunctionInitInput::new(&runtime, None, &[]);
+            open_copy_reader(&CopyFromSource::Stdin, &input).unwrap()
+        };
 
-        assert!(Arc::ptr_eq(&registration._payload, &first_lookup));
-        assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
-        assert_eq!(Arc::strong_count(&registration._payload), 3);
-
-        let mut reader = open_csv_reader(&path).unwrap();
-        drop(first_lookup);
-        drop(second_lookup);
-        drop(registration);
-
-        assert!(copy_stdin_payload(&path).is_err());
         let mut contents = String::new();
         reader.read_to_string(&mut contents).unwrap();
         assert_eq!(contents, "1,alpha\n2,beta\n");
     }
 
     #[test]
-    fn copy_stdin_virtual_path_uses_an_opaque_capability() {
-        let registration = register_copy_stdin_payload(Vec::new());
-        let token = registration.path().strip_prefix(COPY_STDIN_PREFIX).unwrap();
+    fn copy_stdin_reader_requires_statement_input() {
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
+        let err = open_copy_reader(&CopyFromSource::Stdin, &input)
+            .err()
+            .expect("missing statement input must fail");
 
-        assert_eq!(token.len(), 32);
-        assert!(u128::from_str_radix(token, 16).is_ok());
+        assert!(err.message().contains("requires statement-scoped input"));
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
-use paro_function::table::TableFunction;
+use paro_function::table::{BoundTableFunctionData, TableFunction};
 use paro_planner::expression::Expression;
 use paro_storage::index::PredicateTree;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
@@ -81,6 +81,7 @@ pub struct ExpressionScanSpec {
 #[derive(Debug, Clone)]
 pub struct TableFunctionScanSpec {
     pub function: Arc<TableFunction>,
+    pub bind_data: Option<BoundTableFunctionData>,
     pub table_index: usize,
     pub arguments: Box<[Expression]>,
     pub projection_ids: Option<Box<[usize]>>,

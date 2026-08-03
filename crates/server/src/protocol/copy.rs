@@ -61,14 +61,8 @@ impl<'a> PgWireCopyOutSink<'a> {
         }
 
         let delimiter = options
-            .delimiter
-            .clone()
-            .unwrap_or_else(|| match options.format {
-                CopyFormat::Csv => ",".to_string(),
-                CopyFormat::Text => "\t".to_string(),
-                CopyFormat::Binary => "\t".to_string(),
-                CopyFormat::Ndjson => "\t".to_string(),
-            });
+            .delimiter()
+            .expect("CSV/TEXT options always have a delimiter");
 
         if delimiter.is_empty() || delimiter.chars().count() != 1 {
             return Err(paro_error::invalid_parameter(
@@ -87,38 +81,24 @@ impl<'a> PgWireCopyOutSink<'a> {
 
     fn delimiter(&self) -> String {
         self.options
-            .delimiter
-            .clone()
-            .unwrap_or_else(|| match self.options.format {
-                CopyFormat::Csv => ",".to_string(),
-                CopyFormat::Text => "\t".to_string(),
-                CopyFormat::Binary => "\t".to_string(),
-                CopyFormat::Ndjson => "\t".to_string(),
-            })
+            .delimiter()
+            .expect("COPY OUT only supports CSV/TEXT formats")
+            .to_string()
     }
 
     fn null_string(&self) -> String {
         self.options
-            .null_string
-            .clone()
-            .unwrap_or_else(|| match self.options.format {
-                CopyFormat::Csv => String::new(),
-                CopyFormat::Text => "\\N".to_string(),
-                CopyFormat::Binary => String::new(),
-                CopyFormat::Ndjson => String::new(),
-            })
+            .null_string()
+            .expect("COPY OUT only supports CSV/TEXT formats")
+            .to_string()
     }
 
     fn quote_char(&self) -> Option<char> {
-        self.options.quote.or(match self.options.format {
-            CopyFormat::Csv => Some('"'),
-            CopyFormat::Text | CopyFormat::Binary | CopyFormat::Ndjson => None,
-        })
+        self.options.quote()
     }
 
     fn escape_char(&self) -> Option<char> {
-        let quote = self.quote_char();
-        self.options.escape.or(quote)
+        self.options.escape()
     }
 
     async fn send_copy_data_line(&mut self, line: String) -> Result<()> {
@@ -295,7 +275,7 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
             .await
             .map_err(|e| paro_error::internal(e.to_string()))?;
 
-        if self.options.header.unwrap_or(false) {
+        if self.options.header() {
             let header = self.serialize_header();
             self.send_copy_data_line(header).await?;
         }

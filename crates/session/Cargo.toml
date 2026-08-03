@@ -36,4 +36,3 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }
-serial_test = { workspace = true }

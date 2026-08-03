@@ -5,7 +5,10 @@
 
 use crate::cancel::backend_key::BackendCancelKey;
 use paro_common::logging::targets;
-use paro_instance::{ConnectionHandle, Instance, SessionExecutionHandle, StatementCancelReason};
+use paro_instance::{
+    ConnectionHandle, CopyStdinMetrics, CopyStdinRejectReason, Instance, SessionExecutionHandle,
+    StatementCancelReason,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -14,9 +17,8 @@ use std::time::Instant;
 use futures::{SinkExt, StreamExt};
 use paro_common::runtime_value::Value;
 use paro_session::{
-    copy_stdin_metrics, BindMessage, CloseTarget, ConnectionShutdownReason, CopyStdinRejectReason,
-    DescribeTarget, ExecutePortalMessage, ExtendedQueryMessage, ExtendedQueryResponder,
-    ParseMessage, Session, TransactionState,
+    BindMessage, CloseTarget, ConnectionShutdownReason, DescribeTarget, ExecutePortalMessage,
+    ExtendedQueryMessage, ExtendedQueryResponder, ParseMessage, Session, TransactionState,
 };
 use pgwire::error::PgWireError;
 use pgwire::messages::copy::{
@@ -147,10 +149,14 @@ impl Connection {
             force_close_token,
         } = init;
         let _ = tcp.set_nodelay(true);
+        let copy_stdin_metrics = instance.copy_stdin_metrics().clone();
         Self {
             id,
             peer_addr,
-            socket: Framed::new(tcp, PgCodec::new(frontend_message_limits)),
+            socket: Framed::new(
+                tcp,
+                PgCodec::new(frontend_message_limits, copy_stdin_metrics),
+            ),
             instance,
             control,
             limits,
@@ -1012,21 +1018,17 @@ pub struct PgCodec {
     ctx: DecodeContext,
     limits: PgFrontendMessageLimits,
     copy_data_mode: bool,
-}
-
-impl Default for PgCodec {
-    fn default() -> Self {
-        Self::new(PgFrontendMessageLimits::new(MAX_PG_FRONTEND_PACKET_BYTES))
-    }
+    copy_stdin_metrics: Arc<CopyStdinMetrics>,
 }
 
 impl PgCodec {
     /// Create a new PgCodec with default protocol version (3.0).
-    pub fn new(limits: PgFrontendMessageLimits) -> Self {
+    pub fn new(limits: PgFrontendMessageLimits, copy_stdin_metrics: Arc<CopyStdinMetrics>) -> Self {
         Self {
             ctx: DecodeContext::new(ProtocolVersion::PROTOCOL3_0),
             limits,
             copy_data_mode: false,
+            copy_stdin_metrics,
         }
     }
 
@@ -1046,7 +1048,7 @@ impl PgCodec {
 
         if message_length > limit {
             if let Some(reason) = rejected_reason {
-                copy_stdin_metrics().record_rejection(reason);
+                self.copy_stdin_metrics.record_rejection(reason);
             }
             return Err(PgWireError::MessageTooLarge(limit, message_length));
         }
@@ -1132,8 +1134,11 @@ mod tests {
     use pgwire::messages::simplequery::Query;
     use pgwire::messages::startup::Startup;
     use pgwire::messages::Message;
-    use serial_test::serial;
     use tokio_util::bytes::{Bytes, BytesMut};
+
+    fn test_codec(limits: PgFrontendMessageLimits) -> PgCodec {
+        PgCodec::new(limits, Arc::new(CopyStdinMetrics::default()))
+    }
 
     fn encode_frontend_message(message: PgWireFrontendMessage) -> BytesMut {
         let mut buf = BytesMut::new();
@@ -1143,7 +1148,7 @@ mod tests {
 
     #[test]
     fn codec_rejects_oversized_query_messages_before_decode() {
-        let mut codec = PgCodec::new(PgFrontendMessageLimits {
+        let mut codec = test_codec(PgFrontendMessageLimits {
             startup_packet_bytes: 1024,
             normal_message_bytes: 16,
             small_message_bytes: 8,
@@ -1163,7 +1168,7 @@ mod tests {
 
     #[test]
     fn codec_allows_copy_frames_within_copy_mode_limit() {
-        let mut codec = PgCodec::new(PgFrontendMessageLimits {
+        let mut codec = test_codec(PgFrontendMessageLimits {
             startup_packet_bytes: 1024,
             normal_message_bytes: 16,
             small_message_bytes: 8,
@@ -1187,16 +1192,18 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn codec_rejects_oversized_copy_frames_and_records_metric() {
-        copy_stdin_metrics().reset_for_tests();
+        let metrics = Arc::new(CopyStdinMetrics::default());
 
-        let mut codec = PgCodec::new(PgFrontendMessageLimits {
-            startup_packet_bytes: 1024,
-            normal_message_bytes: 16,
-            small_message_bytes: 8,
-            copy_data_bytes: 12,
-        });
+        let mut codec = PgCodec::new(
+            PgFrontendMessageLimits {
+                startup_packet_bytes: 1024,
+                normal_message_bytes: 16,
+                small_message_bytes: 8,
+                copy_data_bytes: 12,
+            },
+            metrics.clone(),
+        );
         codec.ctx.awaiting_ssl = false;
         codec.ctx.awaiting_startup = false;
         codec.enter_copy_data_mode();
@@ -1209,15 +1216,15 @@ mod tests {
             .expect_err("copy frame should exceed copy-data limit");
         assert!(matches!(err, PgWireError::MessageTooLarge(12, _)));
 
-        let metrics = copy_stdin_metrics().snapshot();
-        assert_eq!(metrics.rejected_total, 1);
-        assert_eq!(metrics.rejected_total_limit, 0);
-        assert_eq!(metrics.rejected_frame_limit, 1);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.rejected_total, 1);
+        assert_eq!(snapshot.rejected_total_limit, 0);
+        assert_eq!(snapshot.rejected_frame_limit, 1);
     }
 
     #[test]
     fn codec_rejects_oversized_startup_packets() {
-        let mut codec = PgCodec::new(PgFrontendMessageLimits {
+        let mut codec = test_codec(PgFrontendMessageLimits {
             startup_packet_bytes: 16,
             normal_message_bytes: 64,
             small_message_bytes: 8,

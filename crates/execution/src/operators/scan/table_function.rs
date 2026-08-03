@@ -2264,20 +2264,30 @@ impl TableFunctionSourceExec {
             ));
         }
 
-        let input_values = evaluate_table_function_arguments(ctx, &self.spec.arguments)?;
-        let named_parameters = HashMap::new();
-        let input = TableFunctionBindInput {
-            inputs: &input_values,
-            named_parameters: &named_parameters,
-            input_table_types: &self.spec.input_table_types,
-            input_table_names: &self.spec.input_table_names,
-        };
-        let mut bound_return_types = Vec::new();
-        let mut bound_names = Vec::new();
-        let bind_data = if let Some(bind) = self.spec.function.bind {
-            bind(&input, &mut bound_return_types, &mut bound_names)?
+        let (bind_data, input_values) = if let Some(bound) = &self.spec.bind_data {
+            if !self.spec.arguments.is_empty() {
+                return Err(paro_error::internal(
+                    "pre-bound table function must not retain runtime arguments".to_string(),
+                ));
+            }
+            (Some(bound.clone_box()), Vec::new())
         } else {
-            None
+            let input_values = evaluate_table_function_arguments(ctx, &self.spec.arguments)?;
+            let named_parameters = HashMap::new();
+            let input = TableFunctionBindInput {
+                inputs: &input_values,
+                named_parameters: &named_parameters,
+                input_table_types: &self.spec.input_table_types,
+                input_table_names: &self.spec.input_table_names,
+            };
+            let mut bound_return_types = Vec::new();
+            let mut bound_names = Vec::new();
+            let bind_data = if let Some(bind) = self.spec.function.bind {
+                bind(&input, &mut bound_return_types, &mut bound_names)?
+            } else {
+                None
+            };
+            (bind_data, input_values)
         };
         let column_ids = self
             .spec

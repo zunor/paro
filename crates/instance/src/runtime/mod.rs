@@ -13,12 +13,14 @@ use paro_transaction::{CommitDrainWakePool, CommitDrainWakePoolOptions};
 use std::sync::Arc;
 
 pub mod connection_registry;
+pub mod copy_stdin;
 pub mod object_cache;
 pub mod runtime_tuning;
 pub mod session_registry;
 pub mod shutdown_reason;
 
 use self::connection_registry::ConnectionRegistry;
+use self::copy_stdin::CopyStdinMetrics;
 use self::object_cache::ObjectCache;
 use self::runtime_tuning::RuntimeTuning;
 use self::session_registry::SessionExecutionRegistry;
@@ -32,6 +34,7 @@ pub struct InstanceRuntime {
     memory_arbitrator: Arc<MemoryArbitrator>,
     system_reserve: Arc<SystemReserve>,
     connection_registry: Arc<ConnectionRegistry>,
+    copy_stdin_metrics: Arc<CopyStdinMetrics>,
     session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
     db_file_system: Arc<DatabaseFileSystem>,
@@ -74,6 +77,7 @@ impl InstanceRuntime {
             memory_arbitrator,
             system_reserve,
             connection_registry,
+            copy_stdin_metrics: Arc::new(CopyStdinMetrics::default()),
             session_registry,
             object_cache,
             db_file_system,
@@ -107,6 +111,10 @@ impl InstanceRuntime {
 
     pub fn connection_registry(&self) -> &Arc<ConnectionRegistry> {
         &self.connection_registry
+    }
+
+    pub fn copy_stdin_metrics(&self) -> &Arc<CopyStdinMetrics> {
+        &self.copy_stdin_metrics
     }
 
     pub fn session_registry(&self) -> &Arc<SessionExecutionRegistry> {
@@ -198,6 +206,10 @@ impl Instance {
 
     pub fn get_connection_registry(&self) -> &Arc<ConnectionRegistry> {
         self.runtime.connection_registry()
+    }
+
+    pub fn copy_stdin_metrics(&self) -> &Arc<CopyStdinMetrics> {
+        self.runtime.copy_stdin_metrics()
     }
 
     pub fn get_session_registry(&self) -> &Arc<SessionExecutionRegistry> {

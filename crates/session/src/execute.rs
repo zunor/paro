@@ -5,7 +5,6 @@
 
 use crate::completion::StatementCompletion;
 use crate::completion_infer::{infer_statement_completion, initial_statement_completion};
-use crate::copy_metrics::{copy_stdin_metrics, CopyStdinRejectReason};
 use crate::copy_protocol::{CopyInSpec, CopyProtocolSink, CopyProtocolSource, ProtocolResultSink};
 use crate::dispatch::{dispatch_statement, FrontendRoute, PreparedCommand, UtilityCommand};
 use crate::prepared::extended_query::{
@@ -23,8 +22,10 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
 use paro_compiler::{compile_statement, compile_statement_with_parameters};
-use paro_context::{StatementCancellation, StatementOptions, StatementSource};
+use paro_context::{StatementCancellation, StatementInput, StatementOptions, StatementSource};
 use paro_execution::query_executor::executor::Executor;
+use paro_function::table::CopyStdinSource;
+use paro_instance::{CopyStdinMetrics, CopyStdinRejectReason};
 use paro_parser::ast::{
     CopyDirection, CopySource, CopyStmt, CopyTarget, ExecuteStmt, Expr, Identifier, Literal, Query,
     SetExpr, SetValues, Settings, Statement, TableReference,
@@ -33,8 +34,17 @@ use paro_transaction::{
     IsolationLevel, LockMode, LockRequest, LockResource, ReadTrackingPolicy, ReadWritePromotion,
     TableId,
 };
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
+
+#[derive(Default)]
+struct QueryPipelineOptions {
+    statement_format: Option<String>,
+    source: StatementSource,
+    input: StatementInput,
+    completion_override: Option<StatementCompletion>,
+}
 
 impl Session {
     /// Execute a SQL string using the Simple Query protocol with a ResultSink.
@@ -272,9 +282,12 @@ impl Session {
         self.execute_query_pipeline_with_parameters(
             stmt,
             None,
-            statement_format,
-            StatementSource::SimpleQuery,
-            completion_override,
+            QueryPipelineOptions {
+                statement_format,
+                source: StatementSource::SimpleQuery,
+                completion_override,
+                ..QueryPipelineOptions::default()
+            },
             sink,
         )
         .await
@@ -284,11 +297,15 @@ impl Session {
         &mut self,
         stmt: Statement,
         parameter_env: Option<&TypedParameterEnv>,
-        statement_format: Option<String>,
-        source: StatementSource,
-        completion_override: Option<StatementCompletion>,
+        options: QueryPipelineOptions,
         sink: &mut S,
     ) -> Result<()> {
+        let QueryPipelineOptions {
+            statement_format,
+            source,
+            input,
+            completion_override,
+        } = options;
         let require_new_transaction =
             self.transaction.is_auto_commit() && !self.transaction.has_active_transaction();
 
@@ -338,7 +355,7 @@ impl Session {
         let statement_completion = initial_statement_completion(&stmt);
         let started_at = Instant::now();
 
-        let ctx = self.freeze_statement_context(
+        let ctx = self.freeze_statement_context_with_input(
             StatementOptions {
                 statement_format,
                 source,
@@ -346,6 +363,7 @@ impl Session {
             },
             self.current_statement_cancellation()
                 .expect("query pipeline requires an active statement scope"),
+            input,
         );
 
         debug!(
@@ -672,21 +690,25 @@ impl Session {
         let cancellation = self
             .current_statement_cancellation()
             .expect("COPY FROM STDIN requires an active statement scope");
-        let registration = FramedCopySourceBridge::new(self.copy_stdin_memory_limit())
-            .collect(protocol_source, cancellation)
-            .await?
-            .register();
-        let mut rewritten = copy_stmt.clone();
-        rewritten.source = CopySource::File(registration.path().to_string());
+        let payload = FramedCopySourceBridge::new(
+            self.copy_stdin_memory_limit(),
+            self.instance.copy_stdin_metrics().clone(),
+        )
+        .collect(protocol_source, cancellation)
+        .await?;
+        let input = StatementInput::copy_from_stdin(Arc::new(payload));
 
         let mut sink = CompletionCaptureSink::default();
         let result = self
             .execute_query_pipeline_with_parameters(
-                Statement::Copy(rewritten),
+                Statement::Copy(copy_stmt.clone()),
                 parameter_env,
-                statement_format,
-                source,
-                None,
+                QueryPipelineOptions {
+                    statement_format,
+                    source,
+                    input,
+                    completion_override: None,
+                },
                 &mut sink,
             )
             .await;
@@ -1235,10 +1257,9 @@ fn validate_copy_from_options(copy_stmt: &CopyStmt) -> Result<()> {
         paro_function::copy::CopyFormat::Binary => Err(paro_error::not_implemented(
             "COPY FROM STDIN BINARY is not supported yet",
         )),
-        paro_function::copy::CopyFormat::Ndjson => Err(paro_error::not_implemented(
-            "COPY FROM STDIN NDJSON is not supported yet",
-        )),
-        paro_function::copy::CopyFormat::Csv | paro_function::copy::CopyFormat::Text => Ok(()),
+        paro_function::copy::CopyFormat::Csv
+        | paro_function::copy::CopyFormat::Text
+        | paro_function::copy::CopyFormat::Ndjson => Ok(()),
     }
 }
 
@@ -1332,55 +1353,54 @@ struct FramedCopySourceBridge {
 #[derive(Debug)]
 struct BufferedCopyStdinPayload {
     data: Vec<u8>,
-    memory: CopyStdinPayloadMemoryTracker,
-}
-
-impl BufferedCopyStdinPayload {
-    fn register(self) -> RegisteredCopyStdinPayload {
-        RegisteredCopyStdinPayload {
-            registration: paro_function::table::read_csv::register_copy_stdin_payload(self.data),
-            _memory: self.memory,
-        }
-    }
-}
-
-struct RegisteredCopyStdinPayload {
-    registration: paro_function::table::read_csv::CopyStdinPayloadRegistration,
     _memory: CopyStdinPayloadMemoryTracker,
 }
 
-impl RegisteredCopyStdinPayload {
-    fn path(&self) -> &str {
-        self.registration.path()
+impl CopyStdinSource for BufferedCopyStdinPayload {
+    fn as_bytes(&self) -> &[u8] {
+        self.data.as_slice()
     }
 }
 
 #[derive(Debug)]
 /// Keeps resident-memory accounting attached to the COPY payload as ownership
-/// moves from socket collection through registration and execution.
+/// moves from socket collection into the statement execution context.
 struct CopyStdinPayloadMemoryTracker {
     tracked_bytes: usize,
+    metrics: Arc<CopyStdinMetrics>,
 }
 
 impl CopyStdinPayloadMemoryTracker {
+    fn new(metrics: Arc<CopyStdinMetrics>) -> Self {
+        Self {
+            tracked_bytes: 0,
+            metrics,
+        }
+    }
+
     fn observe(&mut self, new_bytes: usize) {
-        copy_stdin_metrics().observe_buffer_bytes(self.tracked_bytes, new_bytes);
+        self.metrics
+            .observe_buffer_bytes(self.tracked_bytes, new_bytes);
         self.tracked_bytes = new_bytes;
+    }
+
+    fn record_rejection(&self, reason: CopyStdinRejectReason) {
+        self.metrics.record_rejection(reason);
     }
 }
 
 impl Drop for CopyStdinPayloadMemoryTracker {
     fn drop(&mut self) {
-        copy_stdin_metrics().finish_buffering(self.tracked_bytes);
+        self.metrics.finish_buffering(self.tracked_bytes);
     }
 }
 
 impl FramedCopySourceBridge {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, metrics: Arc<CopyStdinMetrics>) -> Self {
         Self {
             buffer: Vec::new(),
             limit,
-            memory: CopyStdinPayloadMemoryTracker { tracked_bytes: 0 },
+            memory: CopyStdinPayloadMemoryTracker::new(metrics),
         }
     }
 
@@ -1392,11 +1412,13 @@ impl FramedCopySourceBridge {
         while let Some(chunk) = source.next_chunk().await? {
             cancellation.check()?;
             let new_len = self.buffer.len().checked_add(chunk.len()).ok_or_else(|| {
-                copy_stdin_metrics().record_rejection(CopyStdinRejectReason::TotalLimit);
+                self.memory
+                    .record_rejection(CopyStdinRejectReason::TotalLimit);
                 paro_error::configuration_limit_exceeded("COPY FROM STDIN payload overflow")
             })?;
             if new_len > self.limit {
-                copy_stdin_metrics().record_rejection(CopyStdinRejectReason::TotalLimit);
+                self.memory
+                    .record_rejection(CopyStdinRejectReason::TotalLimit);
                 return Err(paro_error::configuration_limit_exceeded(
                     "COPY FROM STDIN payload exceeds memory limit",
                 ));
@@ -1410,7 +1432,7 @@ impl FramedCopySourceBridge {
         }
         Ok(BufferedCopyStdinPayload {
             data: self.buffer,
-            memory: self.memory,
+            _memory: self.memory,
         })
     }
 }
@@ -1418,7 +1440,6 @@ impl FramedCopySourceBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use tokio_util::bytes::Bytes;
 
     fn parse_one(sql: &str) -> Statement {
@@ -1484,14 +1505,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn copy_stdin_payload_metrics_span_collection_and_execution() {
-        copy_stdin_metrics().reset_for_tests();
+        let metrics = Arc::new(CopyStdinMetrics::default());
         let mut source = TestCopySource {
             chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
         };
 
-        let payload = FramedCopySourceBridge::new(16)
+        let payload = FramedCopySourceBridge::new(16, metrics.clone())
             .collect(
                 &mut source,
                 StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
@@ -1500,26 +1520,25 @@ mod tests {
             .unwrap();
         assert_eq!(payload.data, b"12345");
 
-        let metrics = copy_stdin_metrics().snapshot();
-        assert_eq!(metrics.current_buffer_bytes, 5);
-        assert_eq!(metrics.peak_buffer_bytes, 5);
-        assert_eq!(metrics.rejected_total, 0);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.current_buffer_bytes, 5);
+        assert_eq!(snapshot.peak_buffer_bytes, 5);
+        assert_eq!(snapshot.rejected_total, 0);
 
-        let registration = payload.register();
-        assert_eq!(copy_stdin_metrics().snapshot().current_buffer_bytes, 5);
-        drop(registration);
-        assert_eq!(copy_stdin_metrics().snapshot().current_buffer_bytes, 0);
+        let input = StatementInput::copy_from_stdin(Arc::new(payload));
+        assert_eq!(metrics.snapshot().current_buffer_bytes, 5);
+        drop(input);
+        assert_eq!(metrics.snapshot().current_buffer_bytes, 0);
     }
 
     #[tokio::test]
-    #[serial]
     async fn framed_copy_source_bridge_records_total_limit_rejections() {
-        copy_stdin_metrics().reset_for_tests();
+        let metrics = Arc::new(CopyStdinMetrics::default());
         let mut source = TestCopySource {
             chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
         };
 
-        let err = FramedCopySourceBridge::new(4)
+        let err = FramedCopySourceBridge::new(4, metrics.clone())
             .collect(
                 &mut source,
                 StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
@@ -1530,11 +1549,11 @@ mod tests {
             .message()
             .contains("COPY FROM STDIN payload exceeds memory limit"));
 
-        let metrics = copy_stdin_metrics().snapshot();
-        assert_eq!(metrics.current_buffer_bytes, 0);
-        assert_eq!(metrics.peak_buffer_bytes, 2);
-        assert_eq!(metrics.rejected_total, 1);
-        assert_eq!(metrics.rejected_total_limit, 1);
-        assert_eq!(metrics.rejected_frame_limit, 0);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.current_buffer_bytes, 0);
+        assert_eq!(snapshot.peak_buffer_bytes, 2);
+        assert_eq!(snapshot.rejected_total, 1);
+        assert_eq!(snapshot.rejected_total_limit, 1);
+        assert_eq!(snapshot.rejected_frame_limit, 0);
     }
 }

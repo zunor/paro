@@ -4,7 +4,7 @@
 //! Table function scan (`generate_series`, etc.).
 
 use paro_common::types::LogicalType;
-use paro_function::table::TableFunction;
+use paro_function::table::{BoundTableFunctionData, TableFunction};
 use std::sync::Arc;
 
 use crate::expression::Expression;
@@ -26,6 +26,8 @@ use crate::expression::Expression;
 pub struct TableFunctionGet {
     /// The table function definition.
     pub function: Arc<TableFunction>,
+    /// Bind data produced by a statement-specific planner path.
+    pub bind_data: Option<BoundTableFunctionData>,
     /// Unique table index for this function call.
     pub table_index: usize,
     /// Column names returned by the function.
@@ -55,6 +57,7 @@ impl TableFunctionGet {
     ) -> Self {
         Self {
             function,
+            bind_data: None,
             table_index,
             column_names,
             column_types,
@@ -78,6 +81,7 @@ impl TableFunctionGet {
     ) -> Self {
         Self {
             function,
+            bind_data: None,
             table_index,
             column_names,
             column_types,
@@ -92,6 +96,12 @@ impl TableFunctionGet {
     /// Create with projection.
     pub fn with_projection(mut self, projection_ids: Vec<usize>) -> Self {
         self.projection_ids = Some(projection_ids);
+        self
+    }
+
+    /// Attach bind data already resolved by the statement binder.
+    pub fn with_bind_data(mut self, bind_data: BoundTableFunctionData) -> Self {
+        self.bind_data = Some(bind_data);
         self
     }
 
