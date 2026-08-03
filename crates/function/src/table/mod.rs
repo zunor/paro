@@ -38,6 +38,8 @@ pub mod unnest;
 
 use std::any::Any;
 use std::fmt;
+#[cfg(test)]
+use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -120,14 +122,31 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
 }
 
 #[cfg(test)]
-struct EmptyTableFunctionRuntimeContext;
+pub(crate) struct TestTableFunctionRuntimeContext {
+    buffer_manager: Option<Arc<dyn BufferManager>>,
+}
 
 #[cfg(test)]
-impl TableFunctionRuntimeContext for EmptyTableFunctionRuntimeContext {}
+impl TestTableFunctionRuntimeContext {
+    pub(crate) fn with_buffer_manager(buffer_manager: Arc<dyn BufferManager>) -> Self {
+        Self {
+            buffer_manager: Some(buffer_manager),
+        }
+    }
+}
 
 #[cfg(test)]
-static EMPTY_TABLE_FUNCTION_RUNTIME_CONTEXT: EmptyTableFunctionRuntimeContext =
-    EmptyTableFunctionRuntimeContext;
+impl TableFunctionRuntimeContext for TestTableFunctionRuntimeContext {
+    fn buffer_manager(&self) -> Option<&dyn BufferManager> {
+        self.buffer_manager.as_deref()
+    }
+}
+
+#[cfg(test)]
+static EMPTY_TABLE_FUNCTION_RUNTIME_CONTEXT: TestTableFunctionRuntimeContext =
+    TestTableFunctionRuntimeContext {
+        buffer_manager: None,
+    };
 
 // ============================================================================
 // Table Function Bind Data

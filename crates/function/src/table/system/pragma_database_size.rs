@@ -190,21 +190,11 @@ pub fn create_pragma_database_size_function_set() -> TableFunctionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::TableFunctionRuntimeContext;
-    use paro_storage::buffer::{BufferManager, StandardBufferManager};
+    use crate::table::TestTableFunctionRuntimeContext;
+    use paro_storage::buffer::StandardBufferManager;
     use std::sync::Arc;
 
-    struct TestRuntimeContext {
-        buffer_manager: Arc<dyn BufferManager>,
-    }
-
-    impl TableFunctionRuntimeContext for TestRuntimeContext {
-        fn buffer_manager(&self) -> Option<&dyn BufferManager> {
-            Some(self.buffer_manager.as_ref())
-        }
-    }
-
-    fn reported_memory_limit(runtime: &TestRuntimeContext) -> i64 {
+    fn reported_memory_limit(runtime: &TestTableFunctionRuntimeContext) -> i64 {
         let input = TableFunctionInitInput::new(runtime, None, &[]);
         let state = pragma_database_size_init_global(&input)
             .expect("runtime-backed initialization should succeed")
@@ -225,12 +215,12 @@ mod tests {
 
     #[test]
     fn initialization_reads_the_current_runtime_buffer_manager() {
-        let first = TestRuntimeContext {
-            buffer_manager: Arc::new(StandardBufferManager::with_defaults(16 * 1024 * 1024)),
-        };
-        let second = TestRuntimeContext {
-            buffer_manager: Arc::new(StandardBufferManager::with_defaults(48 * 1024 * 1024)),
-        };
+        let first = TestTableFunctionRuntimeContext::with_buffer_manager(Arc::new(
+            StandardBufferManager::with_defaults(16 * 1024 * 1024),
+        ));
+        let second = TestTableFunctionRuntimeContext::with_buffer_manager(Arc::new(
+            StandardBufferManager::with_defaults(48 * 1024 * 1024),
+        ));
 
         assert_eq!(reported_memory_limit(&first), 16 * 1024 * 1024);
         assert_eq!(reported_memory_limit(&second), 48 * 1024 * 1024);

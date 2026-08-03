@@ -216,11 +216,63 @@ pub fn create_paro_temporary_files_function_set() -> TableFunctionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::TestTableFunctionRuntimeContext;
+    use paro_common::allocator::MemoryTag;
+    use paro_storage::buffer::{BufferManager, StandardBufferManager};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_create_paro_temporary_files_function_set() {
         let set = create_paro_temporary_files_function_set();
         assert_eq!(set.name, "paro_temporary_files");
         assert_eq!(set.functions.len(), 1);
+    }
+
+    #[test]
+    fn initialization_reads_spill_files_from_the_runtime_buffer_manager() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "paro_function_temporary_files_{}_{}",
+            std::process::id(),
+            unique
+        ));
+
+        {
+            let manager = Arc::new(StandardBufferManager::with_defaults(8192));
+            manager
+                .set_temporary_directory(temp_dir.to_string_lossy().into_owned())
+                .expect("temporary directory should be configured");
+            let handle = manager
+                .allocate_temp(MemoryTag::OrderBy, 1024)
+                .expect("test allocation should succeed");
+            let block_id = handle
+                .block_handle()
+                .expect("allocation should expose a block")
+                .block_id();
+            drop(handle);
+            manager.get_buffer_pool().add_to_eviction_queue(block_id);
+            assert!(manager.evict(1024) > 0, "test block should spill");
+
+            let buffer_manager: Arc<dyn BufferManager> = manager;
+            let runtime = TestTableFunctionRuntimeContext::with_buffer_manager(buffer_manager);
+            let input = TableFunctionInitInput::new(&runtime, None, &[]);
+            let state = paro_temporary_files_init_global(&input)
+                .expect("runtime-backed initialization should succeed")
+                .expect("paro_temporary_files should create global state");
+            let state = state
+                .as_any()
+                .downcast_ref::<ParoTemporaryFilesGlobalState>()
+                .expect("unexpected global state type");
+
+            assert!(state.rows.iter().any(|row| {
+                !row.path.is_empty() && row.size > 0 && row.write_bytes > 0 && row.file_count > 0
+            }));
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
