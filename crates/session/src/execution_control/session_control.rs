@@ -52,7 +52,7 @@ impl SessionExecutionControl {
         }
     }
 
-    pub fn begin_statement(
+    pub(crate) fn begin_statement(
         &self,
         statement_timeout: Option<Duration>,
     ) -> Result<Arc<ActiveStatementControl>> {
@@ -72,7 +72,7 @@ impl SessionExecutionControl {
         Ok(control)
     }
 
-    pub fn finish_statement(&self, statement: &Arc<ActiveStatementControl>) {
+    pub(crate) fn finish_statement(&self, statement: &Arc<ActiveStatementControl>) {
         let mut active = self.active_statement.lock();
         if active
             .as_ref()

@@ -333,6 +333,92 @@ async fn test_registered_state_query_lifecycle_notifications() {
     assert_eq!(lifecycle.query_error_count.load(Ordering::Relaxed), 1);
 }
 
+#[tokio::test]
+async fn dropped_statement_future_aborts_scope_and_allows_reuse() {
+    let mut session = create_test_session();
+    session.register_state("lifecycle", LifecycleState::default());
+
+    let mut execution = Box::pin(session.run_in_statement_scope("SELECT pending", async |_| {
+        std::future::pending::<paro_common::error::Result<()>>().await
+    }));
+    let timed_out =
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut execution).await;
+    assert!(timed_out.is_err());
+    drop(execution);
+
+    assert!(!session.has_active_query());
+    assert!(session.current_statement_cancellation().is_none());
+    assert!(session.get_query_progress().is_none());
+
+    let state = session.get_state("lifecycle").unwrap();
+    {
+        let guard = state.lock().unwrap();
+        let lifecycle = guard.as_any().downcast_ref::<LifecycleState>().unwrap();
+        assert_eq!(lifecycle.query_begin_count.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.query_end_count.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.query_error_count.load(Ordering::Relaxed), 1);
+    }
+
+    session
+        .run_in_statement_scope("SELECT reusable", async |_| Ok(()))
+        .await
+        .unwrap();
+}
+
+async fn panic_statement_operation(_: &mut Session) -> paro_common::error::Result<()> {
+    panic!("planned statement panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_statement_future_clears_shared_execution_control() {
+    let mut session = create_test_session();
+    let execution_control = session.execution_control().clone();
+
+    let task = tokio::spawn(async move {
+        let _ = session
+            .run_in_statement_scope("SELECT panic", panic_statement_operation)
+            .await;
+    });
+    let panic = task.await.expect_err("statement operation should panic");
+
+    assert!(panic.is_panic());
+    assert!(execution_control.active_statement().is_none());
+}
+
+#[derive(Debug)]
+struct PanickingQueryBeginState;
+
+impl SessionContextState for PanickingQueryBeginState {
+    fn query_begin(&mut self) {
+        panic!("planned query-begin panic");
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_query_begin_callback_clears_shared_execution_control() {
+    let mut session = create_test_session();
+    session.register_state("panicking", PanickingQueryBeginState);
+    let execution_control = session.execution_control().clone();
+
+    let task = tokio::spawn(async move {
+        let _ = session
+            .run_in_statement_scope("SELECT panic", async |_| Ok(()))
+            .await;
+    });
+    let panic = task.await.expect_err("query-begin callback should panic");
+
+    assert!(panic.is_panic());
+    assert!(execution_control.active_statement().is_none());
+}
+
 #[derive(Debug, Default)]
 struct TxnState {
     begin_count: AtomicU32,

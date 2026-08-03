@@ -46,6 +46,7 @@ use paro_storage::metrics::storage_metrics;
 use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
 use std::collections::HashMap;
 use std::ops::AsyncFnOnce;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -94,6 +95,54 @@ pub struct Session {
     copy_stdin_memory_limit: usize,
     /// Session-owned retained result budget for holdable portals/cursors.
     session_memory_budget: Arc<SessionMemoryBudget>,
+}
+
+/// Linear owner of one active statement scope.
+///
+/// The guard closes the scope explicitly after the operation returns and also
+/// restores the session invariant if the async operation is cancelled or
+/// unwinds before producing a result.
+struct StatementScopeGuard<'a> {
+    session: &'a mut Session,
+    finished: bool,
+}
+
+impl<'a> StatementScopeGuard<'a> {
+    fn enter(session: &'a mut Session, query: &str) -> Result<Self> {
+        session.begin_statement_scope(query)?;
+        let guard = Self {
+            session,
+            finished: false,
+        };
+        guard.session.registered_state.notify_query_begin();
+        tracing::trace!(
+            target: targets::QUERY,
+            session_id = guard.session.id,
+            query,
+            "statement scope started"
+        );
+        Ok(guard)
+    }
+
+    fn session(&mut self) -> &mut Session {
+        self.session
+    }
+
+    fn finish(mut self, error: Option<&ParoError>) {
+        // Mark first so a panic in an extension callback cannot trigger a
+        // second cleanup attempt while this guard unwinds.
+        self.finished = true;
+        self.session.finish_statement_scope(error);
+    }
+}
+
+impl Drop for StatementScopeGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.session.abort_statement_scope();
+    }
 }
 
 impl Session {
@@ -800,13 +849,15 @@ impl Session {
     /// This is the only production boundary that may begin and finish statement
     /// state. Keeping both transitions here makes cleanup unconditional for every
     /// returned success or error, including errors raised before execution starts.
+    /// Its guard also restores the invariant if the async future is dropped or
+    /// unwinds before producing a result.
     pub async fn run_in_statement_scope<T, F>(&mut self, query: &str, operation: F) -> Result<T>
     where
         F: AsyncFnOnce(&mut Session) -> Result<T>,
     {
-        self.begin_statement_scope(query)?;
-        let result = operation(self).await;
-        self.finish_statement_scope(result.as_ref().err());
+        let mut scope = StatementScopeGuard::enter(self, query)?;
+        let result = operation(scope.session()).await;
+        scope.finish(result.as_ref().err());
         result
     }
 
@@ -827,32 +878,54 @@ impl Session {
             .begin_statement(self.current_statement_timeout())?;
         let ctx = ActiveQueryContext::new(query, control);
         self.active_query = Some(ctx);
-        self.registered_state.notify_query_begin();
-        tracing::trace!(
-            target: targets::QUERY,
-            session_id = self.id,
-            query,
-            "statement scope started"
-        );
         Ok(())
     }
 
     /// Finishes active statement state after `run_in_statement_scope`'s operation.
     fn finish_statement_scope(&mut self, error: Option<&ParoError>) {
-        self.registered_state.notify_query_end(error);
-
         let ctx = self
             .active_query
             .take()
             .expect("statement scope completion requires an active statement");
         let elapsed = ctx.elapsed();
         self.execution_control.finish_statement(ctx.control());
+        self.registered_state.notify_query_end(error);
         tracing::trace!(
             target: targets::QUERY,
             session_id = self.id,
             success = error.is_none(),
             elapsed_ms = elapsed.as_millis(),
             "statement scope finished"
+        );
+    }
+
+    /// Restores core statement invariants when the owning async future is
+    /// cancelled or unwinds before returning a result.
+    fn abort_statement_scope(&mut self) {
+        let Some(ctx) = self.active_query.take() else {
+            return;
+        };
+        let elapsed = ctx.elapsed();
+        self.execution_control.finish_statement(ctx.control());
+
+        let error = paro_error::internal("statement scope ended before producing a result");
+        if std::thread::panicking() {
+            // Extension callbacks must not replace the original panic with a
+            // double panic during guard destruction.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                self.registered_state.notify_query_end(Some(&error));
+            }));
+        } else {
+            self.registered_state.notify_query_end(Some(&error));
+        }
+
+        tracing::trace!(
+            target: targets::QUERY,
+            session_id = self.id,
+            success = false,
+            aborted = true,
+            elapsed_ms = elapsed.as_millis(),
+            "statement scope aborted"
         );
     }
 

@@ -81,7 +81,7 @@ impl QueryProgress {
 /// # Lifecycle
 /// 1. Created when a statement enters `Session::run_in_statement_scope`
 /// 2. Holds coordinator and progress bar during execution
-/// 3. Destroyed before `Session::run_in_statement_scope` returns
+/// 3. Destroyed when the scope completes or its owning future is dropped
 ///
 /// # Thread Safety
 /// This structure is not thread-safe by itself. Access should be
