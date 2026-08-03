@@ -2299,6 +2299,7 @@ impl TableFunctionSourceExec {
         let bind_data = Arc::new(bind_data);
 
         let init_input = TableFunctionInitInput::new(
+            ctx.query,
             bind_data.bind_data.as_ref().map(|bind| bind.as_ref()),
             &bind_data.column_ids,
         )
@@ -2340,6 +2341,7 @@ impl TableFunctionSourceExec {
     ) -> Result<SourceLocal> {
         let global = global.table_function()?;
         let init_input = TableFunctionInitInput::new(
+            ctx.query,
             global
                 .bind_data
                 .bind_data

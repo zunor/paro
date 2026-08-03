@@ -31,7 +31,6 @@
 //! - Catalog: ✅ `paro_catalog`
 //! - TableFunction: ✅ `crate::table`
 
-mod memory_runtime;
 pub mod paro_columns;
 pub mod paro_commit_frontiers;
 pub mod paro_commit_poison;
@@ -55,7 +54,6 @@ pub mod paro_views;
 pub mod paro_wal_metrics;
 pub mod pragma_database_size;
 
-pub use memory_runtime::{get_system_buffer_manager, register_system_buffer_manager};
 pub use paro_columns::create_paro_columns_function_set;
 pub use paro_commit_frontiers::create_paro_commit_frontiers_function_set;
 pub use paro_commit_poison::create_paro_commit_poison_function_set;

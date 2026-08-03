@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_paro_search_metrics_function_with_data() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_search_metrics_init_global(&input).unwrap().unwrap();
         let state = state_box
             .as_any_mut()
@@ -861,7 +861,7 @@ mod tests {
             17,
         );
 
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let state_box = paro_search_metrics_init_global(&input).unwrap().unwrap();
         let state = state_box
             .as_any()

@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_paro_schemas_init_global() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let result = paro_schemas_init_global(&input);
         assert!(result.is_ok());
 
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_paro_schemas_function_empty() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let state_box = paro_schemas_init_global(&input).unwrap().unwrap();
         let state = state_box
             .as_any()
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_paro_schemas_function_with_data() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_schemas_init_global(&input).unwrap().unwrap();
 
         // Populate with test data
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_paro_schemas_progress() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_schemas_init_global(&input).unwrap().unwrap();
 
         // Empty state should show 100% progress

@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_paro_optimizers_function_with_data() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_optimizers_init_global(&input).unwrap().unwrap();
         let state = state_box
             .as_any_mut()
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_paro_optimizers_progress() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_optimizers_init_global(&input).unwrap().unwrap();
         let state = state_box
             .as_any_mut()

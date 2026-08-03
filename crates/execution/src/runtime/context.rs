@@ -14,6 +14,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{ParoError, Result};
 use paro_context::{StatementCancellation, StatementContext, TransactionView};
 use paro_function::scalar::FunctionExecContext;
+use paro_function::table::TableFunctionRuntimeContext;
 
 use crate::explain::profiler::{ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::{OperatorMemoryScope, QueryMemoryPool};
@@ -270,6 +271,12 @@ impl FunctionExecContext for QueryRuntimeContext {
                 tag,
             ))
         }
+    }
+}
+
+impl TableFunctionRuntimeContext for QueryRuntimeContext {
+    fn buffer_manager(&self) -> Option<&dyn paro_storage::buffer::BufferManager> {
+        Some(self.session.buffer_manager().as_ref())
     }
 }
 

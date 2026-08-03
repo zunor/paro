@@ -14,8 +14,6 @@ use crate::table::{
     TableFunctionInitInput, TableFunctionInput, TableFunctionResult, TableFunctionSet,
 };
 
-use super::memory_runtime::get_system_buffer_manager;
-
 #[derive(Clone)]
 struct ParoTemporaryFilesBindData;
 
@@ -97,39 +95,36 @@ fn paro_temporary_files_bind(
 }
 
 fn paro_temporary_files_init_global(
-    _input: &TableFunctionInitInput,
+    input: &TableFunctionInitInput,
 ) -> Result<Option<Box<dyn GlobalTableFunctionState>>> {
-    let rows = get_system_buffer_manager()
-        .map(|buffer_manager| {
-            let files = buffer_manager.get_temporary_files();
-            let metrics = buffer_manager.get_temporary_spill_metrics();
+    let buffer_manager = input.buffer_manager()?;
+    let files = buffer_manager.get_temporary_files();
+    let metrics = buffer_manager.get_temporary_spill_metrics();
 
-            if files.is_empty() {
-                return vec![TemporaryFileRow {
-                    path: String::new(),
-                    size: 0,
-                    write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
-                    read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
-                    file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
-                    swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
-                    swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
-                }];
-            }
-
-            files
-                .into_iter()
-                .map(|file| TemporaryFileRow {
-                    path: file.path.display().to_string(),
-                    size: i64::try_from(file.size).unwrap_or(i64::MAX),
-                    write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
-                    read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
-                    file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
-                    swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
-                    swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let rows = if files.is_empty() {
+        vec![TemporaryFileRow {
+            path: String::new(),
+            size: 0,
+            write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
+            read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
+            file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
+            swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
+            swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
+        }]
+    } else {
+        files
+            .into_iter()
+            .map(|file| TemporaryFileRow {
+                path: file.path.display().to_string(),
+                size: i64::try_from(file.size).unwrap_or(i64::MAX),
+                write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
+                read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
+                file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
+                swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
+                swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
+            })
+            .collect()
+    };
 
     Ok(Some(Box::new(ParoTemporaryFilesGlobalState {
         rows,
@@ -221,11 +216,63 @@ pub fn create_paro_temporary_files_function_set() -> TableFunctionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::TestTableFunctionRuntimeContext;
+    use paro_common::allocator::MemoryTag;
+    use paro_storage::buffer::{BufferManager, StandardBufferManager};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_create_paro_temporary_files_function_set() {
         let set = create_paro_temporary_files_function_set();
         assert_eq!(set.name, "paro_temporary_files");
         assert_eq!(set.functions.len(), 1);
+    }
+
+    #[test]
+    fn initialization_reads_spill_files_from_the_runtime_buffer_manager() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "paro_function_temporary_files_{}_{}",
+            std::process::id(),
+            unique
+        ));
+
+        {
+            let manager = Arc::new(StandardBufferManager::with_defaults(8192));
+            manager
+                .set_temporary_directory(temp_dir.to_string_lossy().into_owned())
+                .expect("temporary directory should be configured");
+            let handle = manager
+                .allocate_temp(MemoryTag::OrderBy, 1024)
+                .expect("test allocation should succeed");
+            let block_id = handle
+                .block_handle()
+                .expect("allocation should expose a block")
+                .block_id();
+            drop(handle);
+            manager.get_buffer_pool().add_to_eviction_queue(block_id);
+            assert!(manager.evict(1024) > 0, "test block should spill");
+
+            let buffer_manager: Arc<dyn BufferManager> = manager;
+            let runtime = TestTableFunctionRuntimeContext::with_buffer_manager(buffer_manager);
+            let input = TableFunctionInitInput::new(&runtime, None, &[]);
+            let state = paro_temporary_files_init_global(&input)
+                .expect("runtime-backed initialization should succeed")
+                .expect("paro_temporary_files should create global state");
+            let state = state
+                .as_any()
+                .downcast_ref::<ParoTemporaryFilesGlobalState>()
+                .expect("unexpected global state type");
+
+            assert!(state.rows.iter().any(|row| {
+                !row.path.is_empty() && row.size > 0 && row.write_bytes > 0 && row.file_count > 0
+            }));
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

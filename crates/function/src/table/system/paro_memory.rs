@@ -15,8 +15,6 @@ use crate::table::{
     TableFunctionInitInput, TableFunctionInput, TableFunctionResult, TableFunctionSet,
 };
 
-use super::memory_runtime::get_system_buffer_manager;
-
 #[derive(Clone)]
 struct ParoMemoryBindData;
 
@@ -82,24 +80,20 @@ fn paro_memory_bind(
 }
 
 fn paro_memory_init_global(
-    _input: &TableFunctionInitInput,
+    input: &TableFunctionInitInput,
 ) -> Result<Option<Box<dyn GlobalTableFunctionState>>> {
-    let rows = get_system_buffer_manager()
-        .map(|buffer_manager| {
-            let buffer_pool = buffer_manager.get_buffer_pool();
-            let snapshot = buffer_pool.get_memory_usage_info();
-            let temporary_storage = buffer_pool.get_temporary_storage_by_tag();
-            MemoryTag::all()
-                .iter()
-                .map(|tag| MemoryRow {
-                    tag: tag.name().to_string(),
-                    memory_usage_bytes: snapshot.get(*tag).max(0),
-                    temporary_storage_bytes: i64::try_from(temporary_storage[tag.as_index()])
-                        .unwrap_or(i64::MAX),
-                })
-                .collect()
+    let buffer_pool = input.buffer_manager()?.get_buffer_pool();
+    let snapshot = buffer_pool.get_memory_usage_info();
+    let temporary_storage = buffer_pool.get_temporary_storage_by_tag();
+    let rows = MemoryTag::all()
+        .iter()
+        .map(|tag| MemoryRow {
+            tag: tag.name().to_string(),
+            memory_usage_bytes: snapshot.get(*tag).max(0),
+            temporary_storage_bytes: i64::try_from(temporary_storage[tag.as_index()])
+                .unwrap_or(i64::MAX),
         })
-        .unwrap_or_default();
+        .collect();
 
     Ok(Some(Box::new(ParoMemoryGlobalState {
         rows,
@@ -174,11 +168,41 @@ pub fn create_paro_memory_function_set() -> TableFunctionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::TestTableFunctionRuntimeContext;
+    use paro_storage::buffer::{BufferManager, StandardBufferManager};
+    use std::sync::Arc;
 
     #[test]
     fn test_create_paro_memory_function_set() {
         let set = create_paro_memory_function_set();
         assert_eq!(set.name, "paro_memory");
         assert_eq!(set.functions.len(), 1);
+    }
+
+    #[test]
+    fn initialization_reads_memory_from_the_runtime_buffer_manager() {
+        let buffer_manager: Arc<dyn BufferManager> =
+            Arc::new(StandardBufferManager::with_defaults(16 * 1024 * 1024));
+        let _allocation = buffer_manager
+            .allocate_temp(MemoryTag::InMemoryTable, 4096)
+            .expect("test allocation should succeed");
+        let runtime =
+            TestTableFunctionRuntimeContext::with_buffer_manager(Arc::clone(&buffer_manager));
+        let input = TableFunctionInitInput::new(&runtime, None, &[]);
+
+        let state = paro_memory_init_global(&input)
+            .expect("runtime-backed initialization should succeed")
+            .expect("paro_memory should create global state");
+        let state = state
+            .as_any()
+            .downcast_ref::<ParoMemoryGlobalState>()
+            .expect("unexpected global state type");
+        let row = state
+            .rows
+            .iter()
+            .find(|row| row.tag == MemoryTag::InMemoryTable.name())
+            .expect("in-memory table tag should be reported");
+
+        assert!(row.memory_usage_bytes >= 4096);
     }
 }
