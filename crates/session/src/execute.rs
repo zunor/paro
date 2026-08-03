@@ -672,12 +672,12 @@ impl Session {
         let cancellation = self
             .current_statement_cancellation()
             .expect("COPY FROM STDIN requires an active statement scope");
-        let payload = FramedCopySourceBridge::new(self.copy_stdin_memory_limit())
+        let registration = FramedCopySourceBridge::new(self.copy_stdin_memory_limit())
             .collect(protocol_source, cancellation)
-            .await?;
-        let virtual_path = paro_function::table::read_csv::register_copy_stdin_payload(payload);
+            .await?
+            .register();
         let mut rewritten = copy_stmt.clone();
-        rewritten.source = CopySource::File(virtual_path.clone());
+        rewritten.source = CopySource::File(registration.path().to_string());
 
         let mut sink = CompletionCaptureSink::default();
         let result = self
@@ -690,7 +690,6 @@ impl Session {
                 &mut sink,
             )
             .await;
-        paro_function::table::read_csv::unregister_copy_stdin_payload(&virtual_path);
 
         result?;
         sink.into_completion()
@@ -1327,7 +1326,53 @@ impl ProtocolResultSink for CompletionCaptureSink {}
 struct FramedCopySourceBridge {
     buffer: Vec<u8>,
     limit: usize,
+    memory: CopyStdinPayloadMemoryTracker,
+}
+
+#[derive(Debug)]
+struct BufferedCopyStdinPayload {
+    data: Vec<u8>,
+    memory: CopyStdinPayloadMemoryTracker,
+}
+
+impl BufferedCopyStdinPayload {
+    fn register(self) -> RegisteredCopyStdinPayload {
+        RegisteredCopyStdinPayload {
+            registration: paro_function::table::read_csv::register_copy_stdin_payload(self.data),
+            _memory: self.memory,
+        }
+    }
+}
+
+struct RegisteredCopyStdinPayload {
+    registration: paro_function::table::read_csv::CopyStdinPayloadRegistration,
+    _memory: CopyStdinPayloadMemoryTracker,
+}
+
+impl RegisteredCopyStdinPayload {
+    fn path(&self) -> &str {
+        self.registration.path()
+    }
+}
+
+#[derive(Debug)]
+/// Keeps resident-memory accounting attached to the COPY payload as ownership
+/// moves from socket collection through registration and execution.
+struct CopyStdinPayloadMemoryTracker {
     tracked_bytes: usize,
+}
+
+impl CopyStdinPayloadMemoryTracker {
+    fn observe(&mut self, new_bytes: usize) {
+        copy_stdin_metrics().observe_buffer_bytes(self.tracked_bytes, new_bytes);
+        self.tracked_bytes = new_bytes;
+    }
+}
+
+impl Drop for CopyStdinPayloadMemoryTracker {
+    fn drop(&mut self) {
+        copy_stdin_metrics().finish_buffering(self.tracked_bytes);
+    }
 }
 
 impl FramedCopySourceBridge {
@@ -1335,7 +1380,7 @@ impl FramedCopySourceBridge {
         Self {
             buffer: Vec::new(),
             limit,
-            tracked_bytes: 0,
+            memory: CopyStdinPayloadMemoryTracker { tracked_bytes: 0 },
         }
     }
 
@@ -1343,7 +1388,7 @@ impl FramedCopySourceBridge {
         mut self,
         source: &mut dyn CopyProtocolSource,
         cancellation: StatementCancellation,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<BufferedCopyStdinPayload> {
         while let Some(chunk) = source.next_chunk().await? {
             cancellation.check()?;
             let new_len = self.buffer.len().checked_add(chunk.len()).ok_or_else(|| {
@@ -1360,17 +1405,13 @@ impl FramedCopySourceBridge {
                 paro_error::out_of_memory("COPY FROM STDIN payload allocation failed")
             })?;
             self.buffer.extend_from_slice(&chunk);
-            copy_stdin_metrics().observe_buffer_bytes(self.tracked_bytes, new_len);
-            self.tracked_bytes = new_len;
+            self.memory.observe(new_len);
             cancellation.check()?;
         }
-        Ok(std::mem::take(&mut self.buffer))
-    }
-}
-
-impl Drop for FramedCopySourceBridge {
-    fn drop(&mut self) {
-        copy_stdin_metrics().finish_buffering(self.tracked_bytes);
+        Ok(BufferedCopyStdinPayload {
+            data: self.buffer,
+            memory: self.memory,
+        })
     }
 }
 
@@ -1444,7 +1485,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn framed_copy_source_bridge_updates_metrics_and_resets_current_bytes() {
+    async fn copy_stdin_payload_metrics_span_collection_and_execution() {
         copy_stdin_metrics().reset_for_tests();
         let mut source = TestCopySource {
             chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
@@ -1457,12 +1498,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(payload, b"12345");
+        assert_eq!(payload.data, b"12345");
 
         let metrics = copy_stdin_metrics().snapshot();
-        assert_eq!(metrics.current_buffer_bytes, 0);
+        assert_eq!(metrics.current_buffer_bytes, 5);
         assert_eq!(metrics.peak_buffer_bytes, 5);
         assert_eq!(metrics.rejected_total, 0);
+
+        let registration = payload.register();
+        assert_eq!(copy_stdin_metrics().snapshot().current_buffer_bytes, 5);
+        drop(registration);
+        assert_eq!(copy_stdin_metrics().snapshot().current_buffer_bytes, 0);
     }
 
     #[tokio::test]

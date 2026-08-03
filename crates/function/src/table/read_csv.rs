@@ -14,8 +14,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -34,35 +34,80 @@ use super::{
 const COPY_STDIN_PREFIX: &str = "__paro_copy_stdin__://";
 const COPY_PARALLEL_SPLIT_MIN_BYTES: u64 = 1_048_576;
 const COPY_PARALLEL_MAX_WORKERS: usize = 32;
-static COPY_STDIN_SEQ: AtomicU64 = AtomicU64::new(1);
-static COPY_STDIN_REGISTRY: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+static COPY_STDIN_REGISTRY: OnceLock<Mutex<HashMap<u128, Weak<Vec<u8>>>>> = OnceLock::new();
 
-fn stdin_registry() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+fn stdin_registry() -> &'static Mutex<HashMap<u128, Weak<Vec<u8>>>> {
     COPY_STDIN_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn register_copy_stdin_payload(data: Vec<u8>) -> String {
-    let id = COPY_STDIN_SEQ.fetch_add(1, Ordering::Relaxed).to_string();
-    let mut guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
-    guard.insert(id.clone(), data);
-    format!("{COPY_STDIN_PREFIX}{id}")
+/// Scoped registration for an in-memory COPY FROM STDIN payload.
+///
+/// The registration owns the payload while planning and execution initialize a
+/// reader. Readers share that allocation and may finish consuming it after the
+/// registration is dropped. Dropping the registration always removes the
+/// virtual path from the process-wide lookup directory.
+#[must_use = "the registration must remain alive while the COPY pipeline opens its reader"]
+pub struct CopyStdinPayloadRegistration {
+    id: u128,
+    path: String,
+    _payload: Arc<Vec<u8>>,
 }
 
-pub fn unregister_copy_stdin_payload(path: &str) {
-    let Some(id) = path.strip_prefix(COPY_STDIN_PREFIX) else {
-        return;
-    };
+impl CopyStdinPayloadRegistration {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for CopyStdinPayloadRegistration {
+    fn drop(&mut self) {
+        let mut guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.id);
+    }
+}
+
+pub fn register_copy_stdin_payload(data: Vec<u8>) -> CopyStdinPayloadRegistration {
+    let payload = Arc::new(data);
     let mut guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
-    guard.remove(id);
+    let id = loop {
+        let candidate = rand::random::<u128>();
+        if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(candidate) {
+            entry.insert(Arc::downgrade(&payload));
+            break candidate;
+        }
+    };
+    CopyStdinPayloadRegistration {
+        id,
+        path: format!("{COPY_STDIN_PREFIX}{id:032x}"),
+        _payload: payload,
+    }
+}
+
+fn copy_stdin_payload(path: &str) -> Result<Arc<Vec<u8>>> {
+    let id = path
+        .strip_prefix(COPY_STDIN_PREFIX)
+        .and_then(|id| u128::from_str_radix(id, 16).ok())
+        .ok_or_else(|| paro_error::io_error(format!("invalid COPY STDIN path: {path}")))?;
+    let guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(&id).and_then(Weak::upgrade).ok_or_else(|| {
+        paro_error::io_error(format!("COPY STDIN payload expired or not found: {path}"))
+    })
+}
+
+struct SharedCopyStdinPayload(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedCopyStdinPayload {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
 }
 
 pub(crate) fn open_csv_reader(path: &str) -> Result<Box<dyn BufRead + Send>> {
-    if let Some(id) = path.strip_prefix(COPY_STDIN_PREFIX) {
-        let guard = stdin_registry().lock().unwrap_or_else(|e| e.into_inner());
-        let payload = guard.get(id).cloned().ok_or_else(|| {
-            paro_error::io_error(format!("COPY STDIN payload expired or not found: {}", path))
-        })?;
-        return Ok(Box::new(BufReader::new(Cursor::new(payload))));
+    if is_copy_stdin_path(path) {
+        let payload = copy_stdin_payload(path)?;
+        return Ok(Box::new(BufReader::new(Cursor::new(
+            SharedCopyStdinPayload(payload),
+        ))));
     }
 
     let file = File::open(path)
@@ -1309,4 +1354,41 @@ fn parse_f64(value: &str) -> Result<f64> {
     value
         .parse::<f64>()
         .map_err(|_| paro_error::invalid_value(LogicalType::Double.to_string(), value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn copy_stdin_registration_is_scoped_and_shares_one_payload() {
+        let registration = register_copy_stdin_payload(b"1,alpha\n2,beta\n".to_vec());
+        let path = registration.path().to_string();
+        let first_lookup = copy_stdin_payload(&path).unwrap();
+        let second_lookup = copy_stdin_payload(&path).unwrap();
+
+        assert!(Arc::ptr_eq(&registration._payload, &first_lookup));
+        assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
+        assert_eq!(Arc::strong_count(&registration._payload), 3);
+
+        let mut reader = open_csv_reader(&path).unwrap();
+        drop(first_lookup);
+        drop(second_lookup);
+        drop(registration);
+
+        assert!(copy_stdin_payload(&path).is_err());
+        let mut contents = String::new();
+        reader.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "1,alpha\n2,beta\n");
+    }
+
+    #[test]
+    fn copy_stdin_virtual_path_uses_an_opaque_capability() {
+        let registration = register_copy_stdin_payload(Vec::new());
+        let token = registration.path().strip_prefix(COPY_STDIN_PREFIX).unwrap();
+
+        assert_eq!(token.len(), 32);
+        assert!(u128::from_str_radix(token, 16).is_ok());
+    }
 }

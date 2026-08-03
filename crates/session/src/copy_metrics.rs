@@ -6,7 +6,13 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyStdinMetricsSnapshot {
+    /// Bytes retained by active COPY FROM STDIN commands.
+    ///
+    /// This covers both socket collection and the registered payload consumed
+    /// by execution. The value returns to zero when the command releases its
+    /// payload ownership chain.
     pub current_buffer_bytes: usize,
+    /// High-water mark of [`Self::current_buffer_bytes`].
     pub peak_buffer_bytes: usize,
     pub rejected_total: u64,
     pub rejected_total_limit: u64,
