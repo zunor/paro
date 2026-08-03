@@ -370,7 +370,7 @@ impl Default for TemporaryFileIdentifier {
 }
 
 /// Index of a block within a temporary file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemporaryFileIndex {
     /// The file identifier.
     pub identifier: TemporaryFileIdentifier,
@@ -433,7 +433,7 @@ pub struct TemporaryFileInfo {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TemporaryBlockInfo {
     index: TemporaryFileIndex,
     tag: MemoryTag,
@@ -460,6 +460,8 @@ pub struct TemporarySpillMetricsSnapshot {
 const MAX_ALLOWED_INDEX_BASE: u64 = 4000;
 /// Ownership marker file for startup orphan cleanup.
 const TEMP_DIR_OWNERSHIP_MARKER: &str = ".paro_temp_owner";
+/// Shards used to serialize operations that target the same temporary block.
+const TEMPORARY_BLOCK_OPERATION_LOCK_SHARDS: usize = 64;
 
 /// Manages block indexes within a temporary file.
 ///
@@ -494,15 +496,14 @@ impl BlockIndexManager {
 
     /// Remove an index from the manager.
     ///
-    /// Returns true if the max_index was reduced (file can be truncated).
-    fn remove_index(&mut self, index: u64) -> bool {
+    /// Returns whether the max_index was reduced (and the file can be truncated),
+    /// or `None` if the index was not allocated.
+    fn remove_index(&mut self, index: u64) -> Option<bool> {
         // Remove from indexes_in_use
         if let Some(pos) = self.indexes_in_use.iter().position(|&x| x == index) {
             self.indexes_in_use.remove(pos);
         } else {
-            // This would throw InternalException in a strict implementation
-            // We just return false
-            return false;
+            return None;
         }
 
         // Add to free_indexes
@@ -522,9 +523,9 @@ impl BlockIndexManager {
             // Remove free_indexes that are >= max_index
             self.free_indexes.retain(|&x| x < self.max_index);
 
-            true
+            Some(true)
         } else {
-            false
+            Some(false)
         }
     }
 
@@ -706,18 +707,27 @@ impl TemporaryFileHandle {
     }
 
     /// Erase a block index.
-    fn erase_block_index(&self, block_index: u64) {
+    fn erase_block_index(&self, block_index: u64) -> Result<()> {
         let mut index_manager = self.index_manager.lock().unwrap();
-        let should_truncate = index_manager.remove_index(block_index);
+        let should_truncate = index_manager.remove_index(block_index).ok_or_else(|| {
+            paro_error::internal(format!(
+                "temporary spill block index {} is not allocated",
+                block_index
+            ))
+        })?;
 
         if should_truncate {
             // Truncate file to new max_index
-            let file_guard = self.file.lock().unwrap();
+            let file_guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(file) = file_guard.as_ref() {
                 let new_size = self.get_position(index_manager.get_max_index());
                 let _ = file.set_len(new_size);
             }
         }
+        Ok(())
     }
 
     /// Check if the file is empty.
@@ -728,7 +738,12 @@ impl TemporaryFileHandle {
 
     /// Delete the file.
     fn delete(&self) {
-        let mut file_guard = self.file.lock().unwrap();
+        // Cleanup must remain best-effort even if an I/O path panicked while
+        // holding the file mutex. This is also called from the manager's Drop.
+        let mut file_guard = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *file_guard = None;
         let _ = fs::remove_file(&self.path);
     }
@@ -777,6 +792,13 @@ pub struct CompressionResult {
 pub struct TemporaryFileManager {
     /// Temporary directory path.
     temp_directory: PathBuf,
+    /// Prevents lifecycle operations from racing active spill I/O.
+    ///
+    /// Ordinary block operations hold a shared guard. Destructive manager-wide
+    /// operations such as [`Self::clear`] hold an exclusive guard.
+    lifecycle_lock: RwLock<()>,
+    /// Serializes operations for the same block without serializing unrelated I/O.
+    block_operation_locks: [Mutex<()>; TEMPORARY_BLOCK_OPERATION_LOCK_SHARDS],
     /// Files organized by (size, file_index).
     /// Note: Using Arc<TemporaryFileHandle> for shared ownership across threads.
     files: RwLock<HashMap<(TemporaryBufferSize, u64), Arc<TemporaryFileHandle>>>,
@@ -907,6 +929,8 @@ impl TemporaryFileManager {
 
         Ok(Self {
             temp_directory,
+            lifecycle_lock: RwLock::new(()),
+            block_operation_locks: std::array::from_fn(|_| Mutex::new(())),
             files: RwLock::new(HashMap::new()),
             used_blocks: RwLock::new(HashMap::new()),
             size_on_disk: AtomicU64::new(0),
@@ -955,6 +979,7 @@ impl TemporaryFileManager {
 
     /// Get a snapshot of temporary spill metrics.
     pub fn metrics_snapshot(&self) -> TemporarySpillMetricsSnapshot {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
         TemporarySpillMetricsSnapshot {
             write_bytes: self.get_write_bytes(),
             read_bytes: self.get_read_bytes(),
@@ -968,6 +993,51 @@ impl TemporaryFileManager {
     /// Get the temporary directory path.
     pub fn temp_directory(&self) -> &Path {
         &self.temp_directory
+    }
+
+    fn block_operation_lock(&self, block_id: BlockId) -> &Mutex<()> {
+        let shard = block_id.rem_euclid(TEMPORARY_BLOCK_OPERATION_LOCK_SHARDS as i64) as usize;
+        &self.block_operation_locks[shard]
+    }
+
+    fn reserve_disk_space(&self, bytes: u64) -> Result<()> {
+        let mut current = self.size_on_disk.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(bytes).ok_or_else(|| {
+                paro_error::out_of_memory("temporary spill size accounting overflow")
+            })?;
+            let max_space = self.max_swap_space.load(Ordering::Acquire);
+            if next > max_space {
+                self.swap_limit_hits.fetch_add(1, Ordering::AcqRel);
+                return Err(paro_error::out_of_memory(format!(
+                    "swap space limit exceeded: {} + {} > {}",
+                    current, bytes, max_space
+                )));
+            }
+            match self.size_on_disk.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release_disk_space(&self, bytes: u64) -> Result<()> {
+        self.size_on_disk
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(bytes)
+            })
+            .map(|_| ())
+            .map_err(|current| {
+                paro_error::internal(format!(
+                    "temporary spill size accounting underflow: {} - {}",
+                    current, bytes
+                ))
+            })
     }
 
     /// Compress a buffer with adaptive compression level selection.
@@ -1070,6 +1140,15 @@ impl TemporaryFileManager {
         tag: MemoryTag,
         data: &[u8],
     ) -> Result<usize> {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
+        let _block_guard = self.block_operation_lock(block_id).lock().unwrap();
+        if self.used_blocks.read().unwrap().contains_key(&block_id) {
+            return Err(paro_error::internal(format!(
+                "temporary block {} is already spilled",
+                block_id
+            )));
+        }
+
         let original_size = data.len();
 
         // Get current time for performance statistics
@@ -1085,27 +1164,29 @@ impl TemporaryFileManager {
             self.compress_buffer_with_adaptivity(compression_adaptivity, data);
 
         let buffer_size = compression_result.size.size();
-
-        // Check swap space limit
-        let current_size = self.size_on_disk.load(Ordering::Acquire);
-        let max_space = self.max_swap_space.load(Ordering::Acquire);
-        if current_size + buffer_size as u64 > max_space {
-            self.swap_limit_hits.fetch_add(1, Ordering::AcqRel);
-            return Err(paro_error::out_of_memory(format!(
-                "swap space limit exceeded: {} + {} > {}",
-                current_size, buffer_size, max_space
+        if compressed_data.is_none() && original_size > buffer_size {
+            return Err(paro_error::not_supported(format!(
+                "uncompressed temporary block of {} bytes exceeds the grouped spill slot size of {} bytes",
+                original_size, buffer_size
             )));
         }
+        self.reserve_disk_space(buffer_size as u64)?;
 
         // Find or create a file handle and get a block index
-        let index = self.allocate_block_index(compression_result.size, original_size)?;
+        let index = match self.allocate_block_index(compression_result.size, original_size) {
+            Ok(index) => index,
+            Err(err) => {
+                self.release_disk_space(buffer_size as u64)?;
+                return Err(err);
+            }
+        };
 
         // Get the file and write
         let key = (
             index.identifier.size,
             index.identifier.file_index.unwrap(), // Safe: validated by is_valid()
         );
-        {
+        let write_result = (|| -> Result<()> {
             let files = self.files.read().unwrap();
             let file_handle = files
                 .get(&key)
@@ -1118,30 +1199,43 @@ impl TemporaryFileManager {
                     index.block_index.unwrap(),
                     &compressed,
                     buffer_size,
-                )?;
+                )
             } else {
                 // Write uncompressed data (pad to buffer size)
                 let mut padded_data = vec![0u8; buffer_size];
                 padded_data[..original_size].copy_from_slice(data);
-                file_handle.write_buffer(index.block_index.unwrap(), &padded_data)?;
+                file_handle.write_buffer(index.block_index.unwrap(), &padded_data)
             }
+        })();
+        if let Err(write_err) = write_result {
+            if let Err(cleanup_err) = self.release_spill_allocation(&index) {
+                return Err(paro_error::internal(format!(
+                    "temporary block write failed: {}; rollback failed: {}",
+                    write_err, cleanup_err
+                )));
+            }
+            return Err(write_err);
         }
 
         // Track the block
-        {
+        let registered = {
             let mut used_blocks = self.used_blocks.write().unwrap();
-            if let Some(previous) = used_blocks.insert(block_id, TemporaryBlockInfo { index, tag })
-            {
-                self.spill_usage_per_tag[previous.tag.as_index()].fetch_sub(
-                    previous.index.identifier.size.size() as u64,
-                    Ordering::AcqRel,
-                );
+            match used_blocks.entry(block_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(TemporaryBlockInfo { index, tag });
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
             }
+        };
+        if !registered {
+            self.release_spill_allocation(&index)?;
+            return Err(paro_error::internal(format!(
+                "temporary block {} was concurrently registered",
+                block_id
+            )));
         }
 
-        // Update size on disk
-        self.size_on_disk
-            .fetch_add(buffer_size as u64, Ordering::AcqRel);
         self.spill_usage_per_tag[tag.as_index()].fetch_add(buffer_size as u64, Ordering::AcqRel);
         self.write_bytes
             .fetch_add(buffer_size as u64, Ordering::AcqRel);
@@ -1172,12 +1266,15 @@ impl TemporaryFileManager {
 
     /// Check if a temporary buffer exists.
     pub fn has_temporary_buffer(&self, block_id: BlockId) -> bool {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
+        let _block_guard = self.block_operation_lock(block_id).lock().unwrap();
         let used_blocks = self.used_blocks.read().unwrap();
         used_blocks.contains_key(&block_id)
     }
 
     /// Return block IDs that currently have spilled temporary buffers.
     pub fn temporary_block_ids(&self) -> Vec<BlockId> {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
         let used_blocks = self.used_blocks.read().unwrap();
         used_blocks.keys().copied().collect()
     }
@@ -1193,59 +1290,8 @@ impl TemporaryFileManager {
     /// # Returns
     /// The number of bytes read (original size, not padded).
     pub fn read_temporary_buffer(&self, block_id: BlockId, buffer: &mut [u8]) -> Result<usize> {
-        let block_info = {
-            let mut used_blocks = self.used_blocks.write().unwrap();
-            used_blocks.remove(&block_id).ok_or_else(|| {
-                paro_error::internal(format!("block {} not found in temp files", block_id))
-            })?
-        };
-        let index = block_info.index;
-
-        let buffer_size = index.identifier.size.size();
-        let original_size = index.original_size(); // Use helper method
-        let is_compressed = index.identifier.size != TemporaryBufferSize::Default;
-
-        // Read the buffer
-        let key = (
-            index.identifier.size,
-            index.identifier.file_index.unwrap(), // Safe: validated by is_valid()
-        );
-        {
-            let files = self.files.read().unwrap();
-            let file_handle = files
-                .get(&key)
-                .ok_or_else(|| paro_error::internal("file not found"))?;
-
-            let mut temp_buffer = vec![0u8; buffer_size];
-            file_handle.read_buffer(index.block_index.unwrap(), &mut temp_buffer)?; // Safe: validated by is_valid()
-
-            if is_compressed {
-                // Decompress the data
-                // The compressed data format is: [compressed_size: 8 bytes][compressed_data][padding]
-                // The decompress_buffer function handles reading the compressed_size and decompressing
-                let decompressed = decompress_buffer(&temp_buffer, original_size)?;
-                let copy_size = buffer.len().min(decompressed.len());
-                buffer[..copy_size].copy_from_slice(&decompressed[..copy_size]);
-            } else {
-                // Copy uncompressed data to output buffer (only original size)
-                let copy_size = buffer.len().min(original_size);
-                buffer[..copy_size].copy_from_slice(&temp_buffer[..copy_size]);
-            }
-        }
-
-        self.read_bytes
-            .fetch_add(buffer_size as u64, Ordering::AcqRel);
-        self.spill_usage_per_tag[block_info.tag.as_index()]
-            .fetch_sub(buffer_size as u64, Ordering::AcqRel);
-
-        // Delete the buffer from file
-        self.delete_temporary_buffer_internal(block_id, &index)?;
-
-        Ok(original_size)
-    }
-
-    /// Read a temporary buffer without deleting it.
-    pub fn peek_temporary_buffer(&self, block_id: BlockId, buffer: &mut [u8]) -> Result<usize> {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
+        let _block_guard = self.block_operation_lock(block_id).lock().unwrap();
         let block_info = {
             let used_blocks = self.used_blocks.read().unwrap();
             used_blocks.get(&block_id).copied().ok_or_else(|| {
@@ -1255,33 +1301,31 @@ impl TemporaryFileManager {
         let index = block_info.index;
 
         let buffer_size = index.identifier.size.size();
-        let original_size = index.original_size(); // Use helper method
-        let is_compressed = index.identifier.size != TemporaryBufferSize::Default;
+        let original_size = index.original_size();
+        self.read_block_into(&index, buffer)?;
 
-        let key = (
-            index.identifier.size,
-            index.identifier.file_index.unwrap(), // Safe: validated by is_valid()
-        );
-        {
-            let files = self.files.read().unwrap();
-            let file_handle = files
-                .get(&key)
-                .ok_or_else(|| paro_error::internal("file not found"))?;
+        self.release_tracked_spill(block_id, block_info)?;
+        self.read_bytes
+            .fetch_add(buffer_size as u64, Ordering::AcqRel);
 
-            let mut temp_buffer = vec![0u8; buffer_size];
-            file_handle.read_buffer(index.block_index.unwrap(), &mut temp_buffer)?; // Safe: validated by is_valid()
+        Ok(original_size)
+    }
 
-            if is_compressed {
-                // Decompress the data
-                let decompressed = decompress_buffer(&temp_buffer, original_size)?;
-                let copy_size = buffer.len().min(decompressed.len());
-                buffer[..copy_size].copy_from_slice(&decompressed[..copy_size]);
-            } else {
-                // Copy uncompressed data
-                let copy_size = buffer.len().min(original_size);
-                buffer[..copy_size].copy_from_slice(&temp_buffer[..copy_size]);
-            }
-        }
+    /// Read a temporary buffer without deleting it.
+    pub fn peek_temporary_buffer(&self, block_id: BlockId, buffer: &mut [u8]) -> Result<usize> {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
+        let _block_guard = self.block_operation_lock(block_id).lock().unwrap();
+        let block_info = {
+            let used_blocks = self.used_blocks.read().unwrap();
+            used_blocks.get(&block_id).copied().ok_or_else(|| {
+                paro_error::internal(format!("block {} not found in temp files", block_id))
+            })?
+        };
+        let index = block_info.index;
+
+        let buffer_size = index.identifier.size.size();
+        let original_size = index.original_size();
+        self.read_block_into(&index, buffer)?;
 
         self.read_bytes
             .fetch_add(buffer_size as u64, Ordering::AcqRel);
@@ -1291,58 +1335,149 @@ impl TemporaryFileManager {
 
     /// Delete a temporary buffer.
     pub fn delete_temporary_buffer(&self, block_id: BlockId) -> Result<usize> {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
+        let _block_guard = self.block_operation_lock(block_id).lock().unwrap();
         let block_info = {
-            let mut used_blocks = self.used_blocks.write().unwrap();
-            used_blocks.remove(&block_id).ok_or_else(|| {
+            let used_blocks = self.used_blocks.read().unwrap();
+            used_blocks.get(&block_id).copied().ok_or_else(|| {
                 paro_error::internal(format!("block {} not found in temp files", block_id))
             })?
         };
         let index = block_info.index;
-        self.spill_usage_per_tag[block_info.tag.as_index()]
-            .fetch_sub(index.identifier.size.size() as u64, Ordering::AcqRel);
+        let buffer_size = index.identifier.size.size();
 
-        self.delete_temporary_buffer_internal(block_id, &index)
+        self.release_tracked_spill(block_id, block_info)?;
+
+        Ok(buffer_size)
     }
 
-    /// Internal delete implementation.
-    fn delete_temporary_buffer_internal(
-        &self,
-        _block_id: BlockId,
-        index: &TemporaryFileIndex,
-    ) -> Result<usize> {
-        let buffer_size = index.identifier.size.size();
+    fn read_block_into(&self, index: &TemporaryFileIndex, buffer: &mut [u8]) -> Result<()> {
+        let original_size = index.original_size();
+        if buffer.len() < original_size {
+            return Err(paro_error::invalid_input(format!(
+                "temporary buffer is too small: need {} bytes, got {}",
+                original_size,
+                buffer.len()
+            )));
+        }
+
         let key = (
             index.identifier.size,
             index.identifier.file_index.unwrap(), // Safe: validated by is_valid()
         );
+        let files = self.files.read().unwrap();
+        let file_handle = files
+            .get(&key)
+            .ok_or_else(|| paro_error::internal("temporary spill file not found"))?;
+        let mut temp_buffer = vec![0u8; index.identifier.size.size()];
+        file_handle.read_buffer(index.block_index.unwrap(), &mut temp_buffer)?;
+
+        if index.identifier.size != TemporaryBufferSize::Default {
+            let decompressed = decompress_buffer(&temp_buffer, original_size)?;
+            buffer[..original_size].copy_from_slice(&decompressed);
+        } else {
+            buffer[..original_size].copy_from_slice(&temp_buffer[..original_size]);
+        }
+        Ok(())
+    }
+
+    /// Release an allocated file slot and its disk-space reservation.
+    ///
+    /// Every fallible invariant check happens before the slot or accounting is
+    /// changed. Holding `files` exclusively makes the remaining state transition
+    /// linearizable with allocations and other releases.
+    fn release_spill_allocation(&self, index: &TemporaryFileIndex) -> Result<()> {
+        let key = (
+            index.identifier.size,
+            index.identifier.file_index.unwrap(), // Safe: validated by is_valid()
+        );
+        let block_index = index.block_index.unwrap(); // Safe: validated by is_valid()
+        let buffer_size = index.identifier.size.size() as u64;
+
+        // Keep the file map exclusively locked across erase/check/remove. Otherwise
+        // a concurrent writer can reuse the last slot between the empty check and
+        // file removal.
+        let mut files = self.files.write().unwrap();
+        let current_size = self.size_on_disk.load(Ordering::Acquire);
+        if current_size < buffer_size {
+            return Err(paro_error::internal(format!(
+                "temporary spill size accounting underflow: {} - {}",
+                current_size, buffer_size
+            )));
+        }
 
         let should_remove_file = {
-            let files = self.files.read().unwrap();
             let file_handle = files
                 .get(&key)
-                .ok_or_else(|| paro_error::internal("file not found"))?;
+                .ok_or_else(|| paro_error::internal("temporary spill file not found"))?;
 
-            file_handle.erase_block_index(index.block_index.unwrap()); // Safe: validated by is_valid()
+            // A missing index is reported without mutating the index manager.
+            file_handle.erase_block_index(block_index)?;
             file_handle.is_empty()
         };
 
-        // Remove file if empty
         if should_remove_file {
-            let mut files = self.files.write().unwrap();
             if let Some(file_handle) = files.remove(&key) {
                 file_handle.delete();
             }
         }
 
-        // Update size on disk
-        self.size_on_disk
-            .fetch_sub(buffer_size as u64, Ordering::AcqRel);
+        // All fallible work is complete. Other indexed releases are serialized by
+        // `files`, and reservation-only rollbacks can only remove their own bytes,
+        // so the preflight check above guarantees this subtraction cannot underflow.
+        let previous_size = self.size_on_disk.fetch_sub(buffer_size, Ordering::AcqRel);
+        debug_assert!(previous_size >= buffer_size);
+        Ok(())
+    }
 
-        Ok(buffer_size)
+    /// Release a registered spill as one ownership/accounting transition.
+    fn release_tracked_spill(
+        &self,
+        block_id: BlockId,
+        block_info: TemporaryBlockInfo,
+    ) -> Result<()> {
+        // Keep ownership stable until the file slot and all counters are committed.
+        // Lock order is lifecycle -> block operation -> used_blocks -> files.
+        let mut used_blocks = self.used_blocks.write().unwrap();
+        match used_blocks.get(&block_id) {
+            Some(current) if *current == block_info => {}
+            Some(_) => {
+                return Err(paro_error::internal(format!(
+                    "temporary block {} ownership changed during release",
+                    block_id
+                )));
+            }
+            None => {
+                return Err(paro_error::internal(format!(
+                    "temporary block {} is not registered",
+                    block_id
+                )));
+            }
+        }
+
+        let buffer_size = block_info.index.identifier.size.size() as u64;
+        let tag_usage = &self.spill_usage_per_tag[block_info.tag.as_index()];
+        let current_tag_usage = tag_usage.load(Ordering::Acquire);
+        if current_tag_usage < buffer_size {
+            return Err(paro_error::internal(format!(
+                "temporary spill tag accounting underflow: {} - {}",
+                current_tag_usage, buffer_size
+            )));
+        }
+
+        self.release_spill_allocation(&block_info.index)?;
+
+        // No fallible work remains after the allocation transition commits.
+        let previous_tag_usage = tag_usage.fetch_sub(buffer_size, Ordering::AcqRel);
+        debug_assert!(previous_tag_usage >= buffer_size);
+        let removed = used_blocks.remove(&block_id);
+        debug_assert_eq!(removed, Some(block_info));
+        Ok(())
     }
 
     /// Get the list of temporary files.
     pub fn get_temporary_files(&self) -> Vec<TemporaryFileInfo> {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
         let files = self.files.read().unwrap();
         let mut result = Vec::new();
 
@@ -1354,6 +1489,7 @@ impl TemporaryFileManager {
     }
 
     pub fn spill_usage_per_tag(&self) -> [u64; MEMORY_TAG_COUNT] {
+        let _lifecycle_guard = self.lifecycle_lock.read().unwrap();
         std::array::from_fn(|idx| self.spill_usage_per_tag[idx].load(Ordering::Acquire))
     }
 
@@ -1428,18 +1564,32 @@ impl TemporaryFileManager {
 
     /// Clear all temporary files.
     pub fn clear(&self) -> Result<()> {
-        // Use try_write to avoid panic on poisoned lock
-        let files_result = self.files.try_write();
-        if let Ok(mut files) = files_result {
+        // `clear` is also called from Drop, including while another panic may be
+        // unwinding. Recover poisoned cleanup locks so resource reclamation cannot
+        // turn that panic into a process abort.
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let mut files = self
+                .files
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for file_handle in files.values() {
                 file_handle.delete();
             }
             files.clear();
         }
 
-        if let Ok(mut used_blocks) = self.used_blocks.try_write() {
-            used_blocks.clear();
-        }
+        self.used_blocks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.next_file_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
 
         self.size_on_disk.store(0, Ordering::Release);
         for usage in &self.spill_usage_per_tag {
@@ -1545,10 +1695,22 @@ pub fn decompress_buffer(compressed: &[u8], expected_size: usize) -> Result<Vec<
     // Read compressed size (little-endian)
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&compressed[0..8]);
-    let compressed_size = u64::from_le_bytes(size_bytes) as usize;
+    let compressed_size = usize::try_from(u64::from_le_bytes(size_bytes)).map_err(|_| {
+        paro_error::internal("Compressed buffer length does not fit in address space")
+    })?;
+    let compressed_end = 8usize
+        .checked_add(compressed_size)
+        .ok_or_else(|| paro_error::internal("Compressed buffer length overflow"))?;
+    if compressed_end > compressed.len() {
+        return Err(paro_error::internal(format!(
+            "Compressed buffer payload exceeds allocation: need {} bytes, got {}",
+            compressed_end,
+            compressed.len()
+        )));
+    }
 
     // Decompress only the actual compressed data (not the padding)
-    let compressed_data = &compressed[8..8 + compressed_size];
+    let compressed_data = &compressed[8..compressed_end];
     let decompressed = zstd::decode_all(compressed_data)
         .map_err(|e| paro_error::internal(format!("ZSTD decompression failed: {}", e)))?;
 
@@ -1712,6 +1874,122 @@ mod tests {
     }
 
     #[test]
+    fn failed_read_keeps_spill_tracked_for_cleanup() {
+        let dir = create_temp_dir();
+        let manager = TemporaryFileManager::new(&dir).unwrap();
+        let block_id = 43;
+        let data = vec![7u8; 4096];
+
+        let written = manager
+            .write_temporary_buffer(block_id, MemoryTag::InMemoryTable, &data)
+            .unwrap();
+        let spill_path = manager
+            .get_temporary_files()
+            .into_iter()
+            .next()
+            .expect("spill file")
+            .path;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(spill_path)
+            .expect("truncate spill file");
+
+        let mut output = vec![0u8; data.len()];
+        assert!(manager
+            .read_temporary_buffer(block_id, &mut output)
+            .is_err());
+        assert!(manager.has_temporary_buffer(block_id));
+        assert_eq!(manager.get_used_space(), written as u64);
+        assert_eq!(
+            manager.spill_usage_per_tag()[MemoryTag::InMemoryTable.as_index()],
+            written as u64
+        );
+
+        manager.delete_temporary_buffer(block_id).unwrap();
+        assert!(!manager.has_temporary_buffer(block_id));
+        assert_eq!(manager.get_used_space(), 0);
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn failed_release_preflight_keeps_spill_retryable() {
+        let dir = create_temp_dir();
+        let manager = TemporaryFileManager::new(&dir).unwrap();
+        let block_id = 45;
+        let tag = MemoryTag::InMemoryTable;
+        let data = vec![8u8; 4096];
+
+        let written = manager
+            .write_temporary_buffer(block_id, tag, &data)
+            .unwrap() as u64;
+        let spill_path = manager
+            .get_temporary_files()
+            .into_iter()
+            .next()
+            .expect("spill file")
+            .path;
+
+        // Simulate a corrupted global counter. The release must fail before it
+        // erases the file slot, so restoring the invariant makes it retryable.
+        manager.size_on_disk.store(0, Ordering::Release);
+        assert!(manager.delete_temporary_buffer(block_id).is_err());
+        assert!(manager.has_temporary_buffer(block_id));
+        assert!(spill_path.exists());
+
+        manager.size_on_disk.store(written, Ordering::Release);
+        let tag_usage = &manager.spill_usage_per_tag[tag.as_index()];
+        tag_usage.store(0, Ordering::Release);
+        assert!(manager.delete_temporary_buffer(block_id).is_err());
+        assert!(manager.has_temporary_buffer(block_id));
+        assert!(spill_path.exists());
+        assert_eq!(manager.get_used_space(), written);
+
+        tag_usage.store(written, Ordering::Release);
+        assert_eq!(
+            manager.delete_temporary_buffer(block_id).unwrap(),
+            written as usize
+        );
+        assert!(!manager.has_temporary_buffer(block_id));
+        assert_eq!(manager.get_used_space(), 0);
+        assert!(!spill_path.exists());
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn duplicate_block_write_is_rejected_without_leaking_spill_space() {
+        let dir = create_temp_dir();
+        let manager = TemporaryFileManager::new(&dir).unwrap();
+        let block_id = 44;
+        let original = vec![3u8; 4096];
+
+        let written = manager
+            .write_temporary_buffer(block_id, MemoryTag::InMemoryTable, &original)
+            .unwrap();
+        let duplicate =
+            manager.write_temporary_buffer(block_id, MemoryTag::HashTable, &vec![9u8; 4096]);
+
+        assert!(duplicate.is_err());
+        assert_eq!(manager.get_used_space(), written as u64);
+        assert_eq!(
+            manager.spill_usage_per_tag()[MemoryTag::InMemoryTable.as_index()],
+            written as u64
+        );
+        assert_eq!(
+            manager.spill_usage_per_tag()[MemoryTag::HashTable.as_index()],
+            0
+        );
+
+        let mut output = vec![0u8; original.len()];
+        manager
+            .read_temporary_buffer(block_id, &mut output)
+            .unwrap();
+        assert_eq!(output, original);
+        assert_eq!(manager.get_used_space(), 0);
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
     fn test_peek_buffer() {
         let dir = create_temp_dir();
         let manager = TemporaryFileManager::new(&dir).unwrap();
@@ -1803,6 +2081,40 @@ mod tests {
     }
 
     #[test]
+    fn swap_space_reservations_are_atomic() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        let dir = create_temp_dir();
+        let manager = Arc::new(TemporaryFileManager::new(&dir).unwrap());
+        let reservation = DEFAULT_BLOCK_ALLOC_SIZE as u64;
+        manager.set_max_swap_space(reservation);
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    manager.reserve_disk_space(reservation).is_ok()
+                })
+            })
+            .collect();
+        let successes = handles
+            .into_iter()
+            .map(|handle| usize::from(handle.join().unwrap()))
+            .sum::<usize>();
+
+        assert_eq!(successes, 1);
+        assert_eq!(manager.get_used_space(), reservation);
+        assert_eq!(manager.get_swap_limit_hits(), (THREADS - 1) as u64);
+        manager.release_disk_space(reservation).unwrap();
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
     fn test_get_temporary_files() {
         let dir = create_temp_dir();
         let manager = TemporaryFileManager::new(&dir).unwrap();
@@ -1866,6 +2178,75 @@ mod tests {
         assert_eq!(manager.get_used_space(), 0);
         assert!(manager.get_temporary_files().is_empty());
 
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn drop_recovers_poisoned_cleanup_locks() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = create_temp_dir();
+        let manager = Arc::new(TemporaryFileManager::new(&dir).unwrap());
+        manager
+            .write_temporary_buffer(1, MemoryTag::InMemoryTable, &vec![1u8; 4096])
+            .unwrap();
+        let spill_path = manager
+            .get_temporary_files()
+            .into_iter()
+            .next()
+            .expect("spill file")
+            .path;
+        let file_handle = {
+            let files = manager.files.read().unwrap();
+            Arc::clone(files.values().next().expect("file handle"))
+        };
+
+        let poison_file = Arc::clone(&file_handle);
+        assert!(thread::spawn(move || {
+            let _guard = poison_file.file.lock().unwrap();
+            panic!("poison file lock");
+        })
+        .join()
+        .is_err());
+        drop(file_handle);
+
+        let poison_files = Arc::clone(&manager);
+        assert!(thread::spawn(move || {
+            let _guard = poison_files.files.write().unwrap();
+            panic!("poison files lock");
+        })
+        .join()
+        .is_err());
+
+        let poison_used_blocks = Arc::clone(&manager);
+        assert!(thread::spawn(move || {
+            let _guard = poison_used_blocks.used_blocks.write().unwrap();
+            panic!("poison used-blocks lock");
+        })
+        .join()
+        .is_err());
+
+        let poison_next_index = Arc::clone(&manager);
+        assert!(thread::spawn(move || {
+            let _guard = poison_next_index.next_file_index.write().unwrap();
+            panic!("poison next-index lock");
+        })
+        .join()
+        .is_err());
+
+        let poison_lifecycle = Arc::clone(&manager);
+        assert!(thread::spawn(move || {
+            let _guard = poison_lifecycle.lifecycle_lock.write().unwrap();
+            panic!("poison lifecycle lock");
+        })
+        .join()
+        .is_err());
+
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(manager))).is_ok());
+        assert!(!spill_path.exists());
+        assert!(!dir.join(TEMP_DIR_OWNERSHIP_MARKER).exists());
         cleanup_temp_dir(&dir);
     }
 
@@ -2369,6 +2750,11 @@ mod tests {
         let mut invalid_buffer = vec![0u8; 100];
         invalid_buffer[0..8].copy_from_slice(&(50u64).to_le_bytes()); // Claim size is 50
                                                                       // But the rest is not valid ZSTD data
+        let result = decompress_buffer(&invalid_buffer, 50);
+        assert!(result.is_err());
+
+        // A corrupt length header must be rejected instead of panicking on a slice.
+        invalid_buffer[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
         let result = decompress_buffer(&invalid_buffer, 50);
         assert!(result.is_err());
     }
