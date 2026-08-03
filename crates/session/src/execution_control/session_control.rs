@@ -4,6 +4,7 @@
 use super::statement_control::ActiveStatementControl;
 use super::TokioStatementTimeoutDriver;
 use parking_lot::Mutex;
+use paro_common::error::{self as paro_error, Result};
 use paro_context::{StatementCancelReason, StatementCancellation, StatementTimeoutDriver};
 use paro_instance::{ConnectionShutdownReason, SessionExecutionHandle};
 use std::sync::Arc;
@@ -51,24 +52,27 @@ impl SessionExecutionControl {
         }
     }
 
-    pub fn begin_statement(
+    pub(crate) fn begin_statement(
         &self,
         statement_timeout: Option<Duration>,
-    ) -> Arc<ActiveStatementControl> {
+    ) -> Result<Arc<ActiveStatementControl>> {
+        let mut active = self.active_statement.lock();
+        if active.is_some() {
+            return Err(paro_error::internal(
+                "cannot begin a statement while another statement is active",
+            ));
+        }
+
         let control = Arc::new(ActiveStatementControl::with_timeout_driver(
             &self.connection_shutdown,
             statement_timeout,
             self.statement_timeout_driver.clone(),
         ));
-        let previous = self.active_statement.lock().replace(control.clone());
-        debug_assert!(
-            previous.is_none(),
-            "statement scope replaced before previous scope finished"
-        );
-        control
+        *active = Some(control.clone());
+        Ok(control)
     }
 
-    pub fn finish_statement(&self, statement: &Arc<ActiveStatementControl>) {
+    pub(crate) fn finish_statement(&self, statement: &Arc<ActiveStatementControl>) {
         let mut active = self.active_statement.lock();
         if active
             .as_ref()
@@ -144,7 +148,7 @@ mod tests {
         let control = SessionExecutionControl::with_timeout_driver(Arc::new(
             paro_context::NoopStatementTimeoutDriver,
         ));
-        let statement = control.begin_statement(None);
+        let statement = control.begin_statement(None).unwrap();
 
         control.request_connection_shutdown(ConnectionShutdownReason::ForceClosed);
 
@@ -181,9 +185,29 @@ mod tests {
         let driver = Arc::new(RecordingTimeoutDriver::default());
         let control = SessionExecutionControl::with_timeout_driver(driver.clone());
 
-        let _statement = control.begin_statement(Some(Duration::from_millis(10)));
+        let _statement = control
+            .begin_statement(Some(Duration::from_millis(10)))
+            .unwrap();
         let _compile = control.compile_scope_cancellation(Some(Duration::from_millis(10)));
 
         assert_eq!(driver.arms.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn begin_statement_rejects_overlapping_statement() {
+        let control = SessionExecutionControl::with_timeout_driver(Arc::new(
+            paro_context::NoopStatementTimeoutDriver,
+        ));
+        let first = control.begin_statement(None).unwrap();
+
+        let error = control
+            .begin_statement(None)
+            .expect_err("overlapping statement must be rejected");
+
+        assert!(error.to_string().contains("another statement is active"));
+        assert!(Arc::ptr_eq(
+            control.active_statement().as_ref().unwrap(),
+            &first
+        ));
     }
 }
