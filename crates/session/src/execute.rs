@@ -152,8 +152,6 @@ impl Session {
         );
 
         let query_str = stmt.to_string();
-        self.begin_statement_scope(&query_str);
-
         let route = dispatch_statement(stmt.clone());
         debug!(
             target: targets::SESSION,
@@ -165,13 +163,12 @@ impl Session {
         );
 
         let result = self
-            .execute_frontend_route(route, statement_format, sink)
+            .run_in_statement_scope(&query_str, async move |session| {
+                session
+                    .execute_frontend_route(route, statement_format, sink)
+                    .await
+            })
             .await;
-
-        match &result {
-            Ok(()) => self.finish_statement_scope(true),
-            Err(e) => self.finish_statement_scope_with_error(e),
-        }
 
         debug!(
             target: targets::SESSION,

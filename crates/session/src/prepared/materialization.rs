@@ -16,8 +16,8 @@ use crate::Session;
 ///
 /// # Preconditions
 ///
-/// Callers must have already invoked `session.begin_statement_scope()` so the
-/// session owns an active statement context. This helper initializes the executor
+/// Callers must execute inside `Session::run_in_statement_scope` so the session
+/// owns an active statement context. This helper initializes the executor
 /// through `session.set_executor()` and runs it through `session.get_executor()`,
 /// both of which panic when no active statement is present.
 pub(crate) async fn materialize_compiled_statement(

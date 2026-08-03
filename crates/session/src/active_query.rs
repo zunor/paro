@@ -79,9 +79,9 @@ impl QueryProgress {
 ///
 ///
 /// # Lifecycle
-/// 1. Created when a statement begins (`Session::begin_statement_scope`)
+/// 1. Created when a statement enters `Session::run_in_statement_scope`
 /// 2. Holds coordinator and progress bar during execution
-/// 3. Destroyed when the statement ends (`Session::finish_statement_scope`)
+/// 3. Destroyed before `Session::run_in_statement_scope` returns
 ///
 /// # Thread Safety
 /// This structure is not thread-safe by itself. Access should be
@@ -107,6 +107,9 @@ pub struct ActiveQueryContext {
 
     /// The executor is created per-query and destroyed when the query ends.
     executor: Option<Executor>,
+
+    /// Progress belongs to the active statement and cannot outlive it.
+    progress: QueryProgress,
 }
 
 // Manual Debug implementation because Executor doesn't implement Debug
@@ -119,6 +122,7 @@ impl std::fmt::Debug for ActiveQueryContext {
             .field("control", &self.control)
             .field("open_result_id", &self.open_result_id)
             .field("has_executor", &self.executor.is_some())
+            .field("progress", &self.progress)
             .finish()
     }
 }
@@ -133,6 +137,7 @@ impl ActiveQueryContext {
             control,
             open_result_id: None,
             executor: None,
+            progress: QueryProgress::default(),
         }
     }
 
@@ -149,6 +154,7 @@ impl ActiveQueryContext {
             control,
             open_result_id: None,
             executor: Some(executor),
+            progress: QueryProgress::default(),
         }
     }
 
@@ -165,6 +171,7 @@ impl ActiveQueryContext {
             control,
             open_result_id: None,
             executor: None,
+            progress: QueryProgress::default(),
         }
     }
 
@@ -195,6 +202,16 @@ impl ActiveQueryContext {
     #[inline]
     pub fn control(&self) -> &Arc<ActiveStatementControl> {
         &self.control
+    }
+
+    /// Returns progress for this active statement.
+    pub fn progress(&self) -> &QueryProgress {
+        &self.progress
+    }
+
+    /// Returns mutable progress for this active statement.
+    pub fn progress_mut(&mut self) -> &mut QueryProgress {
+        &mut self.progress
     }
 
     /// Sets the open result ID.

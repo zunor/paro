@@ -45,6 +45,7 @@ use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::metrics::storage_metrics;
 use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
 use std::collections::HashMap;
+use std::ops::AsyncFnOnce;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -87,8 +88,6 @@ pub struct Session {
     pub current_database: Arc<DatabaseHandle>,
     /// Per-query execution state owned by the currently running front-end statement.
     active_query: Option<ActiveQueryContext>,
-    /// Current query progress
-    query_progress: QueryProgress,
     /// Registered state manager for extensible session state
     registered_state: RegisteredStateManager,
     /// Buffered COPY FROM STDIN payload limit used by the transitional bridge.
@@ -539,7 +538,6 @@ impl Session {
             execution_control,
             current_database,
             active_query: None,
-            query_progress: QueryProgress::default(),
             registered_state: RegisteredStateManager::new(),
             copy_stdin_memory_limit: default_copy_stdin_memory_limit,
             session_memory_budget: Arc::new(SessionMemoryBudget::new(
@@ -662,10 +660,6 @@ impl Session {
         self.config = SessionConfig::default();
         self.state.reset(self.current_database.name());
         self.transaction = SessionTransaction::new();
-        if let Some(active) = self.active_query.take() {
-            self.execution_control.finish_statement(active.control());
-        }
-        self.query_progress = QueryProgress::default();
         reconcile_effective_settings(self)
             .expect("builtin session settings must reconcile on session reset");
         self.refresh_session_metadata();
@@ -801,25 +795,38 @@ impl Session {
     // Active Query Context
     // ============================================================
 
-    /// Begins a new query context.
+    /// Runs one front-end statement inside the session's statement lifecycle.
     ///
-    /// This should be called at the start of query execution to track
-    /// the currently executing query.
-    ///
-    /// - `ClientContext::BeginQueryInternal()`
-    ///
-    /// Creates ActiveQueryContext but NOT the Executor.
-    /// The Executor is created later when actually executing (in execute_statement).
-    pub fn begin_statement_scope(&mut self, query: &str) {
+    /// This is the only production boundary that may begin and finish statement
+    /// state. Keeping both transitions here makes cleanup unconditional for every
+    /// returned success or error, including errors raised before execution starts.
+    pub async fn run_in_statement_scope<T, F>(&mut self, query: &str, operation: F) -> Result<T>
+    where
+        F: AsyncFnOnce(&mut Session) -> Result<T>,
+    {
+        self.begin_statement_scope(query)?;
+        let result = operation(self).await;
+        self.finish_statement_scope(result.as_ref().err());
+        result
+    }
+
+    /// Creates the active statement state. Callers must use
+    /// `run_in_statement_scope` so every successful begin has one finish.
+    fn begin_statement_scope(&mut self, query: &str) -> Result<()> {
+        if self.active_query.is_some() {
+            return Err(paro_error::internal(
+                "cannot begin a statement while another statement is active",
+            ));
+        }
+
         let buffer_pool = self.instance.get_buffer_pool();
         storage_metrics().set_memory_usage_snapshot(&buffer_pool.get_memory_usage_info());
 
         let control = self
             .execution_control
-            .begin_statement(self.current_statement_timeout());
+            .begin_statement(self.current_statement_timeout())?;
         let ctx = ActiveQueryContext::new(query, control);
         self.active_query = Some(ctx);
-        self.query_progress.initialize();
         self.registered_state.notify_query_begin();
         tracing::trace!(
             target: targets::QUERY,
@@ -827,48 +834,26 @@ impl Session {
             query,
             "statement scope started"
         );
+        Ok(())
     }
 
-    /// Ends the current query context.
-    ///
-    /// This should be called when query execution completes (success or failure).
-    ///
-    /// - `ClientContext::EndQueryInternal()`
-    pub fn finish_statement_scope(&mut self, success: bool) {
-        self.registered_state.notify_query_end(None);
+    /// Finishes active statement state after `run_in_statement_scope`'s operation.
+    fn finish_statement_scope(&mut self, error: Option<&ParoError>) {
+        self.registered_state.notify_query_end(error);
 
-        if let Some(ctx) = self.active_query.take() {
-            let elapsed = ctx.elapsed();
-            self.execution_control.finish_statement(ctx.control());
-            tracing::trace!(
-                target: targets::QUERY,
-                session_id = self.id,
-                success,
-                elapsed_ms = elapsed.as_millis(),
-                "statement scope finished"
-            );
-        }
-        self.query_progress = QueryProgress::default();
-    }
-
-    /// Ends the current query context with an error.
-    ///
-    /// This variant allows passing the actual error to registered states.
-    pub fn finish_statement_scope_with_error(&mut self, error: &ParoError) {
-        self.registered_state.notify_query_end(Some(error));
-
-        if let Some(ctx) = self.active_query.take() {
-            let elapsed = ctx.elapsed();
-            self.execution_control.finish_statement(ctx.control());
-            tracing::trace!(
-                target: targets::QUERY,
-                session_id = self.id,
-                success = false,
-                elapsed_ms = elapsed.as_millis(),
-                "statement scope finished with error"
-            );
-        }
-        self.query_progress = QueryProgress::default();
+        let ctx = self
+            .active_query
+            .take()
+            .expect("statement scope completion requires an active statement");
+        let elapsed = ctx.elapsed();
+        self.execution_control.finish_statement(ctx.control());
+        tracing::trace!(
+            target: targets::QUERY,
+            session_id = self.id,
+            success = error.is_none(),
+            elapsed_ms = elapsed.as_millis(),
+            "statement scope finished"
+        );
     }
 
     /// Returns the current query string, if any.
@@ -883,21 +868,27 @@ impl Session {
         self.active_query.is_some()
     }
 
-    /// Returns a reference to the current query progress.
+    /// Returns progress for the active statement, if any.
     #[inline]
-    pub fn get_query_progress(&self) -> &QueryProgress {
-        &self.query_progress
+    pub fn get_query_progress(&self) -> Option<&QueryProgress> {
+        self.active_query.as_ref().map(ActiveQueryContext::progress)
     }
 
-    /// Returns a mutable reference to the current query progress.
+    /// Returns mutable progress for the active statement, if any.
     #[inline]
-    pub fn get_query_progress_mut(&mut self) -> &mut QueryProgress {
-        &mut self.query_progress
+    pub fn get_query_progress_mut(&mut self) -> Option<&mut QueryProgress> {
+        self.active_query
+            .as_mut()
+            .map(ActiveQueryContext::progress_mut)
     }
 
-    /// Updates the query progress.
-    pub fn update_query_progress(&mut self, rows_processed: u64, total_rows: u64) {
-        self.query_progress.update(rows_processed, total_rows);
+    /// Updates progress for the active statement.
+    pub fn update_query_progress(&mut self, rows_processed: u64, total_rows: u64) -> Result<()> {
+        let progress = self.get_query_progress_mut().ok_or_else(|| {
+            paro_error::internal("cannot update query progress without an active statement")
+        })?;
+        progress.update(rows_processed, total_rows);
+        Ok(())
     }
 
     /// Cancels the current query if one is active.
@@ -968,8 +959,8 @@ impl Session {
     ///
     /// Panics if there is no active query or if the executor has not been initialized.
     ///
-    /// The Executor is owned by `ActiveQueryContext` and created when execution starts
-    /// (not in `begin_statement_scope()`). This ensures proper cleanup when queries end.
+    /// The Executor is owned by `ActiveQueryContext` and created after entering
+    /// `run_in_statement_scope`. This ensures proper cleanup when queries end.
     pub fn get_executor(&self) -> &Executor {
         self.active_query
             .as_ref()
@@ -991,7 +982,7 @@ impl Session {
 
     /// Sets the executor for the current active query.
     ///
-    /// This should be called when execution starts, after `begin_statement_scope()`.
+    /// This should be called after entering `run_in_statement_scope`.
     ///
     /// # Panics
     ///

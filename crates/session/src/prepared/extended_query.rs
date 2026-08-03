@@ -353,50 +353,58 @@ async fn execute_portal<R: ExtendedQueryResponder>(
     }
 
     let query_str = portal.source_sql.clone();
-    session.begin_statement_scope(&query_str);
-
     let portal_kind = portal.kind.clone();
-    if should_begin_implicit_transaction_for_portal(session, &portal_kind) {
-        session.begin_implicit_transaction_block()?;
-    }
+    let result = session
+        .run_in_statement_scope(&query_str, async |session| {
+            if should_begin_implicit_transaction_for_portal(session, &portal_kind) {
+                session.begin_implicit_transaction_block()?;
+            }
 
-    let result = match portal_kind {
-        PortalKind::Compiled(compiled) => {
-            execute_query_portal(
-                session,
-                &mut portal,
-                Some(*compiled),
-                None,
-                &message,
-                responder,
-            )
-            .await
-        }
-        PortalKind::Query { parameter_env } => {
-            execute_query_portal(
-                session,
-                &mut portal,
-                None,
-                Some(parameter_env),
-                &message,
-                responder,
-            )
-            .await
-        }
-        PortalKind::Utility(cmd) => {
-            execute_utility_portal(session, &mut portal, *cmd, responder).await
-        }
-        PortalKind::ClientCopy {
-            stmt,
-            parameter_env,
-        } => {
-            execute_client_copy_portal(session, &mut portal, *stmt, parameter_env, responder).await
-        }
-    };
+            match portal_kind {
+                PortalKind::Compiled(compiled) => {
+                    execute_query_portal(
+                        session,
+                        &mut portal,
+                        Some(*compiled),
+                        None,
+                        &message,
+                        responder,
+                    )
+                    .await
+                }
+                PortalKind::Query { parameter_env } => {
+                    execute_query_portal(
+                        session,
+                        &mut portal,
+                        None,
+                        Some(parameter_env),
+                        &message,
+                        responder,
+                    )
+                    .await
+                }
+                PortalKind::Utility(cmd) => {
+                    execute_utility_portal(session, &mut portal, *cmd, responder).await
+                }
+                PortalKind::ClientCopy {
+                    stmt,
+                    parameter_env,
+                } => {
+                    execute_client_copy_portal(
+                        session,
+                        &mut portal,
+                        *stmt,
+                        parameter_env,
+                        responder,
+                    )
+                    .await
+                }
+            }
+        })
+        .await;
 
     match &result {
         Ok(PortalProgress::Complete(completion)) => {
-            session.finish_statement_scope(true);
             if !completion.is_transaction_control() {
                 session.command_counter_increment();
             }
@@ -404,11 +412,10 @@ async fn execute_portal<R: ExtendedQueryResponder>(
             session.refresh_session_metadata();
         }
         Ok(PortalProgress::Suspended) => {
-            session.finish_statement_scope(true);
             overwrite_portal_entry(session, message.name.as_deref(), portal);
             session.refresh_session_metadata();
         }
-        Err(error) => session.finish_statement_scope_with_error(error),
+        Err(_) => {}
     }
 
     result.map(|_| ())
