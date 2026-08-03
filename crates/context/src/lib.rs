@@ -14,6 +14,7 @@ mod session_metadata;
 mod statement_cancellation;
 mod statement_context;
 mod statement_environment;
+mod statement_input;
 mod statement_options;
 mod statement_time;
 mod statement_view;
@@ -58,6 +59,7 @@ pub use statement_cancellation::{
 };
 pub use statement_context::{CompileEnvironmentKey, StatementContext};
 pub use statement_environment::{StatementAuthContext, StatementEnvironment};
+pub use statement_input::StatementInput;
 pub use statement_options::{ExplainOutputType, StatementOptions, StatementSource};
 pub use statement_time::StatementTimeContext;
 pub use statement_view::StatementView;

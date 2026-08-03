@@ -17,9 +17,9 @@ use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use serde_json::Value as JsonValue;
 
-use crate::copy::CopyFormat;
+use crate::copy::{CopyFormat, CopyFromSource, CopyOptions};
 
-use super::read_csv::open_csv_reader;
+use super::read_csv::open_copy_reader;
 use super::{
     GlobalTableFunctionState, LocalTableFunctionState, TableFunction, TableFunctionBindData,
     TableFunctionBindInput, TableFunctionInitInput, TableFunctionInput, TableFunctionResult,
@@ -73,7 +73,7 @@ impl ReadNdjsonOptions {
 
 #[derive(Clone, Debug)]
 struct ReadNdjsonBindData {
-    file_path: String,
+    source: CopyFromSource,
     options: ReadNdjsonOptions,
     names: Vec<String>,
     types: Vec<LogicalType>,
@@ -191,11 +191,35 @@ fn read_ndjson_bind(
     return_names.extend(names.iter().cloned());
 
     Ok(Some(Box::new(ReadNdjsonBindData {
-        file_path,
+        source: CopyFromSource::File(file_path),
         options,
         names,
         types,
     })))
+}
+
+pub(crate) fn bind_copy_from(
+    source: CopyFromSource,
+    options: &CopyOptions,
+    names: &[String],
+    types: &[LogicalType],
+) -> Result<Box<dyn TableFunctionBindData>> {
+    if names.len() != types.len() {
+        return Err(paro_error::invalid_input(
+            "COPY FROM input names/types length mismatch",
+        ));
+    }
+    if !matches!(options.format, CopyFormat::Ndjson) {
+        return Err(paro_error::invalid_parameter(
+            "read_ndjson COPY input requires NDJSON format",
+        ));
+    }
+    Ok(Box::new(ReadNdjsonBindData {
+        source,
+        options: ReadNdjsonOptions,
+        names: names.to_vec(),
+        types: types.to_vec(),
+    }))
 }
 
 fn read_ndjson_init_global(
@@ -206,7 +230,7 @@ fn read_ndjson_init_global(
         .and_then(|data| data.as_any().downcast_ref::<ReadNdjsonBindData>())
         .ok_or_else(|| paro_error::internal("Invalid read_ndjson bind data".to_string()))?;
 
-    let reader = open_csv_reader(&bind_data.file_path)?;
+    let reader = open_copy_reader(&bind_data.source, input)?;
     Ok(Some(Box::new(ReadNdjsonGlobalState {
         reader: Mutex::new(ReadNdjsonReader {
             reader,

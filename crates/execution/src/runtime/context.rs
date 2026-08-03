@@ -278,6 +278,10 @@ impl TableFunctionRuntimeContext for QueryRuntimeContext {
     fn buffer_manager(&self) -> Option<&dyn paro_storage::buffer::BufferManager> {
         Some(self.session.buffer_manager().as_ref())
     }
+
+    fn copy_stdin_source(&self) -> Option<Arc<dyn paro_function::table::CopyStdinSource>> {
+        self.session.input.copy_stdin_source()
+    }
 }
 
 #[derive(Debug, Clone)]

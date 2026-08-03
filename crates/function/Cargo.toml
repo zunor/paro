@@ -35,7 +35,6 @@ paro-common = { workspace = true }
 paro-parser = { workspace = true }
 paro-storage = { workspace = true }
 regex = "1"
-rand = "0.8"
 serde_json = { workspace = true }
 
 [dev-dependencies]

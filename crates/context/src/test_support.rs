@@ -212,6 +212,7 @@ impl TestStatementContextBuilder {
             ddl: None,
             settings,
             options: StatementOptions::default(),
+            input: crate::StatementInput::default(),
             time: crate::StatementTimeContext::capture(None),
             databases: Arc::new(AttachedDatabaseDirectory::new(
                 0,

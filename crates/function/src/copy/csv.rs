@@ -10,11 +10,11 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
 use super::{
-    CopyFormat, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
+    CopyFormat, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
     CopyToLocalState, ForceQuoteOption,
 };
-use crate::table::read_csv::create_read_csv_function;
-use crate::table::TableFunction;
+use crate::table::read_csv::{bind_copy_from, create_read_csv_function};
+use crate::table::{TableFunction, TableFunctionBindData};
 
 #[derive(Debug)]
 struct CsvCopyToBindData {
@@ -90,16 +90,11 @@ fn read_csv_table_function() -> TableFunction {
 }
 
 fn csv_copy_from_bind(
+    source: CopyFromSource,
     options: &CopyOptions,
     names: &[String],
     types: &[LogicalType],
-) -> Result<Box<dyn CopyFunctionBindData>> {
-    if names.len() != types.len() {
-        return Err(paro_error::invalid_input(
-            "COPY FROM input names/types length mismatch",
-        ));
-    }
-
+) -> Result<Box<dyn TableFunctionBindData>> {
     if matches!(options.format, CopyFormat::Binary) {
         return Err(paro_error::not_implemented(
             "COPY FROM BINARY is not supported yet",
@@ -111,46 +106,7 @@ fn csv_copy_from_bind(
         ));
     }
 
-    let delimiter = options
-        .delimiter
-        .clone()
-        .unwrap_or_else(|| match options.format {
-            CopyFormat::Csv => ",".to_string(),
-            CopyFormat::Text => "\t".to_string(),
-            CopyFormat::Binary => "\t".to_string(),
-            CopyFormat::Ndjson => ",".to_string(),
-        });
-    if delimiter.is_empty() {
-        return Err(paro_error::invalid_parameter(
-            "COPY option delimiter cannot be empty",
-        ));
-    }
-
-    let quote = options.quote;
-    let escape = options.escape.or(quote);
-
-    if matches!(options.format, CopyFormat::Csv) && quote.is_none() {
-        return Err(paro_error::invalid_parameter(
-            "COPY option quote is required for CSV format",
-        ));
-    }
-
-    if matches!(options.format, CopyFormat::Csv) && escape.is_none() {
-        return Err(paro_error::invalid_parameter(
-            "COPY option escape is required for CSV format",
-        ));
-    }
-
-    Ok(Box::new(CsvCopyFromBindData))
-}
-
-#[derive(Debug)]
-struct CsvCopyFromBindData;
-
-impl CopyFunctionBindData for CsvCopyFromBindData {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+    bind_copy_from(source, options, names, types)
 }
 
 fn csv_copy_to_bind(
@@ -176,26 +132,24 @@ fn csv_copy_to_bind(
     }
 
     let delimiter = options
-        .delimiter
-        .clone()
-        .unwrap_or_else(|| match options.format {
-            CopyFormat::Csv => ",".to_string(),
-            CopyFormat::Text => "\t".to_string(),
-            CopyFormat::Binary => "\t".to_string(),
-            CopyFormat::Ndjson => ",".to_string(),
-        });
+        .delimiter()
+        .expect("CSV/TEXT options always have a delimiter")
+        .to_string();
     if delimiter.is_empty() {
         return Err(paro_error::invalid_parameter(
             "COPY option delimiter cannot be empty",
         ));
     }
 
-    let null_string = options.null_string.clone().unwrap_or_else(String::new);
+    let null_string = options
+        .null_string()
+        .expect("CSV/TEXT options always have a NULL marker")
+        .to_string();
 
-    let header = options.header.unwrap_or(false);
+    let header = options.header();
 
-    let quote = options.quote;
-    let escape = options.escape.or(quote);
+    let quote = options.quote();
+    let escape = options.escape();
 
     if matches!(options.format, CopyFormat::Csv) && quote.is_none() {
         return Err(paro_error::invalid_parameter(

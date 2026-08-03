@@ -776,6 +776,7 @@ fn table_function_source_runs_bound_function_in_typed_source_path() {
         id: PipelineId::new(0),
         source: SourceSpec::TableFunction(TableFunctionScanSpec {
             function,
+            bind_data: None,
             table_index: 0,
             arguments: Box::new([]),
             projection_ids: None,

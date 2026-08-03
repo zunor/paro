@@ -7,11 +7,11 @@ use paro_parser::ast::CopyOptionValue;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyOptions {
     pub format: CopyFormat,
-    pub delimiter: Option<String>,
-    pub null_string: Option<String>,
-    pub header: Option<bool>,
-    pub quote: Option<char>,
-    pub escape: Option<char>,
+    delimiter: Option<String>,
+    null_string: Option<String>,
+    header: Option<bool>,
+    quote: Option<char>,
+    escape: Option<char>,
     pub force_quote: ForceQuoteOption,
     pub force_not_null: Vec<String>,
     pub force_null: Vec<String>,
@@ -49,8 +49,45 @@ impl CopyOptions {
         for (key, value) in options {
             result.apply_option(key, value)?;
         }
-        result.apply_format_defaults();
         Ok(result)
+    }
+
+    /// Return the explicit delimiter, or the selected format's default when
+    /// omitted. Formats without a default return `None`.
+    pub fn delimiter(&self) -> Option<&str> {
+        self.delimiter.as_deref().or(match self.format {
+            CopyFormat::Text => Some("\t"),
+            CopyFormat::Csv => Some(","),
+            CopyFormat::Binary | CopyFormat::Ndjson => None,
+        })
+    }
+
+    /// Return the explicit NULL marker, or the selected format's default when
+    /// omitted. Formats without a default return `None`.
+    pub fn null_string(&self) -> Option<&str> {
+        self.null_string.as_deref().or(match self.format {
+            CopyFormat::Text => Some("\\N"),
+            CopyFormat::Csv => Some(""),
+            CopyFormat::Binary | CopyFormat::Ndjson => None,
+        })
+    }
+
+    pub fn header(&self) -> bool {
+        self.header.unwrap_or(false)
+    }
+
+    pub fn quote(&self) -> Option<char> {
+        self.quote
+            .or_else(|| matches!(self.format, CopyFormat::Csv).then_some('"'))
+    }
+
+    /// Return the effective escape character. PostgreSQL defines an omitted
+    /// CSV escape as the effective quote character, including a custom quote.
+    pub fn escape(&self) -> Option<char> {
+        self.escape.or_else(|| match self.format {
+            CopyFormat::Csv => self.quote(),
+            CopyFormat::Text | CopyFormat::Binary | CopyFormat::Ndjson => None,
+        })
     }
 
     fn apply_option(&mut self, key: &str, value: &CopyOptionValue) -> Result<()> {
@@ -140,38 +177,6 @@ impl CopyOptions {
             }
         }
         Ok(())
-    }
-
-    fn apply_format_defaults(&mut self) {
-        if self.header.is_none() {
-            self.header = Some(false);
-        }
-
-        match self.format {
-            CopyFormat::Text => {
-                if self.delimiter.is_none() {
-                    self.delimiter = Some("\t".to_string());
-                }
-                if self.null_string.is_none() {
-                    self.null_string = Some("\\N".to_string());
-                }
-            }
-            CopyFormat::Csv => {
-                if self.delimiter.is_none() {
-                    self.delimiter = Some(",".to_string());
-                }
-                if self.null_string.is_none() {
-                    self.null_string = Some(String::new());
-                }
-                if self.quote.is_none() {
-                    self.quote = Some('"');
-                }
-                if self.escape.is_none() {
-                    self.escape = Some('"');
-                }
-            }
-            CopyFormat::Binary | CopyFormat::Ndjson => {}
-        }
     }
 
     fn parse_string(value: &CopyOptionValue, key: &str) -> Result<String> {
@@ -301,4 +306,60 @@ pub enum ForceQuoteOption {
     None,
     All,
     Columns(Vec<String>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_default_escape_follows_custom_quote() {
+        let options = CopyOptions::from_ast(&[
+            (
+                "format".to_string(),
+                CopyOptionValue::String("csv".to_string()),
+            ),
+            (
+                "quote".to_string(),
+                CopyOptionValue::String("'".to_string()),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(options.quote(), Some('\''));
+        assert_eq!(options.escape(), Some('\''));
+    }
+
+    #[test]
+    fn explicit_csv_escape_overrides_custom_quote() {
+        let options = CopyOptions::from_ast(&[
+            (
+                "format".to_string(),
+                CopyOptionValue::String("csv".to_string()),
+            ),
+            (
+                "quote".to_string(),
+                CopyOptionValue::String("'".to_string()),
+            ),
+            (
+                "escape".to_string(),
+                CopyOptionValue::String("\\".to_string()),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(options.quote(), Some('\''));
+        assert_eq!(options.escape(), Some('\\'));
+    }
+
+    #[test]
+    fn default_options_resolve_text_defaults() {
+        let options = CopyOptions::default();
+
+        assert_eq!(options.delimiter(), Some("\t"));
+        assert_eq!(options.null_string(), Some("\\N"));
+        assert!(!options.header());
+        assert_eq!(options.quote(), None);
+        assert_eq!(options.escape(), None);
+    }
 }

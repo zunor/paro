@@ -532,6 +532,7 @@ impl LogicalPlanDeepCopy {
                 self.remap_table_index(bind_shared, &mut table_index);
                 LogicalOperator::TableFunctionGet(TblFnGetNode {
                     function: t.function.clone(),
+                    bind_data: t.bind_data.clone(),
                     table_index,
                     column_names: t.column_names.clone(),
                     column_types: t.column_types.clone(),

@@ -2,15 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyStdinMetricsSnapshot {
-    /// Bytes retained by active COPY FROM STDIN commands.
-    ///
-    /// This covers both socket collection and the registered payload consumed
-    /// by execution. The value returns to zero when the command releases its
-    /// payload ownership chain.
+    /// Bytes retained by active COPY FROM STDIN commands in this instance.
     pub current_buffer_bytes: usize,
     /// High-water mark of [`Self::current_buffer_bytes`].
     pub peak_buffer_bytes: usize,
@@ -25,6 +20,7 @@ pub enum CopyStdinRejectReason {
     FrameLimit,
 }
 
+/// Instance-owned observability for PostgreSQL COPY FROM STDIN ingestion.
 #[derive(Debug, Default)]
 pub struct CopyStdinMetrics {
     current_buffer_bytes: AtomicUsize,
@@ -35,11 +31,6 @@ pub struct CopyStdinMetrics {
 }
 
 impl CopyStdinMetrics {
-    fn global() -> &'static CopyStdinMetrics {
-        static INSTANCE: OnceLock<CopyStdinMetrics> = OnceLock::new();
-        INSTANCE.get_or_init(CopyStdinMetrics::default)
-    }
-
     pub fn observe_buffer_bytes(&self, previous_bytes: usize, bytes: usize) {
         let current_total = if bytes >= previous_bytes {
             let delta = bytes - previous_bytes;
@@ -91,18 +82,6 @@ impl CopyStdinMetrics {
             rejected_frame_limit: self.rejected_frame_limit.load(Ordering::Relaxed),
         }
     }
-
-    pub fn reset_for_tests(&self) {
-        self.current_buffer_bytes.store(0, Ordering::Relaxed);
-        self.peak_buffer_bytes.store(0, Ordering::Relaxed);
-        self.rejected_total.store(0, Ordering::Relaxed);
-        self.rejected_total_limit.store(0, Ordering::Relaxed);
-        self.rejected_frame_limit.store(0, Ordering::Relaxed);
-    }
-}
-
-pub fn copy_stdin_metrics() -> &'static CopyStdinMetrics {
-    CopyStdinMetrics::global()
 }
 
 #[cfg(test)]
@@ -110,20 +89,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_buffer_bytes_accumulate_across_overlapping_collectors() {
-        let metrics = copy_stdin_metrics();
-        metrics.reset_for_tests();
+    fn metrics_instances_do_not_share_state() {
+        let first = CopyStdinMetrics::default();
+        let second = CopyStdinMetrics::default();
 
-        metrics.observe_buffer_bytes(0, 3);
-        metrics.observe_buffer_bytes(0, 5);
-        assert_eq!(metrics.snapshot().current_buffer_bytes, 8);
-        assert_eq!(metrics.snapshot().peak_buffer_bytes, 8);
+        first.observe_buffer_bytes(0, 8);
+        first.record_rejection(CopyStdinRejectReason::TotalLimit);
 
-        metrics.observe_buffer_bytes(3, 1);
-        assert_eq!(metrics.snapshot().current_buffer_bytes, 6);
-
-        metrics.finish_buffering(1);
-        metrics.finish_buffering(5);
-        assert_eq!(metrics.snapshot().current_buffer_bytes, 0);
+        assert_eq!(first.snapshot().current_buffer_bytes, 8);
+        assert_eq!(first.snapshot().rejected_total, 1);
+        assert_eq!(second.snapshot().current_buffer_bytes, 0);
+        assert_eq!(second.snapshot().rejected_total, 0);
     }
 }

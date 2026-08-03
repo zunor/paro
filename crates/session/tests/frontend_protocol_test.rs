@@ -250,3 +250,84 @@ async fn copy_from_stdin_uses_copy_protocol_source() {
     .await;
     assert_eq!(query_i64_col(&collect, 0), vec![1, 2]);
 }
+
+#[tokio::test]
+async fn copy_from_stdin_defaults_escape_to_custom_quote() {
+    let instance = create_test_instance("copy_in_custom_quote");
+    let mut session = Session::new(1, instance);
+    let mut collect = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "CREATE TABLE copy_in_custom_quote (id INT, name VARCHAR)",
+    )
+    .await;
+
+    let mut sink = MockCopyInSink::new("1,'it''s'\n");
+    let result = session
+        .execute_simple_query(
+            "COPY copy_in_custom_quote FROM STDIN WITH (FORMAT csv, QUOTE '''')",
+            &mut sink,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "custom QUOTE COPY should succeed: {result:?}"
+    );
+    assert!(
+        sink.errors.is_empty(),
+        "unexpected errors: {:?}",
+        sink.errors
+    );
+    assert_eq!(sink.completion, Some(StatementCompletion::Copy { rows: 1 }));
+
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "SELECT id FROM copy_in_custom_quote WHERE name = 'it''s'",
+    )
+    .await;
+    assert_eq!(query_i64_col(&collect, 0), vec![1]);
+}
+
+#[tokio::test]
+async fn copy_from_stdin_routes_ndjson_through_statement_input() {
+    let instance = create_test_instance("copy_in_ndjson");
+    let mut session = Session::new(1, instance);
+    let mut collect = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "CREATE TABLE copy_in_json (id INT, name VARCHAR)",
+    )
+    .await;
+
+    let mut sink =
+        MockCopyInSink::new("{\"id\":1,\"name\":\"alpha\"}\n{\"id\":2,\"name\":\"beta\"}\n");
+    let result = session
+        .execute_simple_query(
+            "COPY copy_in_json FROM STDIN WITH (FORMAT ndjson)",
+            &mut sink,
+        )
+        .await;
+
+    assert!(result.is_ok(), "NDJSON COPY should succeed: {result:?}");
+    assert!(
+        sink.errors.is_empty(),
+        "unexpected errors: {:?}",
+        sink.errors
+    );
+    assert_eq!(sink.column_count, Some(2));
+    assert_eq!(sink.completion, Some(StatementCompletion::Copy { rows: 2 }));
+
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "SELECT id FROM copy_in_json ORDER BY id",
+    )
+    .await;
+    assert_eq!(query_i64_col(&collect, 0), vec![1, 2]);
+}

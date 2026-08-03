@@ -34,7 +34,7 @@ use paro_context::{
     CompileEnvironmentKey, CursorSummary, DatabaseSnapshotIdentity, EffectiveSettings,
     ExecutionResources, PreparedStatementSummary, QueryResources, RuntimeLimits,
     SessionMetadataRows, StatementCancelReason, StatementCancellation, StatementContext,
-    StatementEnvironment, StatementOptions, StatementSource, StatementView,
+    StatementEnvironment, StatementInput, StatementOptions, StatementSource, StatementView,
 };
 use paro_execution::operators::graph::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
@@ -188,6 +188,15 @@ impl Session {
         &self,
         options: StatementOptions,
         cancellation: StatementCancellation,
+    ) -> Arc<StatementContext> {
+        self.freeze_statement_context_with_input(options, cancellation, StatementInput::default())
+    }
+
+    pub(crate) fn freeze_statement_context_with_input(
+        &self,
+        options: StatementOptions,
+        cancellation: StatementCancellation,
+        input: StatementInput,
     ) -> Arc<StatementContext> {
         let settings = Arc::new(EffectiveSettings::new(self.effective_settings.clone()));
         let runtime_tuning = self.instance.runtime_tuning().snapshot();
@@ -436,6 +445,7 @@ impl Session {
             ddl,
             settings: settings.clone(),
             options,
+            input,
             time: paro_context::StatementTimeContext::capture(
                 self.transaction.transaction_started_at(),
             ),

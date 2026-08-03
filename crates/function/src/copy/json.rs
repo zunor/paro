@@ -11,11 +11,11 @@ use paro_common::types::LogicalType;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use super::{
-    CopyFormat, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
+    CopyFormat, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
     CopyToLocalState,
 };
-use crate::table::read_ndjson::create_read_ndjson_function;
-use crate::table::TableFunction;
+use crate::table::read_ndjson::{bind_copy_from, create_read_ndjson_function};
+use crate::table::{TableFunction, TableFunctionBindData};
 
 #[derive(Debug)]
 struct NdjsonCopyBindData {
@@ -100,10 +100,11 @@ fn ndjson_copy_to_bind(
 }
 
 fn ndjson_copy_from_bind(
+    source: CopyFromSource,
     options: &CopyOptions,
     names: &[String],
     types: &[LogicalType],
-) -> Result<Box<dyn CopyFunctionBindData>> {
+) -> Result<Box<dyn TableFunctionBindData>> {
     if names.len() != types.len() {
         return Err(paro_error::invalid_input(
             "COPY FROM input names/types length mismatch",
@@ -115,9 +116,7 @@ fn ndjson_copy_from_bind(
         ));
     }
 
-    Ok(Box::new(NdjsonCopyBindData {
-        names: names.to_vec(),
-    }))
+    bind_copy_from(source, options, names, types)
 }
 
 fn ndjson_copy_to_initialize_global(
