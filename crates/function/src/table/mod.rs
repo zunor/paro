@@ -40,9 +40,10 @@ use std::any::Any;
 use std::fmt;
 
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_storage::buffer::BufferManager;
 
 // Re-export FunctionData from scalar module
 pub use crate::scalar::FunctionData;
@@ -105,6 +106,28 @@ pub trait LocalTableFunctionState: Send + Sync {
 
 /// Maximum threads constant (use when there's no limit).
 pub const MAX_THREADS: usize = 999999999;
+
+/// Query-scoped services available while a table function initializes.
+///
+/// Runtime-owned resources must enter table functions through this context. Keeping the
+/// interface query-scoped prevents process globals from mixing resources across independent
+/// database instances and avoids extending resource lifetimes beyond the query that uses them.
+pub trait TableFunctionRuntimeContext: Send + Sync {
+    /// Return the buffer manager owned by the current database instance, when available.
+    fn buffer_manager(&self) -> Option<&dyn BufferManager> {
+        None
+    }
+}
+
+#[cfg(test)]
+struct EmptyTableFunctionRuntimeContext;
+
+#[cfg(test)]
+impl TableFunctionRuntimeContext for EmptyTableFunctionRuntimeContext {}
+
+#[cfg(test)]
+static EMPTY_TABLE_FUNCTION_RUNTIME_CONTEXT: EmptyTableFunctionRuntimeContext =
+    EmptyTableFunctionRuntimeContext;
 
 // ============================================================================
 // Table Function Bind Data
@@ -182,6 +205,8 @@ impl<'a> TableFunctionBindInput<'a> {
 ///
 /// Contains all information needed to initialize global state.
 pub struct TableFunctionInitInput<'a> {
+    /// Query-scoped runtime services supplied by the executor.
+    pub runtime: &'a dyn TableFunctionRuntimeContext,
     /// Bind data from the bind phase.
     pub bind_data: Option<&'a dyn TableFunctionBindData>,
     /// Column IDs to scan (for projection pushdown).
@@ -194,12 +219,35 @@ pub struct TableFunctionInitInput<'a> {
 
 impl<'a> TableFunctionInitInput<'a> {
     /// Create a new init input.
-    pub fn new(bind_data: Option<&'a dyn TableFunctionBindData>, column_ids: &'a [usize]) -> Self {
+    pub fn new(
+        runtime: &'a dyn TableFunctionRuntimeContext,
+        bind_data: Option<&'a dyn TableFunctionBindData>,
+        column_ids: &'a [usize],
+    ) -> Self {
         Self {
+            runtime,
             bind_data,
             column_ids,
             max_threads_hint: 1,
         }
+    }
+
+    /// Create a context-free input for table-function unit tests.
+    #[cfg(test)]
+    pub fn new_for_test(
+        bind_data: Option<&'a dyn TableFunctionBindData>,
+        column_ids: &'a [usize],
+    ) -> Self {
+        Self::new(&EMPTY_TABLE_FUNCTION_RUNTIME_CONTEXT, bind_data, column_ids)
+    }
+
+    /// Resolve the instance-owned buffer manager required by memory system functions.
+    pub fn buffer_manager(&self) -> Result<&dyn BufferManager> {
+        self.runtime.buffer_manager().ok_or_else(|| {
+            paro_error::internal(
+                "table function requires an instance-scoped buffer manager".to_string(),
+            )
+        })
     }
 
     /// Create init input with max threads hint.

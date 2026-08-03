@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_paro_tables_init_global() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let result = paro_tables_init_global(&input);
         assert!(result.is_ok());
 
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_paro_tables_function_empty() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let state_box = paro_tables_init_global(&input).unwrap().unwrap();
         let state = state_box
             .as_any()
@@ -478,7 +478,7 @@ mod tests {
     fn test_paro_tables_function_with_data() {
         use paro_common::runtime_value::Value;
 
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_tables_init_global(&input).unwrap().unwrap();
 
         // Populate with test data
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_paro_tables_progress() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_tables_init_global(&input).unwrap().unwrap();
 
         // Empty state should show 100% progress
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_paro_tables_large_batch() {
-        let input = TableFunctionInitInput::new(None, &[]);
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
         let mut state_box = paro_tables_init_global(&input).unwrap().unwrap();
 
         // Create many tables to test batching

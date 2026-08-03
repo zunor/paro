@@ -9,7 +9,6 @@ use crate::runtime::{InstanceRuntime, InstanceRuntimeResources};
 use crate::{BootConfig, DatabaseFileSystem, InstanceConfig};
 use paro_execution::memory_runtime::{MemoryArbitrator, SystemReserve};
 use paro_external::runtime::host::ExternalRuntimeHost;
-use paro_function::register_system_buffer_manager;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, StandardBufferManager};
 use std::sync::Arc;
@@ -41,8 +40,6 @@ impl RuntimeResources {
                     8,
                 ))
             });
-        register_system_buffer_manager(Arc::clone(&buffer_manager));
-
         let scheduler = Arc::new(TaskScheduler::new());
         let _ = scheduler.set_thread_affinity_mode(boot_config.pin_threads);
         let _ = scheduler.set_threads(boot_config.effective_max_threads());

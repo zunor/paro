@@ -49,7 +49,7 @@ pub use table::{
     LocalTableFunctionState, TableFunction, TableFunctionBindData, TableFunctionBindFn,
     TableFunctionBindInput, TableFunctionCardinalityFn, TableFunctionFn, TableFunctionInitGlobalFn,
     TableFunctionInitInput, TableFunctionInitLocalFn, TableFunctionInput, TableFunctionResult,
-    TableFunctionSet, MAX_THREADS,
+    TableFunctionRuntimeContext, TableFunctionSet, MAX_THREADS,
 };
 
 pub mod copy;
@@ -59,11 +59,8 @@ pub use copy::{
     CopyToLocalState, ForceQuoteOption,
 };
 
-// Re-export runtime registration APIs for system table functions.
-pub use table::system::{
-    get_log_storage, get_system_buffer_manager, register_log_storage,
-    register_system_buffer_manager,
-};
+// Re-export log-storage registration APIs for system table functions.
+pub use table::system::{get_log_storage, register_log_storage};
 
 pub mod window;
 

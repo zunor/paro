@@ -14,8 +14,6 @@ use crate::table::{
     TableFunctionInitInput, TableFunctionInput, TableFunctionResult, TableFunctionSet,
 };
 
-use super::memory_runtime::get_system_buffer_manager;
-
 #[derive(Clone)]
 struct ParoTemporaryFilesBindData;
 
@@ -97,39 +95,36 @@ fn paro_temporary_files_bind(
 }
 
 fn paro_temporary_files_init_global(
-    _input: &TableFunctionInitInput,
+    input: &TableFunctionInitInput,
 ) -> Result<Option<Box<dyn GlobalTableFunctionState>>> {
-    let rows = get_system_buffer_manager()
-        .map(|buffer_manager| {
-            let files = buffer_manager.get_temporary_files();
-            let metrics = buffer_manager.get_temporary_spill_metrics();
+    let buffer_manager = input.buffer_manager()?;
+    let files = buffer_manager.get_temporary_files();
+    let metrics = buffer_manager.get_temporary_spill_metrics();
 
-            if files.is_empty() {
-                return vec![TemporaryFileRow {
-                    path: String::new(),
-                    size: 0,
-                    write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
-                    read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
-                    file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
-                    swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
-                    swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
-                }];
-            }
-
-            files
-                .into_iter()
-                .map(|file| TemporaryFileRow {
-                    path: file.path.display().to_string(),
-                    size: i64::try_from(file.size).unwrap_or(i64::MAX),
-                    write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
-                    read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
-                    file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
-                    swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
-                    swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let rows = if files.is_empty() {
+        vec![TemporaryFileRow {
+            path: String::new(),
+            size: 0,
+            write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
+            read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
+            file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
+            swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
+            swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
+        }]
+    } else {
+        files
+            .into_iter()
+            .map(|file| TemporaryFileRow {
+                path: file.path.display().to_string(),
+                size: i64::try_from(file.size).unwrap_or(i64::MAX),
+                write_bytes: i64::try_from(metrics.write_bytes).unwrap_or(i64::MAX),
+                read_bytes: i64::try_from(metrics.read_bytes).unwrap_or(i64::MAX),
+                file_count: i64::try_from(metrics.file_count).unwrap_or(i64::MAX),
+                swap_usage: i64::try_from(metrics.swap_usage).unwrap_or(i64::MAX),
+                swap_limit_hits: i64::try_from(metrics.swap_limit_hits).unwrap_or(i64::MAX),
+            })
+            .collect()
+    };
 
     Ok(Some(Box::new(ParoTemporaryFilesGlobalState {
         rows,

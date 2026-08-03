@@ -14,8 +14,6 @@ use crate::table::{
     TableFunctionInitInput, TableFunctionInput, TableFunctionResult, TableFunctionSet,
 };
 
-use super::memory_runtime::get_system_buffer_manager;
-
 #[derive(Clone)]
 struct PragmaDatabaseSizeBindData;
 
@@ -89,29 +87,26 @@ fn pragma_database_size_bind(
 }
 
 fn pragma_database_size_init_global(
-    _input: &TableFunctionInitInput,
+    input: &TableFunctionInitInput,
 ) -> Result<Option<Box<dyn GlobalTableFunctionState>>> {
-    let rows = get_system_buffer_manager()
-        .map(|buffer_manager| {
-            let used_memory = i64::try_from(buffer_manager.get_used_memory()).unwrap_or(i64::MAX);
-            let memory_limit = i64::try_from(buffer_manager.get_max_memory()).unwrap_or(i64::MAX);
-            let block_size = i64::try_from(buffer_manager.get_block_size()).unwrap_or(i64::MAX);
-            let temporary_file_bytes: u64 = buffer_manager
-                .get_temporary_files()
-                .into_iter()
-                .map(|file| file.size)
-                .sum();
-            let temporary_file_bytes = i64::try_from(temporary_file_bytes).unwrap_or(i64::MAX);
+    let buffer_manager = input.buffer_manager()?;
+    let used_memory = i64::try_from(buffer_manager.get_used_memory()).unwrap_or(i64::MAX);
+    let memory_limit = i64::try_from(buffer_manager.get_max_memory()).unwrap_or(i64::MAX);
+    let block_size = i64::try_from(buffer_manager.get_block_size()).unwrap_or(i64::MAX);
+    let temporary_file_bytes: u64 = buffer_manager
+        .get_temporary_files()
+        .into_iter()
+        .map(|file| file.size)
+        .sum();
+    let temporary_file_bytes = i64::try_from(temporary_file_bytes).unwrap_or(i64::MAX);
 
-            vec![DatabaseSizeRow {
-                database_name: "main".to_string(),
-                database_size: used_memory.saturating_add(temporary_file_bytes),
-                block_size,
-                memory_usage: used_memory,
-                memory_limit,
-            }]
-        })
-        .unwrap_or_default();
+    let rows = vec![DatabaseSizeRow {
+        database_name: "main".to_string(),
+        database_size: used_memory.saturating_add(temporary_file_bytes),
+        block_size,
+        memory_usage: used_memory,
+        memory_limit,
+    }];
 
     Ok(Some(Box::new(PragmaDatabaseSizeGlobalState {
         rows,
@@ -195,11 +190,60 @@ pub fn create_pragma_database_size_function_set() -> TableFunctionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::TableFunctionRuntimeContext;
+    use paro_storage::buffer::{BufferManager, StandardBufferManager};
+    use std::sync::Arc;
+
+    struct TestRuntimeContext {
+        buffer_manager: Arc<dyn BufferManager>,
+    }
+
+    impl TableFunctionRuntimeContext for TestRuntimeContext {
+        fn buffer_manager(&self) -> Option<&dyn BufferManager> {
+            Some(self.buffer_manager.as_ref())
+        }
+    }
+
+    fn reported_memory_limit(runtime: &TestRuntimeContext) -> i64 {
+        let input = TableFunctionInitInput::new(runtime, None, &[]);
+        let state = pragma_database_size_init_global(&input)
+            .expect("runtime-backed initialization should succeed")
+            .expect("pragma_database_size should create global state");
+        let state = state
+            .as_any()
+            .downcast_ref::<PragmaDatabaseSizeGlobalState>()
+            .expect("unexpected global state type");
+        state.rows[0].memory_limit
+    }
 
     #[test]
     fn test_create_pragma_database_size_function_set() {
         let set = create_pragma_database_size_function_set();
         assert_eq!(set.name, "pragma_database_size");
         assert_eq!(set.functions.len(), 1);
+    }
+
+    #[test]
+    fn initialization_reads_the_current_runtime_buffer_manager() {
+        let first = TestRuntimeContext {
+            buffer_manager: Arc::new(StandardBufferManager::with_defaults(16 * 1024 * 1024)),
+        };
+        let second = TestRuntimeContext {
+            buffer_manager: Arc::new(StandardBufferManager::with_defaults(48 * 1024 * 1024)),
+        };
+
+        assert_eq!(reported_memory_limit(&first), 16 * 1024 * 1024);
+        assert_eq!(reported_memory_limit(&second), 48 * 1024 * 1024);
+        assert_eq!(reported_memory_limit(&first), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn initialization_rejects_a_context_without_buffer_services() {
+        let input = TableFunctionInitInput::new_for_test(None, &[]);
+        let error = match pragma_database_size_init_global(&input) {
+            Ok(_) => panic!("missing buffer services should fail initialization"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("instance-scoped buffer manager"));
     }
 }
