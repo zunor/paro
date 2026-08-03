@@ -6,7 +6,6 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::execution_context::ExecutionContext;
 use crate::operators::external::batching::SubmissionBatchPolicy;
 use crate::operators::external::runtime_bridge::{RuntimeBridgeOutcome, TableSubmission};
 use crate::operators::external::table_state::TableOutputBatch;
@@ -61,7 +60,6 @@ impl ExternalTableSinkExec {
         }
         let global = external_table_global(global)?;
         let local = external_table_local(local)?;
-        let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
         let batch_id = local.next_batch_id;
         let submission = TableSubmission {
             batch_id,
@@ -75,7 +73,7 @@ impl ExternalTableSinkExec {
         let outcome = self
             .spec
             .bridge
-            .execute_table(&exec_ctx, &submission, &ctx.memory)?;
+            .execute_table(ctx.query, &submission, &ctx.memory)?;
         let (response, blocked) = match outcome {
             RuntimeBridgeOutcome::Ready(response) => (response, false),
             RuntimeBridgeOutcome::Blocked(response) => (response, true),

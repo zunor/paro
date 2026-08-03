@@ -23,9 +23,9 @@ use paro_external::runtime::host::default_python_binary;
 use paro_planner::operator::external_project::ExternalProjectExpression;
 use serde_json::{json, Value as JsonValue};
 
-use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::memory_runtime::OperatorMemoryScope;
+use crate::runtime::QueryRuntimeContext;
 
 use super::batching::SubmissionBatchPolicy;
 
@@ -139,7 +139,7 @@ impl fmt::Debug for TableSubmission<'_> {
 pub trait ExternalProjectExecutor: Send + Sync + fmt::Debug {
     fn execute(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &ProjectSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome>;
@@ -148,7 +148,7 @@ pub trait ExternalProjectExecutor: Send + Sync + fmt::Debug {
 pub trait ExternalTableExecutor: Send + Sync + fmt::Debug {
     fn execute(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &TableSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome>;
@@ -162,7 +162,7 @@ pub struct TestProjectExecutor;
 impl ExternalProjectExecutor for TestProjectExecutor {
     fn execute(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &ProjectSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
@@ -211,7 +211,7 @@ pub struct PythonProcessProjectExecutor;
 impl ExternalProjectExecutor for PythonProcessProjectExecutor {
     fn execute(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &ProjectSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
@@ -268,7 +268,7 @@ pub struct PythonProcessTableExecutor;
 impl ExternalTableExecutor for PythonProcessTableExecutor {
     fn execute(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &TableSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
@@ -355,7 +355,7 @@ impl ExternalRuntimeBridge {
 
     pub fn execute_project(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &ProjectSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
@@ -364,7 +364,7 @@ impl ExternalRuntimeBridge {
 
     pub fn execute_table(
         &self,
-        ctx: &ExecutionContext,
+        ctx: &QueryRuntimeContext,
         submission: &TableSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
@@ -385,7 +385,7 @@ pub fn format_identity_label(identity: &RoutineCallIdentity, fallback_label: &st
 fn evaluate_external_arguments(
     expression: &ExternalProjectExpression,
     input: &Chunk,
-    ctx: &ExecutionContext,
+    ctx: &QueryRuntimeContext,
     memory: &OperatorMemoryScope<'_>,
 ) -> Result<Vec<Vec<JsonValue>>> {
     let function = match &expression.expression {
@@ -414,7 +414,7 @@ fn evaluate_external_arguments(
 }
 
 fn run_python_routine(
-    ctx: &ExecutionContext,
+    ctx: &QueryRuntimeContext,
     spec: &RoutineSpec,
     arguments: &[Vec<JsonValue>],
 ) -> Result<JsonValue> {
@@ -777,12 +777,11 @@ mod tests {
     use super::{
         ExternalProjectExecutor, ExternalRoutineDescriptor, ProjectSubmission, TestProjectExecutor,
     };
-    use crate::execution_context::ExecutionContext;
     use crate::memory_runtime::{
         LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope, QueryMemoryPool,
     };
     use crate::operators::external::batching::SubmissionBatchPolicy;
-    use crate::thread_context::ThreadContext;
+    use crate::runtime::{ParameterBindings, QueryOutputPort, QueryRuntimeContext};
     use paro_common::allocator::{Allocator, DefaultAllocator, MemoryTag};
     use paro_common::chunk::Chunk;
     use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
@@ -812,19 +811,26 @@ mod tests {
         }
     }
 
-    fn test_ctx() -> ExecutionContext<'static> {
-        let session: Arc<StatementContext> = TestStatementContextBuilder::minimal().build();
-        let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-        ExecutionContext::new(session, thread, None)
+    fn query_ctx(session: Arc<StatementContext>) -> QueryRuntimeContext {
+        QueryRuntimeContext::new(
+            session,
+            Arc::new(ParameterBindings::empty()),
+            Arc::new(QueryMemoryPool::unbounded()),
+            QueryOutputPort::discarding(),
+        )
     }
 
-    fn disabled_runtime_ctx() -> ExecutionContext<'static> {
+    fn test_ctx() -> QueryRuntimeContext {
+        let session: Arc<StatementContext> = TestStatementContextBuilder::minimal().build();
+        query_ctx(session)
+    }
+
+    fn disabled_runtime_ctx() -> QueryRuntimeContext {
         let runtime = Arc::new(ExternalRuntimeHost::new().with_probe(Arc::new(DisabledProbe)));
         let session: Arc<StatementContext> = TestStatementContextBuilder::minimal()
             .with_python_runtime(runtime)
             .build();
-        let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-        ExecutionContext::new(session, thread, None)
+        query_ctx(session)
     }
 
     fn add_one_expr() -> ExternalProjectExpression {

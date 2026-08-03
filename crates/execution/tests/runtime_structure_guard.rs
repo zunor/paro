@@ -98,6 +98,31 @@ fn old_sorting_state_compat_layer_is_gone() {
     }
 }
 
+#[test]
+fn legacy_execution_context_adapter_is_gone() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !manifest.join("src/execution_context.rs").exists(),
+        "the typed runtime must not retain the legacy execution context adapter"
+    );
+
+    let lib = read(&manifest, "src/lib.rs");
+    assert!(
+        !lib.contains("mod execution_context"),
+        "the legacy execution context module must stay removed"
+    );
+
+    for file in rust_files(manifest.join("src")) {
+        let text = fs::read_to_string(&file).expect("read rust source");
+        assert!(
+            !text.contains("crate::execution_context")
+                && !text.contains("execution_context::ExecutionContext"),
+            "{} reintroduced the legacy execution context boundary",
+            file.display()
+        );
+    }
+}
+
 fn contains_operator_state_boundary(text: &str) -> bool {
     text.contains("mod operator_state")
         || text.contains("crate::operator_state")

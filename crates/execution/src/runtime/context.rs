@@ -132,6 +132,10 @@ pub struct UtilityContext<'a> {
     pub errors: &'a QueryErrorRegistry,
 }
 
+/// Canonical query-scoped runtime shared by every typed operator.
+///
+/// Operator role contexts borrow this value so query memory, cancellation,
+/// parameters, output, and diagnostics cannot diverge behind local adapters.
 #[derive(Clone)]
 pub struct QueryRuntimeContext {
     pub session: Arc<StatementContext>,
@@ -258,7 +262,7 @@ impl FunctionExecContext for QueryRuntimeContext {
     }
 
     fn is_interrupted(&self) -> bool {
-        self.session.is_interrupted()
+        self.cancellation.is_cancelled()
     }
 
     fn allocator(&self, tag: MemoryTag) -> Arc<dyn Allocator> {
@@ -1069,9 +1073,41 @@ pub fn check_cancelled(cancel: &StatementCancellation) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock};
+
     use paro_common::error as paro_error;
+    use paro_context::{
+        NoopStatementTimeoutDriver, StatementCancellation, TestStatementContextBuilder,
+    };
+    use paro_function::scalar::FunctionExecContext;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    #[test]
+    fn function_runtime_observes_execution_attempt_cancellation() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let mut query = QueryRuntimeContext::new(
+            session.clone(),
+            Arc::new(ParameterBindings::empty()),
+            Arc::new(QueryMemoryPool::unbounded()),
+            QueryOutputPort::discarding(),
+        );
+        let connection_token = CancellationToken::new();
+        let execution_token = connection_token.child_token();
+        query.cancellation = StatementCancellation::from_parts(
+            connection_token,
+            execution_token.clone(),
+            None,
+            Arc::new(OnceLock::new()),
+            Arc::new(NoopStatementTimeoutDriver),
+        );
+
+        execution_token.cancel();
+
+        assert!(!session.is_interrupted());
+        assert!(FunctionExecContext::is_interrupted(&query));
+    }
 
     #[test]
     fn output_port_reports_backpressure_and_wakes_on_pop() {

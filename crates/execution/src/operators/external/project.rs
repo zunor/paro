@@ -4,7 +4,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::execution_context::ExecutionContext;
 use crate::operators::external::batching::SubmissionBatchPolicy;
 use crate::operators::external::runtime_bridge::{
     ProjectSubmission, RuntimeBridgeOutcome, RuntimeBridgeResponse,
@@ -73,7 +72,6 @@ impl ExternalProjectTransformExec {
         if input.is_empty() {
             return Ok(TransformPoll::NeedMoreInput);
         }
-        let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
         let batch_id = local.next_batch_id;
         let submission = ProjectSubmission {
             batch_id,
@@ -87,7 +85,7 @@ impl ExternalProjectTransformExec {
         let outcome = self
             .spec
             .bridge
-            .execute_project(&exec_ctx, &submission, &ctx.memory)?;
+            .execute_project(ctx.query, &submission, &ctx.memory)?;
         let (response, blocked) = match outcome {
             RuntimeBridgeOutcome::Ready(response) => (response, false),
             RuntimeBridgeOutcome::Blocked(response) => (response, true),

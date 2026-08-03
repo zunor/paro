@@ -3,7 +3,6 @@
 
 //! Shared property graph build/refresh helpers.
 
-use crate::execution_context::ExecutionContext;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogEntryEnum, CreatePropertyGraphInfo};
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -44,15 +43,6 @@ pub fn graph_staging_dir(db_path: &str, txn_id: u64, graph_name: &str) -> PathBu
         .join(txn_id.to_string())
         .join("graph")
         .join(graph_name)
-}
-
-pub fn scan_graph_inputs(
-    ctx: &ExecutionContext,
-    pg_info: &CreatePropertyGraphInfo,
-) -> Result<ScannedGraphInputs> {
-    let catalog = ctx.session.catalog();
-    let txn = ctx.session.catalog_txn_view();
-    scan_graph_inputs_with_catalog(catalog.as_ref(), &txn, pg_info)
 }
 
 pub fn scan_graph_inputs_with_catalog(
@@ -219,14 +209,6 @@ pub fn graph_statistics_from_scans(
     scanned: &ScannedGraphInputs,
 ) -> GraphStatistics {
     GraphStatistics::from_build_input(&build_graph_input_from_scans(graph_name, scanned))
-}
-
-pub fn build_graph_index(
-    ctx: &ExecutionContext,
-    pg_info: &CreatePropertyGraphInfo,
-) -> Result<GraphProjectionIndex> {
-    let scanned = scan_graph_inputs(ctx, pg_info)?;
-    build_graph_index_from_scans(&pg_info.graph_name, &scanned)
 }
 
 fn graph_vertex_key_from_value(value: &Value, context: &str) -> Result<VertexKey> {

@@ -1,21 +1,21 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use divan::Bencher;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
-use paro_execution::thread_context::ThreadContext;
+use paro_execution::runtime::QueryRuntimeContext;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, Expression, ReferenceExpression,
 };
 
 const BATCH_ROWS: usize = 2048;
+
+mod support;
 const ANY_MATCH_CALLS: usize = 4096;
 
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
 }
 
 struct BenchState {
-    runtime: ExecutionContext<'static>,
+    runtime: QueryRuntimeContext,
     join_key_input: Chunk,
     join_key_exprs: Vec<Expression>,
     any_match_input: Chunk,
@@ -33,9 +33,7 @@ struct BenchState {
 fn bench_state() -> &'static BenchState {
     static STATE: OnceLock<BenchState> = OnceLock::new();
     STATE.get_or_init(|| {
-        let session: Arc<StatementContext> = TestStatementContextBuilder::minimal().build();
-        let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-        let runtime = ExecutionContext::new(session, thread, None);
+        let runtime = support::query_runtime();
         let left_values: Vec<i32> = (0..BATCH_ROWS as i32).collect();
         let right_values: Vec<i32> = (0..BATCH_ROWS as i32).rev().collect();
 
