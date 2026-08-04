@@ -1670,6 +1670,58 @@ mod tests {
     }
 
     #[test]
+    fn test_dict_varchar_iterator_crosses_page_and_input_batch_boundaries() {
+        let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
+            .with_nullable(false)
+            .with_encoding(EncodingType::Dict)
+            .with_compression(CompressionType::None)
+            .with_page_size(16 * 1024);
+        let buffer = Cursor::new(Vec::new());
+        let mut writer = ScalarColumnWriter::new(opts, buffer).unwrap();
+
+        let first = vec!["N"; 4096];
+        let second = vec!["R"; 1909];
+        writer
+            .append(&encode_varlen_strings(&first), None, first.len() as u32)
+            .unwrap();
+        writer
+            .append(&encode_varlen_strings(&second), None, second.len() as u32)
+            .unwrap();
+
+        let meta = writer.finish().unwrap();
+        let buffer = Cursor::new(writer.into_inner().into_inner());
+        let reader_meta = ColumnReaderMeta::from_writer_meta(&meta, FieldType::Varchar);
+        let mut reader = ColumnReader::create(
+            reader_meta,
+            buffer,
+            ColumnReaderOptions::default(),
+            create_page_reader(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut iter = reader.new_iterator().unwrap();
+
+        let (first_count, first_batch) = iter.next_batch(4096).unwrap();
+        assert_eq!(first_count, 4096);
+        for row in 0..first_count {
+            assert_eq!(
+                first_batch.varlen_row(row).unwrap().as_deref(),
+                Some(b"N".as_slice())
+            );
+        }
+
+        let (second_count, second_batch) = iter.next_batch(4096).unwrap();
+        assert_eq!(second_count, 1909);
+        for row in 0..second_count {
+            assert_eq!(
+                second_batch.varlen_row(row).unwrap().as_deref(),
+                Some(b"R".as_slice())
+            );
+        }
+    }
+
+    #[test]
     fn test_varchar_iterator_read_by_rowids_emits_storage_dictionary_batch() {
         let mut iter = create_dict_varchar_iterator(false);
 
