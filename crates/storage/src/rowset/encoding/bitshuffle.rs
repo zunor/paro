@@ -10,10 +10,12 @@
 //!
 //! ```text
 //! +------------------------+
-//! | num_elements (4)       |  <- Header (16 bytes total)
+//! | num_elements (4)       |  <- Header (24 bytes total)
 //! | compressed_size (4)    |
 //! | padded_num_elements (4)|
 //! | elem_size_bytes (4)    |
+//! | format_magic (4)       |  <- "BSH2"
+//! | block_elements (4)     |
 //! +------------------------+
 //! | bitshuffle+lz4 data    |
 //! +------------------------+
@@ -32,7 +34,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::Result;
 
 /// Header size for bitshuffle pages.
-pub const BITSHUFFLE_PAGE_HEADER_SIZE: usize = 16;
+pub const BITSHUFFLE_PAGE_HEADER_SIZE: usize = 24;
+const BITSHUFFLE_PAGE_MAGIC: [u8; 4] = *b"BSH2";
+const BITSHUFFLE_BLOCK_ELEMENTS: usize = 1024;
 
 /// Align value up to multiple of 8.
 fn align_up_8(n: u32) -> u32 {
@@ -170,6 +174,8 @@ impl BitShufflePageBuilder {
         output.put_u32_le((BITSHUFFLE_PAGE_HEADER_SIZE + compressed.len()) as u32);
         output.put_u32_le(padded_count);
         output.put_u32_le(self.type_size as u32);
+        output.extend_from_slice(&BITSHUFFLE_PAGE_MAGIC);
+        output.put_u32_le(BITSHUFFLE_BLOCK_ELEMENTS as u32);
 
         // Write compressed data
         output.extend_from_slice(&compressed);
@@ -231,6 +237,8 @@ pub struct BitShufflePageDecoder {
     padded_num_elements: u32,
     /// Element size
     type_size: usize,
+    /// Number of elements transposed together
+    block_elements: usize,
     /// Current index
     cur_index: u32,
     /// Whether init() has been called
@@ -247,6 +255,7 @@ impl BitShufflePageDecoder {
             compressed_size: 0,
             padded_num_elements: 0,
             type_size: 0,
+            block_elements: 0,
             cur_index: 0,
             parsed: false,
         }
@@ -274,8 +283,30 @@ impl BitShufflePageDecoder {
         self.type_size =
             u32::from_le_bytes([self.data[12], self.data[13], self.data[14], self.data[15]])
                 as usize;
+        let format_magic = [self.data[16], self.data[17], self.data[18], self.data[19]];
+        self.block_elements =
+            u32::from_le_bytes([self.data[20], self.data[21], self.data[22], self.data[23]])
+                as usize;
 
         // Validate
+        if format_magic != BITSHUFFLE_PAGE_MAGIC {
+            return Err(paro_common::error::data_corrupted(
+                "BitShufflePageDecoder: unsupported page format",
+            ));
+        }
+        if self.block_elements != BITSHUFFLE_BLOCK_ELEMENTS {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: unsupported block element count {}",
+                self.block_elements,
+            )));
+        }
+        if self.compressed_size as usize != self.data.len() {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: encoded size {} does not match page size {}",
+                self.compressed_size,
+                self.data.len()
+            )));
+        }
         if self.padded_num_elements != align_up_8(self.num_elements) {
             return Err(paro_common::error::data_corrupted(
                 "BitShufflePageDecoder: invalid padded element count",
@@ -298,9 +329,23 @@ impl BitShufflePageDecoder {
         let decompressed = lz4_flex::decompress_size_prepended(compressed_data).map_err(|e| {
             paro_common::error::data_corrupted(format!("LZ4 decompress failed: {}", e))
         })?;
+        let expected_size = (self.padded_num_elements as usize)
+            .checked_mul(self.type_size)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "BitShufflePageDecoder: decoded page size overflow",
+                )
+            })?;
+        if decompressed.len() != expected_size {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: decoded size {} does not match expected size {}",
+                decompressed.len(),
+                expected_size
+            )));
+        }
 
         // Unshuffle
-        let unshuffled = bitunshuffle(&decompressed, self.type_size);
+        let unshuffled = bitunshuffle(&decompressed, self.type_size, self.block_elements);
         self.decoded_data = Some(Bytes::from(unshuffled));
 
         self.parsed = true;
@@ -383,33 +428,46 @@ fn bitshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
     if num_elements == 0 {
         return Vec::new();
     }
+    if num_elements % 8 != 0 {
+        return bitshuffle_scalar(data, type_size, num_elements);
+    }
 
     let mut output = vec![0u8; data.len()];
 
-    // For each bit position
-    for bit in 0..(type_size * 8) {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8;
-
-        // For each element
-        for elem in 0..num_elements {
-            let src_byte = data[elem * type_size + byte_idx];
-            let src_bit = (src_byte >> bit_idx) & 1;
-
-            // Output position: bit * num_elements + elem
-            let out_bit_pos = bit * num_elements + elem;
-            let out_byte_idx = out_bit_pos / 8;
-            let out_bit_idx = out_bit_pos % 8;
-
-            output[out_byte_idx] |= src_bit << out_bit_idx;
+    for block_start in (0..num_elements).step_by(BITSHUFFLE_BLOCK_ELEMENTS) {
+        let block_elements = (num_elements - block_start).min(BITSHUFFLE_BLOCK_ELEMENTS);
+        let plane_bytes = block_elements / 8;
+        let block_output = block_start * type_size;
+        for bit in 0..type_size * 8 {
+            let byte_idx = bit / 8;
+            let bit_idx = bit % 8;
+            let plane_output = block_output + bit * plane_bytes;
+            for element in 0..block_elements {
+                let value = data[(block_start + element) * type_size + byte_idx];
+                output[plane_output + element / 8] |= ((value >> bit_idx) & 1) << (element % 8);
+            }
         }
     }
 
     output
 }
 
+fn bitshuffle_scalar(data: &[u8], type_size: usize, num_elements: usize) -> Vec<u8> {
+    let mut output = vec![0u8; data.len()];
+    for bit in 0..type_size * 8 {
+        let byte_idx = bit / 8;
+        let bit_idx = bit % 8;
+        for element in 0..num_elements {
+            let value = data[element * type_size + byte_idx];
+            let output_bit = bit * num_elements + element;
+            output[output_bit / 8] |= ((value >> bit_idx) & 1) << (output_bit % 8);
+        }
+    }
+    output
+}
+
 /// Reverse bitshuffle operation.
-fn bitunshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
+fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8> {
     let total_bits = data.len() * 8;
     let bits_per_element = type_size * 8;
     let num_elements = total_bits / bits_per_element;
@@ -422,17 +480,22 @@ fn bitunshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
         return bitunshuffle_scalar(data, type_size, num_elements);
     }
 
-    let plane_bytes = num_elements / 8;
     let mut output = vec![0u8; num_elements * type_size];
 
-    for byte_idx in 0..type_size {
-        let plane_base = byte_idx * 8 * plane_bytes;
-        for group in 0..plane_bytes {
-            let planes = std::array::from_fn(|bit| data[plane_base + bit * plane_bytes + group]);
-            let values = transpose_8x8(u64::from_le_bytes(planes)).to_le_bytes();
-            let output_base = group * 8 * type_size + byte_idx;
-            for (elem, value) in values.into_iter().enumerate() {
-                output[output_base + elem * type_size] = value;
+    for block_start in (0..num_elements).step_by(block_elements) {
+        let current_block_elements = (num_elements - block_start).min(block_elements);
+        let plane_bytes = current_block_elements / 8;
+        let block_input = block_start * type_size;
+        for byte_idx in 0..type_size {
+            let plane_base = block_input + byte_idx * 8 * plane_bytes;
+            for group in 0..plane_bytes {
+                let planes =
+                    std::array::from_fn(|bit| data[plane_base + bit * plane_bytes + group]);
+                let values = transpose_8x8(u64::from_le_bytes(planes)).to_le_bytes();
+                let output_base = (block_start + group * 8) * type_size + byte_idx;
+                for (element, value) in values.into_iter().enumerate() {
+                    output[output_base + element * type_size] = value;
+                }
             }
         }
     }
@@ -489,8 +552,24 @@ mod tests {
     fn test_bitshuffle_roundtrip() {
         let data: Vec<u8> = vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
         let shuffled = bitshuffle(&data, 4);
-        let unshuffled = bitunshuffle(&shuffled, 4);
+        let unshuffled = bitunshuffle(&shuffled, 4, BITSHUFFLE_BLOCK_ELEMENTS);
         assert_eq!(data, unshuffled);
+    }
+
+    #[test]
+    fn bitshuffle_roundtrip_across_blocks() {
+        for type_size in [1_usize, 2, 4, 8, 16] {
+            for elements in [1024_usize, 1032, 2056] {
+                let data = (0..elements * type_size)
+                    .map(|idx| (idx.wrapping_mul(73).wrapping_add(type_size * 11)) as u8)
+                    .collect::<Vec<_>>();
+                let shuffled = bitshuffle(&data, type_size);
+                assert_eq!(
+                    bitunshuffle(&shuffled, type_size, BITSHUFFLE_BLOCK_ELEMENTS),
+                    data
+                );
+            }
+        }
     }
 
     #[test]
@@ -502,11 +581,39 @@ mod tests {
                     .collect::<Vec<_>>();
                 let shuffled = bitshuffle(&data, type_size);
                 assert_eq!(
-                    bitunshuffle(&shuffled, type_size),
+                    bitunshuffle(&shuffled, type_size, BITSHUFFLE_BLOCK_ELEMENTS),
                     bitunshuffle_reference(&shuffled, type_size)
                 );
             }
         }
+    }
+
+    #[test]
+    fn decoder_rejects_unsupported_page_format() {
+        let mut builder = BitShufflePageBuilder::new(4, 256 * 1024);
+        builder.add_one(&42_i32.to_le_bytes());
+        let mut page = builder.finish().unwrap().to_vec();
+        page[16..20].copy_from_slice(b"BSH1");
+
+        let error = BitShufflePageDecoder::new(Bytes::from(page))
+            .init()
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported page format"));
+    }
+
+    #[test]
+    fn decoder_rejects_unsupported_block_layout() {
+        let mut builder = BitShufflePageBuilder::new(4, 256 * 1024);
+        builder.add_one(&42_i32.to_le_bytes());
+        let mut page = builder.finish().unwrap().to_vec();
+        page[20..24].copy_from_slice(&512_u32.to_le_bytes());
+
+        let error = BitShufflePageDecoder::new(Bytes::from(page))
+            .init()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported block element count"));
     }
 
     #[test]
