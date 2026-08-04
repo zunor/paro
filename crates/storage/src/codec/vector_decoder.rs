@@ -343,11 +343,30 @@ fn build_fixed_vector<T>(
 where
     T: Default + Copy + FromPrimitiveLe,
 {
-    let values = parse_primitive::<T>(data, rows)?;
+    let expected_bytes = rows
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| paro_error::data_corrupted("Column data length overflow"))?;
+    if data.len() != expected_bytes {
+        return Err(paro_error::data_corrupted(
+            "Column data length does not match expected rows",
+        ));
+    }
     let mut vector = Vector::try_new(logical_type, rows, allocator)?;
     if rows > 0 {
+        #[cfg(target_endian = "little")]
         unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                vector.flat_data_mut::<T>().cast::<u8>(),
+                expected_bytes,
+            );
+        }
+        #[cfg(target_endian = "big")]
+        {
+            let values = parse_primitive::<T>(data, rows)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
+            }
         }
     }
     vector.try_set_count(rows)?;

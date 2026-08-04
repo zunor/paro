@@ -483,7 +483,7 @@ impl SegmentIterator {
                     break;
                 }
 
-                let (rows_read, values_by_col) = self
+                let (rows_read, vectors_by_col) = self
                     .predicate_evaluator
                     .as_mut()
                     .expect("late materialization requires predicate evaluator")
@@ -516,7 +516,7 @@ impl SegmentIterator {
                         .predicate_evaluator
                         .as_ref()
                         .expect("late materialization requires predicate evaluator")
-                        .evaluate_row(&values_by_col, row_idx)?
+                        .evaluate_row(&vectors_by_col, row_idx)?
                     {
                         rowids.push(ord as u32);
                         if rowids.len() >= batch_size {

@@ -9,19 +9,70 @@ use crate::index::{
 };
 use crate::rowset::column::ColumnIterator;
 use crate::tablet::ColumnId;
-use paro_common::allocator::default_allocator;
+use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::Vector;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(super) struct PredicateEvaluator {
-    tree: PredicateTree,
+    tree: CompiledPredicateTree,
     predicate_columns: Vec<ColumnId>,
     predicate_types: Vec<LogicalType>,
-    predicate_column_map: HashMap<ColumnId, usize>,
     predicate_iterators: Vec<Option<Box<dyn ColumnIterator + Send + Sync>>>,
+    allocator: Arc<dyn Allocator>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ComparisonOperator {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+impl ComparisonOperator {
+    #[inline]
+    fn matches(self, ordering: Ordering) -> bool {
+        match self {
+            Self::Equal => ordering.is_eq(),
+            Self::NotEqual => !ordering.is_eq(),
+            Self::LessThan => ordering.is_lt(),
+            Self::LessThanOrEqual => ordering.is_le(),
+            Self::GreaterThan => ordering.is_gt(),
+            Self::GreaterThanOrEqual => ordering.is_ge(),
+        }
+    }
+}
+
+enum CompiledPredicateTree {
+    Leaf(CompiledPredicate),
+    And(Vec<CompiledPredicateTree>),
+    Or(Vec<CompiledPredicateTree>),
+}
+
+enum CompiledPredicate {
+    I32Comparisons {
+        column_idx: usize,
+        comparisons: Vec<(ComparisonOperator, i32)>,
+    },
+    I64Comparisons {
+        column_idx: usize,
+        comparisons: Vec<(ComparisonOperator, i64)>,
+    },
+    I128Comparisons {
+        column_idx: usize,
+        comparisons: Vec<(ComparisonOperator, i128)>,
+    },
+    Generic {
+        column_idx: usize,
+        predicate: Predicate,
+    },
 }
 
 impl PredicateEvaluator {
@@ -74,12 +125,13 @@ impl PredicateEvaluator {
             iterators.push(iter);
         }
 
+        let tree = Self::compile_tree(&tree, &column_map, &types)?;
         Ok(Some(Self {
             tree,
             predicate_columns: columns,
             predicate_types: types,
-            predicate_column_map: column_map,
             predicate_iterators: iterators,
+            allocator: Arc::new(default_allocator()),
         }))
     }
 
@@ -125,13 +177,13 @@ impl PredicateEvaluator {
         Ok(())
     }
 
-    pub(super) fn read_next_batch(&mut self, to_read: usize) -> Result<(usize, Vec<Vec<Value>>)> {
+    pub(super) fn read_next_batch(&mut self, to_read: usize) -> Result<(usize, Vec<Vector>)> {
         if to_read == 0 {
             return Ok((0, Vec::new()));
         }
 
         let mut rows_read: Option<usize> = None;
-        let mut values_by_col: Vec<Option<Vec<Value>>> =
+        let mut vectors_by_col: Vec<Option<Vector>> =
             Vec::with_capacity(self.predicate_columns.len());
 
         for (idx, iter_opt) in self.predicate_iterators.iter_mut().enumerate() {
@@ -147,70 +199,59 @@ impl PredicateEvaluator {
                 } else {
                     rows_read = Some(count);
                 }
-                let values = if batch.storage_dictionary.is_some() {
-                    let vector = vector_decoder::decode_column_batch(
-                        ty,
-                        &batch,
-                        count,
-                        Arc::new(default_allocator()),
-                        None,
-                    )?;
-                    (0..count)
-                        .map(|row_idx| vector.get_value(row_idx))
-                        .collect()
-                } else {
-                    crate::codec::value_decoder::decode_values(
-                        ty,
-                        &batch.data,
-                        batch.nulls.as_deref(),
-                        count,
-                    )?
-                };
-                values_by_col.push(Some(values));
+                vectors_by_col.push(Some(vector_decoder::decode_column_batch(
+                    ty,
+                    &batch,
+                    count,
+                    self.allocator.clone(),
+                    None,
+                )?));
             } else {
-                values_by_col.push(None);
+                vectors_by_col.push(None);
             }
         }
 
         let rows = rows_read.unwrap_or(to_read);
-        let mut filled = Vec::with_capacity(values_by_col.len());
-        for (idx, values) in values_by_col.into_iter().enumerate() {
-            match values {
-                Some(vals) => filled.push(vals),
-                None => filled.push(vec![Value::Null(self.predicate_types[idx].clone()); rows]),
+        let mut filled = Vec::with_capacity(vectors_by_col.len());
+        for (idx, vector) in vectors_by_col.into_iter().enumerate() {
+            match vector {
+                Some(vector) => filled.push(vector),
+                None => filled.push(Vector::try_constant_null(
+                    self.predicate_types[idx].clone(),
+                    rows,
+                    self.allocator.clone(),
+                )?),
             }
         }
 
         Ok((rows, filled))
     }
 
-    pub(super) fn evaluate_row(
-        &self,
-        values_by_col: &[Vec<Value>],
-        row_idx: usize,
-    ) -> Result<bool> {
-        self.evaluate_tree(&self.tree, values_by_col, row_idx)
+    pub(super) fn evaluate_row(&self, vectors_by_col: &[Vector], row_idx: usize) -> Result<bool> {
+        self.evaluate_tree(&self.tree, vectors_by_col, row_idx)
     }
 
     fn evaluate_tree(
         &self,
-        tree: &PredicateTree,
-        values_by_col: &[Vec<Value>],
+        tree: &CompiledPredicateTree,
+        vectors_by_col: &[Vector],
         row_idx: usize,
     ) -> Result<bool> {
         match tree {
-            PredicateTree::Leaf(predicate) => self.evaluate_leaf(predicate, values_by_col, row_idx),
-            PredicateTree::And(children) => {
+            CompiledPredicateTree::Leaf(predicate) => {
+                self.evaluate_leaf(predicate, vectors_by_col, row_idx)
+            }
+            CompiledPredicateTree::And(children) => {
                 for child in children {
-                    if !self.evaluate_tree(child, values_by_col, row_idx)? {
+                    if !self.evaluate_tree(child, vectors_by_col, row_idx)? {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
-            PredicateTree::Or(children) => {
+            CompiledPredicateTree::Or(children) => {
                 for child in children {
-                    if self.evaluate_tree(child, values_by_col, row_idx)? {
+                    if self.evaluate_tree(child, vectors_by_col, row_idx)? {
                         return Ok(true);
                     }
                 }
@@ -221,68 +262,306 @@ impl PredicateEvaluator {
 
     fn evaluate_leaf(
         &self,
-        predicate: &Predicate,
-        values_by_col: &[Vec<Value>],
+        predicate: &CompiledPredicate,
+        vectors_by_col: &[Vector],
         row_idx: usize,
     ) -> Result<bool> {
-        let value = self.get_row_value(values_by_col, predicate.column_id(), row_idx);
+        match predicate {
+            CompiledPredicate::I32Comparisons {
+                column_idx,
+                comparisons,
+            } => Ok(vectors_by_col.get(*column_idx).is_some_and(|vector| {
+                if vector.is_null(row_idx) {
+                    return false;
+                }
+                let lhs = unsafe { vector.get_fixed::<i32>(row_idx) };
+                comparisons
+                    .iter()
+                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+            })),
+            CompiledPredicate::I64Comparisons {
+                column_idx,
+                comparisons,
+            } => Ok(vectors_by_col.get(*column_idx).is_some_and(|vector| {
+                if vector.is_null(row_idx) {
+                    return false;
+                }
+                let lhs = unsafe { vector.get_fixed::<i64>(row_idx) };
+                comparisons
+                    .iter()
+                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+            })),
+            CompiledPredicate::I128Comparisons {
+                column_idx,
+                comparisons,
+            } => Ok(vectors_by_col.get(*column_idx).is_some_and(|vector| {
+                if vector.is_null(row_idx) {
+                    return false;
+                }
+                let lhs = unsafe { vector.get_fixed::<i128>(row_idx) };
+                comparisons
+                    .iter()
+                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+            })),
+            CompiledPredicate::Generic {
+                column_idx,
+                predicate,
+            } => self.evaluate_generic_leaf(*column_idx, predicate, vectors_by_col, row_idx),
+        }
+    }
+
+    fn evaluate_generic_leaf(
+        &self,
+        column_idx: usize,
+        predicate: &Predicate,
+        vectors_by_col: &[Vector],
+        row_idx: usize,
+    ) -> Result<bool> {
+        let vector = vectors_by_col.get(column_idx);
         match predicate {
             Predicate::Eq { value: rhs, .. } => {
-                Ok(!Self::is_null_value(value) && value.is_some_and(|v| v == rhs))
+                Ok(Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_eq))
             }
             Predicate::NotEq { value: rhs, .. } => {
-                Ok(!Self::is_null_value(value) && value.is_some_and(|v| v != rhs))
+                Ok(Self::compare_value(vector, row_idx, rhs).is_some_and(|o| !o.is_eq()))
             }
-            Predicate::Lt { value: rhs, .. } => Self::compare_value(value, rhs, |o| o.is_lt()),
-            Predicate::Le { value: rhs, .. } => Self::compare_value(value, rhs, |o| o.is_le()),
-            Predicate::Gt { value: rhs, .. } => Self::compare_value(value, rhs, |o| o.is_gt()),
-            Predicate::Ge { value: rhs, .. } => Self::compare_value(value, rhs, |o| o.is_ge()),
+            Predicate::Lt { value: rhs, .. } => {
+                Ok(Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_lt))
+            }
+            Predicate::Le { value: rhs, .. } => {
+                Ok(Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_le))
+            }
+            Predicate::Gt { value: rhs, .. } => {
+                Ok(Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_gt))
+            }
+            Predicate::Ge { value: rhs, .. } => {
+                Ok(Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_ge))
+            }
             Predicate::In { values, .. } => {
-                if Self::is_null_value(value) {
+                if vector.is_none_or(|vector| vector.is_null(row_idx)) {
                     return Ok(false);
                 }
-                Ok(value.is_some_and(|lhs| values.iter().any(|rhs| rhs == lhs)))
+                Ok(values.iter().any(|rhs| {
+                    Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_eq)
+                }))
             }
             Predicate::Range { lower, upper, .. } => {
-                if Self::is_null_value(value) {
-                    return Ok(false);
-                }
-                let lhs = value.expect("checked above");
-                let ge = lhs.partial_cmp(lower).map(|o| o.is_ge()).unwrap_or(false);
-                let le = lhs.partial_cmp(upper).map(|o| o.is_le()).unwrap_or(false);
+                let ge = Self::compare_value(vector, row_idx, lower).is_some_and(Ordering::is_ge);
+                let le = Self::compare_value(vector, row_idx, upper).is_some_and(Ordering::is_le);
                 Ok(ge && le)
             }
-            Predicate::IsNull { .. } => Ok(Self::is_null_value(value)),
-            Predicate::IsNotNull { .. } => Ok(!Self::is_null_value(value)),
+            Predicate::IsNull { .. } => Ok(vector.is_none_or(|vector| vector.is_null(row_idx))),
+            Predicate::IsNotNull { .. } => {
+                Ok(vector.is_some_and(|vector| !vector.is_null(row_idx)))
+            }
         }
     }
 
-    fn compare_value<F>(value: Option<&Value>, rhs: &Value, cmp: F) -> Result<bool>
-    where
-        F: FnOnce(std::cmp::Ordering) -> bool,
-    {
-        if Self::is_null_value(value) {
-            return Ok(false);
+    fn compare_value(vector: Option<&Vector>, row_idx: usize, rhs: &Value) -> Option<Ordering> {
+        let vector = vector?;
+        if vector.is_null(row_idx) {
+            return None;
         }
-        Ok(value
-            .expect("checked above")
-            .partial_cmp(rhs)
-            .map(cmp)
-            .unwrap_or(false))
+        unsafe {
+            match (vector.logical_type(), rhs) {
+                (LogicalType::Date, Value::Date(rhs)) => {
+                    vector.get_fixed::<i32>(row_idx).partial_cmp(rhs)
+                }
+                (LogicalType::Decimal { precision, .. }, Value::Decimal(rhs, _, _))
+                    if *precision <= 18 =>
+                {
+                    (vector.get_fixed::<i64>(row_idx) as i128).partial_cmp(rhs)
+                }
+                (LogicalType::Decimal { .. }, Value::Decimal(rhs, _, _)) => {
+                    vector.get_fixed::<i128>(row_idx).partial_cmp(rhs)
+                }
+                (LogicalType::Integer, Value::Integer(rhs)) => {
+                    vector.get_fixed::<i32>(row_idx).partial_cmp(rhs)
+                }
+                (LogicalType::BigInt, Value::BigInt(rhs)) => {
+                    vector.get_fixed::<i64>(row_idx).partial_cmp(rhs)
+                }
+                _ => vector.get_value(row_idx).partial_cmp(rhs),
+            }
+        }
     }
 
-    fn is_null_value(value: Option<&Value>) -> bool {
-        matches!(value, None | Some(Value::Null(_)))
+    fn compile_tree(
+        tree: &PredicateTree,
+        column_map: &HashMap<ColumnId, usize>,
+        column_types: &[LogicalType],
+    ) -> Result<CompiledPredicateTree> {
+        match tree {
+            PredicateTree::Leaf(predicate) => {
+                let column_idx = *column_map.get(&predicate.column_id()).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Predicate column {} has no materialized vector",
+                        predicate.column_id()
+                    ))
+                })?;
+                let logical_type = column_types.get(column_idx).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Predicate column index {column_idx} has no logical type"
+                    ))
+                })?;
+                Ok(CompiledPredicateTree::Leaf(Self::compile_leaf(
+                    column_idx,
+                    logical_type,
+                    predicate,
+                )))
+            }
+            PredicateTree::And(children) => {
+                let mut compiled = Vec::new();
+                for child in children {
+                    match Self::compile_tree(child, column_map, column_types)? {
+                        CompiledPredicateTree::And(grandchildren) => compiled.extend(grandchildren),
+                        child => compiled.push(child),
+                    }
+                }
+                Ok(CompiledPredicateTree::And(
+                    Self::coalesce_fixed_comparisons(compiled),
+                ))
+            }
+            PredicateTree::Or(children) => Ok(CompiledPredicateTree::Or(
+                children
+                    .iter()
+                    .map(|child| Self::compile_tree(child, column_map, column_types))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+        }
     }
 
-    fn get_row_value<'a>(
-        &self,
-        values_by_col: &'a [Vec<Value>],
-        column_id: ColumnId,
-        row_idx: usize,
-    ) -> Option<&'a Value> {
-        let idx = self.predicate_column_map.get(&column_id)?;
-        values_by_col.get(*idx)?.get(row_idx)
+    fn compile_leaf(
+        column_idx: usize,
+        logical_type: &LogicalType,
+        predicate: &Predicate,
+    ) -> CompiledPredicate {
+        let Some((operator, rhs)) = Self::comparison_parts(predicate) else {
+            return CompiledPredicate::Generic {
+                column_idx,
+                predicate: predicate.clone(),
+            };
+        };
+        match (logical_type, rhs) {
+            (LogicalType::Date, Value::Date(rhs)) | (LogicalType::Integer, Value::Integer(rhs)) => {
+                CompiledPredicate::I32Comparisons {
+                    column_idx,
+                    comparisons: vec![(operator, *rhs)],
+                }
+            }
+            (LogicalType::BigInt, Value::BigInt(rhs)) => CompiledPredicate::I64Comparisons {
+                column_idx,
+                comparisons: vec![(operator, *rhs)],
+            },
+            (LogicalType::Decimal { precision, .. }, Value::Decimal(rhs, _, _))
+                if *precision <= 18 && i64::try_from(*rhs).is_ok() =>
+            {
+                CompiledPredicate::I64Comparisons {
+                    column_idx,
+                    comparisons: vec![(operator, *rhs as i64)],
+                }
+            }
+            (LogicalType::Decimal { .. }, Value::Decimal(rhs, _, _)) => {
+                CompiledPredicate::I128Comparisons {
+                    column_idx,
+                    comparisons: vec![(operator, *rhs)],
+                }
+            }
+            _ => CompiledPredicate::Generic {
+                column_idx,
+                predicate: predicate.clone(),
+            },
+        }
+    }
+
+    fn comparison_parts(predicate: &Predicate) -> Option<(ComparisonOperator, &Value)> {
+        match predicate {
+            Predicate::Eq { value, .. } => Some((ComparisonOperator::Equal, value)),
+            Predicate::NotEq { value, .. } => Some((ComparisonOperator::NotEqual, value)),
+            Predicate::Lt { value, .. } => Some((ComparisonOperator::LessThan, value)),
+            Predicate::Le { value, .. } => Some((ComparisonOperator::LessThanOrEqual, value)),
+            Predicate::Gt { value, .. } => Some((ComparisonOperator::GreaterThan, value)),
+            Predicate::Ge { value, .. } => Some((ComparisonOperator::GreaterThanOrEqual, value)),
+            _ => None,
+        }
+    }
+
+    fn coalesce_fixed_comparisons(
+        predicates: Vec<CompiledPredicateTree>,
+    ) -> Vec<CompiledPredicateTree> {
+        let mut result: Vec<CompiledPredicateTree> = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            match predicate {
+                CompiledPredicateTree::Leaf(CompiledPredicate::I32Comparisons {
+                    column_idx,
+                    comparisons,
+                }) => {
+                    let existing = result.iter_mut().find_map(|predicate| match predicate {
+                        CompiledPredicateTree::Leaf(CompiledPredicate::I32Comparisons {
+                            column_idx: existing_idx,
+                            comparisons,
+                        }) if *existing_idx == column_idx => Some(comparisons),
+                        _ => None,
+                    });
+                    if let Some(existing) = existing {
+                        existing.extend(comparisons);
+                    } else {
+                        result.push(CompiledPredicateTree::Leaf(
+                            CompiledPredicate::I32Comparisons {
+                                column_idx,
+                                comparisons,
+                            },
+                        ));
+                    }
+                }
+                CompiledPredicateTree::Leaf(CompiledPredicate::I64Comparisons {
+                    column_idx,
+                    comparisons,
+                }) => {
+                    let existing = result.iter_mut().find_map(|predicate| match predicate {
+                        CompiledPredicateTree::Leaf(CompiledPredicate::I64Comparisons {
+                            column_idx: existing_idx,
+                            comparisons,
+                        }) if *existing_idx == column_idx => Some(comparisons),
+                        _ => None,
+                    });
+                    if let Some(existing) = existing {
+                        existing.extend(comparisons);
+                    } else {
+                        result.push(CompiledPredicateTree::Leaf(
+                            CompiledPredicate::I64Comparisons {
+                                column_idx,
+                                comparisons,
+                            },
+                        ));
+                    }
+                }
+                CompiledPredicateTree::Leaf(CompiledPredicate::I128Comparisons {
+                    column_idx,
+                    comparisons,
+                }) => {
+                    let existing = result.iter_mut().find_map(|predicate| match predicate {
+                        CompiledPredicateTree::Leaf(CompiledPredicate::I128Comparisons {
+                            column_idx: existing_idx,
+                            comparisons,
+                        }) if *existing_idx == column_idx => Some(comparisons),
+                        _ => None,
+                    });
+                    if let Some(existing) = existing {
+                        existing.extend(comparisons);
+                    } else {
+                        result.push(CompiledPredicateTree::Leaf(
+                            CompiledPredicate::I128Comparisons {
+                                column_idx,
+                                comparisons,
+                            },
+                        ));
+                    }
+                }
+                predicate => result.push(predicate),
+            }
+        }
+        result
     }
 }
 
@@ -301,5 +580,60 @@ impl PredicateVerificationExt for Predicate {
                 | Predicate::Ge { .. }
                 | Predicate::Range { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn integer_comparison_tree(
+        conjunction: fn(Vec<PredicateTree>) -> PredicateTree,
+    ) -> PredicateTree {
+        conjunction(vec![
+            PredicateTree::leaf(Predicate::Ge {
+                column_id: 7,
+                value: Value::Integer(10),
+            }),
+            PredicateTree::leaf(Predicate::Lt {
+                column_id: 7,
+                value: Value::Integer(20),
+            }),
+        ])
+    }
+
+    #[test]
+    fn compile_tree_coalesces_same_column_comparisons_only_inside_and() {
+        let column_map = HashMap::from([(7, 0)]);
+        let column_types = [LogicalType::Integer];
+
+        let compiled_and = PredicateEvaluator::compile_tree(
+            &integer_comparison_tree(PredicateTree::And),
+            &column_map,
+            &column_types,
+        )
+        .unwrap();
+        let CompiledPredicateTree::And(and_children) = compiled_and else {
+            panic!("expected compiled AND");
+        };
+        assert_eq!(and_children.len(), 1);
+        assert!(matches!(
+            &and_children[0],
+            CompiledPredicateTree::Leaf(CompiledPredicate::I32Comparisons {
+                column_idx: 0,
+                comparisons,
+            }) if comparisons.len() == 2
+        ));
+
+        let compiled_or = PredicateEvaluator::compile_tree(
+            &integer_comparison_tree(PredicateTree::Or),
+            &column_map,
+            &column_types,
+        )
+        .unwrap();
+        let CompiledPredicateTree::Or(or_children) = compiled_or else {
+            panic!("expected compiled OR");
+        };
+        assert_eq!(or_children.len(), 2);
     }
 }

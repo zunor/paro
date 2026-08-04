@@ -1056,6 +1056,15 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
             return Ok((0, ColumnBatch::empty()));
         }
 
+        let page_remaining = self
+            .current_decoder
+            .as_ref()
+            .map(|decoder| decoder.count().saturating_sub(decoder.current_index()) as usize)
+            .unwrap_or(0);
+        if n <= page_remaining {
+            return self.next_batch_within_current_page(n);
+        }
+
         let mut total_read = 0;
         let mut result_data = Vec::new();
         let mut result_nulls: Option<Vec<u8>> = if self.meta.is_nullable {

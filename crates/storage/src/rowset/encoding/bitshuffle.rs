@@ -418,23 +418,21 @@ fn bitunshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
         return Vec::new();
     }
 
+    if num_elements % 8 != 0 {
+        return bitunshuffle_scalar(data, type_size, num_elements);
+    }
+
+    let plane_bytes = num_elements / 8;
     let mut output = vec![0u8; num_elements * type_size];
 
-    // For each bit position
-    for bit in 0..bits_per_element {
-        let out_byte_idx = bit / 8;
-        let out_bit_idx = bit % 8;
-
-        // For each element
-        for elem in 0..num_elements {
-            // Input position: bit * num_elements + elem
-            let in_bit_pos = bit * num_elements + elem;
-            let in_byte_idx = in_bit_pos / 8;
-            let in_bit_idx = in_bit_pos % 8;
-
-            if in_byte_idx < data.len() {
-                let src_bit = (data[in_byte_idx] >> in_bit_idx) & 1;
-                output[elem * type_size + out_byte_idx] |= src_bit << out_bit_idx;
+    for byte_idx in 0..type_size {
+        let plane_base = byte_idx * 8 * plane_bytes;
+        for group in 0..plane_bytes {
+            let planes = std::array::from_fn(|bit| data[plane_base + bit * plane_bytes + group]);
+            let values = transpose_8x8(u64::from_le_bytes(planes)).to_le_bytes();
+            let output_base = group * 8 * type_size + byte_idx;
+            for (elem, value) in values.into_iter().enumerate() {
+                output[output_base + elem * type_size] = value;
             }
         }
     }
@@ -442,9 +440,50 @@ fn bitunshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
     output
 }
 
+fn bitunshuffle_scalar(data: &[u8], type_size: usize, num_elements: usize) -> Vec<u8> {
+    let mut output = vec![0u8; num_elements * type_size];
+    for bit in 0..type_size * 8 {
+        let output_byte = bit / 8;
+        let output_bit = bit % 8;
+        for element in 0..num_elements {
+            let input_bit = bit * num_elements + element;
+            let value = (data[input_bit / 8] >> (input_bit % 8)) & 1;
+            output[element * type_size + output_byte] |= value << output_bit;
+        }
+    }
+    output
+}
+
+#[inline]
+fn transpose_8x8(mut value: u64) -> u64 {
+    let mut swap = (value ^ (value >> 7)) & 0x00AA_00AA_00AA_00AA;
+    value ^= swap ^ (swap << 7);
+    swap = (value ^ (value >> 14)) & 0x0000_CCCC_0000_CCCC;
+    value ^= swap ^ (swap << 14);
+    swap = (value ^ (value >> 28)) & 0x0000_0000_F0F0_F0F0;
+    value ^ swap ^ (swap << 28)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitunshuffle_reference(data: &[u8], type_size: usize) -> Vec<u8> {
+        let total_bits = data.len() * 8;
+        let bits_per_element = type_size * 8;
+        let num_elements = total_bits / bits_per_element;
+        let mut output = vec![0u8; num_elements * type_size];
+        for bit in 0..bits_per_element {
+            let out_byte_idx = bit / 8;
+            let out_bit_idx = bit % 8;
+            for elem in 0..num_elements {
+                let in_bit_pos = bit * num_elements + elem;
+                let src_bit = (data[in_bit_pos / 8] >> (in_bit_pos % 8)) & 1;
+                output[elem * type_size + out_byte_idx] |= src_bit << out_bit_idx;
+            }
+        }
+        output
+    }
 
     #[test]
     fn test_bitshuffle_roundtrip() {
@@ -452,6 +491,22 @@ mod tests {
         let shuffled = bitshuffle(&data, 4);
         let unshuffled = bitunshuffle(&shuffled, 4);
         assert_eq!(data, unshuffled);
+    }
+
+    #[test]
+    fn optimized_bitunshuffle_matches_reference() {
+        for type_size in [1_usize, 2, 4, 8, 16] {
+            for elements in [8_usize, 16, 24, 64] {
+                let data = (0..elements * type_size)
+                    .map(|idx| (idx.wrapping_mul(73).wrapping_add(type_size * 11)) as u8)
+                    .collect::<Vec<_>>();
+                let shuffled = bitshuffle(&data, type_size);
+                assert_eq!(
+                    bitunshuffle(&shuffled, type_size),
+                    bitunshuffle_reference(&shuffled, type_size)
+                );
+            }
+        }
     }
 
     #[test]

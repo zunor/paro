@@ -5,9 +5,15 @@
 //!
 //! Shared by plan_topn and plan_filter to push down predicates to RowsetScan.
 
+use std::sync::Arc;
+
+use paro_common::allocator::default_allocator;
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::Vector;
+use paro_function::scalar::cast::CastExecCtx;
+use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::get::Get;
 use paro_storage::index::{Predicate, PredicateTree};
@@ -31,15 +37,7 @@ pub fn build_predicate_tree(
         residual_exprs.append(&mut residual);
     }
 
-    let tree = if pushed_trees.is_empty() {
-        None
-    } else if pushed_trees.len() == 1 {
-        Some(pushed_trees.remove(0))
-    } else {
-        Some(PredicateTree::And(pushed_trees))
-    };
-
-    Ok((tree, residual_exprs))
+    Ok((combine_with_and(pushed_trees), residual_exprs))
 }
 
 fn extract_predicate(
@@ -59,14 +57,7 @@ fn extract_predicate(
                 residual_exprs.append(&mut residual);
             }
 
-            let tree = if pushed_trees.is_empty() {
-                None
-            } else if pushed_trees.len() == 1 {
-                Some(pushed_trees.remove(0))
-            } else {
-                Some(PredicateTree::And(pushed_trees))
-            };
-            Ok((tree, residual_exprs))
+            Ok((combine_with_and(pushed_trees), residual_exprs))
         }
         _ => match build_predicate(expr, get)? {
             Some(tree) => Ok((Some(tree), Vec::new())),
@@ -79,11 +70,25 @@ pub fn combine_predicate_trees(
     left: Option<PredicateTree>,
     right: Option<PredicateTree>,
 ) -> Option<PredicateTree> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(PredicateTree::And(vec![left, right])),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
+    combine_with_and([left, right].into_iter().flatten())
+}
+
+fn combine_with_and(trees: impl IntoIterator<Item = PredicateTree>) -> Option<PredicateTree> {
+    let mut combined = Vec::new();
+    let mut pending = trees.into_iter().collect::<Vec<_>>();
+    pending.reverse();
+    while let Some(tree) = pending.pop() {
+        if let PredicateTree::And(children) = tree {
+            pending.extend(children.into_iter().rev());
+        } else if !combined.contains(&tree) {
+            combined.push(tree);
+        }
+    }
+
+    match combined.len() {
+        0 => None,
+        1 => combined.pop(),
+        _ => Some(PredicateTree::And(combined)),
     }
 }
 
@@ -215,16 +220,8 @@ fn extract_constant_value(expr: &Expression, get: &Get, col_idx: usize) -> Resul
         return Ok(None);
     }
 
-    let value = match expr {
-        Expression::Constant(c) => c.value.clone(),
-        Expression::Cast(cast) => {
-            if let Expression::Constant(c) = cast.child.as_ref() {
-                c.value.clone()
-            } else {
-                return Ok(None);
-            }
-        }
-        _ => return Ok(None),
+    let Some(value) = evaluate_bound_constant(expr)? else {
+        return Ok(None);
     };
 
     if value.is_null() {
@@ -238,6 +235,51 @@ fn extract_constant_value(expr: &Expression, get: &Get, col_idx: usize) -> Resul
     match value.cast(col_type) {
         Ok(v) => Ok(Some(v)),
         Err(_) => Ok(None),
+    }
+}
+
+fn evaluate_bound_constant(expr: &Expression) -> Result<Option<Value>> {
+    match expr {
+        Expression::Constant(constant) => Ok(Some(constant.value.clone())),
+        Expression::Cast(cast) => {
+            let Some(value) = evaluate_bound_constant(cast.child.as_ref())? else {
+                return Ok(None);
+            };
+            if value.is_null() {
+                return Ok(None);
+            }
+
+            let allocator = Arc::new(default_allocator());
+            let mut source = Vector::try_new(value.logical_type(), 1, allocator.clone())?;
+            source.set_count(1);
+            source.set_value(0, &value);
+            let mut result = Vector::try_new(cast.target_type.clone(), 1, allocator)?;
+            let ctx = CastExecCtx {
+                runtime: &ConstantCastContext,
+                try_cast: cast.try_cast,
+                cast_data: cast.cast_info.cast_data.as_deref(),
+            };
+            cast.cast_info.execute(&source, &mut result, 1, &ctx)?;
+            let value = result.get_value(0);
+            Ok((!value.is_null()).then_some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
+struct ConstantCastContext;
+
+impl FunctionExecContext for ConstantCastContext {
+    fn current_database(&self) -> Option<&str> {
+        None
+    }
+
+    fn current_schema(&self) -> Option<&str> {
+        None
+    }
+
+    fn current_user(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -258,5 +300,88 @@ pub fn extract_scan_column_index(expr: &Expression) -> Option<usize> {
         Expression::Reference(r) => Some(r.index),
         Expression::ColumnRef(c) => Some(c.binding.column_index),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_function::scalar::cast::date_casts::{parse_date_text, varchar_to_date};
+    use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
+    use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
+    use paro_planner::expression::{CastExpression, ConstantExpression};
+
+    #[test]
+    fn combining_predicates_flattens_and_removes_duplicates() {
+        let lower = PredicateTree::leaf(Predicate::Ge {
+            column_id: 3,
+            value: Value::Integer(2),
+        });
+        let upper = PredicateTree::leaf(Predicate::Le {
+            column_id: 3,
+            value: Value::Integer(8),
+        });
+        let combined = combine_predicate_trees(
+            Some(PredicateTree::And(vec![lower.clone(), upper.clone()])),
+            Some(PredicateTree::And(vec![lower, upper])),
+        )
+        .unwrap();
+
+        let PredicateTree::And(children) = combined else {
+            panic!("expected AND tree");
+        };
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn bound_date_constant_is_evaluated_for_scan_pushdown() {
+        let expr = Expression::Cast(CastExpression::new(
+            Expression::Constant(ConstantExpression::new(
+                Value::Varchar("1994-01-01".to_string()),
+                LogicalType::Varchar,
+            )),
+            LogicalType::Date,
+            BoundCastInfo::fixed(varchar_to_date),
+            false,
+        ));
+
+        assert_eq!(
+            evaluate_bound_constant(&expr).unwrap(),
+            Some(Value::Date(parse_date_text("1994-01-01").unwrap()))
+        );
+    }
+
+    #[test]
+    fn bound_decimal_constant_is_rescaled_for_scan_pushdown() {
+        let source_type = LogicalType::Decimal {
+            precision: 2,
+            scale: 2,
+        };
+        let target_type = LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let cast_functions = CastFunctionSet::new();
+        let cast_info = bind_decimal_casts(
+            &BindCastInput::new(&cast_functions),
+            &source_type,
+            &target_type,
+        )
+        .unwrap()
+        .unwrap();
+        let expr = Expression::Cast(CastExpression::new(
+            Expression::Constant(ConstantExpression::new(
+                Value::Decimal(5, 2, 2),
+                source_type,
+            )),
+            target_type,
+            cast_info,
+            false,
+        ));
+
+        assert_eq!(
+            evaluate_bound_constant(&expr).unwrap(),
+            Some(Value::Decimal(5, 15, 2))
+        );
     }
 }
