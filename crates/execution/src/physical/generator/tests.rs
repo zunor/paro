@@ -678,6 +678,7 @@ fn test_get() -> Get {
             ColumnDefinition::new("c".to_string(), LogicalType::Varchar),
         ],
         storage,
+        paro_catalog::entry::CatalogObjectId::from_raw(10_001),
         0,
     ));
     Get {

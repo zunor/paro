@@ -23,7 +23,7 @@ pub trait DefaultGenerator: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::SchemaEntry;
+    use crate::entry::{CatalogObjectIdAllocator, SchemaEntry};
 
     struct TestGenerator {
         entries: Vec<String>,
@@ -49,6 +49,7 @@ mod tests {
             let schema = SchemaEntry::new(
                 "test_catalog".to_string(),
                 name.to_lowercase(),
+                Arc::new(CatalogObjectIdAllocator::default()),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 0, // timestamp = 0 (committed)
             );

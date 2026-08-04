@@ -33,6 +33,56 @@ impl CatalogObjectId {
     }
 }
 
+/// Instance-scoped allocator for stable catalog object identities.
+///
+/// The allocator is shared by every catalog attached to one Paro runtime instance.
+/// Entry constructors receive identities explicitly; this type is the sole
+/// authority for minting new identities and advancing the recovery watermark.
+#[derive(Debug)]
+pub struct CatalogObjectIdAllocator {
+    next_id: AtomicU64,
+}
+
+impl CatalogObjectIdAllocator {
+    pub const FIRST_USER_OBJECT_ID: u64 = 10_000;
+
+    pub fn new(next_id: u64) -> Self {
+        Self {
+            next_id: AtomicU64::new(next_id),
+        }
+    }
+
+    /// Allocate a fresh identity.
+    #[inline]
+    pub fn allocate(&self) -> CatalogObjectId {
+        let object_id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("catalog object ID space exhausted");
+        CatalogObjectId::from_raw(object_id)
+    }
+
+    /// Return the next identity that would be allocated.
+    #[inline]
+    pub fn current(&self) -> u64 {
+        self.next_id.load(Ordering::Relaxed)
+    }
+
+    /// Advance the allocator to at least `next_id` without ever moving backwards.
+    pub fn advance_to(&self, next_id: u64) -> u64 {
+        let previous = self.next_id.fetch_max(next_id, Ordering::Relaxed);
+        previous.max(next_id)
+    }
+}
+
+impl Default for CatalogObjectIdAllocator {
+    fn default() -> Self {
+        Self::new(Self::FIRST_USER_OBJECT_ID)
+    }
+}
+
 /// Stable display metadata for a catalog object dependency.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CatalogObjectRef {
@@ -1090,16 +1140,6 @@ impl SchemaEntryMeta {
 }
 
 // ============================================================================
-// OID Generation
-// ============================================================================
-
-/// Allocate the next object id from the process-wide allocator (new objects only).
-#[inline]
-pub fn allocate_object_id() -> CatalogObjectId {
-    CatalogObjectId(crate::database_catalog::next_object_id())
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1203,10 +1243,25 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_object_id() {
-        let a = allocate_object_id();
-        let b = allocate_object_id();
+    fn object_id_allocator_is_monotonic() {
+        let allocator = CatalogObjectIdAllocator::default();
+        let a = allocator.allocate();
+        let b = allocator.allocate();
         assert!(b.raw() > a.raw());
+    }
+
+    #[test]
+    fn object_id_allocator_recovery_never_moves_backwards() {
+        let allocator = CatalogObjectIdAllocator::new(42);
+        assert_eq!(allocator.advance_to(100), 100);
+        assert_eq!(allocator.advance_to(50), 100);
+        assert_eq!(allocator.allocate().raw(), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "catalog object ID space exhausted")]
+    fn object_id_allocator_never_wraps() {
+        CatalogObjectIdAllocator::new(u64::MAX).allocate();
     }
 
     #[test]

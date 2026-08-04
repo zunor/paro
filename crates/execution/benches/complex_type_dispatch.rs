@@ -1,23 +1,23 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use divan::Bencher;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
-use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
-use paro_execution::thread_context::ThreadContext;
+use paro_execution::runtime::QueryRuntimeContext;
 use paro_function::scalar::system::{get_array_length_functions, get_array_to_string_functions};
 use paro_function::scalar::vector::get_l2_distance_functions;
 use paro_function::scalar::{BoundScalarFunction, ScalarBindInput, ScalarFunctionSet};
 use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
 
 const ROWS: usize = 2048;
+
+mod support;
 const INT_WIDTH: usize = 8;
 const FLOAT_WIDTH: usize = 16;
 
@@ -26,7 +26,7 @@ fn main() {
 }
 
 struct BenchState {
-    runtime: ExecutionContext<'static>,
+    runtime: QueryRuntimeContext,
     array_length_input: Chunk,
     array_to_string_input: Chunk,
     l2_distance_input: Chunk,
@@ -38,9 +38,7 @@ struct BenchState {
 fn bench_state() -> &'static BenchState {
     static STATE: OnceLock<BenchState> = OnceLock::new();
     STATE.get_or_init(|| {
-        let session: Arc<StatementContext> = TestStatementContextBuilder::minimal().build();
-        let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-        let runtime = ExecutionContext::new(session, thread, None);
+        let runtime = support::query_runtime();
 
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), INT_WIDTH);
         let float_array_type = LogicalType::Array(Box::new(LogicalType::Float), FLOAT_WIDTH);

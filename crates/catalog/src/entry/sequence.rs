@@ -6,8 +6,8 @@
 //! This module defines SequenceCatalogEntry for sequence metadata.
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use std::collections::HashMap;
@@ -186,8 +186,13 @@ pub struct SequenceCatalogEntry {
 
 impl SequenceCatalogEntry {
     /// Create a new sequence catalog entry from CreateSequenceInfo
-    pub fn new(info: CreateSequenceInfo, timestamp: u64, catalog: String) -> Result<Self> {
-        Self::with_object_id(info, timestamp, catalog, allocate_object_id())
+    pub fn new(
+        info: CreateSequenceInfo,
+        timestamp: u64,
+        catalog: String,
+        object_id: CatalogObjectId,
+    ) -> Result<Self> {
+        Self::with_object_id(info, timestamp, catalog, object_id)
     }
 
     pub fn with_object_id(
@@ -646,7 +651,13 @@ mod tests {
     #[test]
     fn test_sequence_catalog_entry() {
         let info = CreateSequenceInfo::new("public".to_string(), "test_seq".to_string());
-        let entry = SequenceCatalogEntry::new(info, 100, "main".to_string()).unwrap();
+        let entry = SequenceCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_001),
+        )
+        .unwrap();
 
         assert_eq!(entry.name(), "test_seq");
         assert_eq!(entry.schema_name(), "public");
@@ -656,7 +667,13 @@ mod tests {
     #[test]
     fn test_sequence_next_value() {
         let info = CreateSequenceInfo::new("public".to_string(), "seq".to_string());
-        let entry = SequenceCatalogEntry::new(info, 100, "main".to_string()).unwrap();
+        let entry = SequenceCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_002),
+        )
+        .unwrap();
 
         assert_eq!(entry.next_value().unwrap(), 1);
         assert_eq!(entry.next_value().unwrap(), 2);
@@ -668,7 +685,13 @@ mod tests {
         let info = CreateSequenceInfo::new("public".to_string(), "roundtrip_seq".to_string())
             .with_start_value(5)
             .with_increment(2);
-        let entry = SequenceCatalogEntry::new(info, 100, "main".to_string()).unwrap();
+        let entry = SequenceCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_003),
+        )
+        .unwrap();
 
         let bytes = entry.serialize_to_bytes().unwrap();
         let restored = SequenceCatalogEntry::deserialize(&bytes, "main".to_string()).unwrap();

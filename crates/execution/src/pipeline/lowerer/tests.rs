@@ -4,8 +4,7 @@
 use std::sync::Arc;
 
 use paro_catalog::entry::{
-    allocate_object_id, CatalogType, ColumnDefinition, SchemaEntryMeta, TableCatalogEntry,
-    TableType,
+    CatalogObjectId, CatalogType, ColumnDefinition, SchemaEntryMeta, TableCatalogEntry, TableType,
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -977,7 +976,7 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
             "test".to_string(),
             "main".to_string(),
             "t".to_string(),
-            allocate_object_id(),
+            CatalogObjectId::from_raw(10_001),
             0,
         ),
         table_type: TableType::BaseTable,

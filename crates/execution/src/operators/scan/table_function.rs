@@ -24,6 +24,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
+use paro_context::StatementContext;
 use paro_function::scalar::FunctionExecContext;
 use paro_function::table::{
     GlobalTableFunctionState, TableFunction, TableFunctionBindData, TableFunctionBindInput,
@@ -31,7 +32,6 @@ use paro_function::table::{
 };
 use paro_planner::expression::Expression;
 
-use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::physical::specs::TableFunctionScanSpec;
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
@@ -40,7 +40,6 @@ use crate::runtime::state::{
     SourceGlobal, SourceLocal, TableFunctionSourceGlobal, TableFunctionSourceLocal,
 };
 use crate::runtime::ExpressionEvalInput;
-use crate::thread_context::ThreadContext;
 
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::search::SearchIndexKind;
@@ -154,7 +153,7 @@ impl TableFunctionBindDataWrapper {
     }
 }
 
-/// Populate data for system table functions from ExecutionContext.
+/// Populate data for system table functions from the statement snapshot.
 ///
 /// This function injects real data into system table functions like:
 /// - `paro_databases()` - Injects database list from DatabaseManager
@@ -166,7 +165,7 @@ impl TableFunctionBindDataWrapper {
 pub(crate) fn populate_system_table_function_data(
     function_name: &str,
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     match function_name {
         "paro_databases" => populate_paro_databases(global_state, ctx),
@@ -192,18 +191,17 @@ pub(crate) fn populate_system_table_function_data(
 }
 
 fn resolve_table_reference(
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
     reference: &str,
 ) -> Result<(String, String, Arc<paro_catalog::entry::TableCatalogEntry>)> {
     let parts: Vec<&str> = reference.split('.').collect();
     let candidates: Vec<(String, String)> = match parts.as_slice() {
         [_table_name] => ctx
-            .session
             .search_path()
             .iter()
             .map(|entry| {
                 let catalog_name = if entry.catalog.is_empty() {
-                    ctx.session.current_database().to_string()
+                    ctx.current_database().to_string()
                 } else {
                     entry.catalog.clone()
                 };
@@ -212,7 +210,7 @@ fn resolve_table_reference(
             .collect(),
         [schema_name, _table_name] => {
             vec![(
-                ctx.session.current_database().to_string(),
+                ctx.current_database().to_string(),
                 (*schema_name).to_string(),
             )]
         }
@@ -231,7 +229,7 @@ fn resolve_table_reference(
     let txn = ctx.catalog_txn_view();
 
     for (catalog_name, schema_name) in candidates {
-        let Some(database) = ctx.session.database(&catalog_name) else {
+        let Some(database) = ctx.database(&catalog_name) else {
             continue;
         };
         let Ok(entry) = database.catalog.get_table(&txn, &schema_name, table_name) else {
@@ -275,7 +273,7 @@ fn visible_storage_row_count(storage: &paro_storage::table::table_handle::TableH
 
 fn populate_paro_databases(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_databases::{
         populate_database_data, DatabaseData, ParoDatabasesGlobalState,
@@ -287,7 +285,7 @@ fn populate_paro_databases(
     {
         let mut databases = Vec::new();
 
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             databases.push(DatabaseData {
                 database_oid: db.identity.id,
                 database_name: db.identity.name.clone(),
@@ -318,7 +316,7 @@ fn populate_paro_databases(
 }
 
 /// Populate paro_schemas() with data from Catalog.
-fn populate_paro_schemas(global_state: &mut dyn GlobalTableFunctionState, ctx: &ExecutionContext) {
+fn populate_paro_schemas(global_state: &mut dyn GlobalTableFunctionState, ctx: &StatementContext) {
     use paro_function::table::system::paro_schemas::{
         populate_schema_data, ParoSchemasGlobalState, SchemaData,
     };
@@ -330,7 +328,7 @@ fn populate_paro_schemas(global_state: &mut dyn GlobalTableFunctionState, ctx: &
         let mut schemas = Vec::new();
 
         // Get schemas from all attached databases
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             let db_name = db.identity.name.clone();
             let db_oid = db.identity.id;
 
@@ -361,13 +359,13 @@ fn populate_paro_schemas(global_state: &mut dyn GlobalTableFunctionState, ctx: &
 
 fn populate_paro_pg_settings(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_pg_settings::{
         populate_settings_data, ParoPgSettingsGlobalState, SettingRowData,
     };
 
-    let provider = ctx.session.session_metadata_provider();
+    let provider = ctx.session_metadata_provider();
 
     if let Some(state) = global_state
         .as_any_mut()
@@ -395,14 +393,14 @@ fn populate_paro_pg_settings(
 
 fn populate_paro_pg_prepared_statements(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_pg_prepared_statements::{
         populate_prepared_statement_data, ParoPgPreparedStatementsGlobalState,
         PreparedStatementSummaryData,
     };
 
-    let provider = ctx.session.session_metadata_provider();
+    let provider = ctx.session_metadata_provider();
 
     if let Some(state) = global_state
         .as_any_mut()
@@ -428,13 +426,13 @@ fn populate_paro_pg_prepared_statements(
 
 fn populate_paro_pg_cursors(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_pg_cursors::{
         populate_cursor_data, CursorSummaryData, ParoPgCursorsGlobalState,
     };
 
-    let provider = ctx.session.session_metadata_provider();
+    let provider = ctx.session_metadata_provider();
 
     if let Some(state) = global_state
         .as_any_mut()
@@ -463,7 +461,7 @@ fn populate_paro_pg_cursors(
 }
 
 /// Populate paro_tables() with data from Catalog.
-fn populate_paro_tables(global_state: &mut dyn GlobalTableFunctionState, ctx: &ExecutionContext) {
+fn populate_paro_tables(global_state: &mut dyn GlobalTableFunctionState, ctx: &StatementContext) {
     use paro_catalog::entry::TableType;
     use paro_function::table::system::paro_tables::{
         populate_table_data, ParoTablesGlobalState, TableData,
@@ -476,7 +474,7 @@ fn populate_paro_tables(global_state: &mut dyn GlobalTableFunctionState, ctx: &E
         let mut tables = Vec::new();
 
         // Get tables from all attached databases
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             let db_name = db.identity.name.clone();
             let db_oid = db.identity.id;
 
@@ -548,7 +546,7 @@ fn populate_paro_tables(global_state: &mut dyn GlobalTableFunctionState, ctx: &E
 }
 
 /// Populate paro_columns() with data from Catalog.
-fn populate_paro_columns(global_state: &mut dyn GlobalTableFunctionState, ctx: &ExecutionContext) {
+fn populate_paro_columns(global_state: &mut dyn GlobalTableFunctionState, ctx: &StatementContext) {
     use paro_function::table::system::paro_columns::{
         populate_column_data, ColumnData, ParoColumnsGlobalState,
     };
@@ -560,7 +558,7 @@ fn populate_paro_columns(global_state: &mut dyn GlobalTableFunctionState, ctx: &
         let mut columns = Vec::new();
 
         // Get columns from all attached databases
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             let db_name = db.identity.name.clone();
             let db_oid = db.identity.id;
 
@@ -616,7 +614,7 @@ fn populate_paro_columns(global_state: &mut dyn GlobalTableFunctionState, ctx: &
 }
 
 /// Populate paro_views() with data from Catalog.
-fn populate_paro_views(global_state: &mut dyn GlobalTableFunctionState, ctx: &ExecutionContext) {
+fn populate_paro_views(global_state: &mut dyn GlobalTableFunctionState, ctx: &StatementContext) {
     use paro_function::table::system::paro_views::{
         populate_view_data, ParoViewsGlobalState, ViewData,
     };
@@ -628,7 +626,7 @@ fn populate_paro_views(global_state: &mut dyn GlobalTableFunctionState, ctx: &Ex
         let mut views = Vec::new();
 
         // Get views from all attached databases
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             let db_name = db.identity.name.clone();
             let db_oid = db.identity.id;
 
@@ -673,7 +671,7 @@ fn populate_paro_views(global_state: &mut dyn GlobalTableFunctionState, ctx: &Ex
 }
 
 /// Populate paro_indexes() with data from Catalog.
-fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &ExecutionContext) {
+fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &StatementContext) {
     use paro_catalog::entry::{IndexType, TableCatalogEntry};
     use paro_function::table::system::paro_indexes::{
         populate_index_data, IndexData, ParoIndexesGlobalState,
@@ -686,7 +684,7 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
         let mut indexes = Vec::new();
 
         // Get indexes from all attached databases
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             let db_name = db.identity.name.clone();
             let db_oid = db.identity.id;
 
@@ -920,7 +918,7 @@ fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
 
 fn populate_paro_storage_info(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_storage_info::{
         populate_storage_info_data, ParoStorageInfoGlobalState, StorageInfoData,
@@ -1028,7 +1026,7 @@ fn populate_paro_storage_info(
 
 fn populate_paro_wal_metrics(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_wal_metrics::{
         populate_wal_metric_data, ParoWalMetricsGlobalState, WalMetricData,
@@ -1042,7 +1040,7 @@ fn populate_paro_wal_metrics(
     };
 
     let mut entries = Vec::new();
-    for db in ctx.session.databases.iter() {
+    for db in ctx.databases.iter() {
         let metrics = db.wal_metrics();
         entries.push(WalMetricData {
             database_oid: db.identity.id,
@@ -1119,7 +1117,7 @@ fn populate_paro_wal_metrics(
 
 fn populate_paro_transaction_metrics(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_transaction_metrics::{
         populate_transaction_metric_data, ParoTransactionMetricsGlobalState, TransactionMetricData,
@@ -1133,7 +1131,7 @@ fn populate_paro_transaction_metrics(
     };
 
     let mut entries = Vec::new();
-    for db in ctx.session.databases.iter() {
+    for db in ctx.databases.iter() {
         let metrics = db.transaction_metrics();
         entries.push(TransactionMetricData {
             database_oid: db.identity.id,
@@ -1977,7 +1975,7 @@ fn row_fetch_metric_buckets<'a>(
 
 fn populate_paro_commit_frontiers(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_commit_frontiers::{
         populate_commit_frontier_data, CommitFrontierData, ParoCommitFrontiersGlobalState,
@@ -1991,7 +1989,7 @@ fn populate_paro_commit_frontiers(
     };
 
     let mut entries = Vec::new();
-    for db in ctx.session.databases.iter() {
+    for db in ctx.databases.iter() {
         let frontier = db.commit_frontier();
         entries.push(CommitFrontierData {
             database_oid: db.identity.id,
@@ -2017,7 +2015,7 @@ fn populate_paro_commit_frontiers(
 
 fn populate_paro_commit_poison(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_commit_poison::{
         populate_commit_poison_data, CommitPoisonData, ParoCommitPoisonGlobalState,
@@ -2031,7 +2029,7 @@ fn populate_paro_commit_poison(
     };
 
     let mut entries = Vec::new();
-    for db in ctx.session.databases.iter() {
+    for db in ctx.databases.iter() {
         let poison = db.commit_poison();
         entries.push(CommitPoisonData {
             database_oid: db.identity.id,
@@ -2054,7 +2052,7 @@ fn u64_to_i64(value: u64) -> i64 {
 /// Populate paro_property_graphs() with data from Catalog and GraphProjectionIndexManager.
 fn populate_paro_property_graphs(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_property_graphs::{
         populate_property_graph_data, ParoPropertyGraphsGlobalState, PropertyGraphData,
@@ -2066,7 +2064,7 @@ fn populate_paro_property_graphs(
     {
         let mut graphs = Vec::new();
 
-        for db in ctx.session.databases.iter() {
+        for db in ctx.databases.iter() {
             let txn = ctx.catalog_txn_view();
 
             let schema_names: Vec<String> = {
@@ -2103,7 +2101,7 @@ fn populate_paro_property_graphs(
                                 last_rebuild_micros,
                                 fingerprint,
                                 index_size,
-                            ) = if let Some(snapshot) = ctx.session.services.graph_index.snapshot(
+                            ) = if let Some(snapshot) = ctx.services.graph_index.snapshot(
                                 &paro_common::identity::GraphId::new(
                                     db.identity.name.clone(),
                                     schema_name.clone(),
@@ -2179,7 +2177,7 @@ fn populate_paro_property_graphs(
 /// Populate paro_graph_statistics() with data from GraphProjectionIndexManager.
 fn populate_paro_graph_statistics(
     global_state: &mut dyn GlobalTableFunctionState,
-    ctx: &ExecutionContext,
+    ctx: &StatementContext,
 ) {
     use paro_function::table::system::paro_graph_statistics::{
         populate_graph_statistics_data, GraphStatisticsData, ParoGraphStatisticsGlobalState,
@@ -2193,11 +2191,11 @@ fn populate_paro_graph_statistics(
         let mut stats = Vec::new();
 
         let graph_id = paro_common::identity::GraphId::new(
-            ctx.session.current_database(),
-            ctx.session.current_schema(),
+            ctx.current_database(),
+            ctx.current_schema(),
             &graph_name,
         );
-        if let Some(snapshot) = ctx.session.services.graph_index.snapshot(&graph_id) {
+        if let Some(snapshot) = ctx.services.graph_index.snapshot(&graph_id) {
             let index = snapshot.base();
             let graph_stats = snapshot.statistics();
 
@@ -2321,12 +2319,10 @@ impl TableFunctionSourceExec {
         };
         let mut global_state = global_state;
         if let Some(ref mut global_state) = global_state {
-            let thread = ThreadContext::single_threaded();
-            let exec_ctx = ExecutionContext::new(Arc::clone(&ctx.query.session), &thread, None);
             populate_system_table_function_data(
                 &self.spec.function.name,
                 global_state.as_mut(),
-                &exec_ctx,
+                ctx.query.session.as_ref(),
             );
         }
         let max_threads = global_state

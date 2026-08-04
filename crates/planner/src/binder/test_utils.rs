@@ -87,6 +87,7 @@ pub(crate) fn test_binder_with_public_table(
             .map(|(name, ty)| ColumnDefinition::new((*name).to_string(), ty.clone()))
             .collect(),
         storage,
+        schema.object_id_allocator().allocate(),
         0,
     ));
     schema

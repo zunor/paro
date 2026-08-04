@@ -7,8 +7,8 @@
 //! This module defines TableCatalogEntry for table metadata.
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -346,6 +346,7 @@ impl TableCatalogEntry {
         name: String,
         columns: Vec<ColumnDefinition>,
         storage: Arc<TableHandle>,
+        object_id: CatalogObjectId,
         timestamp: u64,
     ) -> Self {
         Self::with_object_id(
@@ -354,14 +355,19 @@ impl TableCatalogEntry {
             name,
             columns,
             storage,
-            allocate_object_id(),
+            object_id,
             timestamp,
         )
     }
 
     /// Create from CreateTableInfo
-    pub fn from_info(info: CreateTableInfo, storage: Arc<TableHandle>, timestamp: u64) -> Self {
-        Self::from_info_with_object_id(info, storage, allocate_object_id(), timestamp)
+    pub fn from_info(
+        info: CreateTableInfo,
+        storage: Arc<TableHandle>,
+        object_id: CatalogObjectId,
+        timestamp: u64,
+    ) -> Self {
+        Self::from_info_with_object_id(info, storage, object_id, timestamp)
     }
 
     /// Create from CreateTableInfo with a specific persisted object identity.
@@ -1345,6 +1351,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_001),
             100,
         );
 
@@ -1369,6 +1376,7 @@ mod tests {
             "accounts".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_002),
             100,
         );
 
@@ -1397,6 +1405,7 @@ mod tests {
             "items".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_003),
             42,
         );
 
@@ -1435,6 +1444,7 @@ mod tests {
             "commented_items".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_004),
             42,
         );
         entry
@@ -1470,6 +1480,7 @@ mod tests {
             "legacy_case".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_005),
             42,
         );
 
@@ -1499,6 +1510,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_006),
             100,
         );
 
@@ -1534,6 +1546,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_007),
             100,
         );
 
@@ -1560,6 +1573,7 @@ mod tests {
             "single".to_string(),
             single_col,
             single_storage,
+            CatalogObjectId::from_raw(10_008),
             100,
         );
         assert!(single_entry.remove_column("id", 101).is_err());
@@ -1579,6 +1593,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_009),
             100,
         );
 
@@ -1635,7 +1650,8 @@ mod tests {
         .with_constraints(constraints);
 
         let storage = Arc::new(create_table(&[LogicalType::Integer, LogicalType::Varchar]));
-        let entry = TableCatalogEntry::from_info(info, storage, 100);
+        let entry =
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_010), 100);
 
         assert_eq!(entry.constraints.len(), 3);
         assert_eq!(
@@ -1676,7 +1692,8 @@ mod tests {
             LogicalType::Varchar,
             LogicalType::Varchar,
         ]));
-        let entry = TableCatalogEntry::from_info(info, storage, 100);
+        let entry =
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_011), 100);
 
         // Remove middle column (email)
         let new_entry = entry.remove_column("email", 101).unwrap();
@@ -1706,6 +1723,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_012),
             100,
         );
 
@@ -1728,6 +1746,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_013),
             100,
         );
 
@@ -1752,6 +1771,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_014),
             100,
         );
 
@@ -1779,6 +1799,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_015),
             100,
         );
 
@@ -1802,6 +1823,7 @@ mod tests {
             "users".to_string(),
             columns,
             storage,
+            CatalogObjectId::from_raw(10_016),
             100,
         );
 

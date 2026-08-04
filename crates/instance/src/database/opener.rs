@@ -11,7 +11,7 @@ use crate::metadata::instance_catalog::DatabaseRecord;
 use crate::storage_manager::StorageManager;
 use paro_catalog::catalog::Catalog;
 use paro_catalog::database_catalog::ParoCatalog;
-use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
+use paro_catalog::entry::{CatalogEntryEnum, CatalogObjectIdAllocator, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::RecoverySummary;
 use paro_common::effect::DeferredTask;
@@ -43,6 +43,7 @@ pub struct DatabaseOpenContext {
 pub struct DatabaseOpenRequest {
     pub record: DatabaseRecord,
     pub intent: DatabaseOpenIntent,
+    pub object_id_allocator: Arc<CatalogObjectIdAllocator>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +245,7 @@ impl DatabaseOpener {
             record.name.clone(),
             record.storage_dir.clone(),
             context.buffer_pool.clone(),
+            Arc::clone(&request.object_id_allocator),
             AttachOptions::default(),
             Arc::clone(&context.commit_drain_wake_pool),
         ));

@@ -7,7 +7,7 @@
 //! This module defines `SchemaEntry` and schema-level entry routing.
 
 use super::catalog_entry::{
-    allocate_object_id, CatalogEntryMeta, CatalogObjectId, CatalogType, OnCreateConflict,
+    CatalogEntryMeta, CatalogObjectId, CatalogObjectIdAllocator, CatalogType, OnCreateConflict,
 };
 use super::{
     AggregateFunctionCatalogEntry, CatalogEntryEnum, CopyFunctionCatalogEntry, CreateIndexInfo,
@@ -300,20 +300,37 @@ pub struct SchemaEntry {
     pub base: CatalogEntryMeta,
     /// Family collections contained by this schema version.
     contents: Arc<SchemaContents>,
+    /// Instance-owned identity allocator used for objects created in this schema.
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
     /// Whether this is an internal schema
     pub internal: bool,
 }
 
 impl SchemaEntry {
     /// Create a new schema entry.
-    pub fn new(catalog: String, name: String, gc_epoch: Arc<AtomicU64>, timestamp: u64) -> Self {
-        Self::with_object_id(catalog, name, allocate_object_id(), gc_epoch, timestamp)
+    pub fn new(
+        catalog: String,
+        name: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+        gc_epoch: Arc<AtomicU64>,
+        timestamp: u64,
+    ) -> Self {
+        let object_id = object_id_allocator.allocate();
+        Self::with_object_id(
+            catalog,
+            name,
+            object_id,
+            object_id_allocator,
+            gc_epoch,
+            timestamp,
+        )
     }
 
     fn with_contents(
         catalog: String,
         name: String,
         object_id: CatalogObjectId,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         timestamp: u64,
         contents: Arc<SchemaContents>,
     ) -> Self {
@@ -326,6 +343,7 @@ impl SchemaEntry {
                 timestamp,
             ),
             contents,
+            object_id_allocator,
             internal: false,
         };
         crate::default::default_schemas::configure_internal_schema(&mut schema);
@@ -336,22 +354,37 @@ impl SchemaEntry {
         catalog: String,
         name: String,
         object_id: CatalogObjectId,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         gc_epoch: Arc<AtomicU64>,
         timestamp: u64,
     ) -> Self {
         let contents = Arc::new(SchemaContents::new(&catalog, &name, object_id, gc_epoch));
-        Self::with_contents(catalog, name, object_id, timestamp, contents)
+        Self::with_contents(
+            catalog,
+            name,
+            object_id,
+            object_id_allocator,
+            timestamp,
+            contents,
+        )
     }
 
     /// Create a new schema from CreateSchemaInfo
-    pub fn from_info(info: &CreateSchemaInfo, gc_epoch: Arc<AtomicU64>, timestamp: u64) -> Self {
-        Self::from_info_with_object_id(info, allocate_object_id(), gc_epoch, timestamp)
+    pub fn from_info(
+        info: &CreateSchemaInfo,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+        gc_epoch: Arc<AtomicU64>,
+        timestamp: u64,
+    ) -> Self {
+        let object_id = object_id_allocator.allocate();
+        Self::from_info_with_object_id(info, object_id, object_id_allocator, gc_epoch, timestamp)
     }
 
     /// `object_id` must be the persisted object identity from WAL / checkpoint.
     pub fn from_info_with_object_id(
         info: &CreateSchemaInfo,
         object_id: CatalogObjectId,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         gc_epoch: Arc<AtomicU64>,
         timestamp: u64,
     ) -> Self {
@@ -359,6 +392,7 @@ impl SchemaEntry {
             info.catalog.clone(),
             info.name.clone(),
             object_id,
+            object_id_allocator,
             gc_epoch,
             timestamp,
         );
@@ -382,6 +416,10 @@ impl SchemaEntry {
 
     pub fn name(&self) -> &str {
         &self.base.name
+    }
+
+    pub fn object_id_allocator(&self) -> &Arc<CatalogObjectIdAllocator> {
+        &self.object_id_allocator
     }
 
     pub fn collection(&self, entry_type: CatalogType) -> Option<&Arc<CatalogCollection>> {
@@ -479,8 +517,11 @@ impl SchemaEntry {
 
         match entry_type {
             CatalogType::View => {
-                let generator =
-                    DefaultViewGenerator::new(self.base.catalog.clone(), self.base.name.clone());
+                let generator = DefaultViewGenerator::new(
+                    self.base.catalog.clone(),
+                    self.base.name.clone(),
+                    Arc::clone(&self.object_id_allocator),
+                );
                 let _ = self
                     .contents
                     .views
@@ -490,6 +531,7 @@ impl SchemaEntry {
                 let generator = DefaultFunctionGenerator::new(
                     self.base.catalog.clone(),
                     self.base.name.clone(),
+                    Arc::clone(&self.object_id_allocator),
                 );
                 let _ = self
                     .contents
@@ -500,6 +542,7 @@ impl SchemaEntry {
                 let generator = DefaultTableFunctionGenerator::new(
                     self.base.catalog.clone(),
                     self.base.name.clone(),
+                    Arc::clone(&self.object_id_allocator),
                 );
                 let _ = self
                     .contents
@@ -517,8 +560,11 @@ impl SchemaEntry {
 
         match entry_type {
             CatalogType::View => {
-                let generator =
-                    DefaultViewGenerator::new(self.base.catalog.clone(), self.base.name.clone());
+                let generator = DefaultViewGenerator::new(
+                    self.base.catalog.clone(),
+                    self.base.name.clone(),
+                    Arc::clone(&self.object_id_allocator),
+                );
                 for name in generator.get_default_entries() {
                     let _ = self.contents.views.create_committed_entry_lazy(&name, || {
                         generator.create_default_entry(&name)
@@ -529,6 +575,7 @@ impl SchemaEntry {
                 let generator = DefaultFunctionGenerator::new(
                     self.base.catalog.clone(),
                     self.base.name.clone(),
+                    Arc::clone(&self.object_id_allocator),
                 );
                 for name in generator.get_default_entries() {
                     let _ = self
@@ -543,6 +590,7 @@ impl SchemaEntry {
                 let generator = DefaultTableFunctionGenerator::new(
                     self.base.catalog.clone(),
                     self.base.name.clone(),
+                    Arc::clone(&self.object_id_allocator),
                 );
                 for name in generator.get_default_entries() {
                     let _ = self
@@ -788,6 +836,7 @@ impl SchemaEntry {
             info.clone(),
             0,
             self.base.catalog.clone(),
+            self.object_id_allocator.allocate(),
         ));
         let catalog_entry = Arc::new(CatalogEntryEnum::PropertyGraph(entry));
         match self.contents.property_graphs.stage_create(
@@ -877,7 +926,11 @@ impl SchemaEntry {
         self.serialize_at(u64::MAX)
     }
 
-    pub fn deserialize_metadata(bytes: &[u8], gc_epoch: Arc<AtomicU64>) -> Result<Self> {
+    pub fn deserialize_metadata(
+        bytes: &[u8],
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+        gc_epoch: Arc<AtomicU64>,
+    ) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
 
         let mut oid_buf = [0u8; 8];
@@ -920,6 +973,7 @@ impl SchemaEntry {
             catalog,
             name,
             CatalogObjectId::from_raw(oid),
+            object_id_allocator,
             gc_epoch,
             timestamp,
         );
@@ -940,13 +994,14 @@ impl SchemaEntry {
         bytes: &[u8],
         _catalog: String,
         meta_manager: Option<Arc<TabletMetaManager>>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         gc_epoch: Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let metadata = Self::read_u32_payload(&mut cursor, "schema metadata")?;
         let contents = Self::read_u32_payload(&mut cursor, "schema contents")?;
 
-        let mut schema = Self::deserialize_metadata(&metadata, gc_epoch)?;
+        let mut schema = Self::deserialize_metadata(&metadata, object_id_allocator, gc_epoch)?;
         schema.install_contents(&contents, meta_manager)?;
 
         if cursor.position() != bytes.len() as u64 {
@@ -1071,6 +1126,7 @@ impl SchemaEntry {
             table.base.base.object_id.raw(),
             writer_id,
             self.base.catalog.clone(),
+            self.object_id_allocator.allocate(),
         );
 
         let catalog_entry = Arc::new(CatalogEntryEnum::Index(Arc::new(index_entry)));
@@ -1089,7 +1145,12 @@ impl SchemaEntry {
     ) -> Result<Option<Arc<CatalogEntryEnum>>> {
         let timestamp = transaction.write_timestamp()?;
 
-        let view_entry = ViewCatalogEntry::new(info, timestamp, self.base.catalog.clone());
+        let view_entry = ViewCatalogEntry::new(
+            info,
+            timestamp,
+            self.base.catalog.clone(),
+            self.object_id_allocator.allocate(),
+        );
         let catalog_entry = Arc::new(CatalogEntryEnum::View(Arc::new(view_entry)));
         self.add_entry_internal(transaction, catalog_entry, on_conflict)
     }
@@ -1102,7 +1163,12 @@ impl SchemaEntry {
     ) -> Result<Option<Arc<CatalogEntryEnum>>> {
         let timestamp = transaction.write_timestamp()?;
 
-        let seq_entry = SequenceCatalogEntry::new(info, timestamp, self.base.catalog.clone())?;
+        let seq_entry = SequenceCatalogEntry::new(
+            info,
+            timestamp,
+            self.base.catalog.clone(),
+            self.object_id_allocator.allocate(),
+        )?;
         let catalog_entry = Arc::new(CatalogEntryEnum::Sequence(Arc::new(seq_entry)));
         self.add_entry_internal(transaction, catalog_entry, on_conflict)
     }
@@ -1110,8 +1176,10 @@ impl SchemaEntry {
     pub fn create_routine(
         &self,
         transaction: &CatalogSnapshot,
-        info: CreateRoutineInfo,
+        mut info: CreateRoutineInfo,
     ) -> Result<Option<Arc<CatalogEntryEnum>>> {
+        info.catalog = self.base.catalog.clone();
+        info.schema = self.base.name.clone();
         let timestamp = transaction.write_timestamp()?;
         let collection = self.require_collection(CatalogType::Routine)?;
         let existing = self.contents.routines.get_entry(
@@ -1157,7 +1225,7 @@ impl SchemaEntry {
                 overloads.push(StoredRoutineOverload {
                     spec: info.materialize_spec(
                         RoutineIdentity {
-                            id: RoutineId::from_raw(allocate_object_id().raw()),
+                            id: RoutineId::from_raw(self.object_id_allocator.allocate().raw()),
                             generation: 1,
                         },
                         self.base.name.clone(),
@@ -1179,8 +1247,15 @@ impl SchemaEntry {
             )));
             (entry, true)
         } else {
+            // A routine family and each executable overload have distinct persisted identities.
             let entry = Arc::new(CatalogEntryEnum::Routine(Arc::new(
-                RoutineCatalogEntry::new(info, timestamp, self.base.catalog.clone()),
+                RoutineCatalogEntry::new(
+                    info,
+                    timestamp,
+                    self.base.catalog.clone(),
+                    self.object_id_allocator.allocate(),
+                    RoutineId::from_raw(self.object_id_allocator.allocate().raw()),
+                ),
             )));
             (entry, false)
         };
@@ -1580,6 +1655,7 @@ impl SchemaEntry {
             self.base.catalog.clone(),
             self.base.name.clone(),
             self.base.object_id,
+            Arc::clone(&self.object_id_allocator),
             self.base.timestamp(),
             Arc::clone(&self.contents),
         );
@@ -1667,6 +1743,7 @@ mod tests {
         SchemaEntry::new(
             "test_catalog".to_string(),
             name.to_string(),
+            Arc::new(CatalogObjectIdAllocator::default()),
             Arc::new(AtomicU64::new(0)),
             timestamp,
         )
@@ -1680,13 +1757,19 @@ mod tests {
             bytes,
             "test_catalog".to_string(),
             meta_manager,
+            Arc::new(CatalogObjectIdAllocator::default()),
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap()
     }
 
     fn schema_from_info(info: &CreateSchemaInfo, timestamp: u64) -> SchemaEntry {
-        SchemaEntry::from_info(info, Arc::new(AtomicU64::new(0)), timestamp)
+        SchemaEntry::from_info(
+            info,
+            Arc::new(CatalogObjectIdAllocator::default()),
+            Arc::new(AtomicU64::new(0)),
+            timestamp,
+        )
     }
 
     #[test]
@@ -1768,6 +1851,7 @@ mod tests {
             "test_catalog".to_string(),
             "public".to_string(),
             set,
+            schema.object_id_allocator().allocate(),
             0,
         ));
 
@@ -1801,6 +1885,7 @@ mod tests {
             "descriptor_tbl".to_string(),
             columns,
             storage,
+            schema.object_id_allocator().allocate(),
             0,
         ));
         schema
@@ -1941,6 +2026,7 @@ mod tests {
             77,
             0,
             "test_catalog".to_string(),
+            schema.object_id_allocator().allocate(),
         ))));
         schema
             .contents

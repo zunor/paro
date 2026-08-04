@@ -91,7 +91,7 @@ async fn routine_ddl_is_transactional_and_persistent() {
     exec_ok(
         &mut session,
         &mut sink,
-        "CREATE FUNCTION public.py_add(a INTEGER, b INTEGER) RETURNS INTEGER \
+        "CREATE FUNCTION \"PUBLIC\".py_add(a INTEGER, b INTEGER) RETURNS INTEGER \
          LANGUAGE python IMMUTABLE STRICT AS $$return a + b$$",
     )
     .await;
@@ -99,6 +99,7 @@ async fn routine_ddl_is_transactional_and_persistent() {
 
     let overloads = routine_overloads(&session, "public", "py_add");
     assert_eq!(overloads.len(), 1);
+    assert_eq!(overloads[0].spec.schema, "public");
     assert_eq!(overloads[0].spec.owner.principal, "paro");
     let original_routine_id = overloads[0].spec.identity.id;
     assert_eq!(overloads[0].spec.identity.generation, 1);
@@ -146,6 +147,12 @@ async fn routine_ddl_is_transactional_and_persistent() {
     assert!(overloads.iter().any(|overload| {
         overload.spec.signature().argument_types == vec![LogicalType::BigInt, LogicalType::BigInt]
     }));
+    assert!(
+        overloads
+            .iter()
+            .all(|overload| overload.spec.schema == "public"),
+        "all overloads in one family must use the owning schema's canonical name"
+    );
     assert_eq!(
         overloads
             .iter()
@@ -191,6 +198,7 @@ async fn routine_ddl_is_transactional_and_persistent() {
         vec![LogicalType::Integer, LogicalType::Integer]
     );
     assert_eq!(overloads[0].spec.identity.generation, 2);
+    assert_eq!(overloads[0].spec.schema, "public");
 
     drop(session);
     drop(instance);

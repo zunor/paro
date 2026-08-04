@@ -127,7 +127,7 @@ pub(super) fn run_collection_gc(set: &CatalogCollection, watermark: u64) -> Cata
 mod tests {
     use super::*;
     use crate::collection::{CollectionFamily, InstallMode};
-    use crate::entry::{CatalogEntryEnum, SchemaEntry};
+    use crate::entry::{CatalogEntryEnum, CatalogObjectIdAllocator, SchemaEntry};
     use crate::mvcc::CatalogSnapshot;
     use paro_storage::transaction::manager::TRANSACTION_ID_START;
 
@@ -139,6 +139,7 @@ mod tests {
         Arc::new(CatalogEntryEnum::Schema(Arc::new(SchemaEntry::new(
             "test_catalog".to_string(),
             name.to_string(),
+            Arc::new(CatalogObjectIdAllocator::default()),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             0,
         ))))

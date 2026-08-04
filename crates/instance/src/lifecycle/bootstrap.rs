@@ -33,20 +33,25 @@ impl Instance {
     }
 
     pub(crate) fn initialize_system_database(&self) -> paro_common::error::Result<()> {
-        let mut system = self.database_service.registry().system.write();
-        if system.is_some() {
+        let registry = self.database_service.registry();
+        if registry.system_database().is_some() {
             return Ok(());
         }
 
         let system_db = Arc::new(DatabaseHandle::new_system(
             0,
             Arc::clone(&self.boot_config.buffer_pool),
+            Arc::clone(registry.object_id_allocator()),
         ));
         system_db.bind_task_scheduler(self.runtime.scheduler().clone());
         system_db.initialize().map_err(|e| {
             paro_common::error::internal(format!("Failed to initialize system catalog: {e}"))
         })?;
-        *system = Some(system_db);
+        registry
+            .install_system_database(system_db)
+            .map_err(|error| {
+                paro_common::error::internal(format!("Failed to install system database: {error}"))
+            })?;
         Ok(())
     }
 }

@@ -171,7 +171,8 @@ pub(crate) fn lease_index_backfill(
 mod tests {
     use super::*;
     use paro_catalog::entry::{
-        ColumnDefinition, CreateIndexInfo, IndexCatalogEntry, LogicalIndex, TableCatalogEntry,
+        CatalogObjectId, ColumnDefinition, CreateIndexInfo, IndexCatalogEntry, LogicalIndex,
+        TableCatalogEntry,
     };
     use paro_common::types::LogicalType;
     use paro_storage::table::table_factory::TableFactory;
@@ -192,7 +193,8 @@ mod tests {
                 LogicalType::Integer,
             )],
             storage,
-            object_id,
+            CatalogObjectId::from_raw(object_id),
+            0,
         ))
     }
 
@@ -213,6 +215,7 @@ mod tests {
             table.base.base.object_id.raw(),
             10_001,
             "memory".to_string(),
+            CatalogObjectId::from_raw(10_002),
         ))
     }
 

@@ -5,8 +5,8 @@
 //!
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_function::copy::CopyFunction;
@@ -27,29 +27,33 @@ impl CopyFunctionCatalogEntry {
         catalog: String,
         schema_name: String,
         function: CopyFunction,
+        object_id: CatalogObjectId,
         timestamp: u64,
     ) -> Self {
-        let oid = allocate_object_id();
         let base = SchemaEntryMeta::new(
             CatalogType::CopyFunction,
             catalog,
             schema_name,
             function.name.clone(),
-            oid,
+            object_id,
             timestamp,
         );
 
         Self { base, function }
     }
 
-    pub fn new_internal(catalog: String, schema_name: String, function: CopyFunction) -> Self {
-        let oid = allocate_object_id();
+    pub fn new_internal(
+        catalog: String,
+        schema_name: String,
+        function: CopyFunction,
+        object_id: CatalogObjectId,
+    ) -> Self {
         let mut base = SchemaEntryMeta::new(
             CatalogType::CopyFunction,
             catalog,
             schema_name,
             function.name.clone(),
-            oid,
+            object_id,
             0,
         );
         base.base.internal = true;

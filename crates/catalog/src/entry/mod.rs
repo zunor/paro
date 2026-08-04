@@ -40,10 +40,10 @@ mod view;
 
 // Re-export base types
 pub use catalog_entry::{
-    allocate_object_id, AlterInfo, AlterType, CatalogEntry, CatalogEntryInfo, CatalogEntryMeta,
-    CatalogObjectId, CatalogObjectRef, CatalogType, CreateInfo, Dependency, DependencyList,
-    DependencyType, InCatalogEntry, OnCreateConflict, OnEntryNotFound, SchemaEntryMeta,
-    StandardEntry,
+    AlterInfo, AlterType, CatalogEntry, CatalogEntryInfo, CatalogEntryMeta, CatalogObjectId,
+    CatalogObjectIdAllocator, CatalogObjectRef, CatalogType, CreateInfo, Dependency,
+    DependencyList, DependencyType, InCatalogEntry, OnCreateConflict, OnEntryNotFound,
+    SchemaEntryMeta, StandardEntry,
 };
 
 // Re-export entry types

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use divan::Bencher;
 use paro_common::chunk::Chunk;
@@ -9,10 +9,8 @@ use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
-use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
-use paro_execution::execution_context::ExecutionContext;
 use paro_execution::expression_executor::executor::ExpressionExecutor;
-use paro_execution::thread_context::ThreadContext;
+use paro_execution::runtime::QueryRuntimeContext;
 use paro_function::scalar::cast::{numeric_casts, BoundCastInfo};
 use paro_function::scalar::executor::binary::BinaryExecutor;
 use paro_function::scalar::executor::ternary::TernaryExecutor;
@@ -25,6 +23,8 @@ use paro_planner::expression::{
 };
 
 const ROWS: usize = 2048;
+
+mod support;
 
 fn main() {
     divan::main();
@@ -59,7 +59,7 @@ impl TernaryOperator<i64, i64, i64, bool> for BetweenOp {
 }
 
 struct BenchState {
-    runtime: ExecutionContext<'static>,
+    runtime: QueryRuntimeContext,
     cast_i32_input: Chunk,
     nullable_i32_input: Chunk,
     coalesce_i32_input: Chunk,
@@ -84,9 +84,7 @@ struct BenchState {
 fn bench_state() -> &'static BenchState {
     static STATE: OnceLock<BenchState> = OnceLock::new();
     STATE.get_or_init(|| {
-        let session: Arc<StatementContext> = TestStatementContextBuilder::minimal().build();
-        let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-        let runtime = ExecutionContext::new(session, thread, None);
+        let runtime = support::query_runtime();
 
         let unary_i64_values = (0..ROWS)
             .map(|row| row as i64 - (ROWS as i64 / 2))

@@ -24,7 +24,6 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
-use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::nested_loop::runtime::compare_with_nulls;
 use crate::operators::output::ensure_transform_output;
@@ -321,7 +320,6 @@ impl SortRangeJoinProbeTransformExec {
             ));
         }
 
-        let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
         let mut right_executors = self
             .conditions
             .iter()
@@ -350,7 +348,7 @@ impl SortRangeJoinProbeTransformExec {
                     chunk,
                     None,
                     chunk.size(),
-                    &exec_ctx,
+                    ctx.query,
                 )?);
             }
             for (condition_idx, values) in chunk_values.iter().enumerate() {
@@ -414,13 +412,12 @@ impl SortRangeJoinProbeTransformExec {
         input: &Chunk,
         local: &mut SortRangeJoinProbeTransformLocal,
     ) -> Result<()> {
-        let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
         local.left_condition_results.clear();
         local.left_condition_results.reserve(self.conditions.len());
         for executor in &mut local.left_condition_executors {
             local
                 .left_condition_results
-                .push(executor.execute_expression(0, input, None, input.size(), &exec_ctx)?);
+                .push(executor.execute_expression(0, input, None, input.size(), ctx.query)?);
         }
         Ok(())
     }
@@ -1921,7 +1918,6 @@ fn evaluate_classic_ie_join_side_keys(
     conditions: &[JoinCondition],
     left_side: bool,
 ) -> Result<ClassicIeJoinSideKeys> {
-    let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
     let mut executors = conditions
         .iter()
         .map(|condition| {
@@ -1948,7 +1944,7 @@ fn evaluate_classic_ie_join_side_keys(
                 chunk,
                 None,
                 chunk.size(),
-                &exec_ctx,
+                ctx.query,
             )?);
         }
         for row_idx in 0..chunk.size() {

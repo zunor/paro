@@ -17,7 +17,6 @@ use paro_storage::search::{
 use paro_storage::table::table_handle::TableHandle;
 use paro_transaction::TableId;
 
-use crate::execution_context::ExecutionContext;
 use crate::operators::search::driver::SearchOperatorDriver;
 use crate::physical::specs::{
     FullTextSearchSpec, SearchSourceSpec, SparseVectorSearchSpec, VectorSearchSpec,
@@ -334,8 +333,7 @@ pub(crate) fn poll_search_next(
         .driver
         .as_mut()
         .ok_or_else(|| paro_error::internal("search source local driver missing"))?;
-    let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
-    match driver.next_chunk(&exec_ctx)? {
+    match driver.next_chunk(ctx.cancel)? {
         Some(next) => {
             *output = next;
             Ok(SourcePoll::Output)

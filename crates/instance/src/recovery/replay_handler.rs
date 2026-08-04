@@ -929,6 +929,7 @@ impl<'a> CatalogReplayHandler<'a> {
                 let entry = Arc::new(CatalogEntryEnum::Schema(Arc::new(
                     paro_catalog::entry::SchemaEntry::from_info(
                         &info,
+                        Arc::clone(self.catalog.object_id_allocator()),
                         self.catalog.gc_epoch_handle(),
                         0,
                     ),
@@ -1425,7 +1426,12 @@ mod tests {
             on_conflict: OnCreateConflict::IgnoreOnConflict,
         };
         let entry = Arc::new(CatalogEntryEnum::Schema(Arc::new(
-            paro_catalog::entry::SchemaEntry::from_info(&info, catalog.gc_epoch_handle(), 0),
+            paro_catalog::entry::SchemaEntry::from_info(
+                &info,
+                Arc::clone(catalog.object_id_allocator()),
+                catalog.gc_epoch_handle(),
+                0,
+            ),
         )));
         catalog
             .get_schema_collection()
@@ -1447,7 +1453,12 @@ mod tests {
             columns,
         );
         let entry = Arc::new(CatalogEntryEnum::Table(Arc::new(
-            TableCatalogEntry::from_info(info, storage, 0),
+            TableCatalogEntry::from_info(
+                info,
+                storage,
+                catalog.object_id_allocator().allocate(),
+                0,
+            ),
         )));
         let schema = catalog
             .get_schema(&CatalogSnapshot::read_only(u64::MAX), schema_name)
@@ -1683,6 +1694,7 @@ mod tests {
             table.base.base.object_id.raw(),
             0,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         schema
             .collection(CatalogType::Index)
@@ -1755,6 +1767,7 @@ mod tests {
             table.base.base.object_id.raw(),
             0,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         schema
             .collection(CatalogType::Index)
@@ -1837,6 +1850,7 @@ mod tests {
                     internal: false,
                     on_conflict: OnCreateConflict::IgnoreOnConflict,
                 },
+                Arc::clone(catalog.object_id_allocator()),
                 catalog.gc_epoch_handle(),
                 0,
             ),
@@ -1870,6 +1884,7 @@ mod tests {
                     .with_catalog(catalog.name().to_string()),
                 0,
                 catalog.name().to_string(),
+                catalog.object_id_allocator().allocate(),
             )
             .unwrap(),
         )));
@@ -2046,7 +2061,12 @@ mod tests {
             on_conflict: OnCreateConflict::IgnoreOnConflict,
         };
         let entry = Arc::new(CatalogEntryEnum::Schema(Arc::new(
-            paro_catalog::entry::SchemaEntry::from_info(&info, catalog.gc_epoch_handle(), 0),
+            paro_catalog::entry::SchemaEntry::from_info(
+                &info,
+                Arc::clone(catalog.object_id_allocator()),
+                catalog.gc_epoch_handle(),
+                0,
+            ),
         )));
         catalog
             .get_schema_collection()

@@ -26,7 +26,6 @@ use paro_common::vector::VECTOR_SIZE;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
-use crate::execution_context::ExecutionContext;
 use crate::expression_executor::executor::ExpressionExecutor;
 
 use crate::operators::output::ensure_source_output;
@@ -227,13 +226,12 @@ impl NestedLoopJoinProbeTransformExec {
         if self.conditions.is_empty() {
             return Ok(());
         }
-        let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
         local.left_condition_results.clear();
         local.left_condition_results.reserve(self.conditions.len());
         for executor in &mut local.left_condition_executors {
             local
                 .left_condition_results
-                .push(executor.execute_expression(0, input, None, input.size(), &exec_ctx)?);
+                .push(executor.execute_expression(0, input, None, input.size(), ctx.query)?);
         }
         Ok(())
     }
@@ -403,7 +401,6 @@ impl NestedLoopJoinProbeTransformExec {
         if local.right_cache_chunk_idx == Some(build_chunk_idx) {
             return Ok(());
         }
-        let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
         local.right_condition_cache.clear();
         for executor in &mut local.right_condition_executors {
             local
@@ -413,7 +410,7 @@ impl NestedLoopJoinProbeTransformExec {
                     build_chunk,
                     None,
                     build_chunk.size(),
-                    &exec_ctx,
+                    ctx.query,
                 )?);
         }
         local.right_cache_chunk_idx = Some(build_chunk_idx);
@@ -448,10 +445,9 @@ impl NestedLoopJoinProbeTransformExec {
                 }
                 combined.try_set_cardinality(1)?;
             }
-            let exec_ctx = ExecutionContext::new(ctx.query.session.clone(), ctx.thread, None);
             let executor = local.arbitrary_condition_executor.as_mut().unwrap();
             let combined = local.combined_chunk.as_mut().unwrap();
-            let result_vec = executor.execute_expression(0, combined, None, 1, &exec_ctx)?;
+            let result_vec = executor.execute_expression(0, combined, None, 1, ctx.query)?;
             let val = result_vec.get_value(0);
             return Ok(match val {
                 Value::Boolean(true) => RowMatch::Match,

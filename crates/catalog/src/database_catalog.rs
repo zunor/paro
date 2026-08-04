@@ -15,8 +15,9 @@ use crate::collection::{CatalogCollection, CatalogGcStats, CollectionLockKey, In
 use crate::default::DefaultGenerator;
 use crate::dependency::{DependencyDelta, DependencyGraph};
 use crate::entry::{
-    CatalogEntryEnum, CatalogObjectId, CatalogType, CreateSchemaInfo, DependencyType,
-    DropSchemaInfo, OnCreateConflict, OnEntryNotFound, PropertyGraphCatalogEntry, SchemaEntry,
+    CatalogEntryEnum, CatalogObjectId, CatalogObjectIdAllocator, CatalogType, CreateSchemaInfo,
+    DependencyType, DropSchemaInfo, OnCreateConflict, OnEntryNotFound, PropertyGraphCatalogEntry,
+    SchemaEntry,
 };
 use crate::mvcc::CatalogSnapshot;
 use paro_common::error::{self as paro_error, Result};
@@ -25,51 +26,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 // ============================================================================
 // ParoCatalog Implementation
 // ============================================================================
-
-const OBJECT_ID_ALLOCATOR_START: u64 = 10_000;
-
-static OBJECT_ID_ALLOCATOR: OnceLock<Arc<AtomicU64>> = OnceLock::new();
-
-fn object_id_allocator() -> Arc<AtomicU64> {
-    OBJECT_ID_ALLOCATOR
-        .get_or_init(|| Arc::new(AtomicU64::new(OBJECT_ID_ALLOCATOR_START)))
-        .clone()
-}
-
-fn next_object_id_from(allocator: &AtomicU64) -> u64 {
-    allocator.fetch_add(1, Ordering::SeqCst)
-}
-
-fn bump_object_id_allocator_from(allocator: &AtomicU64, watermark: u64) -> u64 {
-    loop {
-        let current = allocator.load(Ordering::SeqCst);
-        if current >= watermark {
-            return current;
-        }
-
-        match allocator.compare_exchange(current, watermark, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return watermark,
-            Err(actual) => {
-                if actual >= watermark {
-                    return actual;
-                }
-            }
-        }
-    }
-}
-
-fn set_object_id_allocator_from(allocator: &AtomicU64, next_id: u64) {
-    allocator.store(next_id, Ordering::SeqCst);
-}
-
-pub(crate) fn next_object_id() -> u64 {
-    next_object_id_from(object_id_allocator().as_ref())
-}
 
 /// ParoCatalog is the main catalog implementation.
 ///
@@ -91,7 +52,7 @@ pub struct ParoCatalog {
     /// Database path (empty for in-memory)
     db_path: String,
     /// Object id allocator watermark shared with entry constructors.
-    object_id_allocator: Arc<AtomicU64>,
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
     /// Shared GC epoch for the full catalog.
     gc_epoch: Arc<AtomicU64>,
 }
@@ -122,6 +83,14 @@ fn recursive_dir_size(path: &Path) -> u64 {
 impl ParoCatalog {
     /// Create a new ParoCatalog.
     pub fn new(name: String) -> Self {
+        Self::with_object_id_allocator(name, Arc::new(CatalogObjectIdAllocator::default()))
+    }
+
+    /// Create an in-memory catalog using the instance-owned object id allocator.
+    pub fn with_object_id_allocator(
+        name: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         let gc_epoch = Arc::new(AtomicU64::new(0));
         let schemas = CatalogCollection::new(
             format!("{}.schemas", name),
@@ -135,13 +104,26 @@ impl ParoCatalog {
             is_system: false,
             is_in_memory: true,
             db_path: String::new(),
-            object_id_allocator: object_id_allocator(),
+            object_id_allocator,
             gc_epoch,
         }
     }
 
     /// Create a new ParoCatalog with path.
     pub fn with_path(name: String, path: String) -> Self {
+        Self::with_path_and_object_id_allocator(
+            name,
+            path,
+            Arc::new(CatalogObjectIdAllocator::default()),
+        )
+    }
+
+    /// Create a file-backed catalog using the instance-owned object id allocator.
+    pub fn with_path_and_object_id_allocator(
+        name: String,
+        path: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         let gc_epoch = Arc::new(AtomicU64::new(0));
         let schemas = CatalogCollection::new(
             format!("{}.schemas", name),
@@ -155,7 +137,7 @@ impl ParoCatalog {
             is_system: false,
             is_in_memory: path.is_empty(),
             db_path: path,
-            object_id_allocator: object_id_allocator(),
+            object_id_allocator,
             gc_epoch,
         }
     }
@@ -170,22 +152,21 @@ impl ParoCatalog {
 
     /// Get the next object id watermark without allocating a new object id.
     pub fn current_object_id(&self) -> u64 {
-        self.object_id_allocator.load(Ordering::SeqCst)
+        self.object_id_allocator.current()
     }
 
     /// Allocate the next object id.
     pub fn next_object_id(&self) -> u64 {
-        next_object_id_from(self.object_id_allocator.as_ref())
+        self.object_id_allocator.allocate().raw()
     }
 
     /// Ensure the allocator watermark is at least `watermark`.
     pub fn bump_object_id_allocator(&self, watermark: u64) -> u64 {
-        bump_object_id_allocator_from(self.object_id_allocator.as_ref(), watermark)
+        self.object_id_allocator.advance_to(watermark)
     }
 
-    /// Set the allocator watermark exactly to `next_id`.
-    pub fn set_object_id_allocator(&self, next_id: u64) {
-        set_object_id_allocator_from(self.object_id_allocator.as_ref(), next_id);
+    pub fn object_id_allocator(&self) -> &Arc<CatalogObjectIdAllocator> {
+        &self.object_id_allocator
     }
 
     pub fn dependency_graph(&self) -> &DependencyGraph {
@@ -744,7 +725,12 @@ impl ParoCatalog {
         // Create TableCatalogEntry with timestamp 0
         // The actual timestamp will be set by CatalogCollection::create_entry.
         // `from_info` keeps constraints and captures a descriptor from runtime storage.
-        let table_entry = Arc::new(TableCatalogEntry::from_info(info, storage, 0));
+        let table_entry = Arc::new(TableCatalogEntry::from_info(
+            info,
+            storage,
+            self.object_id_allocator.allocate(),
+            0,
+        ));
 
         schema.create_table(transaction, table_entry, on_conflict)?;
         Ok(())
@@ -813,7 +799,12 @@ impl ParoCatalog {
     ) -> Result<Option<Arc<CatalogEntryEnum>>> {
         // Create schema with timestamp 0
         // The actual provisional timestamp will be staged by the schema collection.
-        let schema = Arc::new(SchemaEntry::from_info(info, Arc::clone(&self.gc_epoch), 0));
+        let schema = Arc::new(SchemaEntry::from_info(
+            info,
+            Arc::clone(&self.object_id_allocator),
+            Arc::clone(&self.gc_epoch),
+            0,
+        ));
         let entry = Arc::new(CatalogEntryEnum::Schema(schema.clone()));
         self.schemas
             .stage_create(transaction, &info.name, Arc::clone(&entry))
@@ -836,6 +827,7 @@ impl ParoCatalog {
 
         let generator = crate::default::DefaultSchemaGenerator::new(
             self.name.clone(),
+            Arc::clone(&self.object_id_allocator),
             Arc::clone(&self.gc_epoch),
         );
         if let Some(entry) = generator.create_default_entry(name) {
@@ -1185,12 +1177,6 @@ mod tests {
     use super::*;
     use crate::entry::{CreateTypeInfo, TypeCatalogEntry};
     use paro_storage::transaction::manager::TRANSACTION_ID_START;
-    use std::sync::{Mutex, OnceLock};
-
-    fn object_id_test_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
 
     fn committed_object_ids(schema: &SchemaEntry, kind: CatalogType) -> Vec<u64> {
         let mut ids = schema
@@ -1212,6 +1198,7 @@ mod tests {
                 name.to_string(),
                 paro_common::types::LogicalType::Integer,
             ),
+            CatalogObjectId::from_raw(10_001),
             0,
         ))))
     }
@@ -1255,6 +1242,21 @@ mod tests {
         assert!(catalog.is_paro_catalog());
         assert!(catalog.in_memory());
         assert!(!catalog.is_system_catalog());
+    }
+
+    #[test]
+    fn test_standalone_catalogs_have_isolated_object_id_allocators() {
+        let first = ParoCatalog::new("first".to_string());
+        let second = ParoCatalog::new("second".to_string());
+
+        assert_eq!(
+            first.next_object_id(),
+            CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID
+        );
+        assert_eq!(
+            second.next_object_id(),
+            CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID
+        );
     }
 
     #[test]
@@ -1336,7 +1338,6 @@ mod tests {
 
     #[test]
     fn test_default_materialization_does_not_burn_object_ids_after_first_install() {
-        let _guard = object_id_test_guard().lock().unwrap();
         let catalog = ParoCatalog::new("test_db".to_string());
         let txn = CatalogSnapshot::read_only(u64::MAX);
         let schema = catalog.get_schema(&txn, PG_CATALOG).unwrap();
@@ -1370,7 +1371,6 @@ mod tests {
 
     #[test]
     fn test_concurrent_lazy_default_lookup_is_idempotent() {
-        let _guard = object_id_test_guard().lock().unwrap();
         let catalog = Arc::new(ParoCatalog::new("test_db".to_string()));
         let create_txn = CatalogSnapshot::permanent_writer(u64::MAX);
         let info =
@@ -1471,6 +1471,7 @@ mod tests {
             "test_db".to_string(),
             "history".to_string(),
             CatalogObjectId::from_raw(42),
+            Arc::clone(catalog.object_id_allocator()),
             catalog.gc_epoch_handle(),
             0,
         ));

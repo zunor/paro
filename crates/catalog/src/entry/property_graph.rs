@@ -4,8 +4,8 @@
 //! Property graph catalog entry.
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogObjectRef, CatalogType,
-    CreateInfo, DependencyList, InCatalogEntry, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogObjectRef, CatalogType, CreateInfo,
+    DependencyList, InCatalogEntry, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use std::collections::hash_map::DefaultHasher;
@@ -97,8 +97,13 @@ impl PropertyGraphCatalogEntry {
         deps
     }
 
-    pub fn new(info: CreatePropertyGraphInfo, timestamp: u64, catalog: String) -> Self {
-        Self::with_object_id(info, timestamp, catalog, allocate_object_id())
+    pub fn new(
+        info: CreatePropertyGraphInfo,
+        timestamp: u64,
+        catalog: String,
+        object_id: CatalogObjectId,
+    ) -> Self {
+        Self::with_object_id(info, timestamp, catalog, object_id)
     }
 
     pub fn with_object_id(
@@ -505,7 +510,12 @@ mod tests {
 
     #[test]
     fn property_graph_entry_roundtrip() {
-        let entry = PropertyGraphCatalogEntry::new(sample_info(), 42, "main".to_string());
+        let entry = PropertyGraphCatalogEntry::new(
+            sample_info(),
+            42,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_001),
+        );
         let bytes = entry.serialize_to_bytes().unwrap();
         let restored = PropertyGraphCatalogEntry::deserialize(&bytes, "main".to_string()).unwrap();
 
@@ -518,7 +528,12 @@ mod tests {
 
     #[test]
     fn property_graph_entry_type_and_sql() {
-        let entry = PropertyGraphCatalogEntry::new(sample_info(), 7, "main".to_string());
+        let entry = PropertyGraphCatalogEntry::new(
+            sample_info(),
+            7,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_002),
+        );
         assert_eq!(entry.entry_type(), CatalogType::PropertyGraph);
         assert!(entry.to_sql().contains("CREATE PROPERTY GRAPH"));
     }

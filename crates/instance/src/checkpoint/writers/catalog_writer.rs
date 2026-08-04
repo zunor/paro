@@ -192,9 +192,12 @@ impl CatalogWriter {
         for _ in 0..schema_count {
             let metadata = Self::read_field(&mut cursor)?;
             let contents = Self::read_field(&mut cursor)?;
-            let mut schema_entry_recovered =
-                SchemaEntry::deserialize_metadata(&metadata, catalog.gc_epoch_handle())
-                    .map_err(|e| anyhow::anyhow!(e))?;
+            let mut schema_entry_recovered = SchemaEntry::deserialize_metadata(
+                &metadata,
+                Arc::clone(catalog.object_id_allocator()),
+                catalog.gc_epoch_handle(),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
             schema_entry_recovered
                 .install_contents(&contents, tablet_meta.clone())
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -258,7 +261,7 @@ mod tests {
     fn catalog_snapshot_roundtrip_preserves_view_and_sequence_oid() {
         let catalog = ParoCatalog::new("test_db".to_string());
         catalog.initialize(false);
-        catalog.set_object_id_allocator(1_000_000_000_000);
+        catalog.bump_object_id_allocator(1_000_000_000_000);
 
         let read_txn = CatalogSnapshot::read_only(u64::MAX);
         let schema = catalog.get_schema(&read_txn, "public").unwrap();
@@ -273,6 +276,7 @@ mod tests {
             .with_column_types(vec![LogicalType::Integer]),
             0,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         schema
             .collection(CatalogType::View)
@@ -285,6 +289,7 @@ mod tests {
                 CreateSequenceInfo::new("public".to_string(), "checkpoint_seq".to_string()),
                 0,
                 catalog.name().to_string(),
+                catalog.object_id_allocator().allocate(),
             )
             .expect("sequence info should be valid"),
         )));
@@ -307,6 +312,7 @@ mod tests {
             42,
             0,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         schema
             .collection(CatalogType::Index)
@@ -408,6 +414,7 @@ mod tests {
             .with_column_types(vec![LogicalType::Integer]),
             100,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         views
             .install_replayed(10, before_cut, InstallMode::RejectExisting)
@@ -423,6 +430,7 @@ mod tests {
             .with_column_types(vec![LogicalType::Integer]),
             101,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         views
             .install_replayed(11, after_cut, InstallMode::RejectExisting)

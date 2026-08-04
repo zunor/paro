@@ -1043,6 +1043,7 @@ mod tests {
                 LogicalType::Integer,
             )],
             Arc::new(create_storage(&[LogicalType::Integer])),
+            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             0,
         ))
     }

@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_context::StatementCancellation;
 use paro_storage::search::{
     OpenedSearchCursor, ResourceBudget, SearchBatchConfig, SearchBatchState, SearchReadSnapshot,
 };
 use paro_storage::table::table_handle::TableHandle;
-
-use crate::execution_context::ExecutionContext;
 
 pub(crate) struct SearchOperatorDriver {
     table: Arc<TableHandle>,
@@ -54,9 +53,12 @@ impl SearchOperatorDriver {
         }
     }
 
-    pub(crate) fn next_chunk(&mut self, ctx: &ExecutionContext) -> Result<Option<Chunk>> {
+    pub(crate) fn next_chunk(
+        &mut self,
+        cancellation: &StatementCancellation,
+    ) -> Result<Option<Chunk>> {
         loop {
-            ctx.check_cancelled()?;
+            cancellation.check()?;
             match self
                 .cursor
                 .next_batch(&self.batch_config, &mut self.budget)?

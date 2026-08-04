@@ -2554,9 +2554,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::execution_context::ExecutionContext;
-    use crate::runtime::ParameterBindingEpoch;
-    use crate::thread_context::ThreadContext;
+    use crate::memory_runtime::QueryMemoryPool;
+    use crate::runtime::{
+        ParameterBindingEpoch, ParameterBindings, QueryOutputPort, QueryRuntimeContext,
+    };
     use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
     use paro_common::vector::{DictionaryInfo, DictionarySource, VectorType};
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
@@ -2582,9 +2583,13 @@ mod tests {
         TestStatementContextBuilder::minimal().build()
     }
 
-    fn test_runtime(session: Arc<StatementContext>) -> ExecutionContext<'static> {
-        let thread = Box::leak(Box::new(ThreadContext::single_threaded()));
-        ExecutionContext::new(session, thread, None)
+    fn test_runtime(session: Arc<StatementContext>) -> QueryRuntimeContext {
+        QueryRuntimeContext::new(
+            session,
+            Arc::new(ParameterBindings::empty()),
+            Arc::new(QueryMemoryPool::unbounded()),
+            QueryOutputPort::discarding(),
+        )
     }
 
     fn scalar_subquery_check_expr(row_count: i64) -> Expression {
