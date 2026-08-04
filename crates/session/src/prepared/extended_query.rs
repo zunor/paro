@@ -196,9 +196,8 @@ async fn execute_parse<R: ExtendedQueryResponder>(
         raw_stmt,
         parameter_types,
         result_schema,
-        plan_cache_mode: crate::prepared::plan_cache::PlanCacheMode::Auto,
         generic_plan,
-        custom_plan_executions: 0,
+        generic_plan_uses: 0,
         source: PreparedStatementSource::Protocol,
     };
 
@@ -282,7 +281,6 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         },
         source_sql: statement.source_sql.clone(),
         raw_stmt: statement.raw_stmt.clone(),
-        bound_params: parameter_env.values(),
         holdability: CursorHoldability::WithoutHold,
         scroll_mode: ScrollMode::Scroll,
         result_formats,
@@ -291,7 +289,6 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         execution_state: PortalExecutionState::Ready,
         snapshot_retention: None,
         completion: None,
-        dependency_epoch: session.transaction_visible_version(),
         created_generation: 0,
         transaction_owned: session.has_active_transaction(),
     };
@@ -312,6 +309,7 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         if let Some(plan) = cached_query_plan {
             stored.result_schema = plan.result_schema().to_vec();
             stored.generic_plan = Some(plan);
+            stored.generic_plan_uses = stored.generic_plan_uses.saturating_add(1);
         }
     }
 
@@ -617,11 +615,11 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
     message: &ExecutePortalMessage,
     responder: &mut R,
 ) -> Result<PortalProgress> {
-    if !execution.statement().is_query() {
-        return execute_non_row_query_portal(session, portal, execution, responder).await;
-    }
-
-    if matches!(portal.execution_state, PortalExecutionState::Ready) {
+    if !matches!(portal.execution_state, PortalExecutionState::Ready) {
+        if !execution.statement().is_query() {
+            return execute_non_row_query_portal(session, portal, None, execution, responder).await;
+        }
+    } else {
         let snapshot = session.freeze_statement_context(
             StatementOptions {
                 source: StatementSource::ExtendedQuery,
@@ -631,6 +629,18 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 .current_statement_cancellation()
                 .expect("portal execution requires an active statement scope"),
         );
+        let execution = revalidate_portal_execution(snapshot.clone(), portal, execution)?;
+        portal.kind = PortalKind::Query(execution.clone());
+        if !execution.statement().is_query() {
+            return execute_non_row_query_portal(
+                session,
+                portal,
+                Some(snapshot),
+                execution,
+                responder,
+            )
+            .await;
+        }
         let materialized =
             materialize_compiled_statement(session, snapshot.clone(), execution).await?;
         portal.execution_state = PortalExecutionState::Active(PortalCursor {
@@ -685,9 +695,33 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
     }
 }
 
+/// Paro acquires a portal's data snapshot at first Execute, rather than Bind.
+/// Revalidate against that same snapshot so catalog bindings cannot lag behind it.
+fn revalidate_portal_execution(
+    snapshot: Arc<StatementContext>,
+    portal: &PortalEntry,
+    execution: ExecutionRequest,
+) -> Result<ExecutionRequest> {
+    if execution.statement().compile_environment() == &snapshot.compile_environment_key() {
+        return Ok(execution);
+    }
+
+    let parameter_types = execution.statement().parameter_types().to_vec();
+    let plan = build_query_plan(snapshot, portal.raw_stmt.clone(), &parameter_types)?;
+    if plan.result_schema() != portal.result_schema {
+        return Err(ParoError::new(paro_error::ErrorData::new(
+            paro_error::Severity::Error,
+            paro_error::codes::feature::FEATURE_NOT_SUPPORTED,
+            "cached plan must not change result type",
+        )));
+    }
+    execution.with_statement(plan)
+}
+
 async fn execute_non_row_query_portal<R: ExtendedQueryResponder>(
     session: &mut Session,
     portal: &mut PortalEntry,
+    snapshot: Option<Arc<StatementContext>>,
     execution: ExecutionRequest,
     responder: &mut R,
 ) -> Result<PortalProgress> {
@@ -696,7 +730,11 @@ async fn execute_non_row_query_portal<R: ExtendedQueryResponder>(
         return Ok(PortalProgress::Complete(completion));
     }
 
-    let completion = run_non_row_compiled_statement(session, &portal.raw_stmt, execution)?;
+    let snapshot = snapshot.ok_or_else(|| {
+        paro_error::internal("ready portal execution requires a statement snapshot".to_string())
+    })?;
+    let completion =
+        run_non_row_compiled_statement(session, snapshot, &portal.raw_stmt, execution)?;
     portal.execution_state = PortalExecutionState::Exhausted { position: 0 };
     portal.completion = Some(completion.clone());
     responder.send_command_complete(&completion).await?;
@@ -731,18 +769,10 @@ async fn execute_utility_portal<R: ExtendedQueryResponder>(
 
 fn run_non_row_compiled_statement(
     session: &mut Session,
+    snapshot: Arc<StatementContext>,
     stmt: &Statement,
     execution: ExecutionRequest,
 ) -> Result<StatementCompletion> {
-    let snapshot = session.freeze_statement_context(
-        StatementOptions {
-            source: StatementSource::ExtendedQuery,
-            ..StatementOptions::default()
-        },
-        session
-            .current_statement_cancellation()
-            .expect("portal execution requires an active statement scope"),
-    );
     let executor = Executor::new(snapshot);
     session.set_executor(executor);
 
@@ -1357,6 +1387,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_execute_replans_after_catalog_change_between_bind_and_execute() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance.clone());
+        let mut ddl_session = Session::new(2, instance);
+        let mut sink = CollectingSink::new();
+        let mut responder = TestResponder::default();
+
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "CREATE TABLE portal_replan_t (v INT)",
+        )
+        .await;
+        sink.clear();
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "INSERT INTO portal_replan_t VALUES (1)",
+        )
+        .await;
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("s1".to_string()),
+                query: "SELECT v FROM portal_replan_t".to_string(),
+                type_oids: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("p1".to_string()),
+                statement_name: Some("s1".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        sink.clear();
+        exec_simple_ok(&mut ddl_session, &mut sink, "DROP TABLE portal_replan_t").await;
+        sink.clear();
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "CREATE TABLE portal_replan_t (v INT)",
+        )
+        .await;
+        sink.clear();
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "INSERT INTO portal_replan_t VALUES (2)",
+        )
+        .await;
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Execute(ExecutePortalMessage {
+                name: Some("p1".to_string()),
+                max_rows: 0,
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(responder.rows, vec![vec!["2".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn protocol_execute_replans_non_row_statement_after_catalog_change() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance.clone());
+        let mut ddl_session = Session::new(2, instance);
+        let mut sink = CollectingSink::new();
+        let mut responder = TestResponder::default();
+
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "CREATE TABLE portal_insert_t (v INT)",
+        )
+        .await;
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("s1".to_string()),
+                query: "INSERT INTO portal_insert_t VALUES (?)".to_string(),
+                type_oids: vec![INT4OID],
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("p1".to_string()),
+                statement_name: Some("s1".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"7".to_vec())],
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        sink.clear();
+        exec_simple_ok(&mut ddl_session, &mut sink, "DROP TABLE portal_insert_t").await;
+        sink.clear();
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "CREATE TABLE portal_insert_t (v INT)",
+        )
+        .await;
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Execute(ExecutePortalMessage {
+                name: Some("p1".to_string()),
+                max_rows: 0,
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        sink.clear();
+        exec_simple_ok(&mut session, &mut sink, "SELECT v FROM portal_insert_t").await;
+        let result = sink.assert_single_result();
+        let value = result.chunks[0]
+            .column(0)
+            .expect("result column")
+            .get_value(0);
+        assert_eq!(value, Value::Integer(7));
+    }
+
+    #[tokio::test]
+    async fn protocol_execute_rejects_result_type_change_after_bind() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance.clone());
+        let mut ddl_session = Session::new(2, instance);
+        let mut sink = CollectingSink::new();
+        let mut responder = TestResponder::default();
+
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "CREATE TABLE portal_schema_t (v INT)",
+        )
+        .await;
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("s1".to_string()),
+                query: "SELECT * FROM portal_schema_t".to_string(),
+                type_oids: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("p1".to_string()),
+                statement_name: Some("s1".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        sink.clear();
+        exec_simple_ok(&mut ddl_session, &mut sink, "DROP TABLE portal_schema_t").await;
+        sink.clear();
+        exec_simple_ok(
+            &mut ddl_session,
+            &mut sink,
+            "CREATE TABLE portal_schema_t (v INT, extra INT)",
+        )
+        .await;
+
+        let error = execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Execute(ExecutePortalMessage {
+                name: Some("p1".to_string()),
+                max_rows: 0,
+            }),
+            &mut responder,
+        )
+        .await
+        .expect_err("result schema changes must invalidate a bound portal");
+
+        assert_eq!(error.message(), "cached plan must not change result type");
+    }
+
+    #[tokio::test]
     async fn unnamed_statement_and_portal_support_describe_close_and_flush() {
         let instance = paro_instance::Instance::new_in_memory();
         let mut session = Session::new(1, instance);
@@ -1883,6 +2124,12 @@ mod tests {
         assert_eq!(
             responder.rows,
             vec![vec!["2".to_string()], vec!["42".to_string()]]
+        );
+        assert_eq!(
+            statement_entry(&session, Some("s1"))
+                .unwrap()
+                .generic_plan_uses,
+            2
         );
     }
 

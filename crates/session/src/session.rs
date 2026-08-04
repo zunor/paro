@@ -750,8 +750,9 @@ impl Session {
                     entry.source,
                     crate::prepared::store::PreparedStatementSource::Sql
                 ),
-                generic_plans: i64::from(entry.generic_plan.is_some()),
-                custom_plans: i64::from(entry.custom_plan_executions),
+                generic_plans: entry.generic_plan_uses,
+                // Paro deliberately compiles only value-independent generic plans.
+                custom_plans: 0,
             })
             .collect::<Vec<_>>();
         prepared_statements.sort_by(|a, b| a.name.cmp(&b.name));

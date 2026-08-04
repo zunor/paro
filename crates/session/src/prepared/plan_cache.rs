@@ -9,14 +9,6 @@ use paro_execution::query_executor::compiled::CompiledStatement;
 use paro_parser::ast::Statement;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PlanCacheMode {
-    #[default]
-    Auto,
-    ForceGeneric,
-    ForceCustom,
-}
-
 pub fn build_generic_plan(
     ctx: Arc<StatementContext>,
     stmt: Statement,

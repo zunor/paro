@@ -224,7 +224,6 @@ impl Default for SessionState {
 mod tests {
     use super::super::file_opener::DefaultFileOpener;
     use super::*;
-    use crate::prepared::plan_cache::PlanCacheMode;
     use crate::prepared::portal::{
         CursorHoldability, FormatCode, PortalExecutionState, ScrollMode,
     };
@@ -247,9 +246,8 @@ mod tests {
             raw_stmt: parse_single(sql),
             parameter_types: Vec::new(),
             result_schema: Vec::new(),
-            plan_cache_mode: PlanCacheMode::Auto,
             generic_plan: None,
-            custom_plan_executions: 0,
+            generic_plan_uses: 0,
             source: PreparedStatementSource::Sql,
         }
     }
@@ -260,7 +258,6 @@ mod tests {
             statement_ref: crate::prepared::store::PortalStatementRef::None,
             source_sql: "SELECT 1".to_string(),
             raw_stmt: parse_single("SELECT 1"),
-            bound_params: Vec::new(),
             holdability: CursorHoldability::WithoutHold,
             scroll_mode: ScrollMode::NoScroll,
             result_formats: vec![FormatCode::Text],
@@ -272,7 +269,6 @@ mod tests {
             execution_state: PortalExecutionState::Ready,
             snapshot_retention: None,
             completion: None,
-            dependency_epoch: 0,
             created_generation: 0,
             transaction_owned: true,
         }

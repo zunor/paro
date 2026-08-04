@@ -147,9 +147,8 @@ async fn execute_prepare<S: ProtocolResultSink>(
         raw_stmt,
         parameter_types,
         result_schema,
-        plan_cache_mode: crate::prepared::plan_cache::PlanCacheMode::Auto,
         generic_plan,
-        custom_plan_executions: 0,
+        generic_plan_uses: 0,
         source: PreparedStatementSource::Sql,
     };
 
@@ -342,7 +341,6 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         statement_ref: PortalStatementRef::None,
         source_sql: stmt.query.to_string(),
         raw_stmt: (*stmt.query).clone(),
-        bound_params: Vec::new(),
         holdability: if stmt.hold {
             CursorHoldability::WithHold
         } else {
@@ -358,7 +356,6 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         }),
         snapshot_retention: Some(PortalSnapshotRetention::materialized(snapshot_read_ts)),
         completion: None,
-        dependency_epoch: session.transaction_visible_version(),
         created_generation: 0,
         transaction_owned: session.has_active_transaction(),
     };
@@ -541,36 +538,24 @@ fn select_execute_plan(
         .map(|ty| ty.expect("resolved parameter type"))
         .collect::<Vec<_>>();
 
-    let (compiled, custom_execution) = match entry.plan_cache_mode {
-        crate::prepared::plan_cache::PlanCacheMode::ForceCustom => (
-            build_generic_plan(ctx, entry.raw_stmt.clone(), &resolved_parameter_types)?,
-            true,
-        ),
-        crate::prepared::plan_cache::PlanCacheMode::Auto
-        | crate::prepared::plan_cache::PlanCacheMode::ForceGeneric => {
-            if let Some(plan) = entry.generic_plan.as_ref() {
-                if plan.compile_environment() == &compile_environment
-                    && plan.parameter_types() == concrete_types
-                {
-                    return ExecutionRequest::from_typed_env(plan.clone(), &parameter_env);
-                }
-            }
-
-            (
-                build_generic_plan(ctx, entry.raw_stmt.clone(), &resolved_parameter_types)?,
-                false,
-            )
-        }
-    };
+    let compiled = entry
+        .generic_plan
+        .as_ref()
+        .filter(|plan| {
+            plan.compile_environment() == &compile_environment
+                && plan.parameter_types() == concrete_types
+        })
+        .cloned()
+        .map_or_else(
+            || build_generic_plan(ctx, entry.raw_stmt.clone(), &resolved_parameter_types),
+            Ok,
+        )?;
 
     if let Some(stored) = session.state.get_prepared_statement_mut(name) {
         stored.result_schema = compiled.result_schema().to_vec();
         stored.parameter_types = resolved_parameter_types;
-        if custom_execution {
-            stored.custom_plan_executions = stored.custom_plan_executions.saturating_add(1);
-        } else {
-            stored.generic_plan = Some(compiled.clone());
-        }
+        stored.generic_plan = Some(compiled.clone());
+        stored.generic_plan_uses = stored.generic_plan_uses.saturating_add(1);
     }
 
     ExecutionRequest::from_typed_env(compiled, &parameter_env)

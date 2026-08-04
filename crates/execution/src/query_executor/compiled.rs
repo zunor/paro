@@ -132,6 +132,17 @@ pub struct ExecutionRequest {
 
 impl ExecutionRequest {
     pub fn new(statement: CompiledStatement, bindings: ParameterBindings) -> Result<Self> {
+        Self::validate_bindings(&statement, &bindings)?;
+        Ok(Self {
+            statement,
+            bindings: Arc::new(bindings),
+        })
+    }
+
+    fn validate_bindings(
+        statement: &CompiledStatement,
+        bindings: &ParameterBindings,
+    ) -> Result<()> {
         if statement.parameter_types().len() != bindings.len() {
             return Err(paro_error::protocol_violation(format!(
                 "compiled statement expects {} parameters, but execution supplied {}",
@@ -152,10 +163,7 @@ impl ExecutionRequest {
                 )));
             }
         }
-        Ok(Self {
-            statement,
-            bindings: Arc::new(bindings),
-        })
+        Ok(())
     }
 
     pub fn unparameterized(statement: CompiledStatement) -> Result<Self> {
@@ -170,6 +178,18 @@ impl ExecutionRequest {
             statement,
             ParameterBindings::from_typed_env(parameter_env, ParameterBindingEpoch::new(1)),
         )
+    }
+
+    /// Replaces a stale compiled image while retaining this execution's bindings.
+    ///
+    /// Revalidation is intentional here: catalog changes can cause recompilation
+    /// to produce a different parameter signature even when the SQL is unchanged.
+    pub fn with_statement(self, statement: CompiledStatement) -> Result<Self> {
+        Self::validate_bindings(&statement, &self.bindings)?;
+        Ok(Self {
+            statement,
+            bindings: self.bindings,
+        })
     }
 
     #[inline]
@@ -228,5 +248,27 @@ mod tests {
 
         assert!(error.to_string().contains("parameter 1 has type"));
         assert!(error.to_string().contains("expects INTEGER"));
+    }
+
+    #[test]
+    fn execution_request_reuses_bindings_when_replacing_a_stale_statement() {
+        let bindings = ParameterBindings::new(
+            vec![Value::Integer(7)],
+            vec![LogicalType::Integer],
+            ParameterBindingEpoch::new(1),
+        )
+        .unwrap();
+        let request = ExecutionRequest::new(statement(vec![LogicalType::Integer]), bindings)
+            .expect("matching bindings");
+        let original_bindings = request.clone().into_parts().1;
+        let replacement = statement(vec![LogicalType::Integer]);
+
+        let replaced = request
+            .with_statement(replacement.clone())
+            .expect("matching replacement signature");
+        let (replaced_statement, replaced_bindings) = replaced.into_parts();
+
+        assert!(replaced_statement.shares_image_with(&replacement));
+        assert!(Arc::ptr_eq(&original_bindings, &replaced_bindings));
     }
 }
