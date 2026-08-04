@@ -8,6 +8,7 @@ use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::column::{ColumnBatch, ColumnIterator};
 use crate::tablet::ColumnId;
+use bytes::Bytes;
 use paro_common::allocator::MemoryTag;
 use paro_common::error::{self as paro_error, Result};
 use std::path::PathBuf;
@@ -74,6 +75,51 @@ pub struct SegmentBatch {
     pub rowids: Vec<u32>,
     pub rows: usize,
     pub columns: Vec<(ColumnId, ColumnBatch)>,
+}
+
+struct ReusedPredicateColumn {
+    column_id: ColumnId,
+    predicate_idx: usize,
+    width: usize,
+    data: Vec<u8>,
+    nulls: Vec<u8>,
+}
+
+impl ReusedPredicateColumn {
+    fn new(column_id: ColumnId, predicate_idx: usize, width: usize, capacity: usize) -> Self {
+        Self {
+            column_id,
+            predicate_idx,
+            width,
+            data: Vec::with_capacity(capacity.saturating_mul(width)),
+            nulls: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn append(&mut self, batch: &ColumnBatch, row_idx: usize) -> Result<()> {
+        let start = row_idx
+            .checked_mul(self.width)
+            .ok_or_else(|| paro_error::data_corrupted("Predicate row offset overflow"))?;
+        let end = start
+            .checked_add(self.width)
+            .ok_or_else(|| paro_error::data_corrupted("Predicate row width overflow"))?;
+        let value = batch.data.get(start..end).ok_or_else(|| {
+            paro_error::data_corrupted("Predicate row exceeds the fixed-width batch")
+        })?;
+        self.data.extend_from_slice(value);
+        self.nulls
+            .push(batch.nulls.as_ref().map_or(0, |nulls| nulls[row_idx]));
+        Ok(())
+    }
+
+    fn take_batch(&mut self) -> ColumnBatch {
+        let nulls = std::mem::take(&mut self.nulls);
+        let nulls = nulls
+            .iter()
+            .any(|is_null| *is_null != 0)
+            .then(|| Bytes::from(nulls));
+        ColumnBatch::new(Bytes::from(std::mem::take(&mut self.data)), nulls)
+    }
 }
 
 impl SegmentBatch {
@@ -475,6 +521,19 @@ impl SegmentIterator {
             }
 
             let mut rowids = Vec::with_capacity(batch_size);
+            let mut predicate_matches = Vec::with_capacity(batch_size);
+            let mut reused_predicate_columns = self
+                .column_iterators
+                .iter()
+                .filter_map(|(column_id, _)| {
+                    self.predicate_evaluator
+                        .as_ref()
+                        .and_then(|evaluator| evaluator.raw_column_info(*column_id))
+                        .map(|(predicate_idx, width)| {
+                            ReusedPredicateColumn::new(*column_id, predicate_idx, width, batch_size)
+                        })
+                })
+                .collect::<Vec<_>>();
             while rowids.len() < batch_size && self.current_ordinal < max_rowid {
                 let remaining = (max_rowid - self.current_ordinal) as usize;
                 let output_remaining = batch_size - rowids.len();
@@ -498,7 +557,12 @@ impl SegmentIterator {
                     _ => None,
                 };
 
-                for row_idx in 0..rows_read {
+                self.predicate_evaluator
+                    .as_ref()
+                    .expect("late materialization requires predicate evaluator")
+                    .evaluate_batch(&vectors_by_col, rows_read, &mut predicate_matches)?;
+
+                for &row_idx in &predicate_matches {
                     let ord = self.current_ordinal + row_idx as u64;
                     let matches_index = selection_bitmap.is_none_or(|bm| bm.contains(ord as u32));
                     if !matches_index {
@@ -512,16 +576,20 @@ impl SegmentIterator {
                         continue;
                     }
 
-                    if self
-                        .predicate_evaluator
-                        .as_ref()
-                        .expect("late materialization requires predicate evaluator")
-                        .evaluate_row(&vectors_by_col, row_idx)?
-                    {
-                        rowids.push(ord as u32);
-                        if rowids.len() >= batch_size {
-                            break;
-                        }
+                    for reused in &mut reused_predicate_columns {
+                        let batch = vectors_by_col
+                            .get(reused.predicate_idx)
+                            .and_then(|batch| batch.raw())
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "Reusable predicate column was decoded unexpectedly",
+                                )
+                            })?;
+                        reused.append(batch, row_idx)?;
+                    }
+                    rowids.push(ord as u32);
+                    if rowids.len() >= batch_size {
+                        break;
                     }
                 }
 
@@ -554,7 +622,14 @@ impl SegmentIterator {
             let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
             let mut results = Vec::with_capacity(self.column_iterators.len());
             for (col_id, iter) in &mut self.column_iterators {
-                let batch = iter.read_by_rowids(&rowids_u64)?;
+                let batch = if let Some(reused) = reused_predicate_columns
+                    .iter_mut()
+                    .find(|reused| reused.column_id == *col_id)
+                {
+                    reused.take_batch()
+                } else {
+                    iter.read_by_rowids(&rowids_u64)?
+                };
                 results.push((*col_id, batch));
             }
 

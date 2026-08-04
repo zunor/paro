@@ -52,6 +52,13 @@ impl PredicateColumnBatch {
         }
     }
 
+    pub(super) fn raw(&self) -> Option<&ColumnBatch> {
+        match self {
+            Self::Raw(batch) => Some(batch),
+            Self::Decoded(_) => None,
+        }
+    }
+
     #[inline]
     unsafe fn i32_value(&self, row_idx: usize) -> i32 {
         match self {
@@ -148,6 +155,17 @@ enum CompiledPredicate {
 }
 
 impl PredicateEvaluator {
+    pub(super) fn raw_column_info(&self, column_id: ColumnId) -> Option<(usize, usize)> {
+        let column_idx = self
+            .predicate_columns
+            .iter()
+            .position(|candidate| *candidate == column_id)?;
+        if self.decode_predicate_columns[column_idx] {
+            return None;
+        }
+        Some((column_idx, self.predicate_types[column_idx].physical_size()))
+    }
+
     pub(super) fn new(
         segment: &Segment,
         tree: PredicateTree,
@@ -329,12 +347,123 @@ impl PredicateEvaluator {
         Ok(())
     }
 
-    pub(super) fn evaluate_row(
+    pub(super) fn evaluate_batch(
         &self,
         batches_by_col: &[PredicateColumnBatch],
+        rows: usize,
+        matches: &mut Vec<usize>,
+    ) -> Result<()> {
+        matches.clear();
+        let CompiledPredicateTree::And(children) = &self.tree else {
+            return self.evaluate_batch_generic(batches_by_col, rows, matches);
+        };
+        let Some((first, remaining)) = children.split_first() else {
+            matches.extend(0..rows);
+            return Ok(());
+        };
+        if !children.iter().all(Self::is_fixed_comparison_leaf) {
+            return self.evaluate_batch_generic(batches_by_col, rows, matches);
+        }
+
+        for row_idx in 0..rows {
+            if Self::evaluate_fixed_comparison_leaf(first, batches_by_col, row_idx) {
+                matches.push(row_idx);
+            }
+        }
+        for predicate in remaining {
+            matches.retain(|&row_idx| {
+                Self::evaluate_fixed_comparison_leaf(predicate, batches_by_col, row_idx)
+            });
+        }
+        Ok(())
+    }
+
+    fn evaluate_batch_generic(
+        &self,
+        batches_by_col: &[PredicateColumnBatch],
+        rows: usize,
+        matches: &mut Vec<usize>,
+    ) -> Result<()> {
+        for row_idx in 0..rows {
+            if self.evaluate_tree(&self.tree, batches_by_col, row_idx)? {
+                matches.push(row_idx);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_fixed_comparison_leaf(predicate: &CompiledPredicateTree) -> bool {
+        matches!(
+            predicate,
+            CompiledPredicateTree::Leaf(
+                CompiledPredicate::I32Comparisons { .. }
+                    | CompiledPredicate::I64Comparisons { .. }
+                    | CompiledPredicate::I128Comparisons { .. }
+            )
+        )
+    }
+
+    #[inline]
+    fn evaluate_fixed_comparison_leaf(
+        predicate: &CompiledPredicateTree,
+        batches_by_col: &[PredicateColumnBatch],
         row_idx: usize,
-    ) -> Result<bool> {
-        self.evaluate_tree(&self.tree, batches_by_col, row_idx)
+    ) -> bool {
+        let CompiledPredicateTree::Leaf(predicate) = predicate else {
+            return false;
+        };
+        Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx).unwrap_or(false)
+    }
+
+    #[inline]
+    fn evaluate_fixed_comparison(
+        predicate: &CompiledPredicate,
+        batches_by_col: &[PredicateColumnBatch],
+        row_idx: usize,
+    ) -> Option<bool> {
+        match predicate {
+            CompiledPredicate::I32Comparisons {
+                column_idx,
+                comparisons,
+            } => Some(batches_by_col.get(*column_idx).is_some_and(|batch| {
+                if batch.is_null(row_idx) {
+                    return false;
+                }
+                // SAFETY: read_next_batch validates fixed-width raw batches, and
+                // row_idx is bounded by the batch row count.
+                let lhs = unsafe { batch.i32_value(row_idx) };
+                comparisons
+                    .iter()
+                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+            })),
+            CompiledPredicate::I64Comparisons {
+                column_idx,
+                comparisons,
+            } => Some(batches_by_col.get(*column_idx).is_some_and(|batch| {
+                if batch.is_null(row_idx) {
+                    return false;
+                }
+                // SAFETY: see the I32Comparisons branch above.
+                let lhs = unsafe { batch.i64_value(row_idx) };
+                comparisons
+                    .iter()
+                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+            })),
+            CompiledPredicate::I128Comparisons {
+                column_idx,
+                comparisons,
+            } => Some(batches_by_col.get(*column_idx).is_some_and(|batch| {
+                if batch.is_null(row_idx) {
+                    return false;
+                }
+                // SAFETY: see the I32Comparisons branch above.
+                let lhs = unsafe { batch.i128_value(row_idx) };
+                comparisons
+                    .iter()
+                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+            })),
+            CompiledPredicate::Generic { .. } => None,
+        }
     }
 
     fn evaluate_tree(
@@ -372,52 +501,17 @@ impl PredicateEvaluator {
         batches_by_col: &[PredicateColumnBatch],
         row_idx: usize,
     ) -> Result<bool> {
-        match predicate {
-            CompiledPredicate::I32Comparisons {
-                column_idx,
-                comparisons,
-            } => Ok(batches_by_col.get(*column_idx).is_some_and(|batch| {
-                if batch.is_null(row_idx) {
-                    return false;
-                }
-                // SAFETY: read_next_batch validates fixed-width raw batches, and the
-                // segment iterator only evaluates rows returned by that batch.
-                let lhs = unsafe { batch.i32_value(row_idx) };
-                comparisons
-                    .iter()
-                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
-            })),
-            CompiledPredicate::I64Comparisons {
-                column_idx,
-                comparisons,
-            } => Ok(batches_by_col.get(*column_idx).is_some_and(|batch| {
-                if batch.is_null(row_idx) {
-                    return false;
-                }
-                // SAFETY: see the I32Comparisons branch above.
-                let lhs = unsafe { batch.i64_value(row_idx) };
-                comparisons
-                    .iter()
-                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
-            })),
-            CompiledPredicate::I128Comparisons {
-                column_idx,
-                comparisons,
-            } => Ok(batches_by_col.get(*column_idx).is_some_and(|batch| {
-                if batch.is_null(row_idx) {
-                    return false;
-                }
-                // SAFETY: see the I32Comparisons branch above.
-                let lhs = unsafe { batch.i128_value(row_idx) };
-                comparisons
-                    .iter()
-                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
-            })),
-            CompiledPredicate::Generic {
-                column_idx,
-                predicate,
-            } => self.evaluate_generic_leaf(*column_idx, predicate, batches_by_col, row_idx),
+        if let Some(matches) = Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx) {
+            return Ok(matches);
         }
+        let CompiledPredicate::Generic {
+            column_idx,
+            predicate,
+        } = predicate
+        else {
+            unreachable!("fixed comparisons returned above")
+        };
+        self.evaluate_generic_leaf(*column_idx, predicate, batches_by_col, row_idx)
     }
 
     fn evaluate_generic_leaf(
@@ -791,10 +885,9 @@ mod tests {
             Some(bytes::Bytes::from_static(&[0, 0, 1, 0])),
         ))];
 
-        assert!(!evaluator.evaluate_row(&batches, 0).unwrap());
-        assert!(evaluator.evaluate_row(&batches, 1).unwrap());
-        assert!(!evaluator.evaluate_row(&batches, 2).unwrap());
-        assert!(!evaluator.evaluate_row(&batches, 3).unwrap());
+        let mut matches = Vec::new();
+        evaluator.evaluate_batch(&batches, 4, &mut matches).unwrap();
+        assert_eq!(matches, [1]);
     }
 
     #[test]
