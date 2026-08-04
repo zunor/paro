@@ -1,0 +1,41 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+[meta]
+name = "tpch"
+description = "TPC-H analytical query performance"
+run_order = 90
+
+[params]
+data_dir = "/tmp/paro-tpch-data"
+thread_count = 1
+memory_limit = "2GB"
+rowset_scan_pushdown = true
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "q01_pricing_summary"
+file = "sql/q01.sql"
+validate = "row_count"
+expected = 4
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "q06_forecast_revenue"
+file = "sql/q06.sql"
+validate = "row_count"
+expected = 1
+collect_explain_profile = true
+allow_reexecute = true
+
+[[query]]
+id = "q14_promotion_effect"
+file = "sql/q14.sql"
+validate = "row_count"
+expected = 1
+collect_explain_profile = true
+allow_reexecute = true

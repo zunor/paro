@@ -1,0 +1,11 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
+DROP TABLE IF EXISTS lineitem;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS partsupp;
+DROP TABLE IF EXISTS customer;
+DROP TABLE IF EXISTS supplier;
+DROP TABLE IF EXISTS part;
+DROP TABLE IF EXISTS nation;
+DROP TABLE IF EXISTS region;
