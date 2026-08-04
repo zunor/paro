@@ -326,6 +326,7 @@ mod avg_f64 {
 /// Get the AVG aggregate function set.
 pub fn get_avg_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("avg".to_string());
+    set.set_dynamic_bind(super::decimal::bind_avg);
 
     // Integer -> Double
     set.add_function(AggregateFunction::new(

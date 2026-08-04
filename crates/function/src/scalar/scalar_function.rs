@@ -321,18 +321,27 @@ impl BoundScalarFunction {
 pub struct ScalarFunctionSet {
     pub name: String,
     pub functions: Vec<ScalarFunction>,
+    pub dynamic_bind: Option<ScalarFunctionSetBindFn>,
 }
+
+pub type ScalarFunctionSetBindFn =
+    fn(arguments: &[LogicalType]) -> Result<(ScalarFunction, Vec<LogicalType>)>;
 
 impl ScalarFunctionSet {
     pub fn new(name: String) -> Self {
         Self {
             name,
             functions: Vec::new(),
+            dynamic_bind: None,
         }
     }
 
     pub fn add_function(&mut self, function: ScalarFunction) {
         self.functions.push(function);
+    }
+
+    pub fn set_dynamic_bind(&mut self, bind: ScalarFunctionSetBindFn) {
+        self.dynamic_bind = Some(bind);
     }
 
     pub fn bind(&self, arguments: &[LogicalType]) -> Result<(ScalarFunction, Vec<LogicalType>)> {
@@ -425,10 +434,13 @@ impl ScalarFunctionSet {
 
         match best_match {
             Some((func, _cost, target_types)) => Ok((func.clone(), target_types)),
-            None => Err(paro_error::function_not_found(format!(
-                "{} with arguments {:?}",
-                self.name, arguments
-            ))),
+            None => match self.dynamic_bind {
+                Some(bind) => bind(arguments),
+                None => Err(paro_error::function_not_found(format!(
+                    "{} with arguments {:?}",
+                    self.name, arguments
+                ))),
+            },
         }
     }
 

@@ -265,6 +265,7 @@ define_last_impl!(last_f64, f64);
 /// Get the FIRST aggregate function set.
 pub fn get_first_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("first".to_string());
+    set.set_dynamic_bind(super::decimal::bind_first);
 
     // Integer
     set.add_function(AggregateFunction::new(
@@ -314,6 +315,7 @@ pub fn get_first_function() -> AggregateFunctionSet {
 /// Get the LAST aggregate function set.
 pub fn get_last_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("last".to_string());
+    set.set_dynamic_bind(super::decimal::bind_last);
 
     // Integer
     set.add_function(AggregateFunction::new(

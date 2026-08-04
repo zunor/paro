@@ -535,7 +535,6 @@ fn parse_uhugeint(text: &str) -> Result<u128> {
 
 fn parse_date_value(text: &str) -> Result<Value> {
     let days = parse_date_text(text).ok_or_else(|| paro_error::invalid_value("date", text))?;
-    let days = i32::try_from(days).map_err(|_| paro_error::invalid_value("date", text))?;
     Ok(Value::Date(days))
 }
 

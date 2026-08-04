@@ -475,6 +475,27 @@ impl LogicalType {
         if left == right {
             return left.clone();
         }
+        if let (
+            LogicalType::Decimal {
+                precision: left_precision,
+                scale: left_scale,
+            },
+            LogicalType::Decimal {
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) = (left, right)
+        {
+            let scale = (*left_scale).max(*right_scale);
+            let integral = left_precision
+                .saturating_sub(*left_scale)
+                .max(right_precision.saturating_sub(*right_scale));
+            let precision = integral.saturating_add(scale).min(38);
+            return LogicalType::Decimal {
+                precision,
+                scale: scale.min(precision),
+            };
+        }
         if matches!(left, LogicalType::Unknown) {
             return right.clone();
         }

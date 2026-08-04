@@ -128,6 +128,7 @@ define_sum_impl!(sum_f64, f64, f64); // Double -> Double
 
 pub fn get_sum_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("sum".to_string());
+    set.set_dynamic_bind(super::decimal::bind_sum);
 
     // Integer -> BigInt
     set.add_function(AggregateFunction::new(

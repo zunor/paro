@@ -180,6 +180,7 @@ impl CastRules {
 
             LogicalType::Float => Self::implicit_cast_float(to),
             LogicalType::Double => Self::implicit_cast_double(to),
+            LogicalType::Decimal { .. } => Self::implicit_cast_decimal(from, to),
 
             LogicalType::Date => Self::implicit_cast_date(to),
             LogicalType::Timestamp => Self::implicit_cast_timestamp(to),
@@ -473,6 +474,20 @@ impl CastRules {
         -1
     }
 
+    fn implicit_cast_decimal(from: &LogicalType, to: &LogicalType) -> i64 {
+        let LogicalType::Decimal { .. } = from else {
+            return -1;
+        };
+        match to {
+            // DECIMAL common-type inference may cap the result at precision
+            // 38. That can narrow either the integral or fractional range, but
+            // it is still the SQL numeric coercion: the cast performs checked
+            // rounding and reports overflow for values outside the target.
+            LogicalType::Decimal { .. } => target_type_cost(to),
+            _ => -1,
+        }
+    }
+
     // ========== Temporal Cast Rules ==========
 
     fn implicit_cast_date(to: &LogicalType) -> i64 {
@@ -565,6 +580,22 @@ mod tests {
         assert_eq!(
             CastRules::implicit_cast_cost(&LogicalType::Double, &LogicalType::Integer),
             -1
+        );
+    }
+
+    #[test]
+    fn test_decimal_common_type_coercion_can_change_scale() {
+        let source = LogicalType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        let target = LogicalType::Decimal {
+            precision: 38,
+            scale: 12,
+        };
+        assert_eq!(
+            CastRules::implicit_cast_cost(&source, &target),
+            target_type_cost(&target)
         );
     }
 

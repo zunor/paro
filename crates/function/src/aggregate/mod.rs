@@ -276,18 +276,27 @@ impl AggregateFunction {
 pub struct AggregateFunctionSet {
     pub name: String,
     pub functions: Vec<AggregateFunction>,
+    pub dynamic_bind: Option<AggregateFunctionSetBindFn>,
 }
+
+pub type AggregateFunctionSetBindFn =
+    fn(arguments: &[LogicalType]) -> Result<(AggregateFunction, Vec<LogicalType>)>;
 
 impl AggregateFunctionSet {
     pub fn new(name: String) -> Self {
         Self {
             name,
             functions: Vec::new(),
+            dynamic_bind: None,
         }
     }
 
     pub fn add_function(&mut self, function: AggregateFunction) {
         self.functions.push(function);
+    }
+
+    pub fn set_dynamic_bind(&mut self, bind: AggregateFunctionSetBindFn) {
+        self.dynamic_bind = Some(bind);
     }
 
     /// Find the best matching function for the given arguments using cost-based implicit casting.
@@ -333,10 +342,13 @@ impl AggregateFunctionSet {
 
         match best_match {
             Some((func, _cost, target_types)) => Ok((func.clone(), target_types)),
-            None => Err(paro_common::error::catalog(format!(
-                "No matching aggregate function found for {} with arguments {:?}",
-                self.name, arguments
-            ))),
+            None => match self.dynamic_bind {
+                Some(bind) => bind(arguments),
+                None => Err(paro_common::error::catalog(format!(
+                    "No matching aggregate function found for {} with arguments {:?}",
+                    self.name, arguments
+                ))),
+            },
         }
     }
 

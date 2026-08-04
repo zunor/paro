@@ -9,7 +9,9 @@ use crate::expression::{
 use crate::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::types::LogicalType;
-use paro_parser::ast::{BinaryOperator, ColumnRef, Expr, JsonOperator, SubqueryModifier};
+use paro_parser::ast::{
+    BinaryOperator, ColumnRef, Expr, IntervalKind, JsonOperator, SubqueryModifier,
+};
 /// Maximum expression depth to prevent stack overflow.
 const DEFAULT_MAX_EXPRESSION_DEPTH: usize = 1000;
 
@@ -369,6 +371,49 @@ impl<'a> ExpressionBinder<'a> {
             Expr::Array { exprs, .. } => bind::bind_array(self, exprs),
 
             Expr::MapAccess { expr, accessor, .. } => bind::bind_map_access(self, *expr, accessor),
+
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let mut args = vec![*expr, *substring_from];
+                if let Some(length) = substring_for {
+                    args.push(*length);
+                }
+                bind::bind_function(self.binder, None, "substring", args, false, None, vec![])
+            }
+
+            Expr::Extract { kind, expr, .. } => {
+                let function = match kind {
+                    IntervalKind::Year => "year",
+                    IntervalKind::Quarter => "quarter",
+                    IntervalKind::Month => "month",
+                    IntervalKind::Day => "day",
+                    IntervalKind::Hour => "hour",
+                    IntervalKind::Minute => "minute",
+                    IntervalKind::Second => "second",
+                    IntervalKind::Doy => "dayofyear",
+                    IntervalKind::Dow => "dayofweek",
+                    IntervalKind::Week | IntervalKind::ISOWeek => "week",
+                    IntervalKind::Epoch => "epoch",
+                    _ => {
+                        return Err(paro_error::not_implemented(format!(
+                            "EXTRACT({kind} FROM ...)"
+                        )))
+                    }
+                };
+                bind::bind_function(
+                    self.binder,
+                    None,
+                    function,
+                    vec![*expr],
+                    false,
+                    None,
+                    vec![],
+                )
+            }
 
             _ => Err(paro_error::not_implemented(format!(
                 "Expression not supported: {:?}",

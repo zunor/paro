@@ -144,6 +144,7 @@ define_minmax_impl!(max_f64, f64, cmp_max);
 
 pub fn get_min_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("min".to_string());
+    set.set_dynamic_bind(super::decimal::bind_min);
 
     // Integer
     set.add_function(AggregateFunction::new(
@@ -192,6 +193,7 @@ pub fn get_min_function() -> AggregateFunctionSet {
 
 pub fn get_max_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("max".to_string());
+    set.set_dynamic_bind(super::decimal::bind_max);
 
     // Integer
     set.add_function(AggregateFunction::new(

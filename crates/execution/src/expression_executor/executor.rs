@@ -2193,6 +2193,57 @@ impl ExpressionExecutor {
 
                 Ok(state.result.evaluated(true).expect("in result initialized"))
             }
+            OperatorType::Like | OperatorType::ILike => {
+                let value = Self::execute_value(
+                    &expr.children[0],
+                    &mut state.child_states[0],
+                    chunk,
+                    sel,
+                    count,
+                    runtime,
+                    params,
+                    shared,
+                )?;
+                let pattern = Self::execute_value(
+                    &expr.children[1],
+                    &mut state.child_states[1],
+                    chunk,
+                    sel,
+                    count,
+                    runtime,
+                    params,
+                    shared,
+                )?;
+                Self::store_value(&mut state.child_results[0], &value);
+                Self::store_value(&mut state.child_results[1], &pattern);
+
+                let result = Self::prepare_slot_result(
+                    &mut state.result,
+                    &LogicalType::Boolean,
+                    count,
+                    runtime.allocator(MemoryTag::BaseTable),
+                )?;
+                let case_insensitive = matches!(expr.operator_type, OperatorType::ILike);
+                for row_idx in 0..count {
+                    if value.as_vector().is_null(row_idx) || pattern.as_vector().is_null(row_idx) {
+                        result.set_null(row_idx, true);
+                        continue;
+                    }
+                    let value = value
+                        .as_vector()
+                        .get_string(row_idx)
+                        .ok_or_else(|| paro_error::internal("LIKE left operand was not VARCHAR"))?;
+                    let pattern = pattern.as_vector().get_string(row_idx).ok_or_else(|| {
+                        paro_error::internal("LIKE pattern operand was not VARCHAR")
+                    })?;
+                    result.set_bool(row_idx, sql_like(value, pattern, case_insensitive));
+                }
+
+                Ok(state
+                    .result
+                    .evaluated(true)
+                    .expect("like result initialized"))
+            }
             OperatorType::ArrayConstructor => {
                 let array_size = expr.children.len();
                 let mut result = Vector::try_new_array(
@@ -2329,9 +2380,10 @@ impl ExpressionExecutor {
 
                 Ok(value)
             }
-            OperatorType::Like | OperatorType::ILike | OperatorType::ArrayExtract => Err(
-                paro_error::not_implemented(format!("{:?} operator", expr.operator_type)),
-            ),
+            OperatorType::ArrayExtract => Err(paro_error::not_implemented(format!(
+                "{:?} operator",
+                expr.operator_type
+            ))),
         }
     }
 
@@ -2545,6 +2597,59 @@ impl ExpressionExecutor {
     }
 }
 
+fn sql_like(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let (value, pattern) = if case_insensitive {
+        (value.to_lowercase(), pattern.to_lowercase())
+    } else {
+        (value.to_string(), pattern.to_string())
+    };
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut memo = vec![vec![None; pattern.len() + 1]; value.len() + 1];
+
+    fn matches(
+        value: &[char],
+        pattern: &[char],
+        value_idx: usize,
+        pattern_idx: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(cached) = memo[value_idx][pattern_idx] {
+            return cached;
+        }
+
+        let matched = if pattern_idx == pattern.len() {
+            value_idx == value.len()
+        } else {
+            match pattern[pattern_idx] {
+                '%' => {
+                    matches(value, pattern, value_idx, pattern_idx + 1, memo)
+                        || (value_idx < value.len()
+                            && matches(value, pattern, value_idx + 1, pattern_idx, memo))
+                }
+                '_' => {
+                    value_idx < value.len()
+                        && matches(value, pattern, value_idx + 1, pattern_idx + 1, memo)
+                }
+                '\\' if pattern_idx + 1 < pattern.len() => {
+                    value_idx < value.len()
+                        && value[value_idx] == pattern[pattern_idx + 1]
+                        && matches(value, pattern, value_idx + 1, pattern_idx + 2, memo)
+                }
+                literal => {
+                    value_idx < value.len()
+                        && value[value_idx] == literal
+                        && matches(value, pattern, value_idx + 1, pattern_idx + 1, memo)
+                }
+            }
+        };
+        memo[value_idx][pattern_idx] = Some(matched);
+        matched
+    }
+
+    matches(&value, &pattern, 0, 0, &mut memo)
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -2554,6 +2659,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn like_matches_sql_wildcards_and_escapes() {
+        assert!(sql_like("PROMO BURNISHED COPPER", "PROMO%", false));
+        assert!(sql_like(
+            "special instructions and requests",
+            "%special%requests%",
+            false
+        ));
+        assert!(sql_like("A_B", "A\\_B", false));
+        assert!(sql_like("aXb", "A_B", true));
+        assert!(!sql_like("BRASS PLATED", "%BRASS", false));
+    }
     use crate::memory_runtime::QueryMemoryPool;
     use crate::runtime::{
         ParameterBindingEpoch, ParameterBindings, QueryOutputPort, QueryRuntimeContext,

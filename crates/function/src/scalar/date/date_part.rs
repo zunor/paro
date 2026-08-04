@@ -321,6 +321,27 @@ pub fn extract_from_time(time_micros: i64, part: DatePartSpecifier) -> i64 {
 // ============================================================================
 
 macro_rules! define_extract_fn {
+    ($name:ident, $part:expr, Date, $extract_fn:ident) => {
+        fn $name(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
+            let count = input.size();
+            let src = input
+                .column(0)
+                .ok_or_else(|| paro_common::error::internal("Missing input column".to_string()))?;
+
+            result.set_count(count);
+
+            for i in 0..count {
+                if src.is_null(i) {
+                    result.validity_mut().set_null(i);
+                } else {
+                    let val = i64::from(src.get_i32(i).unwrap_or(0));
+                    result.set_i64(i, $extract_fn(val, $part));
+                }
+            }
+
+            Ok(())
+        }
+    };
     ($name:ident, $part:expr, $input_type:ident, $extract_fn:ident) => {
         fn $name(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
             let count = input.size();

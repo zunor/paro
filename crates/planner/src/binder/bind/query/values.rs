@@ -95,7 +95,13 @@ mod tests {
     fn mixed_values_rows_are_cast_to_their_common_column_type() {
         for (sql, expected_type) in [
             ("VALUES (1), (100000000000)", LogicalType::BigInt),
-            ("VALUES (1), (2.5)", LogicalType::Double),
+            (
+                "VALUES (1), (2.5)",
+                LogicalType::Decimal {
+                    precision: 2,
+                    scale: 1,
+                },
+            ),
             ("VALUES (-1), (100000000000)", LogicalType::BigInt),
         ] {
             let values = bind_values(sql);
