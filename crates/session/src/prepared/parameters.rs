@@ -104,17 +104,6 @@ pub(crate) fn render_probe_statement(
     bind_expr_arguments(stmt, &exprs).map(Some)
 }
 
-pub(crate) fn typed_null_parameter_env(
-    parameter_types: &[Option<LogicalType>],
-) -> TypedParameterEnv {
-    TypedParameterEnv::new(
-        parameter_types
-            .iter()
-            .map(|ty| BoundParameter::null(ty.clone().unwrap_or(LogicalType::Unknown)))
-            .collect(),
-    )
-}
-
 pub(crate) fn typed_parameter_env_from_values(
     parameter_types: &[Option<LogicalType>],
     values: &[Value],

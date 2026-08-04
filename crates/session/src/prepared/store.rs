@@ -8,8 +8,9 @@ use crate::dispatch::UtilityCommand;
 use crate::prepared::typed_parameters::TypedParameterEnv;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_context::CompileEnvironmentKey;
-use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
+use paro_execution::query_executor::compiled::{
+    CompiledStatement, ExecutionRequest, ResultColumnDesc,
+};
 use paro_parser::ast::Statement;
 
 use super::plan_cache::PlanCacheMode;
@@ -46,17 +47,13 @@ pub struct PreparedStatementEntry {
     pub plan_cache_mode: PlanCacheMode,
     pub generic_plan: Option<CompiledStatement>,
     pub custom_plan_executions: u32,
-    pub dependency_epoch: u64,
-    pub compile_environment: CompileEnvironmentKey,
     pub source: PreparedStatementSource,
 }
 
 #[derive(Debug, Clone)]
 pub enum PortalKind {
-    Compiled(Box<CompiledStatement>),
-    Query {
-        parameter_env: TypedParameterEnv,
-    },
+    Query(ExecutionRequest),
+    Materialized,
     Utility(Box<UtilityCommand>),
     ClientCopy {
         stmt: Box<Statement>,
@@ -291,7 +288,6 @@ mod tests {
     use crate::prepared::portal::{
         CursorHoldability, FormatCode, PortalExecutionState, ScrollMode,
     };
-    use paro_context::CompileEnvironmentKey;
     use paro_parser::ast::Statement;
 
     fn parse_single(sql: &str) -> Statement {
@@ -313,14 +309,6 @@ mod tests {
             plan_cache_mode: PlanCacheMode::Auto,
             generic_plan: None,
             custom_plan_executions: 0,
-            dependency_epoch: 0,
-            compile_environment: CompileEnvironmentKey {
-                current_database: "postgres".to_string(),
-                current_schema: "public".to_string(),
-                search_path: Vec::new(),
-                visible_generation: 0,
-                settings_fingerprint: 0,
-            },
             source: PreparedStatementSource::Protocol,
         }
     }

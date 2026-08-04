@@ -229,7 +229,6 @@ mod tests {
         CursorHoldability, FormatCode, PortalExecutionState, ScrollMode,
     };
     use crate::prepared::store::PreparedStatementSource;
-    use paro_context::CompileEnvironmentKey;
     use paro_parser::ast::Statement;
 
     fn parse_single(sql: &str) -> Statement {
@@ -251,14 +250,6 @@ mod tests {
             plan_cache_mode: PlanCacheMode::Auto,
             generic_plan: None,
             custom_plan_executions: 0,
-            dependency_epoch: 0,
-            compile_environment: CompileEnvironmentKey {
-                current_database: "postgres".to_string(),
-                current_schema: "public".to_string(),
-                search_path: Vec::new(),
-                visible_generation: 0,
-                settings_fingerprint: 0,
-            },
             source: PreparedStatementSource::Sql,
         }
     }

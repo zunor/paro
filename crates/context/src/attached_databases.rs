@@ -143,6 +143,7 @@ impl Default for AttachedDatabaseCommitPoisonSnapshot {
 #[derive(Debug, Clone)]
 pub struct AttachedDatabaseSnapshot {
     pub identity: DatabaseSnapshotIdentity,
+    pub catalog_epoch: u64,
     pub catalog: Arc<ParoCatalog>,
     pub tablet_meta: Option<Arc<TabletMetaManager>>,
     pub wal_metrics: AttachedDatabaseWalMetricsSnapshot,
@@ -170,6 +171,10 @@ impl AttachedDatabaseSnapshot {
 
     pub fn catalog(&self) -> &Arc<ParoCatalog> {
         &self.catalog
+    }
+
+    pub fn catalog_epoch(&self) -> u64 {
+        self.catalog_epoch
     }
 
     pub fn tablet_meta_manager(&self) -> Option<Arc<TabletMetaManager>> {

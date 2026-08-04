@@ -24,6 +24,7 @@ pub struct CompileEnvironmentKey {
     pub current_schema: String,
     pub search_path: Vec<CatalogSearchEntry>,
     pub visible_generation: u64,
+    pub catalog_epochs: Vec<(u64, u64)>,
     pub settings_fingerprint: u64,
 }
 
@@ -263,6 +264,11 @@ impl StatementContext {
             current_schema: self.env.current_schema.clone(),
             search_path: self.env.search_path.clone(),
             visible_generation: self.databases.visible_generation,
+            catalog_epochs: self
+                .databases
+                .iter()
+                .map(|database| (database.id(), database.catalog_epoch()))
+                .collect(),
             settings_fingerprint: self.settings.fingerprint(),
         }
     }
@@ -274,5 +280,24 @@ impl StatementContext {
         graph_name: impl Into<String>,
     ) -> GraphId {
         GraphId::new(catalog, schema, graph_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate::TestStatementContextBuilder;
+
+    #[test]
+    fn compile_environment_keeps_the_frozen_catalog_epoch() {
+        let context = TestStatementContextBuilder::minimal().build();
+        let frozen = context.compile_environment_key();
+        let catalog = context.catalog();
+
+        catalog.gc_epoch_handle().fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(context.compile_environment_key(), frozen);
+        assert_ne!(catalog.gc_epoch(), frozen.catalog_epochs[0].1);
     }
 }

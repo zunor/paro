@@ -297,6 +297,7 @@ impl Session {
                         path: database.path().to_string(),
                         db_type: database.db_type(),
                     },
+                    catalog_epoch: database.catalog().gc_epoch(),
                     catalog: database.catalog().clone(),
                     tablet_meta: database.tablet_meta_manager(),
                     wal_metrics: AttachedDatabaseWalMetricsSnapshot {

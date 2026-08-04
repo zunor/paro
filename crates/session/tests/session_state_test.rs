@@ -22,7 +22,6 @@ fn parse_single(sql: &str) -> paro_parser::ast::Statement {
 async fn test_reset_session_state_preserves_active_statement_scope() {
     let mut session = create_test_session();
 
-    let compile_environment = session.compile_environment_key();
     session
         .state
         .add_prepared_statement(PreparedStatementEntry {
@@ -34,8 +33,6 @@ async fn test_reset_session_state_preserves_active_statement_scope() {
             plan_cache_mode: PlanCacheMode::Auto,
             generic_plan: None,
             custom_plan_executions: 0,
-            dependency_epoch: 0,
-            compile_environment,
             source: PreparedStatementSource::Sql,
         });
     session.state.enable_profiler();

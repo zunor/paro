@@ -18,6 +18,18 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
         "CompiledStatement must not expose a legacy physical_plan field"
     );
     assert!(
+        compiled.contains("image: Arc<CompiledStatementImage>")
+            && compiled.contains("compile_environment: CompileEnvironmentKey")
+            && compiled.contains("pub struct ExecutionRequest"),
+        "compiled programs must carry immutable provenance and separate execution inputs"
+    );
+    assert!(
+        !compiled.contains("pub parameter_bindings:")
+            && !compiled.contains("pub executable:")
+            && !compiled.contains("pub result_schema:"),
+        "CompiledStatement must not expose mutable or execution-local image state"
+    );
+    assert!(
         !compiled.contains("LegacyPhysicalPlan") && !compiled.contains("legacy_physical_plan"),
         "legacy compiled executable construction must be removed"
     );
@@ -26,6 +38,11 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
     assert!(
         executor.contains("CompiledExecutable::Program(program)"),
         "Executor must dispatch typed StatementProgram as the primary path"
+    );
+    assert!(
+        executor.contains("pub fn execute(&self, request: ExecutionRequest)")
+            && executor.contains("let (compiled, parameter_bindings) = request.into_parts()"),
+        "Executor must require an explicit plan-plus-bindings execution request"
     );
     assert!(
         !executor.contains("CompiledExecutable::LegacyPhysicalPlan")
