@@ -547,12 +547,7 @@ impl SourceCursorBench {
         let query = query_context(QueryOutputPort::unbounded());
         let template = single_i32_chunk(7);
         let chunks = (0..SOURCE_CHUNKS)
-            .map(|_| {
-                let mut chunk =
-                    Chunk::try_new(bench_allocator()).expect("source chunk slot should allocate");
-                chunk.reference(&template);
-                chunk
-            })
+            .map(|_| template.clone_referencing_vectors())
             .collect::<Vec<_>>();
         let scratch = PipelineScratchLayout::new(
             paro_execution::runtime::ChunkLayout::new(vec![LogicalType::Integer], VECTOR_SIZE),
@@ -896,7 +891,6 @@ struct SinkPendingBench {
     runtime: Arc<PipelineRuntime>,
     task: PipelineTaskState,
     input: Chunk,
-    filler: Chunk,
     template: Chunk,
     profiler: OperatorProfiler,
 }
@@ -933,8 +927,6 @@ impl SinkPendingBench {
             task,
             input: Chunk::try_init_empty(&[LogicalType::Integer], bench_allocator())
                 .expect("input chunk should allocate"),
-            filler: Chunk::try_init_empty(&[LogicalType::Integer], bench_allocator())
-                .expect("filler chunk should allocate"),
             template: single_i32_chunk(19),
             profiler: OperatorProfiler::new(ExplainProfiler::new()),
         }
@@ -968,13 +960,13 @@ impl SinkPendingBench {
         for _ in 0..PENDING_ITERS {
             while self.query.output.pop_front().is_some() {}
 
-            self.filler.reference(&self.template);
-            match self.query.output.try_push(self.filler.take_owned()) {
+            let filler = self.template.clone_referencing_vectors();
+            match self.query.output.try_push(filler) {
                 QueryOutputWrite::Written => {}
                 QueryOutputWrite::Blocked(_) => panic!("output should accept filler chunk"),
             }
 
-            self.input.reference(divan::black_box(&self.template));
+            self.input = divan::black_box(&self.template).clone_referencing_vectors();
             let blocked = self.consume_once();
             assert!(matches!(blocked, SinkPoll::Pending(_)));
             checksum = checksum.wrapping_add(self.input.size());

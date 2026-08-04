@@ -77,12 +77,7 @@ impl MaterializedSourceBench {
             Arc::clone(&allocator),
         );
         let mut chunks = (0..SOURCE_CHUNKS)
-            .map(|_| {
-                let mut chunk =
-                    Chunk::try_new(Arc::clone(&allocator)).expect("benchmark materialized chunk");
-                chunk.reference(&template);
-                chunk
-            })
+            .map(|_| template.clone_referencing_vectors())
             .collect::<Vec<_>>();
         handle
             .append_chunks(&mut chunks)
@@ -118,7 +113,8 @@ impl MaterializedSourceBench {
             memory: TaskMemoryGrants::detached(Arc::clone(&allocator)),
             scratch: ExpressionScratchArena::default(),
             profiler: OperatorProfiler::disabled(),
-            output: Chunk::try_new(allocator).expect("benchmark output chunk"),
+            output: Chunk::try_initialize(&[LogicalType::Integer], 1, allocator)
+                .expect("benchmark output chunk"),
             exec,
             global,
             local,
