@@ -455,6 +455,26 @@ mod tests {
     }
 
     #[test]
+    fn decimal_sum_set_prefers_dynamic_binding_over_double_coercion() {
+        let input = LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let (sum, targets) = crate::aggregate::distributive::sum::get_sum_function()
+            .bind(std::slice::from_ref(&input))
+            .unwrap();
+
+        assert_eq!(targets, vec![input]);
+        assert_eq!(
+            sum.return_type,
+            LogicalType::Decimal {
+                precision: 38,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
     fn decimal_sum_reports_declared_precision_overflow() {
         let data = DecimalAggregateBindData {
             op: DecimalAggregateOp::Sum,

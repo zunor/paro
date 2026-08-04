@@ -484,6 +484,11 @@ impl CastRules {
             // it is still the SQL numeric coercion: the cast performs checked
             // rounding and reports overflow for values outside the target.
             LogicalType::Decimal { .. } => target_type_cost(to),
+            // Exact DECIMAL overloads are selected by their dynamic binders
+            // before coercive fixed overloads. Allowing this conversion is
+            // therefore limited to genuinely mixed DECIMAL/DOUBLE contexts
+            // and explicit DOUBLE targets such as nested collection elements.
+            LogicalType::Double => target_type_cost(to),
             _ => -1,
         }
     }
@@ -596,6 +601,22 @@ mod tests {
         assert_eq!(
             CastRules::implicit_cast_cost(&source, &target),
             target_type_cost(&target)
+        );
+    }
+
+    #[test]
+    fn test_decimal_can_coerce_to_double_but_not_float() {
+        let decimal = LogicalType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        assert_eq!(
+            CastRules::implicit_cast_cost(&decimal, &LogicalType::Double),
+            target_type_cost(&LogicalType::Double)
+        );
+        assert_eq!(
+            CastRules::implicit_cast_cost(&decimal, &LogicalType::Float),
+            -1
         );
     }
 

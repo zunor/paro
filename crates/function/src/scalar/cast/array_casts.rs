@@ -23,7 +23,7 @@ use std::sync::Arc;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::{ArrayType, LogicalType};
-use paro_common::vector::{ArrayVector, ArrayView, Vector};
+use paro_common::vector::{ArrayVector, ArrayView, DataRef, Vector, VectorType, VectorView};
 
 use super::{BindCastInput, BoundCastData, BoundCastInfo, CastExecCtx};
 use crate::scalar::executor::varlen::VarcharResultWriter;
@@ -39,6 +39,24 @@ use crate::scalar::executor::varlen::VarcharResultWriter;
 pub struct ArrayBoundCastData {
     /// Cast function for child elements
     pub child_cast_info: BoundCastInfo,
+}
+
+/// Bound child conversion for variable-length LIST casts.
+#[derive(Debug)]
+pub struct ListBoundCastData {
+    pub child_cast_info: BoundCastInfo,
+}
+
+impl BoundCastData for ListBoundCastData {
+    fn copy(&self) -> Box<dyn BoundCastData> {
+        Box::new(Self {
+            child_cast_info: self.child_cast_info.clone(),
+        })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ArrayBoundCastData {
@@ -546,6 +564,152 @@ pub fn array_to_list_cast(
 }
 
 // ============================================================================
+// List -> List Cast (variable-length element conversion)
+// ============================================================================
+
+fn list_child_vector(vector: &Vector) -> Result<&Vector> {
+    match vector.vector_type() {
+        VectorType::Dictionary => {
+            let child = vector
+                .child()
+                .ok_or_else(|| paro_error::internal("Dictionary LIST missing child"))?;
+            list_child_vector(child)
+        }
+        VectorType::Flat | VectorType::Constant => vector
+            .child()
+            .map(AsRef::as_ref)
+            .ok_or_else(|| paro_error::internal("LIST vector missing child")),
+        VectorType::Sequence => Err(paro_error::internal(
+            "LIST vector cannot use sequence encoding",
+        )),
+    }
+}
+
+fn read_list_entry(
+    entries: &VectorView<'_>,
+    child_len: usize,
+    row: usize,
+) -> Result<(usize, usize)> {
+    let DataRef::Ptr(data) = entries.data() else {
+        return Err(paro_error::internal(
+            "LIST entries cannot use sequence encoding",
+        ));
+    };
+    let entry = unsafe { data.add(entries.physical_index(row) * 8) as *const u32 };
+    let offset = unsafe { std::ptr::read_unaligned(entry) as usize };
+    let length = unsafe { std::ptr::read_unaligned(entry.add(1)) as usize };
+    if offset.saturating_add(length) > child_len {
+        return Err(paro_error::internal(format!(
+            "Invalid LIST entry ({offset}, {length}), child length is {child_len}",
+        )));
+    }
+    Ok((offset, length))
+}
+
+fn write_list_entry(result: &mut Vector, row: usize, offset: usize, length: usize) -> Result<()> {
+    let offset = u32::try_from(offset)
+        .map_err(|_| paro_error::out_of_range("LIST child offset exceeds u32"))?;
+    let length = u32::try_from(length)
+        .map_err(|_| paro_error::out_of_range("LIST child length exceeds u32"))?;
+    let data = unsafe { result.flat_data_mut::<u8>() };
+    let entry = unsafe { data.add(row * 8) as *mut u32 };
+    unsafe {
+        std::ptr::write_unaligned(entry, offset);
+        std::ptr::write_unaligned(entry.add(1), length);
+    }
+    Ok(())
+}
+
+/// Cast a LIST by materializing its selected child rows once, executing the
+/// bound child cast vector-wise, and rebuilding compact parent entries.
+pub fn list_to_list_cast(
+    source: &Vector,
+    result: &mut Vector,
+    count: usize,
+    ctx: &CastExecCtx<'_>,
+) -> Result<bool> {
+    let (source_child_type, target_child_type) =
+        match (source.logical_type(), result.logical_type()) {
+            (LogicalType::List(source), LogicalType::List(target)) => {
+                (source.as_ref().clone(), target.as_ref().clone())
+            }
+            _ => {
+                return Err(paro_error::internal(
+                    "list_to_list_cast requires LIST source and target",
+                ))
+            }
+        };
+    let cast_data = ctx
+        .cast_data
+        .and_then(|data| data.as_any().downcast_ref::<ListBoundCastData>())
+        .ok_or_else(|| paro_error::internal("list_to_list_cast: missing cast data"))?;
+    let entries = source.try_to_view(count)?;
+    let source_child = list_child_vector(source)?;
+
+    let mut rows = Vec::with_capacity(count);
+    let mut child_count = 0usize;
+    for row in 0..count {
+        if !entries.is_valid(row) {
+            rows.push(None);
+            continue;
+        }
+        let (offset, length) = read_list_entry(&entries, source_child.len(), row)?;
+        child_count = child_count
+            .checked_add(length)
+            .ok_or_else(|| paro_error::out_of_range("LIST child count overflow"))?;
+        rows.push(Some((offset, length)));
+    }
+
+    let allocator = result.allocator().clone();
+    let mut materialized =
+        Vector::try_new(source_child_type, child_count.max(1), allocator.clone())?;
+    materialized.try_set_count(child_count)?;
+    let mut destination = 0usize;
+    for (offset, length) in rows.iter().flatten().copied() {
+        materialized.try_copy_range(destination, source_child, offset, length)?;
+        destination += length;
+    }
+
+    let mut converted = Vector::try_new(target_child_type, child_count.max(1), allocator)?;
+    converted.try_set_count(child_count)?;
+    let child_success = if child_count == 0 {
+        true
+    } else {
+        let child_ctx = CastExecCtx {
+            runtime: ctx.runtime,
+            try_cast: ctx.try_cast,
+            cast_data: cast_data
+                .child_cast_info
+                .cast_data
+                .as_ref()
+                .map(AsRef::as_ref),
+        };
+        cast_data
+            .child_cast_info
+            .execute(&materialized, &mut converted, child_count, &child_ctx)?
+    };
+
+    result.set_child(Arc::new(converted));
+    result.set_count(count);
+    let mut output_offset = 0usize;
+    for (row, entry) in rows.into_iter().enumerate() {
+        match entry {
+            Some((_, length)) => {
+                write_list_entry(result, row, output_offset, length)?;
+                result.set_null(row, false);
+                output_offset += length;
+            }
+            None => {
+                write_list_entry(result, row, output_offset, 0)?;
+                result.set_null(row, true);
+            }
+        }
+    }
+
+    Ok(child_success)
+}
+
+// ============================================================================
 // Bind Functions
 // ============================================================================
 
@@ -603,6 +767,16 @@ pub fn bind_array_casts(
         }
     }
 
+    if let (LogicalType::List(source_child), LogicalType::List(target_child)) = (source, target) {
+        let child_cast = input.get_cast_function(source_child, target_child)?;
+        return Ok(Some(BoundCastInfo::array_with_data(
+            list_to_list_cast,
+            Arc::new(ListBoundCastData {
+                child_cast_info: child_cast,
+            }),
+        )));
+    }
+
     Ok(None)
 }
 
@@ -613,6 +787,7 @@ pub fn bind_array_casts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::cast::{decimal_casts, CastFunctionSet};
     use crate::scalar::FunctionExecContext;
 
     #[derive(Debug)]
@@ -842,5 +1017,72 @@ mod tests {
             }
             _ => panic!("Expected Array value, got {:?}", val1),
         }
+    }
+
+    #[test]
+    fn list_to_list_cast_preserves_nested_boundaries_and_nulls() {
+        let decimal_type = LogicalType::Decimal {
+            precision: 3,
+            scale: 1,
+        };
+        let source_type = LogicalType::List(Box::new(decimal_type.clone()));
+        let target_type = LogicalType::List(Box::new(LogicalType::Double));
+        let allocator = paro_common::test_utils::test_allocator();
+
+        let mut source = Vector::try_new(source_type.clone(), 4, allocator.clone()).unwrap();
+        source.try_set_count(4).unwrap();
+        source.set_value(
+            0,
+            &Value::List(
+                vec![
+                    Value::Decimal(15, 3, 1),
+                    Value::Null(decimal_type.clone()),
+                    Value::Decimal(25, 3, 1),
+                ],
+                decimal_type.clone(),
+            ),
+        );
+        source.set_null(1, true);
+        source.set_value(2, &Value::List(vec![], decimal_type.clone()));
+        source.set_value(
+            3,
+            &Value::List(vec![Value::Decimal(-20, 3, 1)], decimal_type),
+        );
+
+        let dictionary =
+            paro_common::test_utils::test_dictionary(Arc::new(source), vec![3, 1, 2, 0]);
+        let mut result = Vector::try_new(target_type.clone(), 4, allocator).unwrap();
+
+        let mut casts = CastFunctionSet::new();
+        casts.register_bind_function(decimal_casts::bind_decimal_casts);
+        casts.register_bind_function(bind_array_casts);
+        let bound = casts.get_cast_function(&source_type, &target_type).unwrap();
+        let ctx = CastExecCtx {
+            runtime: &NOOP_RUNTIME,
+            try_cast: false,
+            cast_data: bound.cast_data.as_deref(),
+        };
+
+        assert!(bound.execute(&dictionary, &mut result, 4, &ctx).unwrap());
+        assert_eq!(
+            result.get_value(0),
+            Value::List(vec![Value::Double(-2.0)], LogicalType::Double)
+        );
+        assert_eq!(result.get_value(1), Value::Null(target_type));
+        assert_eq!(
+            result.get_value(2),
+            Value::List(vec![], LogicalType::Double)
+        );
+        assert_eq!(
+            result.get_value(3),
+            Value::List(
+                vec![
+                    Value::Double(1.5),
+                    Value::Null(LogicalType::Double),
+                    Value::Double(2.5),
+                ],
+                LogicalType::Double,
+            )
+        );
     }
 }

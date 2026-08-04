@@ -87,7 +87,7 @@ PROJECTION  (rows=30)
   ->  PROJECTION  (rows=30)
     Output: r
     ->  FILTER  (rows=30)
-      Filter: #0 < 0.5
+      Filter: #0 < CAST(0.5 AS DOUBLE)
       ->  PROJECTION  (rows=100)
         Output: r
         ->  TABLE_FUNCTION_SCAN  (rows=100)

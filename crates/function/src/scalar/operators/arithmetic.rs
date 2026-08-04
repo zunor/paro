@@ -628,6 +628,25 @@ mod tests {
     }
 
     #[test]
+    fn mixed_decimal_double_arithmetic_uses_double() {
+        let mut set = ScalarFunctionSet::new("+".to_string());
+        register_arithmetic_functions(&mut set);
+
+        let (function, target_types) = set
+            .bind(&[
+                LogicalType::Decimal {
+                    precision: 8,
+                    scale: 2,
+                },
+                LogicalType::Double,
+            ])
+            .unwrap();
+
+        assert_eq!(target_types, vec![LogicalType::Double, LogicalType::Double]);
+        assert_eq!(function.return_type, LogicalType::Double);
+    }
+
+    #[test]
     fn decimal_multiplication_uses_wide_intermediate() {
         let operand = i256::from(20_000_000_000_000_000_000_i128);
         let product = operand.checked_mul(operand).unwrap();

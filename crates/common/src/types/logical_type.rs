@@ -455,21 +455,33 @@ impl LogicalType {
             }
         }
 
-        // Fixed arrays of different lengths cannot be cast to one another, but
-        // both have a lossless common representation as a variable-length list.
-        // This also covers empty array literals (size 0) mixed with non-empty
-        // arrays in VALUES and other common-type inference sites.
-        if let (
-            LogicalType::Array(left_child, left_size),
-            LogicalType::Array(right_child, right_size),
-        ) = (left, right)
-        {
-            if left_size != right_size {
+        // Nested common types must combine their children rather than selecting
+        // one whole container by cast cost. Selecting LIST(DECIMAL(2,1)) over
+        // ARRAY(DECIMAL(3,2), 2), for example, loses a fractional digit before
+        // the value ever reaches its final target type.
+        match (left, right) {
+            (
+                LogicalType::Array(left_child, left_size),
+                LogicalType::Array(right_child, right_size),
+            ) => {
+                let child = Box::new(Self::max_logical_type(left_child, right_child));
+                return if left_size == right_size {
+                    LogicalType::Array(child, *left_size)
+                } else {
+                    // Different fixed lengths share a lossless variable-length
+                    // representation. This also covers empty array literals.
+                    LogicalType::List(child)
+                };
+            }
+            (LogicalType::List(left_child), LogicalType::List(right_child))
+            | (LogicalType::List(left_child), LogicalType::Array(right_child, _))
+            | (LogicalType::Array(left_child, _), LogicalType::List(right_child)) => {
                 return LogicalType::List(Box::new(Self::max_logical_type(
                     left_child,
                     right_child,
                 )));
             }
+            _ => {}
         }
 
         if left == right {
@@ -527,6 +539,18 @@ impl LogicalType {
                 }
                 _ => left.clone(),
             };
+        }
+
+        // FLOAT and DECIMAL cannot represent one another without narrowing,
+        // but both have DOUBLE as their established mixed-numeric domain.
+        // Resolve that common supertype explicitly instead of falling through
+        // to the non-numeric VARCHAR fallback.
+        if matches!(
+            (left, right),
+            (LogicalType::Float, LogicalType::Decimal { .. })
+                | (LogicalType::Decimal { .. }, LogicalType::Float)
+        ) {
+            return LogicalType::Double;
         }
 
         // IntegerLiteral vs concrete type: resolve to concrete type
@@ -994,6 +1018,47 @@ mod tests {
                 &LogicalType::Array(Box::new(LogicalType::Boolean), 2),
             ),
             LogicalType::List(Box::new(LogicalType::Boolean))
+        );
+
+        // Nested child types are widened recursively, including after an ARRAY
+        // has already become a LIST because another row had a different length.
+        let decimal_2_1 = LogicalType::Decimal {
+            precision: 2,
+            scale: 1,
+        };
+        let decimal_3_2 = LogicalType::Decimal {
+            precision: 3,
+            scale: 2,
+        };
+        assert_eq!(
+            LogicalType::max_logical_type(
+                &LogicalType::Array(Box::new(decimal_2_1.clone()), 2),
+                &LogicalType::Array(Box::new(decimal_3_2.clone()), 2),
+            ),
+            LogicalType::Array(Box::new(decimal_3_2.clone()), 2)
+        );
+        assert_eq!(
+            LogicalType::max_logical_type(
+                &LogicalType::List(Box::new(decimal_2_1)),
+                &LogicalType::Array(Box::new(decimal_3_2.clone()), 2),
+            ),
+            LogicalType::List(Box::new(decimal_3_2))
+        );
+    }
+
+    #[test]
+    fn decimal_and_float_use_double_common_type() {
+        let decimal = LogicalType::Decimal {
+            precision: 2,
+            scale: 1,
+        };
+        assert_eq!(
+            LogicalType::max_logical_type(&decimal, &LogicalType::Float),
+            LogicalType::Double
+        );
+        assert_eq!(
+            LogicalType::max_logical_type(&LogicalType::Float, &decimal),
+            LogicalType::Double
         );
     }
 

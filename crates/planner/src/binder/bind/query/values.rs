@@ -131,4 +131,22 @@ mod tests {
             .iter()
             .all(|row| row[0].return_type() == expected_type));
     }
+
+    #[test]
+    fn decimal_list_common_type_preserves_maximum_scale() {
+        let values = bind_values("VALUES ([1.5, 2.5]), ([0.0]), (NULL), ([3.14, -2.0])");
+        let expected_type = LogicalType::List(Box::new(LogicalType::Decimal {
+            precision: 3,
+            scale: 2,
+        }));
+
+        assert_eq!(
+            values.types.as_slice(),
+            std::slice::from_ref(&expected_type)
+        );
+        assert!(values
+            .values
+            .iter()
+            .all(|row| row[0].return_type() == expected_type));
+    }
 }

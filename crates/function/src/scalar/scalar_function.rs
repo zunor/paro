@@ -345,6 +345,17 @@ impl ScalarFunctionSet {
     }
 
     pub fn bind(&self, arguments: &[LogicalType]) -> Result<(ScalarFunction, Vec<LogicalType>)> {
+        // Dynamic binders model parameterized signatures (notably DECIMAL(p,s)).
+        // Give them first refusal so a coercive fixed signature such as
+        // DOUBLE,DOUBLE cannot erase the parameterized type semantics.
+        let dynamic_error = if let Some(bind) = self.dynamic_bind {
+            match bind(arguments) {
+                Ok(bound) => return Ok(bound),
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
         let mut best_match: Option<(&ScalarFunction, i64, Vec<LogicalType>)> = None;
 
         for func in &self.functions {
@@ -434,8 +445,8 @@ impl ScalarFunctionSet {
 
         match best_match {
             Some((func, _cost, target_types)) => Ok((func.clone(), target_types)),
-            None => match self.dynamic_bind {
-                Some(bind) => bind(arguments),
+            None => match dynamic_error {
+                Some(error) => Err(error),
                 None => Err(paro_error::function_not_found(format!(
                     "{} with arguments {:?}",
                     self.name, arguments

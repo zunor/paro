@@ -323,6 +323,17 @@ impl AggregateFunctionSet {
     /// // Result: sum(INTEGER) - cast SMALLINT to INTEGER (lower cost than DOUBLE)
     /// ```
     pub fn bind(&self, arguments: &[LogicalType]) -> Result<(AggregateFunction, Vec<LogicalType>)> {
+        // Parameterized signatures such as DECIMAL(p,s) cannot be represented
+        // by the fixed overload table. Prefer a dynamic match before considering
+        // coercive fixed overloads (for example DECIMAL -> DOUBLE).
+        let dynamic_error = if let Some(bind) = self.dynamic_bind {
+            match bind(arguments) {
+                Ok(bound) => return Ok(bound),
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
         let mut best_match: Option<(&AggregateFunction, i64, Vec<LogicalType>)> = None;
 
         for func in &self.functions {
@@ -346,8 +357,8 @@ impl AggregateFunctionSet {
 
         match best_match {
             Some((func, _cost, target_types)) => Ok((func.clone(), target_types)),
-            None => match self.dynamic_bind {
-                Some(bind) => bind(arguments),
+            None => match dynamic_error {
+                Some(error) => Err(error),
                 None => Err(paro_common::error::catalog(format!(
                     "No matching aggregate function found for {} with arguments {:?}",
                     self.name, arguments
