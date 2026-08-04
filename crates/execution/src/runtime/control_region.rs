@@ -70,7 +70,6 @@ impl ControlRegionRuntimeSet {
                             programs,
                             handles.clone(),
                             params.clone(),
-                            query,
                             &shared_sinks,
                         )
                         .map(ControlRegionRuntime::CorrelatedSubquery)
@@ -477,12 +476,15 @@ pub enum RecursiveCteGateAction {
 pub struct CorrelatedSubqueryControllerState {
     pub id: ControlRegionId,
     pub side: DelimJoinSide,
-    pub capture: Arc<PipelineRuntime>,
+    pub capture: Arc<PipelineProgram>,
     pub dependent_roots: Box<[PipelineSubgraphRoot]>,
-    pub join: Arc<PipelineRuntime>,
+    pub join: Arc<PipelineProgram>,
     pub delim_values: Arc<DelimHandle>,
     pub cached_outer: Option<Arc<DelimHandle>>,
     pub phase: CorrelatedSubqueryPhase,
+    handles: Arc<BreakerHandleRegistry>,
+    params: Arc<ParameterBindings>,
+    shared_sinks: SharedSinkRuntimeSet,
 }
 
 impl CorrelatedSubqueryControllerState {
@@ -492,7 +494,6 @@ impl CorrelatedSubqueryControllerState {
         programs: &PipelineProgramSet,
         handles: Arc<BreakerHandleRegistry>,
         params: Arc<ParameterBindings>,
-        query: &QueryRuntimeContext,
         shared_sinks: &SharedSinkRuntimeSet,
     ) -> Result<Self> {
         let capture = programs
@@ -506,38 +507,36 @@ impl CorrelatedSubqueryControllerState {
         Ok(Self {
             id,
             side: region.side,
-            capture: Arc::new(pipeline_runtime_with_shared_sink(
-                capture,
-                handles.clone(),
-                params.clone(),
-                query,
-                shared_sinks,
-            )?),
+            capture,
             dependent_roots: region.dependent_roots.clone().into_boxed_slice(),
-            join: Arc::new(pipeline_runtime_with_shared_sink(
-                join,
-                handles.clone(),
-                params,
-                query,
-                shared_sinks,
-            )?),
+            join,
             delim_values: handles.get(HandleRef::<DelimHandle>::new(region.delim_values))?,
             cached_outer: region
                 .cached_outer
                 .map(|handle| handles.get(HandleRef::<DelimHandle>::new(handle)))
                 .transpose()?,
             phase: CorrelatedSubqueryPhase::CaptureReady,
+            handles,
+            params,
+            shared_sinks: shared_sinks.clone(),
         })
     }
 
-    pub fn start_capture(&mut self) -> Result<PipelineId> {
+    pub fn start_capture(&mut self, query: &QueryRuntimeContext) -> Result<Arc<PipelineRuntime>> {
         if self.phase != CorrelatedSubqueryPhase::CaptureReady {
             return Err(paro_error::internal(
                 "correlated subquery capture can only start from CaptureReady",
             ));
         }
         self.phase = CorrelatedSubqueryPhase::CaptureRunning;
-        Ok(self.capture.program.id)
+        pipeline_runtime_with_shared_sink(
+            self.capture.clone(),
+            self.handles.clone(),
+            self.params.clone(),
+            query,
+            &self.shared_sinks,
+        )
+        .map(Arc::new)
     }
 
     pub fn finish_capture(&mut self) -> Result<Box<[PipelineSubgraphRoot]>> {
@@ -558,7 +557,7 @@ impl CorrelatedSubqueryControllerState {
         match self.phase {
             CorrelatedSubqueryPhase::DependentReady | CorrelatedSubqueryPhase::DependentRunning => {
                 self.phase = CorrelatedSubqueryPhase::JoinReady;
-                Ok(self.join.program.id)
+                Ok(self.join.id)
             }
             _ => Err(paro_error::internal(
                 "correlated subquery dependents finished in invalid phase",
@@ -566,14 +565,21 @@ impl CorrelatedSubqueryControllerState {
         }
     }
 
-    pub fn start_join(&mut self) -> Result<PipelineId> {
+    pub fn start_join(&mut self, query: &QueryRuntimeContext) -> Result<Arc<PipelineRuntime>> {
         if self.phase != CorrelatedSubqueryPhase::JoinReady {
             return Err(paro_error::internal(
                 "correlated subquery join can only start from JoinReady",
             ));
         }
         self.phase = CorrelatedSubqueryPhase::JoinRunning;
-        Ok(self.join.program.id)
+        pipeline_runtime_with_shared_sink(
+            self.join.clone(),
+            self.handles.clone(),
+            self.params.clone(),
+            query,
+            &self.shared_sinks,
+        )
+        .map(Arc::new)
     }
 
     pub fn finish_join(&mut self) -> Result<()> {
@@ -1021,12 +1027,14 @@ mod tests {
             &programs,
             registry,
             query.params.clone(),
-            &query,
             &shared_sinks,
         )
         .expect("controller");
 
-        assert_eq!(controller.start_capture().unwrap(), PipelineId::new(0));
+        assert_eq!(
+            controller.start_capture(&query).unwrap().program.id,
+            PipelineId::new(0)
+        );
         let dependents = controller.finish_capture().unwrap();
         assert_eq!(
             dependents.as_ref(),
@@ -1039,7 +1047,10 @@ mod tests {
             .expect("cached outer")
             .is_capture_sealed());
         assert_eq!(controller.finish_dependents().unwrap(), PipelineId::new(2));
-        assert_eq!(controller.start_join().unwrap(), PipelineId::new(2));
+        assert_eq!(
+            controller.start_join(&query).unwrap().program.id,
+            PipelineId::new(2)
+        );
         controller.finish_join().unwrap();
         assert_eq!(controller.phase, CorrelatedSubqueryPhase::Done);
     }

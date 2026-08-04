@@ -154,6 +154,191 @@ fn hash_join_output_more_yields_between_output_chunks() {
 }
 
 #[test]
+fn nested_hash_join_output_more_drains_downstream_before_upstream() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let first_handle = handles.register(
+        BreakerHandleKind::HashJoinBuild,
+        RowType::new(
+            vec!["k".to_string(), "v".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        ),
+        Default::default(),
+    );
+    let second_handle = handles.register(
+        BreakerHandleKind::HashJoinBuild,
+        RowType::new(
+            vec!["k".to_string(), "v".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        ),
+        Default::default(),
+    );
+    let first_build_id = PipelineId::new(0);
+    let second_build_id = PipelineId::new(1);
+    let probe_id = PipelineId::new(2);
+    handles.set_producer(first_handle, first_build_id).unwrap();
+    handles.add_consumer(first_handle, probe_id).unwrap();
+    handles
+        .set_producer(second_handle, second_build_id)
+        .unwrap();
+    handles.add_consumer(second_handle, probe_id).unwrap();
+
+    let build_pipeline = |id, handle, rows: Vec<Vec<Expression>>| PipelineSpec {
+        id,
+        source: SourceSpec::Values(values_spec(
+            rows,
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+        transforms: Vec::new(),
+        sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
+            handle,
+            join_type: JoinType::Inner,
+            conditions: vec![join_condition()].into_boxed_slice(),
+            build_projection: vec![1].into_boxed_slice(),
+            build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+            required: Default::default(),
+            force_external: false,
+        }),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: RowType::new(
+            vec!["k".to_string(), "v".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        ),
+    };
+    let first_rows = (0..(paro_common::vector::VECTOR_SIZE + 1))
+        .map(|idx| vec![int_constant(1), int_constant(idx as i32)])
+        .collect();
+    let second_rows = vec![
+        vec![int_constant(1), int_constant(100)],
+        vec![int_constant(1), int_constant(200)],
+    ];
+    let graph = PipelineGraph {
+        pipelines: vec![
+            build_pipeline(first_build_id, first_handle, first_rows),
+            build_pipeline(second_build_id, second_handle, second_rows),
+            PipelineSpec {
+                id: probe_id,
+                source: SourceSpec::Values(values_spec(
+                    vec![vec![int_constant(1), int_constant(42)]],
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                )),
+                transforms: vec![
+                    TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+                        handle: first_handle,
+                        join_type: JoinType::Inner,
+                        conditions: vec![join_condition()].into_boxed_slice(),
+                        left_projection: vec![0, 1].into_boxed_slice(),
+                        right_projection: vec![0].into_boxed_slice(),
+                        output_names: vec!["k".into(), "probe".into(), "first".into()]
+                            .into_boxed_slice(),
+                        output_types: vec![
+                            LogicalType::Integer,
+                            LogicalType::Integer,
+                            LogicalType::Integer,
+                        ]
+                        .into_boxed_slice(),
+                    }),
+                    TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+                        handle: second_handle,
+                        join_type: JoinType::Inner,
+                        conditions: vec![join_condition()].into_boxed_slice(),
+                        left_projection: vec![1, 2].into_boxed_slice(),
+                        right_projection: vec![0].into_boxed_slice(),
+                        output_names: vec!["probe".into(), "first".into(), "second".into()]
+                            .into_boxed_slice(),
+                        output_types: vec![
+                            LogicalType::Integer,
+                            LogicalType::Integer,
+                            LogicalType::Integer,
+                        ]
+                        .into_boxed_slice(),
+                    }),
+                ],
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: RowType::new(
+                    vec!["probe".into(), "first".into(), "second".into()],
+                    vec![
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                        LogicalType::Integer,
+                    ],
+                ),
+            },
+        ],
+        dependencies: vec![
+            PipelineDependency {
+                producer: first_build_id,
+                consumer: probe_id,
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+            PipelineDependency {
+                producer: second_build_id,
+                consumer: probe_id,
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+        ],
+        handles: handles.finish(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(probe_id),
+    };
+    let programs = PipelineProgramBuilder::default()
+        .build_program_set(&graph)
+        .unwrap();
+    let registry = Arc::new(BreakerHandleRegistry::from_catalog(&graph.handles).unwrap());
+    let make_runtime = |id| {
+        Arc::new(
+            PipelineRuntime::with_registry(
+                programs.get(id).unwrap().clone(),
+                Arc::clone(&registry),
+                query.params.clone(),
+                &query,
+            )
+            .unwrap(),
+        )
+    };
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(22),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+    for id in [first_build_id, second_build_id] {
+        let runtime = make_runtime(id);
+        let task = runtime
+            .create_task_state(&query, paro_common::test_utils::test_allocator())
+            .unwrap();
+        run_to_done(
+            &mut PipelineTaskExecutor::new(runtime, task),
+            &query,
+            &thread,
+            &wake,
+            &mut profiler,
+        );
+    }
+    let runtime = make_runtime(probe_id);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .unwrap();
+    run_to_done(
+        &mut PipelineTaskExecutor::new(runtime, task),
+        &query,
+        &thread,
+        &wake,
+        &mut profiler,
+    );
+
+    let mut output_rows = 0;
+    while let Some(chunk) = output.pop_front() {
+        output_rows += chunk.size();
+    }
+    assert_eq!(output_rows, (paro_common::vector::VECTOR_SIZE + 1) * 2);
+}
+
+#[test]
 fn sort_range_join_uses_sorted_range_probe_candidates() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());

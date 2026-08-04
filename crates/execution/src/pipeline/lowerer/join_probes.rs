@@ -703,6 +703,14 @@ impl<'a> PipelineLowerer<'a> {
                 self.collect_probe_roles_source_fallback(root, pipelines, dependencies)
             }
             _ => {
+                // A probe chain can only inline streaming operators and joins.  Other
+                // breaker roots (for example a grouped aggregate on the left side of
+                // a cross product) must first be completed and exposed through a
+                // materialized source.  Falling through to collect_linear_roles would
+                // otherwise try to execute the blocking operator as a transform.
+                if self.breaker_dispatch_for_root(root).is_some() {
+                    return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
+                }
                 if let Some(tail) = self.collect_tail_to_breaker(root, |kind| {
                     matches!(
                         kind,
