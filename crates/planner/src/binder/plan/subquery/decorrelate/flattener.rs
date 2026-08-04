@@ -12,14 +12,13 @@ use crate::binder::{Binder, CorrelatedColumnInfo};
 use crate::expression::*;
 use crate::operator::Window;
 use crate::operator::{
-    Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, DependentJoin,
-    DependentJoinKind, DistinctType, Filter, Join, JoinComparisonType, JoinCondition, JoinSide,
-    JoinType, LogicalOperator, MarkSubqueryKind, Projection,
+    ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, DependentJoin, DependentJoinKind,
+    DistinctType, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
+    LogicalOperator, MarkSubqueryKind, Projection,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_function::aggregate::distributive::first_last::get_first_function;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_function::window::WindowFunction;
 use std::sync::Arc;
@@ -98,7 +97,6 @@ impl DependentJoinFlattener {
 
         match kind {
             DependentJoinKind::Scalar => self.flatten_scalar_subquery(
-                binder,
                 left,
                 rewritten_right,
                 visible_columns,
@@ -171,7 +169,6 @@ impl DependentJoinFlattener {
 
     fn flatten_scalar_subquery(
         &mut self,
-        binder: &mut Binder,
         left: LogicalPlan,
         right: LogicalPlan,
         right_visible_columns: Vec<usize>,
@@ -190,71 +187,24 @@ impl DependentJoinFlattener {
             )));
         }
         let scalar_child_index = right_visible_columns[0];
-        let scalar_type = right_types
-            .get(scalar_child_index)
-            .cloned()
-            .ok_or_else(|| {
-                paro_error::internal(format!(
-                    "Scalar subquery visible column {} out of range for rhs width {}",
-                    scalar_child_index,
-                    right_types.len()
-                ))
-            })?;
-
-        let conditions = self.create_correlated_join_conditions(correlated_columns)?;
-
-        let mut join = ComparisonJoin::new(JoinType::Left, left, right, conditions);
-        join.duplicate_eliminated_columns = self.duplicate_eliminated_columns(correlated_columns);
-        join.right_projection_map = right_visible_columns;
-        let join_op = LogicalOperator::Join(Join::Comparison(join));
-
-        let left_col_count = join_op.children()[0].types().len();
-        let scalar_col_index = left_col_count;
-
-        let first_func_set = get_first_function();
-        let (first_func, _) = first_func_set
-            .bind(std::slice::from_ref(&scalar_type))
-            .map_err(|e| paro_error::internal(format!("Failed to bind FIRST function: {}", e)))?;
-
-        let scalar_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            *join_op
-                .get_column_bindings()
-                .get(scalar_col_index)
-                .ok_or_else(|| {
-                    paro_error::internal(
-                        "Flattened scalar subquery join must expose the scalar rhs binding",
-                    )
-                })?,
-            scalar_type.clone(),
-        ));
-
-        let first_agg = AggregateExpression::new(first_func, vec![scalar_ref], scalar_type.clone());
-
-        let left_types = join_op.children()[0].types();
-        let join_bindings = join_op.get_column_bindings();
-        let mut groups = Vec::new();
-        for (i, t) in left_types.iter().enumerate() {
-            groups.push(Expression::ColumnRef(ColumnRefExpression::new(
-                join_bindings[i],
-                t.clone(),
+        if scalar_child_index >= right_types.len() {
+            return Err(paro_error::internal(format!(
+                "Scalar subquery visible column {} out of range for rhs width {}",
+                scalar_child_index,
+                right_types.len()
             )));
         }
 
-        let group_index = self.next_table_index();
-        let aggregate_index = self.next_table_index();
-        let groupings_index = self.next_table_index();
-        let aggregate = Aggregate::new(
-            group_index,
-            aggregate_index,
-            groupings_index,
-            binder.wrap_plan(join_op),
-            groups,
-            Vec::new(),
-            vec![Expression::Aggregate(first_agg)],
-            vec![],
-        );
+        let conditions = self.create_correlated_join_conditions(correlated_columns)?;
 
-        Ok(LogicalOperator::Aggregate(aggregate))
+        // SINGLE preserves every outer row and its bindings while enforcing the
+        // scalar-subquery cardinality contract. The former LEFT + GROUP BY all
+        // outer columns + FIRST emulation both collapsed duplicate outer rows
+        // and replaced their bindings with aggregate-group bindings.
+        let mut join = ComparisonJoin::new(JoinType::Single, left, right, conditions);
+        join.duplicate_eliminated_columns = self.duplicate_eliminated_columns(correlated_columns);
+        join.right_projection_map = right_visible_columns;
+        Ok(LogicalOperator::Join(Join::Comparison(join)))
     }
 
     fn flatten_lateral_join(

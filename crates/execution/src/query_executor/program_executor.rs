@@ -523,11 +523,34 @@ fn run_pipeline_dag(
                 if rf[region_id.index()] {
                     continue;
                 }
-                run_control_region(region_id, dispatch.regions, ctx)?;
+                if pipeline_id != control_region_entry_pipeline(ctx.graph, region_id)? {
+                    continue;
+                }
+                let mut completed = finished
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, done)| done.then_some(PipelineId::new(idx)))
+                    .collect::<HashSet<_>>();
+                run_control_region(region_id, dispatch.regions, ctx, &mut completed)?;
                 rf[region_id.index()] = true;
-                for member in &dispatch.region_members[region_id.index()] {
+                // The set was seeded with globally finished pipelines so region
+                // dependencies are not replayed. Publish only newly completed work,
+                // together with every member covered by the completed controller.
+                let mut newly_finished = completed
+                    .into_iter()
+                    .filter(|pipeline| !finished[pipeline.index()])
+                    .collect::<HashSet<_>>();
+                newly_finished.extend(
+                    dispatch.region_members[region_id.index()]
+                        .iter()
+                        .copied()
+                        .filter(|member| !finished[member.index()]),
+                );
+                let mut newly_finished = newly_finished.into_iter().collect::<Vec<_>>();
+                newly_finished.sort_unstable();
+                for pipeline in newly_finished {
                     mark_pipeline_finished(
-                        *member,
+                        pipeline,
                         &mut finished,
                         &mut finished_count,
                         &mut gates,
@@ -807,18 +830,19 @@ fn run_control_region_root(
         query,
         allocator,
     };
-    run_control_region(root, &mut regions, &ctx)
+    run_control_region(root, &mut regions, &ctx, &mut HashSet::new())
 }
 
 fn run_control_region(
     id: ControlRegionId,
     regions: &mut ControlRegionRuntimeSet,
     ctx: &GraphExecutionContext<'_>,
+    completed: &mut HashSet<PipelineId>,
 ) -> Result<()> {
     match regions.regions.get(id.index()) {
         Some(ControlRegionRuntime::RecursiveCte(_)) => {}
         Some(ControlRegionRuntime::CorrelatedSubquery(_)) => {
-            return run_correlated_subquery_region(id, regions, ctx);
+            return run_correlated_subquery_region(id, regions, ctx, completed);
         }
         None => return Err(paro_error::internal("control-region id is invalid")),
     }
@@ -830,7 +854,9 @@ fn run_control_region(
     match region {
         ControlRegionRuntime::RecursiveCte(controller) => {
             let anchor = controller.start_anchor()?;
+            let anchor_id = anchor.program.id;
             run_runtime(anchor, ctx.query, ctx.allocator.clone())?;
+            completed.insert(anchor_id);
             let mut action = controller.finish_anchor()?;
             loop {
                 match action {
@@ -842,7 +868,9 @@ fn run_control_region(
                                     paro_error::internal("recursive CTE iteration runtime missing")
                                 })?;
                             for runtime in iteration.recursive_pipelines.iter().cloned() {
+                                let pipeline_id = runtime.program.id;
                                 run_runtime(runtime, ctx.query, ctx.allocator.clone())?;
+                                completed.insert(pipeline_id);
                             }
                         }
                         action = controller.finish_recursive_iteration()?;
@@ -854,7 +882,9 @@ fn run_control_region(
                             ));
                         }
                         let emit = controller.start_emit(ctx.query)?;
+                        let emit_id = emit.program.id;
                         run_runtime(emit, ctx.query, ctx.allocator.clone())?;
+                        completed.insert(emit_id);
                         controller.finish_emit()?;
                         return Ok(());
                     }
@@ -872,14 +902,15 @@ fn run_correlated_subquery_region(
     id: ControlRegionId,
     regions: &mut ControlRegionRuntimeSet,
     ctx: &GraphExecutionContext<'_>,
+    completed: &mut HashSet<PipelineId>,
 ) -> Result<()> {
-    let (capture_id, capture) = {
-        let controller = correlated_subquery_controller_mut(regions, id)?;
-        let capture = controller.capture.clone();
-        let capture_id = controller.start_capture()?;
-        (capture_id, capture)
-    };
-    run_pipeline_runtime_or_nested_region(capture_id, capture, id, regions, ctx)?;
+    let capture_id = correlated_subquery_controller_mut(regions, id)?.capture.id;
+    if control_region_root_for_pipeline(ctx.graph, capture_id, Some(id))?.is_none() {
+        run_pipeline_dependencies(capture_id, id, regions, ctx, completed)?;
+    }
+    let capture = correlated_subquery_controller_mut(regions, id)?.start_capture(ctx.query)?;
+    run_pipeline_runtime_or_nested_region(capture_id, capture, id, regions, ctx, completed)?;
+    completed.insert(capture_id);
 
     let dependents = {
         let controller = correlated_subquery_controller_mut(regions, id)?;
@@ -888,24 +919,75 @@ fn run_correlated_subquery_region(
     for root in dependents.iter() {
         match root {
             PipelineSubgraphRoot::Pipeline(pipeline) => {
-                run_pipeline(*pipeline, ctx)?;
+                run_control_region_pipeline(*pipeline, id, regions, ctx, completed)?;
             }
             PipelineSubgraphRoot::ControlRegion(region) => {
-                run_control_region(*region, regions, ctx)?;
+                run_control_region(*region, regions, ctx, completed)?;
             }
         }
     }
 
-    let join = {
+    let join_id = {
         let controller = correlated_subquery_controller_mut(regions, id)?;
         controller.finish_dependents()?;
-        controller.start_join()?;
-        controller.join.clone()
+        controller.join.id
     };
+    run_pipeline_dependencies(join_id, id, regions, ctx, completed)?;
+    let join = correlated_subquery_controller_mut(regions, id)?.start_join(ctx.query)?;
     run_runtime(join, ctx.query, ctx.allocator.clone())?;
+    completed.insert(join_id);
 
     let controller = correlated_subquery_controller_mut(regions, id)?;
     controller.finish_join()
+}
+
+fn run_control_region_pipeline(
+    pipeline: PipelineId,
+    current_region: ControlRegionId,
+    regions: &mut ControlRegionRuntimeSet,
+    ctx: &GraphExecutionContext<'_>,
+    completed: &mut HashSet<PipelineId>,
+) -> Result<()> {
+    if completed.contains(&pipeline) {
+        return Ok(());
+    }
+    if let Some(nested) =
+        control_region_root_for_pipeline(ctx.graph, pipeline, Some(current_region))?
+    {
+        run_control_region(nested, regions, ctx, completed)?;
+    } else {
+        run_pipeline_dependencies(pipeline, current_region, regions, ctx, completed)?;
+        run_pipeline(pipeline, ctx)?;
+    }
+    completed.insert(pipeline);
+    Ok(())
+}
+
+fn run_pipeline_dependencies(
+    consumer: PipelineId,
+    current_region: ControlRegionId,
+    regions: &mut ControlRegionRuntimeSet,
+    ctx: &GraphExecutionContext<'_>,
+    completed: &mut HashSet<PipelineId>,
+) -> Result<()> {
+    let producers = ctx
+        .graph
+        .dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency.consumer == consumer
+                && !matches!(
+                    dependency.kind,
+                    crate::pipeline::graph::DependencyKind::LoopEntry(_)
+                        | crate::pipeline::graph::DependencyKind::LoopBack(_)
+                )
+        })
+        .map(|dependency| dependency.producer)
+        .collect::<Vec<_>>();
+    for producer in producers {
+        run_control_region_pipeline(producer, current_region, regions, ctx, completed)?;
+    }
+    Ok(())
 }
 
 fn run_pipeline_runtime_or_nested_region(
@@ -914,13 +996,29 @@ fn run_pipeline_runtime_or_nested_region(
     current_region: ControlRegionId,
     regions: &mut ControlRegionRuntimeSet,
     ctx: &GraphExecutionContext<'_>,
+    completed: &mut HashSet<PipelineId>,
 ) -> Result<()> {
     if let Some(nested) =
         control_region_root_for_pipeline(ctx.graph, pipeline, Some(current_region))?
     {
-        return run_control_region(nested, regions, ctx);
+        return run_control_region(nested, regions, ctx, completed);
     }
     run_runtime(runtime, ctx.query, ctx.allocator.clone())
+}
+
+fn control_region_entry_pipeline(
+    graph: &PipelineGraph,
+    region: ControlRegionId,
+) -> Result<PipelineId> {
+    let entry = match graph.control_regions.get(region.index()) {
+        Some(ControlRegion::RecursiveCte(region)) => Ok(region.anchor),
+        Some(ControlRegion::CorrelatedSubquery(region)) => Ok(region.capture),
+        None => Err(paro_error::internal("control-region id is invalid")),
+    }?;
+    if let Some(nested) = control_region_root_for_pipeline(graph, entry, Some(region))? {
+        return control_region_entry_pipeline(graph, nested);
+    }
+    Ok(entry)
 }
 
 fn control_region_root_for_pipeline(

@@ -163,6 +163,60 @@ fn hash_join_lowers_replay_fence_for_memory_triggered_external_fallback() {
 }
 
 #[test]
+fn hash_join_merges_optional_branches_before_stateful_transforms() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        other => panic!("expected hash join root, got {other:?}"),
+    };
+    let output = plan.node(plan.root).output.clone();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let mut pipelines = Vec::new();
+    let mut dependencies = Vec::new();
+
+    let tail = lowerer
+        .lower_hash_join_to_sink(
+            plan.root,
+            &spec,
+            vec![TransformSpec::Limit(crate::physical::LimitSpec {
+                limit: Some(Expression::Constant(ConstantExpression::new(
+                    Value::Integer(1),
+                    LogicalType::Integer,
+                ))),
+                offset: None,
+                hnsw_ef_hint: None,
+            })],
+            SinkSpec::ClientResult(ClientResultSpec::default()),
+            SinkSharing::Exclusive,
+            output,
+            &mut pipelines,
+            &mut dependencies,
+        )
+        .unwrap();
+
+    assert_eq!(pipelines.len(), 4);
+    assert!(matches!(pipelines[1].sink, SinkSpec::Materialize(_)));
+    assert!(matches!(
+        pipelines[2].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert!(matches!(pipelines[2].sink, SinkSpec::Materialize(_)));
+    assert_eq!(pipelines[1].sink_sharing, pipelines[2].sink_sharing);
+    assert!(matches!(pipelines[3].source, SourceSpec::Materialized(_)));
+    assert!(matches!(
+        pipelines[3].transforms.as_slice(),
+        [TransformSpec::Limit(_)]
+    ));
+    assert!(matches!(pipelines[3].sink, SinkSpec::ClientResult(_)));
+    assert_eq!(tail, PipelineId::new(3));
+    assert!(dependencies.iter().any(|dependency| {
+        dependency.producer == PipelineId::new(2)
+            && dependency.consumer == PipelineId::new(3)
+            && dependency.kind == DependencyKind::FinalizeBeforeEmit
+    }));
+}
+
+#[test]
 fn forced_external_hash_join_keeps_spill_replay_pipeline() {
     let plan = hash_join_plan_with_context(
         JoinType::Inner,

@@ -95,7 +95,13 @@ mod tests {
     fn mixed_values_rows_are_cast_to_their_common_column_type() {
         for (sql, expected_type) in [
             ("VALUES (1), (100000000000)", LogicalType::BigInt),
-            ("VALUES (1), (2.5)", LogicalType::Double),
+            (
+                "VALUES (1), (2.5)",
+                LogicalType::Decimal {
+                    precision: 2,
+                    scale: 1,
+                },
+            ),
             ("VALUES (-1), (100000000000)", LogicalType::BigInt),
         ] {
             let values = bind_values(sql);
@@ -115,6 +121,24 @@ mod tests {
     fn differently_sized_array_rows_use_a_common_list_type() {
         let values = bind_values("VALUES ([1, 2, 3]), ([4, 5]), (NULL), ([])");
         let expected_type = LogicalType::List(Box::new(LogicalType::Integer));
+
+        assert_eq!(
+            values.types.as_slice(),
+            std::slice::from_ref(&expected_type)
+        );
+        assert!(values
+            .values
+            .iter()
+            .all(|row| row[0].return_type() == expected_type));
+    }
+
+    #[test]
+    fn decimal_list_common_type_preserves_maximum_scale() {
+        let values = bind_values("VALUES ([1.5, 2.5]), ([0.0]), (NULL), ([3.14, -2.0])");
+        let expected_type = LogicalType::List(Box::new(LogicalType::Decimal {
+            precision: 3,
+            scale: 2,
+        }));
 
         assert_eq!(
             values.types.as_slice(),

@@ -24,7 +24,7 @@ use crate::binder::ir::{BoundFromItem, BoundJoin, JoinType};
 use crate::binder::{Binder, CorrelatedColumnInfo};
 use crate::expression::*;
 use paro_common::error::{self as paro_error, Result};
-use paro_parser::ast::{Join, JoinCondition, JoinOperator};
+use paro_parser::ast::{Join, JoinCondition, JoinOperator, TableReference};
 
 /// Bind a JOIN clause.
 ///
@@ -77,6 +77,31 @@ pub fn bind_join(binder: &mut Binder, join: Join) -> Result<BoundFromItem> {
         right: Box::new(right),
         condition,
         join_type,
+        lateral,
+        correlated_columns,
+    }))
+}
+
+/// Bind one item in a comma-separated FROM list as a left-associative cross
+/// product.
+///
+/// The parser intentionally preserves `FROM a, b, c` as a list rather than
+/// manufacturing JOIN syntax. Lowering the list here keeps name resolution in
+/// SQL's left-to-right order and retains LATERAL metadata for references that
+/// depend on an earlier item.
+pub fn bind_implicit_cross_join(
+    binder: &mut Binder,
+    left: BoundFromItem,
+    right_ref: TableReference,
+) -> Result<BoundFromItem> {
+    let right = binder.bind_table_ref(right_ref)?;
+    let (lateral, correlated_columns) = extract_lateral_metadata(&right);
+
+    Ok(BoundFromItem::Join(BoundJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        condition: None,
+        join_type: JoinType::Cross,
         lateral,
         correlated_columns,
     }))
@@ -202,6 +227,37 @@ mod tests {
             }
             other => panic!("expected bound join, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comma_separated_from_items_bind_as_left_associative_cross_joins() {
+        let mut binder = test_binder();
+        let statement =
+            parse_one("SELECT * FROM (VALUES (1)) a(x), (VALUES (2)) b(y), (VALUES (3)) c(z)")
+                .expect("parse")
+                .stmt;
+
+        let Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+        let bound = binder.bind_query(*query).expect("bind");
+        let from_table = match bound {
+            crate::binder::ir::BoundQuery::Select(select) => select.from_table,
+            other => panic!("expected select node, got {other:?}"),
+        }
+        .expect("from table");
+
+        let BoundFromItem::Join(outer) = from_table else {
+            panic!("expected outer cross join");
+        };
+        assert_eq!(outer.join_type, JoinType::Cross);
+        assert!(outer.condition.is_none());
+
+        let BoundFromItem::Join(inner) = *outer.left else {
+            panic!("expected left-associative inner cross join");
+        };
+        assert_eq!(inner.join_type, JoinType::Cross);
+        assert!(inner.condition.is_none());
     }
 }
 

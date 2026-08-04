@@ -13,6 +13,7 @@
 use crate::aggregate::{
     AggregateFinalizeFn, AggregateFunction, AggregateFunctionSet, AggregateInputData,
 };
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -188,8 +189,9 @@ unsafe fn finalize_var_pop(
     _input_data: &AggregateInputData,
     result: &mut Vector,
     count: usize,
-) {
+) -> Result<()> {
     finalize_impl(states, result, count, FinalizeKind::VarPop);
+    Ok(())
 }
 
 unsafe fn finalize_var_samp(
@@ -197,8 +199,9 @@ unsafe fn finalize_var_samp(
     _input_data: &AggregateInputData,
     result: &mut Vector,
     count: usize,
-) {
+) -> Result<()> {
     finalize_impl(states, result, count, FinalizeKind::VarSamp);
+    Ok(())
 }
 
 unsafe fn finalize_stddev_pop(
@@ -206,8 +209,9 @@ unsafe fn finalize_stddev_pop(
     _input_data: &AggregateInputData,
     result: &mut Vector,
     count: usize,
-) {
+) -> Result<()> {
     finalize_impl(states, result, count, FinalizeKind::StddevPop);
+    Ok(())
 }
 
 unsafe fn finalize_stddev_samp(
@@ -215,8 +219,9 @@ unsafe fn finalize_stddev_samp(
     _input_data: &AggregateInputData,
     result: &mut Vector,
     count: usize,
-) {
+) -> Result<()> {
     finalize_impl(states, result, count, FinalizeKind::StddevSamp);
+    Ok(())
 }
 
 fn build_variance_set(name: &str, finalize: AggregateFinalizeFn) -> AggregateFunctionSet {
@@ -339,7 +344,7 @@ mod tests {
 
         {
             let input_data = preserve_input_data(func, &mut arena);
-            (func.finalize)(&states, &input_data, &mut result, 1);
+            (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
         }
 
         result

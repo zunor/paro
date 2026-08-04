@@ -25,6 +25,8 @@
 
 pub mod scalar;
 
+mod decimal;
+
 // Re-export key types from scalar module
 pub use scalar::{
     function_data_equals, BoundScalarFunction, DictionaryStrategy, ExpressionState, FunctionData,

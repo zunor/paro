@@ -20,10 +20,10 @@ use crate::physical::specs::PhysicalNodeKind;
 use crate::physical::{ChunkScanSpec, DummyScanSpec, RowType};
 use crate::pipeline::graph::{
     ClientResultSpec, ControlRegion, ControlRegionId, CorrelatedSubqueryRegion,
-    DelimCaptureSinkSpec, DelimJoinSide, DelimScanSourceSpec, DependencyKind, PipelineDependency,
-    PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, RecursiveCteDedup, RecursiveCteRegion,
-    RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec, RecursiveTermination, SinkSharing,
-    SinkSpec, SourceSpec,
+    DelimCaptureSinkSpec, DelimJoinSide, DelimScanSourceSpec, DependencyKind, MaterializeSinkSpec,
+    MaterializedSourceSpec, PipelineDependency, PipelineGraph, PipelineId, PipelineRoot,
+    PipelineSpec, RecursiveCteDedup, RecursiveCteRegion, RecursiveTableAppendSinkSpec,
+    RecursiveTableScanSourceSpec, RecursiveTermination, SinkSharing, SinkSpec, SourceSpec,
 };
 use crate::pipeline::handles::{BreakerHandleCatalogBuilder, BreakerHandleKind};
 use crate::pipeline::{PipelineProgramBuilder, StatementProgram};
@@ -86,6 +86,47 @@ fn correlated_control_region_root_uses_bounded_background_output() {
     let stats = execution.query.output.stats();
     assert_eq!(stats.pushed_rows, 3);
     assert!(stats.peak_queue_chunks <= 2);
+}
+
+#[test]
+fn correlated_capture_runs_its_breaker_dependencies_before_capture() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let statement = correlated_control_region_with_capture_dependency_statement();
+    let mut execution = start_program_with_output_for_test(
+        TestStatementContextBuilder::minimal().build(),
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        allocator,
+        QueryOutputPort::bounded_with_stats(2),
+        QueryOutputPort::unbounded_with_stats(),
+        true,
+    )
+    .expect("correlated control-region program starts");
+
+    assert_eq!(collect_i32_background_output(&mut execution), vec![1, 2, 3]);
+}
+
+#[test]
+fn correlated_region_dependency_is_not_replayed_by_outer_dag() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let statement = correlated_control_region_with_external_dependent_producer_statement();
+    let mut execution = start_program_with_output_for_test(
+        TestStatementContextBuilder::minimal().build(),
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        allocator,
+        QueryOutputPort::bounded_with_stats(2),
+        QueryOutputPort::unbounded_with_stats(),
+        true,
+    )
+    .expect("correlated control-region program starts");
+
+    assert_eq!(
+        collect_i32_background_output(&mut execution),
+        vec![99, 7, 1, 2]
+    );
 }
 
 #[test]
@@ -334,6 +375,162 @@ fn correlated_control_region_statement() -> StatementProgram {
             },
         )],
         root: PipelineRoot::ControlRegion(ControlRegionId::new(0)),
+    });
+    statement_from_graph(graph, row_type)
+}
+
+fn correlated_control_region_with_capture_dependency_statement() -> StatementProgram {
+    let row_type = int_row_type();
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let materialized = handles.register(
+        BreakerHandleKind::Materialized,
+        row_type.clone(),
+        PipelineProperties::default(),
+    );
+    let delim_values = handles.register(
+        BreakerHandleKind::Delim,
+        row_type.clone(),
+        PipelineProperties::default(),
+    );
+
+    let graph = Arc::new(PipelineGraph {
+        pipelines: vec![
+            PipelineSpec {
+                id: PipelineId::new(0),
+                source: SourceSpec::Chunk(chunk_scan_spec(vec![i32_chunk(&[1, 2, 2, 3])])),
+                transforms: Vec::new(),
+                sink: SinkSpec::Materialize(MaterializeSinkSpec {
+                    handle: materialized,
+                    required: Default::default(),
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+            PipelineSpec {
+                id: PipelineId::new(1),
+                source: SourceSpec::Materialized(MaterializedSourceSpec {
+                    handle: materialized,
+                }),
+                transforms: Vec::new(),
+                sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
+                    handle: delim_values,
+                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
+                        0,
+                        LogicalType::Integer,
+                    ))]
+                    .into_boxed_slice(),
+                    cached_outer: None,
+                    required: Default::default(),
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+            PipelineSpec {
+                id: PipelineId::new(2),
+                source: SourceSpec::DelimScan(DelimScanSourceSpec {
+                    handle: delim_values,
+                }),
+                transforms: Vec::new(),
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+        ],
+        dependencies: vec![PipelineDependency {
+            producer: PipelineId::new(0),
+            consumer: PipelineId::new(1),
+            kind: DependencyKind::MaterializeBeforeRead,
+        }],
+        handles: handles.finish(),
+        control_regions: vec![ControlRegion::CorrelatedSubquery(
+            CorrelatedSubqueryRegion {
+                side: DelimJoinSide::Left,
+                capture: PipelineId::new(1),
+                dependent_roots: Vec::new(),
+                join: PipelineId::new(2),
+                delim_values,
+                cached_outer: None,
+            },
+        )],
+        root: PipelineRoot::ControlRegion(ControlRegionId::new(0)),
+    });
+    statement_from_graph(graph, row_type)
+}
+
+fn correlated_control_region_with_external_dependent_producer_statement() -> StatementProgram {
+    let row_type = int_row_type();
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let delim_values = handles.register(
+        BreakerHandleKind::Delim,
+        row_type.clone(),
+        PipelineProperties::default(),
+    );
+
+    let client_pipeline = |id, values| PipelineSpec {
+        id: PipelineId::new(id),
+        source: SourceSpec::Chunk(chunk_scan_spec(vec![i32_chunk(values)])),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: row_type.clone(),
+    };
+    let graph = Arc::new(PipelineGraph {
+        pipelines: vec![
+            PipelineSpec {
+                id: PipelineId::new(0),
+                source: SourceSpec::Chunk(chunk_scan_spec(vec![i32_chunk(&[1, 2])])),
+                transforms: Vec::new(),
+                sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
+                    handle: delim_values,
+                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
+                        0,
+                        LogicalType::Integer,
+                    ))]
+                    .into_boxed_slice(),
+                    cached_outer: None,
+                    required: Default::default(),
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+            client_pipeline(1, &[7]),
+            PipelineSpec {
+                id: PipelineId::new(2),
+                source: SourceSpec::DelimScan(DelimScanSourceSpec {
+                    handle: delim_values,
+                }),
+                transforms: Vec::new(),
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+            client_pipeline(3, &[99]),
+        ],
+        dependencies: vec![PipelineDependency {
+            producer: PipelineId::new(3),
+            consumer: PipelineId::new(1),
+            kind: DependencyKind::SideEffectOrder,
+        }],
+        handles: handles.finish(),
+        control_regions: vec![ControlRegion::CorrelatedSubquery(
+            CorrelatedSubqueryRegion {
+                side: DelimJoinSide::Left,
+                capture: PipelineId::new(0),
+                dependent_roots: vec![crate::pipeline::graph::PipelineSubgraphRoot::Pipeline(
+                    PipelineId::new(1),
+                )],
+                join: PipelineId::new(2),
+                delim_values,
+                cached_outer: None,
+            },
+        )],
+        root: PipelineRoot::Pipeline(PipelineId::new(2)),
     });
     statement_from_graph(graph, row_type)
 }

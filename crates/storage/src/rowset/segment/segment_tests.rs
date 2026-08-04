@@ -62,6 +62,61 @@ fn segment_open_and_iterate_roundtrip() {
 }
 
 #[test]
+fn segment_varlen_column_keeps_rows_across_pages_and_appends() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("varlen-multipage.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::new(0, "id", LogicalType::Integer),
+                TabletColumn::new(1, "flag", LogicalType::Varchar),
+            ],
+            KeysType::DuplicateKeys,
+        )
+        .unwrap(),
+    );
+    let opts = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_page_size(16 * 1024);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, opts).unwrap();
+
+    let encode_strings = |value: &str, count: usize| {
+        let mut data = Vec::with_capacity(count * (value.len() + 4));
+        for _ in 0..count {
+            data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            data.extend_from_slice(value.as_bytes());
+        }
+        data
+    };
+    for (start, count, flag) in [(0_i32, 4096_usize, "N"), (4096, 1909, "R")] {
+        let ids = (start..start + count as i32)
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        writer
+            .append_chunk(&[
+                ColumnData::new(ids, count as u32),
+                ColumnData::new(encode_strings(flag, count), count as u32),
+            ])
+            .unwrap();
+    }
+
+    let segment = writer.finalize().unwrap();
+    assert_eq!(segment.num_rows(), 6005);
+    assert_eq!(segment.get_column_meta(0).unwrap().num_rows, 6005);
+    assert_eq!(segment.get_column_meta(1).unwrap().num_rows, 6005);
+
+    let mut iter = segment.new_iterator().unwrap();
+    let mut rows = 0;
+    while iter.has_next() {
+        let batch = iter.next_batch_with_rowid_policy(4096, false).unwrap();
+        assert!(batch.rows > 0);
+        rows += batch.rows;
+    }
+    assert_eq!(rows, 6005);
+}
+
+#[test]
 fn segment_predicate_fallback_uses_late_materialize() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("predicate.seg");

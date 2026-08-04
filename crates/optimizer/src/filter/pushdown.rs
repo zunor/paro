@@ -356,6 +356,12 @@ impl FilterPushdown {
                         JoinType::Left => {
                             self.pushdown_left_join(cj, left_bindings, right_bindings)
                         }
+                        JoinType::Mark => {
+                            // MARK outputs the left schema plus one marker. Predicates over
+                            // left columns are safe below the join; predicates over the marker
+                            // must remain above it.
+                            self.pushdown_left_join(cj, left_bindings, right_bindings)
+                        }
                         JoinType::Semi | JoinType::Anti => self.pushdown_semi_anti_join(cj),
                         _ => self.finish_pushdown(LogicalOperator::Join(Join::Comparison(cj))),
                     }
@@ -1300,6 +1306,52 @@ mod tests {
             }
             _ => panic!("Expected Filter above Cross product"),
         }
+    }
+
+    #[test]
+    fn test_mark_join_pushes_left_predicates_but_keeps_marker_predicate() {
+        let ctx = BindContext::new();
+        let left = LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            plan(&ctx, make_get(0)),
+            plan(&ctx, make_get(1)),
+        )));
+        let mut join = ComparisonJoin::new(
+            JoinType::Mark,
+            plan(&ctx, left),
+            plan(&ctx, make_get(2)),
+            vec![JoinCondition::new(
+                make_column_ref(0, 0),
+                make_column_ref(2, 0),
+                JoinComparisonType::Equal,
+            )],
+        );
+        let mark_index = 90;
+        join.mark_index = Some(mark_index);
+        let marker = Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(mark_index, 0),
+            LogicalType::Boolean,
+        ));
+        let left_predicate = make_comparison(
+            ComparisonType::Equal,
+            make_column_ref(0, 0),
+            make_column_ref(1, 0),
+        );
+        let filter = PlannerFilter::new(
+            plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
+            vec![left_predicate, marker],
+        );
+
+        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
+
+        let LogicalOperator::Filter(filter) = result else {
+            panic!("marker predicate must remain above the MARK join");
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
+            panic!("expected MARK join below marker filter");
+        };
+        assert_eq!(join.join_type, JoinType::Mark);
+        assert!(matches!(join.left.operator, LogicalOperator::Filter(_)));
     }
 
     #[test]

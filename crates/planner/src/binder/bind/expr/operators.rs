@@ -18,8 +18,17 @@ pub fn bind_comparison(
     right: Expr,
     comparison_type: ComparisonType,
 ) -> Result<Expression> {
-    let mut left = binder.bind_child(left)?;
-    let mut right = binder.bind_child(right)?;
+    let left = binder.bind_child(left)?;
+    let right = binder.bind_child(right)?;
+    bind_bound_comparison(binder, left, right, comparison_type)
+}
+
+fn bind_bound_comparison(
+    binder: &mut ExpressionBinder,
+    mut left: Expression,
+    mut right: Expression,
+    comparison_type: ComparisonType,
+) -> Result<Expression> {
     let left_sql_type = left.get_expression_return_type();
     let right_sql_type = right.get_expression_return_type();
     let input_type = try_bind_comparison(&left_sql_type, &right_sql_type, comparison_type)?;
@@ -227,31 +236,31 @@ pub fn bind_between(
     let bound_high = binder.bind_child(high)?;
 
     if not {
-        let left = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThan,
+        let left = bind_bound_comparison(
+            binder,
             bound_expr.clone(),
             bound_low,
-        ));
-        let right = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            bound_expr,
-            bound_high,
-        ));
+            ComparisonType::LessThan,
+        )?;
+        let right =
+            bind_bound_comparison(binder, bound_expr, bound_high, ComparisonType::GreaterThan)?;
         Ok(Expression::Conjunction(ConjunctionExpression::new(
             ConjunctionType::Or,
             vec![left, right],
         )))
     } else {
-        let left = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThanOrEqual,
+        let left = bind_bound_comparison(
+            binder,
             bound_expr.clone(),
             bound_low,
-        ));
-        let right = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThanOrEqual,
+            ComparisonType::GreaterThanOrEqual,
+        )?;
+        let right = bind_bound_comparison(
+            binder,
             bound_expr,
             bound_high,
-        ));
+            ComparisonType::LessThanOrEqual,
+        )?;
         Ok(Expression::Conjunction(ConjunctionExpression::new(
             ConjunctionType::And,
             vec![left, right],

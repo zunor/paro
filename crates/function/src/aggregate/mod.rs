@@ -83,8 +83,12 @@ pub type AggregateCombineFn =
 /// * `states`: Vector containing pointers to states.
 /// * `result`: Result vector to write to.
 /// * `count`: Number of results to generate.
-pub type AggregateFinalizeFn =
-    unsafe fn(states: &Vector, input_data: &AggregateInputData, result: &mut Vector, count: usize);
+pub type AggregateFinalizeFn = unsafe fn(
+    states: &Vector,
+    input_data: &AggregateInputData,
+    result: &mut Vector,
+    count: usize,
+) -> Result<()>;
 
 /// Function to destruct complex states (if state contains allocated resources like StringHeap).
 pub type AggregateDestructorFn =
@@ -276,18 +280,27 @@ impl AggregateFunction {
 pub struct AggregateFunctionSet {
     pub name: String,
     pub functions: Vec<AggregateFunction>,
+    pub dynamic_bind: Option<AggregateFunctionSetBindFn>,
 }
+
+pub type AggregateFunctionSetBindFn =
+    fn(arguments: &[LogicalType]) -> Result<(AggregateFunction, Vec<LogicalType>)>;
 
 impl AggregateFunctionSet {
     pub fn new(name: String) -> Self {
         Self {
             name,
             functions: Vec::new(),
+            dynamic_bind: None,
         }
     }
 
     pub fn add_function(&mut self, function: AggregateFunction) {
         self.functions.push(function);
+    }
+
+    pub fn set_dynamic_bind(&mut self, bind: AggregateFunctionSetBindFn) {
+        self.dynamic_bind = Some(bind);
     }
 
     /// Find the best matching function for the given arguments using cost-based implicit casting.
@@ -310,6 +323,17 @@ impl AggregateFunctionSet {
     /// // Result: sum(INTEGER) - cast SMALLINT to INTEGER (lower cost than DOUBLE)
     /// ```
     pub fn bind(&self, arguments: &[LogicalType]) -> Result<(AggregateFunction, Vec<LogicalType>)> {
+        // Parameterized signatures such as DECIMAL(p,s) cannot be represented
+        // by the fixed overload table. Prefer a dynamic match before considering
+        // coercive fixed overloads (for example DECIMAL -> DOUBLE).
+        let dynamic_error = if let Some(bind) = self.dynamic_bind {
+            match bind(arguments) {
+                Ok(bound) => return Ok(bound),
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
         let mut best_match: Option<(&AggregateFunction, i64, Vec<LogicalType>)> = None;
 
         for func in &self.functions {
@@ -333,10 +357,13 @@ impl AggregateFunctionSet {
 
         match best_match {
             Some((func, _cost, target_types)) => Ok((func.clone(), target_types)),
-            None => Err(paro_common::error::catalog(format!(
-                "No matching aggregate function found for {} with arguments {:?}",
-                self.name, arguments
-            ))),
+            None => match dynamic_error {
+                Some(error) => Err(error),
+                None => Err(paro_common::error::catalog(format!(
+                    "No matching aggregate function found for {} with arguments {:?}",
+                    self.name, arguments
+                ))),
+            },
         }
     }
 
@@ -422,7 +449,8 @@ mod tests {
         _input_data: &AggregateInputData,
         _result: &mut Vector,
         _count: usize,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     fn create_dummy_aggregate(

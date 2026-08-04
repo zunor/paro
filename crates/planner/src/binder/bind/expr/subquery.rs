@@ -252,7 +252,13 @@ mod tests {
                 assert_eq!(subquery.children.len(), 2);
                 assert_eq!(subquery.child_types.len(), 2);
                 assert_eq!(subquery.child_targets.len(), 2);
-                assert_eq!(subquery.child_targets[0], LogicalType::Double);
+                assert_eq!(
+                    subquery.child_targets[0],
+                    LogicalType::Decimal {
+                        precision: 2,
+                        scale: 1
+                    }
+                );
                 assert_eq!(subquery.child_targets[1], LogicalType::Varchar);
                 assert!(matches!(
                     subquery.children[0],

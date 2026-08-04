@@ -216,9 +216,11 @@ impl RowsetSourceExec {
         for filter in &self.desc.dynamic_runtime_filters {
             let handle = ctx.handles.get(filter.handle)?;
             if !handle.runtime_filter_ready() {
-                return Err(paro_error::internal(
-                    "hash join runtime filter was not published before rowset scan",
-                ));
+                return Err(paro_error::internal(format!(
+                    "hash join runtime filter {} was not published before rowset scan of {}",
+                    filter.handle.id().index(),
+                    self.desc.table.name()
+                )));
             }
             if let Some(predicate) =
                 handle.runtime_filter_predicate(filter.build_key_index, filter.probe_column_id)

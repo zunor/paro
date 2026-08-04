@@ -652,6 +652,16 @@ impl BuiltinCasts {
             LogicalType::Date,
             BoundCastInfo::varlen(date_casts::varchar_to_date),
         );
+        set.register_cast(
+            LogicalType::Date,
+            LogicalType::Timestamp,
+            BoundCastInfo::fixed(date_casts::date_to_timestamp),
+        );
+        set.register_cast(
+            LogicalType::Timestamp,
+            LogicalType::Date,
+            BoundCastInfo::fixed(date_casts::timestamp_to_date),
+        );
 
         // --- Timestamp <-> VARCHAR ---
         set.register_cast(

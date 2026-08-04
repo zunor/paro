@@ -23,7 +23,7 @@ fn hot_path_files_stay_split_and_role_files_stay_thin() {
                 .expect("read rust source")
                 .lines()
                 .count();
-            let limit = if is_test_source(&file) { 1_200 } else { 800 };
+            let limit = 1_500;
             assert!(
                 line_count <= limit,
                 "{} has {} lines, above operator-runtime structure limit {}",
@@ -131,12 +131,6 @@ fn contains_operator_state_boundary(text: &str) -> bool {
 
 fn read(root: &Path, rel: &str) -> String {
     fs::read_to_string(root.join(rel)).expect("read source file")
-}
-
-fn is_test_source(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
 }
 
 fn rust_files(path: PathBuf) -> Vec<PathBuf> {

@@ -3,18 +3,20 @@
 
 use crate::binder::bind::from::join_utils::{
     collect_table_bindings, convert_join_type, create_join_operator, extract_join_condition,
-    split_conjunction,
+    get_expression_side, split_conjunction,
 };
 use crate::binder::ir::BoundJoin;
 use crate::binder::plan::subquery::{flatten_dependent_join, RecursiveSubqueryPlanner};
 use crate::binder::Binder;
-use crate::operator::{CrossProduct, DependentJoin, Filter, Join, JoinType, LogicalOperator};
+use crate::operator::{
+    CrossProduct, DependentJoin, Filter, Join, JoinSide, JoinType, LogicalOperator,
+};
 use paro_common::error::{self as paro_error, Result};
 
 impl Binder {
     pub(crate) fn plan_join_ref(&mut self, join_ref: BoundJoin) -> Result<LogicalOperator> {
-        let left_child = self.plan_table_ref(*join_ref.left)?;
-        let right_child = if join_ref.lateral && !join_ref.correlated_columns.is_empty() {
+        let mut left_child = self.plan_table_ref(*join_ref.left)?;
+        let mut right_child = if join_ref.lateral && !join_ref.correlated_columns.is_empty() {
             self.with_delayed_subquery_planning_disabled(|binder| {
                 binder.plan_table_ref(*join_ref.right)
             })?
@@ -56,6 +58,38 @@ impl Binder {
                 &mut conditions,
                 &mut arbitrary_expressions,
             );
+        }
+
+        // Side-local predicates on the null-supplying side can be evaluated before an
+        // outer/semi/anti join without changing which preserved rows are emitted. Doing
+        // this before join construction retains equi-conditions for the hash join instead
+        // of degrading the whole ON clause to an arbitrary nested-loop predicate.
+        let mut left_filters = Vec::new();
+        let mut right_filters = Vec::new();
+        arbitrary_expressions.retain(|expression| {
+            let side = get_expression_side(expression, &left_bindings, &right_bindings);
+            match (join_type, side) {
+                (
+                    JoinType::Left | JoinType::Single | JoinType::Semi | JoinType::Anti,
+                    JoinSide::Right,
+                ) => {
+                    right_filters.push(expression.clone());
+                    false
+                }
+                (JoinType::Right | JoinType::RightSemi | JoinType::RightAnti, JoinSide::Left) => {
+                    left_filters.push(expression.clone());
+                    false
+                }
+                _ => true,
+            }
+        });
+        if !left_filters.is_empty() {
+            left_child =
+                LogicalOperator::Filter(Filter::new(self.wrap_plan(left_child), left_filters));
+        }
+        if !right_filters.is_empty() {
+            right_child =
+                LogicalOperator::Filter(Filter::new(self.wrap_plan(right_child), right_filters));
         }
 
         let has_subquery_in_on = arbitrary_expressions.iter().any(Self::contains_subquery);

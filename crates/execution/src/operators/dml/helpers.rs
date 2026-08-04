@@ -152,30 +152,13 @@ pub(crate) fn flush_insert_buffered_chunks(
     if local.buffered_rows == 0 {
         return Ok(0);
     }
-    let table_types = storage.types();
-    let mut merged = Chunk::try_initialize(
-        table_types,
-        local.buffered_rows,
-        ctx.query.allocator(MemoryTag::MemTable),
-    )?;
-    merged.try_set_cardinality(local.buffered_rows)?;
-    let mut dst_row = 0;
+    let mut flushed_rows = 0;
     for chunk in local.buffered_chunks.drain(..) {
-        let rows = chunk.size();
-        for col_idx in 0..chunk.column_count() {
-            let src_col = chunk
-                .column(col_idx)
-                .ok_or_else(|| paro_error::internal("source column missing"))?;
-            let dst_col = merged
-                .column_mut(col_idx)
-                .ok_or_else(|| paro_error::internal("destination column missing"))?;
-            dst_col.try_copy_range(dst_row, src_col, 0, rows)?;
-        }
-        dst_row += rows;
+        storage.append_with_transaction(&ctx.query.transaction, &chunk, txn.clone())?;
+        flushed_rows += chunk.size();
     }
-    storage.append_with_transaction(&ctx.query.transaction, &merged, txn)?;
     local.buffered_rows = 0;
-    Ok(dst_row)
+    Ok(flushed_rows)
 }
 
 pub(crate) fn collect_updated_column_values(

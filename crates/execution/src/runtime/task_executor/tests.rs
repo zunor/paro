@@ -20,8 +20,8 @@ use paro_function::table::{
 use paro_function::window::WindowFunction;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{
-    AggregateExpression, ConstantExpression, Expression, OrderByExpression, ReferenceExpression,
-    WindowExpression, WindowFrame,
+    AggregateExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+    OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 

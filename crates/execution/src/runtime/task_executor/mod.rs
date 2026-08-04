@@ -3,6 +3,7 @@
 
 //! Single-task executor state machine for the role-specific runtime.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, ParoError, Result};
@@ -86,6 +87,12 @@ pub struct PipelineTaskExecutor {
     pub task: PipelineTaskState,
     completion_stage: PipelineCompletionStage,
     blocked_resume: Option<PipelineTaskPhase>,
+    /// OutputMore continuations suspended behind a downstream transform.
+    ///
+    /// A single pipeline can contain multiple expanding transforms. When a
+    /// downstream transform also returns OutputMore, it must be drained before
+    /// resuming the upstream transform that produced its current input.
+    output_more_continuations: VecDeque<usize>,
     finish_group: Option<FinishTaskGroup>,
     active_finish_task: Option<super::context::FinishTaskId>,
     call_context: OperatorCallContextCell,
@@ -101,6 +108,7 @@ impl PipelineTaskExecutor {
             task,
             completion_stage: PipelineCompletionStage::MergeLocal,
             blocked_resume: None,
+            output_more_continuations: VecDeque::new(),
             finish_group: None,
             active_finish_task: None,
             call_context,

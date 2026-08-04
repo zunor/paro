@@ -11,6 +11,7 @@
 //! - Float types: accumulate sum as f64, count as u64, finalize to f64
 
 use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -109,7 +110,7 @@ mod avg_i32 {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state_ptrs = states.flat_data::<*mut u8>();
         let result_data = result.flat_data_mut::<f64>();
 
@@ -124,6 +125,7 @@ mod avg_i32 {
                 *result_data.add(i) = state.sum / (state.count as f64);
             }
         }
+        Ok(())
     }
 }
 
@@ -207,7 +209,7 @@ mod avg_i64 {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state_ptrs = states.flat_data::<*mut u8>();
         let result_data = result.flat_data_mut::<f64>();
 
@@ -222,6 +224,7 @@ mod avg_i64 {
                 *result_data.add(i) = state.sum / (state.count as f64);
             }
         }
+        Ok(())
     }
 }
 
@@ -305,7 +308,7 @@ mod avg_f64 {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state_ptrs = states.flat_data::<*mut u8>();
         let result_data = result.flat_data_mut::<f64>();
 
@@ -320,12 +323,14 @@ mod avg_f64 {
                 *result_data.add(i) = state.sum / (state.count as f64);
             }
         }
+        Ok(())
     }
 }
 
 /// Get the AVG aggregate function set.
 pub fn get_avg_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("avg".to_string());
+    set.set_dynamic_bind(super::decimal::bind_avg);
 
     // Integer -> Double
     set.add_function(AggregateFunction::new(
@@ -438,7 +443,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -481,7 +486,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -525,7 +530,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -558,7 +563,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(result.is_null(0)); // AVG of empty set is NULL
@@ -626,7 +631,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&target_states, &input_data, &mut result, 1);
+                (func.finalize)(&target_states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));

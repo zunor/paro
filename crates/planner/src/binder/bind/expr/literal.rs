@@ -8,7 +8,7 @@
 
 use crate::expression::{ConstantExpression, Expression};
 use ethnum::i256;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::Literal;
@@ -60,10 +60,23 @@ pub fn bind_literal(value: Literal) -> Result<Expression> {
                     }
                 }
             } else {
-                // For now, convert to double
-                let divisor = 10f64.powi(scale as i32);
-                let f = (value.as_i128() as f64) / divisor;
-                (Value::Double(f), LogicalType::Double)
+                let decimal = value.as_i128();
+                if value != i256::from(decimal) {
+                    return Err(paro_error::out_of_range(
+                        "Decimal literal exceeds maximum precision 38",
+                    ));
+                }
+                let digits = decimal.to_string().trim_start_matches('-').len().max(1) as u8;
+                let precision = digits.max(scale);
+                if precision > 38 {
+                    return Err(paro_error::out_of_range(
+                        "Decimal literal exceeds maximum precision 38",
+                    ));
+                }
+                (
+                    Value::Decimal(decimal, precision, scale),
+                    LogicalType::Decimal { precision, scale },
+                )
             }
         }
         Literal::String(s) => (Value::Varchar(s.clone()), LogicalType::Varchar),

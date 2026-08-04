@@ -23,6 +23,8 @@ use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 
 use crate::copy::{CopyFormat, CopyFromSource, CopyOptions};
+use crate::scalar::cast::date_casts::parse_date_text;
+use crate::scalar::cast::decimal_casts::parse_decimal_text;
 
 use super::{
     CopyStdinSource, GlobalTableFunctionState, LocalTableFunctionState, TableFunction,
@@ -1313,6 +1315,12 @@ fn parse_field(field: &ParsedField, target_type: &LogicalType) -> Result<Value> 
         LogicalType::UBigInt => parse_u64(&field.value).map(Value::UBigInt),
         LogicalType::Float => parse_f64(&field.value).map(|v| Value::Float(v as f32)),
         LogicalType::Double => parse_f64(&field.value).map(Value::Double),
+        LogicalType::Decimal { precision, scale } => {
+            parse_decimal_text(&field.value, *precision, *scale)
+        }
+        LogicalType::Date => parse_date_text(&field.value)
+            .map(Value::Date)
+            .ok_or_else(|| paro_error::invalid_value(target_type.to_string(), field.value.clone())),
         _ => Err(paro_error::not_implemented(format!(
             "read_csv does not support type {}",
             target_type
@@ -1385,5 +1393,55 @@ mod tests {
             .expect("missing statement input must fail");
 
         assert!(err.message().contains("requires statement-scoped input"));
+    }
+
+    #[test]
+    fn parse_field_uses_sql_decimal_cast_semantics() {
+        let field = ParsedField {
+            value: "-12.345".to_string(),
+            is_null: false,
+        };
+
+        let value = parse_field(
+            &field,
+            &LogicalType::Decimal {
+                precision: 6,
+                scale: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(value, Value::Decimal(-1235, 6, 2));
+    }
+
+    #[test]
+    fn parse_field_rejects_decimal_precision_overflow() {
+        let field = ParsedField {
+            value: "1000.00".to_string(),
+            is_null: false,
+        };
+
+        let err = parse_field(
+            &field,
+            &LogicalType::Decimal {
+                precision: 5,
+                scale: 2,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.message().contains("exceeds precision 5"));
+    }
+
+    #[test]
+    fn parse_field_supports_date() {
+        let field = ParsedField {
+            value: "1998-12-01".to_string(),
+            is_null: false,
+        };
+
+        let value = parse_field(&field, &LogicalType::Date).unwrap();
+
+        assert_eq!(value, Value::Date(10_561));
     }
 }

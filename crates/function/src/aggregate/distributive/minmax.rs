@@ -6,6 +6,7 @@
 //!
 
 use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -104,7 +105,7 @@ macro_rules! define_minmax_impl {
                 _input_data: &AggregateInputData,
                 result: &mut Vector,
                 count: usize,
-            ) {
+            ) -> Result<()> {
                 let state_ptrs = states.flat_data::<*mut u8>();
                 let result_data = result.flat_data_mut::<$type>();
 
@@ -119,6 +120,7 @@ macro_rules! define_minmax_impl {
                         *result_data.add(i) = state.value;
                     }
                 }
+                Ok(())
             }
         }
     };
@@ -144,6 +146,7 @@ define_minmax_impl!(max_f64, f64, cmp_max);
 
 pub fn get_min_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("min".to_string());
+    set.set_dynamic_bind(super::decimal::bind_min);
 
     // Integer
     set.add_function(AggregateFunction::new(
@@ -192,6 +195,7 @@ pub fn get_min_function() -> AggregateFunctionSet {
 
 pub fn get_max_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("max".to_string());
+    set.set_dynamic_bind(super::decimal::bind_max);
 
     // Integer
     set.add_function(AggregateFunction::new(
@@ -295,7 +299,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert_eq!(result.get_flat::<i32>(0), 5);
@@ -337,7 +341,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert_eq!(result.get_flat::<f64>(0), 3.5);

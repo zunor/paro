@@ -6,6 +6,7 @@ pub mod avg;
 pub mod bit_agg;
 pub mod bool_agg;
 pub mod count;
+pub(crate) mod decimal;
 pub mod first_last;
 pub mod minmax;
 pub mod string_agg;

@@ -209,11 +209,19 @@ impl PipelineTaskExecutor {
         transform_idx: usize,
         resume: TransformResumeState,
     ) -> Result<TaskStepResult> {
+        let continuations_before = self.output_more_continuations.len();
         let result = self.push_transform_output_downstream(ctx, transform_idx, resume)?;
-        if matches!(result, TaskStepResult::Continue)
-            && matches!(resume, TransformResumeState::OutputMore)
-        {
-            self.phase = PipelineTaskPhase::RunningTransformOutputMore { transform_idx };
+        // A synchronous non-expanding downstream transform must not resume an
+        // older ancestor: its caller still owns that decision. Once a call
+        // suspends, `resume_transform_output` becomes the top-level owner and
+        // handles both FromStart and OutputMore resumes.
+        if matches!(resume, TransformResumeState::OutputMore) {
+            self.schedule_transform_resume_after_downstream(
+                transform_idx,
+                resume,
+                continuations_before,
+                &result,
+            );
         }
         Ok(result)
     }
@@ -224,30 +232,68 @@ impl PipelineTaskExecutor {
         transform_idx: usize,
         resume: TransformResumeState,
     ) -> Result<TaskStepResult> {
+        let continuations_before = self.output_more_continuations.len();
         let result = self.push_transform_output_downstream(ctx, transform_idx, resume)?;
         if !matches!(result, TaskStepResult::Continue) {
             return Ok(result);
         }
         match resume {
-            TransformResumeState::FromStart => Ok(TaskStepResult::Continue),
-            TransformResumeState::OutputMore => {
-                self.phase = PipelineTaskPhase::RunningTransformOutputMore { transform_idx };
-                Ok(TaskStepResult::Continue)
+            TransformResumeState::FromStart | TransformResumeState::OutputMore => {
+                self.schedule_transform_resume_after_downstream(
+                    transform_idx,
+                    resume,
+                    continuations_before,
+                    &result,
+                );
             }
             TransformResumeState::FlushNext => {
                 self.phase = PipelineTaskPhase::Flushing {
                     transform_idx: transform_idx + 1,
                     resume_idx: 0,
                 };
-                Ok(TaskStepResult::Continue)
             }
             TransformResumeState::FlushOutputMore => {
                 self.phase = PipelineTaskPhase::Flushing {
                     transform_idx,
                     resume_idx: 0,
                 };
-                Ok(TaskStepResult::Continue)
             }
+        }
+        Ok(TaskStepResult::Continue)
+    }
+
+    fn schedule_transform_resume_after_downstream(
+        &mut self,
+        transform_idx: usize,
+        resume: TransformResumeState,
+        continuations_before: usize,
+        result: &TaskStepResult,
+    ) {
+        if !matches!(result, TaskStepResult::Continue) {
+            return;
+        }
+        if matches!(resume, TransformResumeState::OutputMore) {
+            if matches!(self.phase, PipelineTaskPhase::Running) {
+                self.phase = PipelineTaskPhase::RunningTransformOutputMore { transform_idx };
+            } else {
+                // Downstream installed its own continuation. Insert this one
+                // after continuations created by that downstream call, but
+                // before any older upstream ancestors.
+                let descendants = self
+                    .output_more_continuations
+                    .len()
+                    .saturating_sub(continuations_before);
+                self.output_more_continuations
+                    .insert(descendants, transform_idx);
+            }
+        } else if matches!(self.phase, PipelineTaskPhase::Running) {
+            self.schedule_next_output_more_continuation();
+        }
+    }
+
+    fn schedule_next_output_more_continuation(&mut self) {
+        if let Some(transform_idx) = self.output_more_continuations.pop_front() {
+            self.phase = PipelineTaskPhase::RunningTransformOutputMore { transform_idx };
         }
     }
 
@@ -316,7 +362,13 @@ impl PipelineTaskExecutor {
         transform_idx: usize,
     ) -> Result<TaskStepResult> {
         self.phase = PipelineTaskPhase::Running;
-        self.continue_transform_output_more(ctx, transform_idx)
+        let result = self.continue_transform_output_more(ctx, transform_idx)?;
+        if matches!(result, TaskStepResult::Continue)
+            && matches!(self.phase, PipelineTaskPhase::Running)
+        {
+            self.schedule_next_output_more_continuation();
+        }
+        Ok(result)
     }
 
     pub(crate) fn consume_sink_from_slot(
@@ -416,7 +468,10 @@ impl PipelineTaskExecutor {
             }
             SinkResumeState::FromStart
             | SinkResumeState::LocalCursor
-            | SinkResumeState::RowOffset(_) => Ok(TaskStepResult::Continue),
+            | SinkResumeState::RowOffset(_) => {
+                self.schedule_next_output_more_continuation();
+                Ok(TaskStepResult::Continue)
+            }
         }
     }
 

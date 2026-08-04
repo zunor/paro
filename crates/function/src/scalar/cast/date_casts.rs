@@ -30,9 +30,17 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+pub(crate) fn days_in_month(year: i32, month: u32) -> u32 {
+    if is_leap_year(year) && month == 2 {
+        29
+    } else {
+        DAYS_IN_MONTH[month as usize - 1] as u32
+    }
+}
+
 /// Convert days since Unix epoch to (year, month, day).
 /// Returns (year, month, day) where month is 1-12 and day is 1-31.
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+pub(crate) fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     // http://howardhinnant.github.io/date_algorithms.html
 
     // Shift epoch from 1970-01-01 to 0000-03-01 (makes leap year calculation easier)
@@ -57,7 +65,7 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 }
 
 /// Convert (year, month, day) to days since Unix epoch.
-fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
+pub(crate) fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
     // http://howardhinnant.github.io/date_algorithms.html
 
     // Validate inputs
@@ -87,13 +95,13 @@ fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
 }
 
 /// Parse a date string in YYYY-MM-DD format.
-fn parse_date(s: &str) -> Option<i64> {
+fn parse_date(s: &str) -> Option<i32> {
     let s = s.trim();
 
     // Handle special values
     match s.to_lowercase().as_str() {
-        "infinity" | "inf" => return Some(i64::MAX),
-        "-infinity" | "-inf" => return Some(i64::MIN),
+        "infinity" | "inf" => return Some(i32::MAX),
+        "-infinity" | "-inf" => return Some(i32::MIN),
         _ => {}
     }
 
@@ -139,38 +147,34 @@ fn parse_date(s: &str) -> Option<i64> {
         return None;
     }
 
-    let max_day = if is_leap_year(year) && month == 2 {
-        29
-    } else {
-        DAYS_IN_MONTH[month as usize - 1] as u32
-    };
+    let max_day = days_in_month(year, month);
 
     if day < 1 || day > max_day {
         return None;
     }
 
-    Some(ymd_to_days(year, month, day))
+    i32::try_from(ymd_to_days(year, month, day)).ok()
 }
 
-pub fn parse_date_text(s: &str) -> Option<i64> {
+pub fn parse_date_text(s: &str) -> Option<i32> {
     parse_date(s)
 }
 
 /// Format a date (days since epoch) as YYYY-MM-DD string.
-fn format_date(days: i64, buf: &mut [u8]) -> usize {
+fn format_date(days: i32, buf: &mut [u8]) -> usize {
     // Handle special values
-    if days == i64::MAX {
+    if days == i32::MAX {
         let s = b"infinity";
         buf[..s.len()].copy_from_slice(s);
         return s.len();
     }
-    if days == i64::MIN {
+    if days == i32::MIN {
         let s = b"-infinity";
         buf[..s.len()].copy_from_slice(s);
         return s.len();
     }
 
-    let (year, month, day) = days_to_ymd(days);
+    let (year, month, day) = days_to_ymd(i64::from(days));
 
     // Format as YYYY-MM-DD
     let mut cursor = std::io::Cursor::new(&mut buf[..]);
@@ -197,7 +201,7 @@ pub fn date_to_varchar(
 
     for i in 0..count {
         if !input.is_null(i) {
-            let days = unsafe { input.get_flat::<i64>(i) };
+            let days = unsafe { input.get_fixed::<i32>(i) };
             let len = format_date(days, &mut buf);
             let s = std::str::from_utf8(&buf[..len]).unwrap();
             result.set_string(i, s);
@@ -224,7 +228,7 @@ pub fn varchar_to_date(
             if let Some(s) = input.get_string(i) {
                 match parse_date(s) {
                     Some(days) => {
-                        unsafe { result.set_flat::<i64>(i, days) };
+                        unsafe { result.set_flat::<i32>(i, days) };
                     }
                     None => {
                         if ctx.try_cast {
@@ -242,6 +246,61 @@ pub fn varchar_to_date(
     }
 
     Ok(all_success)
+}
+
+/// Cast Date (days since epoch) to Timestamp (microseconds since epoch).
+pub fn date_to_timestamp(
+    input: &Vector,
+    result: &mut Vector,
+    count: usize,
+    _ctx: &CastExecCtx<'_>,
+) -> Result<bool> {
+    result.set_count(count);
+    for i in 0..count {
+        if input.is_null(i) {
+            result.set_null(i, true);
+            continue;
+        }
+        let days = input
+            .get_i32(i)
+            .ok_or_else(|| paro_error::internal("DATE vector has no physical INT32 value"))?;
+        let micros = match days {
+            i32::MAX => i64::MAX,
+            i32::MIN => i64::MIN,
+            _ => i64::from(days)
+                .checked_mul(MICROS_PER_DAY)
+                .ok_or_else(|| paro_error::out_of_range("DATE to TIMESTAMP overflow"))?,
+        };
+        result.set_i64(i, micros);
+    }
+    Ok(true)
+}
+
+/// Cast Timestamp (microseconds since epoch) to Date (days since epoch).
+pub fn timestamp_to_date(
+    input: &Vector,
+    result: &mut Vector,
+    count: usize,
+    _ctx: &CastExecCtx<'_>,
+) -> Result<bool> {
+    result.set_count(count);
+    for i in 0..count {
+        if input.is_null(i) {
+            result.set_null(i, true);
+            continue;
+        }
+        let micros = input
+            .get_i64(i)
+            .ok_or_else(|| paro_error::internal("TIMESTAMP vector has no physical INT64 value"))?;
+        let days = match micros {
+            i64::MAX => i32::MAX,
+            i64::MIN => i32::MIN,
+            _ => i32::try_from(micros.div_euclid(MICROS_PER_DAY))
+                .map_err(|_| paro_error::out_of_range("TIMESTAMP to DATE overflow"))?,
+        };
+        result.set_i32(i, days);
+    }
+    Ok(true)
 }
 
 // ============================================================================
@@ -1047,6 +1106,7 @@ fn parse_verbose_interval(s: &str) -> Option<Interval> {
 
     let s = s.to_lowercase();
     let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut found_any = false;
 
     let mut i = 0;
     while i < tokens.len() {
@@ -1055,8 +1115,14 @@ fn parse_verbose_interval(s: &str) -> Option<Interval> {
             if i + 1 < tokens.len() {
                 let unit = tokens[i + 1];
                 match unit {
+                    u if u.starts_with("millennium") => {
+                        months += (num as i32) * 12_000;
+                    }
                     u if u.starts_with("year") => {
                         months += (num as i32) * 12;
+                    }
+                    u if u.starts_with("quarter") => {
+                        months += (num as i32) * 3;
                     }
                     u if u.starts_with("month") => {
                         months += num as i32;
@@ -1086,6 +1152,7 @@ fn parse_verbose_interval(s: &str) -> Option<Interval> {
                         return None;
                     }
                 }
+                found_any = true;
                 i += 2;
                 continue;
             }
@@ -1093,7 +1160,7 @@ fn parse_verbose_interval(s: &str) -> Option<Interval> {
         i += 1;
     }
 
-    if months == 0 && days == 0 && micros == 0 && !tokens.is_empty() {
+    if !found_any {
         // Failed to parse anything meaningful
         return None;
     }
@@ -1247,6 +1314,34 @@ pub fn varchar_to_interval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::types::LogicalType;
+
+    #[derive(Debug)]
+    struct TestContext;
+
+    impl crate::scalar::FunctionExecContext for TestContext {
+        fn current_database(&self) -> Option<&str> {
+            None
+        }
+
+        fn current_schema(&self) -> Option<&str> {
+            None
+        }
+
+        fn current_user(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    static TEST_CONTEXT: TestContext = TestContext;
+
+    fn ctx() -> CastExecCtx<'static> {
+        CastExecCtx {
+            runtime: &TEST_CONTEXT,
+            try_cast: false,
+            cast_data: None,
+        }
+    }
 
     #[test]
     fn test_days_to_ymd() {
@@ -1286,8 +1381,9 @@ mod tests {
     #[test]
     fn test_parse_date() {
         assert_eq!(parse_date("1970-01-01"), Some(0));
-        assert_eq!(parse_date("2024-06-15"), Some(ymd_to_days(2024, 6, 15)));
-        assert_eq!(parse_date("  2024-06-15  "), Some(ymd_to_days(2024, 6, 15)));
+        let expected = i32::try_from(ymd_to_days(2024, 6, 15)).unwrap();
+        assert_eq!(parse_date("2024-06-15"), Some(expected));
+        assert_eq!(parse_date("  2024-06-15  "), Some(expected));
 
         // Invalid formats
         assert_eq!(parse_date("not-a-date"), None);
@@ -1295,8 +1391,8 @@ mod tests {
         assert_eq!(parse_date("2024-02-30"), None); // Invalid day
 
         // Special values
-        assert_eq!(parse_date("infinity"), Some(i64::MAX));
-        assert_eq!(parse_date("-infinity"), Some(i64::MIN));
+        assert_eq!(parse_date("infinity"), Some(i32::MAX));
+        assert_eq!(parse_date("-infinity"), Some(i32::MIN));
     }
 
     #[test]
@@ -1306,16 +1402,57 @@ mod tests {
         let len = format_date(0, &mut buf);
         assert_eq!(&buf[..len], b"1970-01-01");
 
-        let days = ymd_to_days(2024, 6, 15);
+        let days = i32::try_from(ymd_to_days(2024, 6, 15)).unwrap();
         let len = format_date(days, &mut buf);
         assert_eq!(&buf[..len], b"2024-06-15");
 
         // Special values
-        let len = format_date(i64::MAX, &mut buf);
+        let len = format_date(i32::MAX, &mut buf);
         assert_eq!(&buf[..len], b"infinity");
 
-        let len = format_date(i64::MIN, &mut buf);
+        let len = format_date(i32::MIN, &mut buf);
         assert_eq!(&buf[..len], b"-infinity");
+    }
+
+    #[test]
+    fn varchar_to_date_writes_one_physical_i32_per_row() {
+        let count = paro_common::vector::VECTOR_SIZE;
+        let dates = vec!["1998-09-02"; count];
+        let input = paro_common::test_utils::test_string_vector_with_allocator(
+            &dates,
+            paro_common::test_utils::test_allocator(),
+        );
+        let mut result = paro_common::test_utils::test_vector_with_capacity(
+            paro_common::types::LogicalType::Date,
+            count,
+        );
+
+        varchar_to_date(&input, &mut result, count, &ctx()).unwrap();
+
+        let expected = parse_date("1998-09-02").unwrap();
+        assert_eq!(result.len(), count);
+        assert_eq!(result.get_i32(0), Some(expected));
+        assert_eq!(result.get_i32(count - 1), Some(expected));
+    }
+
+    #[test]
+    fn date_timestamp_casts_use_floor_for_pre_epoch_values() {
+        let mut dates = paro_common::test_utils::test_vector(LogicalType::Date);
+        dates.set_count(3);
+        dates.set_i32(0, -1);
+        dates.set_i32(1, 0);
+        dates.set_i32(2, 1);
+        let mut timestamps = paro_common::test_utils::test_vector(LogicalType::Timestamp);
+        date_to_timestamp(&dates, &mut timestamps, 3, &ctx()).unwrap();
+        assert_eq!(timestamps.get_i64(0), Some(-MICROS_PER_DAY));
+        assert_eq!(timestamps.get_i64(1), Some(0));
+        assert_eq!(timestamps.get_i64(2), Some(MICROS_PER_DAY));
+
+        timestamps.set_i64(0, -1);
+        timestamp_to_date(&timestamps, &mut dates, 3, &ctx()).unwrap();
+        assert_eq!(dates.get_i32(0), Some(-1));
+        assert_eq!(dates.get_i32(1), Some(0));
+        assert_eq!(dates.get_i32(2), Some(1));
     }
 
     #[test]
@@ -1468,6 +1605,8 @@ mod tests {
         assert_eq!(parse_interval("1 year"), Some(Interval::new(12, 0, 0)));
         assert_eq!(parse_interval("2 months"), Some(Interval::new(2, 0, 0)));
         assert_eq!(parse_interval("3 days"), Some(Interval::new(0, 3, 0)));
+        assert_eq!(parse_interval("2 quarters"), Some(Interval::new(6, 0, 0)));
+        assert_eq!(parse_interval("0 days"), Some(Interval::new(0, 0, 0)));
         assert_eq!(
             parse_interval("4 hours"),
             Some(Interval::new(0, 0, 4 * Interval::MICROS_PER_HOUR))

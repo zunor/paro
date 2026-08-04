@@ -6,7 +6,7 @@
 //! Implements casts between Decimal and numeric/varchar types.
 
 use paro_common::error::{self as paro_error, Result};
-use paro_common::runtime_value::format_decimal_i128;
+use paro_common::runtime_value::{format_decimal_i128, Value};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -130,6 +130,20 @@ fn parse_decimal_string(s: &str) -> Result<(i128, u8)> {
     let scale = frac_part.len() as u8;
 
     Ok((value, scale))
+}
+
+/// Parse a textual decimal using the same rescaling and precision rules as
+/// the vectorized VARCHAR -> DECIMAL cast.
+///
+/// Text-backed table functions (COPY/CSV, JSON, etc.) should use this helper
+/// instead of maintaining their own decimal grammar. Keeping the conversion
+/// here guarantees that bulk ingestion and SQL casts agree on rounding and
+/// overflow behavior.
+pub(crate) fn parse_decimal_text(s: &str, precision: u8, scale: u8) -> Result<Value> {
+    let (raw_value, raw_scale) = parse_decimal_string(s)?;
+    let scaled = rescale_decimal(raw_value, raw_scale, scale)?;
+    check_decimal_precision(scaled, precision)?;
+    Ok(Value::Decimal(scaled, precision, scale))
 }
 
 fn decimal_params(ty: &LogicalType) -> Result<(u8, u8)> {

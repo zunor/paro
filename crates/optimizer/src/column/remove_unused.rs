@@ -401,6 +401,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 // Collect references from join conditions
                 match join {
                     paro_planner::operator::Join::Comparison(cj) => {
+                        // Delim capture keys are evaluated against the captured
+                        // child just like join conditions. Track them here so a
+                        // pruned scan both retains the key and rewrites its
+                        // binding to the compacted child layout.
+                        for expr in &mut cj.duplicate_eliminated_columns {
+                            child_optimizer.visit_expression(expr);
+                        }
                         for cond in &mut cj.conditions {
                             child_optimizer.visit_expression(&mut cond.left);
                             child_optimizer.visit_expression(&mut cond.right);
@@ -819,5 +826,92 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
         self.add_binding(expr);
 
         None // Don't replace, just collect
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RemoveUnusedColumns;
+    use paro_common::types::LogicalType;
+    use paro_context::test_support::TestStatementContextBuilder;
+    use paro_planner::binder::Binder;
+    use paro_planner::expression::{ColumnRefExpression, Expression};
+    use paro_planner::operator::{
+        ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType, JoinCondition,
+        JoinType, LogicalOperator, Projection,
+    };
+    use paro_planner::plan::LogicalPlan;
+
+    fn int_column(table_index: usize, column_index: usize) -> Expression {
+        Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(table_index, column_index),
+            LogicalType::Integer,
+        ))
+    }
+
+    fn binding(expression: &Expression) -> ColumnBinding {
+        let Expression::ColumnRef(column) = expression else {
+            panic!("expected column reference");
+        };
+        column.binding
+    }
+
+    #[test]
+    fn delim_capture_key_tracks_pruned_child_binding() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let left = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Get(Get::new_without_table(
+                10,
+                vec!["unused".into(), "key".into()],
+                vec![LogicalType::Integer, LogicalType::Integer],
+            )),
+        );
+        let right = LogicalPlan::new(
+            ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                20,
+                Vec::new(),
+                vec!["value".into()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let mut join = ComparisonJoin::new(
+            JoinType::Single,
+            left,
+            right,
+            vec![JoinCondition::new(
+                int_column(10, 1),
+                int_column(20, 0),
+                JoinComparisonType::NotDistinctFrom,
+            )],
+        );
+        join.duplicate_eliminated_columns = vec![int_column(10, 1)];
+        join.right_projection_map = vec![0];
+        let joined = LogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(30, joined, vec![int_column(20, 0)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected root projection");
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &projection.child.operator else {
+            panic!("expected comparison join");
+        };
+        let LogicalOperator::Get(get) = &join.left.operator else {
+            panic!("expected left get");
+        };
+        assert_eq!(get.column_ids, vec![1]);
+        assert_eq!(
+            binding(&join.duplicate_eliminated_columns[0]),
+            ColumnBinding::new(10, 0)
+        );
+        assert_eq!(binding(&join.conditions[0].left), ColumnBinding::new(10, 0));
     }
 }

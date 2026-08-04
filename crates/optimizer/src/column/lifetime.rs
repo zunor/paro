@@ -151,9 +151,11 @@ impl ColumnLifetimeAnalyzer {
                 known_bindings.extend(left_bindings.iter().copied());
                 known_bindings.extend(right_bindings.iter().copied());
 
-                // Delim/correlated joins rely on duplicate-eliminated columns carried through
-                // specialized pipelines. Column-lifetime pruning can drop required columns
-                // because bindings are remapped later. Keep full schemas for this shape.
+                // Delim/correlated joins rely on duplicate-eliminated columns
+                // carried through specialized pipelines. Their planner-provided
+                // projection maps also distinguish visible subquery output from
+                // internal correlation columns, so only replace those maps when
+                // the complete binding set is safe to analyze.
                 if comp_join.duplicate_eliminated_columns.is_empty()
                     && !self.has_unknown_references(&known_bindings)
                 {
@@ -164,9 +166,6 @@ impl ColumnLifetimeAnalyzer {
                         Self::generate_projection_map_from_unused(&left_bindings, &left_unused);
                     comp_join.right_projection_map =
                         Self::generate_projection_map_from_unused(&right_bindings, &right_unused);
-                } else {
-                    comp_join.left_projection_map.clear();
-                    comp_join.right_projection_map.clear();
                 }
 
                 comp_join.left = Box::new(self.optimize_plan(left)?);
@@ -311,11 +310,15 @@ mod tests {
     use super::ColumnLifetimeAnalyzer;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
+    use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ColumnRefExpression, Expression, WindowExpression, WindowFrame, WindowFrameBound,
         WindowFrameType,
     };
-    use paro_planner::operator::ColumnBinding;
+    use paro_planner::operator::{
+        ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinType, LogicalOperator,
+    };
+    use paro_planner::plan::LogicalPlan;
 
     #[test]
     fn extract_column_bindings_visits_window_frame_offsets() {
@@ -342,5 +345,42 @@ mod tests {
         ColumnLifetimeAnalyzer::extract_column_bindings(&expression, &mut bindings);
 
         assert_eq!(bindings, vec![expected]);
+    }
+
+    #[test]
+    fn delim_join_preserves_visible_rhs_projection() {
+        let ctx = BindContext::new();
+        let left = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["outer_key".into()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let right = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                20,
+                Vec::new(),
+                vec!["value".into(), "__corr_1".into()],
+                vec![LogicalType::Integer, LogicalType::Integer],
+            )),
+        );
+        let mut join = ComparisonJoin::new(JoinType::Single, left, right, Vec::new());
+        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(10, 0),
+            LogicalType::Integer,
+        ))];
+        join.right_projection_map = vec![0];
+        let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Join(Join::Comparison(join)) = optimized.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.right_projection_map, vec![0]);
+        assert_eq!(join.get_types().len(), 2);
     }
 }

@@ -1666,7 +1666,7 @@ mod tests {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         let result_data = result.flat_data_mut::<i64>();
@@ -1675,6 +1675,7 @@ mod tests {
             let state_ptr = *state_data.add(state_idx) as *const i64;
             *result_data.add(row) = *state_ptr;
         }
+        Ok(())
     }
 
     unsafe fn sum_destructor(_states: &Vector, _input_data: &AggregateInputData, count: usize) {

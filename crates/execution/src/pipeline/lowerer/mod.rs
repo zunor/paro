@@ -177,6 +177,7 @@ mod linear;
 mod materialized_pair;
 mod pipeline_dispatch;
 mod pipelines;
+mod probe_sources;
 mod set_operation;
 
 pub(crate) use breaker_lowering::BreakerDispatch;

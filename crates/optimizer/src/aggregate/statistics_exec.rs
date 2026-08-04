@@ -343,7 +343,8 @@ mod tests {
         _input_data: &AggregateInputData,
         _result: &mut Vector,
         _count: usize,
-    ) {
+    ) -> paro_common::error::Result<()> {
+        Ok(())
     }
 
     fn aggregate_expr(

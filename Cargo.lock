@@ -1657,6 +1657,7 @@ dependencies = [
 name = "paro-function"
 version = "0.1.0"
 dependencies = [
+ "ethnum",
  "paro-common",
  "paro-parser",
  "paro-storage",

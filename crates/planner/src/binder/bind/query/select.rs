@@ -732,14 +732,20 @@ impl Binder {
     }
 
     pub fn bind_from_clause(&mut self, from: &[TableReference]) -> Result<Option<BoundFromItem>> {
-        if !from.is_empty() {
-            if from.len() > 1 {
-                return Err(paro_error::not_implemented("Implicit join in FROM clause"));
-            }
-            Ok(Some(self.bind_table_ref(from[0].clone())?))
-        } else {
-            Ok(None)
+        let Some((first, rest)) = from.split_first() else {
+            return Ok(None);
+        };
+
+        let mut bound = self.bind_table_ref(first.clone())?;
+        for table_ref in rest {
+            bound = crate::binder::bind::from::join::bind_implicit_cross_join(
+                self,
+                bound,
+                table_ref.clone(),
+            )?;
         }
+
+        Ok(Some(bound))
     }
 
     /// Bind SELECT list and record expression aliases

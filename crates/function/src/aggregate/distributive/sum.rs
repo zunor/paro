@@ -6,6 +6,7 @@
 //!
 
 use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -37,11 +38,6 @@ macro_rules! define_sum_impl {
             ) {
                 let input = inputs[0];
                 let state_ptrs = states.flat_data::<*mut u8>();
-
-                // Optimized path for Flat vectors
-                /*
-                // In a real implementation we would check vector type and use specific path
-                 */
 
                 for i in 0..count {
                     if !input.is_null(i) {
@@ -101,7 +97,7 @@ macro_rules! define_sum_impl {
                 _input_data: &AggregateInputData,
                 result: &mut Vector,
                 count: usize,
-            ) {
+            ) -> Result<()> {
                 let state_ptrs = states.flat_data::<*mut u8>();
                 let result_data = result.flat_data_mut::<$state_type>();
 
@@ -116,6 +112,7 @@ macro_rules! define_sum_impl {
                         *result_data.add(i) = state.value;
                     }
                 }
+                Ok(())
             }
         }
     };
@@ -128,6 +125,7 @@ define_sum_impl!(sum_f64, f64, f64); // Double -> Double
 
 pub fn get_sum_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("sum".to_string());
+    set.set_dynamic_bind(super::decimal::bind_sum);
 
     // Integer -> BigInt
     set.add_function(AggregateFunction::new(
@@ -230,7 +228,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert_eq!(result.get_flat::<i64>(0), 10);
@@ -273,7 +271,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert_eq!(result.get_flat::<i64>(0), 1);
