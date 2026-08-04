@@ -121,10 +121,29 @@ impl JoinOrderOptimizer {
 
     /// Check if a join can be optimized.
     fn can_optimize_join(&self, plan: &LogicalOperator) -> bool {
+        // CTE references carry execution-region identity that the join-order
+        // reconstructor does not preserve yet. Reordering a recursive term can
+        // detach its scan from the recursive control region and panic at run
+        // time, so keep CTE join trees in their bound order.
+        if Self::contains_cte_reference(plan) {
+            return false;
+        }
         match plan {
             LogicalOperator::Join(join) => RelationManager::join_is_reorderable(join),
+            // SQL comma joins arrive here as Filter(CrossProduct). The filter
+            // contains the actual join edge, so optimizing only the child
+            // leaves a Cartesian product followed by an equality filter.
+            LogicalOperator::Filter(filter) => self.can_optimize_join(&filter.child.operator),
             _ => false,
         }
+    }
+
+    fn contains_cte_reference(plan: &LogicalOperator) -> bool {
+        matches!(plan, LogicalOperator::CTERef(_))
+            || plan
+                .children()
+                .into_iter()
+                .any(|child| Self::contains_cte_reference(&child.operator))
     }
 
     /// Optimize a join tree.
@@ -489,27 +508,32 @@ impl JoinOrderOptimizer {
         used_filters: &mut HashSet<usize>,
     ) -> LogicalPlan {
         let logical_cost_model = LogicalCostModel::default();
+        let mut expressions = Vec::new();
+        let mut filter_indexes = Vec::new();
         for filter in &self.filter_infos {
             if used_filters.contains(&filter.filter_index) {
                 continue;
             }
             if filter.set.count() > 0 && JoinRelationSet::is_subset(result_set, &filter.set) {
-                let child_estimate = result.stats.estimated_cardinality;
-                let estimated_cardinality = child_estimate.map(|estimate| {
-                    logical_cost_model.estimate_filter_cardinality(
-                        estimate.expected,
-                        std::slice::from_ref(&filter.filter),
-                        &self.column_stats,
-                    )
-                });
-                result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-                    result,
-                    vec![filter.filter.clone()],
-                )));
-                result.stats.estimated_cardinality = estimated_cardinality;
-                used_filters.insert(filter.filter_index);
+                expressions.push(filter.filter.clone());
+                filter_indexes.push(filter.filter_index);
             }
         }
+        if expressions.is_empty() {
+            return result;
+        }
+
+        let child_estimate = result.stats.estimated_cardinality;
+        let estimated_cardinality = child_estimate.map(|estimate| {
+            logical_cost_model.estimate_filter_cardinality(
+                estimate.expected,
+                &expressions,
+                &self.column_stats,
+            )
+        });
+        result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
+        result.stats.estimated_cardinality = estimated_cardinality;
+        used_filters.extend(filter_indexes);
         result
     }
 
@@ -640,10 +664,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use paro_common::types::LogicalType;
+    use paro_common::{runtime_value::Value, types::LogicalType};
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::binder::context::BindContext;
-    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
     use paro_planner::operator::{ColumnBinding, ExpressionGet, Projection};
     use paro_planner::plan::{CardinalityEstimate, NodeStats};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
@@ -748,6 +772,113 @@ mod tests {
             }
             other => panic!("expected comparison join, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn optimize_converts_filtered_cross_product_to_comparison_join() {
+        let session = make_test_session();
+        let mut optimizer = JoinOrderOptimizer::new();
+        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            LogicalPlan::synthetic(create_scan(0)),
+            LogicalPlan::synthetic(create_scan(1)),
+        ))));
+        let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+            ComparisonType::Equal,
+            column_ref(0, 0),
+            column_ref(1, 0),
+        ));
+        let plan = LogicalOperator::Filter(Filter::new(cross, vec![equality]));
+
+        let bind_context = BindContext::new();
+        let optimized = optimizer.optimize(&session, &bind_context, plan).unwrap();
+
+        let LogicalOperator::Join(Join::Comparison(join)) = optimized else {
+            panic!("expected filtered cross product to become a comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::Inner);
+        assert_eq!(join.conditions.len(), 1);
+        assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
+    }
+
+    #[test]
+    fn filtered_cte_join_is_not_reordered_out_of_its_control_region() {
+        let cte_ref = LogicalPlan::synthetic(LogicalOperator::CTERef(
+            paro_planner::operator::CTERef::new(
+                12,
+                30,
+                vec!["id".to_string()],
+                vec![LogicalType::Integer],
+            ),
+        ));
+        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            cte_ref,
+            LogicalPlan::synthetic(create_scan(31)),
+        ))));
+        let plan = LogicalOperator::Filter(Filter::new(
+            cross,
+            vec![Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(30, 0),
+                    column_ref(31, 0),
+                ),
+            )],
+        ));
+
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan));
+    }
+
+    #[test]
+    fn optimize_coalesces_single_relation_filters_after_join_reordering() {
+        let session = make_test_session();
+        let mut optimizer = JoinOrderOptimizer::new();
+        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            LogicalPlan::synthetic(create_scan(0)),
+            LogicalPlan::synthetic(create_scan(1)),
+        ))));
+        let compare = |comparison_type, left, right| {
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                comparison_type,
+                left,
+                right,
+            ))
+        };
+        let constant = |value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::Integer(value),
+                LogicalType::Integer,
+            ))
+        };
+        let plan = LogicalOperator::Filter(Filter::new(
+            cross,
+            vec![
+                compare(ComparisonType::Equal, column_ref(0, 0), column_ref(1, 0)),
+                compare(
+                    ComparisonType::GreaterThanOrEqual,
+                    column_ref(0, 0),
+                    constant(10),
+                ),
+                compare(ComparisonType::LessThan, column_ref(0, 0), constant(20)),
+            ],
+        ));
+
+        let bind_context = BindContext::new();
+        let optimized = optimizer.optimize(&session, &bind_context, plan).unwrap();
+        let LogicalOperator::Join(Join::Comparison(join)) = optimized else {
+            panic!("expected comparison join");
+        };
+        let filters = [&join.left.operator, &join.right.operator]
+            .into_iter()
+            .find_map(|operator| match operator {
+                LogicalOperator::Filter(filter) => Some(filter),
+                _ => None,
+            })
+            .expect("single-relation filter");
+        assert_eq!(filters.expressions.len(), 2);
+        assert!(matches!(
+            filters.child.operator,
+            LogicalOperator::ExpressionGet(_)
+        ));
     }
 
     #[test]

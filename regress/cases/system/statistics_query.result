@@ -45,22 +45,20 @@ PROJECTION  (rows=1)
   Output: s.id, b.payload
   Cardinality: [0, 1, 1]
   Output Schema: s.id INTEGER, b.payload VARCHAR
-  ->  FILTER  (rows=1)
-    Filter: #2 = #0
-    Cardinality: [0, 1, 1]
+  ->  HASH_JOIN  (rows=0)
+    Join Type: INNER
+    Join Condition: #0 = #0
+    Cardinality: [0, 0, 0]
     Output Schema: id INTEGER, payload VARCHAR, id INTEGER
-    ->  CROSS_PRODUCT  (rows=5)
-      Cardinality: [5, 5, 5]
-      Output Schema: id INTEGER, payload VARCHAR, id INTEGER
-      ->  ROWSET_SCAN on public.stats_big b
-        Columns: id, payload
-        Pushed Predicate: col#0 = 1
-        Late Materialize: auto
-        Runtime Filter: #0 = 1
-        Output Schema: id INTEGER, payload VARCHAR
-      ->  ROWSET_SCAN on public.stats_small s
-        Columns: id
-        Output Schema: id INTEGER
+    ->  ROWSET_SCAN on public.stats_big b
+      Columns: id, payload
+      Pushed Predicate: col#0 <= 1 AND col#0 = 1
+      Late Materialize: auto
+      Runtime Filter: #0 = 1
+      Output Schema: id INTEGER, payload VARCHAR
+    ->  ROWSET_SCAN on public.stats_small s
+      Columns: id
+      Output Schema: id INTEGER
 
 SELECT s.id, b.payload
 FROM stats_small AS s

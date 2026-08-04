@@ -145,21 +145,19 @@ PROJECTION  (rows=1)
     Output: aggr_0
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
-    ->  FILTER  (rows=19)
-      Filter: #0 = #1
-      Cardinality: [9, 19, 29]
+    ->  HASH_JOIN  (rows=0)
+      Join Type: INNER
+      Join Condition: #0 = #0
+      Cardinality: [0, 0, 0]
       Output Schema: k INTEGER, k INTEGER
-      ->  CROSS_PRODUCT  (rows=192)
-        Cardinality: [192, 192, 192]
-        Output Schema: k INTEGER, k INTEGER
-        ->  ROWSET_SCAN on public.rowset_pushdown_case c
-          Columns: k
-          Pushed Predicate: col#1 >= 2 AND col#1 <= 8
-          Runtime Filter: #0 >= 2 AND #0 <= 8
-          Output Schema: k INTEGER
-        ->  ROWSET_SCAN on public.rowset_pushdown_dim d
-          Columns: k
-          Output Schema: k INTEGER
+      ->  ROWSET_SCAN on public.rowset_pushdown_case c
+        Columns: k
+        Pushed Predicate: col#1 >= 2 AND col#1 <= 8
+        Runtime Filter: #0 >= 2 AND #0 <= 8
+        Output Schema: k INTEGER
+      ->  ROWSET_SCAN on public.rowset_pushdown_dim d
+        Columns: k
+        Output Schema: k INTEGER
 
 EXPLAIN (VERBOSE)
 SELECT id FROM rowset_pushdown_case ORDER BY score ASC LIMIT 5;
