@@ -108,6 +108,28 @@ fn correlated_capture_runs_its_breaker_dependencies_before_capture() {
 }
 
 #[test]
+fn correlated_region_dependency_is_not_replayed_by_outer_dag() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let statement = correlated_control_region_with_external_dependent_producer_statement();
+    let mut execution = start_program_with_output_for_test(
+        TestStatementContextBuilder::minimal().build(),
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        allocator,
+        QueryOutputPort::bounded_with_stats(2),
+        QueryOutputPort::unbounded_with_stats(),
+        true,
+    )
+    .expect("correlated control-region program starts");
+
+    assert_eq!(
+        collect_i32_background_output(&mut execution),
+        vec![99, 7, 1, 2]
+    );
+}
+
+#[test]
 fn explain_analyze_recursive_control_region_reports_iteration_profile() {
     let allocator = paro_common::test_utils::test_allocator();
     let statement = StatementProgram::ExplainAnalyze {
@@ -434,6 +456,81 @@ fn correlated_control_region_with_capture_dependency_statement() -> StatementPro
             },
         )],
         root: PipelineRoot::ControlRegion(ControlRegionId::new(0)),
+    });
+    statement_from_graph(graph, row_type)
+}
+
+fn correlated_control_region_with_external_dependent_producer_statement() -> StatementProgram {
+    let row_type = int_row_type();
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let delim_values = handles.register(
+        BreakerHandleKind::Delim,
+        row_type.clone(),
+        PipelineProperties::default(),
+    );
+
+    let client_pipeline = |id, values| PipelineSpec {
+        id: PipelineId::new(id),
+        source: SourceSpec::Chunk(chunk_scan_spec(vec![i32_chunk(values)])),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: row_type.clone(),
+    };
+    let graph = Arc::new(PipelineGraph {
+        pipelines: vec![
+            PipelineSpec {
+                id: PipelineId::new(0),
+                source: SourceSpec::Chunk(chunk_scan_spec(vec![i32_chunk(&[1, 2])])),
+                transforms: Vec::new(),
+                sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
+                    handle: delim_values,
+                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
+                        0,
+                        LogicalType::Integer,
+                    ))]
+                    .into_boxed_slice(),
+                    cached_outer: None,
+                    required: Default::default(),
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+            client_pipeline(1, &[7]),
+            PipelineSpec {
+                id: PipelineId::new(2),
+                source: SourceSpec::DelimScan(DelimScanSourceSpec {
+                    handle: delim_values,
+                }),
+                transforms: Vec::new(),
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: row_type.clone(),
+            },
+            client_pipeline(3, &[99]),
+        ],
+        dependencies: vec![PipelineDependency {
+            producer: PipelineId::new(3),
+            consumer: PipelineId::new(1),
+            kind: DependencyKind::SideEffectOrder,
+        }],
+        handles: handles.finish(),
+        control_regions: vec![ControlRegion::CorrelatedSubquery(
+            CorrelatedSubqueryRegion {
+                side: DelimJoinSide::Left,
+                capture: PipelineId::new(0),
+                dependent_roots: vec![crate::pipeline::graph::PipelineSubgraphRoot::Pipeline(
+                    PipelineId::new(1),
+                )],
+                join: PipelineId::new(2),
+                delim_values,
+                cached_outer: None,
+            },
+        )],
+        root: PipelineRoot::Pipeline(PipelineId::new(2)),
     });
     statement_from_graph(graph, row_type)
 }

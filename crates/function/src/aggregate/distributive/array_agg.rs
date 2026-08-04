@@ -266,10 +266,14 @@ unsafe fn finalize(
     _input_data: &AggregateInputData,
     result: &mut Vector,
     count: usize,
-) {
+) -> Result<()> {
     let child_type = match result.logical_type() {
         LogicalType::List(child) => child.as_ref().clone(),
-        ty => panic!("array_agg result type must be LIST, got {ty:?}"),
+        ty => {
+            return Err(paro_error::internal(format!(
+                "array_agg result type must be LIST, got {ty:?}"
+            )))
+        }
     };
     let state_ptrs = states.flat_data::<*mut u8>();
 
@@ -280,9 +284,9 @@ unsafe fn finalize(
             continue;
         }
 
-        let Some(child) = result.child() else {
-            panic!("array_agg result vector missing list child");
-        };
+        let child = result
+            .child()
+            .ok_or_else(|| paro_error::internal("array_agg result vector missing list child"))?;
         let dest_offset = child.len();
         let needed = dest_offset + state.values.len();
         ensure_list_child_capacity(result, &child_type, needed);
@@ -302,6 +306,7 @@ unsafe fn finalize(
         write_list_entry(result, i, dest_offset, state.values.len());
         result.set_null(i, false);
     }
+    Ok(())
 }
 
 unsafe fn destructor(states: &Vector, _input_data: &AggregateInputData, count: usize) {
@@ -388,7 +393,7 @@ mod tests {
 
         {
             let input_data = preserve_input_data(func, &mut arena);
-            (func.finalize)(&states, &input_data, &mut result, 1);
+            (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
         }
         {
             let input_data = preserve_input_data(func, &mut arena);

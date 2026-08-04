@@ -4,6 +4,7 @@
 //! ColumnBatch → columnar storage encoding (compaction / merge path).
 
 use crate::rowset::column::ColumnBatch;
+use crate::rowset::encoding::BinaryPlainPageDecoder;
 use crate::rowset::ColumnData;
 use crate::tablet::{ColumnId, TabletSchema};
 use bytes::Bytes;
@@ -63,13 +64,45 @@ fn materialize_storage_dictionary(
         )));
     }
 
+    let storage_dictionary = batch
+        .storage_dictionary
+        .as_ref()
+        .expect("storage dictionary checked above");
+    let mut decoder = BinaryPlainPageDecoder::new(storage_dictionary.dictionary.clone());
+    decoder.init()?;
+    if batch.nulls.as_ref().is_some_and(|nulls| nulls.len() < rows) {
+        return Err(paro_error::data_corrupted(
+            "Storage dictionary null map shorter than row count",
+        ));
+    }
+
     let mut data = Vec::new();
     for row in 0..rows {
-        let value = batch.varlen_row(row)?.unwrap_or_default();
+        let is_null = batch.nulls.as_ref().is_some_and(|nulls| nulls[row] != 0);
+        if is_null {
+            data.extend_from_slice(&0_u32.to_le_bytes());
+            continue;
+        }
+        let code_offset = row
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("Storage dictionary row overflow"))?;
+        let code_end = code_offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("Storage dictionary code overflow"))?;
+        let code_bytes = storage_dictionary
+            .codes
+            .get(code_offset..code_end)
+            .ok_or_else(|| {
+                paro_error::data_corrupted("Storage dictionary codes shorter than row count")
+            })?;
+        let code = u32::from_le_bytes(code_bytes.try_into().expect("u32 code slice"));
+        let value = decoder.string_at(code).ok_or_else(|| {
+            paro_error::data_corrupted(format!("Storage dictionary code {code} is out of range"))
+        })?;
         let len = u32::try_from(value.len())
             .map_err(|_| paro_error::out_of_range("Storage dictionary value exceeds u32 length"))?;
         data.extend_from_slice(&len.to_le_bytes());
-        data.extend_from_slice(&value);
+        data.extend_from_slice(value.as_ref());
     }
     Ok(Bytes::from(data))
 }

@@ -211,12 +211,18 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         let continuations_before = self.output_more_continuations.len();
         let result = self.push_transform_output_downstream(ctx, transform_idx, resume)?;
-        self.schedule_transform_resume_after_downstream(
-            transform_idx,
-            resume,
-            continuations_before,
-            &result,
-        );
+        // A synchronous non-expanding downstream transform must not resume an
+        // older ancestor: its caller still owns that decision. Once a call
+        // suspends, `resume_transform_output` becomes the top-level owner and
+        // handles both FromStart and OutputMore resumes.
+        if matches!(resume, TransformResumeState::OutputMore) {
+            self.schedule_transform_resume_after_downstream(
+                transform_idx,
+                resume,
+                continuations_before,
+                &result,
+            );
+        }
         Ok(result)
     }
 

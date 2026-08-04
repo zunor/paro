@@ -144,9 +144,9 @@ pub fn finalize_states(
             .column_mut(agg_idx)
             .expect("result column validated above");
         result_vector.try_set_count(count)?;
-        with_aggregate_input_data(object, input_data, |aggr_input| unsafe {
-            (object.function.finalize)(&states, &aggr_input, result_vector, count);
-        });
+        with_aggregate_input_data_result(object, input_data, |aggr_input| unsafe {
+            (object.function.finalize)(&states, &aggr_input, result_vector, count)
+        })?;
     }
     Ok(())
 }
@@ -595,7 +595,7 @@ mod tests {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state = states.try_decode_ref(count).unwrap();
         let state_data = state.get_data::<*mut u8>();
         let result_data = result.flat_data_mut::<i64>();
@@ -604,6 +604,7 @@ mod tests {
             let state_ptr = *state_data.add(state_idx) as *const i64;
             *result_data.add(row) = *state_ptr;
         }
+        Ok(())
     }
 
     unsafe fn test_destructor(_states: &Vector, _input_data: &AggregateInputData, count: usize) {

@@ -3,14 +3,15 @@
 
 use crate::binder::bind::expr as bind;
 use crate::expression::{
-    CastExpression, ColumnRefExpression, ComparisonType, ConjunctionType, Expression,
-    OperatorExpression, OperatorType, SubqueryType,
+    CastExpression, ColumnRefExpression, ComparisonType, ConjunctionType, ConstantExpression,
+    Expression, OperatorExpression, OperatorType, SubqueryType,
 };
 use crate::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, ParoError, Result};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{
-    BinaryOperator, ColumnRef, Expr, IntervalKind, JsonOperator, SubqueryModifier,
+    BinaryOperator, ColumnRef, Expr, IntervalKind, JsonOperator, Literal, SubqueryModifier,
 };
 /// Maximum expression depth to prevent stack overflow.
 const DEFAULT_MAX_EXPRESSION_DEPTH: usize = 1000;
@@ -415,11 +416,33 @@ impl<'a> ExpressionBinder<'a> {
                 )
             }
 
+            Expr::Interval { expr, unit, .. } => self.bind_interval_literal(*expr, unit),
+
             _ => Err(paro_error::not_implemented(format!(
                 "Expression not supported: {:?}",
                 expr
             ))),
         }
+    }
+
+    fn bind_interval_literal(&mut self, expr: Expr, unit: IntervalKind) -> Result<Expression> {
+        let Expr::Literal {
+            value: Literal::String(value),
+            ..
+        } = expr
+        else {
+            return Err(paro_error::syntax(
+                "INTERVAL with an explicit unit requires a string literal",
+            ));
+        };
+
+        let text = format!("{value} {unit}");
+        let interval = paro_function::scalar::cast::date_casts::parse_interval_text(&text)
+            .ok_or_else(|| paro_error::invalid_value("INTERVAL", &text))?;
+        Ok(Expression::Constant(ConstantExpression::new(
+            Value::Interval(interval.months, interval.days, interval.micros),
+            LogicalType::Interval,
+        )))
     }
 
     fn bind_column_ref(&mut self, column: ColumnRef) -> Result<Expression> {
@@ -756,8 +779,15 @@ impl<'a> ExpressionBinder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_atat_bind_target, AtAtBindTarget};
+    use super::{bind_expression, resolve_atat_bind_target, AtAtBindTarget};
+    use crate::binder::test_utils::test_binder;
+    use crate::expression::Expression;
+    use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
+
+    fn parse_expr(sql: &str) -> paro_parser::ast::Expr {
+        paro_parser::parse_expr(sql).expect("parse expression")
+    }
 
     #[test]
     fn resolve_atat_bind_target_dispatches_fulltext_and_json() {
@@ -784,5 +814,16 @@ mod tests {
             err.contains("operator @@ expects TSVECTOR and TSQUERY"),
             "expected clear type mismatch error, got: {err}"
         );
+    }
+
+    #[test]
+    fn binds_qualified_interval_literals_as_exact_constants() {
+        let mut binder = test_binder();
+        let bound = bind_expression(&mut binder, parse_expr("INTERVAL '3' MONTH")).unwrap();
+        let Expression::Constant(constant) = bound else {
+            panic!("expected constant interval")
+        };
+        assert_eq!(constant.return_type, LogicalType::Interval);
+        assert_eq!(constant.value, Value::Interval(3, 0, 0));
     }
 }

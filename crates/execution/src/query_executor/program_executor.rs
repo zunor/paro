@@ -533,6 +533,17 @@ fn run_pipeline_dag(
                     .collect::<HashSet<_>>();
                 run_control_region(region_id, dispatch.regions, ctx, &mut completed)?;
                 rf[region_id.index()] = true;
+                let mut completed = completed.into_iter().collect::<Vec<_>>();
+                completed.sort_unstable();
+                for pipeline in completed {
+                    mark_pipeline_finished(
+                        pipeline,
+                        &mut finished,
+                        &mut finished_count,
+                        &mut gates,
+                        &mut ready,
+                    );
+                }
                 for member in &dispatch.region_members[region_id.index()] {
                     mark_pipeline_finished(
                         *member,
@@ -839,7 +850,9 @@ fn run_control_region(
     match region {
         ControlRegionRuntime::RecursiveCte(controller) => {
             let anchor = controller.start_anchor()?;
+            let anchor_id = anchor.program.id;
             run_runtime(anchor, ctx.query, ctx.allocator.clone())?;
+            completed.insert(anchor_id);
             let mut action = controller.finish_anchor()?;
             loop {
                 match action {
@@ -851,7 +864,9 @@ fn run_control_region(
                                     paro_error::internal("recursive CTE iteration runtime missing")
                                 })?;
                             for runtime in iteration.recursive_pipelines.iter().cloned() {
+                                let pipeline_id = runtime.program.id;
                                 run_runtime(runtime, ctx.query, ctx.allocator.clone())?;
+                                completed.insert(pipeline_id);
                             }
                         }
                         action = controller.finish_recursive_iteration()?;
@@ -863,7 +878,9 @@ fn run_control_region(
                             ));
                         }
                         let emit = controller.start_emit(ctx.query)?;
+                        let emit_id = emit.program.id;
                         run_runtime(emit, ctx.query, ctx.allocator.clone())?;
+                        completed.insert(emit_id);
                         controller.finish_emit()?;
                         return Ok(());
                     }

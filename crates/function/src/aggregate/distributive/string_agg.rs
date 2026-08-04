@@ -272,7 +272,7 @@ mod string_agg_one_arg {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state_ptrs = states.flat_data::<*mut u8>();
         for i in 0..count {
             let state = &*((*state_ptrs.add(i)) as *const State);
@@ -283,6 +283,7 @@ mod string_agg_one_arg {
                 result.set_string(i, &state.result);
             }
         }
+        Ok(())
     }
 
     pub unsafe fn destructor(states: &Vector, _input_data: &AggregateInputData, count: usize) {
@@ -431,7 +432,7 @@ mod string_agg_two_args {
         _input_data: &AggregateInputData,
         result: &mut Vector,
         count: usize,
-    ) {
+    ) -> Result<()> {
         let state_ptrs = states.flat_data::<*mut u8>();
         for i in 0..count {
             let state = &*((*state_ptrs.add(i)) as *const State);
@@ -442,6 +443,7 @@ mod string_agg_two_args {
                 result.set_string(i, &state.result);
             }
         }
+        Ok(())
     }
 
     pub unsafe fn destructor(states: &Vector, _input_data: &AggregateInputData, count: usize) {
@@ -538,7 +540,7 @@ mod tests {
 
         {
             let input_data = preserve_input_data(func, &mut arena);
-            (func.finalize)(&states, &input_data, &mut result, 1);
+            (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
         }
         {
             let input_data = preserve_input_data(func, &mut arena);

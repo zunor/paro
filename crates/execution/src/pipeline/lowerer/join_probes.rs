@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::pipeline::graph::{MaterializeSinkSpec, NljUnmatchedSourceSpec};
+use crate::pipeline::graph::NljUnmatchedSourceSpec;
 
 impl<'a> PipelineLowerer<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -415,25 +415,6 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         let needs_unmatched = needs_hash_join_unmatched_source(spec.join_type);
-        let downstream_is_client = matches!(sink, SinkSpec::ClientResult(_))
-            && matches!(sink_sharing, SinkSharing::Exclusive);
-        let branch_sharing = if downstream_is_client {
-            SinkSharing::Exclusive
-        } else {
-            match sink_sharing {
-                SinkSharing::Exclusive => SinkSharing::Shared(self.next_shared_sink()),
-                shared @ SinkSharing::Shared(_) => shared,
-            }
-        };
-        if needs_unmatched
-            && consumer_transforms
-                .iter()
-                .any(|transform| matches!(transform, TransformSpec::Limit(_)))
-        {
-            return Err(paro_error::not_implemented(
-                "LIMIT above right/full hash join requires a shared post-join limit pipeline",
-            ));
-        }
 
         let node = self.plan.node(root);
         let children = self.plan.child_ids(&node.children);
@@ -448,9 +429,50 @@ impl<'a> PipelineLowerer<'a> {
         let join_output = RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec());
         let handle = self.handles.register(
             BreakerHandleKind::HashJoinBuild,
-            join_output,
+            join_output.clone(),
             Default::default(),
         );
+
+        // Probe, spill replay, and unmatched-build output are disjoint branches of one
+        // logical join. Stateful downstream transforms must observe their union once;
+        // cloning them into every branch would finalize LIMIT/aggregate/window state once
+        // per branch (including an empty replay branch). Insert a shared materialization
+        // barrier before such transforms and resume the logical stream in one pipeline.
+        let merge_handle = hash_join_requires_merge_barrier(&consumer_transforms).then(|| {
+            self.handles.register(
+                BreakerHandleKind::Materialized,
+                join_output.clone(),
+                Default::default(),
+            )
+        });
+        let branch_transforms = if merge_handle.is_some() {
+            Vec::new()
+        } else {
+            consumer_transforms.clone()
+        };
+        let (branch_sink, branch_sharing, branch_output) = if let Some(merge_handle) = merge_handle
+        {
+            (
+                SinkSpec::Materialize(MaterializeSinkSpec {
+                    handle: merge_handle,
+                    required: Default::default(),
+                }),
+                SinkSharing::Shared(self.next_shared_sink()),
+                join_output.clone(),
+            )
+        } else {
+            let downstream_is_client = matches!(sink, SinkSpec::ClientResult(_))
+                && matches!(sink_sharing, SinkSharing::Exclusive);
+            let sharing = if downstream_is_client {
+                SinkSharing::Exclusive
+            } else {
+                match sink_sharing {
+                    SinkSharing::Exclusive => SinkSharing::Shared(self.next_shared_sink()),
+                    shared @ SinkSharing::Shared(_) => shared,
+                }
+            };
+            (sink.clone(), sharing, output.clone())
+        };
 
         let producer = self.lower_subtree_to_sink(
             *right,
@@ -475,14 +497,13 @@ impl<'a> PipelineLowerer<'a> {
         let source = self.attach_hash_join_runtime_filters(source, &transforms, handle, spec);
         let probe_source_handles = source.clone();
         transforms.push(hash_join_probe_transform(handle, spec));
-        transforms.extend(consumer_transforms.iter().cloned());
-        let branch_sink = sink.clone();
+        transforms.extend(branch_transforms.iter().cloned());
         let pushed = self.push_pipeline(
             source,
             transforms,
-            branch_sink,
+            branch_sink.clone(),
             branch_sharing,
-            output.clone(),
+            branch_output.clone(),
             pipelines,
             dependencies,
         )?;
@@ -508,44 +529,40 @@ impl<'a> PipelineLowerer<'a> {
             kind: DependencyKind::BuildBeforeProbe,
         });
 
-        let replay = {
-            // Non-forced hash joins can still switch to external mode during
-            // build finish under memory pressure. Keep the replay fence in the
-            // graph for every hash join; the source exits immediately when the
-            // handle stayed in-memory.
-            let replay_source = SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
-                handle,
-                join_type: spec.join_type,
-                conditions: spec.conditions.clone(),
-                probe_types: self.plan.node(*left).output.types.clone(),
-                build_payload_types: spec.right_output_types.clone(),
-                left_projection: spec.left_projection.clone(),
-                right_projection: spec.right_projection.clone(),
-                output_names: spec.output_names.clone(),
-                output_types: spec.output_types.clone(),
-            });
-            let replay = self.push_pipeline(
-                replay_source,
-                consumer_transforms.to_vec(),
-                sink.clone(),
-                branch_sharing,
-                output.clone(),
-                pipelines,
-                dependencies,
-            )?;
-            self.handles.add_consumer(handle, replay.entry)?;
-            dependencies.push(PipelineDependency {
-                producer: consumer,
-                consumer: replay.entry,
-                kind: DependencyKind::ProbeBeforeSpillReplay,
-            });
-            Some(replay)
-        };
+        // Non-forced hash joins can still switch to external mode during build
+        // finish under memory pressure. Keep the replay fence in the graph for
+        // every hash join; the source exits immediately when the handle stayed
+        // in-memory.
+        let replay_source = SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
+            handle,
+            join_type: spec.join_type,
+            conditions: spec.conditions.clone(),
+            probe_types: self.plan.node(*left).output.types.clone(),
+            build_payload_types: spec.right_output_types.clone(),
+            left_projection: spec.left_projection.clone(),
+            right_projection: spec.right_projection.clone(),
+            output_names: spec.output_names.clone(),
+            output_types: spec.output_types.clone(),
+        });
+        let replay = self.push_pipeline(
+            replay_source,
+            branch_transforms.clone(),
+            branch_sink.clone(),
+            branch_sharing,
+            branch_output.clone(),
+            pipelines,
+            dependencies,
+        )?;
+        self.handles.add_consumer(handle, replay.entry)?;
+        dependencies.push(PipelineDependency {
+            producer: pushed.tail,
+            consumer: replay.entry,
+            kind: DependencyKind::ProbeBeforeSpillReplay,
+        });
+
+        let mut last_branch = replay.tail;
 
         if needs_unmatched {
-            let replay = replay.ok_or_else(|| {
-                paro_error::internal("right/full hash join unmatched source requires replay fence")
-            })?;
             let source = SourceSpec::HashJoinUnmatched(HashJoinUnmatchedSourceSpec {
                 handle,
                 join_type: spec.join_type,
@@ -556,23 +573,44 @@ impl<'a> PipelineLowerer<'a> {
             });
             let unmatched = self.push_pipeline(
                 source,
-                consumer_transforms,
-                sink,
+                branch_transforms,
+                branch_sink,
                 branch_sharing,
-                output,
+                branch_output,
                 pipelines,
                 dependencies,
             )?;
             self.handles.add_consumer(handle, unmatched.entry)?;
             dependencies.push(PipelineDependency {
-                producer: replay.entry,
+                producer: replay.tail,
                 consumer: unmatched.entry,
                 kind: DependencyKind::FinalizeBeforeEmit,
             });
-            return Ok(unmatched.tail);
+            last_branch = unmatched.tail;
         }
 
-        Ok(replay.map_or(pushed.tail, |replay| replay.tail))
+        let Some(merge_handle) = merge_handle else {
+            return Ok(last_branch);
+        };
+        self.handles.set_producer(merge_handle, pushed.tail)?;
+        let merged = self.push_pipeline(
+            SourceSpec::Materialized(MaterializedSourceSpec {
+                handle: merge_handle,
+            }),
+            consumer_transforms,
+            sink,
+            sink_sharing,
+            output,
+            pipelines,
+            dependencies,
+        )?;
+        self.handles.add_consumer(merge_handle, merged.entry)?;
+        dependencies.push(PipelineDependency {
+            producer: last_branch,
+            consumer: merged.entry,
+            kind: DependencyKind::FinalizeBeforeEmit,
+        });
+        Ok(merged.tail)
     }
 
     pub(crate) fn collect_probe_roles(
@@ -732,75 +770,16 @@ impl<'a> PipelineLowerer<'a> {
             }
         }
     }
-
-    pub(crate) fn attach_hash_join_runtime_filters(
-        &self,
-        mut source: SourceSpec,
-        transforms: &[TransformSpec],
-        handle: BreakerHandleId,
-        spec: &HashJoinSpec,
-    ) -> SourceSpec {
-        if !can_push_hash_join_runtime_filter(spec.join_type) || !transforms.is_empty() {
-            return source;
-        }
-        let SourceSpec::Rowset(rowset) = &mut source else {
-            return source;
-        };
-        for (build_key_index, condition) in spec.conditions.iter().enumerate() {
-            if condition.comparison != JoinComparisonType::Equal {
-                continue;
-            }
-            let Expression::Reference(reference) = &condition.left else {
-                continue;
-            };
-            let Some(&probe_column_id) = rowset.scan.column_ids.get(reference.index) else {
-                continue;
-            };
-            let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
-                continue;
-            };
-            rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
-                handle,
-                build_key_index,
-                probe_column_id,
-            });
-        }
-        source
-    }
-
-    pub(crate) fn collect_probe_roles_source_fallback(
-        &mut self,
-        root: PhysicalPlanNodeId,
-        pipelines: &mut Vec<PipelineSpec>,
-        dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeBuild>)> {
-        let output = self.plan.node(root).output.clone();
-        let handle = self.handles.register(
-            BreakerHandleKind::Materialized,
-            output.clone(),
-            Default::default(),
-        );
-        let producer = self.lower_subtree_to_sink(
-            root,
-            SinkSpec::Materialize(MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
-            SinkSharing::Exclusive,
-            output,
-            pipelines,
-            dependencies,
-        )?;
-        self.handles.set_producer(handle, producer)?;
-        let source = SourceSpec::Materialized(MaterializedSourceSpec { handle });
-        Ok((
-            source,
-            Vec::new(),
-            vec![PendingProbeBuild { producer, handle }],
-        ))
-    }
 }
 
-fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
-    matches!(join_type, JoinType::Inner | JoinType::Semi)
+fn hash_join_requires_merge_barrier(transforms: &[TransformSpec]) -> bool {
+    transforms.iter().any(|transform| {
+        matches!(
+            transform,
+            TransformSpec::Limit(_)
+                | TransformSpec::StreamingTopN(_)
+                | TransformSpec::StreamingAggregate(_)
+                | TransformSpec::StreamingWindow(_)
+        )
+    })
 }

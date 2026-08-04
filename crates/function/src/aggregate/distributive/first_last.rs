@@ -11,6 +11,7 @@
 //! - `any_value(x)` / `arbitrary(x)`: Returns any value (implementation uses first)
 
 use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -129,7 +130,7 @@ macro_rules! define_first_impl {
                 _input_data: &AggregateInputData,
                 result: &mut Vector,
                 count: usize,
-            ) {
+            ) -> Result<()> {
                 let state_ptrs = states.flat_data::<*mut u8>();
                 let result_data = result.flat_data_mut::<$type>();
 
@@ -144,6 +145,7 @@ macro_rules! define_first_impl {
                         *result_data.add(i) = state.value;
                     }
                 }
+                Ok(())
             }
         }
     };
@@ -233,7 +235,7 @@ macro_rules! define_last_impl {
                 _input_data: &AggregateInputData,
                 result: &mut Vector,
                 count: usize,
-            ) {
+            ) -> Result<()> {
                 let state_ptrs = states.flat_data::<*mut u8>();
                 let result_data = result.flat_data_mut::<$type>();
 
@@ -248,6 +250,7 @@ macro_rules! define_last_impl {
                         *result_data.add(i) = state.value;
                     }
                 }
+                Ok(())
             }
         }
     };
@@ -558,7 +561,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -603,7 +606,7 @@ mod tests {
             *states_ptr = state_ptr;
 
             let input_data = preserve_input_data(&func, &mut arena);
-            (func.finalize)(&states, &input_data, &mut result, 1);
+            (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
 
             assert!(!result.is_null(0));
             assert_eq!(result.get_flat::<i32>(0), 30);
@@ -646,7 +649,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -688,7 +691,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -732,7 +735,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -764,7 +767,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(result.is_null(0));
@@ -805,7 +808,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&states, &input_data, &mut result, 1);
+                (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));
@@ -875,7 +878,7 @@ mod tests {
 
             {
                 let input_data = preserve_input_data(&func, &mut arena);
-                (func.finalize)(&target_states, &input_data, &mut result, 1);
+                (func.finalize)(&target_states, &input_data, &mut result, 1).unwrap();
             }
 
             assert!(!result.is_null(0));

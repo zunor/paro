@@ -83,8 +83,12 @@ pub type AggregateCombineFn =
 /// * `states`: Vector containing pointers to states.
 /// * `result`: Result vector to write to.
 /// * `count`: Number of results to generate.
-pub type AggregateFinalizeFn =
-    unsafe fn(states: &Vector, input_data: &AggregateInputData, result: &mut Vector, count: usize);
+pub type AggregateFinalizeFn = unsafe fn(
+    states: &Vector,
+    input_data: &AggregateInputData,
+    result: &mut Vector,
+    count: usize,
+) -> Result<()>;
 
 /// Function to destruct complex states (if state contains allocated resources like StringHeap).
 pub type AggregateDestructorFn =
@@ -434,7 +438,8 @@ mod tests {
         _input_data: &AggregateInputData,
         _result: &mut Vector,
         _count: usize,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     fn create_dummy_aggregate(

@@ -182,7 +182,8 @@ mod tests {
         _input_data: &AggregateInputData,
         _result: &mut paro_common::vector::Vector,
         _count: usize,
-    ) {
+    ) -> paro_common::error::Result<()> {
+        Ok(())
     }
 
     fn make_test_function(state_size: usize) -> AggregateFunction {

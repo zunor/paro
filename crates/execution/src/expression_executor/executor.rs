@@ -2598,56 +2598,127 @@ impl ExpressionExecutor {
 }
 
 fn sql_like(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    // TPC-H strings and patterns are ASCII. Keep that path allocation-free;
+    // the Unicode path below only allocates the two linear character arrays.
+    if value.is_ascii() && pattern.is_ascii() {
+        return sql_like_ascii(value.as_bytes(), pattern.as_bytes(), case_insensitive);
+    }
+
     let (value, pattern) = if case_insensitive {
         (value.to_lowercase(), pattern.to_lowercase())
     } else {
-        (value.to_string(), pattern.to_string())
+        (value.to_owned(), pattern.to_owned())
     };
-    let value: Vec<char> = value.chars().collect();
-    let pattern: Vec<char> = pattern.chars().collect();
-    let mut memo = vec![vec![None; pattern.len() + 1]; value.len() + 1];
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    sql_like_chars(&value, &pattern)
+}
 
-    fn matches(
-        value: &[char],
-        pattern: &[char],
-        value_idx: usize,
-        pattern_idx: usize,
-        memo: &mut [Vec<Option<bool>>],
-    ) -> bool {
-        if let Some(cached) = memo[value_idx][pattern_idx] {
-            return cached;
+fn sql_like_ascii(value: &[u8], pattern: &[u8], case_insensitive: bool) -> bool {
+    let equals = |left: u8, right: u8| {
+        if case_insensitive {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
+        }
+    };
+    let mut value_idx = 0;
+    let mut pattern_idx = 0;
+    let mut wildcard = None;
+    let mut wildcard_value_idx = 0;
+
+    while value_idx < value.len() {
+        if pattern_idx < pattern.len() {
+            match pattern[pattern_idx] {
+                b'%' => {
+                    wildcard = Some(pattern_idx);
+                    pattern_idx += 1;
+                    wildcard_value_idx = value_idx;
+                    continue;
+                }
+                b'_' => {
+                    value_idx += 1;
+                    pattern_idx += 1;
+                    continue;
+                }
+                b'\\' if pattern_idx + 1 < pattern.len() => {
+                    if equals(value[value_idx], pattern[pattern_idx + 1]) {
+                        value_idx += 1;
+                        pattern_idx += 2;
+                        continue;
+                    }
+                }
+                literal if equals(value[value_idx], literal) => {
+                    value_idx += 1;
+                    pattern_idx += 1;
+                    continue;
+                }
+                _ => {}
+            }
         }
 
-        let matched = if pattern_idx == pattern.len() {
-            value_idx == value.len()
-        } else {
-            match pattern[pattern_idx] {
-                '%' => {
-                    matches(value, pattern, value_idx, pattern_idx + 1, memo)
-                        || (value_idx < value.len()
-                            && matches(value, pattern, value_idx + 1, pattern_idx, memo))
-                }
-                '_' => {
-                    value_idx < value.len()
-                        && matches(value, pattern, value_idx + 1, pattern_idx + 1, memo)
-                }
-                '\\' if pattern_idx + 1 < pattern.len() => {
-                    value_idx < value.len()
-                        && value[value_idx] == pattern[pattern_idx + 1]
-                        && matches(value, pattern, value_idx + 1, pattern_idx + 2, memo)
-                }
-                literal => {
-                    value_idx < value.len()
-                        && value[value_idx] == literal
-                        && matches(value, pattern, value_idx + 1, pattern_idx + 1, memo)
-                }
-            }
+        let Some(wildcard_idx) = wildcard else {
+            return false;
         };
-        memo[value_idx][pattern_idx] = Some(matched);
-        matched
+        wildcard_value_idx += 1;
+        value_idx = wildcard_value_idx;
+        pattern_idx = wildcard_idx + 1;
     }
 
-    matches(&value, &pattern, 0, 0, &mut memo)
+    while pattern_idx < pattern.len() && pattern[pattern_idx] == b'%' {
+        pattern_idx += 1;
+    }
+    pattern_idx == pattern.len()
+}
+
+fn sql_like_chars(value: &[char], pattern: &[char]) -> bool {
+    let mut value_idx = 0;
+    let mut pattern_idx = 0;
+    let mut wildcard = None;
+    let mut wildcard_value_idx = 0;
+
+    while value_idx < value.len() {
+        if pattern_idx < pattern.len() {
+            match pattern[pattern_idx] {
+                '%' => {
+                    wildcard = Some(pattern_idx);
+                    pattern_idx += 1;
+                    wildcard_value_idx = value_idx;
+                    continue;
+                }
+                '_' => {
+                    value_idx += 1;
+                    pattern_idx += 1;
+                    continue;
+                }
+                '\\' if pattern_idx + 1 < pattern.len() => {
+                    if value[value_idx] == pattern[pattern_idx + 1] {
+                        value_idx += 1;
+                        pattern_idx += 2;
+                        continue;
+                    }
+                }
+                literal if value[value_idx] == literal => {
+                    value_idx += 1;
+                    pattern_idx += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(wildcard_idx) = wildcard else {
+            return false;
+        };
+        wildcard_value_idx += 1;
+        value_idx = wildcard_value_idx;
+        pattern_idx = wildcard_idx + 1;
+    }
+
+    while pattern_idx < pattern.len() && pattern[pattern_idx] == '%' {
+        pattern_idx += 1;
+    }
+    pattern_idx == pattern.len()
 }
 
 #[cfg(test)]
@@ -2671,6 +2742,19 @@ mod tests {
         assert!(sql_like("A_B", "A\\_B", false));
         assert!(sql_like("aXb", "A_B", true));
         assert!(!sql_like("BRASS PLATED", "%BRASS", false));
+        assert!(sql_like("100%", "100\\%", false));
+        assert!(!sql_like("100\\%", "100\\%", false));
+        assert!(sql_like("你好世界", "你_世%", false));
+        assert!(sql_like("Éclair", "é%", true));
+        assert!(!sql_like("anything", "", false));
+        assert!(sql_like("", "%", false));
+    }
+
+    #[test]
+    fn like_handles_long_wildcard_patterns_in_linear_space() {
+        let value = "a".repeat(8_192);
+        let pattern = format!("%{}b", "a%".repeat(4_096));
+        assert!(!sql_like(&value, &pattern, false));
     }
     use crate::memory_runtime::QueryMemoryPool;
     use crate::runtime::{

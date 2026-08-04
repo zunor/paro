@@ -842,7 +842,8 @@ mod tests {
         _input_data: &AggregateInputData,
         _result: &mut Vector,
         _count: usize,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     fn make_test_aggregate_object() -> AggregateObject {

@@ -376,12 +376,14 @@ mod tests {
             ComparisonType::Equal,
         );
         let mut root = expression_get(40, vec![LogicalType::Integer, LogicalType::Varchar]);
+        let outer_bindings = root.get_column_bindings();
 
         let result = binder
             .plan_correlated_subquery(&subquery, &mut root)
             .expect("plan correlated scalar");
         let result_bindings = root.get_column_bindings();
         let expected_binding = *result_bindings.last().expect("scalar binding");
+        assert_eq!(&result_bindings[..outer_bindings.len()], &outer_bindings);
 
         match result {
             Expression::ColumnRef(col_ref) => {
@@ -503,13 +505,11 @@ mod tests {
             .expect("plan correlated scalar");
 
         match &root {
-            LogicalOperator::Aggregate(agg) => match &agg.child.operator {
-                LogicalOperator::Join(Join::Comparison(join)) => {
-                    assert_eq!(join.duplicate_eliminated_columns.len(), 1);
-                }
-                other => panic!("expected scalar child join, got {other:?}"),
-            },
-            other => panic!("expected aggregate root, got {other:?}"),
+            LogicalOperator::Join(Join::Comparison(join)) => {
+                assert_eq!(join.join_type, JoinType::Single);
+                assert_eq!(join.duplicate_eliminated_columns.len(), 1);
+            }
+            other => panic!("expected single join root, got {other:?}"),
         }
     }
 
@@ -808,20 +808,18 @@ mod tests {
             .expect("plan correlated scalar aggregate");
 
         match &root {
-            LogicalOperator::Aggregate(outer_agg) => match &outer_agg.child.operator {
-                LogicalOperator::Join(Join::Comparison(join)) => match &join.right.operator {
-                    LogicalOperator::Aggregate(inner_agg) => {
-                        assert_eq!(inner_agg.groups.len(), 1);
-                        assert_eq!(
-                            extract_binding(&join.conditions[0].right),
-                            Some(ColumnBinding::new(inner_agg.group_index, 0))
-                        );
-                    }
-                    other => panic!("expected aggregate rhs, got {other:?}"),
-                },
-                other => panic!("expected left join under scalar aggregate, got {other:?}"),
+            LogicalOperator::Join(Join::Comparison(join)) => match &join.right.operator {
+                LogicalOperator::Aggregate(inner_agg) => {
+                    assert_eq!(join.join_type, JoinType::Single);
+                    assert_eq!(inner_agg.groups.len(), 1);
+                    assert_eq!(
+                        extract_binding(&join.conditions[0].right),
+                        Some(ColumnBinding::new(inner_agg.group_index, 0))
+                    );
+                }
+                other => panic!("expected aggregate rhs, got {other:?}"),
             },
-            other => panic!("expected outer aggregate root, got {other:?}"),
+            other => panic!("expected single join root, got {other:?}"),
         }
     }
 

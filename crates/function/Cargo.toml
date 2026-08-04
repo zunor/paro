@@ -31,6 +31,7 @@ manual-range-contains = "allow"
 approx-constant = "allow"
 
 [dependencies]
+ethnum = { workspace = true }
 paro-common = { workspace = true }
 paro-parser = { workspace = true }
 paro-storage = { workspace = true }
