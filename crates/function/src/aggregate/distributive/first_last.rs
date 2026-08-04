@@ -10,7 +10,9 @@
 //! - `last(x)`: Returns the last non-NULL value
 //! - `any_value(x)` / `arbitrary(x)`: Returns any value (implementation uses first)
 
-use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use crate::aggregate::{
+    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+};
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -54,14 +56,12 @@ macro_rules! define_first_impl {
             pub unsafe fn update(
                 inputs: &[&Vector],
                 _input_data: &AggregateInputData,
-                states: &Vector,
+                states: &AggregateStateInput,
                 count: usize,
             ) {
                 let input = inputs[0];
-                let state_ptrs = states.flat_data::<*mut u8>();
-
                 for i in 0..count {
-                    let state_ptr = *state_ptrs.add(i);
+                    let state_ptr = states.state_ptr(i);
                     let state = state_ptr as *mut State;
 
                     // First: only set if not already set
@@ -168,14 +168,12 @@ macro_rules! define_last_impl {
             pub unsafe fn update(
                 inputs: &[&Vector],
                 _input_data: &AggregateInputData,
-                states: &Vector,
+                states: &AggregateStateInput,
                 count: usize,
             ) {
                 let input = inputs[0];
-                let state_ptrs = states.flat_data::<*mut u8>();
-
                 for i in 0..count {
-                    let state_ptr = *state_ptrs.add(i);
+                    let state_ptr = states.state_ptr(i);
                     let state = state_ptr as *mut State;
 
                     // Last: always update (overwrite previous)

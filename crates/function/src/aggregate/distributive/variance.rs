@@ -12,6 +12,7 @@
 
 use crate::aggregate::{
     AggregateFinalizeFn, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -69,17 +70,15 @@ macro_rules! define_variance_input_impl {
             pub unsafe fn update(
                 inputs: &[&Vector],
                 _input_data: &AggregateInputData,
-                states: &Vector,
+                states: &AggregateStateInput,
                 count: usize,
             ) {
                 let input = inputs[0];
-                let state_ptrs = states.flat_data::<*mut u8>();
-
                 for i in 0..count {
                     if input.is_null(i) {
                         continue;
                     }
-                    let state_ptr = *state_ptrs.add(i);
+                    let state_ptr = states.state_ptr(i);
                     let state = &mut *(state_ptr as *mut State);
                     let value: $input_type = input.get_fixed(i);
                     update_variance_state(state, value as f64);

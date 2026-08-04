@@ -53,16 +53,19 @@ pub(crate) fn can_use_perfect_hash_aggregate(
 
     for group_idx in 0..aggregate.groups.len() {
         let group_type = aggregate.groups[group_idx].return_type();
-        if !group_type.is_integer() {
-            return None;
-        }
-
-        let min_max = aggregate
+        let group_stats = aggregate
             .group_stats
             .get(group_idx)
-            .and_then(|stats| stats.as_ref())
-            .and_then(integer_min_max_from_stats)
-            .or_else(|| integer_type_bounds(&group_type));
+            .and_then(|stats| stats.as_ref());
+        let min_max = match &group_type {
+            ty if ty.is_integer() => group_stats
+                .and_then(integer_min_max_from_stats)
+                .or_else(|| integer_type_bounds(ty)),
+            paro_common::types::LogicalType::Varchar => {
+                group_stats.and_then(single_byte_string_min_max_from_stats)
+            }
+            _ => None,
+        };
         let (min_value, max_value) = min_max?;
         let range = max_value.checked_sub(min_value)?;
         let range_u128 = u128::try_from(range).ok()?;
@@ -82,6 +85,26 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         group_minima,
         required_bits,
     })
+}
+
+fn single_byte_string_min_max_from_stats(
+    stats: &paro_storage::statistics::BaseStatistics,
+) -> Option<(i128, i128)> {
+    let string_stats = paro_storage::statistics::StringStats::get_data(stats)?;
+    if string_stats.max_string_length()? > 1 {
+        return None;
+    }
+    let min = encode_single_byte_string(string_stats.min_bytes())?;
+    let max = encode_single_byte_string(string_stats.max_bytes())?;
+    (min <= max).then_some((min, max))
+}
+
+fn encode_single_byte_string(value: &[u8]) -> Option<i128> {
+    match value {
+        [] => Some(0),
+        [byte] => Some(i128::from(*byte) + 1),
+        _ => None,
+    }
 }
 
 pub(crate) fn integer_min_max_from_stats(
@@ -176,6 +199,27 @@ pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
         LogicalOperator::GraphScan(_) => "GRAPH_SCAN",
         LogicalOperator::GraphExpand(_) => "GRAPH_EXPAND",
         LogicalOperator::DummyScan => "DUMMY_SCAN",
+    }
+}
+
+#[cfg(test)]
+mod perfect_hash_tests {
+    use super::*;
+    use paro_storage::statistics::StringStats;
+
+    #[test]
+    fn single_byte_varchar_stats_form_a_compact_perfect_hash_domain() {
+        let mut stats = StringStats::create_empty(LogicalType::Varchar);
+        StringStats::update(&mut stats, "A");
+        StringStats::update(&mut stats, "R");
+
+        assert_eq!(
+            single_byte_string_min_max_from_stats(&stats),
+            Some((66, 83))
+        );
+
+        StringStats::update(&mut stats, "AB");
+        assert_eq!(single_byte_string_min_max_from_stats(&stats), None);
     }
 }
 

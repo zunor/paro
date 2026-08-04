@@ -7,7 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VectorSelection};
-use paro_function::aggregate::AggregateInputData;
+use paro_function::aggregate::{AggregateInputData, AggregateStateInput};
 
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
@@ -58,7 +58,8 @@ pub fn update_states(
     validate_payload_mapping(objects, payload)?;
     for (agg_idx, object) in objects.iter().enumerate() {
         let inputs = input_vectors_for_aggregate(payload, agg_idx)?;
-        let states = build_state_vector(addresses, &layout, agg_idx, None, count)?;
+        let states =
+            AggregateStateInput::try_new(addresses, layout.state_offset(agg_idx), None, count)?;
         with_aggregate_input_data(object, input_data, |aggr_input| unsafe {
             (object.function.update)(&inputs, &aggr_input, &states, count);
         });
@@ -87,7 +88,12 @@ pub fn update_filtered_states(
         let filtered_inputs =
             filtered_input_vectors_for_aggregate(payload, agg_idx, filter, count)?;
         let filtered_input_refs: Vec<&Vector> = filtered_inputs.iter().collect();
-        let states = build_state_vector(addresses, &layout, agg_idx, Some(filter), count)?;
+        let states = AggregateStateInput::try_new(
+            addresses,
+            layout.state_offset(agg_idx),
+            Some(filter),
+            count,
+        )?;
         with_aggregate_input_data(object, input_data, |aggr_input| unsafe {
             (object.function.update)(&filtered_input_refs, &aggr_input, &states, count);
         });
@@ -539,7 +545,7 @@ mod tests {
     use std::sync::Arc;
 
     use paro_common::allocator::{default_allocator, ArenaAllocator};
-    use paro_function::aggregate::{AggregateCombineType, AggregateFunction};
+    use paro_function::aggregate::{AggregateCombineType, AggregateFunction, AggregateStateInput};
     use paro_planner::expression::{
         AggregateExpression, AggregateType, Expression, ReferenceExpression,
     };
@@ -553,20 +559,17 @@ mod tests {
     unsafe fn test_update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0].try_decode_ref(count).unwrap();
-        let state = states.try_decode_ref(count).unwrap();
         let input_data = input.get_data::<i64>();
-        let state_data = state.get_data::<*mut u8>();
         for row in 0..count {
             let input_idx = input.sel().get(row);
             if !input.validity().is_valid(input_idx) {
                 continue;
             }
-            let state_idx = state.sel().get(row);
-            let state_ptr = *state_data.add(state_idx) as *mut i64;
+            let state_ptr = states.state_ptr(row) as *mut i64;
             *state_ptr += *input_data.add(input_idx);
         }
     }

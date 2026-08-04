@@ -332,9 +332,10 @@ impl StatisticsPropagator {
 
                 LogicalOperator::Filter(filter)
             }
-            LogicalOperator::Aggregate(agg) => {
+            LogicalOperator::Aggregate(mut agg) => {
                 for (i, expr) in agg.groups.iter().enumerate() {
                     if let Some(stats) = self.propagate_expression(expr) {
+                        agg.group_stats[i] = Some(stats.statistics().clone());
                         let binding = ColumnBinding {
                             table_index: agg.group_index,
                             column_index: i,
@@ -429,6 +430,13 @@ impl StatisticsPropagator {
                                             (Value::Varchar(min_s), Value::Varchar(max_s)) => {
                                                 StringStats::set_min(&mut base, min_s);
                                                 StringStats::set_max(&mut base, max_s);
+                                                if let Some(max_length) =
+                                                    StringStats::max_string_length(&storage_stats)
+                                                {
+                                                    StringStats::set_max_string_length(
+                                                        &mut base, max_length,
+                                                    );
+                                                }
                                             }
                                             _ => {
                                                 if !min.is_null() && !max.is_null() {
@@ -911,7 +919,7 @@ mod tests {
     use paro_function::window::WindowFunction;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{WindowExpression, WindowFrame};
-    use paro_planner::operator::{ExpressionGet, Projection, Window};
+    use paro_planner::operator::{Aggregate, ExpressionGet, Projection, Window};
 
     use super::*;
 
@@ -1019,6 +1027,48 @@ mod tests {
                 Some(Value::BigInt(i64::MAX))
             );
         }
+    }
+
+    #[test]
+    fn aggregate_retains_group_statistics_for_physical_planning() {
+        let bind_context = BindContext::new();
+        let input = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Projection(Projection::new(
+                7,
+                LogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+                vec![Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("R".to_string()),
+                    LogicalType::Varchar,
+                ))],
+            )),
+        );
+        let aggregate = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Aggregate(Aggregate::new(
+                20,
+                21,
+                22,
+                input,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(7, 0),
+                    LogicalType::Varchar,
+                ))],
+                vec![paro_planner::binder::ir::GroupingSet {
+                    expressions: vec![0],
+                }],
+                Vec::new(),
+                Vec::new(),
+            )),
+        );
+
+        let optimized = StatisticsPropagator::new().propagate(make_test_session(), aggregate);
+        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+            panic!("expected aggregate");
+        };
+        let stats = aggregate.group_stats[0].as_ref().expect("group statistics");
+        assert_eq!(stats.min_value(), Some(Value::Varchar("R".to_string())));
+        assert_eq!(StringStats::max_string_length(stats), Some(1));
     }
 
     #[test]

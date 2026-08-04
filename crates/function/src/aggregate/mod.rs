@@ -13,7 +13,7 @@
 use paro_common::allocator::ArenaAllocator;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
+use paro_common::vector::{SelectionRef, SelectionVector, Vector};
 use std::fmt;
 use std::sync::Arc;
 
@@ -57,14 +57,79 @@ impl<'a> AggregateInputData<'a> {
     }
 }
 
+/// Zero-copy view over grouped aggregate state addresses.
+///
+/// Group lookup produces one base state address per input row. Aggregate
+/// functions use this view to apply their state-layout offset lazily instead
+/// of materializing another pointer vector for every aggregate in every batch.
+pub struct AggregateStateInput<'a> {
+    address_data: *const *mut u8,
+    address_selection: SelectionRef<'a>,
+    update_selection: Option<&'a SelectionVector>,
+    state_offset: usize,
+}
+
+impl<'a> AggregateStateInput<'a> {
+    pub fn try_new(
+        addresses: &'a Vector,
+        state_offset: usize,
+        update_selection: Option<&'a SelectionVector>,
+        count: usize,
+    ) -> Result<Self> {
+        if update_selection.is_some_and(|selection| count > selection.len()) {
+            return Err(paro_common::error::internal(format!(
+                "Aggregate state selection is shorter than the update: count={count}, selection={}",
+                update_selection.map_or(0, SelectionVector::len)
+            )));
+        }
+        if update_selection.is_none() && count > addresses.len() {
+            return Err(paro_common::error::internal(format!(
+                "Aggregate state address vector is shorter than the update: count={count}, addresses={}",
+                addresses.len()
+            )));
+        }
+
+        let address_view = addresses.try_to_view(addresses.len())?;
+        let address_data = address_view.get_data::<*mut u8>().ok_or_else(|| {
+            paro_common::error::internal(
+                "Aggregate state addresses must use pointer-backed storage".to_string(),
+            )
+        })?;
+        Ok(Self {
+            address_data,
+            address_selection: address_view.sel().clone(),
+            update_selection,
+            state_offset,
+        })
+    }
+
+    /// Resolve the aggregate state for one logical update row.
+    ///
+    /// # Safety
+    /// The caller must keep every base address alive and ensure `state_offset`
+    /// identifies initialized storage for the aggregate function being called.
+    #[inline]
+    pub unsafe fn state_ptr(&self, row: usize) -> *mut u8 {
+        let address_row = self
+            .update_selection
+            .map_or(row, |selection| selection.get(row));
+        let physical_row = self.address_selection.get(address_row);
+        (*self.address_data.add(physical_row)).add(self.state_offset)
+    }
+}
+
 /// Function to update the state with new values.
 ///
 /// # Arguments
 /// * `inputs`: Input vectors (arguments to the aggregate function).
-/// * `states`: Vector containing pointers to the states for each row.
+/// * `states`: Zero-copy view resolving the state for each row.
 /// * `count`: Number of rows to process.
-pub type AggregateUpdateFn =
-    unsafe fn(inputs: &[&Vector], input_data: &AggregateInputData, states: &Vector, count: usize);
+pub type AggregateUpdateFn = unsafe fn(
+    inputs: &[&Vector],
+    input_data: &AggregateInputData,
+    states: &AggregateStateInput,
+    count: usize,
+);
 
 /// Function to combine two states (merge source into target).
 ///
@@ -433,7 +498,7 @@ mod tests {
     unsafe fn dummy_update(
         _inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        _states: &Vector,
+        _states: &AggregateStateInput,
         _count: usize,
     ) {
     }

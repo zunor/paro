@@ -8,7 +8,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
-use crate::aggregate::{AggregateFunction, AggregateInputData, FunctionData};
+use crate::aggregate::{AggregateFunction, AggregateInputData, AggregateStateInput, FunctionData};
 use crate::decimal::{read_decimal, rescale, round_divide, to_i128, write_decimal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,13 +52,26 @@ struct DecimalAggregateState {
     count: u64,
     is_set: bool,
     overflowed: bool,
+    wide: bool,
 }
 
 impl DecimalAggregateState {
+    fn narrow_value(&self) -> i128 {
+        let value = ((self.value_words[1] as u128) << 64) | self.value_words[0] as u128;
+        value as i128
+    }
+
     fn value(&self) -> i256 {
         let low = ((self.value_words[1] as u128) << 64) | self.value_words[0] as u128;
         let high = ((self.value_words[3] as u128) << 64) | self.value_words[2] as u128;
         i256::from_words(high as i128, low as i128)
+    }
+
+    fn set_narrow_value(&mut self, value: i128) {
+        let value = value as u128;
+        let sign = if value >> 127 == 0 { 0 } else { u64::MAX };
+        self.value_words = [value as u64, (value >> 64) as u64, sign, sign];
+        self.wide = false;
     }
 
     fn set_value(&mut self, value: i256) {
@@ -71,6 +84,35 @@ impl DecimalAggregateState {
             high as u64,
             (high >> 64) as u64,
         ];
+        self.wide = value < i256::from(i128::MIN) || value > i256::from(i128::MAX);
+    }
+
+    fn add_i128(&mut self, value: i128) -> bool {
+        if !self.wide {
+            if let Some(value) = self.narrow_value().checked_add(value) {
+                self.set_narrow_value(value);
+                return true;
+            }
+        }
+        let Some(value) = self.value().checked_add(i256::from(value)) else {
+            return false;
+        };
+        self.set_value(value);
+        true
+    }
+
+    fn add_state(&mut self, source: &Self) -> bool {
+        if !self.wide && !source.wide {
+            if let Some(value) = self.narrow_value().checked_add(source.narrow_value()) {
+                self.set_narrow_value(value);
+                return true;
+            }
+        }
+        let Some(value) = self.value().checked_add(source.value()) else {
+            return false;
+        };
+        self.set_value(value);
+        true
     }
 }
 
@@ -167,21 +209,22 @@ unsafe fn initialize(state: *mut u8) {
     state.count = 0;
     state.is_set = false;
     state.overflowed = false;
+    state.wide = false;
 }
 
 unsafe fn update(
     inputs: &[&Vector],
     input_data: &AggregateInputData,
-    states: &Vector,
+    states: &AggregateStateInput,
     count: usize,
 ) {
-    let state_ptrs = states.flat_data::<*mut u8>();
+    let data = bind_data(input_data);
     for row in 0..count {
         if inputs[0].is_null(row) {
             continue;
         }
-        let state = &mut *(*state_ptrs.add(row) as *mut DecimalAggregateState);
-        update_state(state, read_decimal(inputs[0], row).0, bind_data(input_data));
+        let state = &mut *(states.state_ptr(row) as *mut DecimalAggregateState);
+        update_state(state, read_decimal(inputs[0], row).0, data);
     }
 }
 
@@ -205,12 +248,9 @@ unsafe fn simple_update(
 }
 
 fn update_state(state: &mut DecimalAggregateState, value: i128, data: &DecimalAggregateBindData) {
-    let value = i256::from(value);
     match data.op {
         DecimalAggregateOp::Sum | DecimalAggregateOp::Avg => {
-            if let Some(value) = state.value().checked_add(value) {
-                state.set_value(value);
-            } else {
+            if !state.add_i128(value) {
                 state.overflowed = true;
             }
             if let Some(count) = state.count.checked_add(1) {
@@ -221,25 +261,25 @@ fn update_state(state: &mut DecimalAggregateState, value: i128, data: &DecimalAg
             state.is_set = true;
         }
         DecimalAggregateOp::Min => {
-            if !state.is_set || value < state.value() {
-                state.set_value(value);
+            if !state.is_set || value < state.narrow_value() {
+                state.set_narrow_value(value);
                 state.is_set = true;
             }
         }
         DecimalAggregateOp::Max => {
-            if !state.is_set || value > state.value() {
-                state.set_value(value);
+            if !state.is_set || value > state.narrow_value() {
+                state.set_narrow_value(value);
                 state.is_set = true;
             }
         }
         DecimalAggregateOp::First => {
             if !state.is_set {
-                state.set_value(value);
+                state.set_narrow_value(value);
                 state.is_set = true;
             }
         }
         DecimalAggregateOp::Last => {
-            state.set_value(value);
+            state.set_narrow_value(value);
             state.is_set = true;
         }
     }
@@ -260,9 +300,7 @@ unsafe fn combine(source: &Vector, target: &Vector, input_data: &AggregateInputD
         }
         match data.op {
             DecimalAggregateOp::Sum | DecimalAggregateOp::Avg => {
-                if let Some(value) = target.value().checked_add(source.value()) {
-                    target.set_value(value);
-                } else {
+                if !target.add_state(source) {
                     target.overflowed = true;
                 }
                 if let Some(count) = target.count.checked_add(source.count) {
@@ -273,25 +311,25 @@ unsafe fn combine(source: &Vector, target: &Vector, input_data: &AggregateInputD
                 target.is_set = true;
             }
             DecimalAggregateOp::Min => {
-                if !target.is_set || source.value() < target.value() {
-                    target.set_value(source.value());
+                if !target.is_set || source.narrow_value() < target.narrow_value() {
+                    target.set_narrow_value(source.narrow_value());
                     target.is_set = true;
                 }
             }
             DecimalAggregateOp::Max => {
-                if !target.is_set || source.value() > target.value() {
-                    target.set_value(source.value());
+                if !target.is_set || source.narrow_value() > target.narrow_value() {
+                    target.set_narrow_value(source.narrow_value());
                     target.is_set = true;
                 }
             }
             DecimalAggregateOp::First => {
                 if !target.is_set {
-                    target.set_value(source.value());
+                    target.set_narrow_value(source.narrow_value());
                     target.is_set = true;
                 }
             }
             DecimalAggregateOp::Last => {
-                target.set_value(source.value());
+                target.set_narrow_value(source.narrow_value());
                 target.is_set = true;
             }
         }
@@ -368,6 +406,7 @@ mod tests {
             count: 0,
             is_set: false,
             overflowed: false,
+            wide: false,
         }
     }
 
@@ -504,7 +543,10 @@ mod tests {
         let input = 99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
         let mut state = initialized_state();
         update_state(&mut state, input, &data);
+        assert!(!state.wide);
+        assert_eq!(state.narrow_value(), input);
         update_state(&mut state, input, &data);
+        assert!(state.wide);
         assert!(state.value() > i256::from(i128::MAX));
 
         let result = unsafe { finalize_single(&mut state, &data) }.unwrap();

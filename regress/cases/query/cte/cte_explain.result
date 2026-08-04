@@ -33,7 +33,7 @@ MATERIALIZED_CTE
       Output: p.id, p.peer_id, a.total
       ->  FILTER
         Filter: #2 = #3
-        ->  CROSS_PRODUCT  (rows=1000000)
+        ->  CROSS_PRODUCT
           ->  PROJECTION
             Output: expr_1, expr_2, expr_3
             ->  PROJECTION

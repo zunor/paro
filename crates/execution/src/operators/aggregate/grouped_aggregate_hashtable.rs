@@ -14,13 +14,12 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::VectorOperations;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
-use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
+use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
 
 use super::aggregate_kernel::{
-    build_state_vector, combine_states, destroy_states, filtered_input_vectors_for_aggregate,
-    finalize_states, initialize_states, input_vectors_for_aggregate,
-    serialize_aggregate_state_blob, update_filtered_states, update_states,
-    with_aggregate_input_data, AggregatePayload,
+    combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
+    initialize_states, input_vectors_for_aggregate, serialize_aggregate_state_blob,
+    update_filtered_states, update_states, with_aggregate_input_data, AggregatePayload,
 };
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
@@ -582,10 +581,9 @@ impl GroupedAggregateHashTable {
                     selection.len(),
                 )?;
                 let input_refs: Vec<&Vector> = inputs.iter().collect();
-                let states = build_state_vector(
+                let states = AggregateStateInput::try_new(
                     addresses,
-                    &self.state_layout,
-                    agg_idx,
+                    self.state_layout.state_offset(agg_idx),
                     Some(selection),
                     selection.len(),
                 )?;
@@ -603,10 +601,9 @@ impl GroupedAggregateHashTable {
                     aggregate_inputs: &self.aggregate_inputs[agg_idx..agg_idx + 1],
                 };
                 let inputs = input_vectors_for_aggregate(&payload_desc, 0)?;
-                let states = build_state_vector(
+                let states = AggregateStateInput::try_new(
                     addresses,
-                    &self.state_layout,
-                    agg_idx,
+                    self.state_layout.state_offset(agg_idx),
                     None,
                     payload.size(),
                 )?;
@@ -1624,20 +1621,17 @@ mod tests {
     unsafe fn sum_update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0].try_decode_ref(count).unwrap();
         let input_data = input.get_data::<i64>();
-        let state = states.try_decode_ref(count).unwrap();
-        let state_data = state.get_data::<*mut u8>();
         for row in 0..count {
             let input_row = input.sel().get(row);
             if !input.validity().is_valid(input_row) {
                 continue;
             }
-            let state_row = state.sel().get(row);
-            let state_ptr = *state_data.add(state_row) as *mut i64;
+            let state_ptr = states.state_ptr(row) as *mut i64;
             *state_ptr += *input_data.add(input_row);
         }
     }

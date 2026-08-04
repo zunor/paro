@@ -11,14 +11,14 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
-use paro_common::types::LogicalType;
+use paro_common::types::{InlineString, LogicalType};
 use paro_common::vector::{DecodedVectorRef, SelectionVector, Vector};
-use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
+use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
 
 use super::aggregate_kernel::{
-    build_state_vector, combine_states, destroy_states, filtered_input_vectors_for_aggregate,
-    finalize_states, input_vectors_for_aggregate, update_filtered_states, update_states,
-    with_aggregate_input_data, AggregatePayload,
+    combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
+    input_vectors_for_aggregate, update_filtered_states, update_states, with_aggregate_input_data,
+    AggregatePayload,
 };
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
@@ -327,10 +327,9 @@ impl PerfectAggregateHashTable {
                     selection.len(),
                 )?;
                 let input_refs: Vec<&Vector> = inputs.iter().collect();
-                let states = build_state_vector(
+                let states = AggregateStateInput::try_new(
                     addresses,
-                    &self.state_layout,
-                    agg_idx,
+                    self.state_layout.state_offset(agg_idx),
                     Some(selection),
                     selection.len(),
                 )?;
@@ -348,10 +347,9 @@ impl PerfectAggregateHashTable {
                     aggregate_inputs: &self.aggregate_inputs[agg_idx..agg_idx + 1],
                 };
                 let inputs = input_vectors_for_aggregate(&payload_desc, 0)?;
-                let states = build_state_vector(
+                let states = AggregateStateInput::try_new(
                     addresses,
-                    &self.state_layout,
-                    agg_idx,
+                    self.state_layout.state_offset(agg_idx),
                     None,
                     payload.size(),
                 )?;
@@ -816,6 +814,17 @@ fn read_group_value_as_i128(
                 ))
             })
         }
+        LogicalType::Varchar => {
+            let value = unsafe { *group.get_data::<InlineString>().add(physical_idx) };
+            match value.as_bytes() {
+                [] => Ok(0),
+                [byte] => Ok(i128::from(*byte) + 1),
+                bytes => Err(paro_error::internal(format!(
+                    "Single-byte perfect aggregate key received VARCHAR length {}",
+                    bytes.len()
+                ))),
+            }
+        }
         _ => Err(paro_error::internal(format!(
             "Unsupported group key type for perfect aggregate table: {:?}",
             ty
@@ -853,6 +862,25 @@ fn i128_to_value(value: i128, ty: &LogicalType) -> Result<Value> {
         LogicalType::UHugeInt => Ok(Value::UHugeInt(u128::try_from(value).map_err(|_| {
             paro_error::internal(format!("Decoded value out of UHUGEINT range: {value}"))
         })?)),
+        LogicalType::Varchar => match value {
+            0 => Ok(Value::Varchar(String::new())),
+            1..=256 => {
+                let byte = u8::try_from(value - 1).map_err(|_| {
+                    paro_error::internal(format!(
+                        "Decoded value out of single-byte VARCHAR range: {value}"
+                    ))
+                })?;
+                let text = std::str::from_utf8(std::slice::from_ref(&byte)).map_err(|_| {
+                    paro_error::internal(format!(
+                        "Decoded single-byte VARCHAR is not valid UTF-8: {byte}"
+                    ))
+                })?;
+                Ok(Value::Varchar(text.to_string()))
+            }
+            _ => Err(paro_error::internal(format!(
+                "Decoded value out of single-byte VARCHAR range: {value}"
+            ))),
+        },
         _ => Err(paro_error::internal(format!(
             "Unsupported group key type while decoding perfect aggregate output: {:?}",
             ty
@@ -926,4 +954,22 @@ fn max_encoded_for_bits(bits: usize) -> Result<u128> {
         )));
     }
     Ok((1u128 << bits) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_byte_varchar_perfect_hash_codec_roundtrips() {
+        assert_eq!(
+            i128_to_value(0, &LogicalType::Varchar).unwrap(),
+            Value::Varchar(String::new())
+        );
+        assert_eq!(
+            i128_to_value(i128::from(b'R') + 1, &LogicalType::Varchar).unwrap(),
+            Value::Varchar("R".to_string())
+        );
+        assert!(i128_to_value(257, &LogicalType::Varchar).is_err());
+    }
 }
