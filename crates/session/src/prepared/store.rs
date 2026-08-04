@@ -6,13 +6,12 @@ use std::collections::HashMap;
 use crate::completion::StatementCompletion;
 use crate::dispatch::UtilityCommand;
 use crate::prepared::typed_parameters::TypedParameterEnv;
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_context::CompileEnvironmentKey;
-use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
+use paro_execution::query_executor::compiled::{
+    CompiledStatement, ExecutionRequest, ResultColumnDesc,
+};
 use paro_parser::ast::Statement;
 
-use super::plan_cache::PlanCacheMode;
 use super::portal::{
     values_to_text, CursorHoldability, FormatCode, PortalExecutionState, PortalSnapshotRetention,
     ScrollMode,
@@ -43,20 +42,16 @@ pub struct PreparedStatementEntry {
     pub raw_stmt: Statement,
     pub parameter_types: Vec<Option<LogicalType>>,
     pub result_schema: Vec<ResultColumnDesc>,
-    pub plan_cache_mode: PlanCacheMode,
     pub generic_plan: Option<CompiledStatement>,
-    pub custom_plan_executions: u32,
-    pub dependency_epoch: u64,
-    pub compile_environment: CompileEnvironmentKey,
+    /// Successful generic-plan selections by SQL EXECUTE or protocol Bind.
+    pub generic_plan_uses: i64,
     pub source: PreparedStatementSource,
 }
 
 #[derive(Debug, Clone)]
 pub enum PortalKind {
-    Compiled(Box<CompiledStatement>),
-    Query {
-        parameter_env: TypedParameterEnv,
-    },
+    Query(ExecutionRequest),
+    Materialized,
     Utility(Box<UtilityCommand>),
     ClientCopy {
         stmt: Box<Statement>,
@@ -70,7 +65,6 @@ pub struct PortalEntry {
     pub statement_ref: PortalStatementRef,
     pub source_sql: String,
     pub raw_stmt: Statement,
-    pub bound_params: Vec<Value>,
     pub holdability: CursorHoldability,
     pub scroll_mode: ScrollMode,
     pub result_formats: Vec<FormatCode>,
@@ -79,7 +73,6 @@ pub struct PortalEntry {
     pub execution_state: PortalExecutionState,
     pub snapshot_retention: Option<PortalSnapshotRetention>,
     pub completion: Option<StatementCompletion>,
-    pub dependency_epoch: u64,
     pub created_generation: u64,
     pub transaction_owned: bool,
 }
@@ -291,7 +284,6 @@ mod tests {
     use crate::prepared::portal::{
         CursorHoldability, FormatCode, PortalExecutionState, ScrollMode,
     };
-    use paro_context::CompileEnvironmentKey;
     use paro_parser::ast::Statement;
 
     fn parse_single(sql: &str) -> Statement {
@@ -310,17 +302,8 @@ mod tests {
             raw_stmt: parse_single("SELECT 1"),
             parameter_types: Vec::new(),
             result_schema: Vec::new(),
-            plan_cache_mode: PlanCacheMode::Auto,
             generic_plan: None,
-            custom_plan_executions: 0,
-            dependency_epoch: 0,
-            compile_environment: CompileEnvironmentKey {
-                current_database: "postgres".to_string(),
-                current_schema: "public".to_string(),
-                search_path: Vec::new(),
-                visible_generation: 0,
-                settings_fingerprint: 0,
-            },
+            generic_plan_uses: 0,
             source: PreparedStatementSource::Protocol,
         }
     }
@@ -335,7 +318,6 @@ mod tests {
             statement_ref: PortalStatementRef::None,
             source_sql: "SELECT 1".to_string(),
             raw_stmt: parse_single("SELECT 1"),
-            bound_params: Vec::new(),
             holdability,
             scroll_mode: ScrollMode::Scroll,
             result_formats: vec![FormatCode::Text],
@@ -347,7 +329,6 @@ mod tests {
             execution_state: PortalExecutionState::Ready,
             snapshot_retention: None,
             completion: None,
-            dependency_epoch: 0,
             created_generation: 0,
             transaction_owned,
         }

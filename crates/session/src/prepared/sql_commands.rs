@@ -9,7 +9,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_compiler::compile_statement;
 use paro_context::{StatementContext, StatementOptions, StatementSource};
-use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
+use paro_execution::query_executor::compiled::{ExecutionRequest, ResultColumnDesc};
 use paro_execution::query_executor::executor::Executor;
 use paro_parser::ast::{
     CursorScrollMode, DeallocateStmt, Expr, FetchStmt, Literal, PrepareStmt, Statement,
@@ -23,7 +23,7 @@ use crate::copy_protocol::ProtocolResultSink;
 use crate::dispatch::{dispatch_statement, FrontendRoute, PreparedCommand};
 use crate::prepared::materialization::materialize_compiled_statement;
 use crate::prepared::parameters::{
-    bind_expr_arguments, bind_value_arguments, placeholder_count, render_probe_statement,
+    bind_expr_arguments, placeholder_count, render_probe_statement, typed_parameter_env_from_values,
 };
 use crate::prepared::plan_cache::build_generic_plan;
 use crate::prepared::portal::{
@@ -109,34 +109,35 @@ async fn execute_prepare<S: ProtocolResultSink>(
     } else {
         parameter_types
     };
-    let (result_schema, generic_plan) = match render_probe_statement(&raw_stmt, &parameter_types) {
-        Ok(Some(probe_stmt)) => {
-            match build_generic_plan(snapshot.clone(), probe_stmt, &parameter_types) {
-                Ok(plan) => (plan.result_schema.clone(), None),
+    let all_parameter_types_known = parameter_types.iter().all(Option::is_some);
+    let (result_schema, generic_plan) = if parameter_types.is_empty() || all_parameter_types_known {
+        match build_generic_plan(snapshot.clone(), raw_stmt.clone(), &parameter_types) {
+            Ok(plan) => (plan.result_schema().to_vec(), Some(plan)),
+            Err(err) => {
+                if require_new_transaction {
+                    let _ = session.rollback_auto_transaction(Some(&err));
+                }
+                return Err(err);
+            }
+        }
+    } else {
+        match render_probe_statement(&raw_stmt, &parameter_types) {
+            Ok(Some(probe_stmt)) => match compile_statement(snapshot.clone(), probe_stmt) {
+                Ok(plan) => (plan.result_schema().to_vec(), None),
                 Err(err) => {
                     if require_new_transaction {
                         let _ = session.rollback_auto_transaction(Some(&err));
                     }
                     return Err(err);
                 }
-            }
-        }
-        Ok(None) => {
-            match build_generic_plan(snapshot.clone(), raw_stmt.clone(), &parameter_types) {
-                Ok(plan) => (plan.result_schema.clone(), Some(plan)),
-                Err(err) => {
-                    if require_new_transaction {
-                        let _ = session.rollback_auto_transaction(Some(&err));
-                    }
-                    return Err(err);
+            },
+            Ok(None) => unreachable!("non-empty parameters always produce a probe statement"),
+            Err(err) => {
+                if require_new_transaction {
+                    let _ = session.rollback_auto_transaction(Some(&err));
                 }
+                return Err(err);
             }
-        }
-        Err(err) => {
-            if require_new_transaction {
-                let _ = session.rollback_auto_transaction(Some(&err));
-            }
-            return Err(err);
         }
     };
 
@@ -146,11 +147,8 @@ async fn execute_prepare<S: ProtocolResultSink>(
         raw_stmt,
         parameter_types,
         result_schema,
-        plan_cache_mode: crate::prepared::plan_cache::PlanCacheMode::Auto,
         generic_plan,
-        custom_plan_executions: 0,
-        dependency_epoch: session.transaction_visible_version(),
-        compile_environment: snapshot.compile_environment_key(),
+        generic_plan_uses: 0,
         source: PreparedStatementSource::Sql,
     };
 
@@ -205,9 +203,9 @@ async fn execute_execute<S: ProtocolResultSink>(
             .expect("EXECUTE requires an active statement scope"),
     );
 
-    let compiled =
+    let execution =
         match select_execute_plan(session, &name, &entry, snapshot.clone(), &bound_params) {
-            Ok(compiled) => compiled,
+            Ok(execution) => execution,
             Err(err) => {
                 if require_new_transaction {
                     let _ = session.rollback_auto_transaction(Some(&err));
@@ -219,7 +217,7 @@ async fn execute_execute<S: ProtocolResultSink>(
     match run_compiled_statement(
         session,
         snapshot,
-        compiled,
+        execution,
         Some(&entry.raw_stmt),
         None,
         sink,
@@ -324,11 +322,11 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         ));
     }
 
-    let result_schema = compiled.result_schema.clone();
-    let compiled_for_portal = compiled.clone();
+    let result_schema = compiled.result_schema().to_vec();
     let snapshot_read_ts = snapshot.transaction_view().effective_read_ts();
+    let execution = ExecutionRequest::unparameterized(compiled)?;
     let materialized =
-        match materialize_compiled_statement(session, snapshot.clone(), compiled).await {
+        match materialize_compiled_statement(session, snapshot.clone(), execution).await {
             Ok(materialized) => materialized,
             Err(err) => {
                 if require_new_transaction {
@@ -343,7 +341,6 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         statement_ref: PortalStatementRef::None,
         source_sql: stmt.query.to_string(),
         raw_stmt: (*stmt.query).clone(),
-        bound_params: Vec::new(),
         holdability: if stmt.hold {
             CursorHoldability::WithHold
         } else {
@@ -352,14 +349,13 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         scroll_mode: scroll_mode_from_ast(stmt.scroll),
         result_formats: vec![FormatCode::Text; result_schema.len().max(1)],
         result_schema,
-        kind: PortalKind::Compiled(Box::new(compiled_for_portal)),
+        kind: PortalKind::Materialized,
         execution_state: PortalExecutionState::Active(PortalCursor {
             position: -1,
             execution: ExecutionCursorHandle::materialized(materialized),
         }),
         snapshot_retention: Some(PortalSnapshotRetention::materialized(snapshot_read_ts)),
         completion: None,
-        dependency_epoch: session.transaction_visible_version(),
         created_generation: 0,
         transaction_owned: session.has_active_transaction(),
     };
@@ -460,11 +456,12 @@ async fn execute_close_cursor<S: ProtocolResultSink>(
 async fn run_compiled_statement<S: ProtocolResultSink>(
     session: &mut Session,
     ctx: Arc<StatementContext>,
-    compiled: CompiledStatement,
+    execution: ExecutionRequest,
     stmt: Option<&Statement>,
     completion_override: Option<StatementCompletion>,
     sink: &mut S,
 ) -> Result<()> {
+    let compiled = execution.statement().clone();
     let statement_completion = completion_override.clone().unwrap_or_else(|| {
         stmt.map(crate::completion_infer::initial_statement_completion)
             .unwrap_or(StatementCompletion::Empty)
@@ -479,7 +476,7 @@ async fn run_compiled_statement<S: ProtocolResultSink>(
         "Prepared executor initialized"
     );
 
-    let result = session.get_executor().execute(compiled.clone());
+    let result = session.get_executor().execute(execution);
     match result {
         Ok(mut stream) => {
             let result_names = compiled.result_names();
@@ -531,68 +528,37 @@ fn select_execute_plan(
     entry: &PreparedStatementEntry,
     ctx: Arc<StatementContext>,
     bound_params: &[Value],
-) -> Result<CompiledStatement> {
+) -> Result<ExecutionRequest> {
     let compile_environment = ctx.compile_environment_key();
-    let compile_environment_changed = entry.compile_environment != compile_environment;
     let resolved_parameter_types = resolve_parameter_types(&entry.parameter_types, bound_params)?;
-    let bound_stmt =
-        bind_value_arguments(&entry.raw_stmt, bound_params, &resolved_parameter_types)?;
+    let parameter_env = typed_parameter_env_from_values(&resolved_parameter_types, bound_params)?;
+    let concrete_types = parameter_env
+        .logical_types()
+        .into_iter()
+        .map(|ty| ty.expect("resolved parameter type"))
+        .collect::<Vec<_>>();
 
-    if !resolved_parameter_types.is_empty() {
-        let mut compiled = build_generic_plan(ctx, bound_stmt, &resolved_parameter_types)?;
-        compiled.parameter_types = resolved_parameter_types
-            .iter()
-            .map(|ty| ty.clone().unwrap_or(LogicalType::Unknown))
-            .collect();
-        if let Some(stored) = session.state.get_prepared_statement_mut(name) {
-            stored.result_schema = compiled.result_schema.clone();
-            stored.parameter_types = resolved_parameter_types;
-            stored.custom_plan_executions = stored.custom_plan_executions.saturating_add(1);
-            stored.compile_environment = compile_environment;
-        }
-        return Ok(compiled);
+    let compiled = entry
+        .generic_plan
+        .as_ref()
+        .filter(|plan| {
+            plan.compile_environment() == &compile_environment
+                && plan.parameter_types() == concrete_types
+        })
+        .cloned()
+        .map_or_else(
+            || build_generic_plan(ctx, entry.raw_stmt.clone(), &resolved_parameter_types),
+            Ok,
+        )?;
+
+    if let Some(stored) = session.state.get_prepared_statement_mut(name) {
+        stored.result_schema = compiled.result_schema().to_vec();
+        stored.parameter_types = resolved_parameter_types;
+        stored.generic_plan = Some(compiled.clone());
+        stored.generic_plan_uses = stored.generic_plan_uses.saturating_add(1);
     }
 
-    match entry.plan_cache_mode {
-        crate::prepared::plan_cache::PlanCacheMode::ForceCustom => {
-            let mut compiled =
-                build_generic_plan(ctx, bound_stmt.clone(), &resolved_parameter_types)?;
-            compiled.parameter_types = resolved_parameter_types
-                .iter()
-                .map(|ty| ty.clone().unwrap_or(LogicalType::Unknown))
-                .collect();
-            if let Some(stored) = session.state.get_prepared_statement_mut(name) {
-                stored.custom_plan_executions = stored.custom_plan_executions.saturating_add(1);
-                stored.parameter_types = resolved_parameter_types;
-                stored.compile_environment = compile_environment;
-            }
-            Ok(compiled)
-        }
-        crate::prepared::plan_cache::PlanCacheMode::Auto
-        | crate::prepared::plan_cache::PlanCacheMode::ForceGeneric => {
-            if !compile_environment_changed {
-                if let Some(plan) = entry.generic_plan.clone() {
-                    if let Some(stored) = session.state.get_prepared_statement_mut(name) {
-                        stored.parameter_types = resolved_parameter_types;
-                    }
-                    return Ok(plan);
-                }
-            }
-
-            let mut compiled = build_generic_plan(ctx, bound_stmt, &resolved_parameter_types)?;
-            compiled.parameter_types = resolved_parameter_types
-                .iter()
-                .map(|ty| ty.clone().unwrap_or(LogicalType::Unknown))
-                .collect();
-            if let Some(stored) = session.state.get_prepared_statement_mut(name) {
-                stored.result_schema = compiled.result_schema.clone();
-                stored.generic_plan = Some(compiled.clone());
-                stored.parameter_types = resolved_parameter_types;
-                stored.compile_environment = compile_environment;
-            }
-            Ok(compiled)
-        }
-    }
+    ExecutionRequest::from_typed_env(compiled, &parameter_env)
 }
 
 fn validate_preparable_statement(stmt: &Statement) -> Result<()> {
@@ -757,7 +723,8 @@ async fn evaluate_scalar_expr(session: &Session, expr: &Expr) -> Result<Value> {
     );
     let compiled = compile_statement(ctx.clone(), stmt)?;
     let executor = Executor::new(ctx);
-    let mut stream = executor.execute(compiled)?;
+    let execution = ExecutionRequest::unparameterized(compiled)?;
+    let mut stream = executor.execute(execution)?;
 
     let mut result = None;
     while let Some(chunk) = stream.fetch()? {

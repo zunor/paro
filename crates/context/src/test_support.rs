@@ -224,6 +224,7 @@ impl TestStatementContextBuilder {
                         path: ":memory:".to_string(),
                         db_type: DatabaseType::ReadWrite,
                     },
+                    catalog_epoch: catalog.gc_epoch(),
                     catalog,
                     tablet_meta: None,
                     wal_metrics: crate::AttachedDatabaseWalMetricsSnapshot::default(),

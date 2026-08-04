@@ -120,6 +120,18 @@ async fn run_prepare_execute_deallocate_updates_metadata() {
     .await;
     assert_eq!(query_i64_col(&sink, 0), vec![1]);
 
+    exec_ok(&mut session, &mut sink, "EXECUTE stmt1").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 3]);
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT generic_plans, custom_plans FROM pg_catalog.pg_prepared_statements WHERE name = 'stmt1'",
+    )
+    .await;
+    assert_eq!(query_i64_col(&sink, 0), vec![2]);
+    assert_eq!(query_i64_col(&sink, 1), vec![0]);
+
     exec_ok(&mut session, &mut sink, "DEALLOCATE stmt1").await;
     assert_eq!(
         sink.assert_single_result().completion,

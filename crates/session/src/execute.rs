@@ -21,8 +21,9 @@ use async_trait::async_trait;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
-use paro_compiler::{compile_statement, compile_statement_with_parameters};
+use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
 use paro_context::{StatementCancellation, StatementInput, StatementOptions, StatementSource};
+use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
 use paro_function::table::CopyStdinSource;
 use paro_instance::{CopyStdinMetrics, CopyStdinRejectReason};
@@ -371,7 +372,11 @@ impl Session {
         );
         let compile_result = match parameter_env {
             Some(parameter_env) => {
-                compile_statement_with_parameters(ctx.clone(), stmt.clone(), parameter_env)
+                let parameter_types = parameter_env
+                    .iter()
+                    .map(|parameter| parameter.logical_type.clone())
+                    .collect::<Vec<_>>();
+                compile_statement_with_parameter_types(ctx.clone(), stmt.clone(), &parameter_types)
             }
             None => compile_statement(ctx.clone(), stmt.clone()),
         };
@@ -396,7 +401,7 @@ impl Session {
             target: targets::QUERY,
             session_id = self.id,
             statement_completion = %statement_completion,
-            result_columns = compiled.result_schema.len(),
+            result_columns = compiled.result_schema().len(),
             "Statement compilation completed"
         );
 
@@ -410,7 +415,13 @@ impl Session {
             "Query executor initialized"
         );
 
-        let result = self.get_executor().execute(compiled.clone());
+        let execution = match parameter_env {
+            Some(parameter_env) => {
+                ExecutionRequest::from_typed_env(compiled.clone(), parameter_env)?
+            }
+            None => ExecutionRequest::unparameterized(compiled.clone())?,
+        };
+        let result = self.get_executor().execute(execution);
 
         match result {
             Ok(mut stream) => {
@@ -597,7 +608,11 @@ impl Session {
         );
         let compiled = match parameter_env {
             Some(parameter_env) => {
-                compile_statement_with_parameters(ctx.clone(), query_stmt, parameter_env)?
+                let parameter_types = parameter_env
+                    .iter()
+                    .map(|parameter| parameter.logical_type.clone())
+                    .collect::<Vec<_>>();
+                compile_statement_with_parameter_types(ctx.clone(), query_stmt, &parameter_types)?
             }
             None => compile_statement(ctx.clone(), query_stmt)?,
         };
@@ -605,7 +620,7 @@ impl Session {
             target: targets::QUERY,
             session_id = self.id,
             statement_completion = %statement_completion,
-            result_columns = compiled.result_schema.len(),
+            result_columns = compiled.result_schema().len(),
             "Statement compilation completed"
         );
 
@@ -621,7 +636,11 @@ impl Session {
             "Query executor initialized"
         );
 
-        let mut stream = self.get_executor().execute(compiled).map_err(|e| {
+        let execution = match parameter_env {
+            Some(parameter_env) => ExecutionRequest::from_typed_env(compiled, parameter_env)?,
+            None => ExecutionRequest::unparameterized(compiled)?,
+        };
+        let mut stream = self.get_executor().execute(execution).map_err(|e| {
             error!(
                 target: targets::EXECUTOR,
                 session_id = self.id,

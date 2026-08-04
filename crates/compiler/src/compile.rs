@@ -3,10 +3,9 @@
 
 use paro_common::error::Result;
 use paro_common::logging::targets;
-use paro_common::typed_parameters::TypedParameterEnv;
+use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
-use paro_execution::runtime::{ParameterBindingEpoch, ParameterBindings};
 use paro_parser::ast::{Expr, Statement};
 use paro_parser::{Range, StatementVisitor};
 use paro_planner::operator::{ExplainMode, LogicalOperator};
@@ -18,13 +17,13 @@ use std::time::Instant;
 use tracing::{debug, error};
 
 pub fn compile_statement(ctx: Arc<StatementContext>, stmt: Statement) -> Result<CompiledStatement> {
-    compile_statement_with_parameters(ctx, stmt, &TypedParameterEnv::default())
+    compile_statement_with_parameter_types(ctx, stmt, &[])
 }
 
-pub fn compile_statement_with_parameters(
+pub fn compile_statement_with_parameter_types(
     ctx: Arc<StatementContext>,
     stmt: Statement,
-    parameter_env: &TypedParameterEnv,
+    parameter_types: &[LogicalType],
 ) -> Result<CompiledStatement> {
     let statement_tag = stmt.to_string();
     let started_at = Instant::now();
@@ -34,12 +33,12 @@ pub fn compile_statement_with_parameters(
         "Statement compilation pipeline started"
     );
 
-    let mut planner = if parameter_env.is_empty() {
+    let mut planner = if parameter_types.is_empty() {
         Planner::new(ctx.clone())
     } else {
         Planner::new_with_parameters(
             ctx.clone(),
-            parameter_env.clone(),
+            parameter_types.to_vec(),
             build_placeholder_indexes(&stmt)?,
         )
     };
@@ -132,28 +131,21 @@ pub fn compile_statement_with_parameters(
         "Runtime program generated"
     );
 
-    let parameter_types = parameter_env
-        .logical_types()
-        .into_iter()
-        .map(|ty| ty.unwrap_or(paro_common::types::LogicalType::Unknown))
-        .collect::<Vec<_>>();
-    let parameter_bindings =
-        ParameterBindings::from_typed_env(parameter_env, ParameterBindingEpoch::new(1));
-    let compiled = CompiledStatement::new_with_bindings(
+    let compiled = CompiledStatement::new(
         executable,
         result_names
             .into_iter()
             .zip(result_types)
             .map(|(name, logical_type)| ResultColumnDesc { name, logical_type })
             .collect(),
-        parameter_types,
-        parameter_bindings,
+        parameter_types.to_vec(),
+        ctx.compile_environment_key(),
     );
 
     debug!(
         target: targets::QUERY,
         statement_tag = %statement_tag,
-        result_columns = compiled.result_schema.len(),
+        result_columns = compiled.result_schema().len(),
         elapsed_ms = started_at.elapsed().as_millis(),
         "Statement compilation pipeline completed"
     );

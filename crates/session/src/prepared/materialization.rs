@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use paro_common::error::Result;
 use paro_context::StatementContext;
-use paro_execution::query_executor::compiled::CompiledStatement;
+use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
 
 use crate::prepared::portal::MaterializedPortalData;
@@ -23,12 +23,12 @@ use crate::Session;
 pub(crate) async fn materialize_compiled_statement(
     session: &mut Session,
     ctx: Arc<StatementContext>,
-    compiled: CompiledStatement,
+    execution: ExecutionRequest,
 ) -> Result<MaterializedPortalData> {
     let executor = Executor::new(ctx);
     session.set_executor(executor);
 
-    let mut stream = session.get_executor().execute(compiled)?;
+    let mut stream = session.get_executor().execute(execution)?;
     let store = SessionRetainedResultStore::new(session.session_memory_budget());
     while let Some(chunk) = stream.fetch()? {
         store.append(chunk.try_deep_copy(chunk.allocator().clone())?)?;

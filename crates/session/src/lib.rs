@@ -42,7 +42,6 @@ pub use prepared::extended_query::{
     BindMessage, CloseTarget, DescribeTarget, ExecutePortalMessage, ExtendedQueryMessage,
     ExtendedQueryResponder, ParseMessage,
 };
-pub use prepared::plan_cache::PlanCacheMode;
 pub use prepared::portal::{
     CursorHoldability, ExecutionCursorHandle, FormatCode, PortalExecutionState, ScrollMode,
 };

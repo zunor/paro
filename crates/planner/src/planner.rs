@@ -17,7 +17,6 @@ use crate::stack::maybe_grow_planner_stack;
 use crate::verify::verify_physical_planner_invariants;
 use paro_common::error::Result;
 use paro_common::logging::targets;
-use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_parser::ast::Statement;
@@ -97,11 +96,11 @@ impl Planner {
 
     pub fn new_with_parameters(
         context: Arc<StatementContext>,
-        parameter_env: TypedParameterEnv,
+        parameter_types: Vec<LogicalType>,
         placeholder_indexes: BTreeMap<Range, usize>,
     ) -> Self {
         Self {
-            binder: Binder::with_parameters(context.clone(), parameter_env, placeholder_indexes),
+            binder: Binder::with_parameters(context.clone(), parameter_types, placeholder_indexes),
             context,
             plan: None,
             names: Vec::new(),

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use paro_common::error::{self as paro_error, ParoError};
 use paro_session::{
-    PlanCacheMode, PreparedStatementEntry, PreparedStatementSource, Session, SessionContextState,
+    PreparedStatementEntry, PreparedStatementSource, Session, SessionContextState,
     TestSessionBuilder,
 };
 
@@ -22,7 +22,6 @@ fn parse_single(sql: &str) -> paro_parser::ast::Statement {
 async fn test_reset_session_state_preserves_active_statement_scope() {
     let mut session = create_test_session();
 
-    let compile_environment = session.compile_environment_key();
     session
         .state
         .add_prepared_statement(PreparedStatementEntry {
@@ -31,11 +30,8 @@ async fn test_reset_session_state_preserves_active_statement_scope() {
             raw_stmt: parse_single("SELECT 1"),
             parameter_types: Vec::new(),
             result_schema: Vec::new(),
-            plan_cache_mode: PlanCacheMode::Auto,
             generic_plan: None,
-            custom_plan_executions: 0,
-            dependency_epoch: 0,
-            compile_environment,
+            generic_plan_uses: 0,
             source: PreparedStatementSource::Sql,
         });
     session.state.enable_profiler();

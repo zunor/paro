@@ -19,7 +19,7 @@ use crate::binder::bind::clause::BoundGroupInformation;
 use crate::binder::context::BindContext;
 use crate::binder::ir::from::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
-use crate::expression::{ConstantExpression, Expression};
+use crate::expression::{Expression, ParameterExpression};
 use crate::operator::LogicalOperator;
 use crate::plan::{LogicalPlan, PlannedStatement};
 use crate::stack::maybe_grow_planner_stack;
@@ -27,7 +27,8 @@ use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogObjectId, Dependency, DependencyList, DependencyType};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::typed_parameters::{BoundParameter, TypedParameterEnv};
+use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
+use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_parser::ast::{Statement as AstStatement, TableReference};
@@ -89,8 +90,8 @@ pub struct Binder {
     delayed_subquery_planning_enabled: bool,
     /// Optional dependency collector used by CREATE VIEW-style binders.
     dependency_collector: Option<Arc<Mutex<BTreeMap<CatalogObjectId, Dependency>>>>,
-    /// Optional parameter environment for protocol placeholders.
-    parameter_env: Option<Arc<TypedParameterEnv>>,
+    /// Optional type signature for protocol placeholders.
+    parameter_types: Option<Arc<[LogicalType]>>,
     /// Stable placeholder ordering keyed by parser span.
     placeholder_indexes: Option<Arc<BTreeMap<Range, usize>>>,
 }
@@ -109,14 +110,14 @@ impl Binder {
             active_grouping_context: None,
             delayed_subquery_planning_enabled: true,
             dependency_collector: None,
-            parameter_env: None,
+            parameter_types: None,
             placeholder_indexes: None,
         }
     }
 
     pub fn with_parameters(
         session_context: Arc<StatementContext>,
-        parameter_env: TypedParameterEnv,
+        parameter_types: Vec<LogicalType>,
         placeholder_indexes: BTreeMap<Range, usize>,
     ) -> Self {
         let cast_functions = session_context.cast_functions();
@@ -130,7 +131,7 @@ impl Binder {
             active_grouping_context: None,
             delayed_subquery_planning_enabled: true,
             dependency_collector: None,
-            parameter_env: Some(Arc::new(parameter_env)),
+            parameter_types: Some(Arc::from(parameter_types.into_boxed_slice())),
             placeholder_indexes: Some(Arc::new(placeholder_indexes)),
         }
     }
@@ -170,7 +171,7 @@ impl Binder {
             active_grouping_context: None,
             delayed_subquery_planning_enabled: self.delayed_subquery_planning_enabled,
             dependency_collector: self.dependency_collector.clone(),
-            parameter_env: self.parameter_env.clone(),
+            parameter_types: self.parameter_types.clone(),
             placeholder_indexes: self.placeholder_indexes.clone(),
         }
     }
@@ -256,7 +257,7 @@ impl Binder {
         self.row_id_bindings.contains(&table_index)
     }
 
-    pub fn protocol_parameter_at_span(&self, span: Span) -> Result<&BoundParameter> {
+    fn protocol_parameter_at_span(&self, span: Span) -> Result<(usize, &LogicalType)> {
         let span = span.ok_or_else(|| {
             paro_error::protocol_violation(
                 "parameterized placeholder is missing parser span metadata".to_string(),
@@ -267,9 +268,10 @@ impl Binder {
                 "placeholder index map is not available for parameterized compilation".to_string(),
             )
         })?;
-        let parameter_env = self.parameter_env.as_ref().ok_or_else(|| {
+        let parameter_types = self.parameter_types.as_ref().ok_or_else(|| {
             paro_error::protocol_violation(
-                "parameter environment is not available for parameterized compilation".to_string(),
+                "parameter type signature is not available for parameterized compilation"
+                    .to_string(),
             )
         })?;
         let Some(index) = placeholder_indexes.get(&span).copied() else {
@@ -277,20 +279,27 @@ impl Binder {
                 "unbound placeholder at span {span}",
             )));
         };
-        parameter_env.get(index).ok_or_else(|| {
-            paro_error::protocol_violation(format!(
-                "expected at least {} bound parameters, got {}",
-                index + 1,
-                parameter_env.len(),
-            ))
-        })
+        parameter_types
+            .get(index)
+            .map(|logical_type| (index, logical_type))
+            .ok_or_else(|| {
+                paro_error::protocol_violation(format!(
+                    "expected at least {} bound parameters, got {}",
+                    index + 1,
+                    parameter_types.len(),
+                ))
+            })
     }
 
     pub fn bind_protocol_parameter(&self, span: Span) -> Result<Expression> {
-        let parameter = self.protocol_parameter_at_span(span)?;
-        Ok(Expression::Constant(ConstantExpression::new(
-            parameter.value.clone(),
-            parameter.logical_type.clone(),
+        let span = span.ok_or_else(|| {
+            paro_error::protocol_violation(
+                "parameterized placeholder is missing parser span metadata".to_string(),
+            )
+        })?;
+        let (index, logical_type) = self.protocol_parameter_at_span(Some(span))?;
+        Ok(Expression::Parameter(ParameterExpression::new(
+            ParameterSlot::new(RuntimeParamId::new(index), logical_type.clone()),
         )))
     }
 

@@ -15,7 +15,7 @@ use paro_scheduler::scheduler::TaskScheduler;
 use tracing::debug;
 
 use crate::memory_runtime::QueryMemoryPool;
-use crate::query_executor::compiled::{CompiledExecutable, CompiledStatement};
+use crate::query_executor::compiled::{CompiledExecutable, ExecutionRequest};
 use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
 
@@ -45,7 +45,8 @@ impl Executor {
     }
 
     /// Execute a typed runtime program and return a streaming result handler.
-    pub fn execute(&self, compiled: CompiledStatement) -> Result<ResultHandler> {
+    pub fn execute(&self, request: ExecutionRequest) -> Result<ResultHandler> {
+        let (compiled, parameter_bindings) = request.into_parts();
         let result_names = compiled.result_names();
         let result_types = compiled.result_types();
         let is_query = !result_names.is_empty();
@@ -63,8 +64,7 @@ impl Executor {
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
         let query_memory_pool = self.create_query_memory_pool();
-        let parameter_bindings = compiled.parameter_bindings.clone();
-        let CompiledExecutable::Program(program) = compiled.executable;
+        let CompiledExecutable::Program(program) = compiled.executable();
         let handler = self.execute_program(
             program,
             result_names,
@@ -84,18 +84,17 @@ impl Executor {
 
     fn execute_program(
         &self,
-        program: crate::pipeline::StatementProgram,
+        program: &crate::pipeline::StatementProgram,
         result_names: Vec<String>,
         result_types: Vec<LogicalType>,
-        parameter_bindings: ParameterBindings,
+        params: Arc<ParameterBindings>,
         allocator: Arc<dyn paro_common::allocator::Allocator>,
         query_memory_pool: Arc<QueryMemoryPool>,
     ) -> Result<ResultHandler> {
-        let params = Arc::new(parameter_bindings);
         let execution = if result_types.is_empty() {
             program_executor::execute_program(
                 self.session.clone(),
-                &program,
+                program,
                 params,
                 query_memory_pool.clone(),
                 allocator.clone(),
@@ -103,7 +102,7 @@ impl Executor {
         } else {
             program_executor::start_program(
                 self.session.clone(),
-                &program,
+                program,
                 params,
                 query_memory_pool.clone(),
                 allocator.clone(),
