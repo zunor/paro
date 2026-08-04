@@ -25,6 +25,18 @@ pub(crate) fn pow10(exp: u8) -> Result<i256> {
     })
 }
 
+/// Compute a decimal scale factor in the native DECIMAL storage width.
+///
+/// Every declared DECIMAL value fits in `i128`; callers can use this helper
+/// for the common arithmetic path and retry with `i256` when a checked native
+/// operation returns `None`.
+pub(crate) fn pow10_i128(exp: u8) -> Option<i128> {
+    if exp > MAX_DECIMAL_PRECISION {
+        return None;
+    }
+    (0..exp).try_fold(1_i128, |value, _| value.checked_mul(10))
+}
+
 pub(crate) fn rescale(value: i256, from_scale: u8, to_scale: u8) -> Result<i256> {
     if from_scale == to_scale {
         return Ok(value);
@@ -35,6 +47,16 @@ pub(crate) fn rescale(value: i256, from_scale: u8, to_scale: u8) -> Result<i256>
             .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"));
     }
     round_divide(value, pow10(from_scale - to_scale)?)
+}
+
+pub(crate) fn rescale_i128(value: i128, from_scale: u8, to_scale: u8) -> Option<i128> {
+    if from_scale == to_scale {
+        return Some(value);
+    }
+    if from_scale < to_scale {
+        return value.checked_mul(pow10_i128(to_scale - from_scale)?);
+    }
+    round_divide_i128(value, pow10_i128(from_scale - to_scale)?)
 }
 
 pub(crate) fn round_divide(value: i256, divisor: i256) -> Result<i256> {
@@ -66,6 +88,24 @@ pub(crate) fn round_divide(value: i256, divisor: i256) -> Result<i256> {
         .ok_or_else(|| paro_error::out_of_range("Decimal rounding overflow"))
 }
 
+pub(crate) fn round_divide_i128(value: i128, divisor: i128) -> Option<i128> {
+    let quotient = value.checked_div(divisor)?;
+    let remainder = value.checked_rem(divisor)?;
+    if remainder == 0 {
+        return Some(quotient);
+    }
+
+    let divisor_abs = divisor.checked_abs()?;
+    let remainder_abs = remainder.checked_abs()?;
+    let threshold = divisor_abs / 2 + divisor_abs % 2;
+    if remainder_abs < threshold {
+        return Some(quotient);
+    }
+
+    let adjustment = if (value < 0) == (divisor < 0) { 1 } else { -1 };
+    quotient.checked_add(adjustment)
+}
+
 pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
     if precision == 0 || precision > MAX_DECIMAL_PRECISION {
         return Err(paro_error::invalid_input(format!(
@@ -76,6 +116,22 @@ pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
         .checked_abs()
         .ok_or_else(|| paro_error::out_of_range("Decimal value overflow"))?;
     if absolute >= pow10(precision)? {
+        return Err(paro_error::out_of_range(format!(
+            "Decimal value exceeds precision {precision}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_precision_i128(value: i128, precision: u8) -> Result<()> {
+    if precision == 0 || precision > MAX_DECIMAL_PRECISION {
+        return Err(paro_error::invalid_input(format!(
+            "Decimal precision must be between 1 and {MAX_DECIMAL_PRECISION}"
+        )));
+    }
+    let limit = pow10_i128(precision)
+        .ok_or_else(|| paro_error::out_of_range("Decimal precision exceeds i128"))?;
+    if value.unsigned_abs() >= limit as u128 {
         return Err(paro_error::out_of_range(format!(
             "Decimal value exceeds precision {precision}"
         )));
@@ -137,6 +193,29 @@ mod tests {
             rescale(product, 76, 38).unwrap(),
             pow10(38).unwrap() - i256::from(2)
         );
+    }
+
+    #[test]
+    fn native_decimal_helpers_match_wide_rounding_and_signal_overflow() {
+        for (value, from_scale, to_scale) in [
+            (12_345_i128, 2, 4),
+            (12_345_i128, 3, 1),
+            (-12_355_i128, 3, 1),
+            (5_i128, 1, 0),
+            (-5_i128, 1, 0),
+        ] {
+            assert_eq!(
+                rescale_i128(value, from_scale, to_scale),
+                Some(
+                    i128::try_from(rescale(i256::from(value), from_scale, to_scale).unwrap())
+                        .unwrap()
+                )
+            );
+        }
+
+        assert_eq!(rescale_i128(i128::MAX, 0, 1), None);
+        assert!(check_precision_i128(99_999, 5).is_ok());
+        assert!(check_precision_i128(100_000, 5).is_err());
     }
 
     #[test]
