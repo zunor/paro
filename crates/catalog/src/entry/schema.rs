@@ -1176,8 +1176,10 @@ impl SchemaEntry {
     pub fn create_routine(
         &self,
         transaction: &CatalogSnapshot,
-        info: CreateRoutineInfo,
+        mut info: CreateRoutineInfo,
     ) -> Result<Option<Arc<CatalogEntryEnum>>> {
+        info.catalog = self.base.catalog.clone();
+        info.schema = self.base.name.clone();
         let timestamp = transaction.write_timestamp()?;
         let collection = self.require_collection(CatalogType::Routine)?;
         let existing = self.contents.routines.get_entry(
@@ -1245,6 +1247,7 @@ impl SchemaEntry {
             )));
             (entry, true)
         } else {
+            // A routine family and each executable overload have distinct persisted identities.
             let entry = Arc::new(CatalogEntryEnum::Routine(Arc::new(
                 RoutineCatalogEntry::new(
                     info,

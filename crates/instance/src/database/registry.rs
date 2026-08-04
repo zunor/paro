@@ -202,7 +202,7 @@ impl DatabaseFilePathManager {
 #[derive(Debug)]
 pub struct DatabaseRegistry {
     /// The system database holds system entries (builtin functions, types, etc.)
-    pub system: RwLock<Option<Arc<DatabaseHandle>>>,
+    system: RwLock<Option<Arc<DatabaseHandle>>>,
     /// Lock for database operations (attach/detach).
     databases_lock: Mutex<()>,
     /// Map of database name (case-insensitive) to DatabaseHandle instance.
@@ -297,6 +297,26 @@ impl DatabaseRegistry {
                 );
             }
         }
+    }
+
+    /// Return the runtime system database when bootstrap has installed it.
+    pub fn system_database(&self) -> Option<Arc<DatabaseHandle>> {
+        self.system.read().clone()
+    }
+
+    /// Install the system database while enforcing the same allocator ownership as user catalogs.
+    pub(crate) fn install_system_database(&self, db: Arc<DatabaseHandle>) -> anyhow::Result<bool> {
+        if !db.is_system() {
+            anyhow::bail!("Database \"{}\" is not a system database", db.name());
+        }
+        self.ensure_instance_object_id_allocator(&db)?;
+
+        let mut system = self.system.write();
+        if system.is_some() {
+            return Ok(false);
+        }
+        *system = Some(db);
+        Ok(true)
     }
 
     /// Get pg_catalog schema, falling back to public if not available.
@@ -1155,22 +1175,51 @@ mod tests {
     }
 
     #[test]
+    fn test_system_database_install_enforces_type_and_allocator_ownership() {
+        let manager = DatabaseRegistry::new();
+        let user_db = create_test_db(&manager, 1, "user_db");
+        assert!(manager
+            .install_system_database(user_db)
+            .unwrap_err()
+            .to_string()
+            .contains("not a system database"));
+
+        let buffer_pool = Arc::new(BufferPool::new(1024));
+        let foreign_allocator = Arc::new(CatalogObjectIdAllocator::default());
+        let foreign_system = Arc::new(DatabaseHandle::new_system(
+            0,
+            Arc::clone(&buffer_pool),
+            foreign_allocator,
+        ));
+        assert!(manager
+            .install_system_database(foreign_system)
+            .unwrap_err()
+            .to_string()
+            .contains("object ID allocator"));
+
+        let system = Arc::new(DatabaseHandle::new_system(
+            0,
+            buffer_pool,
+            Arc::clone(manager.object_id_allocator()),
+        ));
+        assert!(manager
+            .install_system_database(Arc::clone(&system))
+            .unwrap());
+        assert!(!manager.install_system_database(system).unwrap());
+    }
+
+    #[test]
     fn test_get_databases() {
         let manager = DatabaseRegistry::new();
 
         // Initialize system database
         let buffer_pool = Arc::new(BufferPool::new(1024));
-        let system_db = Arc::new(DatabaseHandle::new(
+        let system_db = Arc::new(DatabaseHandle::new_system(
             0,
-            "system".to_string(),
-            ":memory:".to_string(),
-            buffer_pool.clone(),
+            buffer_pool,
             Arc::clone(manager.object_id_allocator()),
         ));
-        {
-            let mut system = manager.system.write();
-            *system = Some(system_db);
-        }
+        assert!(manager.install_system_database(system_db).unwrap());
 
         let db1 = create_test_db(&manager, 1, "db1");
         let db2 = create_test_db(&manager, 2, "db2");
@@ -1318,15 +1367,11 @@ mod tests {
             Arc::clone(manager.object_id_allocator()),
         ));
         system_db.initialize().unwrap();
-        {
-            let mut system = manager.system.write();
-            *system = Some(system_db);
-        }
+        assert!(manager.install_system_database(system_db).unwrap());
 
         manager.initialize_system_catalog();
 
         // System database should be ready
-        let system = manager.system.read();
-        assert!(system.as_ref().unwrap().is_ready());
+        assert!(manager.system_database().unwrap().is_ready());
     }
 }

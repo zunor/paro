@@ -175,7 +175,11 @@ fn test_system_database_bootstraps_before_user_databases_are_published() {
     );
 
     assert!(
-        instance.database_service.registry().system.read().is_none(),
+        instance
+            .database_service
+            .registry()
+            .system_database()
+            .is_none(),
         "manual constructor helper should start before bootstrap"
     );
     assert!(
@@ -185,7 +189,11 @@ fn test_system_database_bootstraps_before_user_databases_are_published() {
 
     InstanceBootstrap::run(&instance).expect("bootstrap should initialize system state");
     assert!(
-        instance.database_service.registry().system.read().is_some(),
+        instance
+            .database_service
+            .registry()
+            .system_database()
+            .is_some(),
         "system database must be initialized during bootstrap"
     );
     assert!(

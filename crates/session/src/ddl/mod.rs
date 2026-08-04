@@ -404,6 +404,7 @@ impl SessionDdlBridge {
             return collection.stage_replace(txn, &info.name, replacement);
         }
 
+        // A routine family and each executable overload have distinct persisted identities.
         let entry = Arc::new(CatalogEntryEnum::Routine(Arc::new(
             RoutineCatalogEntry::new(
                 info.clone(),
@@ -1093,6 +1094,7 @@ impl DdlApplyContext for SessionDdlBridge {
         let signature = info.signature();
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
+        info.schema = schema.base.name.clone();
         let handle = self.stage_create_routine_handle(schema.as_ref(), &txn, &info)?;
 
         if let Some(handle) = handle {
