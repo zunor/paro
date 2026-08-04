@@ -1487,7 +1487,9 @@ impl CatalogCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::{ColumnDefinition, SchemaEntry, TableCatalogEntry};
+    use crate::entry::{
+        CatalogObjectId, CatalogObjectIdAllocator, ColumnDefinition, SchemaEntry, TableCatalogEntry,
+    };
     use paro_common::types::LogicalType;
     use paro_storage::table::table_factory::TableFactory;
     use std::sync::{mpsc, Arc, Barrier};
@@ -1497,6 +1499,7 @@ mod tests {
         let schema = Arc::new(SchemaEntry::new(
             "test_catalog".to_string(),
             name.to_string(),
+            Arc::new(CatalogObjectIdAllocator::default()),
             Arc::new(AtomicU64::new(0)),
             timestamp,
         ));
@@ -1518,6 +1521,7 @@ mod tests {
                 LogicalType::Integer,
             )],
             storage,
+            CatalogObjectId::from_raw(10_001),
             timestamp,
         ));
         Arc::new(CatalogEntryEnum::Table(table))

@@ -10,8 +10,8 @@
 //! - TableFunctionCatalogEntry
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_function::aggregate::AggregateFunctionSet;
@@ -40,15 +40,15 @@ impl ScalarFunctionCatalogEntry {
         catalog: String,
         schema_name: String,
         functions: ScalarFunctionSet,
+        object_id: CatalogObjectId,
         timestamp: u64,
     ) -> Self {
-        let oid = allocate_object_id();
         let base = SchemaEntryMeta::new(
             CatalogType::ScalarFunction,
             catalog,
             schema_name,
             functions.name.clone(),
-            oid,
+            object_id,
             timestamp,
         );
 
@@ -60,14 +60,14 @@ impl ScalarFunctionCatalogEntry {
         catalog: String,
         schema_name: String,
         functions: ScalarFunctionSet,
+        object_id: CatalogObjectId,
     ) -> Self {
-        let oid = allocate_object_id();
         let mut base = SchemaEntryMeta::new(
             CatalogType::ScalarFunction,
             catalog,
             schema_name,
             functions.name.clone(),
-            oid,
+            object_id,
             0, // Internal functions have timestamp 0
         );
         base.base.internal = true;
@@ -245,15 +245,15 @@ impl AggregateFunctionCatalogEntry {
         catalog: String,
         schema_name: String,
         functions: AggregateFunctionSet,
+        object_id: CatalogObjectId,
         timestamp: u64,
     ) -> Self {
-        let oid = allocate_object_id();
         let base = SchemaEntryMeta::new(
             CatalogType::AggregateFunction,
             catalog,
             schema_name,
             functions.name.clone(),
-            oid,
+            object_id,
             timestamp,
         );
 
@@ -265,14 +265,14 @@ impl AggregateFunctionCatalogEntry {
         catalog: String,
         schema_name: String,
         functions: AggregateFunctionSet,
+        object_id: CatalogObjectId,
     ) -> Self {
-        let oid = allocate_object_id();
         let mut base = SchemaEntryMeta::new(
             CatalogType::AggregateFunction,
             catalog,
             schema_name,
             functions.name.clone(),
-            oid,
+            object_id,
             0,
         );
         base.base.internal = true;
@@ -450,15 +450,15 @@ impl TableFunctionCatalogEntry {
         catalog: String,
         schema_name: String,
         functions: TableFunctionSet,
+        object_id: CatalogObjectId,
         timestamp: u64,
     ) -> Self {
-        let oid = allocate_object_id();
         let base = SchemaEntryMeta::new(
             CatalogType::TableFunction,
             catalog,
             schema_name,
             functions.name.clone(),
-            oid,
+            object_id,
             timestamp,
         );
 
@@ -466,14 +466,18 @@ impl TableFunctionCatalogEntry {
     }
 
     /// Create an internal (built-in) function entry.
-    pub fn new_internal(catalog: String, schema_name: String, functions: TableFunctionSet) -> Self {
-        let oid = allocate_object_id();
+    pub fn new_internal(
+        catalog: String,
+        schema_name: String,
+        functions: TableFunctionSet,
+        object_id: CatalogObjectId,
+    ) -> Self {
         let mut base = SchemaEntryMeta::new(
             CatalogType::TableFunction,
             catalog,
             schema_name,
             functions.name.clone(),
-            oid,
+            object_id,
             0,
         );
         base.base.internal = true;
@@ -640,8 +644,13 @@ mod tests {
     #[test]
     fn test_scalar_function_entry() {
         let set = ScalarFunctionSet::new("my_func".to_string());
-        let entry =
-            ScalarFunctionCatalogEntry::new("main".to_string(), "public".to_string(), set, 100);
+        let entry = ScalarFunctionCatalogEntry::new(
+            "main".to_string(),
+            "public".to_string(),
+            set,
+            CatalogObjectId::from_raw(10_001),
+            100,
+        );
 
         assert_eq!(entry.name(), "my_func");
         assert_eq!(entry.entry_type(), CatalogType::ScalarFunction);
@@ -656,8 +665,13 @@ mod tests {
             vec![LogicalType::BigInt, LogicalType::BigInt],
         ));
 
-        let entry =
-            TableFunctionCatalogEntry::new("main".to_string(), "public".to_string(), set, 100);
+        let entry = TableFunctionCatalogEntry::new(
+            "main".to_string(),
+            "public".to_string(),
+            set,
+            CatalogObjectId::from_raw(10_001),
+            100,
+        );
 
         assert_eq!(entry.name(), "generate_series");
         assert_eq!(entry.entry_type(), CatalogType::TableFunction);

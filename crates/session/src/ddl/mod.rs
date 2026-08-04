@@ -376,16 +376,19 @@ impl SessionDdlBridge {
                     }
                 }
             } else {
-                let scratch = RoutineCatalogEntry::new(
-                    info.clone(),
-                    timestamp,
-                    self.db.catalog().name().to_string(),
-                );
-                let generated =
-                    scratch.overloads().first().cloned().ok_or_else(|| {
-                        paro_error::internal("new routine entry missing overload")
-                    })?;
-                overloads.push(generated);
+                overloads.push(StoredRoutineOverload {
+                    spec: info.materialize_spec(
+                        paro_external::routine::spec::RoutineIdentity {
+                            id: paro_external::routine::spec::RoutineId::from_raw(
+                                schema.object_id_allocator().allocate().raw(),
+                            ),
+                            generation: 1,
+                        },
+                        schema.base.name.clone(),
+                        info.name.clone(),
+                    ),
+                    sql: info.sql.clone(),
+                });
             }
 
             let replacement = Arc::new(CatalogEntryEnum::Routine(Arc::new(
@@ -406,6 +409,10 @@ impl SessionDdlBridge {
                 info.clone(),
                 timestamp,
                 self.db.catalog().name().to_string(),
+                schema.object_id_allocator().allocate(),
+                paro_external::routine::spec::RoutineId::from_raw(
+                    schema.object_id_allocator().allocate().raw(),
+                ),
             ),
         )));
         collection.stage_create(txn, &info.name, entry)
@@ -851,7 +858,12 @@ impl DdlApplyContext for SessionDdlBridge {
         let schema_txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&schema_txn, &info.schema)?;
         let table_entry = Arc::new(CatalogEntryEnum::Table(Arc::new(
-            TableCatalogEntry::from_info(info.clone(), storage, 0),
+            TableCatalogEntry::from_info(
+                info.clone(),
+                storage,
+                self.db.catalog().object_id_allocator().allocate(),
+                0,
+            ),
         )));
         let handle = schema
             .collection(CatalogType::Table)
@@ -916,6 +928,7 @@ impl DdlApplyContext for SessionDdlBridge {
         info.catalog = self.db.catalog().name().to_string();
         let entry = Arc::new(CatalogEntryEnum::Schema(Arc::new(SchemaEntry::from_info(
             &info,
+            Arc::clone(self.db.catalog().object_id_allocator()),
             self.db.catalog().gc_epoch_handle(),
             0,
         ))));
@@ -966,7 +979,12 @@ impl DdlApplyContext for SessionDdlBridge {
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
         let entry = Arc::new(CatalogEntryEnum::Sequence(Arc::new(
-            SequenceCatalogEntry::new(info.clone(), 0, self.db.catalog().name().to_string())?,
+            SequenceCatalogEntry::new(
+                info.clone(),
+                0,
+                self.db.catalog().name().to_string(),
+                self.db.catalog().object_id_allocator().allocate(),
+            )?,
         )));
         let handle = schema
             .collection(CatalogType::Sequence)
@@ -1021,6 +1039,7 @@ impl DdlApplyContext for SessionDdlBridge {
             info.clone(),
             0,
             self.db.catalog().name().to_string(),
+            self.db.catalog().object_id_allocator().allocate(),
         ))));
         let handle = schema
             .collection(CatalogType::View)
@@ -1344,7 +1363,12 @@ impl DdlApplyContext for SessionDdlBridge {
         let txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&txn, &info.schema)?;
         let entry = Arc::new(CatalogEntryEnum::PropertyGraph(Arc::new(
-            PropertyGraphCatalogEntry::new(info.clone(), 0, self.db.catalog().name().to_string()),
+            PropertyGraphCatalogEntry::new(
+                info.clone(),
+                0,
+                self.db.catalog().name().to_string(),
+                self.db.catalog().object_id_allocator().allocate(),
+            ),
         )));
         let handle = schema
             .collection(CatalogType::PropertyGraph)
@@ -1672,6 +1696,7 @@ impl DdlApplyContext for SessionDdlBridge {
             table.base.base.object_id.raw(),
             0,
             self.db.catalog().name().to_string(),
+            self.db.catalog().object_id_allocator().allocate(),
         ));
         index_entry.mark_building();
         let handle = schema

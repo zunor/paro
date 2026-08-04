@@ -488,7 +488,12 @@ mod tests {
             label: "WorksAt".to_string(),
             property_column_ids: vec![3],
         }];
-        Arc::new(PropertyGraphCatalogEntry::new(info, 0, "main".to_string()))
+        Arc::new(PropertyGraphCatalogEntry::new(
+            info,
+            0,
+            "main".to_string(),
+            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
+        ))
     }
 
     #[test]

@@ -644,6 +644,7 @@ mod tests {
             users_table.object_id().raw(),
             0,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         let art_object_id = art_entry.object_id().raw();
         schema
@@ -666,6 +667,7 @@ mod tests {
             docs_table.object_id().raw(),
             0,
             catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
         ))));
         let fulltext_object_id = fulltext_entry.object_id().raw();
         schema

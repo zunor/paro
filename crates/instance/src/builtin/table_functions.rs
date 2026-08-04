@@ -183,6 +183,7 @@ impl BuiltinTableFunctions {
             schema.base.catalog.clone(),
             schema.base.name.clone(),
             set,
+            schema.object_id_allocator().allocate(),
             0, // timestamp 0 = permanent/committed
         ));
         let _ = schema

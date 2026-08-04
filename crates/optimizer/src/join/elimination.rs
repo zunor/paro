@@ -586,6 +586,7 @@ mod tests {
             name.to_string(),
             columns,
             storage,
+            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             0,
         );
         table.constraints = constraints;

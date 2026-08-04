@@ -612,6 +612,7 @@ mod tests {
             name.to_string(),
             vec![ColumnDefinition::new("k".to_string(), LogicalType::Integer)],
             storage,
+            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             0,
         ))
     }

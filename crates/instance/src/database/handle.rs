@@ -18,7 +18,7 @@ use crate::database::wal_observability::WalObservability;
 use crate::storage_manager::StorageManager;
 use parking_lot::{Condvar, Mutex, RwLock};
 use paro_catalog::database_catalog::ParoCatalog;
-use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
+use paro_catalog::entry::{CatalogEntryEnum, CatalogObjectIdAllocator, CatalogType};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::checkpoint::RecoverySummary;
 use paro_common::logging::targets;
@@ -283,21 +283,33 @@ impl std::fmt::Debug for DatabaseHandle {
 }
 
 impl DatabaseHandle {
-    fn catalog_for_path(name: &str, path: &str) -> Arc<ParoCatalog> {
+    fn catalog_for_path(
+        name: &str,
+        path: &str,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Arc<ParoCatalog> {
         if path.is_empty() || path == ":memory:" {
-            Arc::new(ParoCatalog::new(name.to_string()))
+            Arc::new(ParoCatalog::with_object_id_allocator(
+                name.to_string(),
+                object_id_allocator,
+            ))
         } else {
-            Arc::new(ParoCatalog::with_path(name.to_string(), path.to_string()))
+            Arc::new(ParoCatalog::with_path_and_object_id_allocator(
+                name.to_string(),
+                path.to_string(),
+                object_id_allocator,
+            ))
         }
     }
 
     fn base(
         identity: DatabaseIdentity,
         buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         initial_state: DbState,
         commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     ) -> Self {
-        let catalog = Self::catalog_for_path(&identity.name, &identity.path);
+        let catalog = Self::catalog_for_path(&identity.name, &identity.path, object_id_allocator);
         let database_id = identity.id;
         let transaction_manager = Arc::new(TransactionManager::new_for_database_id(database_id));
         Self {
@@ -324,7 +336,13 @@ impl DatabaseHandle {
     }
 
     /// Create a new attached database with options.
-    pub fn new(id: u64, name: String, path: String, buffer_pool: Arc<BufferPool>) -> Self {
+    pub fn new(
+        id: u64,
+        name: String,
+        path: String,
+        buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         Self::base(
             DatabaseIdentity::new(
                 id,
@@ -337,6 +355,7 @@ impl DatabaseHandle {
                 HashMap::new(),
             ),
             buffer_pool,
+            object_id_allocator,
             DbState::Opening,
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
@@ -350,6 +369,7 @@ impl DatabaseHandle {
         name: String,
         path: String,
         buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         options: AttachOptions,
     ) -> Self {
         let db_type = match options.access_mode {
@@ -369,6 +389,7 @@ impl DatabaseHandle {
                 options.options,
             ),
             buffer_pool,
+            object_id_allocator,
             DbState::Opening,
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
@@ -381,6 +402,7 @@ impl DatabaseHandle {
         name: String,
         path: String,
         buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
         options: AttachOptions,
         commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     ) -> Self {
@@ -401,13 +423,18 @@ impl DatabaseHandle {
                 options.options,
             ),
             buffer_pool,
+            object_id_allocator,
             DbState::Opening,
             commit_drain_wake_pool,
         )
     }
 
     /// Create a system database (no storage).
-    pub fn new_system(id: u64, buffer_pool: Arc<BufferPool>) -> Self {
+    pub fn new_system(
+        id: u64,
+        buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         Self::base(
             DatabaseIdentity::new(
                 id,
@@ -420,6 +447,7 @@ impl DatabaseHandle {
                 HashMap::new(),
             ),
             buffer_pool,
+            object_id_allocator,
             DbState::Ready,
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
@@ -428,7 +456,11 @@ impl DatabaseHandle {
     }
 
     /// Create a temporary database (in-memory, session-scoped).
-    pub fn new_temp(id: u64, buffer_pool: Arc<BufferPool>) -> Self {
+    pub fn new_temp(
+        id: u64,
+        buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         Self::base(
             DatabaseIdentity::new(
                 id,
@@ -441,6 +473,7 @@ impl DatabaseHandle {
                 HashMap::new(),
             ),
             buffer_pool,
+            object_id_allocator,
             DbState::Ready,
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),

@@ -469,6 +469,7 @@ mod tests {
                 ),
                 0,
                 "test".to_string(),
+                paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             )),
             BoundGraphPattern { elements },
             columns,
@@ -694,6 +695,7 @@ mod tests {
                 ),
                 0,
                 "test".to_string(),
+                paro_catalog::entry::CatalogObjectId::from_raw(10_002),
             )),
             BoundGraphPattern {
                 elements: vec![

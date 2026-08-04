@@ -40,6 +40,7 @@ impl<'a> CatalogReplayHandler<'a> {
             paro_catalog::entry::SchemaEntry::from_info_with_object_id(
                 &info,
                 CatalogObjectId::from_raw(payload.object_id),
+                Arc::clone(self.catalog.object_id_allocator()),
                 self.catalog.gc_epoch_handle(),
                 0,
             ),

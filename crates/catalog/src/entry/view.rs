@@ -7,8 +7,8 @@
 //! This module defines ViewCatalogEntry for view metadata.
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -133,8 +133,13 @@ pub struct ViewCatalogEntry {
 
 impl ViewCatalogEntry {
     /// Create a new view catalog entry from CreateViewInfo
-    pub fn new(info: CreateViewInfo, timestamp: u64, catalog: String) -> Self {
-        Self::with_object_id(info, timestamp, catalog, allocate_object_id())
+    pub fn new(
+        info: CreateViewInfo,
+        timestamp: u64,
+        catalog: String,
+        object_id: CatalogObjectId,
+    ) -> Self {
+        Self::with_object_id(info, timestamp, catalog, object_id)
     }
 
     pub fn with_object_id(
@@ -625,7 +630,12 @@ mod tests {
         let query = parse_query("SELECT * FROM orders WHERE status = 'pending'");
         let info = CreateViewInfo::new("public".to_string(), "pending_orders".to_string(), query);
 
-        let entry = ViewCatalogEntry::new(info, 100, "main".to_string());
+        let entry = ViewCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_001),
+        );
 
         assert_eq!(entry.name(), "pending_orders");
         assert_eq!(entry.schema_name(), "public");
@@ -638,7 +648,12 @@ mod tests {
         let info = CreateViewInfo::new("hr".to_string(), "emp_view".to_string(), query)
             .with_aliases(vec!["emp_id".to_string(), "emp_name".to_string()]);
 
-        let entry = ViewCatalogEntry::new(info, 100, "main".to_string());
+        let entry = ViewCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_002),
+        );
         let sql = entry.to_sql();
 
         assert!(sql.contains("CREATE VIEW"));
@@ -649,7 +664,12 @@ mod tests {
     fn test_view_copy_preserves_object_id() {
         let query = parse_query("SELECT 1 AS id");
         let info = CreateViewInfo::new("public".to_string(), "copy_view".to_string(), query);
-        let entry = ViewCatalogEntry::new(info, 100, "main".to_string());
+        let entry = ViewCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_003),
+        );
 
         let copied = entry.copy().unwrap();
         assert_eq!(copied.object_id(), entry.object_id());
@@ -659,7 +679,12 @@ mod tests {
     fn test_view_alter_rename_preserves_object_id() {
         let query = parse_query("SELECT 1 AS id");
         let info = CreateViewInfo::new("public".to_string(), "rename_view".to_string(), query);
-        let entry = ViewCatalogEntry::new(info, 100, "main".to_string());
+        let entry = ViewCatalogEntry::new(
+            info,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_004),
+        );
         let altered = entry
             .alter(&AlterInfo::rename(
                 "main".to_string(),
@@ -690,6 +715,7 @@ mod tests {
                 .with_dependencies(dependencies),
             100,
             "main".to_string(),
+            CatalogObjectId::from_raw(10_005),
         );
 
         let bytes = entry.serialize_to_bytes().unwrap();

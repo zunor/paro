@@ -14,8 +14,8 @@
 
 use super::DefaultGenerator;
 use crate::entry::{
-    AggregateFunctionCatalogEntry, CatalogEntryEnum, ScalarFunctionCatalogEntry,
-    TableFunctionCatalogEntry,
+    AggregateFunctionCatalogEntry, CatalogEntryEnum, CatalogObjectIdAllocator,
+    ScalarFunctionCatalogEntry, TableFunctionCatalogEntry,
 };
 use paro_function::aggregate::AggregateFunctionSet;
 use paro_function::scalar::ScalarFunctionSet;
@@ -39,17 +39,23 @@ pub struct DefaultFunctionGenerator {
     catalog_name: String,
     /// The schema name this generator is responsible for
     schema_name: String,
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
     /// Cached function definitions (name -> definition)
     functions: HashMap<String, FunctionDef>,
 }
 
 impl DefaultFunctionGenerator {
     /// Create a new DefaultFunctionGenerator for the given catalog and schema.
-    pub fn new(catalog_name: String, schema_name: String) -> Self {
+    pub fn new(
+        catalog_name: String,
+        schema_name: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         let functions = Self::build_function_map(&schema_name);
         Self {
             catalog_name,
             schema_name,
+            object_id_allocator,
             functions,
         }
     }
@@ -287,6 +293,7 @@ impl DefaultGenerator for DefaultFunctionGenerator {
                     self.catalog_name.clone(),
                     self.schema_name.clone(),
                     set.clone(),
+                    self.object_id_allocator.allocate(),
                     0, // timestamp = 0
                 );
                 Some(Arc::new(CatalogEntryEnum::ScalarFunction(Arc::new(entry))))
@@ -296,6 +303,7 @@ impl DefaultGenerator for DefaultFunctionGenerator {
                     self.catalog_name.clone(),
                     self.schema_name.clone(),
                     set.clone(),
+                    self.object_id_allocator.allocate(),
                     0, // timestamp = 0
                 );
                 Some(Arc::new(CatalogEntryEnum::AggregateFunction(Arc::new(
@@ -321,11 +329,16 @@ impl DefaultGenerator for DefaultFunctionGenerator {
 pub struct DefaultTableFunctionGenerator {
     catalog_name: String,
     schema_name: String,
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
     functions: HashMap<String, TableFunctionSet>,
 }
 
 impl DefaultTableFunctionGenerator {
-    pub fn new(catalog_name: String, schema_name: String) -> Self {
+    pub fn new(
+        catalog_name: String,
+        schema_name: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         let mut functions = HashMap::new();
 
         // Register table functions for public and pg_catalog schemas
@@ -340,6 +353,7 @@ impl DefaultTableFunctionGenerator {
         Self {
             catalog_name,
             schema_name,
+            object_id_allocator,
             functions,
         }
     }
@@ -414,6 +428,7 @@ impl DefaultGenerator for DefaultTableFunctionGenerator {
             self.catalog_name.clone(),
             self.schema_name.clone(),
             set.clone(),
+            self.object_id_allocator.allocate(),
             0, // timestamp = 0
         );
         Some(Arc::new(CatalogEntryEnum::TableFunction(Arc::new(entry))))

@@ -41,6 +41,7 @@ impl Instance {
         let system_db = Arc::new(DatabaseHandle::new_system(
             0,
             Arc::clone(&self.boot_config.buffer_pool),
+            Arc::clone(self.database_service.registry().object_id_allocator()),
         ));
         system_db.bind_task_scheduler(self.runtime.scheduler().clone());
         system_db.initialize().map_err(|e| {

@@ -8,8 +8,8 @@ use crate::database::identity::DatabaseType;
 use crate::database::storage::DatabaseStorage;
 use crate::InMemoryDatabaseStorage;
 use paro_catalog::entry::{
-    CatalogObjectRef, CatalogType, ColumnDefinition, CreateSequenceInfo, CreateViewInfo,
-    DependencyList, OnCreateConflict, TableCatalogEntry,
+    CatalogObjectIdAllocator, CatalogObjectRef, CatalogType, ColumnDefinition, CreateSequenceInfo,
+    CreateViewInfo, DependencyList, OnCreateConflict, TableCatalogEntry,
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::types::LogicalType;
@@ -25,6 +25,10 @@ use std::sync::Arc;
 
 fn create_table(types: &[LogicalType]) -> TableHandle {
     TableFactory::default().create_table(types).unwrap()
+}
+
+fn object_ids() -> Arc<CatalogObjectIdAllocator> {
+    Arc::new(CatalogObjectIdAllocator::default())
 }
 
 fn create_test_meta_manager(path: &str) -> Arc<TabletMetaManager> {
@@ -55,7 +59,7 @@ fn parse_query(sql: &str) -> Box<paro_parser::ast::Query> {
 fn create_checkpointable_db(path: &str) -> (DatabaseHandle, Arc<TabletMetaManager>) {
     let _ = std::fs::remove_dir_all(path);
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test_db".into(), path.into(), buffer_pool);
+    let db = DatabaseHandle::new(1, "test_db".into(), path.into(), buffer_pool, object_ids());
     db.initialize().unwrap();
 
     let buffer_manager: Arc<dyn BufferManager> = Arc::new(StandardBufferManager::new(
@@ -86,6 +90,7 @@ fn create_checkpointable_db(path: &str) -> (DatabaseHandle, Arc<TabletMetaManage
             LogicalType::Integer,
         )],
         storage,
+        db.catalog().object_id_allocator().allocate(),
         0,
     ));
     schema
@@ -98,7 +103,13 @@ fn create_checkpointable_db(path: &str) -> (DatabaseHandle, Arc<TabletMetaManage
 #[test]
 fn test_db_state_transitions() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     assert!(!db.is_ready());
     assert_eq!(db.state(), DbState::Opening);
@@ -119,21 +130,27 @@ fn test_attached_database_type() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
 
     // Test system database
-    let system_db = DatabaseHandle::new_system(0, buffer_pool.clone());
+    let system_db = DatabaseHandle::new_system(0, buffer_pool.clone(), object_ids());
     assert!(system_db.is_system());
     assert!(!system_db.is_temporary());
     assert!(!system_db.is_read_only());
     assert_eq!(system_db.db_type(), DatabaseType::System);
 
     // Test temp database
-    let temp_db = DatabaseHandle::new_temp(1, buffer_pool.clone());
+    let temp_db = DatabaseHandle::new_temp(1, buffer_pool.clone(), object_ids());
     assert!(!temp_db.is_system());
     assert!(temp_db.is_temporary());
     assert!(!temp_db.is_read_only());
     assert_eq!(temp_db.db_type(), DatabaseType::Temp);
 
     // Test read-write database
-    let rw_db = DatabaseHandle::new(2, "test".into(), "/tmp/test".into(), buffer_pool.clone());
+    let rw_db = DatabaseHandle::new(
+        2,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool.clone(),
+        object_ids(),
+    );
     assert!(!rw_db.is_system());
     assert!(!rw_db.is_temporary());
     assert!(!rw_db.is_read_only());
@@ -146,6 +163,7 @@ fn test_attached_database_type() {
         "readonly".into(),
         "/tmp/readonly".into(),
         buffer_pool.clone(),
+        object_ids(),
         ro_options,
     );
     assert!(ro_db.is_read_only());
@@ -201,7 +219,13 @@ fn test_attach_options_from_map() {
 #[test]
 fn test_should_checkpoint_no_wal() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     // No WAL, should not checkpoint
     assert!(!db.should_checkpoint(0));
@@ -211,7 +235,13 @@ fn test_should_checkpoint_no_wal() {
 #[test]
 fn test_checkpoint_in_progress_flag() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     assert!(!db.is_checkpoint_in_progress());
 
@@ -237,7 +267,13 @@ fn test_checkpoint_in_progress_flag() {
 #[test]
 fn test_wal_keep_from_threshold() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     assert_eq!(db.wal_keep_from(), u64::MAX);
 
@@ -258,6 +294,7 @@ fn test_check_wal_health_without_wal() {
         "test".into(),
         db_path.to_string_lossy().to_string(),
         buffer_pool,
+        object_ids(),
     );
 
     let report = db.check_wal_health().unwrap();
@@ -278,6 +315,7 @@ fn test_wal_lifecycle_metrics_tracks_wal_health_check() {
         "test".into(),
         db_path.to_string_lossy().to_string(),
         buffer_pool,
+        object_ids(),
     );
 
     db.check_wal_health().unwrap();
@@ -350,7 +388,13 @@ fn test_extract_database_name() {
 #[test]
 fn test_initial_database_flag() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     assert!(!db.is_initial_database());
     db.set_initial_database();
@@ -362,7 +406,13 @@ fn test_recovery_mode() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
 
     // Default recovery mode
-    let db1 = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool.clone());
+    let db1 = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool.clone(),
+        object_ids(),
+    );
     assert_eq!(db1.recovery_mode(), RecoveryMode::Default);
 
     // NoWalWrites recovery mode
@@ -372,6 +422,7 @@ fn test_recovery_mode() {
         "test2".into(),
         "/tmp/test2".into(),
         buffer_pool.clone(),
+        object_ids(),
         options,
     );
     assert_eq!(db2.recovery_mode(), RecoveryMode::NoWalWrites);
@@ -382,7 +433,13 @@ fn test_visibility() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
 
     // Default visibility
-    let db1 = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool.clone());
+    let db1 = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool.clone(),
+        object_ids(),
+    );
     assert_eq!(db1.visibility(), AttachVisibility::Shown);
 
     // Hidden visibility
@@ -392,6 +449,7 @@ fn test_visibility() {
         "test2".into(),
         "/tmp/test2".into(),
         buffer_pool.clone(),
+        object_ids(),
         options,
     );
     assert_eq!(db2.visibility(), AttachVisibility::Hidden);
@@ -400,7 +458,13 @@ fn test_visibility() {
 #[test]
 fn test_has_storage_manager() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     assert!(!db.has_storage_manager());
     assert!(db.storage_manager().is_none());
@@ -415,6 +479,7 @@ fn test_compaction_tablet_sync_create_drop() {
         "test".into(),
         dir.path().to_string_lossy().into_owned(),
         buffer_pool,
+        object_ids(),
     );
     db.initialize().unwrap();
     let mut storage = InMemoryDatabaseStorage::new();
@@ -434,6 +499,7 @@ fn test_compaction_tablet_sync_create_drop() {
             LogicalType::Integer,
         )],
         storage,
+        db.catalog().object_id_allocator().allocate(),
         0,
     ));
     schema
@@ -461,6 +527,7 @@ fn test_on_detach_shutdowns_compaction_manager() {
         "test".into(),
         "/tmp/test_detach_compaction".into(),
         buffer_pool,
+        object_ids(),
     );
     db.initialize().unwrap();
     let mut storage = InMemoryDatabaseStorage::new();
@@ -476,7 +543,13 @@ fn test_on_detach_shutdowns_compaction_manager() {
 #[test]
 fn test_close_idempotent() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(1, "test".into(), "/tmp/test".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        1,
+        "test".into(),
+        "/tmp/test".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     // First close should succeed
     assert!(db.close(DatabaseCloseAction::TryCheckpoint).is_ok());
@@ -646,9 +719,9 @@ fn test_checkpoint_roundtrip_preserves_object_ids() {
         )
         .unwrap()
         .object_id();
-    // The object-id allocator is process-global, so parallel tests may advance it between
-    // observing the watermark and creating the next catalog entry.
-    assert!(allocated_view.raw() >= restored_allocator_watermark);
+    // The recovered catalog owns this allocator exclusively, so the first new identity starts
+    // exactly at the persisted watermark.
+    assert_eq!(allocated_view.raw(), restored_allocator_watermark);
 }
 
 #[test]
@@ -743,7 +816,13 @@ fn test_checkpoint_updates_wal_lifecycle_metrics() {
 #[test]
 fn test_finalize_load_marks_database_ready_without_recovery() {
     let buffer_pool = Arc::new(BufferPool::new(1024));
-    let db = DatabaseHandle::new(7, "ready_db".into(), "/tmp/ready_db".into(), buffer_pool);
+    let db = DatabaseHandle::new(
+        7,
+        "ready_db".into(),
+        "/tmp/ready_db".into(),
+        buffer_pool,
+        object_ids(),
+    );
 
     assert_eq!(db.state(), DbState::Opening);
     db.initialize().unwrap();

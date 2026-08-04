@@ -8,6 +8,8 @@ use crate::{
     InstanceConfig, InstanceDdlOwner, InstanceLifecycleState, InstanceQuiesceProof,
     InstanceShutdownMode,
 };
+use paro_catalog::mvcc::CatalogSnapshot;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -73,6 +75,23 @@ fn test_instance_multiple_databases() {
     assert!(instance.database_registry().get_database("db1").is_some());
     assert!(instance.database_registry().get_database("db2").is_some());
     assert!(instance.database_registry().get_database("db3").is_some());
+
+    let snapshot = CatalogSnapshot::read_only(u64::MAX);
+    let schema_ids = ["postgres", "db1", "db2", "db3"]
+        .into_iter()
+        .map(|name| {
+            instance
+                .database_registry()
+                .get_database(name)
+                .unwrap()
+                .catalog()
+                .get_schema(&snapshot, "public")
+                .unwrap()
+                .base
+                .object_id
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(schema_ids.len(), 4);
 
     let count = instance.database_registry().approx_database_count();
     assert!(count >= 3, "Expected at least 3 databases, got {}", count);

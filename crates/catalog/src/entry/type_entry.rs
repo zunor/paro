@@ -7,8 +7,8 @@
 //! This module defines TypeCatalogEntry for user-defined types.
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -78,14 +78,13 @@ pub struct TypeCatalogEntry {
 
 impl TypeCatalogEntry {
     /// Create a new type catalog entry.
-    pub fn new(info: CreateTypeInfo, timestamp: u64) -> Self {
-        let oid = allocate_object_id();
+    pub fn new(info: CreateTypeInfo, object_id: CatalogObjectId, timestamp: u64) -> Self {
         let mut base = SchemaEntryMeta::new(
             CatalogType::Type,
             info.catalog,
             info.schema,
             info.name,
-            oid,
+            object_id,
             timestamp,
         );
         base.base.internal = info.internal;
@@ -307,7 +306,7 @@ mod tests {
             LogicalType::Integer,
         );
 
-        let entry = TypeCatalogEntry::new(info, 100);
+        let entry = TypeCatalogEntry::new(info, CatalogObjectId::from_raw(10_001), 100);
 
         assert_eq!(entry.name(), "my_type");
         assert_eq!(entry.entry_type(), CatalogType::Type);
@@ -326,7 +325,7 @@ mod tests {
             LogicalType::Integer,
         );
 
-        let entry = TypeCatalogEntry::new(info, 100);
+        let entry = TypeCatalogEntry::new(info, CatalogObjectId::from_raw(10_002), 100);
         let sql = entry.to_sql();
 
         assert!(sql.contains("CREATE TYPE"));

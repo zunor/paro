@@ -892,6 +892,7 @@ mod tests {
                 LogicalType::Integer,
             )],
             storage,
+            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             0,
         ))
     }

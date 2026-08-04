@@ -4,7 +4,7 @@
 //! Lazily materialized built-in schemas.
 
 use super::DefaultGenerator;
-use crate::entry::{CatalogEntryEnum, SchemaEntry};
+use crate::entry::{CatalogEntryEnum, CatalogObjectIdAllocator, SchemaEntry};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -15,13 +15,19 @@ static SYSTEM_SCHEMAS: &[&str] = &["pg_catalog", "information_schema"];
 
 pub struct DefaultSchemaGenerator {
     catalog_name: String,
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
     gc_epoch: Arc<AtomicU64>,
 }
 
 impl DefaultSchemaGenerator {
-    pub fn new(catalog_name: String, gc_epoch: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        catalog_name: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+        gc_epoch: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             catalog_name,
+            object_id_allocator,
             gc_epoch,
         }
     }
@@ -61,6 +67,7 @@ impl DefaultGenerator for DefaultSchemaGenerator {
         let mut schema = SchemaEntry::new(
             self.catalog_name.clone(),
             lower.clone(),
+            Arc::clone(&self.object_id_allocator),
             Arc::clone(&self.gc_epoch),
             0,
         );

@@ -10,7 +10,7 @@ use crate::builtin::functions::BuiltinFunctions;
 use crate::database::handle::{AttachOptions, DatabaseHandle};
 use parking_lot::{Mutex, RwLock};
 use paro_catalog::database_catalog::ParoCatalog;
-use paro_catalog::entry::SchemaEntry;
+use paro_catalog::entry::{CatalogObjectIdAllocator, SchemaEntry};
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::logging::targets;
 use std::collections::HashMap;
@@ -210,7 +210,7 @@ pub struct DatabaseRegistry {
     /// Runtime-visible logical database names keyed by durable database_id.
     runtime_names_by_id: RwLock<HashMap<u64, String>>,
     /// The next object id handed out by the next_oid method.
-    next_oid: AtomicU64,
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
     /// The current query number.
     current_query_number: AtomicU64,
     /// The current transaction number.
@@ -237,7 +237,7 @@ impl DatabaseRegistry {
             databases_lock: Mutex::new(()),
             databases: RwLock::new(HashMap::new()),
             runtime_names_by_id: RwLock::new(HashMap::new()),
-            next_oid: AtomicU64::new(1),
+            object_id_allocator: Arc::new(CatalogObjectIdAllocator::default()),
             current_query_number: AtomicU64::new(1),
             current_transaction_id: AtomicU64::new(0),
             default_database_id: RwLock::new(None),
@@ -253,7 +253,7 @@ impl DatabaseRegistry {
             databases_lock: Mutex::new(()),
             databases: RwLock::new(HashMap::new()),
             runtime_names_by_id: RwLock::new(HashMap::new()),
-            next_oid: AtomicU64::new(1),
+            object_id_allocator: Arc::new(CatalogObjectIdAllocator::default()),
             current_query_number: AtomicU64::new(1),
             current_transaction_id: AtomicU64::new(0),
             default_database_id: RwLock::new(None),
@@ -338,6 +338,7 @@ impl DatabaseRegistry {
                 info.name
             );
         }
+        self.ensure_instance_object_id_allocator(&db)?;
 
         // Check for duplicate paths
         let path_result = self.insert_database_path(info, options);
@@ -375,6 +376,7 @@ impl DatabaseRegistry {
                 name
             );
         }
+        self.ensure_instance_object_id_allocator(&db)?;
 
         let _lock = self.databases_lock.lock();
         let mut dbs = self.databases.write();
@@ -585,6 +587,7 @@ impl DatabaseRegistry {
     /// # Returns
     /// Ok(()) if successful, Err if a database with the same name already exists.
     pub fn register_database(&self, db: Arc<DatabaseHandle>) -> anyhow::Result<()> {
+        self.ensure_instance_object_id_allocator(&db)?;
         let _lock = self.databases_lock.lock();
         let mut dbs = self.databases.write();
         let name = db.name().to_lowercase();
@@ -600,6 +603,19 @@ impl DatabaseRegistry {
             .insert(db.id(), db.name().to_string());
         dbs.insert(name, db);
         self.bump_visible_generation();
+        Ok(())
+    }
+
+    fn ensure_instance_object_id_allocator(&self, db: &DatabaseHandle) -> anyhow::Result<()> {
+        if !Arc::ptr_eq(
+            db.catalog().object_id_allocator(),
+            &self.object_id_allocator,
+        ) {
+            anyhow::bail!(
+                "Database \"{}\" does not use this instance's catalog object ID allocator",
+                db.name()
+            );
+        }
         Ok(())
     }
 
@@ -784,22 +800,24 @@ impl DatabaseRegistry {
 
     /// Get the next OID for catalog entries.
     ///
-    /// OIDs are globally unique identifiers for catalog entries (tables,
-    /// schemas, functions, etc.).
+    /// OIDs are unique across every catalog attached to this instance.
     pub fn next_oid(&self) -> u64 {
-        self.next_oid.fetch_add(1, Ordering::SeqCst)
+        self.object_id_allocator.allocate().raw()
     }
 
     /// Get the current OID value (without incrementing).
     pub fn current_oid(&self) -> u64 {
-        self.next_oid.load(Ordering::SeqCst)
+        self.object_id_allocator.current()
     }
 
-    /// Set the next OID value.
-    ///
-    /// This is used during recovery to restore the OID counter.
-    pub fn set_next_oid(&self, oid: u64) {
-        self.next_oid.store(oid, Ordering::SeqCst);
+    /// Shared instance-level allocator injected into every attached catalog.
+    pub fn object_id_allocator(&self) -> &Arc<CatalogObjectIdAllocator> {
+        &self.object_id_allocator
+    }
+
+    /// Advance the recovery watermark without ever reusing an identity.
+    pub fn advance_next_oid_to(&self, oid: u64) -> u64 {
+        self.object_id_allocator.advance_to(oid)
     }
 
     /// Reset all databases.
@@ -938,13 +956,14 @@ mod tests {
     use super::*;
     use paro_storage::buffer::BufferPool;
 
-    fn create_test_db(id: u64, name: &str) -> Arc<DatabaseHandle> {
+    fn create_test_db(manager: &DatabaseRegistry, id: u64, name: &str) -> Arc<DatabaseHandle> {
         let buffer_pool = Arc::new(BufferPool::new(1024));
         Arc::new(DatabaseHandle::new(
             id,
             name.to_string(),
             format!("/tmp/{}", name),
             buffer_pool,
+            Arc::clone(manager.object_id_allocator()),
         ))
     }
 
@@ -959,7 +978,7 @@ mod tests {
     #[test]
     fn test_register_and_get_database() {
         let manager = DatabaseRegistry::new();
-        let db = create_test_db(1, "test_db");
+        let db = create_test_db(&manager, 1, "test_db");
 
         manager.register_database(db.clone()).unwrap();
 
@@ -976,8 +995,8 @@ mod tests {
     #[test]
     fn test_register_duplicate_database() {
         let manager = DatabaseRegistry::new();
-        let db1 = create_test_db(1, "test_db");
-        let db2 = create_test_db(2, "TEST_DB"); // Same name, different case
+        let db1 = create_test_db(&manager, 1, "test_db");
+        let db2 = create_test_db(&manager, 2, "TEST_DB"); // Same name, different case
 
         manager.register_database(db1).unwrap();
         let result = manager.register_database(db2);
@@ -989,7 +1008,7 @@ mod tests {
     #[test]
     fn test_unregister_database() {
         let manager = DatabaseRegistry::new();
-        let db = create_test_db(1, "test_db");
+        let db = create_test_db(&manager, 1, "test_db");
 
         manager.register_database(db).unwrap();
         assert!(manager.get_database("test_db").is_some());
@@ -1002,8 +1021,8 @@ mod tests {
     #[test]
     fn test_detach_database() {
         let manager = DatabaseRegistry::new();
-        let db1 = create_test_db(1, "db1");
-        let db2 = create_test_db(2, "db2");
+        let db1 = create_test_db(&manager, 1, "db1");
+        let db2 = create_test_db(&manager, 2, "db2");
 
         manager.register_database(db1).unwrap();
         manager.register_database(db2).unwrap();
@@ -1020,7 +1039,7 @@ mod tests {
     #[test]
     fn test_detach_default_database_fails() {
         let manager = DatabaseRegistry::new();
-        let db = create_test_db(1, "test_db");
+        let db = create_test_db(&manager, 1, "test_db");
 
         manager.register_database(db).unwrap();
 
@@ -1033,8 +1052,8 @@ mod tests {
     #[test]
     fn test_set_default_database() {
         let manager = DatabaseRegistry::new();
-        let db1 = create_test_db(1, "db1");
-        let db2 = create_test_db(2, "db2");
+        let db1 = create_test_db(&manager, 1, "db1");
+        let db2 = create_test_db(&manager, 2, "db2");
 
         manager.register_database(db1).unwrap();
         manager.register_database(db2).unwrap();
@@ -1090,16 +1109,49 @@ mod tests {
         let o2 = manager.next_oid();
         let o3 = manager.next_oid();
 
-        assert_eq!(o1, 1);
-        assert_eq!(o2, 2);
-        assert_eq!(o3, 3);
-        assert_eq!(manager.current_oid(), 4);
+        assert_eq!(o1, CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID);
+        assert_eq!(o2, CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID + 1);
+        assert_eq!(o3, CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID + 2);
+        assert_eq!(
+            manager.current_oid(),
+            CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID + 3
+        );
 
-        // Test set_next_oid
-        manager.set_next_oid(100);
-        assert_eq!(manager.current_oid(), 100);
-        assert_eq!(manager.next_oid(), 100);
-        assert_eq!(manager.current_oid(), 101);
+        manager.advance_next_oid_to(100_000);
+        manager.advance_next_oid_to(50_000);
+        assert_eq!(manager.current_oid(), 100_000);
+        assert_eq!(manager.next_oid(), 100_000);
+        assert_eq!(manager.current_oid(), 100_001);
+    }
+
+    #[test]
+    fn test_attached_catalogs_share_instance_object_id_allocator() {
+        let manager = DatabaseRegistry::new();
+        let db1 = create_test_db(&manager, 1, "db1");
+        let db2 = create_test_db(&manager, 2, "db2");
+
+        manager.register_database(Arc::clone(&db1)).unwrap();
+        manager.register_database(Arc::clone(&db2)).unwrap();
+
+        let first = db1.catalog().object_id_allocator().allocate();
+        let second = db2.catalog().object_id_allocator().allocate();
+        assert_eq!(second.raw(), first.raw() + 1);
+
+        let another_instance = DatabaseRegistry::new();
+        assert_eq!(
+            another_instance.current_oid(),
+            CatalogObjectIdAllocator::FIRST_USER_OBJECT_ID
+        );
+    }
+
+    #[test]
+    fn test_register_rejects_foreign_object_id_allocator() {
+        let manager = DatabaseRegistry::new();
+        let foreign_manager = DatabaseRegistry::new();
+        let db = create_test_db(&foreign_manager, 1, "foreign");
+
+        let err = manager.register_database(db).unwrap_err();
+        assert!(err.to_string().contains("object ID allocator"));
     }
 
     #[test]
@@ -1113,14 +1165,15 @@ mod tests {
             "system".to_string(),
             ":memory:".to_string(),
             buffer_pool.clone(),
+            Arc::clone(manager.object_id_allocator()),
         ));
         {
             let mut system = manager.system.write();
             *system = Some(system_db);
         }
 
-        let db1 = create_test_db(1, "db1");
-        let db2 = create_test_db(2, "db2");
+        let db1 = create_test_db(&manager, 1, "db1");
+        let db2 = create_test_db(&manager, 2, "db2");
 
         manager.register_database(db1).unwrap();
         manager.register_database(db2).unwrap();
@@ -1134,7 +1187,7 @@ mod tests {
         let manager = DatabaseRegistry::new();
         let initial = manager.visible_generation();
 
-        let db1 = create_test_db(1, "db1");
+        let db1 = create_test_db(&manager, 1, "db1");
         manager.register_database(db1).unwrap();
         let after_register = manager.visible_generation();
         assert!(after_register > initial);
@@ -1157,8 +1210,8 @@ mod tests {
     #[test]
     fn test_rename_database() {
         let manager = DatabaseRegistry::new();
-        let db1 = create_test_db(1, "old_name");
-        let db2 = create_test_db(2, "other_db");
+        let db1 = create_test_db(&manager, 1, "old_name");
+        let db2 = create_test_db(&manager, 2, "other_db");
 
         manager.register_database(db1).unwrap();
         manager.register_database(db2).unwrap();
@@ -1175,7 +1228,7 @@ mod tests {
     #[test]
     fn test_rename_default_database_updates_visible_default_name() {
         let manager = DatabaseRegistry::new();
-        let db = create_test_db(1, "old_name");
+        let db = create_test_db(&manager, 1, "old_name");
 
         manager.register_database(db).unwrap();
         assert_eq!(manager.default_database_name().as_deref(), Some("old_name"));
@@ -1191,7 +1244,7 @@ mod tests {
     #[test]
     fn test_rename_to_reserved_name_fails() {
         let manager = DatabaseRegistry::new();
-        let db = create_test_db(1, "mydb");
+        let db = create_test_db(&manager, 1, "mydb");
 
         manager.register_database(db).unwrap();
 
@@ -1203,8 +1256,8 @@ mod tests {
     #[test]
     fn test_rename_to_existing_name_fails() {
         let manager = DatabaseRegistry::new();
-        let db1 = create_test_db(1, "db1");
-        let db2 = create_test_db(2, "db2");
+        let db1 = create_test_db(&manager, 1, "db1");
+        let db2 = create_test_db(&manager, 2, "db2");
 
         manager.register_database(db1).unwrap();
         manager.register_database(db2).unwrap();
@@ -1217,8 +1270,8 @@ mod tests {
     #[test]
     fn test_reset_databases() {
         let manager = DatabaseRegistry::new();
-        let db1 = create_test_db(1, "db1");
-        let db2 = create_test_db(2, "db2");
+        let db1 = create_test_db(&manager, 1, "db1");
+        let db2 = create_test_db(&manager, 2, "db2");
 
         manager.register_database(db1).unwrap();
         manager.register_database(db2).unwrap();
@@ -1234,7 +1287,7 @@ mod tests {
     #[test]
     fn test_get_database_or_error() {
         let manager = DatabaseRegistry::new();
-        let db = create_test_db(1, "test_db");
+        let db = create_test_db(&manager, 1, "test_db");
 
         manager.register_database(db).unwrap();
 
@@ -1259,7 +1312,11 @@ mod tests {
 
         // Initialize system database
         let buffer_pool = Arc::new(BufferPool::new(1024));
-        let system_db = Arc::new(DatabaseHandle::new_system(0, buffer_pool));
+        let system_db = Arc::new(DatabaseHandle::new_system(
+            0,
+            buffer_pool,
+            Arc::clone(manager.object_id_allocator()),
+        ));
         system_db.initialize().unwrap();
         {
             let mut system = manager.system.write();

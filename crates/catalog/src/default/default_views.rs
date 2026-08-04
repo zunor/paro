@@ -24,7 +24,7 @@
 //! - `pg_database`, `pg_namespace`, `pg_tables`, `pg_views`, `pg_class`, `pg_attribute`
 
 use super::DefaultGenerator;
-use crate::entry::{CatalogEntryEnum, CreateViewInfo, ViewCatalogEntry};
+use crate::entry::{CatalogEntryEnum, CatalogObjectIdAllocator, CreateViewInfo, ViewCatalogEntry};
 use paro_common::types::LogicalType;
 use std::sync::Arc;
 
@@ -692,14 +692,20 @@ pub struct DefaultViewGenerator {
     catalog_name: String,
     /// The schema name this generator is responsible for
     schema_name: String,
+    object_id_allocator: Arc<CatalogObjectIdAllocator>,
 }
 
 impl DefaultViewGenerator {
     /// Create a new DefaultViewGenerator for the given catalog and schema.
-    pub fn new(catalog_name: String, schema_name: String) -> Self {
+    pub fn new(
+        catalog_name: String,
+        schema_name: String,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+    ) -> Self {
         Self {
             catalog_name,
             schema_name,
+            object_id_allocator,
         }
     }
 
@@ -757,7 +763,12 @@ impl DefaultGenerator for DefaultViewGenerator {
             .with_sql(view_def.sql.to_string());
 
         // Create the view entry (timestamp = 0 means committed/permanent)
-        let mut view = ViewCatalogEntry::new(info, 0, self.catalog_name.clone());
+        let mut view = ViewCatalogEntry::new(
+            info,
+            0,
+            self.catalog_name.clone(),
+            self.object_id_allocator.allocate(),
+        );
 
         // Mark as internal (cannot be dropped by users)
         view.base.base.internal = true;

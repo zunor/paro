@@ -308,6 +308,7 @@ impl ManagedDatabaseService {
         let request = DatabaseOpenRequest {
             record: record.clone(),
             intent,
+            object_id_allocator: Arc::clone(self.registry.object_id_allocator()),
         };
         let mut result = match intent {
             DatabaseOpenIntent::CreateNew => DatabaseOpener::bootstrap_new(open_ctx, request),

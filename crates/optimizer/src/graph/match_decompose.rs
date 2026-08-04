@@ -260,6 +260,7 @@ mod tests {
                 ),
                 0,
                 "test".to_string(),
+                paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             )),
             BoundGraphPattern { elements },
             columns,

@@ -7,8 +7,8 @@
 //! This module defines IndexCatalogEntry for index metadata.
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogObjectRef, CatalogType,
-    CreateInfo, DependencyList, DependencyType, InCatalogEntry, OnCreateConflict, SchemaEntryMeta,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogObjectRef, CatalogType, CreateInfo,
+    DependencyList, DependencyType, InCatalogEntry, OnCreateConflict, SchemaEntryMeta,
     StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
@@ -372,8 +372,14 @@ pub struct IndexCatalogEntry {
 
 impl IndexCatalogEntry {
     /// Create a new index catalog entry from CreateIndexInfo
-    pub fn new(info: CreateIndexInfo, table_oid: u64, timestamp: u64, catalog: String) -> Self {
-        Self::with_object_id(info, table_oid, timestamp, catalog, allocate_object_id())
+    pub fn new(
+        info: CreateIndexInfo,
+        table_oid: u64,
+        timestamp: u64,
+        catalog: String,
+        object_id: CatalogObjectId,
+    ) -> Self {
+        Self::with_object_id(info, table_oid, timestamp, catalog, object_id)
     }
 
     pub fn with_object_id(
@@ -950,7 +956,13 @@ mod tests {
         )
         .with_unique();
 
-        let entry = IndexCatalogEntry::new(info, 42, 100, "main".to_string());
+        let entry = IndexCatalogEntry::new(
+            info,
+            42,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_001),
+        );
 
         assert_eq!(entry.name(), "idx_users_email");
         assert_eq!(entry.table_name, "users");
@@ -969,7 +981,13 @@ mod tests {
         )
         .with_unique();
 
-        let entry = IndexCatalogEntry::new(info, 42, 100, "main".to_string());
+        let entry = IndexCatalogEntry::new(
+            info,
+            42,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_002),
+        );
         let sql = entry.to_sql();
 
         assert!(sql.contains("CREATE UNIQUE INDEX"));
@@ -987,7 +1005,13 @@ mod tests {
         )
         .with_build_state(IndexBuildState::Building);
 
-        let entry = IndexCatalogEntry::new(info, 42, 100, "main".to_string());
+        let entry = IndexCatalogEntry::new(
+            info,
+            42,
+            100,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_003),
+        );
         assert_eq!(entry.build_state(), IndexBuildState::Building);
         assert_eq!(entry.failure_reason(), None);
 
@@ -1012,7 +1036,13 @@ mod tests {
         .with_index_type(IndexType::HNSW)
         .with_failure_reason("needs rebuild");
 
-        let entry = IndexCatalogEntry::new(info, 7, 123, "main".to_string());
+        let entry = IndexCatalogEntry::new(
+            info,
+            7,
+            123,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_004),
+        );
         let bytes = entry.serialize_to_bytes().unwrap();
         let restored = IndexCatalogEntry::deserialize(&bytes, "main".to_string()).unwrap();
 
@@ -1035,7 +1065,13 @@ mod tests {
         .with_index_type(IndexType::FullText)
         .with_fulltext_options(LogicalIndex::new(2), "simple");
 
-        let entry = IndexCatalogEntry::new(info, 7, 123, "main".to_string());
+        let entry = IndexCatalogEntry::new(
+            info,
+            7,
+            123,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_005),
+        );
         let bytes = entry.serialize_to_bytes().unwrap();
         let restored = IndexCatalogEntry::deserialize(&bytes, "main".to_string()).unwrap();
 
@@ -1060,7 +1096,13 @@ mod tests {
         .with_coverage(IndexCoverage::from_counts(12, 4, 4))
         .with_build_state(IndexBuildState::Ready);
 
-        let entry = IndexCatalogEntry::new(info, 9, 456, "main".to_string());
+        let entry = IndexCatalogEntry::new(
+            info,
+            9,
+            456,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_006),
+        );
         let bytes = entry.serialize_to_bytes().unwrap();
         let restored = IndexCatalogEntry::deserialize(&bytes, "main".to_string()).unwrap();
 

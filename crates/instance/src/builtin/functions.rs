@@ -232,6 +232,7 @@ impl BuiltinFunctions {
                 schema.base.catalog.clone(),
                 schema.base.name.clone(),
                 function,
+                schema.object_id_allocator().allocate(),
                 0,
             ));
             let _ = schema
@@ -250,6 +251,7 @@ impl BuiltinFunctions {
             schema.base.catalog.clone(),
             schema.base.name.clone(),
             set,
+            schema.object_id_allocator().allocate(),
             0,
         ));
         let _ = schema
@@ -267,6 +269,7 @@ impl BuiltinFunctions {
             schema.base.catalog.clone(),
             schema.base.name.clone(),
             set,
+            schema.object_id_allocator().allocate(),
             0,
         ));
         let _ = schema

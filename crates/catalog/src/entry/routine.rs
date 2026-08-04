@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::catalog_entry::{
-    allocate_object_id, AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo,
-    DependencyList, InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
+    AlterInfo, CatalogEntry, CatalogObjectId, CatalogType, CreateInfo, DependencyList,
+    InCatalogEntry, OnCreateConflict, SchemaEntryMeta, StandardEntry,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -99,8 +99,14 @@ pub struct RoutineCatalogEntry {
 }
 
 impl RoutineCatalogEntry {
-    pub fn new(info: CreateRoutineInfo, timestamp: u64, catalog: String) -> Self {
-        Self::with_object_id(info, timestamp, catalog, allocate_object_id())
+    pub fn new(
+        info: CreateRoutineInfo,
+        timestamp: u64,
+        catalog: String,
+        object_id: CatalogObjectId,
+        routine_id: RoutineId,
+    ) -> Self {
+        Self::with_object_id(info, timestamp, catalog, object_id, routine_id)
     }
 
     pub fn with_object_id(
@@ -108,6 +114,7 @@ impl RoutineCatalogEntry {
         timestamp: u64,
         catalog: String,
         object_id: CatalogObjectId,
+        routine_id: RoutineId,
     ) -> Self {
         let base = SchemaEntryMeta::new(
             CatalogType::Routine,
@@ -122,7 +129,7 @@ impl RoutineCatalogEntry {
         let overload = StoredRoutineOverload {
             spec: info.materialize_spec(
                 RoutineIdentity {
-                    id: RoutineId::from_raw(allocate_object_id().raw()),
+                    id: routine_id,
                     generation: 1,
                 },
                 info.schema.clone(),
@@ -426,7 +433,13 @@ mod tests {
 
     #[test]
     fn routine_entry_roundtrips() {
-        let entry = RoutineCatalogEntry::new(create_info(), 42, "main".to_string());
+        let entry = RoutineCatalogEntry::new(
+            create_info(),
+            42,
+            "main".to_string(),
+            CatalogObjectId::from_raw(10_001),
+            RoutineId::from_raw(10_002),
+        );
         let bytes = entry.serialize_to_bytes().expect("serialize");
         let decoded =
             RoutineCatalogEntry::deserialize(&bytes, "main".to_string()).expect("deserialize");
