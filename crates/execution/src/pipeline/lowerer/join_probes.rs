@@ -592,6 +592,10 @@ impl<'a> PipelineLowerer<'a> {
         let Some(merge_handle) = merge_handle else {
             return Ok(last_branch);
         };
+        // A handle records one canonical producer for ownership/diagnostics, while
+        // the shared sink also accepts replay and unmatched writers. The explicit
+        // probe -> replay -> unmatched -> merged dependency chain above is the
+        // execution-order guarantee; the merged consumer waits on `last_branch`.
         self.handles.set_producer(merge_handle, pushed.tail)?;
         let merged = self.push_pipeline(
             SourceSpec::Materialized(MaterializedSourceSpec {

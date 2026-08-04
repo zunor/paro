@@ -9,7 +9,7 @@
 //! - Vector: ✅
 //! - Chunk: ✅
 
-use crate::decimal::{pow10, rescale, round_divide, to_i128};
+use crate::decimal::{pow10, read_decimal, rescale, round_divide, to_i128, write_decimal};
 use crate::scalar::executor::binary::BinaryExecutor;
 use crate::scalar::executor::{BinaryOperator, NullableBinaryOperator};
 use crate::scalar::{
@@ -347,6 +347,88 @@ fn execute_decimal_arithmetic(
         ));
     };
     result.set_count(chunk.size());
+    match bind_data.op {
+        DecimalArithmeticOp::Add => execute_decimal_rows(
+            chunk,
+            result,
+            precision,
+            |left, left_scale, right, right_scale| {
+                let value = rescale(left, left_scale, scale)?
+                    .checked_add(rescale(right, right_scale, scale)?)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal addition overflow"))?;
+                Ok(Some(value))
+            },
+        ),
+        DecimalArithmeticOp::Sub => execute_decimal_rows(
+            chunk,
+            result,
+            precision,
+            |left, left_scale, right, right_scale| {
+                let value = rescale(left, left_scale, scale)?
+                    .checked_sub(rescale(right, right_scale, scale)?)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal subtraction overflow"))?;
+                Ok(Some(value))
+            },
+        ),
+        DecimalArithmeticOp::Mul => execute_decimal_rows(
+            chunk,
+            result,
+            precision,
+            |left, left_scale, right, right_scale| {
+                let raw = left
+                    .checked_mul(right)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal multiplication overflow"))?;
+                Ok(Some(rescale(
+                    raw,
+                    left_scale.saturating_add(right_scale),
+                    scale,
+                )?))
+            },
+        ),
+        DecimalArithmeticOp::Div => execute_decimal_rows(
+            chunk,
+            result,
+            precision,
+            |left, left_scale, right, right_scale| {
+                if right == i256::ZERO {
+                    return Ok(None);
+                }
+                Ok(Some(divide_decimal(
+                    left,
+                    left_scale,
+                    right,
+                    right_scale,
+                    scale,
+                )?))
+            },
+        ),
+        DecimalArithmeticOp::Mod => execute_decimal_rows(
+            chunk,
+            result,
+            precision,
+            |left, left_scale, right, right_scale| {
+                if right == i256::ZERO {
+                    return Ok(None);
+                }
+                let left = rescale(left, left_scale, scale)?;
+                let right = rescale(right, right_scale, scale)?;
+                Ok(Some(left.checked_rem(right).ok_or_else(|| {
+                    paro_error::out_of_range("Decimal remainder overflow")
+                })?))
+            },
+        ),
+    }
+}
+
+fn execute_decimal_rows<F>(
+    chunk: &Chunk,
+    result: &mut Vector,
+    precision: u8,
+    operation: F,
+) -> Result<()>
+where
+    F: Fn(i256, u8, i256, u8) -> Result<Option<i256>>,
+{
     for row in 0..chunk.size() {
         if chunk.data[0].is_null(row) || chunk.data[1].is_null(row) {
             result.set_null(row, true);
@@ -356,39 +438,12 @@ fn execute_decimal_arithmetic(
         let (right, right_scale) = decimal_value_at(&chunk.data[1], row)?;
         let left = i256::from(left);
         let right = i256::from(right);
-        let value = match bind_data.op {
-            DecimalArithmeticOp::Add => rescale(left, left_scale, scale)?
-                .checked_add(rescale(right, right_scale, scale)?)
-                .ok_or_else(|| paro_error::out_of_range("Decimal addition overflow"))?,
-            DecimalArithmeticOp::Sub => rescale(left, left_scale, scale)?
-                .checked_sub(rescale(right, right_scale, scale)?)
-                .ok_or_else(|| paro_error::out_of_range("Decimal subtraction overflow"))?,
-            DecimalArithmeticOp::Mul => {
-                let raw = left
-                    .checked_mul(right)
-                    .ok_or_else(|| paro_error::out_of_range("Decimal multiplication overflow"))?;
-                rescale(raw, left_scale.saturating_add(right_scale), scale)?
-            }
-            DecimalArithmeticOp::Div => {
-                if right == i256::ZERO {
-                    result.set_null(row, true);
-                    continue;
-                }
-                divide_decimal(left, left_scale, right, right_scale, scale)?
-            }
-            DecimalArithmeticOp::Mod => {
-                if right == i256::ZERO {
-                    result.set_null(row, true);
-                    continue;
-                }
-                let left = rescale(left, left_scale, scale)?;
-                let right = rescale(right, right_scale, scale)?;
-                left.checked_rem(right)
-                    .ok_or_else(|| paro_error::out_of_range("Decimal remainder overflow"))?
-            }
+        let Some(value) = operation(left, left_scale, right, right_scale)? else {
+            result.set_null(row, true);
+            continue;
         };
         let value = to_i128(value, precision)?;
-        set_decimal_result(result, row, value, precision)?;
+        write_decimal(result, row, value)?;
     }
     Ok(())
 }
@@ -396,10 +451,7 @@ fn execute_decimal_arithmetic(
 fn decimal_value_at(vector: &Vector, row: usize) -> Result<(i128, u8)> {
     let value = unsafe {
         match vector.logical_type() {
-            LogicalType::Decimal { precision, scale } if *precision <= 18 => {
-                (vector.get_fixed::<i64>(row) as i128, *scale)
-            }
-            LogicalType::Decimal { scale, .. } => (vector.get_fixed::<i128>(row), *scale),
+            LogicalType::Decimal { .. } => read_decimal(vector, row),
             LogicalType::TinyInt => (vector.get_fixed::<i8>(row) as i128, 0),
             LogicalType::SmallInt => (vector.get_fixed::<i16>(row) as i128, 0),
             LogicalType::Integer => (vector.get_fixed::<i32>(row) as i128, 0),
@@ -423,23 +475,6 @@ fn decimal_value_at(vector: &Vector, row: usize) -> Result<(i128, u8)> {
         }
     };
     Ok(value)
-}
-
-fn set_decimal_result(result: &mut Vector, row: usize, value: i128, precision: u8) -> Result<()> {
-    unsafe {
-        if precision <= 18 {
-            result.set_flat::<i64>(
-                row,
-                i64::try_from(value).map_err(|_| {
-                    paro_error::out_of_range("Decimal value exceeds the physical i64 range")
-                })?,
-            );
-        } else {
-            result.set_flat::<i128>(row, value);
-        }
-    }
-    result.set_null(row, false);
-    Ok(())
 }
 
 fn divide_decimal(

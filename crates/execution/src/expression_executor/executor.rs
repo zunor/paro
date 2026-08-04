@@ -2601,9 +2601,24 @@ fn sql_like(value: &str, pattern: &str, case_insensitive: bool) -> bool {
     // TPC-H strings and patterns are ASCII. Keep that path allocation-free;
     // the Unicode path below only allocates the two linear character arrays.
     if value.is_ascii() && pattern.is_ascii() {
-        return sql_like_ascii(value.as_bytes(), pattern.as_bytes(), case_insensitive);
+        return sql_like_tokens(
+            value.as_bytes(),
+            pattern.as_bytes(),
+            b'%',
+            b'_',
+            b'\\',
+            |left, right| {
+                if case_insensitive {
+                    left.eq_ignore_ascii_case(&right)
+                } else {
+                    left == right
+                }
+            },
+        );
     }
 
+    // Unicode case folding can change the number of scalar values, so normalize
+    // both strings before tokenization instead of folding individual characters.
     let (value, pattern) = if case_insensitive {
         (value.to_lowercase(), pattern.to_lowercase())
     } else {
@@ -2611,17 +2626,16 @@ fn sql_like(value: &str, pattern: &str, case_insensitive: bool) -> bool {
     };
     let value = value.chars().collect::<Vec<_>>();
     let pattern = pattern.chars().collect::<Vec<_>>();
-    sql_like_chars(&value, &pattern)
+    sql_like_tokens(&value, &pattern, '%', '_', '\\', |left, right| {
+        left == right
+    })
 }
 
-fn sql_like_ascii(value: &[u8], pattern: &[u8], case_insensitive: bool) -> bool {
-    let equals = |left: u8, right: u8| {
-        if case_insensitive {
-            left.eq_ignore_ascii_case(&right)
-        } else {
-            left == right
-        }
-    };
+fn sql_like_tokens<T, F>(value: &[T], pattern: &[T], any: T, one: T, escape: T, equals: F) -> bool
+where
+    T: Copy + PartialEq,
+    F: Fn(T, T) -> bool,
+{
     let mut value_idx = 0;
     let mut pattern_idx = 0;
     let mut wildcard = None;
@@ -2629,31 +2643,28 @@ fn sql_like_ascii(value: &[u8], pattern: &[u8], case_insensitive: bool) -> bool 
 
     while value_idx < value.len() {
         if pattern_idx < pattern.len() {
-            match pattern[pattern_idx] {
-                b'%' => {
-                    wildcard = Some(pattern_idx);
-                    pattern_idx += 1;
-                    wildcard_value_idx = value_idx;
-                    continue;
-                }
-                b'_' => {
+            let token = pattern[pattern_idx];
+            if token == any {
+                wildcard = Some(pattern_idx);
+                pattern_idx += 1;
+                wildcard_value_idx = value_idx;
+                continue;
+            }
+            if token == one {
+                value_idx += 1;
+                pattern_idx += 1;
+                continue;
+            }
+            if token == escape && pattern_idx + 1 < pattern.len() {
+                if equals(value[value_idx], pattern[pattern_idx + 1]) {
                     value_idx += 1;
-                    pattern_idx += 1;
+                    pattern_idx += 2;
                     continue;
                 }
-                b'\\' if pattern_idx + 1 < pattern.len() => {
-                    if equals(value[value_idx], pattern[pattern_idx + 1]) {
-                        value_idx += 1;
-                        pattern_idx += 2;
-                        continue;
-                    }
-                }
-                literal if equals(value[value_idx], literal) => {
-                    value_idx += 1;
-                    pattern_idx += 1;
-                    continue;
-                }
-                _ => {}
+            } else if equals(value[value_idx], token) {
+                value_idx += 1;
+                pattern_idx += 1;
+                continue;
             }
         }
 
@@ -2665,57 +2676,7 @@ fn sql_like_ascii(value: &[u8], pattern: &[u8], case_insensitive: bool) -> bool 
         pattern_idx = wildcard_idx + 1;
     }
 
-    while pattern_idx < pattern.len() && pattern[pattern_idx] == b'%' {
-        pattern_idx += 1;
-    }
-    pattern_idx == pattern.len()
-}
-
-fn sql_like_chars(value: &[char], pattern: &[char]) -> bool {
-    let mut value_idx = 0;
-    let mut pattern_idx = 0;
-    let mut wildcard = None;
-    let mut wildcard_value_idx = 0;
-
-    while value_idx < value.len() {
-        if pattern_idx < pattern.len() {
-            match pattern[pattern_idx] {
-                '%' => {
-                    wildcard = Some(pattern_idx);
-                    pattern_idx += 1;
-                    wildcard_value_idx = value_idx;
-                    continue;
-                }
-                '_' => {
-                    value_idx += 1;
-                    pattern_idx += 1;
-                    continue;
-                }
-                '\\' if pattern_idx + 1 < pattern.len() => {
-                    if value[value_idx] == pattern[pattern_idx + 1] {
-                        value_idx += 1;
-                        pattern_idx += 2;
-                        continue;
-                    }
-                }
-                literal if value[value_idx] == literal => {
-                    value_idx += 1;
-                    pattern_idx += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        let Some(wildcard_idx) = wildcard else {
-            return false;
-        };
-        wildcard_value_idx += 1;
-        value_idx = wildcard_value_idx;
-        pattern_idx = wildcard_idx + 1;
-    }
-
-    while pattern_idx < pattern.len() && pattern[pattern_idx] == '%' {
+    while pattern_idx < pattern.len() && pattern[pattern_idx] == any {
         pattern_idx += 1;
     }
     pattern_idx == pattern.len()

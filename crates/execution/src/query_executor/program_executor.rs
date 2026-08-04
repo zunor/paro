@@ -533,20 +533,24 @@ fn run_pipeline_dag(
                     .collect::<HashSet<_>>();
                 run_control_region(region_id, dispatch.regions, ctx, &mut completed)?;
                 rf[region_id.index()] = true;
-                let mut completed = completed.into_iter().collect::<Vec<_>>();
-                completed.sort_unstable();
-                for pipeline in completed {
+                // The set was seeded with globally finished pipelines so region
+                // dependencies are not replayed. Publish only newly completed work,
+                // together with every member covered by the completed controller.
+                let mut newly_finished = completed
+                    .into_iter()
+                    .filter(|pipeline| !finished[pipeline.index()])
+                    .collect::<HashSet<_>>();
+                newly_finished.extend(
+                    dispatch.region_members[region_id.index()]
+                        .iter()
+                        .copied()
+                        .filter(|member| !finished[member.index()]),
+                );
+                let mut newly_finished = newly_finished.into_iter().collect::<Vec<_>>();
+                newly_finished.sort_unstable();
+                for pipeline in newly_finished {
                     mark_pipeline_finished(
                         pipeline,
-                        &mut finished,
-                        &mut finished_count,
-                        &mut gates,
-                        &mut ready,
-                    );
-                }
-                for member in &dispatch.region_members[region_id.index()] {
-                    mark_pipeline_finished(
-                        *member,
                         &mut finished,
                         &mut finished_count,
                         &mut gates,

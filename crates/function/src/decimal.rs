@@ -5,6 +5,8 @@
 
 use ethnum::i256;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::types::LogicalType;
+use paro_common::vector::Vector;
 
 pub(crate) const MAX_DECIMAL_PRECISION: u8 = 38;
 
@@ -87,9 +89,44 @@ pub(crate) fn to_i128(value: i256, precision: u8) -> Result<i128> {
         .map_err(|_| paro_error::out_of_range("Decimal value exceeds the physical i128 range"))
 }
 
+/// Read a non-null DECIMAL value through flat, constant, or dictionary storage.
+///
+/// # Safety
+/// `row` must be in bounds for `vector`.
+pub(crate) unsafe fn read_decimal(vector: &Vector, row: usize) -> (i128, u8) {
+    match vector.logical_type() {
+        LogicalType::Decimal { precision, scale } if *precision <= 18 => {
+            (vector.get_fixed::<i64>(row) as i128, *scale)
+        }
+        LogicalType::Decimal { scale, .. } => (vector.get_fixed::<i128>(row), *scale),
+        ty => unreachable!("DECIMAL reader received {ty}"),
+    }
+}
+
+/// Write a DECIMAL value using the physical width declared by the result vector.
+pub(crate) fn write_decimal(result: &mut Vector, row: usize, value: i128) -> Result<()> {
+    let LogicalType::Decimal { precision, .. } = result.logical_type() else {
+        return Err(paro_error::internal(
+            "DECIMAL writer received a non-DECIMAL result vector",
+        ));
+    };
+    if *precision <= 18 {
+        result.set_i64(
+            row,
+            i64::try_from(value).map_err(|_| {
+                paro_error::out_of_range("Decimal value exceeds the physical i64 range")
+            })?,
+        );
+    } else {
+        result.set_i128(row, value);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn wide_intermediate_preserves_decimal_product() {
@@ -106,5 +143,41 @@ mod tests {
     fn precision_check_rejects_38_digit_overflow() {
         assert!(check_precision(pow10(38).unwrap() - i256::ONE, 38).is_ok());
         assert!(check_precision(pow10(38).unwrap(), 38).is_err());
+    }
+
+    #[test]
+    fn decimal_physical_io_uses_declared_width() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut narrow = Vector::try_new(
+            LogicalType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+            2,
+            allocator.clone(),
+        )
+        .unwrap();
+        narrow.set_count(2);
+        write_decimal(&mut narrow, 0, 12_345).unwrap();
+        write_decimal(&mut narrow, 1, 67_890).unwrap();
+        assert_eq!(unsafe { read_decimal(&narrow, 0) }, (12_345, 2));
+        let selection =
+            paro_common::vector::SelectionVector::try_from_indices(vec![1, 0], allocator.clone())
+                .unwrap();
+        let dictionary = Vector::try_dictionary(Arc::new(narrow), selection).unwrap();
+        assert_eq!(unsafe { read_decimal(&dictionary, 0) }, (67_890, 2));
+
+        let mut wide = Vector::try_new(
+            LogicalType::Decimal {
+                precision: 38,
+                scale: 4,
+            },
+            1,
+            allocator,
+        )
+        .unwrap();
+        wide.set_count(1);
+        write_decimal(&mut wide, 0, i128::MAX / 2).unwrap();
+        assert_eq!(unsafe { read_decimal(&wide, 0) }, (i128::MAX / 2, 4));
     }
 }

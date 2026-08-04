@@ -9,7 +9,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
 use crate::aggregate::{AggregateFunction, AggregateInputData, FunctionData};
-use crate::decimal::{rescale, round_divide, to_i128};
+use crate::decimal::{read_decimal, rescale, round_divide, to_i128, write_decimal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecimalAggregateOp {
@@ -181,7 +181,7 @@ unsafe fn update(
             continue;
         }
         let state = &mut *(*state_ptrs.add(row) as *mut DecimalAggregateState);
-        update_state(state, decimal_at(inputs[0], row), bind_data(input_data));
+        update_state(state, read_decimal(inputs[0], row).0, bind_data(input_data));
     }
 }
 
@@ -197,7 +197,7 @@ unsafe fn simple_update(
         if inputs[0].is_null(row) {
             continue;
         }
-        update_state(state, decimal_at(inputs[0], row), data);
+        update_state(state, read_decimal(inputs[0], row).0, data);
         if data.op == DecimalAggregateOp::First && state.is_set {
             return;
         }
@@ -331,17 +331,7 @@ unsafe fn finalize(
                 data.output_precision
             ))
         })?;
-        if data.output_precision <= 18 {
-            result.set_flat::<i64>(
-                row,
-                i64::try_from(value).map_err(|_| {
-                    paro_error::out_of_range("Decimal aggregate exceeds physical i64 range")
-                })?,
-            );
-        } else {
-            result.set_flat::<i128>(row, value);
-        }
-        result.set_null(row, false);
+        write_decimal(result, row, value)?;
     }
     Ok(())
 }
@@ -351,17 +341,6 @@ fn bind_data<'a>(input_data: &'a AggregateInputData<'_>) -> &'a DecimalAggregate
         .bind_data
         .and_then(|data| data.as_any().downcast_ref::<DecimalAggregateBindData>())
         .expect("decimal aggregate bind data")
-}
-
-unsafe fn decimal_at(input: &Vector, row: usize) -> i128 {
-    let LogicalType::Decimal { precision, .. } = input.logical_type() else {
-        unreachable!("decimal aggregate input type")
-    };
-    if *precision <= 18 {
-        input.get_fixed::<i64>(row) as i128
-    } else {
-        input.get_fixed::<i128>(row)
-    }
 }
 
 impl DecimalAggregateOp {
