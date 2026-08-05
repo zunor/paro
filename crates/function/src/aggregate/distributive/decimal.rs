@@ -9,7 +9,10 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
 use crate::aggregate::{AggregateFunction, AggregateInputData, AggregateStateInput, FunctionData};
-use crate::decimal::{read_decimal, rescale, round_divide, to_i128, write_decimal};
+use crate::decimal::{
+    check_precision_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128,
+    write_decimal,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecimalAggregateOp {
@@ -63,14 +66,17 @@ impl DecimalAggregateState {
 
     fn value(&self) -> i256 {
         let low = ((self.value_words[1] as u128) << 64) | self.value_words[0] as u128;
+        if !self.wide {
+            return i256::from(low as i128);
+        }
         let high = ((self.value_words[3] as u128) << 64) | self.value_words[2] as u128;
         i256::from_words(high as i128, low as i128)
     }
 
     fn set_narrow_value(&mut self, value: i128) {
         let value = value as u128;
-        let sign = if value >> 127 == 0 { 0 } else { u64::MAX };
-        self.value_words = [value as u64, (value >> 64) as u64, sign, sign];
+        self.value_words[0] = value as u64;
+        self.value_words[1] = (value >> 64) as u64;
         self.wide = false;
     }
 
@@ -205,7 +211,7 @@ fn bind(
 
 unsafe fn initialize(state: *mut u8) {
     let state = &mut *(state as *mut DecimalAggregateState);
-    state.set_value(i256::ZERO);
+    state.value_words = [0; 4];
     state.count = 0;
     state.is_set = false;
     state.overflowed = false;
@@ -356,19 +362,43 @@ unsafe fn finalize(
                 data.op.name()
             )));
         }
-        let value = if data.op == DecimalAggregateOp::Avg {
+        let value = if !state.wide && data.op != DecimalAggregateOp::Avg {
+            let value = rescale_checked(state.narrow_value(), data.input_scale, data.output_scale)
+                .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?;
+            check_precision_i128(value, data.output_precision).map_err(|_| {
+                paro_error::out_of_range(format!(
+                    "Decimal {} result exceeds precision {}",
+                    data.op.name(),
+                    data.output_precision
+                ))
+            })?;
+            value
+        } else if data.op == DecimalAggregateOp::Avg {
             let scaled = rescale(state.value(), data.input_scale, data.output_scale)?;
-            round_divide(scaled, i256::from(state.count))?
+            to_i128(
+                round_divide(scaled, i256::from(state.count))?,
+                data.output_precision,
+            )
+            .map_err(|_| {
+                paro_error::out_of_range(format!(
+                    "Decimal {} result exceeds precision {}",
+                    data.op.name(),
+                    data.output_precision
+                ))
+            })?
         } else {
-            rescale(state.value(), data.input_scale, data.output_scale)?
+            to_i128(
+                rescale(state.value(), data.input_scale, data.output_scale)?,
+                data.output_precision,
+            )
+            .map_err(|_| {
+                paro_error::out_of_range(format!(
+                    "Decimal {} result exceeds precision {}",
+                    data.op.name(),
+                    data.output_precision
+                ))
+            })?
         };
-        let value = to_i128(value, data.output_precision).map_err(|_| {
-            paro_error::out_of_range(format!(
-                "Decimal {} result exceeds precision {}",
-                data.op.name(),
-                data.output_precision
-            ))
-        })?;
         write_decimal(result, row, value)?;
     }
     Ok(())

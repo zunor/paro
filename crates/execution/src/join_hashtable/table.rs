@@ -1369,4 +1369,44 @@ mod tests {
         );
         assert_eq!(result.data[1].get_value(0).to_string(), "22");
     }
+
+    #[test]
+    fn inner_join_drains_probe_matches_larger_than_one_output_vector() {
+        let row_count = VECTOR_SIZE * 2;
+        let values = (0..row_count as i32).collect::<Vec<_>>();
+        let keys = Chunk::from_arc_vectors(
+            vec![Arc::new(
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &values,
+                    paro_common::test_utils::test_allocator(),
+                ),
+            )],
+            paro_common::test_utils::test_allocator(),
+        );
+        let table = JoinHashTable::new(
+            create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
+            vec![equality_condition()],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            JoinHashTableConfig::default(),
+        );
+        table.build(&keys, &keys).unwrap();
+        table.finalize().unwrap();
+
+        let mut scan = table.create_scan_structure().unwrap();
+        table.probe(&keys, &mut scan, None, keys.size()).unwrap();
+        let mut result = paro_common::test_utils::test_chunk_with_capacity(
+            &[LogicalType::Integer, LogicalType::Integer],
+            VECTOR_SIZE,
+        );
+        let mut emitted = 0;
+        while !scan.finished {
+            emitted += scan
+                .next_inner_join(&keys, &keys, &mut result, &table, &[], &[])
+                .unwrap();
+        }
+
+        assert_eq!(emitted, row_count);
+    }
 }

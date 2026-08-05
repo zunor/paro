@@ -23,8 +23,9 @@ use crate::pipeline_passes::{
     CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass,
     FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
     GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
-    JoinOrderPass, LimitPushdownPass, ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass,
-    StatisticsGatheringPass, StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
+    JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass, ReorderFilterPass,
+    SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass,
+    TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -128,7 +129,8 @@ impl Optimizer {
             current = rewrite_result?;
 
             if self.ctx.verify_enabled {
-                verify_logical_plan(&self.ctx.bind_context, &current)?;
+                verify_logical_plan(&self.ctx.bind_context, &current)
+                    .map_err(|error| error.context(format!("after optimizer pass {opt_type}")))?;
             }
         }
 
@@ -184,6 +186,7 @@ impl Optimizer {
             Box::new(ColumnLifetimePass),
             Box::new(BuildProbeSidePass),
             Box::new(JoinFilterPushdownPass),
+            Box::new(MixedJoinPredicatePass),
             Box::new(TopNPass),
             Box::new(LimitPushdownPass),
             Box::new(InClausePass),
@@ -191,5 +194,40 @@ impl Optimizer {
             Box::new(SegmentPrunerPass),
             Box::new(StatisticsPropagationPass),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_context::test_support::TestStatementContextBuilder;
+    use paro_planner::planner::Planner;
+
+    use super::Optimizer;
+
+    #[test]
+    fn correlated_having_retains_delim_capture_key_through_optimization() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let mut planner = Planner::new(session.clone());
+        let statement = paro_parser::parse_one(
+            "SELECT o.grp \
+             FROM (VALUES (1, 10), (2, 10), (3, 20)) AS o(id, grp) \
+             GROUP BY o.grp \
+             HAVING EXISTS( \
+                 SELECT 1 \
+                 FROM (VALUES (10), (30)) AS d(grp) \
+                 WHERE d.grp = o.grp \
+             )",
+        )
+        .expect("parse correlated HAVING")
+        .stmt;
+        planner
+            .create_plan(statement)
+            .expect("plan correlated HAVING");
+        let plan = planner.take_plan().expect("logical plan");
+        let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+
+        optimizer
+            .optimize(plan)
+            .expect("optimize correlated HAVING without losing delim keys");
     }
 }

@@ -6,17 +6,18 @@ use std::sync::Arc;
 use paro_catalog::entry::{ColumnDefinition, EdgeTableInfo, TableCatalogEntry, VertexTableInfo};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_function::window::WindowFunction;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionExpression, ConjunctionType,
-    ConstantExpression, Expression, OperatorExpression, OperatorType, ReferenceExpression,
-    WindowExpression, WindowFrame,
+    AggregateExpression, ComparisonExpression, ComparisonType, ConjunctionExpression,
+    ConjunctionType, ConstantExpression, Expression, OperatorExpression, OperatorType,
+    ReferenceExpression, WindowExpression, WindowFrame,
 };
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
-    ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order, Projection,
-    SetOperation, Window as LogicalWindow,
+    Aggregate, ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order,
+    Projection, SetOperation, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::index::PredicateTree;
@@ -95,6 +96,67 @@ fn arena_generator_lowers_distinct_to_hash_aggregate() {
     assert_eq!(spec.output_names.as_ref(), ["a"]);
     assert_eq!(plan.child_ids(&plan.node(plan.root).children).len(), 1);
     assert!(PhysicalPlanGenerator::ensure_fully_typed(&plan).is_ok());
+}
+
+#[test]
+fn arena_generator_fuses_aggregate_only_having_into_aggregate_emit() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(Aggregate::new(
+            1,
+            2,
+            3,
+            values,
+            vec![ref_expr(0, LogicalType::Integer)],
+            vec![],
+            vec![count],
+            vec![],
+        )),
+    );
+    let having = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Filter(Filter::new(
+            aggregate,
+            vec![comparison(
+                ComparisonType::GreaterThan,
+                ref_expr(1, LogicalType::BigInt),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(1),
+                    LogicalType::BigInt,
+                )),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator.generate(&having).expect("HAVING should lower");
+
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("aggregate-only HAVING should be fused into aggregate emit");
+    };
+    assert_eq!(spec.having_filter.len(), 1);
+    let Expression::Comparison(predicate) = &spec.having_filter[0] else {
+        panic!("expected rebased HAVING comparison");
+    };
+    let Expression::Reference(reference) = predicate.left.as_ref() else {
+        panic!("expected aggregate reference in HAVING");
+    };
+    assert_eq!(reference.index, 0);
 }
 
 #[test]

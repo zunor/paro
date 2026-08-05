@@ -31,7 +31,6 @@ pub struct RewriteCorrelatedExpressions {
     base_binding: ColumnBinding,
     correlated_map: CorrelatedColumnMap,
     lateral_depth: usize,
-    depth_shift: usize,
     recursion_mode: RewriteRecursionMode,
 }
 
@@ -46,7 +45,6 @@ impl RewriteCorrelatedExpressions {
             base_binding,
             correlated_map,
             lateral_depth,
-            1,
             RewriteRecursionMode::Shallow,
         )
     }
@@ -60,22 +58,6 @@ impl RewriteCorrelatedExpressions {
             base_binding,
             correlated_map,
             lateral_depth,
-            1,
-            RewriteRecursionMode::Recursive,
-        )
-    }
-
-    fn new_recursive_with_shift(
-        base_binding: ColumnBinding,
-        correlated_map: CorrelatedColumnMap,
-        lateral_depth: usize,
-        depth_shift: usize,
-    ) -> Self {
-        Self::new_with_mode(
-            base_binding,
-            correlated_map,
-            lateral_depth,
-            depth_shift.max(1),
             RewriteRecursionMode::Recursive,
         )
     }
@@ -84,14 +66,12 @@ impl RewriteCorrelatedExpressions {
         base_binding: ColumnBinding,
         correlated_map: CorrelatedColumnMap,
         lateral_depth: usize,
-        depth_shift: usize,
         recursion_mode: RewriteRecursionMode,
     ) -> Self {
         Self {
             base_binding,
             correlated_map,
             lateral_depth,
-            depth_shift,
             recursion_mode,
         }
     }
@@ -141,7 +121,10 @@ impl RewriteCorrelatedExpressions {
                         self.base_binding.column_index + new_idx,
                     );
                     col_ref.depth = if self.recursively_rewrites_nested_subqueries() {
-                        col_ref.depth.saturating_sub(self.depth_shift)
+                        // The replacement binding is produced by the duplicated outer scan at
+                        // this lateral level. SQL nesting depth in the source expression no
+                        // longer applies once the reference has been localized to that scan.
+                        self.lateral_depth
                     } else {
                         0
                     };
@@ -178,7 +161,7 @@ impl RewriteCorrelatedExpressions {
                             corr.depth = original_depth.saturating_sub(1).max(1);
                         }
                     }
-                    self.rewrite_nested_subquery_plan(subquery, matched_depth_shift);
+                    self.rewrite_nested_subquery_plan(subquery);
                 }
             }
             Expression::Constant(_) | Expression::Reference(_) => {}
@@ -190,20 +173,15 @@ impl RewriteCorrelatedExpressions {
         }
     }
 
-    fn rewrite_nested_subquery_plan(
-        &self,
-        subquery: &mut crate::expression::SubqueryExpression,
-        depth_shift: usize,
-    ) {
+    fn rewrite_nested_subquery_plan(&self, subquery: &mut crate::expression::SubqueryExpression) {
         let copied = copy_subquery_top_level_plan(
             subquery.subquery.as_ref(),
             subquery.bind_snapshot.as_ref(),
         );
-        let planned_rewriter = Self::new_recursive_with_shift(
+        let planned_rewriter = Self::new_recursive(
             self.base_binding,
             self.correlated_map.clone(),
             self.lateral_depth + 1,
-            depth_shift,
         );
         subquery.subquery = Arc::new(PlannedStatement {
             types: copied.types,
@@ -359,7 +337,6 @@ impl RewriteCorrelatedExpressions {
                     base_binding: self.base_binding,
                     correlated_map: self.correlated_map.clone(),
                     lateral_depth: self.lateral_depth + 1,
-                    depth_shift: self.depth_shift,
                     recursion_mode: self.recursion_mode,
                 };
                 dep.right = Box::new(right_rewriter.rewrite_logical_plan(*dep.right));
@@ -508,6 +485,32 @@ mod tests {
                 assert_eq!(col_ref.depth, 3);
             }
             other => panic!("expected untouched column ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recursive_rewrite_localizes_binding_at_current_lateral_depth() {
+        let binding = ColumnBinding::new(10, 0);
+        let mut map = CorrelatedColumnMap::new();
+        map.insert(binding, 0);
+
+        for (lateral_depth, source_depth) in [(0, 2), (1, 3)] {
+            let rewriter = RewriteCorrelatedExpressions::new_recursive(
+                ColumnBinding::new(99, 0),
+                map.clone(),
+                lateral_depth,
+            );
+            let expression = Expression::ColumnRef(ColumnRefExpression::with_depth(
+                binding,
+                LogicalType::Integer,
+                source_depth,
+            ));
+
+            let Expression::ColumnRef(rewritten) = rewriter.rewrite_expression(expression) else {
+                panic!("expected rewritten column ref");
+            };
+            assert_eq!(rewritten.binding, ColumnBinding::new(99, 0));
+            assert_eq!(rewritten.depth, lateral_depth);
         }
     }
 

@@ -281,12 +281,16 @@ pub(crate) fn build_groups_chunk_for_set(
             continue;
         }
         let row_count = groups.size();
-        let column = groups.column_mut(group_idx).ok_or_else(|| {
+        let column = groups.column(group_idx).ok_or_else(|| {
             paro_error::internal(format!(
                 "missing grouping column while applying grouping set: group_idx={group_idx}"
             ))
         })?;
-        column.validity_mut().try_set_all_invalid(row_count)?;
+        groups.data[group_idx] = Arc::new(Vector::try_constant_null(
+            column.logical_type().clone(),
+            row_count,
+            groups.allocator().clone(),
+        )?);
     }
     Ok(groups)
 }
@@ -609,5 +613,31 @@ pub(crate) fn update_perfect_aggregate_table(
         table.update_aggregates_per_filter(payload, addresses, &filters)
     } else {
         table.update_aggregates(payload, addresses, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_common::chunk::Chunk;
+    use paro_common::types::LogicalType;
+    use paro_common::vector::VectorType;
+
+    use super::build_groups_chunk_for_set;
+
+    #[test]
+    fn absent_grouping_key_is_null_for_dictionary_input() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let child = Arc::new(paro_common::test_utils::test_i32_vector(&[10, 20]));
+        let dictionary = paro_common::test_utils::test_dictionary(child, vec![1, 0]);
+        let groups = Chunk::from_arc_vectors(vec![Arc::new(dictionary)], allocator);
+
+        let grouped = build_groups_chunk_for_set(&groups, &[], 1).expect("grouping set");
+        let column = grouped.column(0).expect("grouping column");
+        assert_eq!(column.logical_type(), &LogicalType::Integer);
+        assert_eq!(column.vector_type(), VectorType::Constant);
+        assert!(column.is_null(0));
+        assert!(column.is_null(1));
     }
 }

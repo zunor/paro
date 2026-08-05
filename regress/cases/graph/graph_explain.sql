@@ -105,7 +105,7 @@ SET force_external = DEFAULT;
 SET temp_directory = DEFAULT;
 
 SET force_external = true;
--- @statement error SQLSTATE=53200
+-- The database-owned default temp directory remains available after RESET.
 SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)

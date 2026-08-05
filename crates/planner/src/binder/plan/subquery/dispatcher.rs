@@ -565,6 +565,22 @@ mod tests {
                         ) \
                   )"
             }
+            "uncorrelated_any_with_correlated_scalar" => {
+                "SELECT o.id \
+                 FROM (VALUES (1), (2)) AS o(id) \
+                 WHERE o.id IN ( \
+                   SELECT p.id \
+                   FROM (VALUES (1, 10, 2, 100), (2, 5, 3, 100)) \
+                        AS p(id, avail, part_key, supp_key) \
+                   WHERE p.avail > ( \
+                     SELECT d.qty \
+                     FROM (VALUES (2, 100, 4), (3, 100, 8)) \
+                          AS d(part_key, supp_key, qty) \
+                     WHERE d.part_key = p.part_key \
+                       AND d.supp_key = p.supp_key \
+                   ) \
+                 )"
+            }
             other => panic!("unknown nested case: {other}"),
         }
     }
@@ -660,7 +676,7 @@ mod tests {
             "planned" => format!("{:?}", planned_logical_operator(sql)),
             other => panic!("unknown probe mode: {other}"),
         };
-        tracing::info!(target: "paro_planner.subquery_probe", "{plan_debug}");
+        println!("{plan_debug}");
     }
 
     #[test]
@@ -706,5 +722,13 @@ mod tests {
     #[test]
     fn join_on_nested_outer_correlation_plans_without_remaining_subquery() {
         assert_planned_probe_succeeds("join_on_nested_outer");
+    }
+
+    #[test]
+    fn uncorrelated_any_with_correlated_scalar_plans_all_correlation_layers() {
+        let plan =
+            planned_logical_operator(nested_case_sql("uncorrelated_any_with_correlated_scalar"));
+        crate::verify::verify_physical_planner_invariants(&plan)
+            .expect("all nested correlation must be flattened before physical planning");
     }
 }

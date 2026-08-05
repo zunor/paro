@@ -264,9 +264,9 @@ impl PhysicalPlanGenerator {
             join_type: join.join_type,
             conditions: join.conditions.clone().into_boxed_slice(),
             left_projection: left_projection.into_boxed_slice(),
-            right_projection: right_projection.into_boxed_slice(),
+            build_input_projection: right_projection.into_boxed_slice(),
             left_output_types: left_types.into_boxed_slice(),
-            right_output_types: right_types.into_boxed_slice(),
+            build_payload_types: right_types.into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
             force_external: self.ctx.force_external
@@ -402,9 +402,9 @@ impl PhysicalPlanGenerator {
             join_type: join.join_type,
             conditions: join.conditions.clone().into_boxed_slice(),
             left_projection: left_projection.into_boxed_slice(),
-            right_projection: right_projection.into_boxed_slice(),
+            build_input_projection: right_projection.into_boxed_slice(),
             left_output_types: left_types.into_boxed_slice(),
-            right_output_types: right_types.into_boxed_slice(),
+            build_payload_types: right_types.into_boxed_slice(),
             output_names: output_names.clone().into_boxed_slice(),
             output_types: output_types.clone().into_boxed_slice(),
             force_external: self.ctx.force_external

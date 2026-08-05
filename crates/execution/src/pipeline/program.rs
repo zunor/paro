@@ -390,7 +390,6 @@ impl OperatorRuntimeRegistry {
                     probe_types: spec.probe_types.clone(),
                     build_payload_types: spec.build_payload_types.clone(),
                     left_projection: spec.left_projection.clone(),
-                    right_projection: spec.right_projection.clone(),
                     output_types: spec.output_types.clone(),
                 })
             }
@@ -399,7 +398,6 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     left_output_types: spec.left_output_types.clone(),
-                    right_projection: spec.right_projection.clone(),
                     output_types: spec.output_types.clone(),
                 })
             }
@@ -474,7 +472,6 @@ impl OperatorRuntimeRegistry {
                     join_type: spec.join_type,
                     conditions: spec.conditions.clone(),
                     left_projection: spec.left_projection.clone(),
-                    right_projection: spec.right_projection.clone(),
                     output_types: spec.output_types.clone(),
                 })
             }
@@ -916,6 +913,7 @@ mod tests {
             aggregate_inputs: Box::new([]),
             aggregate_filters: Box::new([]),
             aggregate_orders: Box::new([]),
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
@@ -1340,7 +1338,6 @@ mod tests {
                             probe_types: Box::new([LogicalType::Integer]),
                             build_payload_types: Box::new([LogicalType::Integer]),
                             left_projection: Box::new([0]),
-                            right_projection: Box::new([0]),
                             output_names: Box::new(["l".to_string(), "r".to_string()]),
                             output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
                         },
@@ -1351,7 +1348,6 @@ mod tests {
                             join_type: JoinType::Inner,
                             conditions: Box::new([join_condition()]),
                             left_projection: Box::new([0]),
-                            right_projection: Box::new([0]),
                             output_names: Box::new(["l".to_string(), "r".to_string()]),
                             output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
                         },

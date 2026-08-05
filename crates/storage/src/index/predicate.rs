@@ -15,7 +15,31 @@ use paro_common::types::LogicalType;
 
 use crate::index::ColumnId;
 
-/// Predicate over a single column.
+/// Ordering operation used by a row-level column comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateComparison {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+impl fmt::Display for PredicateComparison {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Equal => "=",
+            Self::NotEqual => "!=",
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterThanOrEqual => ">=",
+        })
+    }
+}
+
+/// Predicate evaluated by indexes and/or by the storage row verifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Predicate {
     /// column = value
@@ -45,11 +69,19 @@ pub enum Predicate {
     IsNull { column_id: ColumnId },
     /// column IS NOT NULL
     IsNotNull { column_id: ColumnId },
+    /// left_column op right_column. This cannot be answered by a single-column
+    /// index and is always verified against rows selected by other predicates.
+    ColumnComparison {
+        left_column_id: ColumnId,
+        right_column_id: ColumnId,
+        comparison: PredicateComparison,
+    },
 }
 
 impl Predicate {
-    /// Column id referenced by this predicate.
-    pub fn column_id(&self) -> ColumnId {
+    /// Single column eligible for index lookup, or `None` for a multi-column
+    /// row-verification predicate.
+    pub fn index_column_id(&self) -> Option<ColumnId> {
         match self {
             Predicate::Eq { column_id, .. }
             | Predicate::NotEq { column_id, .. }
@@ -60,7 +92,8 @@ impl Predicate {
             | Predicate::In { column_id, .. }
             | Predicate::Range { column_id, .. }
             | Predicate::IsNull { column_id }
-            | Predicate::IsNotNull { column_id } => *column_id,
+            | Predicate::IsNotNull { column_id } => Some(*column_id),
+            Predicate::ColumnComparison { .. } => None,
         }
     }
 }
@@ -89,6 +122,11 @@ impl fmt::Display for Predicate {
             } => write!(f, "col#{column_id} BETWEEN {lower} AND {upper}"),
             Predicate::IsNull { column_id } => write!(f, "col#{column_id} IS NULL"),
             Predicate::IsNotNull { column_id } => write!(f, "col#{column_id} IS NOT NULL"),
+            Predicate::ColumnComparison {
+                left_column_id,
+                right_column_id,
+                comparison,
+            } => write!(f, "col#{left_column_id} {comparison} col#{right_column_id}"),
         }
     }
 }
@@ -142,12 +180,27 @@ pub fn collect_predicate_columns(tree: &PredicateTree) -> Vec<ColumnId> {
 
     fn visit(tree: &PredicateTree, seen: &mut HashSet<ColumnId>, columns: &mut Vec<ColumnId>) {
         match tree {
-            PredicateTree::Leaf(predicate) => {
-                let col = predicate.column_id();
-                if seen.insert(col) {
-                    columns.push(col);
+            PredicateTree::Leaf(predicate) => match predicate {
+                Predicate::ColumnComparison {
+                    left_column_id,
+                    right_column_id,
+                    ..
+                } => {
+                    for column_id in [*left_column_id, *right_column_id] {
+                        if seen.insert(column_id) {
+                            columns.push(column_id);
+                        }
+                    }
                 }
-            }
+                predicate => {
+                    let column_id = predicate
+                        .index_column_id()
+                        .expect("single-column predicate must expose its index column");
+                    if seen.insert(column_id) {
+                        columns.push(column_id);
+                    }
+                }
+            },
             PredicateTree::And(children) | PredicateTree::Or(children) => {
                 for child in children {
                     visit(child, seen, columns);

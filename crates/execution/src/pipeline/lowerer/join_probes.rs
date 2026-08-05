@@ -433,46 +433,72 @@ impl<'a> PipelineLowerer<'a> {
             Default::default(),
         );
 
-        // Probe, spill replay, and unmatched-build output are disjoint branches of one
-        // logical join. Stateful downstream transforms must observe their union once;
-        // cloning them into every branch would finalize LIMIT/aggregate/window state once
-        // per branch (including an empty replay branch). Insert a shared materialization
-        // barrier before such transforms and resume the logical stream in one pipeline.
-        let merge_handle = hash_join_requires_merge_barrier(&consumer_transforms).then(|| {
+        // Probe, spill replay, and unmatched-build output are disjoint branches of one logical
+        // join. Stateful downstream operators must observe their union once. A TopN can consume
+        // that union directly through its shared bounded heap; other stateful transforms retain
+        // the general materialized-union path.
+        let topn_merge = hash_join_topn_merge(&consumer_transforms).map(|(index, spec)| {
+            let input = consumer_transforms[..index]
+                .iter()
+                .fold(join_output.clone(), |row_type, transform| {
+                    transform.output_row_type(&row_type)
+                });
+            let handle = self.handles.register(
+                BreakerHandleKind::TopN,
+                RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec()),
+                Default::default(),
+            );
+            (index, handle, spec.clone(), input)
+        });
+        let merge_handle = (topn_merge.is_none()
+            && hash_join_requires_merge_barrier(&consumer_transforms))
+        .then(|| {
             self.handles.register(
                 BreakerHandleKind::Materialized,
                 join_output.clone(),
                 Default::default(),
             )
         });
-        let branch_transforms = if merge_handle.is_some() {
+        let branch_transforms = if let Some((index, ..)) = topn_merge.as_ref() {
+            consumer_transforms[..*index].to_vec()
+        } else if merge_handle.is_some() {
             Vec::new()
         } else {
             consumer_transforms.clone()
         };
-        let (branch_sink, branch_sharing, branch_output) = if let Some(merge_handle) = merge_handle
-        {
-            (
-                SinkSpec::Materialize(MaterializeSinkSpec {
-                    handle: merge_handle,
-                    required: Default::default(),
-                }),
-                SinkSharing::Shared(self.next_shared_sink()),
-                join_output.clone(),
-            )
-        } else {
-            let downstream_is_client = matches!(sink, SinkSpec::ClientResult(_))
-                && matches!(sink_sharing, SinkSharing::Exclusive);
-            let sharing = if downstream_is_client {
-                SinkSharing::Exclusive
+        let (branch_sink, branch_sharing, branch_output) =
+            if let Some((_, handle, spec, input)) = topn_merge.as_ref() {
+                (
+                    SinkSpec::TopNBuild(TopNBuildSinkSpec {
+                        handle: *handle,
+                        spec: spec.clone(),
+                        required: Default::default(),
+                    }),
+                    SinkSharing::Shared(self.next_shared_sink()),
+                    input.clone(),
+                )
+            } else if let Some(merge_handle) = merge_handle {
+                (
+                    SinkSpec::Materialize(MaterializeSinkSpec {
+                        handle: merge_handle,
+                        required: Default::default(),
+                    }),
+                    SinkSharing::Shared(self.next_shared_sink()),
+                    join_output.clone(),
+                )
             } else {
-                match sink_sharing {
-                    SinkSharing::Exclusive => SinkSharing::Shared(self.next_shared_sink()),
-                    shared @ SinkSharing::Shared(_) => shared,
-                }
+                let downstream_is_client = matches!(sink, SinkSpec::ClientResult(_))
+                    && matches!(sink_sharing, SinkSharing::Exclusive);
+                let sharing = if downstream_is_client {
+                    SinkSharing::Exclusive
+                } else {
+                    match sink_sharing {
+                        SinkSharing::Exclusive => SinkSharing::Shared(self.next_shared_sink()),
+                        shared @ SinkSharing::Shared(_) => shared,
+                    }
+                };
+                (sink.clone(), sharing, output.clone())
             };
-            (sink.clone(), sharing, output.clone())
-        };
 
         let producer = self.lower_subtree_to_sink(
             *right,
@@ -480,8 +506,8 @@ impl<'a> PipelineLowerer<'a> {
                 handle,
                 join_type: spec.join_type,
                 conditions: spec.conditions.clone(),
-                build_projection: spec.right_projection.clone(),
-                build_payload_types: spec.right_output_types.clone(),
+                build_projection: spec.build_input_projection.clone(),
+                build_payload_types: spec.build_payload_types.clone(),
                 required: Default::default(),
                 force_external: spec.force_external,
             }),
@@ -538,9 +564,8 @@ impl<'a> PipelineLowerer<'a> {
             join_type: spec.join_type,
             conditions: spec.conditions.clone(),
             probe_types: self.plan.node(*left).output.types.clone(),
-            build_payload_types: spec.right_output_types.clone(),
+            build_payload_types: spec.build_payload_types.clone(),
             left_projection: spec.left_projection.clone(),
-            right_projection: spec.right_projection.clone(),
             output_names: spec.output_names.clone(),
             output_types: spec.output_types.clone(),
         });
@@ -567,7 +592,6 @@ impl<'a> PipelineLowerer<'a> {
                 handle,
                 join_type: spec.join_type,
                 left_output_types: spec.left_output_types.clone(),
-                right_projection: spec.right_projection.clone(),
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
             });
@@ -587,6 +611,29 @@ impl<'a> PipelineLowerer<'a> {
                 kind: DependencyKind::FinalizeBeforeEmit,
             });
             last_branch = unmatched.tail;
+        }
+
+        if let Some((index, topn_handle, spec, _)) = topn_merge {
+            self.handles.set_producer(topn_handle, pushed.tail)?;
+            let merged = self.push_pipeline(
+                SourceSpec::TopNEmit(TopNEmitSourceSpec {
+                    handle: topn_handle,
+                    spec,
+                }),
+                consumer_transforms[index + 1..].to_vec(),
+                sink,
+                sink_sharing,
+                output,
+                pipelines,
+                dependencies,
+            )?;
+            self.handles.add_consumer(topn_handle, merged.entry)?;
+            dependencies.push(PipelineDependency {
+                producer: last_branch,
+                consumer: merged.entry,
+                kind: DependencyKind::FinalizeBeforeEmit,
+            });
+            return Ok(merged.tail);
         }
 
         let Some(merge_handle) = merge_handle else {
@@ -653,8 +700,8 @@ impl<'a> PipelineLowerer<'a> {
                         handle,
                         join_type: spec.join_type,
                         conditions: spec.conditions.clone(),
-                        build_projection: spec.right_projection.clone(),
-                        build_payload_types: spec.right_output_types.clone(),
+                        build_projection: spec.build_input_projection.clone(),
+                        build_payload_types: spec.build_payload_types.clone(),
                         required: Default::default(),
                         force_external: false,
                     }),
@@ -786,4 +833,25 @@ fn hash_join_requires_merge_barrier(transforms: &[TransformSpec]) -> bool {
                 | TransformSpec::StreamingWindow(_)
         )
     })
+}
+
+fn hash_join_topn_merge(transforms: &[TransformSpec]) -> Option<(usize, &TopNSpec)> {
+    let (index, transform) = transforms
+        .iter()
+        .enumerate()
+        .find(|(_, transform)| is_stateful_transform(transform))?;
+    match transform {
+        TransformSpec::StreamingTopN(spec) => Some((index, spec)),
+        _ => None,
+    }
+}
+
+fn is_stateful_transform(transform: &TransformSpec) -> bool {
+    matches!(
+        transform,
+        TransformSpec::Limit(_)
+            | TransformSpec::StreamingTopN(_)
+            | TransformSpec::StreamingAggregate(_)
+            | TransformSpec::StreamingWindow(_)
+    )
 }

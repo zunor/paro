@@ -45,10 +45,10 @@ PROJECTION  (rows=1)
   Output: s.id, b.payload
   Cardinality: [0, 1, 1]
   Output Schema: s.id INTEGER, b.payload VARCHAR
-  ->  HASH_JOIN  (rows=1)
+  ->  HASH_JOIN  (rows=5)
     Join Type: INNER
     Join Condition: #0 = #0
-    Cardinality: [1, 1, 1]
+    Cardinality: [5, 5, 5]
     Output Schema: id INTEGER, payload VARCHAR, id INTEGER
     ->  ROWSET_SCAN on public.stats_big b
       Columns: id, payload
@@ -56,8 +56,9 @@ PROJECTION  (rows=1)
       Late Materialize: auto
       Runtime Filter: #0 = 1
       Output Schema: id INTEGER, payload VARCHAR
-    ->  ROWSET_SCAN on public.stats_small s
+    ->  ROWSET_SCAN on public.stats_small s  (rows=1)
       Columns: id
+      Cardinality: [1, 1, 1]
       Output Schema: id INTEGER
 
 SELECT s.id, b.payload

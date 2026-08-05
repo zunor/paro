@@ -27,7 +27,7 @@ ORDER_BY  (rows=30)
         ->  EXTERNAL_TABLE  (rows=100)
           ->  PROJECTION
             Output: __external_arg_1, __corr_1
-            ->  CROSS_PRODUCT
+            ->  CROSS_PRODUCT  (rows=1000)
               ->  DUMMY_SCAN
               ->  DELIM_SCAN  (rows=1)
         ->  DELIM_SCAN

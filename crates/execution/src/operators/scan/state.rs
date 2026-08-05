@@ -22,25 +22,33 @@ pub struct RowsetSourceGlobal {
     pub table: Arc<TableHandle>,
     pub storage_snapshot: StorageSnapshot,
     pub segments: Box<[(RowsetSharedPtr, SegmentSharedPtr)]>,
-    pub next_segment: AtomicUsize,
+    pub morsels: Box<[RowsetScanMorsel]>,
+    pub next_morsel: AtomicUsize,
     pub column_projection: ColumnProjection,
     pub overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
     pub predicate: Option<PredicateTree>,
     pub predicate_columns: Box<[ColumnId]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsetScanMorsel {
+    pub segment_idx: usize,
+    pub start_ordinal: u64,
+    pub end_ordinal: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct RowsetSourceLocal {
     pub next_morsel: usize,
-    pub assigned_segment_end: Option<usize>,
+    pub assigned_morsel_end: Option<usize>,
     pub reader: Option<TabletReader>,
 }
 
 impl RowsetSourceLocal {
-    pub fn assign_segment_range(&mut self, start: usize, end: usize) {
+    pub fn assign_morsel_range(&mut self, start: usize, end: usize) {
         debug_assert!(start < end);
         self.next_morsel = start;
-        self.assigned_segment_end = Some(end);
+        self.assigned_morsel_end = Some(end);
     }
 }
 

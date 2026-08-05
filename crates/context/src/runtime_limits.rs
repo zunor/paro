@@ -23,7 +23,7 @@ impl Default for RuntimeLimits {
             max_temp_directory_size: None,
             force_external: false,
             rowset_scan_pushdown: true,
-            parallel_scheduler: false,
+            parallel_scheduler: true,
         }
     }
 }

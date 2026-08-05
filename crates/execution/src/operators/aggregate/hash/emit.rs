@@ -1,25 +1,31 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::vector::VECTOR_SIZE;
+use paro_function::scalar::FunctionExecContext;
 use paro_storage::row::RowSpillReader;
 
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
+use crate::operators::aggregate::output_filter::copy_selected_rows;
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
     AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
     AggregateRuntimeState, HandleRef,
 };
-use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
+use crate::runtime::context::{OperatorCallContext, PipelineInitContext, QueryRuntimeContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
-    BreakerHandleGlobal, HashAggregateEmitSourceLocal, SourceGlobal, SourceLocal,
+    HashAggregateEmitSourceGlobal, HashAggregateEmitSourceLocal, HashAggregateEmitWork,
+    SourceGlobal, SourceLocal,
 };
+use crate::runtime::ExpressionEvalInput;
 
 #[derive(Debug, Clone)]
 pub struct HashAggregateEmitSourceExec {
@@ -29,21 +35,44 @@ pub struct HashAggregateEmitSourceExec {
 
 impl HashAggregateEmitSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
-        Ok(SourceGlobal::HashAggregateEmit(Arc::new(
-            BreakerHandleGlobal {
-                handle: ctx.handles.get(self.handle)?,
-            },
-        )))
+        let handle = ctx.handles.get(self.handle)?;
+        let global = Arc::new(HashAggregateEmitSourceGlobal {
+            handle,
+            work: parking_lot::Mutex::new(None),
+            work_count: AtomicUsize::new(0),
+        });
+        if global.handle.is_finalized() {
+            initialize_work(ctx.query, &global)?;
+        }
+        Ok(SourceGlobal::HashAggregateEmit(global))
     }
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        Ok(SourceLocal::HashAggregateEmit(
-            HashAggregateEmitSourceLocal::default(),
-        ))
+        let mut local = HashAggregateEmitSourceLocal::default();
+        if !self.spec.having_filter.is_empty() {
+            if self.spec.having_filter.len() != 1 {
+                return Err(paro_error::internal(
+                    "aggregate HAVING lowering requires one normalized predicate",
+                ));
+            }
+            local.having_executor = Some(ExpressionExecutor::with_expressions_for_session(
+                &self.spec.having_filter,
+                ctx.query.session.as_ref(),
+            ));
+            local.having_selection = Some(paro_common::vector::SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+            local.having_columns = (self.spec.grouping_key_count
+                ..self.spec.grouping_key_count + self.spec.aggregates.len())
+                .collect();
+        }
+        Ok(SourceLocal::HashAggregateEmit(local))
     }
 
     pub(crate) fn poll_next(
@@ -59,97 +88,159 @@ impl HashAggregateEmitSourceExec {
                 "hash aggregate emit source global state mismatch",
             ));
         };
-        if !global.handle.is_finalized() {
-            return Err(paro_error::internal(
-                "hash aggregate emit source polled before handle was finalized",
-            ));
-        }
         let SourceLocal::HashAggregateEmit(local) = local else {
             return Err(paro_error::internal(
                 "hash aggregate emit source local state mismatch",
             ));
         };
-        if local.tables.is_none() && local.spilled_outputs.is_none() {
-            ctx.query.memory.unregister_reclaimer_by_name(
-                &AggregateBuildCompactionReclaimer::name_for(&global.handle),
-            );
-            ctx.query.memory.unregister_reclaimer_by_name(
-                &AggregateFinalizedStateReclaimer::name_for(&global.handle),
-            );
-            let Some(state) = global.handle.take_state()? else {
-                return Ok(SourcePoll::Finished);
-            };
-            let AggregateRuntimeState::Hash(state) = state else {
+        initialize_work(ctx.query, global)?;
+        ensure_source_output(output, &self.spec.output_types, VECTOR_SIZE)?;
+        loop {
+            if local.work.is_none() {
+                local.work = global.claim_work();
+                local.position = Default::default();
+                if local.work.is_none() {
+                    output.try_set_cardinality(0)?;
+                    return Ok(SourcePoll::Finished);
+                }
+            }
+            let Some(work) = local.work.as_mut() else {
                 return Err(paro_error::internal(
-                    "aggregate handle does not contain hash aggregate state",
+                    "hash aggregate emit source failed to claim initialized work",
                 ));
             };
-            if let Some(spilled_outputs) = state.spilled_outputs {
-                local.spilled_outputs = Some(
-                    spilled_outputs
-                        .into_iter()
-                        .map(|output| output.map(|output| output.into_reader()))
-                        .collect(),
-                );
-            } else {
-                local.positions = vec![Default::default(); state.tables.len()];
-                local.tables = Some(state.tables);
+            match work {
+                HashAggregateEmitWork::Table {
+                    grouping_idx,
+                    table,
+                } => {
+                    let produced = if let (Some(executor), Some(selection)) = (
+                        local.having_executor.as_mut(),
+                        local.having_selection.as_mut(),
+                    ) {
+                        table.scan_with_aggregate_filter(
+                            &mut local.position,
+                            output,
+                            selection,
+                            |aggregates, count, selection| {
+                                executor.select_kernel(
+                                    0,
+                                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                                        params: ctx.query.params.as_ref(),
+                                        columns: aggregates,
+                                    })
+                                    .with_count(count),
+                                    ctx.query,
+                                    selection,
+                                )
+                            },
+                        )?
+                    } else {
+                        table.scan(&mut local.position, output)?
+                    };
+                    if produced {
+                        populate_grouping_columns(&self.spec, output, *grouping_idx)?;
+                        return Ok(SourcePoll::Output);
+                    }
+                }
+                HashAggregateEmitWork::Spilled {
+                    grouping_idx,
+                    reader,
+                } => {
+                    let scratch = local
+                        .spilled_chunk
+                        .get_or_insert(Chunk::try_new(output.allocator().clone())?);
+                    let scanned = reader.read_next(scratch)?;
+                    if scanned > 0 {
+                        if let (Some(executor), Some(selection)) = (
+                            local.having_executor.as_mut(),
+                            local.having_selection.as_mut(),
+                        ) {
+                            let aggregate_types =
+                                &self.spec.output_types[self.spec.grouping_key_count
+                                    ..self.spec.grouping_key_count + self.spec.aggregates.len()];
+                            let mut aggregate_view = Chunk::try_init_empty(
+                                aggregate_types,
+                                scratch.allocator().clone(),
+                            )?;
+                            aggregate_view.reference_columns(scratch, &local.having_columns);
+                            let selected_count = executor.select_kernel(
+                                0,
+                                VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                                    params: ctx.query.params.as_ref(),
+                                    columns: &aggregate_view,
+                                })
+                                .with_count(scanned),
+                                ctx.query,
+                                selection,
+                            )?;
+                            if selected_count == 0 {
+                                continue;
+                            }
+                            copy_selected_rows(scratch, output, selection, selected_count)?;
+                        } else {
+                            copy_spilled_output_rows(scratch, output)?;
+                        }
+                        populate_grouping_columns(&self.spec, output, *grouping_idx)?;
+                        return Ok(SourcePoll::Output);
+                    }
+                }
             }
+            local.work = None;
         }
-        ensure_source_output(output, &self.spec.output_types, VECTOR_SIZE)?;
-        if local.spilled_outputs.is_some() {
-            return self.poll_spilled_outputs(local, output);
-        }
-        let tables = local.tables.as_mut().ok_or_else(|| {
-            paro_error::internal("hash aggregate emit source did not load hash tables")
-        })?;
-        while local.grouping_idx < tables.len() {
-            let table = &mut tables[local.grouping_idx];
-            let position = local.positions.get_mut(local.grouping_idx).ok_or_else(|| {
-                paro_error::internal(format!(
-                    "hash aggregate source position out of bounds: grouping_idx={}",
-                    local.grouping_idx
-                ))
-            })?;
-            if table.scan(position, output)? {
-                populate_grouping_columns(&self.spec, output, local.grouping_idx)?;
-                return Ok(SourcePoll::Output);
-            }
-            local.grouping_idx += 1;
-        }
-        output.try_set_cardinality(0)?;
-        Ok(SourcePoll::Finished)
     }
+}
 
-    fn poll_spilled_outputs(
-        &self,
-        local: &mut HashAggregateEmitSourceLocal,
-        output: &mut Chunk,
-    ) -> Result<SourcePoll> {
-        let spilled_outputs = local.spilled_outputs.as_mut().ok_or_else(|| {
-            paro_error::internal("hash aggregate emit source did not load spilled outputs")
-        })?;
-        while local.grouping_idx < spilled_outputs.len() {
-            if let Some(reader) = spilled_outputs[local.grouping_idx].as_mut() {
-                if local.spilled_chunk.is_none() {
-                    local.spilled_chunk = Some(Chunk::try_new(output.allocator().clone())?);
-                }
-                let scratch = local
-                    .spilled_chunk
-                    .as_mut()
-                    .expect("spilled aggregate scratch chunk initialized");
-                let scanned = reader.read_next(scratch)?;
-                if scanned > 0 {
-                    copy_spilled_output_rows(scratch, output)?;
-                    populate_grouping_columns(&self.spec, output, local.grouping_idx)?;
-                    return Ok(SourcePoll::Output);
+fn initialize_work(
+    query: &QueryRuntimeContext,
+    global: &HashAggregateEmitSourceGlobal,
+) -> Result<()> {
+    let mut shared_work = global.work.lock();
+    if shared_work.is_some() {
+        return Ok(());
+    }
+    if !global.handle.is_finalized() {
+        return Err(paro_error::internal(
+            "hash aggregate emit source polled before handle was finalized",
+        ));
+    }
+    query
+        .memory
+        .unregister_reclaimer_by_name(&AggregateBuildCompactionReclaimer::name_for(&global.handle));
+    query
+        .memory
+        .unregister_reclaimer_by_name(&AggregateFinalizedStateReclaimer::name_for(&global.handle));
+
+    let mut work = std::collections::VecDeque::new();
+    if let Some(state) = global.handle.take_state()? {
+        let AggregateRuntimeState::Hash(state) = state else {
+            return Err(paro_error::internal(
+                "aggregate handle does not contain hash aggregate state",
+            ));
+        };
+        if let Some(spilled_outputs) = state.spilled_outputs {
+            for (grouping_idx, output) in spilled_outputs.into_iter().enumerate() {
+                if let Some(output) = output {
+                    work.push_back(HashAggregateEmitWork::Spilled {
+                        grouping_idx,
+                        reader: output.into_reader(),
+                    });
                 }
             }
-            local.grouping_idx += 1;
+        } else {
+            for (grouping_idx, table) in state.tables.into_iter().enumerate() {
+                for table in table.into_scan_partitions() {
+                    work.push_back(HashAggregateEmitWork::Table {
+                        grouping_idx,
+                        table,
+                    });
+                }
+            }
         }
-        output.try_set_cardinality(0)?;
-        Ok(SourcePoll::Finished)
     }
+    global.work_count.store(work.len(), Ordering::Release);
+    *shared_work = Some(work);
+    Ok(())
 }
 
 fn copy_spilled_output_rows(source: &Chunk, output: &mut Chunk) -> Result<()> {

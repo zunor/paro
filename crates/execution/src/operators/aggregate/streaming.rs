@@ -8,7 +8,7 @@ use paro_common::allocator::{ArenaAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{Vector, VECTOR_SIZE};
+use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::scalar::FunctionExecContext;
 
@@ -69,6 +69,11 @@ impl StreamingAggregateTransformExec {
             &mut state_buffer,
             ctx.query.allocator(MemoryTag::HashTable),
         )?;
+        if self.spec.having_filter.len() > 1 {
+            return Err(paro_error::internal(
+                "aggregate HAVING lowering requires one normalized predicate",
+            ));
+        }
         Ok(TransformLocal::StreamingAggregate(
             StreamingAggregateTransformLocal {
                 aggregate_objects: Arc::clone(&global.aggregate_objects),
@@ -80,6 +85,20 @@ impl StreamingAggregateTransformExec {
                         ctx.query.session.as_ref(),
                     )
                 }),
+                having_executor: (!self.spec.having_filter.is_empty()).then(|| {
+                    ExpressionExecutor::with_expressions_for_session(
+                        &self.spec.having_filter,
+                        ctx.query.session.as_ref(),
+                    )
+                }),
+                having_selection: (!self.spec.having_filter.is_empty())
+                    .then(|| {
+                        SelectionVector::try_with_capacity(
+                            1,
+                            ctx.query.allocator(MemoryTag::BaseTable),
+                        )
+                    })
+                    .transpose()?,
                 payload_chunk: Chunk::try_initialize(
                     &self.spec.payload_types,
                     VECTOR_SIZE,
@@ -193,9 +212,31 @@ impl StreamingAggregateTransformExec {
             output,
             1,
         )?;
+        let selected_count = if let (Some(executor), Some(selection)) = (
+            local.having_executor.as_mut(),
+            local.having_selection.as_mut(),
+        ) {
+            executor.select_kernel(
+                0,
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                    params: ctx.query.params.as_ref(),
+                    columns: output,
+                })
+                .with_count(1),
+                ctx.query,
+                selection,
+            )?
+        } else {
+            1
+        };
         destroy_aggregate_local(local)?;
         local.emitted = true;
-        Ok(TransformFlushPoll::Output)
+        if selected_count == 0 {
+            output.try_set_cardinality(0)?;
+            Ok(TransformFlushPoll::Done)
+        } else {
+            Ok(TransformFlushPoll::Output)
+        }
     }
 
     pub(crate) fn finish_global(

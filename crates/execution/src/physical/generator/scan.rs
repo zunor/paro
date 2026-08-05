@@ -5,6 +5,7 @@ use super::*;
 use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
+use paro_planner::expression::ExpressionIterator;
 use paro_storage::index::{collect_predicate_columns, PredicateTree};
 
 impl PhysicalPlanGenerator {
@@ -126,6 +127,17 @@ impl PhysicalPlanGenerator {
         &mut self,
         filter: &LogicalFilter,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        if filter.projection_map.is_empty() {
+            if let LogicalOperator::Aggregate(aggregate) = &filter.child.operator {
+                if let Some(having_filter) = rebase_aggregate_only_filter(
+                    filter.expressions.clone(),
+                    aggregate.groups.len(),
+                    aggregate.aggregates.len(),
+                ) {
+                    return self.lower_aggregate_with_having(aggregate, having_filter);
+                }
+            }
+        }
         if self.ctx.rowset_scan_pushdown {
             if let LogicalOperator::Get(get) = &filter.child.operator {
                 if get.table.is_some() {
@@ -313,6 +325,52 @@ impl PhysicalPlanGenerator {
             output_types: output_types.into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Sort(spec), vec![child]))
+    }
+}
+
+fn rebase_aggregate_only_filter(
+    expressions: Vec<Expression>,
+    group_count: usize,
+    aggregate_count: usize,
+) -> Option<Box<[Expression]>> {
+    let mut expressions = normalize_filter_expressions(expressions);
+    if expressions.is_empty()
+        || !expressions
+            .iter_mut()
+            .all(|expression| rebase_aggregate_references(expression, group_count, aggregate_count))
+    {
+        return None;
+    }
+    Some(expressions.into_boxed_slice())
+}
+
+fn rebase_aggregate_references(
+    expression: &mut Expression,
+    group_count: usize,
+    aggregate_count: usize,
+) -> bool {
+    match expression {
+        Expression::Reference(reference) => {
+            let Some(rebased) = reference.index.checked_sub(group_count) else {
+                return false;
+            };
+            if rebased >= aggregate_count {
+                return false;
+            }
+            reference.index = rebased;
+            true
+        }
+        Expression::ColumnRef(_)
+        | Expression::Aggregate(_)
+        | Expression::Subquery(_)
+        | Expression::Window(_) => false,
+        _ => {
+            let mut valid = true;
+            ExpressionIterator::enumerate_children_mut(expression, |child| {
+                valid &= rebase_aggregate_references(child, group_count, aggregate_count);
+            });
+            valid
+        }
     }
 }
 

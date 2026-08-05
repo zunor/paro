@@ -203,14 +203,8 @@ impl RawRowCollection {
             let allocator = segment.allocator();
             for chunk_part in segment.chunk_parts() {
                 allocator
-                    .get_row_pointer(pin_state, chunk_part)
+                    .pin_chunk_part(pin_state, chunk_part)
                     .map_err(|e| e.to_string())?;
-
-                if chunk_part.has_heap() {
-                    allocator
-                        .pin_heap_block(pin_state, chunk_part.heap_block_index as usize)
-                        .map_err(|e| e.to_string())?;
-                }
             }
         }
         Ok(())
@@ -789,7 +783,7 @@ impl RawRowCollection {
 
         for part_idx in row_chunk.part_indices.start()..row_chunk.part_indices.end() {
             let part = &segment.chunk_parts[part_idx as usize];
-            let block_ptr = match allocator.get_row_pointer(pin_state, part) {
+            let block_ptr = match allocator.pin_chunk_part(pin_state, part) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -1142,21 +1136,26 @@ mod tests {
             MemoryTag::OrderBy,
         );
 
-        let values: Vec<String> = (0..256)
-            .map(|i| format!("long_value_{:04}_{}", i, "x".repeat(64)))
+        let values: Vec<String> = (0..VECTOR_SIZE)
+            .map(|i| format!("long_value_{:04}_{}", i, "x".repeat(1024)))
             .collect();
-        let mut append_chunk = test_chunk_with_capacity(&[LogicalType::Varchar], values.len());
-        append_chunk.set_cardinality(values.len());
-        if let Some(col) = append_chunk.column_mut(0) {
-            for (idx, value) in values.iter().enumerate() {
-                col.set_string(idx, value);
-            }
-        }
-
         let mut append_state = RawRowAppendState::new();
         collection.initialize_append(&mut append_state, RawRowPinProperties::KeepEverythingPinned);
-        collection.append(&mut append_state, &append_chunk).unwrap();
+        for range in [0..100, 100..values.len()] {
+            let mut append_chunk = test_chunk_with_capacity(&[LogicalType::Varchar], range.len());
+            append_chunk.set_cardinality(range.len());
+            if let Some(col) = append_chunk.column_mut(0) {
+                for (row_idx, value_idx) in range.enumerate() {
+                    col.set_string(row_idx, &values[value_idx]);
+                }
+            }
+            collection.append(&mut append_state, &append_chunk).unwrap();
+        }
         collection.finalize_append(&mut append_state);
+        assert!(
+            collection.segments()[0].chunks()[0].part_count() > 1,
+            "the swizzle regression requires one logical chunk spanning multiple heap blocks"
+        );
 
         // Release persistent pins and force eviction.
         collection.unpin();

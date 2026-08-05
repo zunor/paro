@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
-use paro_planner::operator::{Join, LogicalOperator};
+use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
 
 pub fn verify_logical_plan(_bind_context: &BindContext, plan: &LogicalPlan) -> Result<()> {
@@ -114,6 +114,12 @@ impl Verifier {
                     }
                 }
             }
+            LogicalOperator::Filter(filter) => {
+                let child_bindings = filter.child.get_column_bindings();
+                for expression in &filter.expressions {
+                    self.verify_expression_bindings(expression, &child_bindings, "Filter")?;
+                }
+            }
             LogicalOperator::Aggregate(agg) => {
                 let expected =
                     agg.groups.len() + agg.aggregates.len() + agg.grouping_functions.len();
@@ -172,11 +178,62 @@ impl Verifier {
         Ok(())
     }
 
+    fn verify_expression_bindings(
+        &self,
+        expression: &Expression,
+        available: &[ColumnBinding],
+        scope: &str,
+    ) -> Result<()> {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth == 0 && !available.contains(&column.binding) {
+                return Err(paro_error::internal(format!(
+                    "{scope} expression references unavailable binding {:?}; input bindings: {available:?}",
+                    column.binding
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut result = Ok(());
+        ExpressionIterator::enumerate_children(expression, |child| {
+            if result.is_ok() {
+                result = self.verify_expression_bindings(child, available, scope);
+            }
+        });
+        result
+    }
+
     fn verify_join_projection_maps(&self, join: &Join) -> Result<()> {
         match join {
             Join::Comparison(cj) => {
                 let left_len = cj.left.types().len();
                 let right_len = cj.right.types().len();
+                let left_bindings = cj.left.get_column_bindings();
+                let right_bindings = cj.right.get_column_bindings();
+                let duplicate_input = if cj.delim_flipped {
+                    right_bindings.as_slice()
+                } else {
+                    left_bindings.as_slice()
+                };
+                for expression in &cj.duplicate_eliminated_columns {
+                    self.verify_expression_bindings(
+                        expression,
+                        duplicate_input,
+                        "comparison join duplicate-eliminated key",
+                    )?;
+                }
+                for condition in &cj.conditions {
+                    self.verify_expression_bindings(
+                        &condition.left,
+                        &left_bindings,
+                        "comparison join probe key",
+                    )?;
+                    self.verify_expression_bindings(
+                        &condition.right,
+                        &right_bindings,
+                        "comparison join build key",
+                    )?;
+                }
                 for &idx in &cj.left_projection_map {
                     if idx >= left_len {
                         return Err(paro_error::internal(format!(
@@ -206,6 +263,13 @@ impl Verifier {
             Join::Any(aj) => {
                 let left_len = aj.left.types().len();
                 let right_len = aj.right.types().len();
+                let mut input_bindings = aj.left.get_column_bindings();
+                input_bindings.extend(aj.right.get_column_bindings());
+                self.verify_expression_bindings(
+                    &aj.condition,
+                    &input_bindings,
+                    "ANY join condition",
+                )?;
                 for &idx in &aj.left_projection_map {
                     if idx >= left_len {
                         return Err(paro_error::internal(format!(

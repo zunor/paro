@@ -273,12 +273,12 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 }
             }
             LogicalOperator::Projection(proj) => {
-                let layout_sensitive = proj
+                let carries_external_arguments = proj
                     .output_names
                     .iter()
-                    .any(|name| name.starts_with("__corr_") || name.starts_with("__external_arg_"));
+                    .any(|name| name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
-                if !self.everything_referenced && !layout_sensitive {
+                if !self.everything_referenced && !carries_external_arguments {
                     self.clear_unused_expressions(
                         &mut proj.expressions,
                         Some(&mut proj.output_names),
@@ -913,5 +913,61 @@ mod tests {
             ColumnBinding::new(10, 0)
         );
         assert_eq!(binding(&join.conditions[0].left), ColumnBinding::new(10, 0));
+    }
+
+    #[test]
+    fn correlation_projection_prunes_unobserved_subquery_payload() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let scan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Get(Get::new_without_table(
+                10,
+                vec![
+                    "payload_0".into(),
+                    "correlation_key".into(),
+                    "payload_1".into(),
+                ],
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                ],
+            )),
+        );
+        let mut correlation_projection = Projection::new(
+            20,
+            scan,
+            vec![int_column(10, 0), int_column(10, 2), int_column(10, 1)],
+        );
+        correlation_projection.output_names =
+            vec!["payload_0".into(), "payload_1".into(), "__corr_1".into()];
+        let correlation_projection =
+            LogicalPlan::new(ctx, LogicalOperator::Projection(correlation_projection));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                correlation_projection,
+                vec![int_column(20, 2)],
+            )),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(root) = &plan.operator else {
+            panic!("expected root projection");
+        };
+        assert_eq!(binding(&root.expressions[0]), ColumnBinding::new(20, 0));
+        let LogicalOperator::Projection(correlation) = &root.child.operator else {
+            panic!("expected correlation projection");
+        };
+        assert_eq!(correlation.output_names, vec!["__corr_1"]);
+        assert_eq!(correlation.expressions.len(), 1);
+        let LogicalOperator::Get(scan) = &correlation.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(scan.names, vec!["correlation_key"]);
     }
 }

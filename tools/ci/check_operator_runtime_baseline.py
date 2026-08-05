@@ -834,11 +834,15 @@ def _check_explain_profile_schema_guard() -> list[str]:
     for rel, source in {
         "runtime/scheduler.rs": scheduler,
         "query_executor/pipeline_driver.rs": pipeline_driver,
-        "query_executor/program_executor.rs": program_executor,
         "runtime/task_executor/parallel_finish.rs": parallel_finish,
     }.items():
         if "new_with_context" not in source or "ProfileWorkerContext::new" not in source:
             errors.append(f"PROFILE {rel} must attach pipeline/work/thread profile context")
+    if "run_bound_pipeline_runtime" not in program_executor:
+        errors.append(
+            "PROFILE query_executor/program_executor.rs must delegate control-region "
+            "pipelines to the context-aware scheduler runtime"
+        )
 
     if "record_query_memory_stats" not in program_executor or "runtime_stats()" not in program_executor:
         errors.append("PROFILE EXPLAIN ANALYZE must snapshot query memory stats before rendering")

@@ -16,6 +16,9 @@ pub struct AggregateSpec {
     pub aggregate_inputs: Box<[Box<[usize]>]>,
     pub aggregate_filters: Box<[Option<usize>]>,
     pub aggregate_orders: Box<[Box<[usize]>]>,
+    /// HAVING predicate restricted to finalized aggregate outputs. Reference
+    /// indices are rebased so column zero is the first aggregate value.
+    pub having_filter: Box<[Expression]>,
     pub perfect_hash: Option<PerfectHashAggregatePlan>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,

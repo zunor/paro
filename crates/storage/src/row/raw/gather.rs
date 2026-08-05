@@ -1285,7 +1285,7 @@ fn fetch_chunk_from_segment(
 
     for part_idx in row_chunk.part_indices.start()..row_chunk.part_indices.end() {
         let part = &segment.chunk_parts[part_idx as usize];
-        let block_ptr = match allocator.get_row_pointer(pin_state, part) {
+        let block_ptr = match allocator.pin_chunk_part(pin_state, part) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -1463,7 +1463,7 @@ fn find_row_in_segment(
                 if chunk_offset < part_count {
                     // This row is in this part
                     let allocator = segment.allocator();
-                    if let Ok(block_ptr) = allocator.get_row_pointer(pin_state, part) {
+                    if let Ok(block_ptr) = allocator.pin_chunk_part(pin_state, part) {
                         let offset = chunk_offset * row_width;
                         let row_ptr = unsafe { block_ptr.add(offset) };
                         return Some(row_ptr as *const u8);
@@ -1873,7 +1873,7 @@ mod tests {
         for chunk in &segment.chunks {
             for part_idx in chunk.part_indices.start()..chunk.part_indices.end() {
                 let part = &segment.chunk_parts[part_idx as usize];
-                if let Ok(block_ptr) = segment.allocator().get_row_pointer(&mut pin_state, part) {
+                if let Ok(block_ptr) = segment.allocator().pin_chunk_part(&mut pin_state, part) {
                     for row_in_part in 0..part.count {
                         let offset = (row_in_part as usize) * row_width;
                         let row_ptr: *mut u8 = unsafe { block_ptr.add(offset) };

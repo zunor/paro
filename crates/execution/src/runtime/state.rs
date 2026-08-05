@@ -20,10 +20,10 @@ pub use super::breaker::{
     MaterializeSinkGlobal, MaterializeSinkLocal, MaterializedSourceGlobal, MaterializedSourceLocal,
 };
 pub use crate::operators::aggregate::state::{
-    HashAggregateBuildSinkLocal, HashAggregateEmitSourceLocal, PerfectHashAggregateEmitSourceLocal,
-    PerfectHashAggregateSinkLocal, StreamingAggregateTransformGlobal,
-    StreamingAggregateTransformLocal, UngroupedAggregateEmitSourceLocal,
-    UngroupedAggregateSinkLocal,
+    HashAggregateBuildSinkLocal, HashAggregateEmitSourceGlobal, HashAggregateEmitSourceLocal,
+    HashAggregateEmitWork, PerfectHashAggregateEmitSourceLocal, PerfectHashAggregateSinkLocal,
+    StreamingAggregateTransformGlobal, StreamingAggregateTransformLocal,
+    UngroupedAggregateEmitSourceLocal, UngroupedAggregateSinkLocal,
 };
 pub use crate::operators::dml::state::{
     CopyToSinkGlobal, CopyToSinkLocal, DmlSinkGlobal, EmptyDmlSinkLocal, InsertSinkLocal,
@@ -48,8 +48,9 @@ pub use crate::operators::join::state::{
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
 pub use crate::operators::scan::state::{
     ChunkSourceGlobal, ChunkSourceLocal, EmptySourceGlobal, EmptySourceLocal,
-    ExpressionSourceGlobal, ExpressionSourceLocal, RowsetSourceGlobal, RowsetSourceLocal,
-    TableFunctionSourceGlobal, TableFunctionSourceLocal, ValuesSourceGlobal, ValuesSourceLocal,
+    ExpressionSourceGlobal, ExpressionSourceLocal, RowsetScanMorsel, RowsetSourceGlobal,
+    RowsetSourceLocal, TableFunctionSourceGlobal, TableFunctionSourceLocal, ValuesSourceGlobal,
+    ValuesSourceLocal,
 };
 pub use crate::operators::search::state::{SearchSourceGlobal, SearchSourceLocal};
 pub use crate::operators::set::state::{
@@ -110,7 +111,7 @@ pub enum SourceGlobal {
     ClassicIeJoin(Arc<crate::operators::join::sort_range::ClassicIeJoinSourceGlobal>),
     HashJoinSpillReplay(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     HashJoinUnmatched(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
-    HashAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
+    HashAggregateEmit(Arc<HashAggregateEmitSourceGlobal>),
     UngroupedAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
     PerfectHashAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
     SortEmit(Arc<BreakerHandleGlobal<SortHandle>>),

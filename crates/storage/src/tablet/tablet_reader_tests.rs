@@ -740,6 +740,28 @@ fn test_segment_iterator_skips_sequential_rowids_for_plain_scan() {
 }
 
 #[test]
+fn test_segment_iterator_ordinal_range_is_end_exclusive() {
+    let tmp = TempDir::new().unwrap();
+    let schema = create_test_schema();
+    let segment_path = tmp.path().join("ordinal_range.dat");
+    let segment = create_segment_with_values(&schema, 0, &[10, 20, 30, 40, 50], &segment_path);
+
+    let mut iter = SegmentIterator::new_with_delete_vector(&segment, vec![0], None).unwrap();
+    iter.set_ordinal_range(1, 4).unwrap();
+    let batch = iter.next_batch_with_rowid_policy(10, true).unwrap();
+
+    assert_eq!(batch.rows, 3);
+    assert_eq!(batch.rowids, vec![1, 2, 3]);
+    let values = &batch.columns[0].1.data;
+    let decoded = values
+        .chunks_exact(std::mem::size_of::<i64>())
+        .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, vec![20, 30, 40]);
+    assert!(!iter.has_next());
+}
+
+#[test]
 fn test_tablet_reader_emits_row_id_column() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path();

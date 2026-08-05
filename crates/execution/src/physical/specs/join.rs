@@ -10,9 +10,12 @@ pub struct HashJoinSpec {
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
+    /// Columns copied from the build input into the hash-table payload.
+    /// Once materialized, the payload is already dense and is never projected
+    /// by source-column indexes again.
+    pub build_input_projection: Box<[usize]>,
     pub left_output_types: Box<[LogicalType]>,
-    pub right_output_types: Box<[LogicalType]>,
+    pub build_payload_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub force_external: bool,

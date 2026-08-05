@@ -36,7 +36,8 @@ SET memory_limit = DEFAULT;
 SELECT current_setting('memory_limit') FROM memory_dummy;
 
 SET temp_directory = DEFAULT;
-SELECT current_setting('temp_directory') FROM memory_dummy;
+SELECT current_setting('temp_directory') <> '(empty)' AS has_default_temp_directory
+FROM memory_dummy;
 
 SET max_temp_directory_size = DEFAULT;
 SELECT current_setting('max_temp_directory_size') FROM memory_dummy;

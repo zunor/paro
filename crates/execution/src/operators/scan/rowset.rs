@@ -11,7 +11,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_function::scalar::FunctionExecContext;
 
 use paro_storage::index::{collect_predicate_columns, PredicateTree};
-use paro_storage::rowset::SegmentOptions;
+use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
 use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptions};
 use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
@@ -21,7 +21,13 @@ use crate::pipeline::graph::RowsetSourceSpec;
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
-use crate::runtime::state::{RowsetSourceGlobal, RowsetSourceLocal, SourceGlobal, SourceLocal};
+use crate::runtime::state::{
+    RowsetScanMorsel, RowsetSourceGlobal, RowsetSourceLocal, SourceGlobal, SourceLocal,
+};
+
+/// A scan task owns enough batches to amortize iterator initialization while
+/// exposing useful parallelism for tables stored in only one or two segments.
+const ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RowsetSourceExec {
@@ -121,13 +127,15 @@ impl RowsetSourceExec {
             .map(collect_predicate_columns)
             .unwrap_or_default()
             .into_boxed_slice();
+        let morsels = build_scan_morsels(&segments);
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
             table_index: self.desc.table_index,
             table,
             storage_snapshot,
             segments: segments.into_boxed_slice(),
-            next_segment: Default::default(),
+            morsels,
+            next_morsel: Default::default(),
             column_projection,
             overlay_delete_vectors,
             predicate,
@@ -157,25 +165,30 @@ impl RowsetSourceExec {
         loop {
             ctx.cancel.check()?;
             if local.reader.is_none() {
-                let segment_idx = if let Some(end) = local.assigned_segment_end {
+                let morsel_idx = if let Some(end) = local.assigned_morsel_end {
                     if local.next_morsel >= end {
                         return Ok(SourcePoll::Finished);
                     }
-                    let segment_idx = local.next_morsel;
+                    let morsel_idx = local.next_morsel;
                     local.next_morsel += 1;
-                    segment_idx
+                    morsel_idx
                 } else {
-                    global.next_segment.fetch_add(1, Ordering::AcqRel)
+                    global.next_morsel.fetch_add(1, Ordering::AcqRel)
                 };
-                let Some((rowset, segment)) = global.segments.get(segment_idx) else {
+                let Some(morsel) = global.morsels.get(morsel_idx) else {
                     return Ok(SourcePoll::Finished);
                 };
+                let (rowset, segment) =
+                    global.segments.get(morsel.segment_idx).ok_or_else(|| {
+                        paro_error::internal("rowset scan morsel references an invalid segment")
+                    })?;
 
                 let mut params =
                     TabletReaderParams::with_version(global.storage_snapshot.visible_version())
                         .with_projection(global.column_projection.clone())
                         .with_emit_row_id(self.desc.emit_row_id)
-                        .with_segment_handle(Arc::clone(segment));
+                        .with_segment_handle(Arc::clone(segment))
+                        .with_segment_ordinal_range(morsel.start_ordinal, morsel.end_ordinal);
                 if let Some(predicate) = &global.predicate {
                     params = params.with_predicates(predicate.clone());
                     if self.desc.late_materialize && !global.predicate_columns.is_empty() {
@@ -230,6 +243,24 @@ impl RowsetSourceExec {
         }
         Ok(combine_predicates(predicates))
     }
+}
+
+fn build_scan_morsels(segments: &[(RowsetSharedPtr, SegmentSharedPtr)]) -> Box<[RowsetScanMorsel]> {
+    segments
+        .iter()
+        .enumerate()
+        .flat_map(|(segment_idx, (_, segment))| {
+            let row_count = segment.num_rows();
+            (0..row_count)
+                .step_by(ROWSET_MORSEL_ROWS as usize)
+                .map(move |start_ordinal| RowsetScanMorsel {
+                    segment_idx,
+                    start_ordinal,
+                    end_ordinal: row_count.min(start_ordinal + ROWSET_MORSEL_ROWS),
+                })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 fn combine_predicates(predicates: Vec<PredicateTree>) -> Option<PredicateTree> {

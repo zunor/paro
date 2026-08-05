@@ -26,6 +26,7 @@ fn streaming_shape_guards_reject_misrouted_breakers() {
         aggregate_inputs: Box::new([]),
         aggregate_filters: Box::new([]),
         aggregate_orders: Box::new([]),
+        having_filter: Box::new([]),
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::BigInt].into_boxed_slice(),

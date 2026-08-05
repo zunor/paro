@@ -4,6 +4,7 @@
 //! Binder-owned logical plan deep-copy and binding remap helpers.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::binder::context::BindShared;
 use crate::binder::CorrelatedColumnInfo;
@@ -78,6 +79,7 @@ struct LogicalPlanDeepCopy {
     table_index_map: HashMap<usize, usize>,
     cte_index_map: HashMap<usize, usize>,
     preserve_logical_indices: bool,
+    preserve_statistics: bool,
     nested_subquery_copy_mode: NestedSubqueryCopyMode,
 }
 
@@ -93,6 +95,7 @@ impl LogicalPlanDeepCopy {
             table_index_map: HashMap::new(),
             cte_index_map: HashMap::new(),
             preserve_logical_indices: false,
+            preserve_statistics: false,
             nested_subquery_copy_mode: NestedSubqueryCopyMode::Deep,
         }
     }
@@ -102,6 +105,7 @@ impl LogicalPlanDeepCopy {
             table_index_map: HashMap::new(),
             cte_index_map: HashMap::new(),
             preserve_logical_indices: true,
+            preserve_statistics: true,
             nested_subquery_copy_mode: NestedSubqueryCopyMode::Deep,
         }
     }
@@ -111,6 +115,7 @@ impl LogicalPlanDeepCopy {
             table_index_map: HashMap::new(),
             cte_index_map: HashMap::new(),
             preserve_logical_indices: false,
+            preserve_statistics: false,
             nested_subquery_copy_mode: NestedSubqueryCopyMode::Shallow,
         }
     }
@@ -164,7 +169,11 @@ impl LogicalPlanDeepCopy {
         let operator = self.copy_operator(&plan.operator, bind_shared);
         LogicalPlan {
             id: bind_shared.next_plan_id(),
-            stats: NodeStats::default(),
+            stats: if self.preserve_statistics {
+                plan.stats.clone()
+            } else {
+                NodeStats::default()
+            },
             operator,
         }
     }
@@ -677,19 +686,101 @@ impl LogicalOperatorVisitor for DeepCopyBindingRewriter {
     }
 
     fn visit_replace_subquery(&mut self, expr: &mut SubqueryExpression) -> Option<Expression> {
+        let needs_outer_rebase = expr
+            .correlated_columns
+            .iter()
+            .any(|corr| self.table_index_map.contains_key(&corr.table_index));
         self.remap_correlated_columns(&mut expr.correlated_columns);
 
         if self.nested_subquery_copy_mode == NestedSubqueryCopyMode::Deep {
-            let mut copied_statement = PlannedStatement {
+            let copied_statement = PlannedStatement {
                 types: expr.subquery.types.clone(),
                 names: expr.subquery.names.clone(),
                 plan: deep_copy_plan(&expr.subquery.plan, expr.bind_snapshot.shared().as_ref()),
             };
-            self.visit_operator(&mut copied_statement.plan.operator);
-            expr.subquery = std::sync::Arc::new(copied_statement);
+            expr.subquery = Arc::new(rebase_delayed_correlations(
+                copied_statement,
+                &self.table_index_map,
+            ));
+        } else if needs_outer_rebase {
+            expr.subquery = Arc::new(rebase_delayed_correlations(
+                duplicate_statement_preserving_indices(expr),
+                &self.table_index_map,
+            ));
         }
 
         None
+    }
+}
+
+/// Rebase only references that cross into a delayed subquery. Local bindings inside the
+/// subquery belong to its own plan and must not be rewritten with the caller's index map.
+fn rebase_delayed_correlations(
+    mut statement: PlannedStatement,
+    table_index_map: &HashMap<usize, usize>,
+) -> PlannedStatement {
+    let mut rebaser = DelayedCorrelationRebaser { table_index_map };
+    rebaser.visit_operator(&mut statement.plan.operator);
+    statement
+}
+
+fn duplicate_statement_preserving_indices(expr: &SubqueryExpression) -> PlannedStatement {
+    PlannedStatement {
+        types: expr.subquery.types.clone(),
+        names: expr.subquery.names.clone(),
+        plan: duplicate_plan_preserving_indices(
+            &expr.subquery.plan,
+            expr.bind_snapshot.shared().as_ref(),
+        ),
+    }
+}
+
+struct DelayedCorrelationRebaser<'a> {
+    table_index_map: &'a HashMap<usize, usize>,
+}
+
+impl LogicalOperatorVisitor for DelayedCorrelationRebaser<'_> {
+    fn visit_operator(&mut self, op: &mut LogicalOperator) {
+        if let LogicalOperator::DependentJoin(dependent) = op {
+            remap_correlated_columns(&mut dependent.correlated_columns, self.table_index_map);
+        }
+        self.visit_operator_children(op);
+        self.visit_operator_expressions(op);
+    }
+
+    fn visit_replace_column_ref(&mut self, expr: &mut ColumnRefExpression) -> Option<Expression> {
+        if expr.depth > 0 {
+            if let Some(new_table_index) = self.table_index_map.get(&expr.binding.table_index) {
+                expr.binding = ColumnBinding::new(*new_table_index, expr.binding.column_index);
+            }
+        }
+        None
+    }
+
+    fn visit_replace_subquery(&mut self, expr: &mut SubqueryExpression) -> Option<Expression> {
+        let needs_outer_rebase = expr
+            .correlated_columns
+            .iter()
+            .any(|corr| self.table_index_map.contains_key(&corr.table_index));
+        remap_correlated_columns(&mut expr.correlated_columns, self.table_index_map);
+        if needs_outer_rebase {
+            expr.subquery = Arc::new(rebase_delayed_correlations(
+                duplicate_statement_preserving_indices(expr),
+                self.table_index_map,
+            ));
+        }
+        None
+    }
+}
+
+fn remap_correlated_columns(
+    correlated_columns: &mut [CorrelatedColumnInfo],
+    table_index_map: &HashMap<usize, usize>,
+) {
+    for correlated in correlated_columns {
+        if let Some(new_table_index) = table_index_map.get(&correlated.table_index) {
+            correlated.table_index = *new_table_index;
+        }
     }
 }
 
@@ -707,7 +798,7 @@ impl DeepCopyBindingRewriter {
 mod tests {
     use paro_common::types::LogicalType;
 
-    use super::deep_copy_plan;
+    use super::{deep_copy_plan, duplicate_plan_preserving_indices};
     use crate::binder::context::BindContext;
     use crate::binder::ir::CTEMaterialize;
     use crate::expression::{ColumnRefExpression, Expression};
@@ -803,5 +894,42 @@ mod tests {
         assert_ne!(cte.cte_index, 4);
         assert_ne!(cte_ref.table_index, 2);
         assert_eq!(cte_ref.cte_index, cte.cte_index);
+    }
+
+    #[test]
+    fn duplicate_plan_preserving_indices_keeps_nested_statistics() {
+        let bind_context = BindContext::new();
+        let mut child = LogicalPlan::new(&bind_context, expression_get(7));
+        child.stats.estimated_cardinality = Some(CardinalityEstimate::exact(456));
+        let original = LogicalPlan {
+            id: PlanNodeId(99),
+            stats: NodeStats {
+                estimated_cardinality: Some(CardinalityEstimate::exact(123)),
+            },
+            operator: LogicalOperator::Projection(Projection::new(
+                11,
+                child,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    crate::operator::ColumnBinding::new(7, 0),
+                    LogicalType::Integer,
+                ))],
+            )),
+        };
+
+        let copy = duplicate_plan_preserving_indices(&original, bind_context.shared().as_ref());
+
+        assert_eq!(copy.stats, original.stats);
+        let LogicalOperator::Projection(copy) = copy.operator else {
+            panic!("expected projection");
+        };
+        assert_eq!(
+            copy.child.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(456))
+        );
+        let LogicalOperator::ExpressionGet(copy_child) = &copy.child.operator else {
+            panic!("expected expression get");
+        };
+        assert_eq!(copy.table_index, 11);
+        assert_eq!(copy_child.table_index, 7);
     }
 }

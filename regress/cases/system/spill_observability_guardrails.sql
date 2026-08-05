@@ -65,7 +65,8 @@ EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 
 SET force_external = true;
 
--- @statement error SQLSTATE=53200
+-- RESET restores the database-owned spill directory, so forced external execution remains valid.
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 
 SET force_external = DEFAULT;

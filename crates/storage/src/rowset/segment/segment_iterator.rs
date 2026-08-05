@@ -62,6 +62,7 @@ pub struct SegmentIterator {
     column_iterators: Vec<(ColumnId, Box<dyn ColumnIterator + Send + Sync>)>,
     current_ordinal: u64,
     num_rows: u64,
+    end_ordinal: u64,
     options: SegmentOptions,
     delete_vector: Option<DeleteVector>,
     pub(super) evaluated_selection: PredicateResult,
@@ -160,6 +161,7 @@ impl SegmentIterator {
             column_iterators,
             current_ordinal: 0,
             num_rows: segment.num_rows(),
+            end_ordinal: segment.num_rows(),
             options: segment.options.clone(),
             delete_vector: None,
             evaluated_selection: PredicateResult::Unknown,
@@ -276,7 +278,21 @@ impl SegmentIterator {
     }
 
     pub fn has_next(&self) -> bool {
-        self.current_ordinal < self.num_rows
+        self.current_ordinal < self.end_ordinal
+    }
+
+    /// Restrict this iterator to an ownership-disjoint ordinal range.
+    /// Predicate bitmaps, delete vectors, and emitted row ids remain expressed
+    /// in segment-relative ordinals, so no downstream remapping is required.
+    pub fn set_ordinal_range(&mut self, start: u64, end: u64) -> Result<()> {
+        if start > end || end > self.num_rows {
+            return Err(paro_error::out_of_range(format!(
+                "Segment ordinal range [{start}, {end}) exceeds row count {}",
+                self.num_rows
+            )));
+        }
+        self.end_ordinal = end;
+        self.seek_to_ordinal(start)
     }
 
     pub fn seek_to_ordinal(&mut self, ordinal: u64) -> Result<()> {
@@ -338,7 +354,7 @@ impl SegmentIterator {
                     }
                 }
                 if !found {
-                    self.current_ordinal = self.num_rows;
+                    self.current_ordinal = self.end_ordinal;
                     self.rowid_tracker.reset();
                     return Ok(SegmentBatch::empty());
                 }
@@ -351,11 +367,11 @@ impl SegmentIterator {
 
             if selection_bitmap.is_some() || self.delete_vector.is_some() {
                 let mut rowids = Vec::with_capacity(batch_size);
-                let mut max_rowid = self.num_rows;
+                let mut max_rowid = self.end_ordinal;
                 if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
                     for range in ranges {
                         if self.current_ordinal < range.end_row as u64 {
-                            max_rowid = range.end_row as u64;
+                            max_rowid = self.end_ordinal.min(range.end_row as u64);
                             break;
                         }
                     }
@@ -378,7 +394,8 @@ impl SegmentIterator {
                 }
 
                 if rowids.is_empty() {
-                    if self.current_ordinal >= max_rowid && self.current_ordinal < self.num_rows {
+                    if self.current_ordinal >= max_rowid && self.current_ordinal < self.end_ordinal
+                    {
                         self.rowid_tracker.reset();
                         continue;
                     }
@@ -413,7 +430,8 @@ impl SegmentIterator {
             }
 
             let start_ord = self.current_ordinal as u32;
-            let mut effective_batch_size = batch_size;
+            let mut effective_batch_size =
+                batch_size.min((self.end_ordinal - self.current_ordinal) as usize);
             if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
                 for range in ranges {
                     if self.current_ordinal < range.end_row as u64 {
@@ -426,7 +444,7 @@ impl SegmentIterator {
             }
 
             if self.column_iterators.is_empty() {
-                let remaining = (self.num_rows - self.current_ordinal) as usize;
+                let remaining = (self.end_ordinal - self.current_ordinal) as usize;
                 let to_read = effective_batch_size.min(remaining);
                 let rowids = if to_read == 0 || !materialize_sequential_rowids {
                     Vec::new()
@@ -504,17 +522,17 @@ impl SegmentIterator {
                     }
                 }
                 if !found {
-                    self.current_ordinal = self.num_rows;
+                    self.current_ordinal = self.end_ordinal;
                     self.rowid_tracker.reset();
                     return Ok(SegmentBatch::empty());
                 }
             }
 
-            let mut max_rowid = self.num_rows;
+            let mut max_rowid = self.end_ordinal;
             if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
                 for range in ranges {
                     if self.current_ordinal < range.end_row as u64 {
-                        max_rowid = range.end_row as u64;
+                        max_rowid = self.end_ordinal.min(range.end_row as u64);
                         break;
                     }
                 }
@@ -600,7 +618,7 @@ impl SegmentIterator {
             }
 
             if rowids.is_empty() {
-                if self.current_ordinal >= max_rowid && self.current_ordinal < self.num_rows {
+                if self.current_ordinal >= max_rowid && self.current_ordinal < self.end_ordinal {
                     self.rowid_tracker.reset();
                     continue;
                 }
@@ -653,6 +671,7 @@ impl std::fmt::Debug for SegmentIterator {
             .field("file_path", &self.file_path)
             .field("current_ordinal", &self.current_ordinal)
             .field("num_rows", &self.num_rows)
+            .field("end_ordinal", &self.end_ordinal)
             .field("num_columns", &self.column_iterators.len())
             .field("late_materialize", &self.predicate_evaluator.is_some())
             .field("prefetcher", &self.prefetcher.is_some())

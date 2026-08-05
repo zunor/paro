@@ -15,6 +15,7 @@ pub(crate) mod distinct_helpers;
 pub mod grouped_aggregate_data;
 pub mod grouped_aggregate_hashtable;
 pub(crate) mod ordered_helpers;
+pub(crate) mod output_filter;
 pub(crate) mod payload_spill;
 pub mod perfect_aggregate_hashtable;
 pub(crate) mod perfect_hash_key;

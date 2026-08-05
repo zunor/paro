@@ -3,13 +3,10 @@
 
 //! Push filter predicates as close to data sources as semantics allow.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use paro_planner::expression::ComparisonType;
 use paro_planner::expression::ConjunctionType;
-use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, Expression, ExpressionIterator,
-};
+use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
 use paro_planner::operator::empty_result::EmptyResult;
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{
@@ -357,10 +354,7 @@ impl FilterPushdown {
                             self.pushdown_left_join(cj, left_bindings, right_bindings)
                         }
                         JoinType::Mark => {
-                            // MARK outputs the left schema plus one marker. Predicates over
-                            // left columns are safe below the join; predicates over the marker
-                            // must remain above it.
-                            self.pushdown_left_join(cj, left_bindings, right_bindings)
+                            self.pushdown_mark_join(cj, left_bindings, right_bindings)
                         }
                         JoinType::Semi | JoinType::Anti => self.pushdown_semi_anti_join(cj),
                         _ => self.finish_pushdown(LogicalOperator::Join(Join::Comparison(cj))),
@@ -375,21 +369,61 @@ impl FilterPushdown {
         }
     }
 
-    /// Get table bindings from a plan subtree.
-    fn get_table_bindings_plan(plan: &LogicalPlan) -> HashSet<usize> {
-        let mut bindings = HashSet::new();
-        Self::collect_table_bindings(&plan.operator, &mut bindings);
-        bindings
+    /// Push down through a MARK join, lowering it to a SEMI join when its marker
+    /// is consumed exclusively by a positive top-level filter.
+    ///
+    /// In a WHERE clause, retaining rows for which an IN/EXISTS marker is TRUE
+    /// has exactly semi-join semantics: FALSE and UNKNOWN are both discarded.
+    /// The rewrite is deliberately limited to a bare marker predicate and no
+    /// other marker references, so it cannot erase observable expressions or
+    /// alter three-valued logic in a compound predicate.
+    fn pushdown_mark_join(
+        &mut self,
+        mut join: ComparisonJoin,
+        left_bindings: HashSet<usize>,
+        right_bindings: HashSet<usize>,
+    ) -> LogicalOperator {
+        let Some(mark_index) = join.mark_index else {
+            return self.pushdown_left_join(join, left_bindings, right_bindings);
+        };
+        let mark_binding = paro_planner::operator::ColumnBinding::new(mark_index, 0);
+        let positive_marker = self.filters.iter().position(|filter| {
+            matches!(
+                &filter.filter,
+                Expression::ColumnRef(column)
+                    if column.depth == 0 && column.binding == mark_binding
+            )
+        });
+        let marker_reference_count = self
+            .filters
+            .iter()
+            .filter(|filter| filter.bindings.contains(&mark_index))
+            .count();
+
+        if let Some(marker_index) = positive_marker.filter(|_| marker_reference_count == 1) {
+            self.filters.remove(marker_index);
+            join.join_type = JoinType::Semi;
+            join.mark_index = None;
+            join.mark_null_condition_start = None;
+            self.pushdown_semi_anti_join(join)
+        } else {
+            // MARK outputs the left schema plus one marker. Predicates over
+            // left columns are safe below the join; predicates over the marker
+            // must remain above it.
+            self.pushdown_left_join(join, left_bindings, right_bindings)
+        }
     }
 
-    /// Recursively collect table bindings.
-    fn collect_table_bindings(op: &LogicalOperator, bindings: &mut HashSet<usize>) {
-        for idx in op.get_table_index() {
-            bindings.insert(idx);
-        }
-        for child in op.children() {
-            Self::collect_table_bindings(&child.operator, bindings);
-        }
+    /// Get table bindings from a plan subtree.
+    fn get_table_bindings_plan(plan: &LogicalPlan) -> HashSet<usize> {
+        // Predicate routing is governed by the child's output contract, not by
+        // every table index introduced somewhere below it. The latter includes
+        // bindings hidden by projections and misses synthetic outputs such as a
+        // MARK join's marker column.
+        plan.get_column_bindings()
+            .into_iter()
+            .map(|binding| binding.table_index)
+            .collect()
     }
 
     /// Push down through an inner comparison join.
@@ -399,66 +433,6 @@ impl FilterPushdown {
         left_bindings: HashSet<usize>,
         right_bindings: HashSet<usize>,
     ) -> LogicalOperator {
-        let range_condition_count = cj
-            .conditions
-            .iter()
-            .filter(|condition| {
-                matches!(
-                    condition.comparison,
-                    paro_planner::operator::JoinComparisonType::LessThan
-                        | paro_planner::operator::JoinComparisonType::LessThanOrEqual
-                        | paro_planner::operator::JoinComparisonType::GreaterThan
-                        | paro_planner::operator::JoinComparisonType::GreaterThanOrEqual
-                )
-            })
-            .count();
-        let preserve_inner_comparison = (range_condition_count == 1 || range_condition_count == 2)
-            && range_condition_count == cj.conditions.len();
-
-        if !preserve_inner_comparison {
-            // Inner join without range-only comparison handling: treat join predicates as filters
-            // and fall through to the CrossProduct + Filter path.
-            for condition in &cj.conditions {
-                let comparison_type = match condition.comparison {
-                    paro_planner::operator::JoinComparisonType::Equal => ComparisonType::Equal,
-                    paro_planner::operator::JoinComparisonType::NotEqual => {
-                        ComparisonType::NotEqual
-                    }
-                    paro_planner::operator::JoinComparisonType::LessThan => {
-                        ComparisonType::LessThan
-                    }
-                    paro_planner::operator::JoinComparisonType::GreaterThan => {
-                        ComparisonType::GreaterThan
-                    }
-                    paro_planner::operator::JoinComparisonType::LessThanOrEqual => {
-                        ComparisonType::LessThanOrEqual
-                    }
-                    paro_planner::operator::JoinComparisonType::GreaterThanOrEqual => {
-                        ComparisonType::GreaterThanOrEqual
-                    }
-                    paro_planner::operator::JoinComparisonType::NotDistinctFrom => {
-                        ComparisonType::NotDistinctFrom
-                    }
-                    paro_planner::operator::JoinComparisonType::DistinctFrom => {
-                        ComparisonType::DistinctFrom
-                    }
-                };
-                let expr = Expression::Comparison(ComparisonExpression::new(
-                    comparison_type,
-                    condition.left.clone(),
-                    condition.right.clone(),
-                ));
-                if self.add_filter(expr) == FilterResult::Unsatisfiable {
-                    return LogicalOperator::DummyScan;
-                }
-            }
-
-            self.generate_filters();
-
-            let cross = CrossProduct::new(*cj.left, *cj.right);
-            return self.pushdown_cross_product(cross, left_bindings, right_bindings);
-        }
-
         let mut left_pushdown = FilterPushdown::new();
         let mut right_pushdown = FilterPushdown::new();
         let mut left_unsat = false;
@@ -466,6 +440,25 @@ impl FilterPushdown {
         let mut remaining_filters = Vec::new();
 
         for filter in self.filters.drain(..) {
+            for implied in Self::derive_or_domain_filters(&filter.filter) {
+                match Self::get_expression_side(&implied, &left_bindings, &right_bindings) {
+                    JoinSide::Left => {
+                        if !left_unsat
+                            && left_pushdown.add_filter(implied) == FilterResult::Unsatisfiable
+                        {
+                            left_unsat = true;
+                        }
+                    }
+                    JoinSide::Right => {
+                        if !right_unsat
+                            && right_pushdown.add_filter(implied) == FilterResult::Unsatisfiable
+                        {
+                            right_unsat = true;
+                        }
+                    }
+                    JoinSide::Both | JoinSide::None => {}
+                }
+            }
             let side = Self::get_expression_side(&filter.filter, &left_bindings, &right_bindings);
             match side {
                 JoinSide::Left => {
@@ -667,6 +660,21 @@ impl FilterPushdown {
         let mut join_filters = Vec::new();
 
         for filter in self.filters.drain(..) {
+            for implied in Self::derive_or_domain_filters(&filter.filter) {
+                match Self::get_expression_side(&implied, &left_bindings, &right_bindings) {
+                    JoinSide::Left => {
+                        if left_pushdown.add_filter(implied) == FilterResult::Unsatisfiable {
+                            return LogicalOperator::DummyScan;
+                        }
+                    }
+                    JoinSide::Right => {
+                        if right_pushdown.add_filter(implied) == FilterResult::Unsatisfiable {
+                            return LogicalOperator::DummyScan;
+                        }
+                    }
+                    JoinSide::Both | JoinSide::None => {}
+                }
+            }
             let side = Self::get_expression_side(&filter.filter, &left_bindings, &right_bindings);
             match side {
                 JoinSide::Left => {
@@ -718,6 +726,122 @@ impl FilterPushdown {
             side = JoinSide::combine(side, binding_side);
         }
         side
+    }
+
+    /// Derive side-local domain predicates implied by every branch of an OR expression.
+    ///
+    /// `(a = 1 AND b = 2) OR (a = 2 AND b = 1)` implies both `a IN (1, 2)` and
+    /// `b IN (1, 2)`. Keeping the original predicate preserves the correlation between domains;
+    /// the implied predicates only reduce rows before the join.
+    fn derive_or_domain_filters(expr: &Expression) -> Vec<Expression> {
+        if expr.evaluation_properties().is_reorder_fence() {
+            return Vec::new();
+        }
+        let mut branches = Vec::new();
+        Self::flatten_disjunction(expr, &mut branches);
+        if branches.len() < 2 {
+            return Vec::new();
+        }
+
+        let mut common_domains: Option<
+            HashMap<paro_planner::operator::ColumnBinding, Vec<Expression>>,
+        > = None;
+        for branch in branches {
+            let mut branch_domains = HashMap::new();
+            Self::collect_branch_equalities(branch, &mut branch_domains);
+            if branch_domains.is_empty() {
+                return Vec::new();
+            }
+            match &mut common_domains {
+                None => common_domains = Some(branch_domains),
+                Some(common) => {
+                    common.retain(|binding, values| {
+                        let Some(branch_values) = branch_domains.get(binding) else {
+                            return false;
+                        };
+                        for value in branch_values {
+                            if !values.iter().any(|existing| existing.equals(value)) {
+                                values.push(value.clone());
+                            }
+                        }
+                        true
+                    });
+                    if common.is_empty() {
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+
+        let mut domains = common_domains
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        domains.sort_unstable_by_key(|(binding, _)| (binding.table_index, binding.column_index));
+        domains
+            .into_iter()
+            .map(|(_, comparisons)| match comparisons.as_slice() {
+                [comparison] => comparison.clone(),
+                _ => Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+                    ConjunctionType::Or,
+                    comparisons,
+                )),
+            })
+            .collect()
+    }
+
+    fn flatten_disjunction<'a>(expr: &'a Expression, output: &mut Vec<&'a Expression>) {
+        match expr {
+            Expression::Conjunction(conjunction)
+                if conjunction.conjunction_type == ConjunctionType::Or =>
+            {
+                for child in &conjunction.children {
+                    Self::flatten_disjunction(child, output);
+                }
+            }
+            expr => output.push(expr),
+        }
+    }
+
+    fn collect_branch_equalities(
+        expr: &Expression,
+        domains: &mut HashMap<paro_planner::operator::ColumnBinding, Vec<Expression>>,
+    ) {
+        if let Expression::Conjunction(conjunction) = expr {
+            if conjunction.conjunction_type == ConjunctionType::And {
+                for child in &conjunction.children {
+                    Self::collect_branch_equalities(child, domains);
+                }
+                return;
+            }
+        }
+        let Expression::Comparison(comparison) = expr else {
+            return;
+        };
+        if comparison.comparison_type != paro_planner::expression::ComparisonType::Equal {
+            return;
+        }
+        let (Expression::ColumnRef(column), Expression::Constant(_)) =
+            (comparison.left.as_ref(), comparison.right.as_ref())
+        else {
+            let (Expression::Constant(constant), Expression::ColumnRef(column)) =
+                (comparison.left.as_ref(), comparison.right.as_ref())
+            else {
+                return;
+            };
+            let canonical =
+                Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                    paro_planner::expression::ComparisonType::Equal,
+                    Expression::ColumnRef(column.clone()),
+                    Expression::Constant(constant.clone()),
+                ));
+            domains.entry(column.binding).or_default().push(canonical);
+            return;
+        };
+        domains
+            .entry(column.binding)
+            .or_default()
+            .push(expr.clone());
     }
 
     /// Push down through an Aggregate operator.
@@ -892,668 +1016,5 @@ impl Default for FilterPushdown {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use paro_common::chunk::Chunk;
-    use paro_common::error::Result;
-    use paro_common::types::LogicalType;
-    use paro_common::vector::Vector;
-    use paro_external::routine::boundary::PlacementClass;
-    use paro_function::scalar::{ExpressionState, FunctionStability, ScalarFunction};
-    use paro_planner::binder::context::BindContext;
-    use paro_planner::expression::{
-        ComparisonExpression, ComparisonType, ConjunctionExpression, ConstantExpression,
-        FunctionExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
-    };
-    use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
-    };
-    use paro_planner::plan::LogicalPlan;
-
-    fn plan(ctx: &BindContext, op: LogicalOperator) -> LogicalPlan {
-        LogicalPlan::new(ctx, op)
-    }
-
-    fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
-    }
-
-    fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: paro_common::runtime_value::Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
-    }
-
-    fn noop_scalar_execute(
-        _input: &Chunk,
-        _state: &dyn ExpressionState,
-        _result: &mut Vector,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn external_call() -> Expression {
-        let function = ScalarFunction::new(
-            "external_test".to_string(),
-            vec![],
-            LogicalType::Integer,
-            noop_scalar_execute,
-        );
-        let mut expression = FunctionExpression::new(function, vec![], LogicalType::Integer);
-        expression
-            .routine_meta
-            .as_mut()
-            .expect("builtin routine metadata")
-            .boundary
-            .placement = PlacementClass::External;
-        Expression::Function(expression)
-    }
-
-    fn volatile_call() -> Expression {
-        let function = ScalarFunction::new(
-            "volatile_test".to_string(),
-            vec![],
-            LogicalType::Integer,
-            noop_scalar_execute,
-        )
-        .with_stability(FunctionStability::Volatile);
-        Expression::Function(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Integer,
-        ))
-    }
-
-    fn window_with_start_offset(offset: Expression) -> Expression {
-        Expression::Window(WindowExpression {
-            function: paro_function::window::WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(offset)),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        })
-    }
-
-    fn make_comparison(
-        comp_type: ComparisonType,
-        left: Expression,
-        right: Expression,
-    ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comp_type, left, right))
-    }
-
-    fn make_get(table_index: usize) -> LogicalOperator {
-        LogicalOperator::Get(Get::new_without_table(
-            table_index,
-            vec!["col0".to_string(), "col1".to_string()],
-            vec![LogicalType::Integer, LogicalType::Varchar],
-        ))
-    }
-
-    fn make_delim_join(ctx: &BindContext, join_type: JoinType) -> LogicalOperator {
-        let left = plan(ctx, make_get(0));
-        let right = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
-            JoinType::Inner,
-            plan(ctx, make_get(1)),
-            plan(
-                ctx,
-                LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer])),
-            ),
-            vec![JoinCondition::new(
-                make_column_ref(1, 0),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(99, 0),
-                    LogicalType::Integer,
-                )),
-                JoinComparisonType::Equal,
-            )],
-        )));
-
-        let mut join = ComparisonJoin::new(
-            join_type,
-            left,
-            plan(ctx, right),
-            vec![JoinCondition::new(
-                make_column_ref(0, 0),
-                make_column_ref(1, 0),
-                JoinComparisonType::Equal,
-            )],
-        );
-        join.duplicate_eliminated_columns = vec![make_column_ref(0, 0)];
-        LogicalOperator::Join(Join::Comparison(join))
-    }
-
-    fn contains_empty_result(p: &LogicalPlan) -> bool {
-        if p.is_empty_result() {
-            return true;
-        }
-        p.children()
-            .iter()
-            .any(|child| contains_empty_result(child))
-    }
-
-    #[test]
-    fn test_filter_extract_bindings() {
-        let expr = make_comparison(
-            ComparisonType::Equal,
-            make_column_ref(0, 0),
-            make_constant(5),
-        );
-
-        let filter = Filter::new(expr);
-        assert!(filter.bindings.contains(&0));
-        assert_eq!(filter.bindings.len(), 1);
-    }
-
-    #[test]
-    fn test_filter_extract_bindings_multiple() {
-        let expr = make_comparison(
-            ComparisonType::Equal,
-            make_column_ref(0, 0),
-            make_column_ref(1, 0),
-        );
-
-        let filter = Filter::new(expr);
-        assert!(filter.bindings.contains(&0));
-        assert!(filter.bindings.contains(&1));
-        assert_eq!(filter.bindings.len(), 2);
-    }
-
-    #[test]
-    fn test_filter_extract_bindings_visits_window_frame_offsets() {
-        let filter = Filter::new(window_with_start_offset(make_column_ref(7, 0)));
-
-        assert_eq!(filter.bindings, HashSet::from([7]));
-    }
-
-    #[test]
-    fn test_external_routine_detection_visits_window_frame_offsets() {
-        let expression = window_with_start_offset(external_call());
-
-        assert!(expression.contains_external_routine());
-    }
-
-    #[test]
-    fn test_projection_boundary_check_visits_window_frame_offsets() {
-        let ctx = BindContext::new();
-        let projection = Projection::new(7, plan(&ctx, make_get(0)), vec![external_call()]);
-        let expression = window_with_start_offset(make_column_ref(7, 0));
-
-        assert!(projection_reference_crosses_execution_boundary(
-            &projection,
-            &expression
-        ));
-    }
-
-    #[test]
-    fn test_pushdown_filter_through_filter() {
-        let ctx = BindContext::new();
-        let get = make_get(0);
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(0, 0),
-            make_constant(5),
-        );
-        let filter = PlannerFilter::new(plan(&ctx, get), vec![filter_expr]);
-        let op = LogicalOperator::Filter(filter);
-
-        let mut pushdown = FilterPushdown::new();
-        let result = pushdown.rewrite(op);
-
-        // Filter should be pushed down to create Filter(Get)
-        match result {
-            LogicalOperator::Filter(f) => {
-                assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
-            }
-            _ => panic!("Expected Filter operator"),
-        }
-    }
-
-    #[test]
-    fn test_pushdown_through_projection() {
-        let ctx = BindContext::new();
-        // Create: Filter(Projection(Get))
-        // Filter: proj.col0 > 5
-        // Projection: [get.col0, get.col1]
-        let get = make_get(0);
-        let proj = Projection::new(
-            1, // projection table index
-            plan(&ctx, get),
-            vec![make_column_ref(0, 0), make_column_ref(0, 1)],
-        );
-
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(1, 0), // references projection output
-            make_constant(5),
-        );
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Projection(proj)),
-            vec![filter_expr],
-        );
-        let op = LogicalOperator::Filter(filter);
-
-        let mut pushdown = FilterPushdown::new();
-        let result = pushdown.rewrite(op);
-
-        // Filter should be pushed through projection
-        // Result should be: Projection(Filter(Get))
-        match result {
-            LogicalOperator::Projection(p) => match p.child.operator {
-                LogicalOperator::Filter(f) => {
-                    assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
-                }
-                _ => panic!("Expected Filter under Projection"),
-            },
-            _ => panic!("Expected Projection operator"),
-        }
-    }
-
-    #[test]
-    fn test_filter_stays_above_volatile_projection() {
-        let ctx = BindContext::new();
-        let projection = Projection::new(1, plan(&ctx, make_get(0)), vec![volatile_call()]);
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(1, 0),
-            make_constant(5),
-        );
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Projection(projection)),
-            vec![filter_expr],
-        );
-
-        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
-
-        let LogicalOperator::Filter(filter) = result else {
-            panic!("expected evaluation fence above volatile projection");
-        };
-        assert!(matches!(
-            filter.child.operator,
-            LogicalOperator::Projection(_)
-        ));
-    }
-
-    #[test]
-    fn test_pushdown_through_cross_product() {
-        let ctx = BindContext::new();
-        // Create: Filter(Cross(Get0, Get1))
-        // Filter: get0.col0 > 5 (only references left side)
-        let left = make_get(0);
-        let right = make_get(1);
-        let cross = CrossProduct::new(plan(&ctx, left), plan(&ctx, right));
-
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(0, 0), // references left side only
-            make_constant(5),
-        );
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Join(Join::Cross(cross))),
-            vec![filter_expr],
-        );
-        let op = LogicalOperator::Filter(filter);
-
-        let mut pushdown = FilterPushdown::new();
-        let result = pushdown.rewrite(op);
-
-        // Filter should be pushed to left side
-        // Result should be: Cross(Filter(Get0), Get1)
-        match result {
-            LogicalOperator::Join(Join::Cross(cp)) => {
-                match cp.left.operator {
-                    LogicalOperator::Filter(f) => {
-                        assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
-                    }
-                    _ => panic!("Expected Filter on left side"),
-                }
-                assert!(matches!(cp.right.operator, LogicalOperator::Get(_)));
-            }
-            _ => panic!("Expected Cross product"),
-        }
-    }
-
-    #[test]
-    fn test_volatile_filter_stays_above_cross_product() {
-        let ctx = BindContext::new();
-        let cross = CrossProduct::new(plan(&ctx, make_get(0)), plan(&ctx, make_get(1)));
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(0, 0),
-            volatile_call(),
-        );
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Join(Join::Cross(cross))),
-            vec![filter_expr],
-        );
-
-        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
-
-        let LogicalOperator::Filter(filter) = result else {
-            panic!("expected volatile predicate to remain above cross product");
-        };
-        assert!(matches!(
-            filter.child.operator,
-            LogicalOperator::Join(Join::Cross(_))
-        ));
-    }
-
-    #[test]
-    fn test_volatile_inner_join_condition_is_not_converted_to_input_filter() {
-        let ctx = BindContext::new();
-        let join = ComparisonJoin::new(
-            JoinType::Inner,
-            plan(&ctx, make_get(0)),
-            plan(&ctx, make_get(1)),
-            vec![JoinCondition::new(
-                make_column_ref(0, 0),
-                volatile_call(),
-                JoinComparisonType::Equal,
-            )],
-        );
-
-        let result = FilterPushdown::new().rewrite(LogicalOperator::Join(Join::Comparison(join)));
-
-        assert!(matches!(result, LogicalOperator::Join(Join::Comparison(_))));
-    }
-
-    #[test]
-    fn test_pushdown_join_filter_stays_above() {
-        let ctx = BindContext::new();
-        // Create: Filter(Cross(Get0, Get1))
-        // Filter: get0.col0 = get1.col0 (references both sides)
-        let left = make_get(0);
-        let right = make_get(1);
-        let cross = CrossProduct::new(plan(&ctx, left), plan(&ctx, right));
-
-        let filter_expr = make_comparison(
-            ComparisonType::Equal,
-            make_column_ref(0, 0), // references left
-            make_column_ref(1, 0), // references right
-        );
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Join(Join::Cross(cross))),
-            vec![filter_expr],
-        );
-        let op = LogicalOperator::Filter(filter);
-
-        let mut pushdown = FilterPushdown::new();
-        let result = pushdown.rewrite(op);
-
-        // Filter referencing both sides should stay above the join
-        match result {
-            LogicalOperator::Filter(f) => {
-                assert!(matches!(
-                    f.child.operator,
-                    LogicalOperator::Join(Join::Cross(_))
-                ));
-            }
-            _ => panic!("Expected Filter above Cross product"),
-        }
-    }
-
-    #[test]
-    fn test_mark_join_pushes_left_predicates_but_keeps_marker_predicate() {
-        let ctx = BindContext::new();
-        let left = LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            plan(&ctx, make_get(0)),
-            plan(&ctx, make_get(1)),
-        )));
-        let mut join = ComparisonJoin::new(
-            JoinType::Mark,
-            plan(&ctx, left),
-            plan(&ctx, make_get(2)),
-            vec![JoinCondition::new(
-                make_column_ref(0, 0),
-                make_column_ref(2, 0),
-                JoinComparisonType::Equal,
-            )],
-        );
-        let mark_index = 90;
-        join.mark_index = Some(mark_index);
-        let marker = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(mark_index, 0),
-            LogicalType::Boolean,
-        ));
-        let left_predicate = make_comparison(
-            ComparisonType::Equal,
-            make_column_ref(0, 0),
-            make_column_ref(1, 0),
-        );
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
-            vec![left_predicate, marker],
-        );
-
-        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
-
-        let LogicalOperator::Filter(filter) = result else {
-            panic!("marker predicate must remain above the MARK join");
-        };
-        assert_eq!(filter.expressions.len(), 1);
-        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
-            panic!("expected MARK join below marker filter");
-        };
-        assert_eq!(join.join_type, JoinType::Mark);
-        assert!(matches!(join.left.operator, LogicalOperator::Filter(_)));
-    }
-
-    #[test]
-    fn test_pushdown_through_order() {
-        let ctx = BindContext::new();
-        let get = make_get(0);
-        let order = paro_planner::operator::Order {
-            child: Box::new(plan(&ctx, get)),
-            orders: vec![],
-            projection_map: Vec::new(),
-        };
-
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(0, 0),
-            make_constant(5),
-        );
-        let filter =
-            PlannerFilter::new(plan(&ctx, LogicalOperator::Order(order)), vec![filter_expr]);
-        let op = LogicalOperator::Filter(filter);
-
-        let mut pushdown = FilterPushdown::new();
-        let result = pushdown.rewrite(op);
-
-        // Filter should be pushed through Order
-        match result {
-            LogicalOperator::Order(o) => match o.child.operator {
-                LogicalOperator::Filter(f) => {
-                    assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
-                }
-                _ => panic!("Expected Filter under Order"),
-            },
-            _ => panic!("Expected Order operator"),
-        }
-    }
-
-    #[test]
-    fn test_filter_stays_above_limit() {
-        let ctx = BindContext::new();
-        let get = make_get(0);
-        let limit =
-            paro_planner::operator::Limit::new(plan(&ctx, get), Some(make_constant(10)), None);
-
-        let filter_expr = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(0, 0),
-            make_constant(5),
-        );
-        let filter =
-            PlannerFilter::new(plan(&ctx, LogicalOperator::Limit(limit)), vec![filter_expr]);
-        let op = LogicalOperator::Filter(filter);
-
-        let mut pushdown = FilterPushdown::new();
-        let result = pushdown.rewrite(op);
-
-        // Filtering before LIMIT can select replacement rows, so the predicate must stay above it.
-        match result {
-            LogicalOperator::Filter(filter) => {
-                assert!(matches!(filter.child.operator, LogicalOperator::Limit(_)));
-            }
-            _ => panic!("Expected Filter above Limit"),
-        }
-    }
-
-    #[test]
-    fn test_pushdown_preserves_delim_join_shape() {
-        let ctx = BindContext::new();
-        let filter = PlannerFilter::new(
-            plan(&ctx, make_delim_join(&ctx, JoinType::Inner)),
-            vec![make_comparison(
-                ComparisonType::GreaterThan,
-                make_column_ref(0, 0),
-                make_constant(5),
-            )],
-        );
-        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
-
-        match result {
-            LogicalOperator::Join(Join::Comparison(join)) => {
-                assert!(!join.duplicate_eliminated_columns.is_empty());
-                assert!(matches!(join.left.operator, LogicalOperator::Filter(_)));
-                assert!(!contains_empty_result(&join.right));
-            }
-            _ => panic!("expected delim comparison join"),
-        }
-    }
-
-    #[test]
-    fn test_pushdown_rhs_conflict_materializes_empty_result_inside_delim_subtree() {
-        let ctx = BindContext::new();
-        let left = plan(&ctx, make_get(0));
-        let rhs_base = LogicalOperator::Filter(PlannerFilter::new(
-            plan(&ctx, make_get(1)),
-            vec![make_comparison(
-                ComparisonType::Equal,
-                make_column_ref(1, 0),
-                make_constant(1),
-            )],
-        ));
-        let rhs = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
-            JoinType::Inner,
-            plan(&ctx, rhs_base),
-            plan(
-                &ctx,
-                LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer])),
-            ),
-            vec![JoinCondition::new(
-                make_column_ref(1, 0),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(99, 0),
-                    LogicalType::Integer,
-                )),
-                JoinComparisonType::Equal,
-            )],
-        )));
-        let mut join = ComparisonJoin::new(
-            JoinType::Mark,
-            left,
-            plan(&ctx, rhs),
-            vec![JoinCondition::new(
-                make_column_ref(0, 0),
-                make_column_ref(1, 0),
-                JoinComparisonType::Equal,
-            )],
-        );
-        join.duplicate_eliminated_columns = vec![make_column_ref(0, 0)];
-
-        let filter = PlannerFilter::new(
-            plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
-            vec![make_comparison(
-                ComparisonType::Equal,
-                make_column_ref(1, 0),
-                make_constant(2),
-            )],
-        );
-        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
-
-        match result {
-            LogicalOperator::Join(Join::Comparison(join)) => {
-                assert!(contains_empty_result(&join.right));
-            }
-            _ => panic!("expected join with empty result in rhs subtree"),
-        }
-    }
-
-    #[test]
-    fn test_split_predicates() {
-        // Create: a > 5 AND b < 10
-        let left = make_comparison(
-            ComparisonType::GreaterThan,
-            make_column_ref(0, 0),
-            make_constant(5),
-        );
-        let right = make_comparison(
-            ComparisonType::LessThan,
-            make_column_ref(0, 1),
-            make_constant(10),
-        );
-        let and_expr = Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: vec![left, right],
-        });
-
-        let predicates = FilterPushdown::split_predicates(and_expr);
-        assert_eq!(predicates.len(), 2);
-    }
-
-    #[test]
-    fn test_get_expression_side() {
-        let left_bindings: HashSet<usize> = [0].into_iter().collect();
-        let right_bindings: HashSet<usize> = [1].into_iter().collect();
-
-        // Expression referencing only left
-        let left_expr = make_column_ref(0, 0);
-        assert_eq!(
-            FilterPushdown::get_expression_side(&left_expr, &left_bindings, &right_bindings),
-            JoinSide::Left
-        );
-
-        // Expression referencing only right
-        let right_expr = make_column_ref(1, 0);
-        assert_eq!(
-            FilterPushdown::get_expression_side(&right_expr, &left_bindings, &right_bindings),
-            JoinSide::Right
-        );
-
-        // Expression referencing both
-        let both_expr = make_comparison(
-            ComparisonType::Equal,
-            make_column_ref(0, 0),
-            make_column_ref(1, 0),
-        );
-        assert_eq!(
-            FilterPushdown::get_expression_side(&both_expr, &left_bindings, &right_bindings),
-            JoinSide::Both
-        );
-
-        // Constant expression
-        let const_expr = make_constant(5);
-        assert_eq!(
-            FilterPushdown::get_expression_side(&const_expr, &left_bindings, &right_bindings),
-            JoinSide::None
-        );
-    }
-}
+#[path = "pushdown_tests.rs"]
+mod tests;

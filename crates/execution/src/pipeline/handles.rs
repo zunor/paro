@@ -127,7 +127,9 @@ impl BreakerHandleCatalogBuilder {
             .entries
             .get_mut(id.index())
             .ok_or_else(|| paro_error::internal("unknown breaker handle id"))?;
-        entry.consumers.push(consumer);
+        if !entry.consumers.contains(&consumer) {
+            entry.consumers.push(consumer);
+        }
         Ok(())
     }
 

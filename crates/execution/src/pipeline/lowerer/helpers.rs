@@ -70,7 +70,6 @@ pub(crate) fn hash_join_probe_transform(
         join_type: spec.join_type,
         conditions: spec.conditions.clone(),
         left_projection: spec.left_projection.clone(),
-        right_projection: spec.right_projection.clone(),
         output_names: spec.output_names.clone(),
         output_types: spec.output_types.clone(),
     })

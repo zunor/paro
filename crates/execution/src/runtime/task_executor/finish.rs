@@ -188,6 +188,10 @@ impl PipelineTaskExecutor {
             self.completion_stage = PipelineCompletionStage::PrepareFinish;
             return Ok(TaskStepResult::Continue);
         };
+        if self.defer_shared_producer_merge {
+            self.completion_stage = PipelineCompletionStage::PrepareFinish;
+            return Ok(TaskStepResult::Continue);
+        }
 
         match shared.mark_producer_merged()? {
             SharedSinkMergeEvent::WaitingForProducers { .. } => {

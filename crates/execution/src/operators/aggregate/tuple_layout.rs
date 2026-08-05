@@ -379,6 +379,75 @@ impl TupleLayout {
         }
     }
 
+    /// Gather one serialized group column into a flat vector.
+    ///
+    /// Fixed-width keys are copied directly into the vector's physical buffer,
+    /// avoiding a `Value` allocation and dispatch for every group. Variable-
+    /// length keys retain the typed deserializer because their row references
+    /// may point into the aggregate heap.
+    ///
+    /// # Safety
+    /// `row_base` must reference `count` initialized rows separated by
+    /// `row_stride` bytes, each encoded with this layout.
+    pub unsafe fn gather_group_column(
+        &self,
+        row_base: *const u8,
+        row_stride: usize,
+        count: usize,
+        group_idx: usize,
+        varlen_heap: &VarlenHeap,
+        result: &mut Vector,
+    ) -> Result<()> {
+        let group_type = self.group_types.get(group_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "Group index out of bounds in TupleLayout gather: idx={group_idx}, count={}",
+                self.group_count()
+            ))
+        })?;
+        if result.logical_type() != group_type {
+            return Err(paro_error::internal(format!(
+                "Group gather type mismatch: expected={group_type:?}, actual={:?}",
+                result.logical_type()
+            )));
+        }
+        result.try_set_count(count)?;
+        result.validity_mut().try_set_all_valid(count)?;
+
+        if self.varlen_groups[group_idx] {
+            for row_idx in 0..count {
+                // SAFETY: guaranteed by this method's caller contract.
+                let row_ptr = unsafe { row_base.add(row_idx * row_stride) };
+                let value = self.deserialize_group_value(row_ptr, group_idx, varlen_heap)?;
+                result.set_value(row_idx, &value);
+            }
+            return Ok(());
+        }
+
+        let width = group_storage_width(group_type)?;
+        // SAFETY: the logical-type equality above guarantees that the vector's
+        // flat physical width matches `width`, and it has capacity for `count` rows.
+        let target = unsafe { result.flat_data_mut::<u8>() };
+        for row_idx in 0..count {
+            // SAFETY: guaranteed by this method's caller contract, and the
+            // target vector owns at least `count * width` physical bytes.
+            let row_ptr = unsafe { row_base.add(row_idx * row_stride) };
+            if !row_is_valid(row_ptr, group_idx) {
+                result.validity_mut().try_set_null(row_idx)?;
+                continue;
+            }
+            // SAFETY: the source row follows this layout, the destination slot is
+            // within the initialized vector capacity, and the ranges do not overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row_ptr.add(self.group_offsets[group_idx]),
+                    target.add(row_idx * width),
+                    width,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Deserialize full group key from one row.
     pub fn deserialize_group_key(
         &self,

@@ -138,9 +138,13 @@ impl<'a> PipelineLowerer<'a> {
             self.recursive_cte_handles.remove(&spec.cte_index);
         }
         let recursive_sink = recursive_result?;
-        let recursive = (first_recursive_pipeline..pipelines.len())
-            .map(PipelineId::new)
-            .collect::<Vec<_>>();
+        let recursive =
+            recursive_loop_pipelines(first_recursive_pipeline, pipelines, dependencies, working);
+        if !recursive.contains(&recursive_sink) {
+            return Err(paro_error::internal(
+                "recursive CTE sink is not reachable from its working-table scan",
+            ));
+        }
 
         let source = SourceSpec::RecursiveTableScan(RecursiveTableScanSourceSpec {
             handle: accumulated,
@@ -188,4 +192,63 @@ impl<'a> PipelineLowerer<'a> {
         self.control_region_roots.insert(emit, region_id);
         Ok(emit)
     }
+}
+
+/// Find the pipelines that must run on every recursive iteration.
+///
+/// Lowering a recursive term can also create loop-invariant breaker producers,
+/// such as the build side of a hash join against a constant relation. Those
+/// producers remain ordinary dependencies and are executed once before the
+/// first iteration. Only pipelines downstream of the recursive working-table
+/// scan belong to the loop itself.
+fn recursive_loop_pipelines(
+    first_pipeline: usize,
+    pipelines: &[PipelineSpec],
+    dependencies: &[PipelineDependency],
+    working: BreakerHandleId,
+) -> Vec<PipelineId> {
+    let in_recursive_term = |pipeline: PipelineId| pipeline.index() >= first_pipeline;
+    let mut members = pipelines
+        .iter()
+        .skip(first_pipeline)
+        .filter_map(|pipeline| match &pipeline.source {
+            SourceSpec::RecursiveTableScan(source) if source.handle == working => Some(pipeline.id),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    loop {
+        let mut changed = false;
+        for dependency in dependencies {
+            if members.contains(&dependency.producer)
+                && in_recursive_term(dependency.consumer)
+                && members.insert(dependency.consumer)
+            {
+                changed = true;
+            }
+        }
+
+        let recursive_shared_sinks = pipelines
+            .iter()
+            .filter(|pipeline| members.contains(&pipeline.id))
+            .filter_map(|pipeline| match pipeline.sink_sharing {
+                SinkSharing::Shared(id) => Some(id),
+                SinkSharing::Exclusive => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for pipeline in pipelines.iter().skip(first_pipeline) {
+            if let SinkSharing::Shared(id) = pipeline.sink_sharing {
+                if recursive_shared_sinks.contains(&id) && members.insert(pipeline.id) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort_unstable();
+    members
 }

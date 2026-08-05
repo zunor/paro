@@ -17,7 +17,9 @@ use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
 use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types, JoinKeySide};
-use crate::operators::join::hash::memory::hash_join_memory_context;
+use crate::operators::join::hash::memory::{
+    hash_join_memory_context, hash_join_spill_memory_context,
+};
 use crate::operators::join::hash::payload::build_payload_chunk_ref;
 use crate::physical::properties::MemoryClass;
 use crate::physical::properties::RequiredProperties;
@@ -52,11 +54,11 @@ impl HashJoinBuildSinkExec {
             self.build_payload_types.to_vec(),
             self.join_type,
             hash_join_memory_context(ctx.query),
-        );
+        )?;
         ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
             HashJoinBuildSpillReclaimer::new(
                 handle.clone(),
-                hash_join_memory_context(ctx.query),
+                hash_join_spill_memory_context(ctx.query),
                 ctx.query.memory.capacity_bytes(),
             ),
         ));
@@ -94,7 +96,7 @@ impl HashJoinBuildSinkExec {
                         local_id,
                         Arc::clone(&hash_table),
                         Arc::clone(&build_spill),
-                        hash_join_memory_context(ctx.query),
+                        hash_join_spill_memory_context(ctx.query),
                         ctx.query.memory.capacity_bytes(),
                     ),
                 ));

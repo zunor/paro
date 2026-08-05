@@ -117,7 +117,7 @@ impl RowsetCursor {
                 Vec::new()
             };
 
-            let iter = if use_late_materialize && !predicate_columns.is_empty() {
+            let mut iter = if use_late_materialize && !predicate_columns.is_empty() {
                 SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
                     &seg,
                     col_ids,
@@ -135,6 +135,9 @@ impl RowsetCursor {
                     params.prefetcher.clone(),
                 )?
             };
+            if let Some((start, end)) = params.segment_ordinal_range {
+                iter.set_ordinal_range(start, end)?;
+            }
             if iter.num_columns() == 0 && !params.emit_row_id && projection.is_empty() {
                 continue;
             };
@@ -292,6 +295,11 @@ impl TabletReader {
         params: TabletReaderParams,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
+        if params.segment_ordinal_range.is_some() && params.segment.is_none() {
+            return Err(paro_error::invalid_input(
+                "segment ordinal range requires an explicit segment handle",
+            ));
+        }
         let schema = tablet
             .schema()
             .ok_or_else(|| paro_error::internal("Tablet schema not available"))?;

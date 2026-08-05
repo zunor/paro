@@ -6,7 +6,10 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::VECTOR_SIZE;
+use paro_function::scalar::FunctionExecContext;
 
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
+use crate::operators::aggregate::output_filter::copy_selected_rows;
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
@@ -18,6 +21,7 @@ use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
     BreakerHandleGlobal, PerfectHashAggregateEmitSourceLocal, SourceGlobal, SourceLocal,
 };
+use crate::runtime::ExpressionEvalInput;
 
 #[derive(Debug, Clone)]
 pub struct PerfectHashAggregateEmitSourceExec {
@@ -36,12 +40,30 @@ impl PerfectHashAggregateEmitSourceExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        Ok(SourceLocal::PerfectHashAggregateEmit(
-            PerfectHashAggregateEmitSourceLocal::default(),
-        ))
+        let mut local = PerfectHashAggregateEmitSourceLocal::default();
+        if !self.spec.having_filter.is_empty() {
+            if self.spec.having_filter.len() != 1 {
+                return Err(paro_error::internal(
+                    "aggregate HAVING lowering requires one normalized predicate",
+                ));
+            }
+            local.having_executor = Some(ExpressionExecutor::with_expressions_for_session(
+                &self.spec.having_filter,
+                ctx.query.session.as_ref(),
+            ));
+            local.having_selection = Some(paro_common::vector::SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+            local.having_columns = (self.spec.grouping_key_count
+                ..self.spec.grouping_key_count + self.spec.aggregates.len())
+                .collect();
+        }
+        Ok(SourceLocal::PerfectHashAggregateEmit(local))
     }
 
     pub(crate) fn poll_next(
@@ -88,7 +110,37 @@ impl PerfectHashAggregateEmitSourceExec {
         let table = local.table.as_mut().ok_or_else(|| {
             paro_error::internal("perfect aggregate emit source did not load table")
         })?;
-        if table.scan(&mut local.position, output)? {
+        if let (Some(executor), Some(selection)) = (
+            local.having_executor.as_mut(),
+            local.having_selection.as_mut(),
+        ) {
+            let scratch = local.filtered_chunk.get_or_insert(Chunk::try_new(
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+            ensure_source_output(scratch, &self.spec.output_types, VECTOR_SIZE)?;
+            while table.scan(&mut local.position, scratch)? {
+                let aggregate_types = &self.spec.output_types[self.spec.grouping_key_count
+                    ..self.spec.grouping_key_count + self.spec.aggregates.len()];
+                let mut aggregate_view =
+                    Chunk::try_init_empty(aggregate_types, scratch.allocator().clone())?;
+                aggregate_view.reference_columns(scratch, &local.having_columns);
+                let selected_count = executor.select_kernel(
+                    0,
+                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                        params: ctx.query.params.as_ref(),
+                        columns: &aggregate_view,
+                    })
+                    .with_count(scratch.size()),
+                    ctx.query,
+                    selection,
+                )?;
+                if selected_count > 0 {
+                    copy_selected_rows(scratch, output, selection, selected_count)?;
+                    return Ok(SourcePoll::Output);
+                }
+            }
+        } else if table.scan(&mut local.position, output)? {
             return Ok(SourcePoll::Output);
         }
         output.try_set_cardinality(0)?;

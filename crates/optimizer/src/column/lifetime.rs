@@ -144,8 +144,13 @@ impl ColumnLifetimeAnalyzer {
 
                 let left = *comp_join.left;
                 let right = *comp_join.right;
-                let left_bindings = left.get_column_bindings();
-                let right_bindings = right.get_column_bindings();
+                comp_join.left = Box::new(self.optimize_plan(left)?);
+                comp_join.right = Box::new(self.optimize_plan(right)?);
+
+                // Child joins may compact their outputs. Current projection
+                // indexes must be derived from those final child layouts.
+                let left_bindings = comp_join.left.get_column_bindings();
+                let right_bindings = comp_join.right.get_column_bindings();
                 let mut known_bindings =
                     Vec::with_capacity(left_bindings.len() + right_bindings.len());
                 known_bindings.extend(left_bindings.iter().copied());
@@ -168,9 +173,6 @@ impl ColumnLifetimeAnalyzer {
                         Self::generate_projection_map_from_unused(&right_bindings, &right_unused);
                 }
 
-                comp_join.left = Box::new(self.optimize_plan(left)?);
-                comp_join.right = Box::new(self.optimize_plan(right)?);
-
                 Ok(LogicalOperator::Join(Join::Comparison(comp_join)))
             }
             Join::Any(mut any_join) => {
@@ -178,8 +180,11 @@ impl ColumnLifetimeAnalyzer {
 
                 let left = *any_join.left;
                 let right = *any_join.right;
-                let left_bindings = left.get_column_bindings();
-                let right_bindings = right.get_column_bindings();
+                any_join.left = Box::new(self.optimize_plan(left)?);
+                any_join.right = Box::new(self.optimize_plan(right)?);
+
+                let left_bindings = any_join.left.get_column_bindings();
+                let right_bindings = any_join.right.get_column_bindings();
                 let mut known_bindings =
                     Vec::with_capacity(left_bindings.len() + right_bindings.len());
                 known_bindings.extend(left_bindings.iter().copied());
@@ -198,9 +203,6 @@ impl ColumnLifetimeAnalyzer {
                     Self::generate_projection_map_from_unused(&left_bindings, &left_unused);
                 any_join.right_projection_map =
                     Self::generate_projection_map_from_unused(&right_bindings, &right_unused);
-
-                any_join.left = Box::new(self.optimize_plan(left)?);
-                any_join.right = Box::new(self.optimize_plan(right)?);
 
                 Ok(LogicalOperator::Join(Join::Any(any_join)))
             }

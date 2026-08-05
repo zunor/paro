@@ -10,7 +10,7 @@ use paro_planner::operator::join::{JoinCondition, JoinType};
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::hash::hashing::compute_hashes_for_keys_into;
 use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types, JoinKeySide};
-use crate::operators::join::hash::memory::hash_join_memory_context;
+use crate::operators::join::hash::memory::hash_join_spill_memory_context;
 use crate::operators::join::hash::probe_output::{
     emit_empty_build_probe_result, scan_hash_join_results,
 };
@@ -31,7 +31,6 @@ pub struct HashJoinProbeTransformExec {
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
     pub output_types: Box<[LogicalType]>,
 }
 
@@ -140,7 +139,7 @@ impl HashJoinProbeTransformExec {
                         radix_bits,
                         input.column_count(),
                         spill_chunk.types(),
-                        hash_join_memory_context(ctx.query),
+                        hash_join_spill_memory_context(ctx.query),
                     )?);
                 }
                 local
@@ -163,7 +162,7 @@ impl HashJoinProbeTransformExec {
                 self.join_type,
                 input,
                 &self.left_projection,
-                &self.right_projection,
+                &[],
                 &self.output_types,
                 output,
             )?;
@@ -222,7 +221,7 @@ impl HashJoinProbeTransformExec {
                     &hash_table,
                     scan_structure,
                     &self.left_projection,
-                    &self.right_projection,
+                    &[],
                 )?;
                 (count, scan_structure.finished)
             };

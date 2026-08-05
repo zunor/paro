@@ -24,6 +24,7 @@ pub struct TabletReaderParams {
     pub late_materialize: bool,
     pub predicate_columns: Option<Vec<ColumnId>>,
     pub segment: Option<SegmentSharedPtr>,
+    pub segment_ordinal_range: Option<(u64, u64)>,
     pub segment_options: Option<SegmentOptions>,
     pub prefetcher: Option<Arc<Prefetcher>>,
     pub emit_row_id: bool,
@@ -84,6 +85,7 @@ impl Default for TabletReaderParams {
             late_materialize: false,
             predicate_columns: None,
             segment: None,
+            segment_ordinal_range: None,
             segment_options: None,
             prefetcher: None,
             emit_row_id: false,
@@ -130,6 +132,11 @@ impl TabletReaderParams {
 
     pub fn with_segment_handle(mut self, segment: SegmentSharedPtr) -> Self {
         self.segment = Some(segment);
+        self
+    }
+
+    pub fn with_segment_ordinal_range(mut self, start: u64, end: u64) -> Self {
+        self.segment_ordinal_range = Some((start, end));
         self
     }
 

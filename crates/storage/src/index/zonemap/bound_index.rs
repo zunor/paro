@@ -428,7 +428,7 @@ impl BoundIndex for ZoneMapIndex {
         if self.column_ids.len() != 1 {
             return PredicateResult::Unknown;
         }
-        if predicate.column_id() != self.column_ids[0] {
+        if predicate.index_column_id() != Some(self.column_ids[0]) {
             return PredicateResult::Unknown;
         }
 
@@ -449,6 +449,7 @@ impl BoundIndex for ZoneMapIndex {
             }
             // NotEq: ZoneMap cannot precisely exclude a single value
             Predicate::NotEq { .. } => PredicateResult::Unknown,
+            Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
     }
 }

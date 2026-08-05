@@ -23,13 +23,14 @@ use paro_scheduler::task::{
 use crate::explain::profiler::{OperatorProfiler, ProfileMorselRange, ProfileWorkerContext};
 use crate::explain::types::ExplainRuntimeStats;
 use crate::memory_runtime::{AdmissionWaiterId, PipelineAdmissionGuard};
+use crate::physical::properties::Parallelism;
 use crate::pipeline::graph::{PipelineGraph, PipelineId, SinkSharing};
 use crate::pipeline::PipelineProgramSet;
 use crate::runtime::{
     Blocker, BreakerHandleRegistry, OperatorWakeScope, PendingWakeRegistration,
     PipelineDependencyGates, PipelineRuntime, PipelineTaskExecutor, PipelineTaskId,
-    PipelineTaskStepContext, QueryRuntimeContext, SharedSinkRuntimeSet, SourceGlobal, SourceLocal,
-    TaskStepResult, WakeKey, WakeSource, WakeToken, WorkGroupCompletion,
+    PipelineTaskStepContext, QueryRuntimeContext, SharedSinkMergeEvent, SharedSinkRuntimeSet,
+    SourceGlobal, SourceLocal, TaskStepResult, WakeKey, WakeSource, WakeToken, WorkGroupCompletion,
 };
 use crate::thread_context::ThreadContext;
 
@@ -130,17 +131,17 @@ impl<'a> PipelineScheduler<'a> {
 
     fn run_pipeline(&mut self, pipeline: PipelineId) -> Result<()> {
         let runtime = self.create_runtime(pipeline)?;
-        let Some(source_work) = source_work(&runtime.source_global) else {
-            return self.run_single_pipeline(runtime, 0, 1);
-        };
-        let total_threads = self.pipeline_thread_count(pipeline, source_work.morsel_count());
-        if total_threads <= 1 || source_work.morsel_count() <= 1 {
-            return self.run_single_pipeline(runtime, 0, 1);
-        }
-
-        let morsels = source_work.into_task_morsels(total_threads);
-        self.run_parallel_data_tasks(runtime.clone(), morsels, total_threads)?;
-        self.run_finish_task(runtime, total_threads)
+        let properties = &self
+            .graph
+            .pipeline(pipeline)
+            .ok_or_else(|| paro_error::internal("pipeline spec missing"))?
+            .properties;
+        run_bound_pipeline_runtime(
+            runtime,
+            properties.capabilities.parallelism,
+            self.query.clone(),
+            self.allocator.clone(),
+        )
     }
 
     fn create_runtime(&self, pipeline: PipelineId) -> Result<Arc<PipelineRuntime>> {
@@ -166,123 +167,6 @@ impl<'a> PipelineScheduler<'a> {
         )?))
     }
 
-    fn pipeline_thread_count(&self, pipeline: PipelineId, morsel_count: usize) -> usize {
-        let Some(spec) = self.graph.pipeline(pipeline) else {
-            return 1;
-        };
-        if spec.sink_sharing != SinkSharing::Exclusive {
-            return 1;
-        }
-        let parallelism = spec.properties.capabilities.parallelism;
-        if parallelism.max <= 1 {
-            return 1;
-        }
-        if morsel_count <= 1 {
-            return 1;
-        }
-        let threads = self.query.session.number_of_threads().max(1);
-        let cap = parallelism
-            .max
-            .min(threads)
-            .min(morsel_count)
-            .max(parallelism.min);
-        cap.max(1)
-    }
-
-    fn run_single_pipeline(
-        &self,
-        runtime: Arc<PipelineRuntime>,
-        thread_id: usize,
-        total_threads: usize,
-    ) -> Result<()> {
-        let task = runtime.create_task_state(self.query.as_ref(), self.allocator.clone())?;
-        let mut executor = PipelineTaskExecutor::new(runtime.clone(), task);
-        let thread = ThreadContext::new(thread_id, total_threads);
-        let wake = OperatorWakeScope {
-            task_id: PipelineTaskId(runtime.program.id.index() as u64),
-            generation: self.query.output.wake_generation(),
-        };
-        let mut profiler = self.query.explain_profiler.as_ref().map_or_else(
-            OperatorProfiler::disabled,
-            |profiler| {
-                OperatorProfiler::new_with_context(
-                    profiler.clone(),
-                    ProfileWorkerContext::new(
-                        Some(runtime.program.id.index() as u64),
-                        Some(runtime.program.id.index() as u64),
-                        Some(thread_id as u64),
-                        Some(total_threads as u64),
-                        None,
-                    ),
-                )
-            },
-        );
-        let mut ctx = PipelineTaskStepContext {
-            query: self.query.as_ref(),
-            thread: &thread,
-            wake: &wake,
-            profiler: &mut profiler,
-        };
-        loop {
-            match executor.step(&mut ctx)? {
-                TaskStepResult::Continue => {}
-                TaskStepResult::Done => {
-                    profiler.flush();
-                    return Ok(());
-                }
-                TaskStepResult::Blocked(blocker) => {
-                    return Err(single_task_blocked_error(&blocker))
-                }
-            }
-        }
-    }
-
-    fn run_parallel_data_tasks(
-        &self,
-        runtime: Arc<PipelineRuntime>,
-        morsels: Vec<SourceMorsel>,
-        total_threads: usize,
-    ) -> Result<()> {
-        let scheduler = self.query.session.scheduler().clone();
-        let producer = scheduler.create_producer_with_priority(0);
-        let group = Arc::new(PipelineWorkerCoordinator::new(morsels.len()));
-        let mut tasks = Vec::with_capacity(morsels.len());
-        for (task_idx, morsel) in morsels.into_iter().enumerate() {
-            let work = WorkUnit::morsel(runtime.program.id, task_idx as u64, morsel);
-            let task = PipelineWorkerTask::new_data(
-                runtime.clone(),
-                self.query.clone(),
-                self.allocator.clone(),
-                Arc::downgrade(&group),
-                work,
-                task_idx % total_threads,
-                total_threads,
-                Some(morsel),
-            );
-            tasks.push(as_scheduler_task(task));
-        }
-        producer.schedule_tasks(tasks);
-        wait_for_group(self.query.as_ref(), scheduler.as_ref(), &producer, &group)
-    }
-
-    fn run_finish_task(&self, runtime: Arc<PipelineRuntime>, total_threads: usize) -> Result<()> {
-        let scheduler = self.query.session.scheduler().clone();
-        let producer = scheduler.create_producer_with_priority(0);
-        let group = Arc::new(PipelineWorkerCoordinator::new(1));
-        let work = WorkUnit::finish(runtime.program.id);
-        let task = as_scheduler_task(PipelineWorkerTask::new_finish(
-            runtime,
-            self.query.clone(),
-            self.allocator.clone(),
-            Arc::downgrade(&group),
-            work,
-            0,
-            total_threads,
-        ));
-        producer.schedule_task(task);
-        wait_for_group(self.query.as_ref(), scheduler.as_ref(), &producer, &group)
-    }
-
     fn push_ready_pipeline(&mut self, pipeline: PipelineId, dependency_unblocks: u32) {
         let priority = self.policy.ready_priority_for_pipeline(
             self.graph,
@@ -305,6 +189,7 @@ impl<'a> PipelineScheduler<'a> {
         }
         self.finished[pipeline.index()] = true;
         self.finished_count += 1;
+        self.handles.pipeline_finished(pipeline);
         for event in self.gates.mark_finished(pipeline) {
             if !self.finished[event.pipeline.index()] && self.gates.is_ready(event.pipeline) {
                 self.push_ready_pipeline(event.pipeline, 1);
@@ -313,20 +198,179 @@ impl<'a> PipelineScheduler<'a> {
     }
 }
 
+/// Execute one already-bound pipeline runtime with the same morsel scheduler
+/// used by the ordinary DAG driver. Control regions use this entry point to
+/// preserve their phase ordering while still parallelizing each ready phase.
+pub(crate) fn run_bound_pipeline_runtime(
+    runtime: Arc<PipelineRuntime>,
+    parallelism: Parallelism,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+) -> Result<()> {
+    let Some(source_work) = source_work(&runtime.source_global) else {
+        return run_single_pipeline(runtime, query.as_ref(), allocator, 0, 1);
+    };
+    let morsel_count = source_work.morsel_count();
+    let total_threads = pipeline_thread_count(parallelism, morsel_count, query.as_ref());
+    if total_threads <= 1 || morsel_count <= 1 {
+        return run_single_pipeline(runtime, query.as_ref(), allocator, 0, 1);
+    }
+
+    let morsels = source_work.into_task_morsels(total_threads);
+    run_parallel_data_tasks(
+        runtime.clone(),
+        morsels,
+        total_threads,
+        query.clone(),
+        allocator.clone(),
+    )?;
+    if let Some(shared) = runtime.shared_sink.as_ref() {
+        match shared.mark_producer_merged()? {
+            SharedSinkMergeEvent::WaitingForProducers { .. } => return Ok(()),
+            SharedSinkMergeEvent::ReadyToFinish => {
+                if !shared.try_begin_finish()? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    run_finish_task(runtime, total_threads, query, allocator)
+}
+
+fn pipeline_thread_count(
+    parallelism: Parallelism,
+    morsel_count: usize,
+    query: &QueryRuntimeContext,
+) -> usize {
+    if !query.session.limits.parallel_scheduler || parallelism.max <= 1 || morsel_count <= 1 {
+        return 1;
+    }
+    let threads = query.session.number_of_threads().max(1);
+    parallelism
+        .max
+        .min(threads)
+        .min(morsel_count)
+        .max(parallelism.min)
+        .max(1)
+}
+
+fn run_single_pipeline(
+    runtime: Arc<PipelineRuntime>,
+    query: &QueryRuntimeContext,
+    allocator: Arc<dyn Allocator>,
+    thread_id: usize,
+    total_threads: usize,
+) -> Result<()> {
+    let task = runtime.create_task_state(query, allocator)?;
+    let mut executor = PipelineTaskExecutor::new(runtime.clone(), task);
+    let thread = ThreadContext::new(thread_id, total_threads);
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(runtime.program.id.index() as u64),
+        generation: query.output.wake_generation(),
+    };
+    let mut profiler =
+        query
+            .explain_profiler
+            .as_ref()
+            .map_or_else(OperatorProfiler::disabled, |profiler| {
+                OperatorProfiler::new_with_context(
+                    profiler.clone(),
+                    ProfileWorkerContext::new(
+                        Some(runtime.program.id.index() as u64),
+                        Some(runtime.program.id.index() as u64),
+                        Some(thread_id as u64),
+                        Some(total_threads as u64),
+                        None,
+                    ),
+                )
+            });
+    let mut ctx = PipelineTaskStepContext {
+        query,
+        thread: &thread,
+        wake: &wake,
+        profiler: &mut profiler,
+    };
+    loop {
+        match executor.step(&mut ctx)? {
+            TaskStepResult::Continue => {}
+            TaskStepResult::Done => {
+                profiler.flush();
+                return Ok(());
+            }
+            TaskStepResult::Blocked(blocker) => return Err(single_task_blocked_error(&blocker)),
+        }
+    }
+}
+
+fn run_parallel_data_tasks(
+    runtime: Arc<PipelineRuntime>,
+    morsels: Vec<SourceMorsel>,
+    total_threads: usize,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+) -> Result<()> {
+    let scheduler = query.session.scheduler().clone();
+    let producer = scheduler.create_producer_with_priority(0);
+    let group = Arc::new(PipelineWorkerCoordinator::new(morsels.len()));
+    let mut tasks = Vec::with_capacity(morsels.len());
+    for (task_idx, morsel) in morsels.into_iter().enumerate() {
+        let work = WorkUnit::morsel(runtime.program.id, task_idx as u64, morsel);
+        let task = PipelineWorkerTask::new_data(
+            runtime.clone(),
+            query.clone(),
+            allocator.clone(),
+            Arc::downgrade(&group),
+            work,
+            task_idx % total_threads,
+            total_threads,
+            Some(morsel),
+        );
+        tasks.push(as_scheduler_task(task));
+    }
+    producer.schedule_tasks(tasks);
+    wait_for_group(query.as_ref(), scheduler.as_ref(), &producer, &group)
+}
+
+fn run_finish_task(
+    runtime: Arc<PipelineRuntime>,
+    total_threads: usize,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+) -> Result<()> {
+    let scheduler = query.session.scheduler().clone();
+    let producer = scheduler.create_producer_with_priority(0);
+    let group = Arc::new(PipelineWorkerCoordinator::new(1));
+    let work = WorkUnit::finish(runtime.program.id);
+    let task = as_scheduler_task(PipelineWorkerTask::new_finish(
+        runtime,
+        query.clone(),
+        allocator,
+        Arc::downgrade(&group),
+        work,
+        0,
+        total_threads,
+    ));
+    producer.schedule_task(task);
+    wait_for_group(query.as_ref(), scheduler.as_ref(), &producer, &group)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct WorkUnitId(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceMorsel {
-    RowsetSegments { start: usize, end: usize },
+    RowsetScan { start: usize, end: usize },
     Chunks { start: usize, end: usize },
+    HashAggregatePartitions { start: usize, end: usize },
     SortEmit { task_idx: usize },
 }
 
 impl SourceMorsel {
     fn morsel_count(self) -> usize {
         match self {
-            Self::RowsetSegments { start, end } | Self::Chunks { start, end } => end - start,
+            Self::RowsetScan { start, end }
+            | Self::Chunks { start, end }
+            | Self::HashAggregatePartitions { start, end } => end - start,
             Self::SortEmit { .. } => 1,
         }
     }
@@ -334,8 +378,9 @@ impl SourceMorsel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceWork {
-    RowsetSegments { count: usize },
+    RowsetScan { count: usize },
     Chunks { count: usize },
+    HashAggregatePartitions { count: usize },
     SortEmit { task_count: usize },
 }
 
@@ -346,19 +391,26 @@ const DATA_TASKS_PER_THREAD: usize = 4;
 impl SourceWork {
     fn morsel_count(self) -> usize {
         match self {
-            Self::RowsetSegments { count } | Self::Chunks { count } => count,
+            Self::RowsetScan { count }
+            | Self::Chunks { count }
+            | Self::HashAggregatePartitions { count } => count,
             Self::SortEmit { task_count } => task_count,
         }
     }
 
     fn into_task_morsels(self, total_threads: usize) -> Vec<SourceMorsel> {
         match self {
-            Self::RowsetSegments { count } => partition_morsel_ranges(count, total_threads)
-                .map(|(start, end)| SourceMorsel::RowsetSegments { start, end })
+            Self::RowsetScan { count } => partition_morsel_ranges(count, total_threads)
+                .map(|(start, end)| SourceMorsel::RowsetScan { start, end })
                 .collect(),
             Self::Chunks { count } => partition_morsel_ranges(count, total_threads)
                 .map(|(start, end)| SourceMorsel::Chunks { start, end })
                 .collect(),
+            Self::HashAggregatePartitions { count } => {
+                partition_morsel_ranges(count, total_threads)
+                    .map(|(start, end)| SourceMorsel::HashAggregatePartitions { start, end })
+                    .collect()
+            }
             Self::SortEmit { task_count } => (0..task_count)
                 .map(|task_idx| SourceMorsel::SortEmit { task_idx })
                 .collect(),
@@ -381,8 +433,9 @@ fn partition_morsel_ranges(
     })
 }
 
-const PROFILE_MORSEL_ROWSET_SEGMENT: &str = "rowset_segment";
+const PROFILE_MORSEL_ROWSET_SCAN: &str = "rowset_scan";
 const PROFILE_MORSEL_CHUNK: &str = "chunk";
+const PROFILE_MORSEL_HASH_AGGREGATE_PARTITION: &str = "hash_aggregate_partition";
 const PROFILE_MORSEL_SORT_EMIT: &str = "sort_emit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,7 +789,9 @@ impl PipelineWorkerTask {
             assign_source_morsel(&mut task.source, morsel)?;
         }
         self.executor = Some(match self.mode {
-            PipelineWorkerMode::Data => PipelineTaskExecutor::new(self.runtime.clone(), task),
+            PipelineWorkerMode::Data => {
+                PipelineTaskExecutor::new_parallel_data_task(self.runtime.clone(), task)
+            }
             PipelineWorkerMode::Finish => {
                 PipelineTaskExecutor::new_finish_task(self.runtime.clone(), task)
             }
@@ -986,12 +1041,17 @@ fn as_scheduler_task(task: PipelineWorkerTask) -> Arc<ParkingMutex<dyn Task>> {
 
 fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
     match source {
-        SourceGlobal::Rowset(global) => Some(SourceWork::RowsetSegments {
-            count: global.segments.len(),
+        SourceGlobal::Rowset(global) => Some(SourceWork::RowsetScan {
+            count: global.morsels.len(),
         }),
         SourceGlobal::Chunk(global) => Some(SourceWork::Chunks {
             count: global.chunks.len(),
         }),
+        SourceGlobal::HashAggregateEmit(global) if global.work_count() > 1 => {
+            Some(SourceWork::HashAggregatePartitions {
+                count: global.work_count(),
+            })
+        }
         SourceGlobal::SortEmit(global) => {
             let task_count = global
                 .handle
@@ -1013,14 +1073,15 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
 
 fn assign_source_morsel(source: &mut SourceLocal, morsel: SourceMorsel) -> Result<()> {
     match (source, morsel) {
-        (SourceLocal::Rowset(local), SourceMorsel::RowsetSegments { start, end }) => {
-            local.assign_segment_range(start, end);
+        (SourceLocal::Rowset(local), SourceMorsel::RowsetScan { start, end }) => {
+            local.assign_morsel_range(start, end);
             Ok(())
         }
         (SourceLocal::Chunk(local), SourceMorsel::Chunks { start, end }) => {
             local.assign_chunk_range(start, end);
             Ok(())
         }
+        (SourceLocal::HashAggregateEmit(_), SourceMorsel::HashAggregatePartitions { .. }) => Ok(()),
         (SourceLocal::SortEmit(_), SourceMorsel::SortEmit { .. }) => Ok(()),
         (source, morsel) => Err(paro_error::internal(format!(
             "source local {} cannot accept scheduler morsel {:?}",
@@ -1032,14 +1093,21 @@ fn assign_source_morsel(source: &mut SourceLocal, morsel: SourceMorsel) -> Resul
 
 fn profile_morsel_range_from_work(work: WorkUnit) -> Option<ProfileMorselRange> {
     match work.kind {
-        WorkUnitKind::Morsel(SourceMorsel::RowsetSegments { start, end }) => Some(
-            ProfileMorselRange::new(PROFILE_MORSEL_ROWSET_SEGMENT, start as u64, end as u64),
+        WorkUnitKind::Morsel(SourceMorsel::RowsetScan { start, end }) => Some(
+            ProfileMorselRange::new(PROFILE_MORSEL_ROWSET_SCAN, start as u64, end as u64),
         ),
         WorkUnitKind::Morsel(SourceMorsel::Chunks { start, end }) => Some(ProfileMorselRange::new(
             PROFILE_MORSEL_CHUNK,
             start as u64,
             end as u64,
         )),
+        WorkUnitKind::Morsel(SourceMorsel::HashAggregatePartitions { start, end }) => {
+            Some(ProfileMorselRange::new(
+                PROFILE_MORSEL_HASH_AGGREGATE_PARTITION,
+                start as u64,
+                end as u64,
+            ))
+        }
         WorkUnitKind::Morsel(SourceMorsel::SortEmit { task_idx }) => Some(ProfileMorselRange::new(
             PROFILE_MORSEL_SORT_EMIT,
             task_idx as u64,
@@ -1062,14 +1130,14 @@ fn wake_key_ready(query: &QueryRuntimeContext, key: WakeKey) -> Option<u64> {
 
 fn single_task_blocked_error(blocker: &Blocker) -> ParoError {
     match blocker.wake.map(|wake| wake.source) {
-        Some(WakeSource::OutputBuffer) => paro_error::internal(
-            "parallel completed-output pipeline blocked on output backpressure",
-        ),
+        Some(WakeSource::OutputBuffer) => {
+            paro_error::internal("synchronously driven pipeline blocked on output backpressure")
+        }
         Some(source) => paro_error::internal(format!(
-            "single-task parallel scheduler fallback blocked on unsupported wake source {source:?}"
+            "synchronously driven pipeline blocked on unsupported wake source {source:?}"
         )),
         None => paro_error::internal(format!(
-            "single-task parallel scheduler fallback blocked on {:?} without a wake key",
+            "synchronously driven pipeline blocked on {:?} without a wake key",
             blocker.reason
         )),
     }
@@ -1126,7 +1194,7 @@ mod tests {
             _ => false,
         }));
 
-        let uneven = SourceWork::RowsetSegments { count: 19 }.into_task_morsels(4);
+        let uneven = SourceWork::RowsetScan { count: 19 }.into_task_morsels(4);
         assert_eq!(uneven.len(), 16);
         assert_eq!(
             uneven

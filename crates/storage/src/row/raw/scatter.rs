@@ -57,6 +57,7 @@ pub fn build_rows(
         // Allocate space.
         let allocation = {
             let allocator = segment.allocator_mut();
+            let accounting_class = allocator.accounting_class();
             let heap_sizes_opt = if layout.all_constant() {
                 None
             } else {
@@ -65,7 +66,7 @@ pub fn build_rows(
 
             allocator.allocate_rows(remaining, heap_sizes_opt).map_err(|err| {
                 paro_error::internal(format!(
-                    "failed to allocate row slots while building spill chunk: offset={offset}, remaining={remaining}, count={count}, error={err}"
+                    "failed to allocate row slots: class={accounting_class:?}, offset={offset}, remaining={remaining}, count={count}, error={err}"
                 ))
             })?
         };
@@ -143,7 +144,7 @@ pub fn build_rows(
             };
             let row_block_offset =
                 allocation.row_block_offset + allocation_row_offset * layout.get_row_width();
-            let mut part = if let Some(heap_info) = &allocation.heap_info {
+            let part = if let Some(heap_info) = &allocation.heap_info {
                 super::RawRowChunkPart::new(
                     allocation.row_block_index as u32,
                     row_block_offset as u32,
@@ -176,7 +177,7 @@ pub fn build_rows(
                         heap_info.heap_block_index,
                         allocation_heap_offset,
                     ) {
-                        part.base_heap_ptr = Some(ptr);
+                        *part.heap_base_address.lock().unwrap() = Some(ptr as usize);
                     }
                 }
             }

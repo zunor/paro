@@ -372,6 +372,48 @@ fn ungrouped_aggregate_breaker_merges_and_emits_count() {
 }
 
 #[test]
+fn ungrouped_aggregate_having_can_suppress_its_single_row() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let mut spec = ungrouped_count_spec();
+    spec.having_filter = vec![Expression::Comparison(ComparisonExpression::new(
+        ComparisonType::GreaterThan,
+        reference(0, LogicalType::BigInt),
+        Expression::Constant(ConstantExpression::new(
+            Value::BigInt(3),
+            LogicalType::BigInt,
+        )),
+    ))]
+    .into_boxed_slice();
+    let graph = aggregate_breaker_graph(
+        SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
+            handle: BreakerHandleId::new(0),
+            spec: spec.clone(),
+            required: Default::default(),
+        }),
+        SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
+            handle: BreakerHandleId::new(0),
+            spec,
+        }),
+        vec![
+            vec![int_constant(1)],
+            vec![int_constant(2)],
+            vec![int_constant(3)],
+        ],
+        vec![LogicalType::Integer],
+        RowType::new(vec!["count".to_string()], vec![LogicalType::BigInt]),
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(19),
+        generation: WakeGeneration(0),
+    };
+    run_two_stage_breaker(graph, &query, &thread, &wake);
+
+    assert!(output.pop_front().is_none());
+}
+
+#[test]
 fn hash_aggregate_breaker_groups_and_emits_counts() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
@@ -548,7 +590,7 @@ fn hash_aggregate_breaker_preemptively_spills_payload_under_low_query_cap() {
 }
 
 #[test]
-fn hash_aggregate_breaker_spills_payload_when_available_query_memory_is_low() {
+fn hash_aggregate_breaker_does_not_spill_for_unrelated_query_memory() {
     let output = QueryOutputPort::unbounded();
     let query = query_context_with_limits(
         output.clone(),
@@ -609,11 +651,10 @@ fn hash_aggregate_breaker_spills_payload_when_available_query_memory_is_low() {
     }
     rows.sort_unstable();
     assert_eq!(rows, vec![(1, 2), (2, 2), (3, 1)]);
-    assert!(profile.operators.values().any(|actual| {
-        actual.runtime.spilled == Some(true)
-            && actual.runtime.spilled_bytes.unwrap_or(0) > 0
-            && actual.runtime.repartition_depth == Some(1)
-    }));
+    assert!(profile
+        .operators
+        .values()
+        .all(|actual| actual.runtime.spilled != Some(true)));
 }
 
 #[test]

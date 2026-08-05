@@ -605,6 +605,30 @@ mod tests {
     }
 
     #[test]
+    fn spill_accounting_is_observable_without_consuming_working_set_capacity() {
+        let pool = Arc::new(QueryMemoryPool::new(128));
+        let owner: Arc<dyn MemoryOwner> = pool.clone();
+        let memory = MemoryAccountingContext::from_owner(
+            owner,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Spill,
+        );
+
+        let release = memory
+            .retain(512)
+            .expect("spill bytes are governed by the buffer pool");
+        assert_eq!(pool.issued_bytes(), 0);
+        assert_eq!(pool.spill_bytes(), 512);
+        assert_eq!(pool.published_used_bytes(), 512);
+
+        release.release();
+        assert_eq!(pool.issued_bytes(), 0);
+        assert_eq!(pool.spill_bytes(), 0);
+        assert_eq!(pool.published_used_bytes(), 0);
+    }
+
+    #[test]
     fn shared_retained_object_reclassifies_revocable_bytes_on_rebind() {
         let pool = Arc::new(QueryMemoryPool::new(1024));
         let account = Arc::new(OperatorMemoryAccount::new(pool.clone()));

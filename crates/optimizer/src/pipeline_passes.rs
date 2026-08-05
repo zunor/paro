@@ -25,6 +25,7 @@ use crate::graph::start_selection::GraphStartSelection;
 use crate::join::build_probe_side::BuildProbeSideOptimizer;
 use crate::join::elimination::JoinElimination;
 use crate::join::filter_pushdown::JoinFilterPushdown;
+use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::join_order::optimizer::JoinOrderOptimizer;
 use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;
@@ -32,7 +33,7 @@ use crate::optimizer_type::OptimizerType;
 use crate::rewriter::Rewriter;
 use crate::rules::arithmetic::ArithmeticSimplificationRule;
 use crate::rules::comparison::ComparisonSimplificationRule;
-use crate::rules::conjunction::ConjunctionSimplificationRule;
+use crate::rules::conjunction::{CommonConjunctionFactorRule, ConjunctionSimplificationRule};
 use crate::rules::constant_folding::ConstantFoldingRule;
 use crate::rules::move_constants::MoveConstantsRule;
 use crate::search::optimizer::SearchOptimizer;
@@ -103,6 +104,7 @@ impl Rewriter for ExpressionRewriterPass {
         rewriter.add_rule(Box::new(ArithmeticSimplificationRule::new()));
         rewriter.add_rule(Box::new(ComparisonSimplificationRule::new()));
         rewriter.add_rule(Box::new(ConjunctionSimplificationRule::new()));
+        rewriter.add_rule(Box::new(CommonConjunctionFactorRule::new()));
         rewriter.add_rule(Box::new(MoveConstantsRule::new()));
         rewriter.rewrite_plan(&mut plan);
         Ok(plan)
@@ -329,6 +331,18 @@ impl Rewriter for JoinFilterPushdownPass {
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
         Ok(JoinFilterPushdown::new(ctx.session.clone()).optimize_plan(plan))
+    }
+}
+
+pub struct MixedJoinPredicatePass;
+
+impl Rewriter for MixedJoinPredicatePass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::MixedJoinPredicate
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        JoinPredicateNormalizer::new(&ctx.bind_context).optimize_plan(plan)
     }
 }
 

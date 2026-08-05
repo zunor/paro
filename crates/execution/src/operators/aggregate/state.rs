@@ -1,8 +1,9 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -17,7 +18,7 @@ use crate::memory_runtime::QueryMemoryPool;
 use crate::operators::aggregate::payload_spill::{
     AggregatePayloadSpillBuffer, AggregateStateSpillBuffer,
 };
-use crate::runtime::breaker::UngroupedAggregateRuntimeState;
+use crate::runtime::breaker::{AggregateHandle, UngroupedAggregateRuntimeState};
 
 use super::accounted_rows::DistinctRowSet;
 use super::aggregate_object::AggregateObject;
@@ -29,31 +30,65 @@ use super::row_format::AggregateGroupFormat;
 
 #[derive(Debug, Default)]
 pub struct HashAggregateEmitSourceLocal {
-    pub tables: Option<Vec<AggregateHashTable>>,
-    pub spilled_outputs: Option<Vec<Option<RowStoreSpillReader<AggregateGroupFormat>>>>,
+    pub work: Option<HashAggregateEmitWork>,
     pub spilled_chunk: Option<Chunk>,
-    pub positions: Vec<AggregateHTScanPosition>,
-    pub grouping_idx: usize,
+    pub position: AggregateHTScanPosition,
+    pub having_executor: Option<ExpressionExecutor>,
+    pub having_selection: Option<SelectionVector>,
+    pub having_columns: Box<[usize]>,
+}
+
+#[derive(Debug)]
+pub struct HashAggregateEmitSourceGlobal {
+    pub handle: Arc<AggregateHandle>,
+    pub work: Mutex<Option<VecDeque<HashAggregateEmitWork>>>,
+    pub work_count: AtomicUsize,
+}
+
+impl HashAggregateEmitSourceGlobal {
+    pub fn claim_work(&self) -> Option<HashAggregateEmitWork> {
+        self.work.lock().as_mut()?.pop_front()
+    }
+
+    pub fn work_count(&self) -> usize {
+        self.work_count.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub enum HashAggregateEmitWork {
+    Table {
+        grouping_idx: usize,
+        table: AggregateHashTable,
+    },
+    Spilled {
+        grouping_idx: usize,
+        reader: RowStoreSpillReader<AggregateGroupFormat>,
+    },
 }
 
 #[derive(Debug, Default)]
 pub struct UngroupedAggregateEmitSourceLocal {
     pub state: Option<UngroupedAggregateRuntimeState>,
     pub emitted: bool,
+    pub having_executor: Option<ExpressionExecutor>,
+    pub having_selection: Option<SelectionVector>,
 }
 
 #[derive(Debug, Default)]
 pub struct PerfectHashAggregateEmitSourceLocal {
     pub table: Option<PerfectAggregateHashTable>,
     pub position: PerfectHTScanPosition,
+    pub filtered_chunk: Option<Chunk>,
+    pub having_executor: Option<ExpressionExecutor>,
+    pub having_selection: Option<SelectionVector>,
+    pub having_columns: Box<[usize]>,
 }
 
-impl Drop for HashAggregateEmitSourceLocal {
+impl Drop for HashAggregateEmitWork {
     fn drop(&mut self) {
-        if let Some(tables) = self.tables.as_mut() {
-            for table in tables {
-                let _ = table.destroy();
-            }
+        if let Self::Table { table, .. } = self {
+            let _ = table.destroy();
         }
     }
 }
@@ -185,6 +220,8 @@ pub struct StreamingAggregateTransformLocal {
     pub layout: AggregateStateLayout,
     pub aggregate_inputs: Arc<[Vec<usize>]>,
     pub projection_executor: Option<ExpressionExecutor>,
+    pub having_executor: Option<ExpressionExecutor>,
+    pub having_selection: Option<SelectionVector>,
     pub payload_chunk: Chunk,
     /// U64-aligned aggregate states. Aggregate kernels access this buffer
     /// through raw state-address vectors; `destroyed` makes cleanup idempotent

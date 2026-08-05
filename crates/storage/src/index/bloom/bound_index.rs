@@ -297,7 +297,7 @@ impl BoundIndex for BloomFilterIndex {
         if self.column_ids.len() != 1 {
             return PredicateResult::Unknown;
         }
-        if predicate.column_id() != self.column_ids[0] {
+        if predicate.index_column_id() != Some(self.column_ids[0]) {
             return PredicateResult::Unknown;
         }
 

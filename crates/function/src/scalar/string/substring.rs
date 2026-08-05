@@ -110,43 +110,68 @@ fn count_bind_data(state: &dyn ExpressionState) -> Option<&CountBindData> {
         .and_then(|data| data.as_any().downcast_ref::<CountBindData>())
 }
 
-/// Extract substring using Unicode codepoints.
-/// start is 1-indexed (SQL standard).
-/// Negative start counts from end.
-fn substring_unicode(s: &str, start: i64, length: Option<i64>) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let char_count = chars.len() as i64;
-
-    if char_count == 0 {
-        return String::new();
+/// Extract a borrowed UTF-8 substring using SQL's codepoint positions.
+///
+/// A substring is always contiguous in the source, so materializing `Vec<char>`
+/// and a second `String` only adds per-row allocations. ASCII values use direct
+/// byte offsets; non-ASCII values scan only to the requested boundaries.
+fn substring_unicode(s: &str, start: i64, length: Option<i64>) -> &str {
+    if s.is_empty() {
+        return s;
     }
 
-    // Handle start position (1-indexed)
-    let start_idx = if start > 0 {
-        (start - 1).min(char_count) as usize
-    } else if start < 0 {
-        // Negative: count from end
-        (char_count + start).max(0) as usize
+    let character_count = if start < 0 {
+        Some(if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        })
     } else {
-        // start = 0: special case, treat as 1 but reduce length by 1
+        None
+    };
+    let start_index = if start > 0 {
+        usize::try_from(start - 1).unwrap_or(usize::MAX)
+    } else if start < 0 {
+        character_count
+            .expect("negative substring start computes the character count")
+            .saturating_sub(start.unsigned_abs().min(usize::MAX as u64) as usize)
+    } else {
         0
     };
-
-    // Handle length
-    let end_idx = match length {
-        Some(len) if len <= 0 => start_idx, // Zero or negative length = empty
-        Some(len) => {
-            let adjusted_len = if start == 0 { len - 1 } else { len };
-            (start_idx as i64 + adjusted_len).min(char_count) as usize
+    let requested_length = match length {
+        Some(value) if value <= 0 => 0,
+        Some(value) => {
+            let value = usize::try_from(value).unwrap_or(usize::MAX);
+            if start == 0 {
+                value.saturating_sub(1)
+            } else {
+                value
+            }
         }
-        None => char_count as usize, // No length = to end
+        None => usize::MAX,
     };
-
-    if start_idx >= end_idx {
-        return String::new();
+    if requested_length == 0 {
+        return &s[0..0];
     }
 
-    chars[start_idx..end_idx].iter().collect()
+    let start_byte = codepoint_offset(s, start_index);
+    let end_byte = if requested_length == usize::MAX {
+        s.len()
+    } else {
+        codepoint_offset(s, start_index.saturating_add(requested_length))
+    };
+    &s[start_byte..end_byte]
+}
+
+#[inline]
+fn codepoint_offset(value: &str, index: usize) -> usize {
+    if value.is_ascii() {
+        return index.min(value.len());
+    }
+    value
+        .char_indices()
+        .nth(index)
+        .map_or(value.len(), |(offset, _)| offset)
 }
 
 /// Implementation of `substring(VARCHAR, BIGINT) -> VARCHAR`.
@@ -173,8 +198,9 @@ fn substring_2_varchar(
             continue;
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
-        let sub = substring_unicode(str_view.get_inline_string(row).as_str(), start, None);
-        writer.write_str(row, &sub)?;
+        let value = str_view.get_inline_string(row);
+        let sub = substring_unicode(value.as_str(), start, None);
+        writer.write_str(row, sub)?;
     }
 
     Ok(())
@@ -211,12 +237,9 @@ fn substring_3_varchar(
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
         let length = bound_length.unwrap_or_else(|| len_view.get_i64(row));
-        let sub = substring_unicode(
-            str_view.get_inline_string(row).as_str(),
-            start,
-            Some(length),
-        );
-        writer.write_str(row, &sub)?;
+        let value = str_view.get_inline_string(row);
+        let sub = substring_unicode(value.as_str(), start, Some(length));
+        writer.write_str(row, sub)?;
     }
 
     Ok(())

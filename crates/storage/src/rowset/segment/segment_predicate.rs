@@ -5,7 +5,8 @@ use super::segment::Segment;
 use crate::buffer::Prefetcher;
 use crate::codec::vector_decoder;
 use crate::index::{
-    collect_predicate_columns, IndexEvaluator, Predicate, PredicateResult, PredicateTree,
+    collect_predicate_columns, IndexEvaluator, Predicate, PredicateComparison, PredicateResult,
+    PredicateTree,
 };
 use crate::rowset::column::{ColumnBatch, ColumnIterator};
 use crate::tablet::ColumnId;
@@ -136,6 +137,51 @@ impl ComparisonOperator {
     }
 }
 
+impl From<PredicateComparison> for ComparisonOperator {
+    fn from(value: PredicateComparison) -> Self {
+        match value {
+            PredicateComparison::Equal => Self::Equal,
+            PredicateComparison::NotEqual => Self::NotEqual,
+            PredicateComparison::LessThan => Self::LessThan,
+            PredicateComparison::LessThanOrEqual => Self::LessThanOrEqual,
+            PredicateComparison::GreaterThan => Self::GreaterThan,
+            PredicateComparison::GreaterThanOrEqual => Self::GreaterThanOrEqual,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedComparisonWidth {
+    I32,
+    I64,
+    I128,
+}
+
+impl FixedComparisonWidth {
+    fn from_logical_type(logical_type: &LogicalType) -> Option<Self> {
+        match logical_type {
+            LogicalType::Date | LogicalType::Integer => Some(Self::I32),
+            LogicalType::BigInt
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+            | LogicalType::Time => Some(Self::I64),
+            LogicalType::Decimal { precision, .. } if *precision <= 18 => Some(Self::I64),
+            LogicalType::Decimal { .. } | LogicalType::Interval | LogicalType::Uuid => {
+                Some(Self::I128)
+            }
+            _ => None,
+        }
+    }
+
+    fn bytes(self) -> usize {
+        match self {
+            Self::I32 => std::mem::size_of::<i32>(),
+            Self::I64 => std::mem::size_of::<i64>(),
+            Self::I128 => std::mem::size_of::<i128>(),
+        }
+    }
+}
+
 enum CompiledPredicateTree {
     Leaf(CompiledPredicate),
     And(Vec<CompiledPredicateTree>),
@@ -176,6 +222,12 @@ enum CompiledPredicate {
     Generic {
         column_idx: usize,
         predicate: Predicate,
+    },
+    FixedColumnComparison {
+        left_column_idx: usize,
+        right_column_idx: usize,
+        comparison: ComparisonOperator,
+        width: FixedComparisonWidth,
     },
 }
 
@@ -445,7 +497,10 @@ impl PredicateEvaluator {
     fn is_fixed_comparison_leaf(predicate: &CompiledPredicateTree) -> bool {
         matches!(
             predicate,
-            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons { .. })
+            CompiledPredicateTree::Leaf(
+                CompiledPredicate::FixedComparisons { .. }
+                    | CompiledPredicate::FixedColumnComparison { .. }
+            )
         )
     }
 
@@ -502,6 +557,35 @@ impl PredicateEvaluator {
                 }
             })),
             CompiledPredicate::Generic { .. } => None,
+            CompiledPredicate::FixedColumnComparison {
+                left_column_idx,
+                right_column_idx,
+                comparison,
+                width,
+            } => {
+                let left = batches_by_col.get(*left_column_idx)?;
+                let right = batches_by_col.get(*right_column_idx)?;
+                if left.is_null(row_idx) || right.is_null(row_idx) {
+                    return Some(false);
+                }
+                // SAFETY: compile_tree requires identical logical types, the
+                // access planner validates both physical widths, and row_idx is
+                // bounded by the shared predicate batch row count.
+                Some(unsafe {
+                    let ordering = match width {
+                        FixedComparisonWidth::I32 => {
+                            left.i32_value(row_idx).cmp(&right.i32_value(row_idx))
+                        }
+                        FixedComparisonWidth::I64 => {
+                            left.i64_value(row_idx).cmp(&right.i64_value(row_idx))
+                        }
+                        FixedComparisonWidth::I128 => {
+                            left.i128_value(row_idx).cmp(&right.i128_value(row_idx))
+                        }
+                    };
+                    comparison.matches(ordering)
+                })
+            }
         }
     }
 
@@ -541,12 +625,11 @@ impl PredicateEvaluator {
         row_idx: usize,
     ) -> Result<bool> {
         match predicate {
-            CompiledPredicate::FixedComparisons { .. } => {
-                Ok(
-                    Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx)
-                        .unwrap_or(false),
-                )
-            }
+            CompiledPredicate::FixedComparisons { .. }
+            | CompiledPredicate::FixedColumnComparison { .. } => Ok(
+                Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx)
+                    .unwrap_or(false),
+            ),
             CompiledPredicate::Generic {
                 column_idx,
                 predicate,
@@ -600,6 +683,9 @@ impl PredicateEvaluator {
             Predicate::IsNotNull { .. } => {
                 Ok(vector.is_some_and(|vector| !vector.is_null(row_idx)))
             }
+            Predicate::ColumnComparison { .. } => Err(paro_error::internal(
+                "Column comparison was not compiled to its fixed-width evaluator",
+            )),
         }
     }
 
@@ -639,10 +725,58 @@ impl PredicateEvaluator {
     ) -> Result<CompiledPredicateTree> {
         match tree {
             PredicateTree::Leaf(predicate) => {
-                let column_idx = *column_map.get(&predicate.column_id()).ok_or_else(|| {
+                if let Predicate::ColumnComparison {
+                    left_column_id,
+                    right_column_id,
+                    comparison,
+                } = predicate
+                {
+                    let left_column_idx = *column_map.get(left_column_id).ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Predicate column {left_column_id} has no materialized vector"
+                        ))
+                    })?;
+                    let right_column_idx = *column_map.get(right_column_id).ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Predicate column {right_column_id} has no materialized vector"
+                        ))
+                    })?;
+                    let left_type = column_types.get(left_column_idx).ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Predicate column index {left_column_idx} has no logical type"
+                        ))
+                    })?;
+                    let right_type = column_types.get(right_column_idx).ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "Predicate column index {right_column_idx} has no logical type"
+                        ))
+                    })?;
+                    if left_type != right_type {
+                        return Err(paro_error::internal(format!(
+                            "Column comparison types differ: left={left_type:?}, right={right_type:?}"
+                        )));
+                    }
+                    let width =
+                        FixedComparisonWidth::from_logical_type(left_type).ok_or_else(|| {
+                            paro_error::internal(format!(
+                                "Unsupported raw column comparison type: {left_type:?}"
+                            ))
+                        })?;
+                    return Ok(CompiledPredicateTree::Leaf(
+                        CompiledPredicate::FixedColumnComparison {
+                            left_column_idx,
+                            right_column_idx,
+                            comparison: (*comparison).into(),
+                            width,
+                        },
+                    ));
+                }
+                let column_id = predicate.index_column_id().ok_or_else(|| {
+                    paro_error::internal("Predicate has no index column or column comparison")
+                })?;
+                let column_idx = *column_map.get(&column_id).ok_or_else(|| {
                     paro_error::internal(format!(
-                        "Predicate column {} has no materialized vector",
-                        predicate.column_id()
+                        "Predicate column {column_id} has no materialized vector"
                     ))
                 })?;
                 let logical_type = column_types.get(column_idx).ok_or_else(|| {
@@ -702,6 +836,31 @@ impl PredicateEvaluator {
                         )));
                     }
                     PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
+                }
+            }
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedColumnComparison {
+                left_column_idx,
+                right_column_idx,
+                width,
+                ..
+            }) => {
+                for column_idx in [*left_column_idx, *right_column_idx] {
+                    match access[column_idx] {
+                        PredicateColumnAccess::Unused => {
+                            access[column_idx] = PredicateColumnAccess::Raw {
+                                width: width.bytes(),
+                            };
+                        }
+                        PredicateColumnAccess::Raw {
+                            width: existing_width,
+                        } if existing_width != width.bytes() => {
+                            return Err(paro_error::internal(format!(
+                                "Predicate column {column_idx} compiled with conflicting widths {existing_width} and {}",
+                                width.bytes()
+                            )));
+                        }
+                        PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
+                    }
                 }
             }
             CompiledPredicateTree::And(children) | CompiledPredicateTree::Or(children) => {
@@ -822,6 +981,7 @@ impl PredicateVerificationExt for Predicate {
                 | Predicate::Gt { .. }
                 | Predicate::Ge { .. }
                 | Predicate::Range { .. }
+                | Predicate::ColumnComparison { .. }
         )
     }
 }
@@ -915,6 +1075,59 @@ mod tests {
         let mut matches = Vec::new();
         evaluator.evaluate_batch(&batches, 4, &mut matches).unwrap();
         assert_eq!(matches, [1]);
+    }
+
+    #[test]
+    fn fixed_column_comparison_reads_both_raw_batches_with_filter_null_semantics() {
+        let column_map = HashMap::from([(7, 0), (8, 1)]);
+        let column_types = [LogicalType::Date, LogicalType::Date];
+        let tree = PredicateEvaluator::compile_tree(
+            &PredicateTree::leaf(Predicate::ColumnComparison {
+                left_column_id: 7,
+                right_column_id: 8,
+                comparison: PredicateComparison::LessThan,
+            }),
+            &column_map,
+            &column_types,
+        )
+        .unwrap();
+        let mut access = [PredicateColumnAccess::Unused; 2];
+        PredicateEvaluator::mark_column_access(&tree, &mut access).unwrap();
+        assert_eq!(
+            access,
+            [
+                PredicateColumnAccess::Raw { width: 4 },
+                PredicateColumnAccess::Raw { width: 4 }
+            ]
+        );
+        let evaluator = PredicateEvaluator {
+            tree,
+            predicate_columns: vec![7, 8],
+            predicate_types: column_types.to_vec(),
+            predicate_iterators: std::iter::repeat_with(|| None).take(2).collect(),
+            predicate_column_access: access.to_vec(),
+            allocator: Arc::new(default_allocator()),
+        };
+        let raw_batch = |values: [i32; 4], nulls: &'static [u8]| {
+            PredicateColumnBatch::Raw(ColumnBatch::new(
+                Bytes::from(
+                    values
+                        .into_iter()
+                        .flat_map(i32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
+                Some(Bytes::from_static(nulls)),
+            ))
+        };
+        let batches = [
+            raw_batch([1, 3, 5, 7], &[0, 0, 1, 0]),
+            raw_batch([2, 2, 9, 8], &[0, 0, 0, 1]),
+        ];
+
+        let mut matches = Vec::new();
+        evaluator.evaluate_batch(&batches, 4, &mut matches).unwrap();
+
+        assert_eq!(matches, [0]);
     }
 
     #[test]

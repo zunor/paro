@@ -25,7 +25,6 @@ pub struct HashJoinUnmatchedSourceExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
     pub left_output_types: Box<[LogicalType]>,
-    pub right_projection: Box<[usize]>,
     pub output_types: Box<[LogicalType]>,
 }
 
@@ -107,16 +106,12 @@ impl HashJoinUnmatchedSourceExec {
                 &build_sel,
                 count,
                 &self.left_output_types,
-                &self.right_projection,
+                &[],
                 output,
             )?,
-            JoinType::RightSemi | JoinType::RightAnti => construct_semi_join_result(
-                &build_chunk,
-                &build_sel,
-                count,
-                &self.right_projection,
-                output,
-            )?,
+            JoinType::RightSemi | JoinType::RightAnti => {
+                construct_semi_join_result(&build_chunk, &build_sel, count, &[], output)?
+            }
             _ => unreachable!("unmatched source only emits right-side joins"),
         }
         Ok(SourcePoll::Output)

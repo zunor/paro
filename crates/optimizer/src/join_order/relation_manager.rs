@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_planner::expression::{Expression, ExpressionIterator};
-use paro_planner::operator::{Join, JoinType, LogicalOperator, LogicalOperatorType};
+use paro_planner::operator::{ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType};
 
 use crate::expression::join_tree_has_evaluation_fence;
 use crate::join_order::query_graph::FilterInfo;
@@ -48,7 +48,7 @@ impl ExtractedFilter {
 #[derive(Debug, Clone, Default)]
 pub struct RelationStats {
     /// Estimated distinct count for each column.
-    pub column_distinct_count: Vec<DistinctCount>,
+    pub column_distinct_count: HashMap<ColumnBinding, DistinctCount>,
     /// Estimated cardinality (row count).
     pub cardinality: usize,
     /// Filter strength (selectivity factor).
@@ -61,7 +61,7 @@ impl RelationStats {
     /// Create new empty statistics.
     pub fn new() -> Self {
         Self {
-            column_distinct_count: Vec::new(),
+            column_distinct_count: HashMap::new(),
             cardinality: 1,
             filter_strength: 1.0,
             stats_initialized: false,
@@ -328,7 +328,7 @@ impl RelationManager {
 
     /// Check if a join is reorderable.
     pub fn join_is_reorderable(join: &Join) -> bool {
-        if Self::join_contains_delim_get(join) || join_tree_has_evaluation_fence(join) {
+        if join_tree_has_evaluation_fence(join) {
             return false;
         }
 
@@ -355,19 +355,6 @@ impl RelationManager {
             }
             Join::Any(_) => false,
         }
-    }
-
-    fn join_contains_delim_get(join: &Join) -> bool {
-        Self::operator_contains_delim_get(&join.left().operator)
-            || Self::operator_contains_delim_get(&join.right().operator)
-    }
-
-    fn operator_contains_delim_get(op: &LogicalOperator) -> bool {
-        matches!(op, LogicalOperator::DelimGet(_))
-            || op
-                .children()
-                .into_iter()
-                .any(|child| Self::operator_contains_delim_get(&child.operator))
     }
 
     /// Check if an expression contains a column reference.
@@ -408,6 +395,7 @@ impl RelationManager {
                 | LogicalOperatorType::Aggregate
                 | LogicalOperatorType::Window
                 | LogicalOperatorType::CTERef
+                | LogicalOperatorType::DelimGet
         )
     }
 
@@ -887,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn test_join_with_delim_get_subtree_is_not_reorderable() {
+    fn test_join_with_delim_get_subtree_is_reorderable_inside_owner_region() {
         let left = create_test_get(0);
         let right = LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer]));
         let join = ComparisonJoin::new(
@@ -904,7 +892,7 @@ mod tests {
             )],
         );
 
-        assert!(!RelationManager::join_is_reorderable(&Join::Comparison(
+        assert!(RelationManager::join_is_reorderable(&Join::Comparison(
             join
         )));
     }

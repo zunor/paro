@@ -6,9 +6,19 @@
 use std::sync::Arc;
 
 use crate::join_order::cardinality::CardinalityEstimator;
-use crate::join_order::query_graph::NeighborInfo;
+use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::RelationStats;
+
+/// Predicates evaluated at one cut in the chosen join tree.
+///
+/// Query-graph adjacency can expose several independent edges across the same
+/// cut. The physical join must evaluate all of them, so the DP plan stores a
+/// predicate set rather than one arbitrarily selected graph neighbor.
+#[derive(Debug, Clone)]
+pub struct JoinPredicateSet {
+    pub filters: Vec<Arc<FilterInfo>>,
+}
 
 /// A node in the dynamic programming join plan.
 ///
@@ -17,7 +27,7 @@ pub struct DPJoinNode {
     /// The set of relations in this node.
     pub set: Arc<JoinRelationSet>,
     /// The selected query-graph edge that connects the left and right children.
-    pub info: Option<NeighborInfo>,
+    pub predicates: Option<JoinPredicateSet>,
     /// Whether this is a leaf node (single relation).
     pub is_leaf: bool,
     /// The left child set (for non-leaf nodes).
@@ -39,7 +49,7 @@ impl DPJoinNode {
     pub fn leaf(set: Arc<JoinRelationSet>) -> Self {
         Self {
             set: set.clone(),
-            info: None,
+            predicates: None,
             is_leaf: true,
             left_set: set.clone(),
             right_set: set,
@@ -51,7 +61,7 @@ impl DPJoinNode {
     /// Create an intermediate node (join of two relations).
     pub fn intermediate(
         set: Arc<JoinRelationSet>,
-        info: Option<NeighborInfo>,
+        predicates: Option<JoinPredicateSet>,
         left_set: Arc<JoinRelationSet>,
         right_set: Arc<JoinRelationSet>,
         cost: f64,
@@ -59,7 +69,7 @@ impl DPJoinNode {
     ) -> Self {
         Self {
             set,
-            info,
+            predicates,
             is_leaf: false,
             left_set,
             right_set,
@@ -132,7 +142,7 @@ impl CostModel {
         left: &DPJoinNode,
         right: &DPJoinNode,
         set_manager: &mut JoinRelationSetManager,
-        info: Option<NeighborInfo>,
+        predicates: Option<JoinPredicateSet>,
     ) -> DPJoinNode {
         let combination = set_manager.union(&left.set, &right.set);
         let cost = self.compute_cost(left, right, set_manager);
@@ -142,7 +152,7 @@ impl CostModel {
 
         DPJoinNode::intermediate(
             combination,
-            info,
+            predicates,
             left.set.clone(),
             right.set.clone(),
             cost,
@@ -158,12 +168,25 @@ impl CostModel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::join_order::query_graph::FilterInfo;
     use crate::join_order::relation_manager::DistinctCount;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
     use paro_planner::operator::ColumnBinding;
+
+    fn column_distinct_counts(
+        table_index: usize,
+        counts: impl IntoIterator<Item = DistinctCount>,
+    ) -> HashMap<ColumnBinding, DistinctCount> {
+        counts
+            .into_iter()
+            .enumerate()
+            .map(|(column_index, count)| (ColumnBinding::new(table_index, column_index), count))
+            .collect()
+    }
 
     fn create_column_ref(
         table_index: usize,
@@ -243,7 +266,7 @@ mod tests {
         );
 
         assert!(!node.is_leaf);
-        assert!(node.info.is_none());
+        assert!(node.predicates.is_none());
         assert_eq!(node.cost, 100.0);
         assert_eq!(node.cardinality, 50.0);
         assert!(Arc::ptr_eq(&node.left_set, &left));
@@ -285,10 +308,10 @@ mod tests {
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
 
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(50, true)]);
 
         cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
 
@@ -317,10 +340,10 @@ mod tests {
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
 
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(50, true)]);
 
         cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
 
@@ -330,7 +353,7 @@ mod tests {
 
         let left = DPJoinNode {
             set: left_set.clone(),
-            info: None,
+            predicates: None,
             is_leaf: false,
             left_set: left_set.clone(),
             right_set: left_set.clone(),
@@ -340,7 +363,7 @@ mod tests {
 
         let right = DPJoinNode {
             set: right_set.clone(),
-            info: None,
+            predicates: None,
             is_leaf: false,
             left_set: right_set.clone(),
             right_set: right_set.clone(),
@@ -368,10 +391,10 @@ mod tests {
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
 
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(50, true)]);
 
         cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
 
@@ -416,14 +439,16 @@ mod tests {
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
 
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count =
-            vec![DistinctCount::new(50, true), DistinctCount::new(25, true)];
+        stats1.column_distinct_count = column_distinct_counts(
+            1,
+            [DistinctCount::new(50, true), DistinctCount::new(25, true)],
+        );
 
         let mut stats2 = RelationStats::with_cardinality(200);
-        stats2.column_distinct_count = vec![DistinctCount::new(20, true)];
+        stats2.column_distinct_count = column_distinct_counts(2, [DistinctCount::new(20, true)]);
 
         cost_model.init_cost_model(&mut set_manager, &[stats0, stats1, stats2]);
 

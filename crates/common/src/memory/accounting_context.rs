@@ -103,6 +103,16 @@ impl MemoryAccountingContext {
         }
 
         if let Some(owner) = &self.owner {
+            if self.class == MemoryAccountingClass::Spill {
+                owner.record_allocation(self.domain, self.tag, self.class, bytes);
+                return Ok(MemoryReleaseHandle::new_observed(
+                    self.owner.clone(),
+                    self.domain,
+                    self.tag,
+                    self.class,
+                    bytes,
+                ));
+            }
             owner.acquire_capacity(self.domain, bytes)?;
             owner.record_allocation(self.domain, self.tag, self.class, bytes);
         }

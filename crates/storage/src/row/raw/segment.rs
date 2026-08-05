@@ -104,16 +104,14 @@ pub struct RawRowChunkPart {
     pub total_heap_size: usize,
     /// Number of rows in this part
     pub count: u32,
-    /// Base heap pointer for swizzling
-    pub base_heap_ptr: Option<*mut u8>,
-    /// Lock for recomputing heap pointers
-    pub lock: Arc<Mutex<()>>,
+    /// Last pinned base address of this part's heap range.
+    ///
+    /// Row-local varlen pointers are swizzled whenever the buffer pool reloads
+    /// the heap block at another address. Keeping the address as an integer
+    /// avoids giving a stale raw pointer a false lifetime, and sharing the
+    /// state makes cloned part metadata observe the same swizzle generation.
+    pub heap_base_address: Arc<Mutex<Option<usize>>>,
 }
-
-// Safety: The raw pointer is protected by the lock for swizzling,
-// and logic must ensure it's only accessed when the block is pinned.
-unsafe impl Send for RawRowChunkPart {}
-unsafe impl Sync for RawRowChunkPart {}
 
 impl RawRowChunkPart {
     /// Create a new chunk part.
@@ -132,8 +130,7 @@ impl RawRowChunkPart {
             heap_block_offset,
             total_heap_size,
             count,
-            base_heap_ptr: None,
-            lock: Arc::new(Mutex::new(())),
+            heap_base_address: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,8 +143,7 @@ impl RawRowChunkPart {
             heap_block_offset: INVALID_INDEX,
             total_heap_size: 0,
             count,
-            base_heap_ptr: None,
-            lock: Arc::new(Mutex::new(())),
+            heap_base_address: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -156,7 +152,7 @@ impl RawRowChunkPart {
         self.heap_block_index = INVALID_INDEX;
         self.heap_block_offset = INVALID_INDEX;
         self.total_heap_size = 0;
-        self.base_heap_ptr = None;
+        *self.heap_base_address.lock().unwrap() = None;
     }
 
     /// Check if this part has heap data.

@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::join_order::cost_model::{CostModel, DPJoinNode};
+use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinPredicateSet};
 use crate::join_order::query_graph::{NeighborInfo, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 
@@ -332,27 +332,37 @@ impl<'a> PlanEnumerator<'a> {
         right: &DPJoinNode,
         connections: &[NeighborInfo],
     ) -> DPJoinNode {
-        let chosen_connection = connections
-            .iter()
-            .find(|connection| !connection.filters.is_empty())
-            .or_else(|| connections.first())
-            .cloned();
+        let predicates = Self::collect_cut_predicates(connections);
 
-        let mut best_connection = chosen_connection;
-        for connection in connections {
-            if connection.filters.iter().any(|filter| {
+        self.cost_model
+            .compute_cost_and_create_node(left, right, self.set_manager, predicates)
+    }
+
+    fn collect_cut_predicates(connections: &[NeighborInfo]) -> Option<JoinPredicateSet> {
+        let boundary_join_type = connections
+            .iter()
+            .flat_map(|connection| &connection.filters)
+            .find_map(|filter| {
                 matches!(
                     filter.join_type,
                     paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
                 )
-            }) {
-                best_connection = Some(connection.clone());
-                break;
+                .then_some(filter.join_type)
+            });
+        let mut seen = HashSet::new();
+        let mut filters = Vec::new();
+        for filter in connections
+            .iter()
+            .flat_map(|connection| &connection.filters)
+        {
+            if boundary_join_type.is_some_and(|join_type| filter.join_type != join_type) {
+                continue;
+            }
+            if seen.insert(filter.filter_index) {
+                filters.push(Arc::clone(filter));
             }
         }
-
-        self.cost_model
-            .compute_cost_and_create_node(left, right, self.set_manager, best_connection)
+        (!filters.is_empty()).then_some(JoinPredicateSet { filters })
     }
 
     /// Solve join order approximately using a greedy algorithm.
@@ -469,12 +479,25 @@ fn add_super_sets(current: &[HashSet<usize>], all_neighbors: &[usize]) -> Vec<Ha
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::join_order::query_graph::FilterInfo;
     use crate::join_order::relation_manager::{DistinctCount, RelationStats};
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
     use paro_planner::operator::ColumnBinding;
+
+    fn column_distinct_counts(
+        table_index: usize,
+        counts: impl IntoIterator<Item = DistinctCount>,
+    ) -> HashMap<ColumnBinding, DistinctCount> {
+        counts
+            .into_iter()
+            .enumerate()
+            .map(|(column_index, count)| (ColumnBinding::new(table_index, column_index), count))
+            .collect()
+    }
 
     fn create_column_ref(
         table_index: usize,
@@ -515,6 +538,30 @@ mod tests {
         filter.set_right_binding(ColumnBinding::new(right_table, right_col));
 
         Arc::new(filter)
+    }
+
+    #[test]
+    fn join_cut_collects_all_crossing_predicates_once() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        let filter_ac = create_equality_filter(&mut set_manager, 0, 1, 2, 0, 1);
+        let connections = vec![
+            NeighborInfo {
+                neighbor: set_manager.get_relation(1),
+                filters: vec![Arc::clone(&filter_ab)],
+            },
+            NeighborInfo {
+                neighbor: set_manager.get_relation(2),
+                filters: vec![filter_ab, filter_ac],
+            },
+        ];
+
+        let predicates = PlanEnumerator::collect_cut_predicates(&connections)
+            .expect("join cut should contain predicates");
+
+        assert_eq!(predicates.filters.len(), 2);
+        assert_eq!(predicates.filters[0].filter_index, 0);
+        assert_eq!(predicates.filters[1].filter_index, 1);
     }
 
     #[test]
@@ -599,10 +646,10 @@ mod tests {
 
         // Initialize cost model
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
 
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(50, true)]);
 
         cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
 
@@ -617,7 +664,7 @@ mod tests {
         // Check final plan exists
         let final_plan = enumerator.get_final_plan();
         assert!(final_plan.is_some());
-        assert!(final_plan.unwrap().info.is_some());
+        assert!(final_plan.unwrap().predicates.is_some());
     }
 
     #[test]
@@ -646,14 +693,16 @@ mod tests {
 
         // Initialize cost model
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
 
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count =
-            vec![DistinctCount::new(50, true), DistinctCount::new(25, true)];
+        stats1.column_distinct_count = column_distinct_counts(
+            1,
+            [DistinctCount::new(50, true), DistinctCount::new(25, true)],
+        );
 
         let mut stats2 = RelationStats::with_cardinality(200);
-        stats2.column_distinct_count = vec![DistinctCount::new(20, true)];
+        stats2.column_distinct_count = column_distinct_counts(2, [DistinctCount::new(20, true)]);
 
         cost_model.init_cost_model(&mut set_manager, &[stats0, stats1, stats2]);
 
@@ -669,7 +718,7 @@ mod tests {
         let plan = final_plan.unwrap();
         assert_eq!(plan.set.count(), 3);
         assert!(plan.cost > 0.0);
-        assert!(plan.info.is_some());
+        assert!(plan.predicates.is_some());
     }
 
     #[test]

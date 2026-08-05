@@ -137,6 +137,7 @@ fn distinct_spec() -> AggregateSpec {
         aggregate_inputs: Box::new([Box::new([0])]),
         aggregate_filters: Box::new([None]),
         aggregate_orders: Box::new([Box::new([])]),
+        having_filter: Box::new([]),
         perfect_hash: None,
         output_names: Box::new([]),
         output_types: Box::new([]),
@@ -162,6 +163,7 @@ fn grouped_distinct_grouping_set_spec() -> AggregateSpec {
         aggregate_inputs: Box::new([Box::new([2])]),
         aggregate_filters: Box::new([None]),
         aggregate_orders: Box::new([Box::new([])]),
+        having_filter: Box::new([]),
         perfect_hash: None,
         output_names: Box::new(["g0".to_string(), "g1".to_string(), "count".to_string()]),
         output_types: Box::new([

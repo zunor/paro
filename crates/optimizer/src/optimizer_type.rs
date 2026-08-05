@@ -62,6 +62,8 @@ pub enum OptimizerType {
     SamplingPushdown,
     /// Pushes join filters to table scans.
     JoinFilterPushdown,
+    /// Separates hash keys from residual predicates on inner joins.
+    MixedJoinPredicate,
     /// Extension-provided optimizers.
     Extension,
     /// Materializes CTEs for reuse.
@@ -87,7 +89,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 37] = [
+    pub const ALL: [OptimizerType; 38] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -114,6 +116,7 @@ impl OptimizerType {
         OptimizerType::ReorderFilter,
         OptimizerType::SamplingPushdown,
         OptimizerType::JoinFilterPushdown,
+        OptimizerType::MixedJoinPredicate,
         OptimizerType::Extension,
         OptimizerType::MaterializedCte,
         OptimizerType::SumRewriter,
@@ -159,6 +162,7 @@ impl OptimizerType {
             OptimizerType::ReorderFilter => "reorder_filter",
             OptimizerType::SamplingPushdown => "sampling_pushdown",
             OptimizerType::JoinFilterPushdown => "join_filter_pushdown",
+            OptimizerType::MixedJoinPredicate => "mixed_join_predicate",
             OptimizerType::Extension => "extension",
             OptimizerType::MaterializedCte => "materialized_cte",
             OptimizerType::SumRewriter => "sum_rewriter",
@@ -211,6 +215,7 @@ impl FromStr for OptimizerType {
             "reorder_filter" => Ok(OptimizerType::ReorderFilter),
             "sampling_pushdown" => Ok(OptimizerType::SamplingPushdown),
             "join_filter_pushdown" => Ok(OptimizerType::JoinFilterPushdown),
+            "mixed_join_predicate" => Ok(OptimizerType::MixedJoinPredicate),
             "extension" => Ok(OptimizerType::Extension),
             "materialized_cte" => Ok(OptimizerType::MaterializedCte),
             "sum_rewriter" => Ok(OptimizerType::SumRewriter),

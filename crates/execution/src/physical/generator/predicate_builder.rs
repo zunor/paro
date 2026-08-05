@@ -16,7 +16,7 @@ use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::get::Get;
-use paro_storage::index::{Predicate, PredicateTree};
+use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
 
 pub fn build_predicate_tree(
     filters: &[Expression],
@@ -121,6 +121,10 @@ fn build_comparison_predicate(
     let left_col = extract_scan_column_index(&cmp.left);
     let right_col = extract_scan_column_index(&cmp.right);
 
+    if let (Some(left_col), Some(right_col)) = (left_col, right_col) {
+        return build_column_comparison_predicate(cmp.comparison_type, get, left_col, right_col);
+    }
+
     let (col_idx, value, comparison) = match (left_col, right_col) {
         (Some(col), None) => {
             let Some(value) = extract_constant_value(&cmp.right, get, col)? else {
@@ -156,6 +160,57 @@ fn build_comparison_predicate(
     };
 
     Ok(Some(PredicateTree::Leaf(predicate)))
+}
+
+fn build_column_comparison_predicate(
+    comparison: ComparisonType,
+    get: &Get,
+    left_col: usize,
+    right_col: usize,
+) -> Result<Option<PredicateTree>> {
+    let (Some(left_type), Some(right_type)) = (
+        get.column_types.get(left_col),
+        get.column_types.get(right_col),
+    ) else {
+        return Ok(None);
+    };
+    if left_type != right_type || !supports_raw_column_comparison(left_type) {
+        return Ok(None);
+    }
+    let comparison = match comparison {
+        ComparisonType::Equal => PredicateComparison::Equal,
+        ComparisonType::NotEqual => PredicateComparison::NotEqual,
+        ComparisonType::LessThan => PredicateComparison::LessThan,
+        ComparisonType::LessThanOrEqual => PredicateComparison::LessThanOrEqual,
+        ComparisonType::GreaterThan => PredicateComparison::GreaterThan,
+        ComparisonType::GreaterThanOrEqual => PredicateComparison::GreaterThanOrEqual,
+        ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => return Ok(None),
+    };
+    let (Some(left_column_id), Some(right_column_id)) =
+        (get.column_ids.get(left_col), get.column_ids.get(right_col))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PredicateTree::Leaf(Predicate::ColumnComparison {
+        left_column_id: *left_column_id as u32,
+        right_column_id: *right_column_id as u32,
+        comparison,
+    })))
+}
+
+fn supports_raw_column_comparison(logical_type: &LogicalType) -> bool {
+    matches!(
+        logical_type,
+        LogicalType::Date
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+            | LogicalType::Time
+            | LogicalType::Decimal { .. }
+            | LogicalType::Interval
+            | LogicalType::Uuid
+    )
 }
 
 fn build_operator_predicate(
@@ -313,6 +368,39 @@ mod tests {
     use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
     use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
     use paro_planner::expression::{CastExpression, ConstantExpression};
+    use paro_planner::operator::Get;
+
+    #[test]
+    fn fixed_width_column_comparison_is_pushed_to_storage() {
+        let get = Get::new_without_table(
+            7,
+            vec!["commit_date".to_string(), "receipt_date".to_string()],
+            vec![LogicalType::Date, LogicalType::Date],
+        );
+        let expression =
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::LessThan,
+                Expression::Reference(paro_planner::expression::ReferenceExpression::new(
+                    0,
+                    LogicalType::Date,
+                )),
+                Expression::Reference(paro_planner::expression::ReferenceExpression::new(
+                    1,
+                    LogicalType::Date,
+                )),
+            ));
+
+        let predicate = build_predicate(&expression, &get).unwrap();
+
+        assert_eq!(
+            predicate,
+            Some(PredicateTree::leaf(Predicate::ColumnComparison {
+                left_column_id: 0,
+                right_column_id: 1,
+                comparison: PredicateComparison::LessThan,
+            }))
+        );
+    }
 
     #[test]
     fn combining_predicates_flattens_and_removes_duplicates() {

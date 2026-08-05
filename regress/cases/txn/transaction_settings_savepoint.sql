@@ -29,8 +29,10 @@ ROLLBACK;
 
 SELECT name, setting, short_desc AS description
 FROM pg_settings
-WHERE name <> 'threads'
+WHERE name NOT IN ('threads', 'temp_directory')
 ORDER BY name;
+
+SELECT current_setting('temp_directory') <> '(empty)' AS has_default_temp_directory;
 
 DISCARD ALL;
 SHOW application_name;

@@ -81,6 +81,35 @@ fn recursive_cte_lowers_to_control_region() {
 }
 
 #[test]
+fn recursive_cte_hoists_loop_invariant_hash_build() {
+    let plan = recursive_cte_with_invariant_hash_build_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    let invariant_build = graph
+        .pipelines
+        .iter()
+        .find(|pipeline| matches!(pipeline.sink, SinkSpec::HashJoinBuild(_)))
+        .expect("invariant hash build pipeline")
+        .id;
+    let ControlRegion::RecursiveCte(region) = &graph.control_regions[0] else {
+        panic!("expected recursive CTE region");
+    };
+    assert!(!region.recursive.contains(&invariant_build));
+    assert!(region.recursive.iter().any(|pipeline| {
+        graph.pipelines[pipeline.index()]
+            .transforms
+            .iter()
+            .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_)))
+    }));
+    assert!(graph.dependencies.iter().any(|dependency| {
+        dependency.producer == invariant_build
+            && region.recursive.contains(&dependency.consumer)
+            && matches!(dependency.kind, DependencyKind::BuildBeforeProbe)
+    }));
+}
+
+#[test]
 fn projection_above_recursive_cte_stays_on_emit_pipeline() {
     let plan = projected_recursive_cte_plan();
     let mut lowerer = PipelineLowerer::new(&plan);

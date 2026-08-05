@@ -355,6 +355,61 @@ fn right_hash_join_lowers_unmatched_emit_pipeline() {
 }
 
 #[test]
+fn hash_join_merges_optional_branches_directly_into_topn_heap() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        other => panic!("expected hash join root, got {other:?}"),
+    };
+    let output = plan.node(plan.root).output.clone();
+    let topn = TopNSpec {
+        orders: vec![OrderByNode {
+            expression: Expression::Reference(ReferenceExpression::new(0, output.types[0].clone())),
+            ascending: true,
+            nulls_first: true,
+        }]
+        .into_boxed_slice(),
+        limit: 1,
+        offset: 0,
+        hnsw_ef_hint: None,
+        output_names: output.names.clone(),
+        output_types: output.types.clone(),
+    };
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let mut pipelines = Vec::new();
+    let mut dependencies = Vec::new();
+
+    let tail = lowerer
+        .lower_hash_join_to_sink(
+            plan.root,
+            &spec,
+            vec![TransformSpec::StreamingTopN(topn)],
+            SinkSpec::ClientResult(ClientResultSpec::default()),
+            SinkSharing::Exclusive,
+            output,
+            &mut pipelines,
+            &mut dependencies,
+        )
+        .unwrap();
+
+    assert_eq!(pipelines.len(), 4);
+    assert!(matches!(pipelines[1].sink, SinkSpec::TopNBuild(_)));
+    assert!(matches!(
+        pipelines[2].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert!(matches!(pipelines[2].sink, SinkSpec::TopNBuild(_)));
+    assert_eq!(pipelines[1].sink_sharing, pipelines[2].sink_sharing);
+    assert!(matches!(pipelines[3].source, SourceSpec::TopNEmit(_)));
+    assert!(pipelines[3].transforms.is_empty());
+    assert!(matches!(pipelines[3].sink, SinkSpec::ClientResult(_)));
+    assert!(!pipelines
+        .iter()
+        .any(|pipeline| matches!(pipeline.sink, SinkSpec::Materialize(_))));
+    assert_eq!(tail, PipelineId::new(3));
+}
+
+#[test]
 fn right_nested_loop_join_lowers_unmatched_emit_pipeline() {
     let plan = nested_loop_join_plan(JoinType::Right);
     let mut lowerer = PipelineLowerer::new(&plan);

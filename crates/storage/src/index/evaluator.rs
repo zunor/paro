@@ -92,7 +92,10 @@ impl IndexEvaluator {
     /// Indexes are pre-filtered by column_id (stored in the HashMap)
     /// and sorted by priority (ART > Bitmap > Bloom > ZoneMap).
     fn evaluate_single(&self, predicate: &Predicate) -> PredicateResult {
-        let Some(indexes) = self.indexes.get(&predicate.column_id()) else {
+        let Some(column_id) = predicate.index_column_id() else {
+            return PredicateResult::Unknown;
+        };
+        let Some(indexes) = self.indexes.get(&column_id) else {
             return PredicateResult::Unknown;
         };
 

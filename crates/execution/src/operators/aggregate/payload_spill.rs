@@ -399,6 +399,7 @@ mod tests {
         aggregate_objects, build_groups_chunk, create_hash_aggregate_tables, group_payload_refs,
         group_types, normalized_grouping_sets, update_hash_aggregate_tables,
     };
+    use crate::operators::aggregate::grouped_aggregate_hashtable::hash_group_columns;
     use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHTScanPosition;
     use crate::physical::specs::AggregateSpec;
 
@@ -426,9 +427,29 @@ mod tests {
             aggregate_inputs: Box::new([Box::new([])]),
             aggregate_filters: Box::new([None]),
             aggregate_orders: Box::new([Box::new([])]),
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
+        }
+    }
+
+    fn grouped_varchar_count_spec() -> AggregateSpec {
+        AggregateSpec {
+            grouping_key_count: 1,
+            projection_exprs: Box::new([]),
+            payload_types: Box::new([LogicalType::Varchar]),
+            groups: Box::new([reference(0, LogicalType::Varchar)]),
+            grouping_sets: Box::new([]),
+            aggregates: Box::new([count_star_expression()]),
+            grouping_functions: Box::new([]),
+            aggregate_inputs: Box::new([Box::new([])]),
+            aggregate_filters: Box::new([None]),
+            aggregate_orders: Box::new([Box::new([])]),
+            having_filter: Box::new([]),
+            perfect_hash: None,
+            output_names: Box::new(["k".to_string(), "count".to_string()]),
+            output_types: Box::new([LogicalType::Varchar, LogicalType::BigInt]),
         }
     }
 
@@ -522,6 +543,112 @@ mod tests {
             .collect::<Vec<_>>();
         actual.sort_unstable();
         assert_eq!(actual, vec![(1, 2), (2, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn aggregate_payload_spill_preserves_varchar_group_keys_across_batches() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let buffer_pool = Arc::new(BufferPool::new(64 * 1024 * 1024));
+        let memory = MemoryAccountingContext::detached(
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        );
+        let spec = grouped_varchar_count_spec();
+        let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
+        let group_refs = group_payload_refs(&spec).expect("group refs");
+        let grouping_sets = normalized_grouping_sets(&spec)
+            .expect("grouping sets")
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        let values = [
+            "PERU",
+            "UNITED KINGDOM",
+            "A deliberately long grouping key that lives outside the inline string payload",
+        ];
+        let row_count = VECTOR_SIZE * 3 + 17;
+        let mut spill = AggregatePayloadSpillBuffer::new(
+            Arc::clone(&buffer_pool),
+            [LogicalType::Varchar],
+            3,
+            memory.clone(),
+        )
+        .expect("spill");
+        for batch_start in (0..row_count).step_by(VECTOR_SIZE) {
+            let batch_size = (row_count - batch_start).min(VECTOR_SIZE);
+            let mut payload =
+                Chunk::try_initialize(&[LogicalType::Varchar], batch_size, allocator.clone())
+                    .expect("payload");
+            payload.set_cardinality(batch_size);
+            for row_idx in 0..batch_size {
+                let value = values[(batch_start + row_idx) % values.len()];
+                payload
+                    .column_mut(0)
+                    .expect("group column")
+                    .set_value(row_idx, &Value::Varchar(value.to_string()));
+            }
+            let groups = build_groups_chunk(&payload, &group_refs).expect("groups");
+            let hashes = hash_group_columns(&groups).expect("hashes");
+            spill
+                .append_payload(&payload, &hashes)
+                .expect("append spill");
+        }
+
+        let spilled = spill.seal();
+        let mut tables =
+            create_hash_aggregate_tables(&spec, allocator.clone(), memory, 1).expect("tables");
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
+        for partition_idx in 0..spilled.partition_count() {
+            spilled
+                .replay_partition_payloads(partition_idx, allocator.clone(), |payload_batch| {
+                    update_hash_aggregate_tables(
+                        &spec,
+                        &aggregate_objects,
+                        payload_batch,
+                        &group_refs,
+                        &grouping_sets,
+                        &mut tables,
+                        &mut addresses,
+                        &mut new_groups,
+                    )
+                })
+                .expect("replay partition");
+        }
+
+        let mut output = Chunk::try_initialize(
+            &[LogicalType::Varchar, LogicalType::BigInt],
+            values.len(),
+            allocator,
+        )
+        .expect("output");
+        let mut position = AggregateHTScanPosition::default();
+        let mut actual = Vec::new();
+        while tables[0].scan(&mut position, &mut output).expect("scan") {
+            actual.extend((0..output.size()).map(|row| {
+                (
+                    output
+                        .column(0)
+                        .unwrap()
+                        .get_string(row)
+                        .unwrap()
+                        .to_string(),
+                    output.column(1).unwrap().get_i64(row).unwrap(),
+                )
+            }));
+        }
+        actual.sort_unstable();
+        let mut expected = values
+            .iter()
+            .enumerate()
+            .map(|(value_idx, value)| {
+                let count = (value_idx..row_count).step_by(values.len()).count() as i64;
+                ((*value).to_string(), count)
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]

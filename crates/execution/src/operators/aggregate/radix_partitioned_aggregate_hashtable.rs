@@ -39,6 +39,18 @@ pub enum AggregateHashTable {
 }
 
 impl AggregateHashTable {
+    /// Split a finalized table into independently scannable ownership units.
+    pub fn into_scan_partitions(self) -> Vec<Self> {
+        match self {
+            Self::Flat(table) => vec![Self::Flat(table)],
+            Self::Radix(table) => table
+                .into_partitions()
+                .into_iter()
+                .map(Self::Flat)
+                .collect(),
+        }
+    }
+
     pub fn new_flat(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -189,6 +201,26 @@ impl AggregateHashTable {
         }
     }
 
+    pub fn scan_with_aggregate_filter(
+        &mut self,
+        position: &mut AggregateHTScanPosition,
+        result: &mut Chunk,
+        selection: &mut SelectionVector,
+        mut select: impl FnMut(&Chunk, usize, &mut SelectionVector) -> Result<usize>,
+    ) -> Result<bool> {
+        match self {
+            Self::Flat(table) => {
+                table.scan_with_aggregate_filter(&mut position.flat, result, selection, select)
+            }
+            Self::Radix(table) => table.scan_with_aggregate_filter(
+                &mut position.radix,
+                result,
+                selection,
+                &mut select,
+            ),
+        }
+    }
+
     pub fn scan_state_rows(
         &self,
         position: &mut AggregateHTScanPosition,
@@ -336,6 +368,10 @@ struct RadixRoutingScratch {
 }
 
 impl RadixPartitionedAggregateHashTable {
+    fn into_partitions(self) -> Vec<GroupedAggregateHashTable> {
+        self.partitions
+    }
+
     pub fn new(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -651,6 +687,41 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
                     ))
                 })?;
             if partition.scan(part_position, result)? {
+                return Ok(true);
+            }
+            partition.destroy()?;
+            position.partition_idx += 1;
+        }
+        result.try_set_cardinality(0)?;
+        Ok(false)
+    }
+
+    pub fn scan_with_aggregate_filter(
+        &mut self,
+        position: &mut RadixHTScanPosition,
+        result: &mut Chunk,
+        selection: &mut SelectionVector,
+        mut select: impl FnMut(&Chunk, usize, &mut SelectionVector) -> Result<usize>,
+    ) -> Result<bool> {
+        while position.partition_idx < self.partitions.len() {
+            let partition_idx = position.partition_idx;
+            let partition = self.partitions.get_mut(partition_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Radix partition index out of bounds during filtered scan: partition_idx={partition_idx}"
+                ))
+            })?;
+            if position.partition_positions.len() <= partition_idx {
+                position
+                    .partition_positions
+                    .resize_with(partition_idx + 1, HTScanPosition::default);
+            }
+            let partition_position = &mut position.partition_positions[partition_idx];
+            if partition.scan_with_aggregate_filter(
+                partition_position,
+                result,
+                selection,
+                &mut select,
+            )? {
                 return Ok(true);
             }
             partition.destroy()?;

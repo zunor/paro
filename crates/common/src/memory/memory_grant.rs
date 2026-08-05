@@ -288,6 +288,7 @@ pub struct MemoryReleaseHandle {
     tag: MemoryTag,
     class: MemoryAccountingClass,
     bytes: usize,
+    capacity_accounted: bool,
     released: AtomicBool,
 }
 
@@ -299,12 +300,37 @@ impl MemoryReleaseHandle {
         class: MemoryAccountingClass,
         bytes: usize,
     ) -> Self {
+        Self::new_inner(owner, domain, tag, class, bytes, true)
+    }
+
+    /// Track allocation observability without charging query working-set
+    /// capacity. This is reserved for bytes already externalized to spill
+    /// storage, whose resident pages are governed by the buffer pool.
+    pub fn new_observed(
+        owner: Option<Arc<dyn MemoryOwner>>,
+        domain: MemoryDomain,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+        bytes: usize,
+    ) -> Self {
+        Self::new_inner(owner, domain, tag, class, bytes, false)
+    }
+
+    fn new_inner(
+        owner: Option<Arc<dyn MemoryOwner>>,
+        domain: MemoryDomain,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+        bytes: usize,
+        capacity_accounted: bool,
+    ) -> Self {
         Self {
             owner,
             domain,
             tag,
             class,
             bytes,
+            capacity_accounted,
             released: AtomicBool::new(false),
         }
     }
@@ -338,7 +364,9 @@ impl MemoryReleaseHandle {
         }
         if let Some(owner) = &self.owner {
             owner.release_allocation(self.domain, self.tag, self.class, self.bytes);
-            owner.release_capacity(self.domain, self.bytes);
+            if self.capacity_accounted {
+                owner.release_capacity(self.domain, self.bytes);
+            }
         }
     }
 }
@@ -350,6 +378,7 @@ impl fmt::Debug for MemoryReleaseHandle {
             .field("tag", &self.tag)
             .field("class", &self.class)
             .field("bytes", &self.bytes)
+            .field("capacity_accounted", &self.capacity_accounted)
             .field("released", &self.released.load(Ordering::Acquire))
             .field("has_owner", &self.owner.is_some())
             .finish()

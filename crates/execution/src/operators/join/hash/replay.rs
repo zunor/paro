@@ -39,7 +39,6 @@ pub struct HashJoinSpillReplaySourceExec {
     pub probe_types: Box<[LogicalType]>,
     pub build_payload_types: Box<[LogicalType]>,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
     pub output_types: Box<[LogicalType]>,
 }
 
@@ -153,7 +152,7 @@ impl HashJoinSpillReplaySourceExec {
                     self.join_type,
                     &replay_input,
                     &self.left_projection,
-                    &self.right_projection,
+                    &[],
                     &self.output_types,
                     output,
                 )?;
@@ -260,7 +259,7 @@ impl HashJoinSpillReplaySourceExec {
             current.hash_table.as_ref(),
             &mut current.scan_structure,
             &self.left_projection,
-            &self.right_projection,
+            &[],
         )?;
         if current.scan_structure.finished {
             current.probe_in_progress = false;
@@ -306,16 +305,12 @@ impl HashJoinSpillReplaySourceExec {
                 &build_sel,
                 count,
                 &self.left_output_types(),
-                &self.right_projection,
+                &[],
                 output,
             )?,
-            JoinType::RightSemi | JoinType::RightAnti => construct_semi_join_result(
-                &build_chunk,
-                &build_sel,
-                count,
-                &self.right_projection,
-                output,
-            )?,
+            JoinType::RightSemi | JoinType::RightAnti => {
+                construct_semi_join_result(&build_chunk, &build_sel, count, &[], output)?
+            }
             _ => unreachable!("checked build-propagating join types above"),
         }
         Ok(count)

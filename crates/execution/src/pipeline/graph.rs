@@ -618,7 +618,6 @@ pub struct HashJoinSpillReplaySourceSpec {
     pub probe_types: Box<[LogicalType]>,
     pub build_payload_types: Box<[LogicalType]>,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
 }
@@ -628,7 +627,6 @@ pub struct HashJoinUnmatchedSourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub left_output_types: Box<[LogicalType]>,
-    pub right_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
 }
@@ -801,7 +799,6 @@ pub struct HashJoinProbeSpec {
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
 }

@@ -10,6 +10,13 @@ fn null_int_constant() -> Expression {
     ))
 }
 
+fn varchar_constant(value: &str) -> Expression {
+    Expression::Constant(ConstantExpression::new(
+        Value::Varchar(value.to_string()),
+        LogicalType::Varchar,
+    ))
+}
+
 #[test]
 fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds() {
     let output = QueryOutputPort::unbounded();
@@ -35,7 +42,6 @@ fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds(
                 probe_types: vec![LogicalType::Integer].into_boxed_slice(),
                 build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                 left_projection: vec![0].into_boxed_slice(),
-                right_projection: vec![0].into_boxed_slice(),
                 output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                 output_types: vec![LogicalType::Integer, LogicalType::Integer].into_boxed_slice(),
             }),
@@ -86,11 +92,11 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
     let query = query_context(output.clone());
     let build_row_type = RowType::new(
         vec!["rk".to_string(), "rv".to_string()],
-        vec![LogicalType::Integer, LogicalType::Integer],
+        vec![LogicalType::Integer, LogicalType::Varchar],
     );
     let join_row_type = RowType::new(
         vec!["lv".to_string(), "rv".to_string()],
-        vec![LogicalType::Integer, LogicalType::Integer],
+        vec![LogicalType::Integer, LogicalType::Varchar],
     );
 
     let mut handles = BreakerHandleCatalogBuilder::default();
@@ -112,10 +118,13 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                 id: build_id,
                 source: SourceSpec::Values(values_spec(
                     vec![
-                        vec![int_constant(1), int_constant(10)],
-                        vec![int_constant(2), int_constant(20)],
+                        vec![int_constant(1), varchar_constant("ALGERIA")],
+                        vec![
+                            int_constant(2),
+                            varchar_constant("a payload longer than the inline string limit"),
+                        ],
                     ],
-                    vec![LogicalType::Integer, LogicalType::Integer],
+                    vec![LogicalType::Integer, LogicalType::Varchar],
                 )),
                 transforms: Vec::new(),
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
@@ -123,7 +132,7 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     join_type: JoinType::Inner,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
-                    build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_payload_types: vec![LogicalType::Varchar].into_boxed_slice(),
                     required: Default::default(),
                     force_external: true,
                 }),
@@ -145,9 +154,8 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     join_type: JoinType::Inner,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                    output_types: vec![LogicalType::Integer, LogicalType::Integer]
+                    output_types: vec![LogicalType::Integer, LogicalType::Varchar]
                         .into_boxed_slice(),
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -163,11 +171,10 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
-                    build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_payload_types: vec![LogicalType::Varchar].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                    output_types: vec![LogicalType::Integer, LogicalType::Integer]
+                    output_types: vec![LogicalType::Integer, LogicalType::Varchar]
                         .into_boxed_slice(),
                 }),
                 transforms: Vec::new(),
@@ -229,7 +236,7 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
     let chunk = output.pop_front().expect("external replay output");
     assert_eq!(chunk.size(), 1);
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(100));
-    assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(10));
+    assert_eq!(chunk.column(1).unwrap().get_string(0), Some("ALGERIA"));
     assert!(output.pop_front().is_none());
 }
 
@@ -297,7 +304,6 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     join_type: JoinType::Right,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -317,7 +323,6 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -334,7 +339,6 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     handle,
                     join_type: JoinType::Right,
                     left_output_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -475,7 +479,6 @@ fn hash_join_external_right_replay_outputs_build_rows_when_probe_never_spilled()
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -606,7 +609,6 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                     join_type: JoinType::Mark,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: Vec::new().into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Boolean]
                         .into_boxed_slice(),
@@ -626,7 +628,6 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: Vec::new().into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Boolean]
                         .into_boxed_slice(),

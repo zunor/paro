@@ -439,6 +439,51 @@ mod tests {
     }
 
     #[test]
+    fn correlated_having_uses_aggregate_group_output_as_delim_key() {
+        let mut binder = test_binder();
+        let outer = wrapped(
+            &binder,
+            expression_get(60, vec![LogicalType::Integer, LogicalType::Integer]),
+        );
+        let mut root = LogicalOperator::Aggregate(Aggregate::new(
+            61,
+            62,
+            63,
+            outer,
+            vec![int_col(60, 1)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let subquery = subquery_expression(
+            SubqueryType::Exists,
+            expression_get(70, vec![LogicalType::Integer]),
+            vec![],
+            vec![],
+            vec![],
+            vec![correlated_column(60, 1, LogicalType::Integer)],
+            LogicalType::Boolean,
+            ComparisonType::Equal,
+        );
+
+        binder
+            .plan_correlated_subquery(&subquery, &mut root)
+            .expect("plan correlated HAVING");
+
+        let LogicalOperator::Join(Join::Comparison(join)) = root else {
+            panic!("expected mark join");
+        };
+        assert_eq!(
+            extract_binding(&join.conditions[0].left),
+            Some(ColumnBinding::new(61, 0))
+        );
+        assert_eq!(
+            extract_binding(&join.duplicate_eliminated_columns[0]),
+            Some(ColumnBinding::new(61, 0))
+        );
+    }
+
+    #[test]
     fn plan_correlated_not_exists_subquery_returns_negated_mark_expression() {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(61, 0, LogicalType::Integer)];

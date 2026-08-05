@@ -272,7 +272,6 @@ impl HashAggregateBuildSinkExec {
                 "hash aggregate sink local state mismatch",
             ));
         };
-        maybe_switch_empty_local_to_payload_spill(ctx, &self.spec, local)?;
         let payload = if let Some(executor) = local.projection_executor.as_mut() {
             projected_payload_chunk(
                 &self.spec,
@@ -538,7 +537,6 @@ fn hash_aggregate_local_payload_spill_enabled(
     spec: &AggregateSpec,
 ) -> bool {
     hash_aggregate_external_payload_spill_enabled(query, spec)
-        || hash_aggregate_pressure_payload_spill_enabled(query, spec)
 }
 
 fn hash_aggregate_preemptive_payload_spill_enabled(
@@ -553,43 +551,8 @@ fn hash_aggregate_preemptive_payload_spill_enabled(
     capacity <= threshold
 }
 
-fn hash_aggregate_pressure_payload_spill_enabled(
-    query: &crate::runtime::context::QueryRuntimeContext,
-    spec: &AggregateSpec,
-) -> bool {
-    if !hash_aggregate_payload_spill_supported(spec) || !query_has_temporary_directory(query) {
-        return false;
-    }
-    let threshold = HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD
-        .saturating_mul(query.session.number_of_threads().max(1));
-    query.memory.available_bytes() <= threshold
-}
-
 fn aggregate_payload_spill_radix_bits(parallelism: usize) -> usize {
     parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize
-}
-
-fn maybe_switch_empty_local_to_payload_spill(
-    ctx: &mut OperatorCallContext,
-    spec: &AggregateSpec,
-    local: &mut HashAggregateBuildSinkLocal,
-) -> Result<()> {
-    if local.raw_payload_spill_enabled()
-        || !hash_aggregate_pressure_payload_spill_enabled(ctx.query, spec)
-    {
-        return Ok(());
-    }
-    let mut tables = local.tables.lock();
-    if tables.iter().any(|table| table.count() > 0) {
-        return Ok(());
-    }
-    for table in tables.iter_mut() {
-        table.destroy()?;
-    }
-    tables.clear();
-    drop(tables);
-    local.enable_raw_payload_spill();
-    Ok(())
 }
 
 fn append_payload_to_local_spill(
@@ -1287,6 +1250,7 @@ mod tests {
             aggregate_inputs: Box::new([Box::new([])]),
             aggregate_filters: Box::new([None]),
             aggregate_orders: Box::new([Box::new([])]),
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
@@ -1312,6 +1276,7 @@ mod tests {
             aggregate_inputs: Box::new([Box::new([1])]),
             aggregate_filters: Box::new([None]),
             aggregate_orders: Box::new([Box::new([])]),
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "items".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::Varchar]),

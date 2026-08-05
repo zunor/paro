@@ -16,7 +16,7 @@ use paro_external::routine::spec::{
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_function::window::WindowFunction;
 use paro_planner::binder::context::BindContext;
-use paro_planner::binder::ir::CTEMaterialize;
+use paro_planner::binder::ir::{CTEMaterialize, OrderByNode};
 use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, OrderByExpression, ReferenceExpression,
     WindowExpression, WindowFrame,
@@ -615,6 +615,78 @@ fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
 fn recursive_cte_plan(union_all: bool) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let cte = recursive_cte_logical_plan(&ctx, union_all);
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&cte).unwrap()
+}
+
+fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let anchor = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["node".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let recursive_ref = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::CTERef(CTERef::new(
+            9,
+            1,
+            vec!["node".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let edges = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            vec![],
+            vec!["src".to_string(), "dst".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            recursive_ref,
+            edges,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+    let recursive = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(
+            Projection::new(
+                2,
+                join,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    2,
+                    LogicalType::Integer,
+                ))],
+            )
+            .with_output_names(vec!["node".to_string()]),
+        ),
+    );
+    let cte = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::RecursiveCTE(RecursiveCTE {
+            cte_index: 9,
+            cte_name: "walk".to_string(),
+            column_names: vec!["node".to_string()],
+            column_types: vec![LogicalType::Integer],
+            union_all: true,
+            anchor: Box::new(anchor),
+            recursive: Box::new(recursive),
+        }),
+    );
 
     let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
     generator.generate(&cte).unwrap()

@@ -248,14 +248,11 @@ impl CardinalityEstimator {
     /// Update total domains with statistics from a relation.
     pub fn update_total_domains(&mut self, set: &Arc<JoinRelationSet>, stats: &RelationStats) {
         debug_assert_eq!(set.count(), 1);
-        let relation_id = set.relations()[0];
 
         // Initialize the distinct count for all columns used in joins
-        for (i, distinct_count) in stats.column_distinct_count.iter().enumerate() {
-            let key = ColumnBinding::new(relation_id, i);
-
+        for (key, distinct_count) in &stats.column_distinct_count {
             for relation_to_tdom in &mut self.relation_set_stats {
-                if !relation_to_tdom.equivalent_relations.contains(&key) {
+                if !relation_to_tdom.equivalent_relations.contains(key) {
                     continue;
                 }
 
@@ -827,6 +824,17 @@ mod tests {
         })
     }
 
+    fn column_distinct_counts(
+        table_index: usize,
+        counts: impl IntoIterator<Item = DistinctCount>,
+    ) -> HashMap<ColumnBinding, DistinctCount> {
+        counts
+            .into_iter()
+            .enumerate()
+            .map(|(column_index, count)| (ColumnBinding::new(table_index, column_index), count))
+            .collect()
+    }
+
     fn create_equality_filter(
         set_manager: &mut JoinRelationSetManager,
         left_table: usize,
@@ -950,7 +958,7 @@ mod tests {
         // Initialize props for relation 0
         let set0 = set_manager.get_relation(0);
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
         estimator.init_cardinality_estimator_props(&set0, &stats0);
 
         // Check that cardinality was stored
@@ -986,13 +994,13 @@ mod tests {
         // Initialize relation 0 with cardinality 1000, distinct count 100
         let set0 = set_manager.get_relation(0);
         let mut stats0 = RelationStats::with_cardinality(1000);
-        stats0.column_distinct_count = vec![DistinctCount::new(100, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
         estimator.init_cardinality_estimator_props(&set0, &stats0);
 
         // Initialize relation 1 with cardinality 500, distinct count 50
         let set1 = set_manager.get_relation(1);
         let mut stats1 = RelationStats::with_cardinality(500);
-        stats1.column_distinct_count = vec![DistinctCount::new(50, true)];
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(50, true)]);
         estimator.init_cardinality_estimator_props(&set1, &stats1);
 
         // Estimate cardinality for join
@@ -1012,12 +1020,12 @@ mod tests {
 
         let set0 = set_manager.get_relation(0);
         let mut stats0 = RelationStats::with_cardinality(9);
-        stats0.column_distinct_count = vec![DistinctCount::new(9, true)];
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(9, true)]);
         estimator.init_cardinality_estimator_props(&set0, &stats0);
 
         let set1 = set_manager.get_relation(1);
         let mut stats1 = RelationStats::with_cardinality(19);
-        stats1.column_distinct_count = vec![DistinctCount::new(19, true)];
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(19, true)]);
         estimator.init_cardinality_estimator_props(&set1, &stats1);
 
         let join_set = set_manager.get_relation_from_vec(vec![0, 1]);

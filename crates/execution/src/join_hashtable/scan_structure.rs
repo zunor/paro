@@ -45,6 +45,18 @@ pub struct ScanStructure {
     pub lhs_sel: SelectionVector,
     /// Pointers to build-side rows that passed all predicates.
     pub rhs_pointers: Vec<usize>,
+    /// Build pointers retained while a match batch is drained across output vectors.
+    pending_rhs_pointers: Vec<usize>,
+    /// Accepted matches in the current chain step.
+    pending_match_count: usize,
+    /// Next accepted match to emit.
+    pending_match_offset: usize,
+    /// Matched build row per probe row for a SINGLE join (zero means unmatched).
+    single_match_pointers: Vec<usize>,
+    /// Next SINGLE-join probe row to emit.
+    single_output_offset: usize,
+    /// Whether all SINGLE-join chains have been validated and collected.
+    single_matches_ready: bool,
     /// Reusable probe hash buffer.
     pub hashes: Vec<u64>,
     /// Reusable flags for residual-filtered probe rows.
@@ -100,67 +112,60 @@ impl ScanStructure {
 
         let mut base_count = 0;
 
-        while self.count > 0 && base_count < paro_common::vector::VECTOR_SIZE {
-            // Safety check: if adding matches from current chains could overflow the batch,
-            // and we already have some results, break and let the next call handle these chains.
-            // This is safe because res_count <= self.count.
-            if base_count > 0 && base_count + self.count > paro_common::vector::VECTOR_SIZE {
+        while base_count < paro_common::vector::VECTOR_SIZE {
+            if self.pending_match_offset < self.pending_match_count {
+                let available = self.pending_match_count - self.pending_match_offset;
+                let emit_count =
+                    available.min(paro_common::vector::VECTOR_SIZE.saturating_sub(base_count));
+                for output_idx in 0..emit_count {
+                    let pending_idx = self.pending_match_offset + output_idx;
+                    self.lhs_sel.set(
+                        base_count + output_idx,
+                        self.chain_match_sel.get(pending_idx),
+                    );
+                    let build_ptr = self.pending_rhs_pointers[pending_idx];
+                    self.rhs_pointers[base_count + output_idx] = build_ptr;
+                    if hash_table.has_found_flag() {
+                        hash_table.set_build_side_found(build_ptr, true);
+                    }
+                }
+                self.pending_match_offset += emit_count;
+                base_count += emit_count;
+
+                if self.pending_match_offset < self.pending_match_count {
+                    break;
+                }
+
+                self.pending_match_count = 0;
+                self.pending_match_offset = 0;
+                self.advance_pointers();
+                continue;
+            }
+
+            if self.count == 0 {
                 break;
             }
 
-            // Resolve predicates for current candidates
-            let res_count = self.resolve_predicates(keys, hash_table, base_count);
-
-            if res_count > 0 {
-                let rhs_offset = base_count;
-                self.scratch_sel.set_len(res_count);
-                let accepted_count = residual_filter(
-                    &self.chain_match_sel,
-                    &self.rhs_pointers[rhs_offset..rhs_offset + res_count],
-                    res_count,
-                    &mut self.scratch_sel,
-                )?;
-
-                for i in 0..accepted_count {
-                    let match_idx = self.scratch_sel.get(i);
-                    self.chain_match_sel
-                        .set(i, self.chain_match_sel.get(match_idx));
-                    self.rhs_pointers[rhs_offset + i] = self.rhs_pointers[rhs_offset + match_idx];
-                }
-
-                // Found some matches
-                let count_to_copy = std::cmp::min(
-                    accepted_count,
-                    paro_common::vector::VECTOR_SIZE - base_count,
-                );
-
-                // Copy LHS indices
-                for i in 0..count_to_copy {
-                    self.lhs_sel
-                        .set(base_count + i, self.chain_match_sel.get(i));
-                    if hash_table.has_found_flag() {
-                        hash_table.set_build_side_found(self.rhs_pointers[base_count + i], true);
-                    }
-                }
-
-                // Copy RHS pointers (we need to store these for gathering)
-                // rhs_pointers already contains row_ptr for these matches from resolve_predicates
-
-                base_count += count_to_copy;
-
-                if count_to_copy < res_count {
-                    // We don't have enough space in the output chunk
-                    // We need to keep the remaining matches for next call
-                    // For now, let's assume we fit or we'll need a way to buffer
-                    // state.lhs_output.Reference(left);
-                    // state.scan_structure.Next(state.lhs_join_keys, state.lhs_output, chunk);
-                }
+            let match_count = self.resolve_predicates_into_pending(keys, hash_table);
+            self.scratch_sel.set_len(match_count);
+            let accepted_count = residual_filter(
+                &self.chain_match_sel,
+                &self.pending_rhs_pointers[..match_count],
+                match_count,
+                &mut self.scratch_sel,
+            )?;
+            for accepted_idx in 0..accepted_count {
+                let match_idx = self.scratch_sel.get(accepted_idx);
+                self.chain_match_sel
+                    .set(accepted_idx, self.chain_match_sel.get(match_idx));
+                self.pending_rhs_pointers[accepted_idx] = self.pending_rhs_pointers[match_idx];
             }
+            self.pending_match_count = accepted_count;
+            self.pending_match_offset = 0;
 
-            // Always advance pointers and try to find more matches for the same input chunk
-            // if we haven't filled our output batch yet.
-            // If we have long chains, we might find more matches for the same rows.
-            self.advance_pointers();
+            if accepted_count == 0 {
+                self.advance_pointers();
+            }
         }
 
         if base_count > 0 {
@@ -176,7 +181,7 @@ impl ScanStructure {
             result.set_cardinality(0);
         }
 
-        if self.count == 0 {
+        if self.count == 0 && self.pending_match_count == 0 {
             self.finished = true;
         }
 
@@ -197,6 +202,12 @@ impl ScanStructure {
             found_match: vec![false; VECTOR_SIZE],
             lhs_sel: SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone())?,
             rhs_pointers: vec![0; VECTOR_SIZE],
+            pending_rhs_pointers: vec![0; VECTOR_SIZE],
+            pending_match_count: 0,
+            pending_match_offset: 0,
+            single_match_pointers: vec![0; VECTOR_SIZE],
+            single_output_offset: 0,
+            single_matches_ready: false,
             hashes: vec![0; VECTOR_SIZE],
             accepted_flags: vec![false; VECTOR_SIZE],
             match_count: 0,
@@ -217,6 +228,8 @@ impl ScanStructure {
         self.pointers.resize(capacity, 0);
         self.found_match.resize(capacity, false);
         self.rhs_pointers.resize(capacity, 0);
+        self.pending_rhs_pointers.resize(capacity, 0);
+        self.single_match_pointers.resize(capacity, 0);
         self.hashes.resize(capacity, 0);
         self.accepted_flags.resize(capacity, false);
         self.sel_vector = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
@@ -235,6 +248,10 @@ impl ScanStructure {
         self.finished = false;
         self.is_null = false;
         self.has_null_value_filter = false;
+        self.pending_match_count = 0;
+        self.pending_match_offset = 0;
+        self.single_output_offset = 0;
+        self.single_matches_ready = false;
         for i in 0..self.pointers.len() {
             self.found_match[i] = false;
             self.pointers[i] = 0;
@@ -561,6 +578,24 @@ impl ScanStructure {
             }
         }
 
+        match_count
+    }
+
+    fn resolve_predicates_into_pending(
+        &mut self,
+        keys: &paro_common::chunk::Chunk,
+        hash_table: &JoinHashTable,
+    ) -> usize {
+        let mut match_count = 0;
+        for active_idx in 0..self.count {
+            let probe_idx = self.sel_vector.get(active_idx);
+            let row_ptr = self.pointers[probe_idx];
+            if row_ptr != 0 && hash_table.key_values_match_build_row(keys, probe_idx, row_ptr) {
+                self.chain_match_sel.set(match_count, probe_idx);
+                self.pending_rhs_pointers[match_count] = row_ptr;
+                match_count += 1;
+            }
+        }
         match_count
     }
 
@@ -906,34 +941,41 @@ impl ScanStructure {
             return Ok(0);
         }
 
-        let mut matched_ptrs = vec![None; left.size()];
+        if !self.single_matches_ready {
+            self.single_match_pointers[..left.size()].fill(0);
+            while self.count > 0 {
+                let match_count = self.resolve_predicates(keys, hash_table, 0);
+                self.scratch_sel.set_len(match_count);
+                let accepted_count = residual_filter(
+                    &self.chain_match_sel,
+                    &self.rhs_pointers[..match_count],
+                    match_count,
+                    &mut self.scratch_sel,
+                )?;
 
-        while self.count > 0 {
-            let match_count = self.resolve_predicates(keys, hash_table, 0);
-            self.scratch_sel.set_len(match_count);
-            let accepted_count = residual_filter(
-                &self.chain_match_sel,
-                &self.rhs_pointers[..match_count],
-                match_count,
-                &mut self.scratch_sel,
-            )?;
-
-            for i in 0..accepted_count {
-                let match_idx = self.scratch_sel.get(i);
-                let lhs_idx = self.chain_match_sel.get(match_idx);
-                if matched_ptrs[lhs_idx].is_some() {
-                    return Err(paro_common::error::invalid_input(
-                        "More than one row returned by a SINGLE join",
-                    ));
+                for i in 0..accepted_count {
+                    let match_idx = self.scratch_sel.get(i);
+                    let lhs_idx = self.chain_match_sel.get(match_idx);
+                    if self.single_match_pointers[lhs_idx] != 0 {
+                        return Err(paro_common::error::invalid_input(
+                            "More than one row returned by a SINGLE join",
+                        ));
+                    }
+                    self.found_match[lhs_idx] = true;
+                    self.single_match_pointers[lhs_idx] = self.rhs_pointers[match_idx];
                 }
-                self.found_match[lhs_idx] = true;
-                matched_ptrs[lhs_idx] = Some(self.rhs_pointers[match_idx]);
-            }
 
-            self.advance_pointers();
+                self.advance_pointers();
+            }
+            self.single_matches_ready = true;
         }
 
-        let left_sel = SelectionVector::try_incremental(left.size(), self.allocator.clone())?;
+        let emit_count = (left.size() - self.single_output_offset).min(result.capacity());
+        let mut left_sel = SelectionVector::try_with_capacity(emit_count, self.allocator.clone())?;
+        left_sel.set_len(emit_count);
+        for output_idx in 0..emit_count {
+            left_sel.set(output_idx, self.single_output_offset + output_idx);
+        }
         let left_indices: Vec<usize> = if left_projection_map.is_empty() {
             (0..left.column_count()).collect()
         } else {
@@ -958,19 +1000,22 @@ impl ScanStructure {
                 .column_mut(right_offset + out_idx)
                 .expect("single join output vector must exist");
 
-            for (row_idx, row_ptr) in matched_ptrs.iter().enumerate() {
-                if let Some(ptr) = row_ptr {
-                    let value = hash_table.read_build_value(*ptr, *build_idx);
-                    vector.set_value(row_idx, &value);
-                    vector.set_null(row_idx, false);
+            for output_idx in 0..emit_count {
+                let probe_idx = self.single_output_offset + output_idx;
+                let row_ptr = self.single_match_pointers[probe_idx];
+                if row_ptr != 0 {
+                    let value = hash_table.read_build_value(row_ptr, *build_idx);
+                    vector.set_value(output_idx, &value);
+                    vector.set_null(output_idx, false);
                 } else {
-                    vector.set_null(row_idx, true);
+                    vector.set_null(output_idx, true);
                 }
             }
         }
 
-        result.set_cardinality(left.size());
-        self.finished = true;
+        result.set_cardinality(emit_count);
+        self.single_output_offset += emit_count;
+        self.finished = self.single_output_offset == left.size();
         Ok(result.size())
     }
 
@@ -1071,398 +1116,5 @@ impl ScanStructure {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
-    use paro_common::chunk::Chunk;
-    use paro_common::runtime_value::Value;
-    use paro_common::types::LogicalType;
-
-    use paro_planner::expression::{ConstantExpression, Expression};
-    use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
-    use paro_storage::buffer::BufferPool;
-    use std::sync::Arc;
-
-    fn create_test_buffer_pool() -> Arc<BufferPool> {
-        BufferPool::new_arc(64 * 1024 * 1024)
-    }
-
-    fn equality_condition() -> JoinCondition {
-        JoinCondition::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            JoinComparisonType::Equal,
-        )
-    }
-
-    fn not_distinct_condition() -> JoinCondition {
-        JoinCondition::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            JoinComparisonType::NotDistinctFrom,
-        )
-    }
-
-    fn build_hash_table(
-        join_type: JoinType,
-        build_keys: &[i32],
-        build_payload: &[i32],
-    ) -> JoinHashTable {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            join_type,
-            JoinHashTableConfig::default(),
-        );
-
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    build_keys,
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    build_payload,
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        ht.build(&keys, &payload).unwrap();
-        ht.finalize().unwrap();
-        ht
-    }
-
-    fn chunk_from_optional_i32(values: &[Option<i32>]) -> Chunk {
-        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer],
-            values.len(),
-        );
-        for (row_idx, value) in values.iter().enumerate() {
-            let column = chunk.column_mut(0).expect("column must exist");
-            match value {
-                Some(value) => column.set_value(row_idx, &Value::Integer(*value)),
-                None => column.set_value(row_idx, &Value::Null(LogicalType::Integer)),
-            }
-        }
-        chunk.set_cardinality(values.len());
-        chunk
-    }
-
-    fn build_hash_table_from_optional(
-        join_type: JoinType,
-        condition: JoinCondition,
-        build_keys: &[Option<i32>],
-        build_payload: &[i32],
-    ) -> JoinHashTable {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![condition],
-            vec![LogicalType::Integer],
-            join_type,
-            JoinHashTableConfig::default(),
-        );
-
-        let keys = chunk_from_optional_i32(build_keys);
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    build_payload,
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        ht.build(&keys, &payload).unwrap();
-        ht.finalize().unwrap();
-        ht
-    }
-
-    fn prepare_probe(ht: &JoinHashTable, probe_keys: &[i32]) -> (ScanStructure, Chunk, Chunk) {
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    probe_keys,
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let left = keys.clone();
-        let mut scan = ht
-            .create_scan_structure()
-            .expect("test scan structure allocation failed");
-        ht.probe(&keys, &mut scan, None, keys.size()).unwrap();
-        (scan, keys, left)
-    }
-
-    #[test]
-    fn test_scan_structure_new() {
-        let ss = ScanStructure::try_new(16, paro_common::test_utils::test_allocator())
-            .expect("test scan structure allocation failed");
-        assert_eq!(ss.count, 0);
-        assert!(ss.is_null);
-        assert!(!ss.finished);
-        assert_eq!(ss.pointer_offset, 16);
-    }
-
-    #[test]
-    fn test_scan_structure_reset() {
-        let mut ss = ScanStructure::try_new(16, paro_common::test_utils::test_allocator())
-            .expect("test scan structure allocation failed");
-        ss.count = 5;
-        ss.finished = true;
-        ss.is_null = false;
-        ss.found_match[0] = true;
-
-        ss.reset();
-
-        assert_eq!(ss.count, 0);
-        assert!(!ss.is_null);
-        assert!(!ss.finished);
-        assert!(!ss.found_match[0]);
-    }
-
-    #[test]
-    fn test_pointers_exhausted() {
-        let mut ss = ScanStructure::try_new(16, paro_common::test_utils::test_allocator())
-            .expect("test scan structure allocation failed");
-        assert!(ss.pointers_exhausted());
-
-        ss.count = 1;
-        assert!(!ss.pointers_exhausted());
-    }
-
-    #[test]
-    fn test_next_left_join_emits_matches_then_unmatched_rows() {
-        let ht = build_hash_table(JoinType::Left, &[1, 2], &[10, 20]);
-        let (mut scan, keys, left) = prepare_probe(&ht, &[1, 3]);
-        let mut result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Integer],
-            2,
-        );
-
-        let first = scan
-            .next_left_join(&keys, &left, &mut result, &ht, &[], &[])
-            .unwrap();
-        assert_eq!(first, 1);
-        assert_eq!(result.data[0].get_value(0).to_string(), "1");
-        assert_eq!(result.data[1].get_value(0).to_string(), "10");
-
-        let second = scan
-            .next_left_join(&keys, &left, &mut result, &ht, &[], &[])
-            .unwrap();
-        assert_eq!(second, 1);
-        assert_eq!(result.data[0].get_value(0).to_string(), "3");
-        assert!(result.data[1].is_null(0));
-    }
-
-    #[test]
-    fn test_next_semi_anti_and_mark_join() {
-        let ht = build_hash_table(JoinType::Inner, &[1, 2], &[10, 20]);
-
-        let (mut semi_scan, keys, left) = prepare_probe(&ht, &[1, 3]);
-        let mut semi_result =
-            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
-        let semi_count = semi_scan
-            .next_semi_join(&keys, &left, &mut semi_result, &ht, &[])
-            .unwrap();
-        assert_eq!(semi_count, 1);
-        assert_eq!(semi_result.data[0].get_value(0).to_string(), "1");
-
-        let (mut anti_scan, keys, left) = prepare_probe(&ht, &[1, 3]);
-        let mut anti_result =
-            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
-        let anti_count = anti_scan
-            .next_anti_join(&keys, &left, &mut anti_result, &ht, &[])
-            .unwrap();
-        assert_eq!(anti_count, 1);
-        assert_eq!(anti_result.data[0].get_value(0).to_string(), "3");
-
-        let (mut mark_scan, keys, left) = prepare_probe(&ht, &[1, 3]);
-        let mut mark_result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Boolean],
-            2,
-        );
-        let mark_count = mark_scan
-            .next_mark_join(&keys, &left, &mut mark_result, &ht, &[])
-            .unwrap();
-        assert_eq!(mark_count, 2);
-        assert_eq!(mark_result.data[1].get_value(0).to_string(), "true");
-        assert_eq!(mark_result.data[1].get_value(1).to_string(), "false");
-    }
-
-    #[test]
-    fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
-        let ht = build_hash_table_from_optional(
-            JoinType::Semi,
-            not_distinct_condition(),
-            &[None, Some(2)],
-            &[10, 20],
-        );
-
-        let keys = chunk_from_optional_i32(&[None, Some(1), Some(2)]);
-        let left = keys.clone();
-
-        let mut semi_scan = ht
-            .create_scan_structure()
-            .expect("test scan structure allocation failed");
-        ht.probe(&keys, &mut semi_scan, None, keys.size()).unwrap();
-        let mut semi_result =
-            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
-        let semi_count = semi_scan
-            .next_semi_join(&keys, &left, &mut semi_result, &ht, &[])
-            .unwrap();
-        assert_eq!(semi_count, 2);
-        assert!(semi_result.data[0].is_null(0));
-        assert_eq!(semi_result.data[0].get_value(1).to_string(), "2");
-
-        let mut anti_scan = ht
-            .create_scan_structure()
-            .expect("test scan structure allocation failed");
-        ht.probe(&keys, &mut anti_scan, None, keys.size()).unwrap();
-        let mut anti_result =
-            paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
-        let anti_count = anti_scan
-            .next_anti_join(&keys, &left, &mut anti_result, &ht, &[])
-            .unwrap();
-        assert_eq!(anti_count, 1);
-        assert_eq!(anti_result.data[0].get_value(0).to_string(), "1");
-    }
-
-    #[test]
-    fn test_next_single_join_null_fills_unmatched_rows() {
-        let ht = build_hash_table(JoinType::Single, &[1, 2], &[10, 20]);
-        let (mut scan, keys, left) = prepare_probe(&ht, &[1, 3]);
-        let mut result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Integer],
-            2,
-        );
-
-        let count = scan
-            .next_single_join(&keys, &left, &mut result, &ht, &[], &[])
-            .unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(result.data[0].get_value(0).to_string(), "1");
-        assert_eq!(result.data[1].get_value(0).to_string(), "10");
-        assert_eq!(result.data[0].get_value(1).to_string(), "3");
-        assert!(result.data[1].is_null(1));
-    }
-
-    #[test]
-    fn test_next_single_join_errors_on_duplicates() {
-        let ht = build_hash_table(JoinType::Single, &[1, 1], &[10, 11]);
-        let (mut scan, keys, left) = prepare_probe(&ht, &[1]);
-        let mut result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Integer],
-            1,
-        );
-
-        let err = scan
-            .next_single_join(&keys, &left, &mut result, &ht, &[], &[])
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("More than one row returned by a SINGLE join"));
-    }
-
-    #[test]
-    fn test_next_right_semi_or_anti_join_marks_build_rows() {
-        let ht = build_hash_table(JoinType::RightSemi, &[1, 2], &[10, 20]);
-        let (mut scan, keys, _left) = prepare_probe(&ht, &[1]);
-
-        let count = scan.next_right_semi_or_anti_join(&keys, &ht).unwrap();
-        assert_eq!(count, 0);
-
-        let mut matched_state = ht.create_full_outer_scan_state();
-        let mut matched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let matched_count = ht
-            .scan_full_outer(&mut matched_state, true, &mut matched)
-            .unwrap();
-        assert_eq!(matched_count, 1);
-        assert_eq!(matched.data[0].get_value(0).to_string(), "10");
-
-        let mut unmatched_state = ht.create_full_outer_scan_state();
-        let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let unmatched_count = ht
-            .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
-            .unwrap();
-        assert_eq!(unmatched_count, 1);
-        assert_eq!(unmatched.data[0].get_value(0).to_string(), "20");
-    }
-
-    #[test]
-    fn test_next_right_semi_or_anti_join_marks_all_duplicate_build_rows() {
-        let ht = build_hash_table(JoinType::RightSemi, &[3, 3], &[30, 31]);
-        let (mut scan, keys, _left) = prepare_probe(&ht, &[3, 3]);
-
-        let count = scan.next_right_semi_or_anti_join(&keys, &ht).unwrap();
-        assert_eq!(count, 0);
-
-        let mut matched_state = ht.create_full_outer_scan_state();
-        let mut matched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let matched_count = ht
-            .scan_full_outer(&mut matched_state, true, &mut matched)
-            .unwrap();
-        assert_eq!(matched_count, 2);
-        assert_eq!(matched.data[0].get_value(0).to_string(), "30");
-        assert_eq!(matched.data[0].get_value(1).to_string(), "31");
-
-        let mut unmatched_state = ht.create_full_outer_scan_state();
-        let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let unmatched_count = ht
-            .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
-            .unwrap();
-        assert_eq!(unmatched_count, 0);
-    }
-
-    #[test]
-    fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
-        let ht = build_hash_table(JoinType::Right, &[1, 2], &[10, 20]);
-        let (mut scan, keys, left) = prepare_probe(&ht, &[1]);
-        let mut result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Integer],
-            1,
-        );
-
-        let count = scan
-            .next_inner_join(&keys, &left, &mut result, &ht, &[], &[])
-            .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(result.data[0].get_value(0).to_string(), "1");
-        assert_eq!(result.data[1].get_value(0).to_string(), "10");
-
-        let mut unmatched_state = ht.create_full_outer_scan_state();
-        let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let unmatched_count = ht
-            .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
-            .unwrap();
-        assert_eq!(unmatched_count, 1);
-        assert_eq!(unmatched.data[0].get_value(0).to_string(), "20");
-    }
-}
+#[path = "scan_structure_tests.rs"]
+mod tests;

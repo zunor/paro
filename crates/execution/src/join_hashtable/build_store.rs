@@ -471,6 +471,13 @@ impl HashBuildStore {
                 chunk.column_count()
             )));
         }
+        if chunk.types() != self.layout.row_format().logical_types() {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore append type mismatch: expected {:?}, got {:?}",
+                self.layout.row_format().logical_types(),
+                chunk.types()
+            )));
+        }
 
         let mut appended = 0usize;
         let base_columns = (0..self.layout.base().column_count())
@@ -568,6 +575,22 @@ impl HashBuildStore {
                 "HashBuildStore payload width mismatch: expected {}, got {}",
                 self.layout.payload_count(),
                 payload.column_count()
+            )));
+        }
+        let expected_keys = &self.layout.base().types()[..self.layout.key_count()];
+        if keys.types() != expected_keys {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore key type mismatch: expected {expected_keys:?}, got {:?}",
+                keys.types()
+            )));
+        }
+        let payload_start = self.layout.key_count();
+        let expected_payload =
+            &self.layout.base().types()[payload_start..payload_start + self.layout.payload_count()];
+        if payload.types() != expected_payload {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore payload type mismatch: expected {expected_payload:?}, got {:?}",
+                payload.types()
             )));
         }
 

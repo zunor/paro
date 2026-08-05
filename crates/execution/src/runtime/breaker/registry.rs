@@ -330,6 +330,18 @@ impl BreakerHandleRegistry {
         }
     }
 
+    /// Notify breaker handles that one static consumer pipeline has completed.
+    /// Handles use their catalog ownership metadata to release large resources
+    /// as soon as the final consumer is done instead of retaining them until
+    /// query teardown.
+    pub fn pipeline_finished(&self, pipeline: PipelineId) {
+        for handle in self.handles.iter() {
+            if let RuntimeBreakerHandle::HashJoinBuild(join) = handle {
+                join.consumer_finished(pipeline);
+            }
+        }
+    }
+
     pub fn live_handle_count(&self) -> usize {
         self.handles
             .iter()

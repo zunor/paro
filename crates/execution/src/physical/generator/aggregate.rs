@@ -9,6 +9,14 @@ impl PhysicalPlanGenerator {
         &mut self,
         aggregate: &LogicalAggregate,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        self.lower_aggregate_with_having(aggregate, Box::new([]))
+    }
+
+    pub(crate) fn lower_aggregate_with_having(
+        &mut self,
+        aggregate: &LogicalAggregate,
+        having_filter: Box<[Expression]>,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.generate_node(aggregate.child.as_ref())?;
 
         let mut projection_exprs = Vec::new();
@@ -114,6 +122,7 @@ impl PhysicalPlanGenerator {
             aggregate_inputs: aggregate_inputs.into_boxed_slice(),
             aggregate_filters: aggregate_filters.into_boxed_slice(),
             aggregate_orders: aggregate_orders.into_boxed_slice(),
+            having_filter,
             perfect_hash,
             output_names: aggregate
                 .get_column_bindings()
@@ -167,6 +176,7 @@ impl PhysicalPlanGenerator {
             aggregate_inputs: Box::new([]),
             aggregate_filters: Box::new([]),
             aggregate_orders: Box::new([]),
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: child_names.into_boxed_slice(),
             output_types: child_types.into_boxed_slice(),

@@ -163,17 +163,29 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
 }
 
 fn verify_expression(expr: &Expression) -> Result<()> {
+    verify_expression_node(expr, expr)
+}
+
+fn verify_expression_node(expr: &Expression, root: &Expression) -> Result<()> {
     if let Expression::Subquery(subquery) = expr {
         return Err(paro_error::internal(format!(
-            "Planner verify failed: Expression::Subquery remained after flattening (state={:?})",
-            subquery.planning_state
+            "Planner verify failed: Expression::Subquery remained after flattening (state={:?}) in {root:?}",
+            subquery.planning_state,
         )));
+    }
+    if let Expression::ColumnRef(column) = expr {
+        if column.depth != 0 {
+            return Err(paro_error::internal(format!(
+                "Planner verify failed: correlated column {:?} remained at depth {} after flattening in {root:?}",
+                column.binding, column.depth,
+            )));
+        }
     }
 
     let mut result = Ok(());
     ExpressionIterator::enumerate_children(expr, |child| {
         if result.is_ok() {
-            result = verify_expression(child);
+            result = verify_expression_node(child, root);
         }
     });
     result

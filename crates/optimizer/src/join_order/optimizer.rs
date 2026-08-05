@@ -21,9 +21,9 @@ use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
 use paro_storage::statistics::ColumnStatistics;
 
 use crate::cost_model::CostModel as LogicalCostModel;
-use crate::join_order::cost_model::{CostModel, DPJoinNode};
+use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinPredicateSet};
 use crate::join_order::enumerator::PlanEnumerator;
-use crate::join_order::query_graph::{FilterInfo, NeighborInfo, QueryGraphEdges};
+use crate::join_order::query_graph::{FilterInfo, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::{
     DistinctCount, ExtractedFilter, RelationManager, RelationStats,
@@ -390,16 +390,19 @@ impl JoinOrderOptimizer {
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
                 let from_hll = distinct > 0;
-                DistinctCount::new(
-                    if from_hll {
-                        // A filter can reduce the relation cardinality without
-                        // rewriting base-column HLL statistics. The filtered
-                        // domain cannot contain more distinct values than rows.
-                        distinct.min(cardinality.max(1))
-                    } else {
-                        cardinality.max(1)
-                    },
-                    from_hll,
+                (
+                    binding,
+                    DistinctCount::new(
+                        if from_hll {
+                            // A filter can reduce the relation cardinality without
+                            // rewriting base-column HLL statistics. The filtered
+                            // domain cannot contain more distinct values than rows.
+                            distinct.min(cardinality.max(1))
+                        } else {
+                            cardinality.max(1)
+                        },
+                        from_hll,
+                    ),
                 )
             })
             .collect();
@@ -478,8 +481,8 @@ impl JoinOrderOptimizer {
             let mut left_plan = self.reconstruct_plan(bind_context, left_node, used_filters)?;
             let mut right_plan = self.reconstruct_plan(bind_context, right_node, used_filters)?;
 
-            let result = if let Some(info) = &node.info {
-                if info.filters.is_empty() {
+            let result = if let Some(predicates) = &node.predicates {
+                if predicates.filters.is_empty() {
                     {
                         let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
                             CrossProduct {
@@ -492,15 +495,17 @@ impl JoinOrderOptimizer {
                         plan
                     }
                 } else {
-                    let chosen_join_type = Self::choose_join_type(info);
+                    let chosen_join_type = Self::choose_join_type(predicates);
                     if matches!(chosen_join_type, JoinType::Semi | JoinType::Anti)
                         && Self::edge_is_inverted(
                             &left_set,
                             &right_set,
-                            info.filters
+                            predicates
+                                .filters
                                 .first()
                                 .and_then(|filter| filter.left_set.as_ref()),
-                            info.filters
+                            predicates
+                                .filters
                                 .first()
                                 .and_then(|filter| filter.right_set.as_ref()),
                         )
@@ -511,7 +516,7 @@ impl JoinOrderOptimizer {
 
                     let mut join =
                         ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
-                    for filter in &info.filters {
+                    for filter in &predicates.filters {
                         if self.append_join_conditions(&mut join, filter, &left_set, &right_set) {
                             used_filters.insert(filter.filter_index);
                         }
@@ -695,12 +700,14 @@ impl JoinOrderOptimizer {
         ))
     }
 
-    fn choose_join_type(info: &NeighborInfo) -> JoinType {
-        info.filters
+    fn choose_join_type(predicates: &JoinPredicateSet) -> JoinType {
+        predicates
+            .filters
             .iter()
             .find(|filter| matches!(filter.join_type, JoinType::Semi | JoinType::Anti))
             .or_else(|| {
-                info.filters
+                predicates
+                    .filters
                     .iter()
                     .find(|filter| filter.join_type != JoinType::Invalid)
             })
@@ -952,8 +959,12 @@ mod tests {
 
         let stats = optimizer.relation_manager.get_relation_stats();
         assert_eq!(stats[0].cardinality, 9);
-        assert_eq!(stats[0].column_distinct_count[0].distinct_count, 9);
-        assert!(stats[0].column_distinct_count[0].from_hll);
+        let distinct_count = stats[0]
+            .column_distinct_count
+            .get(&ColumnBinding::new(0, 0))
+            .expect("projection column should retain its binding-keyed statistics");
+        assert_eq!(distinct_count.distinct_count, 9);
+        assert!(distinct_count.from_hll);
     }
 
     #[test]

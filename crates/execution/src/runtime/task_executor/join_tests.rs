@@ -72,7 +72,6 @@ fn hash_join_output_more_yields_between_output_chunks() {
                     join_type: JoinType::Inner,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -230,7 +229,6 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                         join_type: JoinType::Inner,
                         conditions: vec![join_condition()].into_boxed_slice(),
                         left_projection: vec![0, 1].into_boxed_slice(),
-                        right_projection: vec![0].into_boxed_slice(),
                         output_names: vec!["k".into(), "probe".into(), "first".into()]
                             .into_boxed_slice(),
                         output_types: vec![
@@ -245,7 +243,6 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                         join_type: JoinType::Inner,
                         conditions: vec![join_condition()].into_boxed_slice(),
                         left_projection: vec![1, 2].into_boxed_slice(),
-                        right_projection: vec![0].into_boxed_slice(),
                         output_names: vec!["probe".into(), "first".into(), "second".into()]
                             .into_boxed_slice(),
                         output_types: vec![
@@ -447,7 +444,6 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                         join_type: JoinType::Inner,
                         conditions: vec![join_condition()].into_boxed_slice(),
                         left_projection: vec![1].into_boxed_slice(),
-                        right_projection: vec![0].into_boxed_slice(),
                         output_names: vec!["nation".into(), "payload".into()].into_boxed_slice(),
                         output_types: vec![LogicalType::Integer, LogicalType::Integer]
                             .into_boxed_slice(),
@@ -784,7 +780,6 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                     join_type: JoinType::Single,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -912,7 +907,6 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                     join_type: JoinType::Right,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -928,7 +922,6 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                     handle,
                     join_type: JoinType::Right,
                     left_output_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -1299,6 +1292,7 @@ fn topn_aggregate_and_window_stream_through_typed_transforms() {
             aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
             aggregate_filters: vec![None].into_boxed_slice(),
             aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: vec!["count".to_string()].into_boxed_slice(),
             output_types: vec![LogicalType::BigInt].into_boxed_slice(),
@@ -1318,6 +1312,57 @@ fn topn_aggregate_and_window_stream_through_typed_transforms() {
     let chunk = output.pop_front().expect("aggregate output");
     assert_eq!(chunk.size(), 1);
     assert_eq!(chunk.column(0).unwrap().get_i64(0), Some(3));
+
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let aggregate = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let spec = PipelineSpec {
+        id: PipelineId::new(0),
+        source: SourceSpec::Values(values_spec(
+            vec![vec![int_constant(10)], vec![int_constant(20)]],
+            vec![LogicalType::Integer],
+        )),
+        transforms: vec![TransformSpec::StreamingAggregate(AggregateSpec {
+            grouping_key_count: 0,
+            projection_exprs: Box::new([]),
+            payload_types: Box::new([]),
+            groups: Box::new([]),
+            grouping_sets: Box::new([]),
+            aggregates: vec![aggregate].into_boxed_slice(),
+            grouping_functions: Box::new([]),
+            aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+            aggregate_filters: vec![None].into_boxed_slice(),
+            aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+            having_filter: vec![Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                reference(0, LogicalType::BigInt),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(2),
+                    LogicalType::BigInt,
+                )),
+            ))]
+            .into_boxed_slice(),
+            perfect_hash: None,
+            output_names: vec!["count".to_string()].into_boxed_slice(),
+            output_types: vec![LogicalType::BigInt].into_boxed_slice(),
+        })],
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: RowType::new(vec!["count".to_string()], vec![LogicalType::BigInt]),
+    };
+    let runtime = runtime_from_spec(&query, spec);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    let mut profiler = OperatorProfiler::disabled();
+    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+    assert!(output.pop_front().is_none());
 
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());

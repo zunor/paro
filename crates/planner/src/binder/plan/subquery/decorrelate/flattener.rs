@@ -42,7 +42,13 @@ struct PushDownResult {
 
 pub struct DependentJoinFlattener {
     shared: Arc<BindShared>,
+    /// Bindings as referenced inside the dependent RHS before decorrelation.
     correlated_columns: Vec<CorrelatedColumnInfo>,
+    /// Equivalent bindings exposed by the left input at the dependent-join boundary.
+    ///
+    /// These differ for clauses above a grouping boundary: the RHS still refers to the
+    /// pre-aggregate group expression, while the join must read the aggregate's group output.
+    outer_correlated_columns: Vec<CorrelatedColumnInfo>,
     delim_table_index: usize,
     delim_scan_allocated: bool,
     correlated_base_binding: Option<ColumnBinding>,
@@ -59,6 +65,7 @@ impl DependentJoinFlattener {
         Self {
             shared,
             correlated_columns,
+            outer_correlated_columns: Vec::new(),
             delim_table_index,
             delim_scan_allocated: false,
             correlated_base_binding: None,
@@ -87,6 +94,8 @@ impl DependentJoinFlattener {
         }
 
         self.correlated_columns = correlated_columns.clone();
+        self.outer_correlated_columns =
+            Self::bind_correlations_to_left_output(&left.operator, &correlated_columns)?;
 
         let PushDownResult {
             plan: rewritten_right,
@@ -96,34 +105,17 @@ impl DependentJoinFlattener {
         self.correlated_base_binding = Some(base_binding);
 
         match kind {
-            DependentJoinKind::Scalar => self.flatten_scalar_subquery(
-                left,
-                rewritten_right,
-                visible_columns,
-                &correlated_columns,
-            ),
+            DependentJoinKind::Scalar => {
+                self.flatten_scalar_subquery(left, rewritten_right, visible_columns)
+            }
             DependentJoinKind::Mark {
                 mark_index,
                 subquery: MarkSubqueryKind::Exists,
-            } => self.flatten_exists_subquery(
-                binder,
-                left,
-                rewritten_right,
-                &correlated_columns,
-                mark_index,
-                false,
-            ),
+            } => self.flatten_exists_subquery(binder, left, rewritten_right, mark_index, false),
             DependentJoinKind::Mark {
                 mark_index,
                 subquery: MarkSubqueryKind::NotExists,
-            } => self.flatten_exists_subquery(
-                binder,
-                left,
-                rewritten_right,
-                &correlated_columns,
-                mark_index,
-                true,
-            ),
+            } => self.flatten_exists_subquery(binder, left, rewritten_right, mark_index, true),
             DependentJoinKind::Mark {
                 mark_index,
                 subquery: MarkSubqueryKind::Any(payload),
@@ -131,7 +123,6 @@ impl DependentJoinFlattener {
                 binder,
                 left,
                 rewritten_right,
-                &correlated_columns,
                 payload.comparison_type,
                 mark_index,
                 &payload.expression_children,
@@ -145,7 +136,6 @@ impl DependentJoinFlattener {
                 binder,
                 left,
                 rewritten_right,
-                &correlated_columns,
                 payload.comparison_type,
                 mark_index,
                 &payload.expression_children,
@@ -161,7 +151,6 @@ impl DependentJoinFlattener {
                 left,
                 rewritten_right,
                 visible_columns,
-                &correlated_columns,
                 join_condition,
             ),
         }
@@ -172,7 +161,6 @@ impl DependentJoinFlattener {
         left: LogicalPlan,
         right: LogicalPlan,
         right_visible_columns: Vec<usize>,
-        correlated_columns: &[CorrelatedColumnInfo],
     ) -> Result<LogicalOperator> {
         let right_types = right.types();
         if right_types.is_empty() {
@@ -195,14 +183,14 @@ impl DependentJoinFlattener {
             )));
         }
 
-        let conditions = self.create_correlated_join_conditions(correlated_columns)?;
+        let conditions = self.create_correlated_join_conditions()?;
 
         // SINGLE preserves every outer row and its bindings while enforcing the
         // scalar-subquery cardinality contract. The former LEFT + GROUP BY all
         // outer columns + FIRST emulation both collapsed duplicate outer rows
         // and replaced their bindings with aggregate-group bindings.
         let mut join = ComparisonJoin::new(JoinType::Single, left, right, conditions);
-        join.duplicate_eliminated_columns = self.duplicate_eliminated_columns(correlated_columns);
+        join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
         join.right_projection_map = right_visible_columns;
         Ok(LogicalOperator::Join(Join::Comparison(join)))
     }
@@ -214,12 +202,11 @@ impl DependentJoinFlattener {
         mut left: LogicalPlan,
         mut right: LogicalPlan,
         right_visible_columns: Vec<usize>,
-        correlated_columns: &[CorrelatedColumnInfo],
         join_condition: Option<Expression>,
     ) -> Result<LogicalOperator> {
         let left_bindings = collect_table_bindings(&left.operator);
         let right_bindings = collect_table_bindings(&right.operator);
-        let mut conditions = self.create_correlated_join_conditions(correlated_columns)?;
+        let mut conditions = self.create_correlated_join_conditions()?;
         let mut arbitrary_expressions = Vec::new();
 
         if let Some(join_condition) = join_condition {
@@ -247,7 +234,7 @@ impl DependentJoinFlattener {
         }
 
         let mut join = ComparisonJoin::new(join_type, left, right, conditions);
-        join.duplicate_eliminated_columns = self.duplicate_eliminated_columns(correlated_columns);
+        join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
         join.right_projection_map = right_visible_columns;
         let plan = LogicalOperator::Join(Join::Comparison(join));
 
@@ -272,19 +259,16 @@ impl DependentJoinFlattener {
         binder: &mut Binder,
         left: LogicalPlan,
         right: LogicalPlan,
-        correlated_columns: &[CorrelatedColumnInfo],
         mark_index: usize,
         is_not_exists: bool,
     ) -> Result<LogicalOperator> {
         let (right, base_binding) = self.compact_mark_subquery_right(binder, right, &[])?;
-        let conditions =
-            self.create_correlated_join_conditions_for_base(correlated_columns, base_binding)?;
+        let conditions = self.create_correlated_join_conditions_for_base(base_binding)?;
 
         let mut mark_join = ComparisonJoin::new(JoinType::Mark, left, right, conditions);
         mark_join.mark_index = Some(mark_index);
         mark_join.mark_null_condition_start = None;
-        mark_join.duplicate_eliminated_columns =
-            self.duplicate_eliminated_columns(correlated_columns);
+        mark_join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
 
         let join_op = LogicalOperator::Join(Join::Comparison(mark_join));
         let _ = is_not_exists;
@@ -296,7 +280,6 @@ impl DependentJoinFlattener {
         binder: &mut Binder,
         left: LogicalPlan,
         right: LogicalPlan,
-        correlated_columns: &[CorrelatedColumnInfo],
         comparison_type: ComparisonType,
         mark_index: usize,
         expression_children: &[Expression],
@@ -334,8 +317,7 @@ impl DependentJoinFlattener {
         let (right, base_binding) =
             self.compact_mark_subquery_right(binder, right, &payload_positions)?;
 
-        let mut conditions =
-            self.create_correlated_join_conditions_for_base(correlated_columns, base_binding)?;
+        let mut conditions = self.create_correlated_join_conditions_for_base(base_binding)?;
         let payload_condition_start = conditions.len();
         conditions.extend(self.create_any_join_conditions(
             &right,
@@ -348,8 +330,7 @@ impl DependentJoinFlattener {
         let mut mark_join = ComparisonJoin::new(JoinType::Mark, left, right, conditions);
         mark_join.mark_index = Some(mark_index);
         mark_join.mark_null_condition_start = Some(payload_condition_start);
-        mark_join.duplicate_eliminated_columns =
-            self.duplicate_eliminated_columns(correlated_columns);
+        mark_join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
 
         Ok(LogicalOperator::Join(Join::Comparison(mark_join)))
     }
@@ -359,7 +340,6 @@ impl DependentJoinFlattener {
         binder: &mut Binder,
         left: LogicalPlan,
         right: LogicalPlan,
-        correlated_columns: &[CorrelatedColumnInfo],
         comparison_type: ComparisonType,
         mark_index: usize,
         expression_children: &[Expression],
@@ -381,7 +361,6 @@ impl DependentJoinFlattener {
             binder,
             left,
             right,
-            correlated_columns,
             inverted_comparison,
             mark_index,
             expression_children,
@@ -393,26 +372,60 @@ impl DependentJoinFlattener {
         Ok(any_result)
     }
 
-    fn create_correlated_join_conditions(
-        &self,
+    fn bind_correlations_to_left_output(
+        left: &LogicalOperator,
         correlated_columns: &[CorrelatedColumnInfo],
-    ) -> Result<Vec<JoinCondition>> {
+    ) -> Result<Vec<CorrelatedColumnInfo>> {
+        let output_bindings = left.get_column_bindings();
+        correlated_columns
+            .iter()
+            .map(|correlated| {
+                let original = ColumnBinding::new(
+                    correlated.table_index,
+                    correlated.column_index,
+                );
+                if output_bindings.contains(&original) {
+                    return Ok(correlated.clone());
+                }
+
+                if let LogicalOperator::Aggregate(aggregate) = left {
+                    for (group_idx, group) in aggregate.groups.iter().enumerate() {
+                        let Expression::ColumnRef(group_column) = group else {
+                            continue;
+                        };
+                        if group_column.depth == 0 && group_column.binding == original {
+                            let mut rebound = correlated.clone();
+                            rebound.table_index = aggregate.group_index;
+                            rebound.column_index = group_idx;
+                            rebound.return_type = group.return_type();
+                            return Ok(rebound);
+                        }
+                    }
+                }
+
+                Err(paro_error::internal(format!(
+                    "correlated column {original:?} is not exposed by the dependent join left input; output bindings: {output_bindings:?}"
+                )))
+            })
+            .collect()
+    }
+
+    fn create_correlated_join_conditions(&self) -> Result<Vec<JoinCondition>> {
         let base_binding = self.correlated_base_binding.ok_or_else(|| {
             paro_error::internal(
                 "PushDownDependentJoin must establish a base binding before join conditions are built",
             )
         })?;
-        self.create_correlated_join_conditions_for_base(correlated_columns, base_binding)
+        self.create_correlated_join_conditions_for_base(base_binding)
     }
 
     fn create_correlated_join_conditions_for_base(
         &self,
-        correlated_columns: &[CorrelatedColumnInfo],
         base_binding: ColumnBinding,
     ) -> Result<Vec<JoinCondition>> {
         let mut conditions = Vec::new();
 
-        for (idx, corr) in correlated_columns.iter().enumerate() {
+        for (idx, corr) in self.outer_correlated_columns.iter().enumerate() {
             let left_expr = Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(corr.table_index, corr.column_index),
                 corr.return_type.clone(),
@@ -525,11 +538,8 @@ impl DependentJoinFlattener {
             .collect()
     }
 
-    fn duplicate_eliminated_columns(
-        &self,
-        correlated_columns: &[CorrelatedColumnInfo],
-    ) -> Vec<Expression> {
-        correlated_columns
+    fn duplicate_eliminated_columns(&self) -> Vec<Expression> {
+        self.outer_correlated_columns
             .iter()
             .map(|corr| {
                 Expression::ColumnRef(ColumnRefExpression::new(
