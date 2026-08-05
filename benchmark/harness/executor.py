@@ -687,7 +687,10 @@ def _per_chunk(numerator: Any, rows: Any, chunk_size: int = VECTOR_SIZE) -> floa
 
 def _normalize_value(value: Any) -> Any:
     if isinstance(value, Decimal):
-        return float(value)
+        # JSON numbers and Python floats cannot represent DECIMAL exactly.
+        # Keep the fixed-point representation returned by the server so strong
+        # benchmark validation detects scale and low-order digit regressions.
+        return format(value, "f")
     if isinstance(value, (date, datetime, time)):
         return value.isoformat()
     if isinstance(value, memoryview):

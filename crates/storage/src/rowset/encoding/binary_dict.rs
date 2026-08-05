@@ -271,6 +271,8 @@ impl BinaryDictPageBuilder {
 pub struct BinaryDictPageDecoder {
     /// Page data
     data: Bytes,
+    /// Row count supplied by the ordinal index.
+    expected_num_elements: u32,
     /// Encoding type
     encoding_type: EncodingMode,
     /// Code decoder (for dict mode)
@@ -285,9 +287,10 @@ pub struct BinaryDictPageDecoder {
 
 impl BinaryDictPageDecoder {
     /// Create a new decoder.
-    pub fn new(data: Bytes) -> Self {
+    pub fn new(data: Bytes, expected_num_elements: u32) -> Self {
         BinaryDictPageDecoder {
             data,
+            expected_num_elements,
             encoding_type: EncodingMode::Dict,
             code_decoder: None,
             plain_decoder: None,
@@ -323,7 +326,8 @@ impl BinaryDictPageDecoder {
         match marker {
             DICT_ENCODING_MARKER => {
                 self.encoding_type = EncodingMode::Dict;
-                let mut decoder = BitShufflePageDecoder::new(page_data);
+                let mut decoder =
+                    BitShufflePageDecoder::new(page_data, self.expected_num_elements, 4);
                 decoder.init()?;
                 self.code_decoder = Some(decoder);
             }
@@ -331,6 +335,13 @@ impl BinaryDictPageDecoder {
                 self.encoding_type = EncodingMode::Plain;
                 let mut decoder = BinaryPlainPageDecoder::new(page_data);
                 decoder.init()?;
+                if decoder.count() != self.expected_num_elements {
+                    return Err(paro_common::error::data_corrupted(format!(
+                        "BinaryDictPageDecoder: element count {} does not match ordinal index {}",
+                        decoder.count(),
+                        self.expected_num_elements,
+                    )));
+                }
                 self.plain_decoder = Some(decoder);
             }
             _ => {
@@ -492,7 +503,7 @@ mod tests {
         let data_page = builder.finish().unwrap();
 
         // Decode
-        let mut decoder = BinaryDictPageDecoder::new(data_page);
+        let mut decoder = BinaryDictPageDecoder::new(data_page, 6);
         decoder.set_dict_decoder(dict_page).unwrap();
         decoder.init().unwrap();
 
@@ -529,7 +540,7 @@ mod tests {
         assert!(data_page.len() < 1000 * 14); // 14 = len("repeated_value")
 
         // Verify
-        let mut decoder = BinaryDictPageDecoder::new(data_page);
+        let mut decoder = BinaryDictPageDecoder::new(data_page, 1000);
         decoder.set_dict_decoder(dict_page).unwrap();
         decoder.init().unwrap();
 
@@ -551,7 +562,7 @@ mod tests {
         let dict_page = builder.get_dictionary_page().unwrap();
         let data_page = builder.finish().unwrap();
 
-        let mut decoder = BinaryDictPageDecoder::new(data_page);
+        let mut decoder = BinaryDictPageDecoder::new(data_page, 5);
         decoder.set_dict_decoder(dict_page).unwrap();
         decoder.init().unwrap();
 
@@ -618,14 +629,14 @@ mod tests {
         let plain_page = builder.finish().unwrap();
         let global_dict = builder.get_dictionary_page().unwrap();
 
-        let mut dict_decoder = BinaryDictPageDecoder::new(dict_encoded_page);
+        let mut dict_decoder = BinaryDictPageDecoder::new(dict_encoded_page, 1);
         dict_decoder.set_dict_decoder(global_dict.clone()).unwrap();
         dict_decoder.init().unwrap();
         assert!(dict_decoder.is_dict_encoded());
         let values = dict_decoder.next_batch(1).unwrap();
         assert_eq!(values[0].as_ref(), b"alpha");
 
-        let mut plain_decoder = BinaryDictPageDecoder::new(plain_page);
+        let mut plain_decoder = BinaryDictPageDecoder::new(plain_page, 1);
         plain_decoder.init().unwrap();
         assert!(!plain_decoder.is_dict_encoded());
         let values = plain_decoder.next_batch(1).unwrap();
@@ -645,7 +656,7 @@ mod tests {
         let dict_page = builder.get_dictionary_page().unwrap();
         let data_page = builder.finish().unwrap();
 
-        let mut decoder = BinaryDictPageDecoder::new(data_page);
+        let mut decoder = BinaryDictPageDecoder::new(data_page, 5);
         decoder.set_dict_decoder(dict_page).unwrap();
         decoder.init().unwrap();
 

@@ -121,11 +121,10 @@ impl JoinOrderOptimizer {
 
     /// Check if a join can be optimized.
     fn can_optimize_join(&self, plan: &LogicalOperator) -> bool {
-        // CTE references carry execution-region identity that the join-order
-        // reconstructor does not preserve yet. Reordering a recursive term can
-        // detach its scan from the recursive control region and panic at run
-        // time, so keep CTE join trees in their bound order.
-        if Self::contains_cte_reference(plan) {
+        // A CTE reference is bound to the control region that owns its runtime
+        // state. It is therefore a join-reordering boundary, not an ordinary
+        // relation leaf.
+        if Self::contains_control_region_reference(plan) {
             return false;
         }
         match plan {
@@ -133,17 +132,23 @@ impl JoinOrderOptimizer {
             // SQL comma joins arrive here as Filter(CrossProduct). The filter
             // contains the actual join edge, so optimizing only the child
             // leaves a Cartesian product followed by an equality filter.
-            LogicalOperator::Filter(filter) => self.can_optimize_join(&filter.child.operator),
+            LogicalOperator::Filter(filter) => {
+                !filter
+                    .expressions
+                    .iter()
+                    .any(|expression| expression.evaluation_properties().is_reorder_fence())
+                    && self.can_optimize_join(&filter.child.operator)
+            }
             _ => false,
         }
     }
 
-    fn contains_cte_reference(plan: &LogicalOperator) -> bool {
+    fn contains_control_region_reference(plan: &LogicalOperator) -> bool {
         matches!(plan, LogicalOperator::CTERef(_))
             || plan
                 .children()
                 .into_iter()
-                .any(|child| Self::contains_cte_reference(&child.operator))
+                .any(|child| Self::contains_control_region_reference(&child.operator))
     }
 
     /// Optimize a join tree.
@@ -164,7 +169,7 @@ impl JoinOrderOptimizer {
 
         // Extract relations and filters from the join tree
         let mut filters = Vec::new();
-        self.extract_join_relations(ctx, bind_context, &plan, &mut filters)?;
+        self.extract_join_relations(ctx, bind_context, &plan, &mut filters, true)?;
 
         // Check if we have enough relations to optimize
         if self.relation_manager.num_relations() < 2 {
@@ -172,9 +177,13 @@ impl JoinOrderOptimizer {
         }
 
         // Extract edges from filters
-        let filter_infos = self
+        let extracted_predicates = self
             .relation_manager
             .extract_edges(&filters, &mut self.set_manager);
+        let Some(extracted_predicates) = extracted_predicates else {
+            return Ok(None);
+        };
+        let filter_infos = extracted_predicates.graph_filters;
         self.filter_infos = filter_infos.clone();
 
         // Initialize cardinality estimator
@@ -255,7 +264,10 @@ impl JoinOrderOptimizer {
         let reconstructed =
             self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?;
 
-        Ok(Some(reconstructed))
+        Ok(Some(self.attach_filter_expressions(
+            reconstructed,
+            extracted_predicates.root_filters,
+        )))
     }
 
     /// Extract relations and filters from a join tree.
@@ -265,39 +277,49 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
         plan: &LogicalPlan,
         filters: &mut Vec<ExtractedFilter>,
+        at_region_root: bool,
     ) -> Result<()> {
         match &plan.operator {
-            LogicalOperator::Join(join) => {
+            LogicalOperator::Join(Join::Comparison(join))
+                if matches!(join.join_type, JoinType::Semi | JoinType::Anti) =>
+            {
+                if at_region_root {
+                    // A semi/anti join is not associative with surrounding
+                    // joins. At its own optimization root, keep both inputs
+                    // atomic and optimize only their orientation and join
+                    // implementation. Each input was optimized recursively
+                    // before this pass.
+                    self.add_relation_plan(ctx, bind_context, &join.left);
+                    self.add_relation_plan(ctx, bind_context, &join.right);
+                    Self::extract_comparison_join_filters(join, filters);
+                } else {
+                    self.add_relation_plan(ctx, bind_context, plan);
+                }
+            }
+            LogicalOperator::Join(join) if RelationManager::join_is_reorderable(join) => {
                 // Recursively extract from children first so table-index mappings exist
-                self.extract_join_relations(ctx, bind_context, join.left(), filters)?;
-                self.extract_join_relations(ctx, bind_context, join.right(), filters)?;
+                self.extract_join_relations(ctx, bind_context, join.left(), filters, false)?;
+                self.extract_join_relations(ctx, bind_context, join.right(), filters, false)?;
 
                 match join {
                     Join::Comparison(cj) => {
-                        for cond in &cj.conditions {
-                            // Create comparison expression
-                            let filter = Expression::Comparison(
-                                paro_planner::expression::ComparisonExpression {
-                                    left: Box::new(cond.left.clone()),
-                                    right: Box::new(cond.right.clone()),
-                                    comparison_type: Self::to_comparison_type(cond.comparison),
-                                },
-                            );
-                            filters.push(ExtractedFilter::new(filter, cj.join_type));
-                        }
+                        Self::extract_comparison_join_filters(cj, filters);
                     }
                     Join::Cross(_) => {
                         // No conditions for cross product
                     }
-                    Join::Any(_) => {
-                        // Any join is not reorderable
-                        return Ok(());
-                    }
+                    Join::Any(_) => unreachable!("ANY joins are join-reordering boundaries"),
                 }
             }
             LogicalOperator::Filter(filter) => {
                 // Continue with child
-                self.extract_join_relations(ctx, bind_context, filter.child.as_ref(), filters)?;
+                self.extract_join_relations(
+                    ctx,
+                    bind_context,
+                    filter.child.as_ref(),
+                    filters,
+                    at_region_root,
+                )?;
                 filters.extend(
                     filter
                         .expressions
@@ -306,50 +328,73 @@ impl JoinOrderOptimizer {
                         .map(ExtractedFilter::inner),
                 );
             }
+            LogicalOperator::Join(_) => {
+                // Outer, semi, anti, and expression joins are not associative
+                // members of an inner-join region. Preserve the complete
+                // subtree as one relation; its children have already been
+                // optimized by `optimize_plan_recursive`.
+                self.add_relation_plan(ctx, bind_context, plan);
+            }
             _ => {
                 // This is a base relation
                 if RelationManager::operator_needs_relation(plan.operator.op_type()) {
-                    // Get cardinality estimate
-                    let cardinality = self.estimate_cardinality(ctx, plan);
-                    let mut stats = RelationStats::with_cardinality(cardinality);
-                    stats.column_distinct_count = plan
-                        .get_column_bindings()
-                        .into_iter()
-                        .map(|binding| {
-                            let distinct = self
-                                .column_stats
-                                .get(&binding)
-                                .map(|stats| stats.get_distinct_count())
-                                .unwrap_or(0);
-                            let from_hll = distinct > 0;
-                            DistinctCount::new(
-                                if from_hll {
-                                    distinct
-                                } else {
-                                    cardinality.max(1)
-                                },
-                                from_hll,
-                            )
-                        })
-                        .collect();
-                    // Add to relation manager
-                    self.relation_manager.add_relation(
-                        duplicate_operator_preserving_indices(
-                            &plan.operator,
-                            bind_context.shared().as_ref(),
-                        ),
-                        None,
-                        stats,
-                    );
-                    self.relation_plans.push(duplicate_plan_preserving_indices(
-                        plan,
-                        bind_context.shared().as_ref(),
-                    ));
+                    self.add_relation_plan(ctx, bind_context, plan);
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn extract_comparison_join_filters(join: &ComparisonJoin, filters: &mut Vec<ExtractedFilter>) {
+        filters.extend(join.conditions.iter().map(|condition| {
+            let expression =
+                Expression::Comparison(paro_planner::expression::ComparisonExpression {
+                    left: Box::new(condition.left.clone()),
+                    right: Box::new(condition.right.clone()),
+                    comparison_type: Self::to_comparison_type(condition.comparison),
+                });
+            ExtractedFilter::new(expression, join.join_type)
+        }));
+    }
+
+    fn add_relation_plan(
+        &mut self,
+        ctx: &StatementContext,
+        bind_context: &BindContext,
+        plan: &LogicalPlan,
+    ) {
+        let cardinality = self.estimate_cardinality(ctx, plan);
+        let mut stats = RelationStats::with_cardinality(cardinality);
+        stats.column_distinct_count = plan
+            .get_column_bindings()
+            .into_iter()
+            .map(|binding| {
+                let distinct = self
+                    .column_stats
+                    .get(&binding)
+                    .map(|stats| stats.get_distinct_count())
+                    .unwrap_or(0);
+                let from_hll = distinct > 0;
+                DistinctCount::new(
+                    if from_hll {
+                        distinct
+                    } else {
+                        cardinality.max(1)
+                    },
+                    from_hll,
+                )
+            })
+            .collect();
+        self.relation_manager.add_relation(
+            duplicate_operator_preserving_indices(&plan.operator, bind_context.shared().as_ref()),
+            None,
+            stats,
+        );
+        self.relation_plans.push(duplicate_plan_preserving_indices(
+            plan,
+            bind_context.shared().as_ref(),
+        ));
     }
 
     /// Estimate the cardinality of a base relation.
@@ -519,13 +564,38 @@ impl JoinOrderOptimizer {
                 filter_indexes.push(filter.filter_index);
             }
         }
+        result = self.attach_filter_expressions_with_cost_model(
+            result,
+            expressions,
+            &logical_cost_model,
+        );
+        used_filters.extend(filter_indexes);
+        result
+    }
+
+    fn attach_filter_expressions(
+        &self,
+        result: LogicalPlan,
+        expressions: Vec<Expression>,
+    ) -> LogicalPlan {
+        self.attach_filter_expressions_with_cost_model(
+            result,
+            expressions,
+            &LogicalCostModel::default(),
+        )
+    }
+
+    fn attach_filter_expressions_with_cost_model(
+        &self,
+        mut result: LogicalPlan,
+        expressions: Vec<Expression>,
+        cost_model: &LogicalCostModel,
+    ) -> LogicalPlan {
         if expressions.is_empty() {
             return result;
         }
-
-        let child_estimate = result.stats.estimated_cardinality;
-        let estimated_cardinality = child_estimate.map(|estimate| {
-            logical_cost_model.estimate_filter_cardinality(
+        let estimated_cardinality = result.stats.estimated_cardinality.map(|estimate| {
+            cost_model.estimate_filter_cardinality(
                 estimate.expected,
                 &expressions,
                 &self.column_stats,
@@ -533,7 +603,6 @@ impl JoinOrderOptimizer {
         });
         result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
         result.stats.estimated_cardinality = estimated_cardinality;
-        used_filters.extend(filter_indexes);
         result
     }
 
@@ -666,8 +735,11 @@ mod tests {
     use super::*;
     use paro_common::{runtime_value::Value, types::LogicalType};
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_function::scalar::FunctionStability;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
+    use paro_planner::expression::{
+        ColumnRefExpression, ConstantExpression, FunctionExpression, ReferenceExpression,
+    };
     use paro_planner::operator::{ColumnBinding, ExpressionGet, Projection};
     use paro_planner::plan::{CardinalityEstimate, NodeStats};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
@@ -703,6 +775,34 @@ mod tests {
             column_ref(right_table, 0),
             comparison,
         )
+    }
+
+    fn cross_product(left_table: usize, right_table: usize) -> LogicalPlan {
+        LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            LogicalPlan::synthetic(create_scan(left_table)),
+            LogicalPlan::synthetic(create_scan(right_table)),
+        ))))
+    }
+
+    fn volatile_boolean() -> Expression {
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .expect("random overload")
+            .with_stability(FunctionStability::Volatile);
+        Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            Expression::Function(FunctionExpression::new(
+                function,
+                Vec::new(),
+                LogicalType::Double,
+            )),
+            Expression::Constant(ConstantExpression::new(
+                Value::Double(0.5),
+                LogicalType::Double,
+            )),
+        ))
     }
 
     fn count_cross_products(plan: &LogicalOperator) -> usize {
@@ -798,6 +898,96 @@ mod tests {
         assert_eq!(join.join_type, JoinType::Inner);
         assert_eq!(join.conditions.len(), 1);
         assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
+    }
+
+    #[test]
+    fn optimize_preserves_relation_independent_filter_above_reordered_join() {
+        let session = make_test_session();
+        let mut optimizer = JoinOrderOptimizer::new();
+        let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+            ComparisonType::Equal,
+            column_ref(0, 0),
+            column_ref(1, 0),
+        ));
+        let constant_false = Expression::Constant(ConstantExpression::new(
+            Value::Boolean(false),
+            LogicalType::Boolean,
+        ));
+        let plan = LogicalOperator::Filter(Filter::new(
+            cross_product(0, 1),
+            vec![equality, constant_false.clone()],
+        ));
+
+        let optimized = optimizer
+            .optimize(&session, &BindContext::new(), plan)
+            .unwrap();
+
+        let LogicalOperator::Filter(filter) = optimized else {
+            panic!("relation-independent predicate must remain a filter");
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        assert!(filter.expressions[0].equals(&constant_false));
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::Join(Join::Comparison(_))
+        ));
+    }
+
+    #[test]
+    fn optimizer_keeps_original_tree_for_unmapped_or_bound_references() {
+        let session = make_test_session();
+        let plans = [
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(99, 0),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Integer(1),
+                    LogicalType::Integer,
+                )),
+            )),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+        ];
+
+        for predicate in plans {
+            let original = predicate.clone();
+            let plan = LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![predicate]));
+            let optimized = JoinOrderOptimizer::new()
+                .optimize(&session, &BindContext::new(), plan)
+                .unwrap();
+            let LogicalOperator::Filter(filter) = optimized else {
+                panic!("unsafe predicate must keep its filter wrapper");
+            };
+            assert_eq!(filter.expressions.len(), 1);
+            assert!(filter.expressions[0].equals(&original));
+        }
+    }
+
+    #[test]
+    fn volatile_filter_is_a_join_reordering_fence() {
+        let predicate = volatile_boolean();
+        let plan =
+            LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![predicate.clone()]));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan));
+
+        let optimized = JoinOrderOptimizer::new()
+            .optimize(&make_test_session(), &BindContext::new(), plan)
+            .unwrap();
+        let LogicalOperator::Filter(filter) = optimized else {
+            panic!("volatile predicate must keep its evaluation boundary");
+        };
+        assert!(filter.expressions[0].equals(&predicate));
+
+        let nested_filter = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            LogicalPlan::synthetic(create_scan(0)),
+            vec![volatile_boolean()],
+        )));
+        let surrounding_join = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+            JoinType::Inner,
+            nested_filter,
+            LogicalPlan::synthetic(create_scan(1)),
+            vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+        )));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join));
     }
 
     #[test]
@@ -919,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_semi_join_keeps_join_type() {
+    fn semi_join_optimization_keeps_inputs_atomic() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new();
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -928,6 +1118,8 @@ mod tests {
             LogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
+
+        assert!(optimizer.can_optimize_join(&plan));
 
         let bind_context = BindContext::new();
         let optimized = optimizer.optimize(&session, &bind_context, plan).unwrap();
@@ -943,6 +1135,49 @@ mod tests {
             }
             other => panic!("expected semi comparison join, got {other:?}"),
         }
+    }
+
+    fn assert_nested_join_is_atomic(boundary_type: JoinType) {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let boundary = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                boundary_type,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ),
+        )));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                boundary,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 2)],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut filters = Vec::new();
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 2);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].join_type, JoinType::Inner);
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimizer.relation_plans[0].operator
+        else {
+            panic!("join boundary must remain an atomic relation");
+        };
+        assert_eq!(join.join_type, boundary_type);
+    }
+
+    #[test]
+    fn extraction_keeps_non_associative_joins_as_atomic_relations() {
+        assert_nested_join_is_atomic(JoinType::Left);
+        assert_nested_join_is_atomic(JoinType::Semi);
+        assert_nested_join_is_atomic(JoinType::Anti);
     }
 
     #[test]

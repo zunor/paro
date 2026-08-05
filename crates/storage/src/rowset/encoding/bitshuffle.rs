@@ -30,6 +30,7 @@
 //! This is effective because similar values have similar bit patterns,
 //! and transposing groups similar bits together for better compression.
 
+use crate::compression::decompress_size_prepended_exact;
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::Result;
 
@@ -227,6 +228,10 @@ impl BitShufflePageBuilder {
 pub struct BitShufflePageDecoder {
     /// Page data
     data: Bytes,
+    /// Element count supplied by the ordinal index.
+    expected_num_elements: u32,
+    /// Element width supplied by the column schema.
+    expected_type_size: usize,
     /// Decompressed and unshuffled data
     decoded_data: Option<Bytes>,
     /// Number of elements
@@ -247,9 +252,11 @@ pub struct BitShufflePageDecoder {
 
 impl BitShufflePageDecoder {
     /// Create a new decoder.
-    pub fn new(data: Bytes) -> Self {
+    pub fn new(data: Bytes, expected_num_elements: u32, expected_type_size: usize) -> Self {
         BitShufflePageDecoder {
             data,
+            expected_num_elements,
+            expected_type_size,
             decoded_data: None,
             num_elements: 0,
             compressed_size: 0,
@@ -307,7 +314,22 @@ impl BitShufflePageDecoder {
                 self.data.len()
             )));
         }
-        if self.padded_num_elements != align_up_8(self.num_elements) {
+        if self.num_elements != self.expected_num_elements {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: element count {} does not match ordinal index {}",
+                self.num_elements, self.expected_num_elements,
+            )));
+        }
+        let expected_padded_num_elements = self
+            .expected_num_elements
+            .checked_add(7)
+            .map(|count| count & !7)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "BitShufflePageDecoder: padded element count overflow",
+                )
+            })?;
+        if self.padded_num_elements != expected_padded_num_elements {
             return Err(paro_common::error::data_corrupted(
                 "BitShufflePageDecoder: invalid padded element count",
             ));
@@ -323,26 +345,24 @@ impl BitShufflePageDecoder {
                 )));
             }
         }
+        if self.type_size != self.expected_type_size {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: type size {} does not match column schema {}",
+                self.type_size, self.expected_type_size,
+            )));
+        }
 
-        // Decompress
-        let compressed_data = &self.data[BITSHUFFLE_PAGE_HEADER_SIZE..];
-        let decompressed = lz4_flex::decompress_size_prepended(compressed_data).map_err(|e| {
-            paro_common::error::data_corrupted(format!("LZ4 decompress failed: {}", e))
-        })?;
-        let expected_size = (self.padded_num_elements as usize)
-            .checked_mul(self.type_size)
+        let expected_size = (expected_padded_num_elements as usize)
+            .checked_mul(self.expected_type_size)
             .ok_or_else(|| {
                 paro_common::error::data_corrupted(
                     "BitShufflePageDecoder: decoded page size overflow",
                 )
             })?;
-        if decompressed.len() != expected_size {
-            return Err(paro_common::error::data_corrupted(format!(
-                "BitShufflePageDecoder: decoded size {} does not match expected size {}",
-                decompressed.len(),
-                expected_size
-            )));
-        }
+        // Decompress only after the page header and the embedded LZ4 size
+        // prefix agree on the exact output allocation.
+        let compressed_data = &self.data[BITSHUFFLE_PAGE_HEADER_SIZE..];
+        let decompressed = decompress_size_prepended_exact(compressed_data, expected_size)?;
 
         // Unshuffle
         let unshuffled = bitunshuffle(&decompressed, self.type_size, self.block_elements);
@@ -428,9 +448,7 @@ fn bitshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
     if num_elements == 0 {
         return Vec::new();
     }
-    if num_elements % 8 != 0 {
-        return bitshuffle_scalar(data, type_size, num_elements);
-    }
+    debug_assert!(num_elements.is_multiple_of(8));
 
     let mut output = vec![0u8; data.len()];
 
@@ -452,20 +470,6 @@ fn bitshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
     output
 }
 
-fn bitshuffle_scalar(data: &[u8], type_size: usize, num_elements: usize) -> Vec<u8> {
-    let mut output = vec![0u8; data.len()];
-    for bit in 0..type_size * 8 {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8;
-        for element in 0..num_elements {
-            let value = data[element * type_size + byte_idx];
-            let output_bit = bit * num_elements + element;
-            output[output_bit / 8] |= ((value >> bit_idx) & 1) << (output_bit % 8);
-        }
-    }
-    output
-}
-
 /// Reverse bitshuffle operation.
 fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8> {
     let total_bits = data.len() * 8;
@@ -476,9 +480,7 @@ fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8>
         return Vec::new();
     }
 
-    if num_elements % 8 != 0 {
-        return bitunshuffle_scalar(data, type_size, num_elements);
-    }
+    debug_assert!(num_elements.is_multiple_of(8));
 
     let mut output = vec![0u8; num_elements * type_size];
 
@@ -500,20 +502,6 @@ fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8>
         }
     }
 
-    output
-}
-
-fn bitunshuffle_scalar(data: &[u8], type_size: usize, num_elements: usize) -> Vec<u8> {
-    let mut output = vec![0u8; num_elements * type_size];
-    for bit in 0..type_size * 8 {
-        let output_byte = bit / 8;
-        let output_bit = bit % 8;
-        for element in 0..num_elements {
-            let input_bit = bit * num_elements + element;
-            let value = (data[input_bit / 8] >> (input_bit % 8)) & 1;
-            output[element * type_size + output_byte] |= value << output_bit;
-        }
-    }
     output
 }
 
@@ -550,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_bitshuffle_roundtrip() {
-        let data: Vec<u8> = vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let data = (0_u8..32).collect::<Vec<_>>();
         let shuffled = bitshuffle(&data, 4);
         let unshuffled = bitunshuffle(&shuffled, 4, BITSHUFFLE_BLOCK_ELEMENTS);
         assert_eq!(data, unshuffled);
@@ -595,7 +583,7 @@ mod tests {
         let mut page = builder.finish().unwrap().to_vec();
         page[16..20].copy_from_slice(b"BSH1");
 
-        let error = BitShufflePageDecoder::new(Bytes::from(page))
+        let error = BitShufflePageDecoder::new(Bytes::from(page), 1, 4)
             .init()
             .unwrap_err();
         assert!(error.to_string().contains("unsupported page format"));
@@ -608,12 +596,54 @@ mod tests {
         let mut page = builder.finish().unwrap().to_vec();
         page[20..24].copy_from_slice(&512_u32.to_le_bytes());
 
-        let error = BitShufflePageDecoder::new(Bytes::from(page))
+        let error = BitShufflePageDecoder::new(Bytes::from(page), 1, 4)
             .init()
             .unwrap_err();
         assert!(error
             .to_string()
             .contains("unsupported block element count"));
+    }
+
+    #[test]
+    fn decoder_rejects_page_header_that_disagrees_with_external_metadata() {
+        let mut builder = BitShufflePageBuilder::new(4, 256 * 1024);
+        builder.add_one(&42_i32.to_le_bytes());
+        let page = builder.finish().unwrap();
+
+        let count_error = BitShufflePageDecoder::new(page.clone(), 2, 4)
+            .init()
+            .unwrap_err();
+        assert!(count_error.to_string().contains("ordinal index"));
+
+        let type_error = BitShufflePageDecoder::new(page, 1, 8).init().unwrap_err();
+        assert!(type_error.to_string().contains("column schema"));
+    }
+
+    #[test]
+    fn decoder_rejects_element_count_that_cannot_be_padded() {
+        let mut builder = BitShufflePageBuilder::new(4, 256 * 1024);
+        builder.add_one(&42_i32.to_le_bytes());
+        let mut page = builder.finish().unwrap().to_vec();
+        page[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = BitShufflePageDecoder::new(Bytes::from(page), u32::MAX, 4)
+            .init()
+            .unwrap_err();
+        assert!(error.to_string().contains("padded element count overflow"));
+    }
+
+    #[test]
+    fn decoder_rejects_lz4_size_prefix_before_decompression() {
+        let mut builder = BitShufflePageBuilder::new(4, 256 * 1024);
+        builder.add_one(&42_i32.to_le_bytes());
+        let mut page = builder.finish().unwrap().to_vec();
+        page[BITSHUFFLE_PAGE_HEADER_SIZE..BITSHUFFLE_PAGE_HEADER_SIZE + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = BitShufflePageDecoder::new(Bytes::from(page), 1, 4)
+            .init()
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match expected size"));
     }
 
     #[test]
@@ -631,7 +661,7 @@ mod tests {
         let page_data = builder.finish().unwrap();
 
         // Decode
-        let mut decoder = BitShufflePageDecoder::new(page_data);
+        let mut decoder = BitShufflePageDecoder::new(page_data, 100, 4);
         decoder.init().unwrap();
         assert_eq!(decoder.count(), 100);
         assert_eq!(decoder.type_size(), 4);
@@ -664,7 +694,7 @@ mod tests {
         builder.add(&bytes, 50);
         let page_data = builder.finish().unwrap();
 
-        let mut decoder = BitShufflePageDecoder::new(page_data);
+        let mut decoder = BitShufflePageDecoder::new(page_data, 50, 8);
         decoder.init().unwrap();
 
         let (count, data) = decoder.next_batch(50).unwrap();
@@ -696,7 +726,7 @@ mod tests {
 
         let page_data = builder.finish().unwrap();
 
-        let mut decoder = BitShufflePageDecoder::new(page_data);
+        let mut decoder = BitShufflePageDecoder::new(page_data, 100, 4);
         decoder.init().unwrap();
 
         // Seek to position 50
@@ -726,7 +756,7 @@ mod tests {
         assert!(page_data.len() < 1000 * 4);
 
         // Verify data
-        let mut decoder = BitShufflePageDecoder::new(page_data);
+        let mut decoder = BitShufflePageDecoder::new(page_data, 1000, 4);
         decoder.init().unwrap();
 
         let (count, data) = decoder.next_batch(1000).unwrap();

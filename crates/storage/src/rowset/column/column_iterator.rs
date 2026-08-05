@@ -381,13 +381,26 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         };
 
         let (data_body, null_body) = Self::split_page_body(body, data_footer.nullmap_size)?;
+        let page_end_ordinal = self.page_end_ordinal(page_idx);
+        let page_num_rows = page_end_ordinal
+            .checked_sub(first_ordinal)
+            .ok_or_else(|| paro_error::data_corrupted("Page ordinal range is inverted"))?;
+        let page_num_rows = u32::try_from(page_num_rows).map_err(|_| {
+            paro_error::data_corrupted(format!(
+                "Page row count {page_num_rows} exceeds the decoder format"
+            ))
+        })?;
 
         // Create decoder based on encoding type
-        let decoder = self.create_decoder(data_body)?;
+        let decoder = self.create_decoder(data_body, page_num_rows)?;
 
         let null_decoder = if self.meta.is_nullable {
             if let Some(null_body) = null_body {
-                Some(self.create_null_decoder(null_body, data_footer.null_encoding)?)
+                Some(self.create_null_decoder(
+                    null_body,
+                    data_footer.null_encoding,
+                    page_num_rows,
+                )?)
             } else {
                 None
             }
@@ -429,7 +442,11 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
     }
 
     /// Create a decoder for the given page data.
-    fn create_decoder(&mut self, data: Bytes) -> Result<PageDecoderImpl> {
+    fn create_decoder(
+        &mut self,
+        data: Bytes,
+        expected_num_elements: u32,
+    ) -> Result<PageDecoderImpl> {
         let mut decoder = match self.meta.encoding {
             EncodingType::Plain => {
                 if self.meta.field_type == crate::rowset::encoding::FieldType::Vector {
@@ -448,11 +465,18 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 }
             }
             EncodingType::BitShuffle => {
-                PageDecoderImpl::BitShuffle(BitShufflePageDecoder::new(data))
+                let type_size = self.meta.type_size.ok_or_else(|| {
+                    paro_error::internal("BitShuffle encoding requires type size")
+                })?;
+                PageDecoderImpl::BitShuffle(BitShufflePageDecoder::new(
+                    data,
+                    expected_num_elements,
+                    type_size,
+                ))
             }
             EncodingType::Rle => PageDecoderImpl::Rle(RlePageDecoder::new(data, 1)),
             EncodingType::Dict => {
-                let mut decoder = BinaryDictPageDecoder::new(data);
+                let mut decoder = BinaryDictPageDecoder::new(data, expected_num_elements);
                 if let Some(ref dict_data) = self.dict_data {
                     decoder.set_dict_decoder(dict_data.clone())?;
                 }
@@ -488,16 +512,22 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
     }
 
     /// Create a null decoder for the given null map bytes.
-    fn create_null_decoder(&self, data: Bytes, encoding: NullEncoding) -> Result<PageDecoderImpl> {
-        let mut decoder = match encoding {
-            NullEncoding::BitShuffle => {
-                PageDecoderImpl::BitShuffle(BitShufflePageDecoder::new(data))
-            }
-            NullEncoding::Rle => PageDecoderImpl::Rle(RlePageDecoder::new(data, 1)),
-            NullEncoding::Lz4 => {
-                return Err(paro_error::not_supported("Null LZ4 encoding not supported"))
-            }
-        };
+    fn create_null_decoder(
+        &self,
+        data: Bytes,
+        encoding: NullEncoding,
+        expected_num_elements: u32,
+    ) -> Result<PageDecoderImpl> {
+        let mut decoder =
+            match encoding {
+                NullEncoding::BitShuffle => PageDecoderImpl::BitShuffle(
+                    BitShufflePageDecoder::new(data, expected_num_elements, 1),
+                ),
+                NullEncoding::Rle => PageDecoderImpl::Rle(RlePageDecoder::new(data, 1)),
+                NullEncoding::Lz4 => {
+                    return Err(paro_error::not_supported("Null LZ4 encoding not supported"))
+                }
+            };
         decoder.init()?;
         Ok(decoder)
     }

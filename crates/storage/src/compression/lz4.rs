@@ -25,6 +25,43 @@ impl Lz4BlockCompression {
     }
 }
 
+/// Decompress an LZ4 block whose size prefix must agree with trusted page
+/// metadata. The output buffer is sized from `expected_size`, never from the
+/// compressed payload, so corrupt input cannot choose a second allocation size.
+pub(crate) fn decompress_size_prepended_exact(
+    input: &[u8],
+    expected_size: usize,
+) -> Result<Vec<u8>> {
+    let size_prefix = input
+        .get(..4)
+        .ok_or_else(|| paro_error::data_corrupted("LZ4 block is shorter than its size prefix"))?;
+    let advertised_size =
+        u32::from_le_bytes(size_prefix.try_into().expect("four-byte size prefix")) as usize;
+    if advertised_size != expected_size {
+        return Err(paro_error::data_corrupted(format!(
+            "LZ4 decoded size prefix {advertised_size} does not match expected size {expected_size}"
+        )));
+    }
+
+    let mut output = Vec::new();
+    output.try_reserve_exact(expected_size).map_err(|error| {
+        paro_error::out_of_memory(format!(
+            "Failed to reserve {expected_size} bytes for LZ4 decompression: {error}"
+        ))
+    })?;
+    output.resize(expected_size, 0);
+    let decoded_size =
+        lz4_flex::block::decompress_into(&input[4..], &mut output).map_err(|error| {
+            paro_error::data_corrupted(format!("LZ4 decompression failed: {error}"))
+        })?;
+    if decoded_size != expected_size {
+        return Err(paro_error::data_corrupted(format!(
+            "LZ4 decoded size {decoded_size} does not match expected size {expected_size}"
+        )));
+    }
+    Ok(output)
+}
+
 impl BlockCompressionCodec for Lz4BlockCompression {
     fn compress(&self, input: &[u8]) -> Result<Vec<u8>> {
         // lz4_flex::compress_prepend_size prepends a 4-byte little-endian size
@@ -32,10 +69,8 @@ impl BlockCompressionCodec for Lz4BlockCompression {
         Ok(compressed)
     }
 
-    fn decompress(&self, input: &[u8], _uncompressed_size: usize) -> Result<Vec<u8>> {
-        // lz4_flex::decompress_size_prepended reads the size prefix
-        lz4_flex::decompress_size_prepended(input)
-            .map_err(|e| paro_error::data_corrupted(format!("LZ4 decompression failed: {}", e)))
+    fn decompress(&self, input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+        decompress_size_prepended_exact(input, uncompressed_size)
     }
 
     fn max_compressed_len(&self, input_len: usize) -> usize {
@@ -123,5 +158,14 @@ mod tests {
 
         let result = codec.decompress(&invalid_data, 100);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lz4_rejects_size_prefix_that_disagrees_with_page_metadata() {
+        let codec = Lz4BlockCompression::new();
+        let compressed = codec.compress(b"bounded output").unwrap();
+
+        let error = codec.decompress(&compressed, 1).unwrap_err();
+        assert!(error.to_string().contains("does not match expected size"));
     }
 }

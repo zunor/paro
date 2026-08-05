@@ -87,3 +87,9 @@ ORDER BY a.id;
 a.id	a.a_val	b.b_val	c.c_val
 3	a3	b3	c3
 5	a5	b5	c5
+
+SELECT COUNT(*) AS impossible_count
+FROM join_inner_chain_a AS a, join_inner_chain_b AS b
+WHERE a.id = b.id AND FALSE;
+impossible_count
+0
