@@ -209,7 +209,10 @@ enum PageDecoderImpl {
     BitShuffle(BitShufflePageDecoder),
     Rle(RlePageDecoder<u8>),
     BinaryPlain(BinaryPlainPageDecoder),
-    BinaryDict(BinaryDictPageDecoder),
+    Dictionary {
+        decoder: BinaryDictPageDecoder,
+        value_width: Option<usize>,
+    },
 }
 
 impl PageDecoderImpl {
@@ -219,7 +222,7 @@ impl PageDecoderImpl {
             PageDecoderImpl::BitShuffle(d) => d.init(),
             PageDecoderImpl::Rle(d) => d.init(),
             PageDecoderImpl::BinaryPlain(d) => d.init(),
-            PageDecoderImpl::BinaryDict(d) => d.init(),
+            PageDecoderImpl::Dictionary { decoder, .. } => decoder.init(),
         }
     }
 
@@ -229,7 +232,7 @@ impl PageDecoderImpl {
             PageDecoderImpl::BitShuffle(d) => d.seek_to_position(pos),
             PageDecoderImpl::Rle(d) => d.seek_to_position(pos),
             PageDecoderImpl::BinaryPlain(d) => d.seek_to_position(pos),
-            PageDecoderImpl::BinaryDict(d) => d.seek_to_position(pos),
+            PageDecoderImpl::Dictionary { decoder, .. } => decoder.seek_to_position(pos),
         }
     }
 
@@ -252,15 +255,26 @@ impl PageDecoderImpl {
                 }
                 Ok((strings.len(), Bytes::from(result)))
             }
-            PageDecoderImpl::BinaryDict(d) => {
-                let strings = d.next_batch(n)?;
-                // Concatenate strings with length prefixes
+            PageDecoderImpl::Dictionary {
+                decoder,
+                value_width,
+            } => {
+                let values = decoder.next_batch(n)?;
                 let mut result = Vec::new();
-                for s in &strings {
-                    result.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    result.extend_from_slice(s);
+                for value in &values {
+                    if let Some(width) = value_width {
+                        if value.len() != *width {
+                            return Err(paro_error::data_corrupted(format!(
+                                "Dictionary value width {} does not match column width {width}",
+                                value.len(),
+                            )));
+                        }
+                    } else {
+                        result.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    }
+                    result.extend_from_slice(value);
                 }
-                Ok((strings.len(), Bytes::from(result)))
+                Ok((values.len(), Bytes::from(result)))
             }
         }
     }
@@ -271,7 +285,7 @@ impl PageDecoderImpl {
             PageDecoderImpl::BitShuffle(d) => d.count(),
             PageDecoderImpl::Rle(d) => d.count(),
             PageDecoderImpl::BinaryPlain(d) => d.count(),
-            PageDecoderImpl::BinaryDict(d) => d.count(),
+            PageDecoderImpl::Dictionary { decoder, .. } => decoder.count(),
         }
     }
 
@@ -281,7 +295,7 @@ impl PageDecoderImpl {
             PageDecoderImpl::BitShuffle(d) => d.current_index(),
             PageDecoderImpl::Rle(d) => d.current_index(),
             PageDecoderImpl::BinaryPlain(d) => d.current_index(),
-            PageDecoderImpl::BinaryDict(d) => d.current_index(),
+            PageDecoderImpl::Dictionary { decoder, .. } => decoder.current_index(),
         }
     }
 }
@@ -480,7 +494,10 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 if let Some(ref dict_data) = self.dict_data {
                     decoder.set_dict_decoder(dict_data.clone())?;
                 }
-                PageDecoderImpl::BinaryDict(decoder)
+                PageDecoderImpl::Dictionary {
+                    decoder,
+                    value_width: self.meta.type_size,
+                }
             }
             _ => {
                 return Err(paro_error::not_supported(format!(
@@ -770,7 +787,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         };
 
         let (count, codes) = match self.current_decoder.as_mut() {
-            Some(PageDecoderImpl::BinaryDict(decoder)) if decoder.is_dict_encoded() => {
+            Some(PageDecoderImpl::Dictionary { decoder, .. }) if decoder.is_dict_encoded() => {
                 let page_remaining =
                     decoder.count().saturating_sub(decoder.current_index()) as usize;
                 if page_remaining == 0 || n > page_remaining {
@@ -838,7 +855,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             }
 
             let (count, code_bytes) = match self.current_decoder.as_mut() {
-                Some(PageDecoderImpl::BinaryDict(decoder)) if decoder.is_dict_encoded() => {
+                Some(PageDecoderImpl::Dictionary { decoder, .. }) if decoder.is_dict_encoded() => {
                     decoder.next_dict_codes(row_run.span_len)?
                 }
                 _ => {
@@ -1426,6 +1443,38 @@ mod tests {
         reader.new_iterator().unwrap()
     }
 
+    fn create_dict_i32_iterator() -> Box<dyn ColumnIterator + Send + Sync> {
+        let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+            .with_nullable(false)
+            .with_encoding(EncodingType::Dict)
+            .with_compression(CompressionType::None)
+            .with_page_size(1024);
+        let buffer = Cursor::new(Vec::new());
+        let mut writer = ScalarColumnWriter::new(opts, buffer).unwrap();
+
+        let values = [7_i32, 11, 7, 13, 11, 7];
+        let data = values
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        writer.append(&data, None, values.len() as u32).unwrap();
+
+        let meta = writer.finish().unwrap();
+        assert_eq!(meta.num_rows, values.len() as u64);
+        let buffer = Cursor::new(writer.into_inner().into_inner());
+        let reader_meta = ColumnReaderMeta::from_writer_meta(&meta, FieldType::Int);
+        let mut reader = ColumnReader::create(
+            reader_meta,
+            buffer,
+            ColumnReaderOptions::default(),
+            create_page_reader(),
+            None,
+            None,
+        )
+        .unwrap();
+        reader.new_iterator().unwrap()
+    }
+
     fn create_plain_varchar_iterator(nullable: bool) -> Box<dyn ColumnIterator + Send + Sync> {
         let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
             .with_nullable(nullable)
@@ -1503,6 +1552,27 @@ mod tests {
                 batch.data[offset + 3],
             ]);
             assert_eq!(value, i as i32);
+        }
+    }
+
+    #[test]
+    fn fixed_width_dictionary_roundtrips_as_a_typed_dictionary_batch() {
+        let mut iter = create_dict_i32_iterator();
+        let (count, batch) = iter.next_batch(6).unwrap();
+        assert_eq!(count, 6);
+        assert!(batch.storage_dictionary.is_some());
+
+        let decoded = vector_decoder::decode_column_batch(
+            &LogicalType::Integer,
+            &batch,
+            count,
+            Arc::new(default_allocator()),
+            None,
+        )
+        .unwrap();
+        let expected = [7_i32, 11, 7, 13, 11, 7];
+        for (row, expected) in expected.into_iter().enumerate() {
+            assert_eq!(unsafe { decoded.get_fixed::<i32>(row) }, expected);
         }
     }
 

@@ -71,11 +71,11 @@ impl ArrayBoundCastData {
         input: &BindCastInput,
         source: &LogicalType,
         target: &LogicalType,
-    ) -> Result<Box<dyn BoundCastData>> {
+    ) -> Result<Self> {
         let source_child = ArrayType::get_child_type(source);
         let target_child = ArrayType::get_child_type(target);
         let child_cast = input.get_cast_function(source_child, target_child)?;
-        Ok(Box::new(Self::new(child_cast)))
+        Ok(Self::new(child_cast))
     }
 }
 
@@ -727,11 +727,12 @@ pub fn bind_array_casts(
         if let LogicalType::Array(_, _) = target {
             let target_child = ArrayType::get_child_type(target);
             let child_cast = input.get_cast_function(&LogicalType::Float, target_child)?;
+            let dependency = child_cast.context_dependency();
             let cast_data = ArrayBoundCastData::new(child_cast);
-            return Ok(Some(BoundCastInfo::array_with_data(
-                varchar_to_array_cast,
-                Arc::new(cast_data),
-            )));
+            return Ok(Some(
+                BoundCastInfo::array_with_data(varchar_to_array_cast, Arc::new(cast_data))
+                    .with_context_dependency(dependency),
+            ));
         }
     }
 
@@ -744,10 +745,11 @@ pub fn bind_array_casts(
     if let LogicalType::Array(_, _) = source {
         if let LogicalType::Array(_, _) = target {
             let cast_data = ArrayBoundCastData::bind_array_to_array_cast(input, source, target)?;
-            return Ok(Some(BoundCastInfo::array_with_data(
-                array_to_array_cast,
-                Arc::from(cast_data),
-            )));
+            let dependency = cast_data.child_cast_info.context_dependency();
+            return Ok(Some(
+                BoundCastInfo::array_with_data(array_to_array_cast, Arc::new(cast_data))
+                    .with_context_dependency(dependency),
+            ));
         }
     }
 
@@ -759,22 +761,27 @@ pub fn bind_array_casts(
                 _ => unreachable!(),
             };
             let child_cast = input.get_cast_function(source_child, target_child)?;
+            let dependency = child_cast.context_dependency();
             let cast_data = ArrayBoundCastData::new(child_cast);
-            return Ok(Some(BoundCastInfo::array_with_data(
-                array_to_list_cast,
-                Arc::new(cast_data),
-            )));
+            return Ok(Some(
+                BoundCastInfo::array_with_data(array_to_list_cast, Arc::new(cast_data))
+                    .with_context_dependency(dependency),
+            ));
         }
     }
 
     if let (LogicalType::List(source_child), LogicalType::List(target_child)) = (source, target) {
         let child_cast = input.get_cast_function(source_child, target_child)?;
-        return Ok(Some(BoundCastInfo::array_with_data(
-            list_to_list_cast,
-            Arc::new(ListBoundCastData {
-                child_cast_info: child_cast,
-            }),
-        )));
+        let dependency = child_cast.context_dependency();
+        return Ok(Some(
+            BoundCastInfo::array_with_data(
+                list_to_list_cast,
+                Arc::new(ListBoundCastData {
+                    child_cast_info: child_cast,
+                }),
+            )
+            .with_context_dependency(dependency),
+        ));
     }
 
     Ok(None)

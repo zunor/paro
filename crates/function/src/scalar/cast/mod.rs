@@ -86,6 +86,23 @@ pub enum CastDispatch {
     Struct(StructCastFn),
 }
 
+/// Describes whether a cast can be evaluated without the query runtime context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastContextDependency {
+    Independent,
+    Runtime,
+}
+
+impl CastContextDependency {
+    pub fn combine(self, other: Self) -> Self {
+        if matches!(self, Self::Runtime) || matches!(other, Self::Runtime) {
+            Self::Runtime
+        } else {
+            Self::Independent
+        }
+    }
+}
+
 /// Metadata stored in a bound cast expression.
 pub trait BoundCastData: fmt::Debug + Send + Sync {
     fn copy(&self) -> Box<dyn BoundCastData>;
@@ -101,6 +118,7 @@ pub struct BoundCastInfo {
     pub dispatch: CastDispatch,
     /// Optional metadata for the cast (e.g. decimal precision/scale)
     pub cast_data: Option<Arc<dyn BoundCastData>>,
+    context_dependency: CastContextDependency,
 }
 
 impl BoundCastInfo {
@@ -108,6 +126,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Fixed(function),
             cast_data: None,
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -115,6 +134,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Varlen(function),
             cast_data: None,
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -122,6 +142,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Array(function),
             cast_data: None,
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -129,6 +150,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Struct(function),
             cast_data: None,
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -136,6 +158,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Fixed(function),
             cast_data: Some(data),
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -143,6 +166,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Varlen(function),
             cast_data: Some(data),
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -150,6 +174,7 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Array(function),
             cast_data: Some(data),
+            context_dependency: CastContextDependency::Independent,
         }
     }
 
@@ -157,7 +182,24 @@ impl BoundCastInfo {
         Self {
             dispatch: CastDispatch::Struct(function),
             cast_data: Some(data),
+            context_dependency: CastContextDependency::Independent,
         }
+    }
+
+    /// Marks a cast as requiring the query runtime context for correct evaluation.
+    pub fn requiring_runtime_context(mut self) -> Self {
+        self.context_dependency = CastContextDependency::Runtime;
+        self
+    }
+
+    /// Propagates the context requirement of a nested cast.
+    pub fn with_context_dependency(mut self, dependency: CastContextDependency) -> Self {
+        self.context_dependency = self.context_dependency.combine(dependency);
+        self
+    }
+
+    pub fn context_dependency(&self) -> CastContextDependency {
+        self.context_dependency
     }
 
     pub fn identity(source: &LogicalType, target: &LogicalType) -> Self {
@@ -299,6 +341,7 @@ impl fmt::Debug for BoundCastInfo {
         f.debug_struct("BoundCastInfo")
             .field("dispatch", &self.dispatch)
             .field("cast_data", &self.cast_data)
+            .field("context_dependency", &self.context_dependency)
             .finish()
     }
 }

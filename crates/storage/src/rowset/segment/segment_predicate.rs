@@ -23,8 +23,15 @@ pub(super) struct PredicateEvaluator {
     predicate_columns: Vec<ColumnId>,
     predicate_types: Vec<LogicalType>,
     predicate_iterators: Vec<Option<Box<dyn ColumnIterator + Send + Sync>>>,
-    decode_predicate_columns: Vec<bool>,
+    predicate_column_access: Vec<PredicateColumnAccess>,
     allocator: Arc<dyn Allocator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredicateColumnAccess {
+    Unused,
+    Raw { width: usize },
+    Decoded,
 }
 
 pub(super) enum PredicateColumnBatch {
@@ -135,18 +142,36 @@ enum CompiledPredicateTree {
     Or(Vec<CompiledPredicateTree>),
 }
 
+enum FixedComparisonValues {
+    I32(Vec<(ComparisonOperator, i32)>),
+    I64(Vec<(ComparisonOperator, i64)>),
+    I128(Vec<(ComparisonOperator, i128)>),
+}
+
+impl FixedComparisonValues {
+    fn physical_width(&self) -> usize {
+        match self {
+            Self::I32(_) => std::mem::size_of::<i32>(),
+            Self::I64(_) => std::mem::size_of::<i64>(),
+            Self::I128(_) => std::mem::size_of::<i128>(),
+        }
+    }
+
+    fn extend_same_type(&mut self, other: &mut Self) -> bool {
+        match (self, other) {
+            (Self::I32(existing), Self::I32(incoming)) => existing.append(incoming),
+            (Self::I64(existing), Self::I64(incoming)) => existing.append(incoming),
+            (Self::I128(existing), Self::I128(incoming)) => existing.append(incoming),
+            _ => return false,
+        }
+        true
+    }
+}
+
 enum CompiledPredicate {
-    I32Comparisons {
+    FixedComparisons {
         column_idx: usize,
-        comparisons: Vec<(ComparisonOperator, i32)>,
-    },
-    I64Comparisons {
-        column_idx: usize,
-        comparisons: Vec<(ComparisonOperator, i64)>,
-    },
-    I128Comparisons {
-        column_idx: usize,
-        comparisons: Vec<(ComparisonOperator, i128)>,
+        comparisons: FixedComparisonValues,
     },
     Generic {
         column_idx: usize,
@@ -160,10 +185,10 @@ impl PredicateEvaluator {
             .predicate_columns
             .iter()
             .position(|candidate| *candidate == column_id)?;
-        if self.decode_predicate_columns[column_idx] {
-            return None;
+        match self.predicate_column_access[column_idx] {
+            PredicateColumnAccess::Raw { width } => Some((column_idx, width)),
+            PredicateColumnAccess::Unused | PredicateColumnAccess::Decoded => None,
         }
-        Some((column_idx, self.predicate_types[column_idx].physical_size()))
     }
 
     pub(super) fn new(
@@ -216,14 +241,27 @@ impl PredicateEvaluator {
         }
 
         let tree = Self::compile_tree(&tree, &column_map, &types)?;
-        let mut decode_predicate_columns = vec![false; columns.len()];
-        Self::mark_decoded_columns(&tree, &mut decode_predicate_columns);
+        let mut predicate_column_access = vec![PredicateColumnAccess::Unused; columns.len()];
+        Self::mark_column_access(&tree, &mut predicate_column_access)?;
+        for (idx, access) in predicate_column_access.iter_mut().enumerate() {
+            match access {
+                PredicateColumnAccess::Raw { width } if *width != types[idx].physical_size() => {
+                    return Err(paro_error::internal(format!(
+                        "Compiled predicate width {width} disagrees with {:?} physical width {}",
+                        types[idx],
+                        types[idx].physical_size(),
+                    )));
+                }
+                PredicateColumnAccess::Unused => *access = PredicateColumnAccess::Decoded,
+                PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
+            }
+        }
         Ok(Some(Self {
             tree,
             predicate_columns: columns,
             predicate_types: types,
             predicate_iterators: iterators,
-            decode_predicate_columns,
+            predicate_column_access,
             allocator: Arc::new(default_allocator()),
         }))
     }
@@ -295,20 +333,13 @@ impl PredicateEvaluator {
                 } else {
                     rows_read = Some(count);
                 }
-                if self.decode_predicate_columns[idx] {
-                    batches_by_col.push(Some(PredicateColumnBatch::Decoded(
-                        vector_decoder::decode_column_batch(
-                            ty,
-                            &batch,
-                            count,
-                            self.allocator.clone(),
-                            None,
-                        )?,
-                    )));
-                } else {
-                    Self::validate_raw_batch(&batch, ty.physical_size(), count)?;
-                    batches_by_col.push(Some(PredicateColumnBatch::Raw(batch)));
-                }
+                batches_by_col.push(Some(Self::prepare_column_batch(
+                    ty,
+                    self.predicate_column_access[idx],
+                    batch,
+                    count,
+                    self.allocator.clone(),
+                )?));
             } else {
                 batches_by_col.push(None);
             }
@@ -330,11 +361,30 @@ impl PredicateEvaluator {
         Ok((rows, filled))
     }
 
+    fn prepare_column_batch(
+        ty: &LogicalType,
+        access: PredicateColumnAccess,
+        batch: ColumnBatch,
+        rows: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<PredicateColumnBatch> {
+        if let PredicateColumnAccess::Raw { width } = access {
+            if batch.storage_dictionary.is_none() {
+                Self::validate_raw_batch(&batch, width, rows)?;
+                return Ok(PredicateColumnBatch::Raw(batch));
+            }
+        }
+
+        Ok(PredicateColumnBatch::Decoded(
+            vector_decoder::decode_column_batch(ty, &batch, rows, allocator, None)?,
+        ))
+    }
+
     fn validate_raw_batch(batch: &ColumnBatch, width: usize, rows: usize) -> Result<()> {
         let expected = rows
             .checked_mul(width)
             .ok_or_else(|| paro_error::data_corrupted("Predicate batch width overflow"))?;
-        if width == 0 || batch.data.len() != expected || batch.storage_dictionary.is_some() {
+        if width == 0 || batch.data.len() != expected {
             return Err(paro_error::data_corrupted(
                 "Fixed predicate batch has an invalid physical layout",
             ));
@@ -395,11 +445,7 @@ impl PredicateEvaluator {
     fn is_fixed_comparison_leaf(predicate: &CompiledPredicateTree) -> bool {
         matches!(
             predicate,
-            CompiledPredicateTree::Leaf(
-                CompiledPredicate::I32Comparisons { .. }
-                    | CompiledPredicate::I64Comparisons { .. }
-                    | CompiledPredicate::I128Comparisons { .. }
-            )
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons { .. })
         )
     }
 
@@ -422,45 +468,38 @@ impl PredicateEvaluator {
         row_idx: usize,
     ) -> Option<bool> {
         match predicate {
-            CompiledPredicate::I32Comparisons {
+            CompiledPredicate::FixedComparisons {
                 column_idx,
                 comparisons,
             } => Some(batches_by_col.get(*column_idx).is_some_and(|batch| {
                 if batch.is_null(row_idx) {
                     return false;
                 }
-                // SAFETY: read_next_batch validates fixed-width raw batches, and
-                // row_idx is bounded by the batch row count.
-                let lhs = unsafe { batch.i32_value(row_idx) };
-                comparisons
-                    .iter()
-                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
-            })),
-            CompiledPredicate::I64Comparisons {
-                column_idx,
-                comparisons,
-            } => Some(batches_by_col.get(*column_idx).is_some_and(|batch| {
-                if batch.is_null(row_idx) {
-                    return false;
+                // SAFETY: construction cross-checks the comparison width
+                // with the schema, read_next_batch validates raw layouts,
+                // and row_idx is bounded by the batch row count.
+                unsafe {
+                    match comparisons {
+                        FixedComparisonValues::I32(comparisons) => {
+                            let lhs = batch.i32_value(row_idx);
+                            comparisons
+                                .iter()
+                                .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+                        }
+                        FixedComparisonValues::I64(comparisons) => {
+                            let lhs = batch.i64_value(row_idx);
+                            comparisons
+                                .iter()
+                                .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+                        }
+                        FixedComparisonValues::I128(comparisons) => {
+                            let lhs = batch.i128_value(row_idx);
+                            comparisons
+                                .iter()
+                                .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+                        }
+                    }
                 }
-                // SAFETY: see the I32Comparisons branch above.
-                let lhs = unsafe { batch.i64_value(row_idx) };
-                comparisons
-                    .iter()
-                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
-            })),
-            CompiledPredicate::I128Comparisons {
-                column_idx,
-                comparisons,
-            } => Some(batches_by_col.get(*column_idx).is_some_and(|batch| {
-                if batch.is_null(row_idx) {
-                    return false;
-                }
-                // SAFETY: see the I32Comparisons branch above.
-                let lhs = unsafe { batch.i128_value(row_idx) };
-                comparisons
-                    .iter()
-                    .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
             })),
             CompiledPredicate::Generic { .. } => None,
         }
@@ -501,17 +540,18 @@ impl PredicateEvaluator {
         batches_by_col: &[PredicateColumnBatch],
         row_idx: usize,
     ) -> Result<bool> {
-        if let Some(matches) = Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx) {
-            return Ok(matches);
+        match predicate {
+            CompiledPredicate::FixedComparisons { .. } => {
+                Ok(
+                    Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx)
+                        .unwrap_or(false),
+                )
+            }
+            CompiledPredicate::Generic {
+                column_idx,
+                predicate,
+            } => self.evaluate_generic_leaf(*column_idx, predicate, batches_by_col, row_idx),
         }
-        let CompiledPredicate::Generic {
-            column_idx,
-            predicate,
-        } = predicate
-        else {
-            unreachable!("fixed comparisons returned above")
-        };
-        self.evaluate_generic_leaf(*column_idx, predicate, batches_by_col, row_idx)
     }
 
     fn evaluate_generic_leaf(
@@ -637,18 +677,40 @@ impl PredicateEvaluator {
         }
     }
 
-    fn mark_decoded_columns(tree: &CompiledPredicateTree, decoded: &mut [bool]) {
+    fn mark_column_access(
+        tree: &CompiledPredicateTree,
+        access: &mut [PredicateColumnAccess],
+    ) -> Result<()> {
         match tree {
             CompiledPredicateTree::Leaf(CompiledPredicate::Generic { column_idx, .. }) => {
-                decoded[*column_idx] = true;
+                access[*column_idx] = PredicateColumnAccess::Decoded;
             }
-            CompiledPredicateTree::Leaf(_) => {}
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
+                column_idx,
+                comparisons,
+            }) => {
+                let width = comparisons.physical_width();
+                match access[*column_idx] {
+                    PredicateColumnAccess::Unused => {
+                        access[*column_idx] = PredicateColumnAccess::Raw { width };
+                    }
+                    PredicateColumnAccess::Raw {
+                        width: existing_width,
+                    } if existing_width != width => {
+                        return Err(paro_error::internal(format!(
+                            "Predicate column {column_idx} compiled with conflicting widths {existing_width} and {width}"
+                        )));
+                    }
+                    PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
+                }
+            }
             CompiledPredicateTree::And(children) | CompiledPredicateTree::Or(children) => {
                 for child in children {
-                    Self::mark_decoded_columns(child, decoded);
+                    Self::mark_column_access(child, access)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn compile_leaf(
@@ -664,27 +726,33 @@ impl PredicateEvaluator {
         };
         match (logical_type, rhs) {
             (LogicalType::Date, Value::Date(rhs)) | (LogicalType::Integer, Value::Integer(rhs)) => {
-                CompiledPredicate::I32Comparisons {
+                CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons: vec![(operator, *rhs)],
+                    comparisons: FixedComparisonValues::I32(vec![(operator, *rhs)]),
                 }
             }
-            (LogicalType::BigInt, Value::BigInt(rhs)) => CompiledPredicate::I64Comparisons {
+            (LogicalType::BigInt, Value::BigInt(rhs)) => CompiledPredicate::FixedComparisons {
                 column_idx,
-                comparisons: vec![(operator, *rhs)],
+                comparisons: FixedComparisonValues::I64(vec![(operator, *rhs)]),
             },
             (LogicalType::Decimal { precision, .. }, Value::Decimal(rhs, _, _))
-                if *precision <= 18 && i64::try_from(*rhs).is_ok() =>
+                if *precision <= 18 =>
             {
-                CompiledPredicate::I64Comparisons {
+                let Ok(rhs) = i64::try_from(*rhs) else {
+                    return CompiledPredicate::Generic {
+                        column_idx,
+                        predicate: predicate.clone(),
+                    };
+                };
+                CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons: vec![(operator, *rhs as i64)],
+                    comparisons: FixedComparisonValues::I64(vec![(operator, rhs)]),
                 }
             }
             (LogicalType::Decimal { .. }, Value::Decimal(rhs, _, _)) => {
-                CompiledPredicate::I128Comparisons {
+                CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons: vec![(operator, *rhs)],
+                    comparisons: FixedComparisonValues::I128(vec![(operator, *rhs)]),
                 }
             }
             _ => CompiledPredicate::Generic {
@@ -712,66 +780,21 @@ impl PredicateEvaluator {
         let mut result: Vec<CompiledPredicateTree> = Vec::with_capacity(predicates.len());
         for predicate in predicates {
             match predicate {
-                CompiledPredicateTree::Leaf(CompiledPredicate::I32Comparisons {
+                CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons,
+                    mut comparisons,
                 }) => {
                     let existing = result.iter_mut().find_map(|predicate| match predicate {
-                        CompiledPredicateTree::Leaf(CompiledPredicate::I32Comparisons {
+                        CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                             column_idx: existing_idx,
                             comparisons,
                         }) if *existing_idx == column_idx => Some(comparisons),
                         _ => None,
                     });
-                    if let Some(existing) = existing {
-                        existing.extend(comparisons);
-                    } else {
+                    if existing.is_none_or(|existing| !existing.extend_same_type(&mut comparisons))
+                    {
                         result.push(CompiledPredicateTree::Leaf(
-                            CompiledPredicate::I32Comparisons {
-                                column_idx,
-                                comparisons,
-                            },
-                        ));
-                    }
-                }
-                CompiledPredicateTree::Leaf(CompiledPredicate::I64Comparisons {
-                    column_idx,
-                    comparisons,
-                }) => {
-                    let existing = result.iter_mut().find_map(|predicate| match predicate {
-                        CompiledPredicateTree::Leaf(CompiledPredicate::I64Comparisons {
-                            column_idx: existing_idx,
-                            comparisons,
-                        }) if *existing_idx == column_idx => Some(comparisons),
-                        _ => None,
-                    });
-                    if let Some(existing) = existing {
-                        existing.extend(comparisons);
-                    } else {
-                        result.push(CompiledPredicateTree::Leaf(
-                            CompiledPredicate::I64Comparisons {
-                                column_idx,
-                                comparisons,
-                            },
-                        ));
-                    }
-                }
-                CompiledPredicateTree::Leaf(CompiledPredicate::I128Comparisons {
-                    column_idx,
-                    comparisons,
-                }) => {
-                    let existing = result.iter_mut().find_map(|predicate| match predicate {
-                        CompiledPredicateTree::Leaf(CompiledPredicate::I128Comparisons {
-                            column_idx: existing_idx,
-                            comparisons,
-                        }) if *existing_idx == column_idx => Some(comparisons),
-                        _ => None,
-                    });
-                    if let Some(existing) = existing {
-                        existing.extend(comparisons);
-                    } else {
-                        result.push(CompiledPredicateTree::Leaf(
-                            CompiledPredicate::I128Comparisons {
+                            CompiledPredicate::FixedComparisons {
                                 column_idx,
                                 comparisons,
                             },
@@ -806,6 +829,8 @@ impl PredicateVerificationExt for Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rowset::encoding::BinaryPlainPageBuilder;
+    use bytes::Bytes;
 
     fn integer_comparison_tree(
         conjunction: fn(Vec<PredicateTree>) -> PredicateTree,
@@ -839,9 +864,9 @@ mod tests {
         assert_eq!(and_children.len(), 1);
         assert!(matches!(
             &and_children[0],
-            CompiledPredicateTree::Leaf(CompiledPredicate::I32Comparisons {
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                 column_idx: 0,
-                comparisons,
+                comparisons: FixedComparisonValues::I32(comparisons),
             }) if comparisons.len() == 2
         ));
 
@@ -872,7 +897,9 @@ mod tests {
             predicate_columns: vec![7],
             predicate_types: column_types.to_vec(),
             predicate_iterators: std::iter::once(None).collect(),
-            decode_predicate_columns: vec![false],
+            predicate_column_access: vec![PredicateColumnAccess::Raw {
+                width: std::mem::size_of::<i32>(),
+            }],
             allocator: Arc::new(default_allocator()),
         };
         let values = [5_i32, 10, 19, 20];
@@ -906,10 +933,60 @@ mod tests {
             &column_types,
         )
         .unwrap();
-        let mut decoded = [false];
+        let mut access = [PredicateColumnAccess::Unused];
 
-        PredicateEvaluator::mark_decoded_columns(&tree, &mut decoded);
+        PredicateEvaluator::mark_column_access(&tree, &mut access).unwrap();
 
-        assert_eq!(decoded, [true]);
+        assert_eq!(access, [PredicateColumnAccess::Decoded]);
+    }
+
+    #[test]
+    fn narrow_decimal_never_compiles_to_a_wider_physical_reader() {
+        let predicate = Predicate::Eq {
+            column_id: 7,
+            value: Value::Decimal(i128::MAX, 18, 0),
+        };
+
+        let compiled = PredicateEvaluator::compile_leaf(
+            0,
+            &LogicalType::Decimal {
+                precision: 18,
+                scale: 0,
+            },
+            &predicate,
+        );
+
+        assert!(matches!(compiled, CompiledPredicate::Generic { .. }));
+    }
+
+    #[test]
+    fn raw_fixed_predicate_falls_back_to_decoding_a_storage_dictionary() {
+        let mut dictionary = BinaryPlainPageBuilder::new(1024);
+        assert!(dictionary.add_slice(&5_i32.to_le_bytes()));
+        assert!(dictionary.add_slice(&11_i32.to_le_bytes()));
+        let dictionary = dictionary.finish().unwrap();
+        let codes = [0_u32, 1, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let batch = ColumnBatch::with_storage_dictionary(dictionary, Bytes::from(codes), None);
+
+        let prepared = PredicateEvaluator::prepare_column_batch(
+            &LogicalType::Integer,
+            PredicateColumnAccess::Raw {
+                width: std::mem::size_of::<i32>(),
+            },
+            batch,
+            3,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        let PredicateColumnBatch::Decoded(vector) = prepared else {
+            panic!("storage dictionary must be decoded before fixed predicate evaluation");
+        };
+        assert_eq!(unsafe { vector.get_fixed::<i32>(0) }, 5);
+        assert_eq!(unsafe { vector.get_fixed::<i32>(1) }, 11);
+        assert_eq!(unsafe { vector.get_fixed::<i32>(2) }, 5);
     }
 }

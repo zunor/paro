@@ -169,10 +169,33 @@ fn decode_storage_dictionary_batch(
             }
         }
         other => {
-            return Err(paro_error::not_supported(format!(
-                "Storage dictionary decode not supported for {:?}",
-                other
-            )))
+            let width = physical_layout::fixed_row_width(other).map_err(|_| {
+                paro_error::not_supported(format!(
+                    "Storage dictionary decode not supported for {other:?}"
+                ))
+            })?;
+            let mut raw = Vec::with_capacity(dictionary_len.saturating_mul(width));
+            for idx in 0..dictionary_len {
+                let value = dictionary_decoder
+                    .string_at(idx as u32)
+                    .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
+                if value.len() != width {
+                    return Err(paro_error::data_corrupted(format!(
+                        "Dictionary value width {} does not match {other:?} physical width {width}",
+                        value.len(),
+                    )));
+                }
+                raw.extend_from_slice(&value);
+            }
+            let decoded = build_vector_from_bytes(
+                other,
+                &Bytes::from(raw),
+                dictionary_len,
+                allocator.clone(),
+            )?;
+            for idx in 0..dictionary_len {
+                child.try_copy_at(idx, &decoded, idx)?;
+            }
         }
     }
     if has_null_slot {

@@ -11,7 +11,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::LogicalType;
 use paro_common::vector::{DecodedVectorRef, SelectionVector, Vector};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
 
@@ -22,6 +22,7 @@ use super::aggregate_kernel::{
 };
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
+use super::perfect_hash_key::PerfectHashKeyDomain;
 
 /// Scan cursor for [`PerfectAggregateHashTable::scan`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,7 +33,7 @@ pub struct PerfectHTScanPosition {
 /// Direct-addressing aggregate table used by perfect-hash GROUP BY.
 #[derive(Debug)]
 pub struct PerfectAggregateHashTable {
-    group_types: Vec<LogicalType>,
+    group_domains: Vec<PerfectHashKeyDomain>,
     group_minima: Vec<i128>,
     required_bits: Vec<usize>,
     bit_offsets: Vec<usize>,
@@ -95,6 +96,16 @@ impl PerfectAggregateHashTable {
                 required_bits.len()
             )));
         }
+        let group_domains = group_types
+            .into_iter()
+            .map(|ty| {
+                PerfectHashKeyDomain::try_new(ty.clone()).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Unsupported perfect aggregate group key type: {ty:?}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         validate_aggregate_inputs(&aggregate_objects, &aggregate_inputs)?;
 
         let mut bit_offsets = Vec::with_capacity(required_bits.len());
@@ -160,7 +171,7 @@ impl PerfectAggregateHashTable {
             .collect::<Vec<_>>();
 
         Ok(Self {
-            group_types,
+            group_domains,
             group_minima,
             required_bits,
             bit_offsets,
@@ -205,7 +216,7 @@ impl PerfectAggregateHashTable {
             return Ok(0);
         }
 
-        let decoded_groups = (0..self.group_types.len())
+        let decoded_groups = (0..self.group_domains.len())
             .map(|group_idx| {
                 groups
                     .column(group_idx)
@@ -411,7 +422,7 @@ impl PerfectAggregateHashTable {
         position: &mut PerfectHTScanPosition,
         result: &mut Chunk,
     ) -> Result<bool> {
-        let group_count = self.group_types.len();
+        let group_count = self.group_domains.len();
         let aggregate_count = self.aggregate_objects.len();
         let required_columns = group_count + aggregate_count;
         if result.column_count() < required_columns {
@@ -595,7 +606,7 @@ impl PerfectAggregateHashTable {
         row_idx: usize,
     ) -> Result<usize> {
         let mut slot = 0usize;
-        for group_idx in 0..self.group_types.len() {
+        for group_idx in 0..self.group_domains.len() {
             let encoded =
                 self.encoded_group_value(&decoded_groups[group_idx], row_idx, group_idx)?;
             slot |= encoded << self.bit_offsets[group_idx];
@@ -620,8 +631,7 @@ impl PerfectAggregateHashTable {
             return Ok(0);
         }
 
-        let value =
-            read_group_value_as_i128(decoded_group, &self.group_types[group_idx], physical_idx)?;
+        let value = self.group_domains[group_idx].encode_decoded(decoded_group, physical_idx)?;
         let min_value = self.group_minima[group_idx];
         let adjusted = value
             .checked_sub(min_value)
@@ -676,7 +686,9 @@ impl PerfectAggregateHashTable {
                     self.group_minima[group_idx]
                 ))
             })?;
-        i128_to_value(value, &self.group_types[group_idx]).map(Some)
+        self.group_domains[group_idx]
+            .value_from_encoded(value)
+            .map(Some)
     }
 
     fn initialize_state(&self, state_ptr: *mut u8) {
@@ -689,14 +701,14 @@ impl PerfectAggregateHashTable {
     }
 
     fn validate_group_chunk(&self, groups: &Chunk) -> Result<()> {
-        if groups.column_count() != self.group_types.len() {
+        if groups.column_count() != self.group_domains.len() {
             return Err(paro_error::internal(format!(
                 "Group key column count mismatch for perfect aggregate table: expected={}, actual={}",
-                self.group_types.len(),
+                self.group_domains.len(),
                 groups.column_count()
             )));
         }
-        for group_idx in 0..self.group_types.len() {
+        for group_idx in 0..self.group_domains.len() {
             let group_type = groups
                 .column(group_idx)
                 .ok_or_else(|| {
@@ -704,10 +716,10 @@ impl PerfectAggregateHashTable {
                 })?
                 .logical_type()
                 .clone();
-            if group_type != self.group_types[group_idx] {
+            if &group_type != self.group_domains[group_idx].logical_type() {
                 return Err(paro_error::internal(format!(
                     "Group key type mismatch for perfect aggregate table at index {group_idx}: expected={:?}, actual={:?}",
-                    self.group_types[group_idx], group_type
+                    self.group_domains[group_idx].logical_type(), group_type
                 )));
             }
         }
@@ -715,7 +727,7 @@ impl PerfectAggregateHashTable {
     }
 
     fn ensure_compatible(&self, other: &Self) -> Result<()> {
-        if self.group_types != other.group_types
+        if self.group_domains != other.group_domains
             || self.group_minima != other.group_minima
             || self.required_bits != other.required_bits
             || self.total_groups != other.total_groups
@@ -791,103 +803,6 @@ fn validate_aggregate_inputs(
     Ok(())
 }
 
-fn read_group_value_as_i128(
-    group: &DecodedVectorRef<'_>,
-    ty: &LogicalType,
-    physical_idx: usize,
-) -> Result<i128> {
-    match ty {
-        LogicalType::TinyInt => Ok(unsafe { *group.get_data::<i8>().add(physical_idx) } as i128),
-        LogicalType::SmallInt => Ok(unsafe { *group.get_data::<i16>().add(physical_idx) } as i128),
-        LogicalType::Integer => Ok(unsafe { *group.get_data::<i32>().add(physical_idx) } as i128),
-        LogicalType::BigInt => Ok(unsafe { *group.get_data::<i64>().add(physical_idx) } as i128),
-        LogicalType::HugeInt => Ok(unsafe { *group.get_data::<i128>().add(physical_idx) }),
-        LogicalType::UTinyInt => Ok(unsafe { *group.get_data::<u8>().add(physical_idx) } as i128),
-        LogicalType::USmallInt => Ok(unsafe { *group.get_data::<u16>().add(physical_idx) } as i128),
-        LogicalType::UInteger => Ok(unsafe { *group.get_data::<u32>().add(physical_idx) } as i128),
-        LogicalType::UBigInt => Ok(unsafe { *group.get_data::<u64>().add(physical_idx) } as i128),
-        LogicalType::UHugeInt => {
-            let value = unsafe { *group.get_data::<u128>().add(physical_idx) };
-            i128::try_from(value).map_err(|_| {
-                paro_error::internal(format!(
-                    "UHUGEINT group key exceeds i128 range in perfect aggregate: {value}"
-                ))
-            })
-        }
-        LogicalType::Varchar => {
-            let value = unsafe { *group.get_data::<InlineString>().add(physical_idx) };
-            match value.as_bytes() {
-                [] => Ok(0),
-                [byte] => Ok(i128::from(*byte) + 1),
-                bytes => Err(paro_error::internal(format!(
-                    "Single-byte perfect aggregate key received VARCHAR length {}",
-                    bytes.len()
-                ))),
-            }
-        }
-        _ => Err(paro_error::internal(format!(
-            "Unsupported group key type for perfect aggregate table: {:?}",
-            ty
-        ))),
-    }
-}
-
-fn i128_to_value(value: i128, ty: &LogicalType) -> Result<Value> {
-    match ty {
-        LogicalType::TinyInt => Ok(Value::TinyInt(i8::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of TINYINT range: {value}"))
-        })?)),
-        LogicalType::SmallInt => Ok(Value::SmallInt(i16::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of SMALLINT range: {value}"))
-        })?)),
-        LogicalType::Integer => Ok(Value::Integer(i32::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of INTEGER range: {value}"))
-        })?)),
-        LogicalType::BigInt => Ok(Value::BigInt(i64::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of BIGINT range: {value}"))
-        })?)),
-        LogicalType::HugeInt => Ok(Value::HugeInt(value)),
-        LogicalType::UTinyInt => Ok(Value::UTinyInt(u8::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of UTINYINT range: {value}"))
-        })?)),
-        LogicalType::USmallInt => Ok(Value::USmallInt(u16::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of USMALLINT range: {value}"))
-        })?)),
-        LogicalType::UInteger => Ok(Value::UInteger(u32::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of UINTEGER range: {value}"))
-        })?)),
-        LogicalType::UBigInt => Ok(Value::UBigInt(u64::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of UBIGINT range: {value}"))
-        })?)),
-        LogicalType::UHugeInt => Ok(Value::UHugeInt(u128::try_from(value).map_err(|_| {
-            paro_error::internal(format!("Decoded value out of UHUGEINT range: {value}"))
-        })?)),
-        LogicalType::Varchar => match value {
-            0 => Ok(Value::Varchar(String::new())),
-            1..=256 => {
-                let byte = u8::try_from(value - 1).map_err(|_| {
-                    paro_error::internal(format!(
-                        "Decoded value out of single-byte VARCHAR range: {value}"
-                    ))
-                })?;
-                let text = std::str::from_utf8(std::slice::from_ref(&byte)).map_err(|_| {
-                    paro_error::internal(format!(
-                        "Decoded single-byte VARCHAR is not valid UTF-8: {byte}"
-                    ))
-                })?;
-                Ok(Value::Varchar(text.to_string()))
-            }
-            _ => Err(paro_error::internal(format!(
-                "Decoded value out of single-byte VARCHAR range: {value}"
-            ))),
-        },
-        _ => Err(paro_error::internal(format!(
-            "Unsupported group key type while decoding perfect aggregate output: {:?}",
-            ty
-        ))),
-    }
-}
-
 fn validate_addresses_vector(addresses: &Vector, row_count: usize) -> Result<()> {
     if addresses.capacity() < row_count {
         return Err(paro_error::internal(format!(
@@ -954,22 +869,4 @@ fn max_encoded_for_bits(bits: usize) -> Result<u128> {
         )));
     }
     Ok((1u128 << bits) - 1)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn single_byte_varchar_perfect_hash_codec_roundtrips() {
-        assert_eq!(
-            i128_to_value(0, &LogicalType::Varchar).unwrap(),
-            Value::Varchar(String::new())
-        );
-        assert_eq!(
-            i128_to_value(i128::from(b'R') + 1, &LogicalType::Varchar).unwrap(),
-            Value::Varchar("R".to_string())
-        );
-        assert!(i128_to_value(257, &LogicalType::Varchar).is_err());
-    }
 }

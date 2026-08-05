@@ -45,10 +45,10 @@ PROJECTION  (rows=1)
   Output: s.id, b.payload
   Cardinality: [0, 1, 1]
   Output Schema: s.id INTEGER, b.payload VARCHAR
-  ->  HASH_JOIN  (rows=0)
+  ->  HASH_JOIN  (rows=1)
     Join Type: INNER
     Join Condition: #0 = #0
-    Cardinality: [0, 0, 0]
+    Cardinality: [1, 1, 1]
     Output Schema: id INTEGER, payload VARCHAR, id INTEGER
     ->  ROWSET_SCAN on public.stats_big b
       Columns: id, payload

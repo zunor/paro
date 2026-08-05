@@ -10,8 +10,8 @@
 //! - Chunk: ✅
 
 use crate::decimal::{
-    check_precision_i128, pow10, pow10_i128, read_decimal, rescale, rescale_i128, round_divide,
-    round_divide_i128, to_i128, write_decimal,
+    check_precision_i128, pow10_checked, read_decimal, rescale_checked, round_divide_checked,
+    to_i128, write_decimal, DecimalInteger,
 };
 use crate::scalar::executor::binary::BinaryExecutor;
 use crate::scalar::executor::{BinaryOperator, NullableBinaryOperator};
@@ -141,10 +141,10 @@ enum DecimalArithmeticOp {
     Mod,
 }
 
-enum NativeDecimalResult {
-    Value(i128),
+enum DecimalEvaluation<T> {
+    Value(T),
     Null,
-    RetryWide,
+    Overflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,147 +356,16 @@ fn execute_decimal_arithmetic(
         ));
     };
     result.set_count(chunk.size());
-    match bind_data.op {
-        DecimalArithmeticOp::Add => execute_decimal_rows(
-            chunk,
-            result,
-            precision,
-            |left, left_scale, right, right_scale| {
-                let Some(left) = rescale_i128(left, left_scale, scale) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                let Some(right) = rescale_i128(right, right_scale, scale) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                match left.checked_add(right) {
-                    Some(value) => NativeDecimalResult::Value(value),
-                    None => NativeDecimalResult::RetryWide,
-                }
-            },
-            |left, left_scale, right, right_scale| {
-                let value = rescale(left, left_scale, scale)?
-                    .checked_add(rescale(right, right_scale, scale)?)
-                    .ok_or_else(|| paro_error::out_of_range("Decimal addition overflow"))?;
-                Ok(Some(value))
-            },
-        ),
-        DecimalArithmeticOp::Sub => execute_decimal_rows(
-            chunk,
-            result,
-            precision,
-            |left, left_scale, right, right_scale| {
-                let Some(left) = rescale_i128(left, left_scale, scale) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                let Some(right) = rescale_i128(right, right_scale, scale) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                match left.checked_sub(right) {
-                    Some(value) => NativeDecimalResult::Value(value),
-                    None => NativeDecimalResult::RetryWide,
-                }
-            },
-            |left, left_scale, right, right_scale| {
-                let value = rescale(left, left_scale, scale)?
-                    .checked_sub(rescale(right, right_scale, scale)?)
-                    .ok_or_else(|| paro_error::out_of_range("Decimal subtraction overflow"))?;
-                Ok(Some(value))
-            },
-        ),
-        DecimalArithmeticOp::Mul => execute_decimal_rows(
-            chunk,
-            result,
-            precision,
-            |left, left_scale, right, right_scale| {
-                let Some(raw) = left.checked_mul(right) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                match rescale_i128(raw, left_scale.saturating_add(right_scale), scale) {
-                    Some(value) => NativeDecimalResult::Value(value),
-                    None => NativeDecimalResult::RetryWide,
-                }
-            },
-            |left, left_scale, right, right_scale| {
-                let raw = left
-                    .checked_mul(right)
-                    .ok_or_else(|| paro_error::out_of_range("Decimal multiplication overflow"))?;
-                Ok(Some(rescale(
-                    raw,
-                    left_scale.saturating_add(right_scale),
-                    scale,
-                )?))
-            },
-        ),
-        DecimalArithmeticOp::Div => execute_decimal_rows(
-            chunk,
-            result,
-            precision,
-            |left, left_scale, right, right_scale| {
-                if right == 0 {
-                    return NativeDecimalResult::Null;
-                }
-                match divide_decimal_i128(left, left_scale, right, right_scale, scale) {
-                    Some(value) => NativeDecimalResult::Value(value),
-                    None => NativeDecimalResult::RetryWide,
-                }
-            },
-            |left, left_scale, right, right_scale| {
-                if right == i256::ZERO {
-                    return Ok(None);
-                }
-                Ok(Some(divide_decimal(
-                    left,
-                    left_scale,
-                    right,
-                    right_scale,
-                    scale,
-                )?))
-            },
-        ),
-        DecimalArithmeticOp::Mod => execute_decimal_rows(
-            chunk,
-            result,
-            precision,
-            |left, left_scale, right, right_scale| {
-                if right == 0 {
-                    return NativeDecimalResult::Null;
-                }
-                let Some(left) = rescale_i128(left, left_scale, scale) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                let Some(right) = rescale_i128(right, right_scale, scale) else {
-                    return NativeDecimalResult::RetryWide;
-                };
-                match left.checked_rem(right) {
-                    Some(value) => NativeDecimalResult::Value(value),
-                    None => NativeDecimalResult::RetryWide,
-                }
-            },
-            |left, left_scale, right, right_scale| {
-                if right == i256::ZERO {
-                    return Ok(None);
-                }
-                let left = rescale(left, left_scale, scale)?;
-                let right = rescale(right, right_scale, scale)?;
-                Ok(Some(left.checked_rem(right).ok_or_else(|| {
-                    paro_error::out_of_range("Decimal remainder overflow")
-                })?))
-            },
-        ),
-    }
+    execute_decimal_rows(chunk, result, precision, scale, bind_data.op)
 }
 
-fn execute_decimal_rows<N, W>(
+fn execute_decimal_rows(
     chunk: &Chunk,
     result: &mut Vector,
     precision: u8,
-    native_operation: N,
-    wide_operation: W,
-) -> Result<()>
-where
-    N: Fn(i128, u8, i128, u8) -> NativeDecimalResult,
-    W: Fn(i256, u8, i256, u8) -> Result<Option<i256>>,
-{
+    result_scale: u8,
+    op: DecimalArithmeticOp,
+) -> Result<()> {
     for row in 0..chunk.size() {
         if chunk.data[0].is_null(row) || chunk.data[1].is_null(row) {
             result.set_null(row, true);
@@ -504,25 +373,84 @@ where
         }
         let (left, left_scale) = decimal_value_at(&chunk.data[0], row)?;
         let (right, right_scale) = decimal_value_at(&chunk.data[1], row)?;
-        match native_operation(left, left_scale, right, right_scale) {
-            NativeDecimalResult::Value(value) => {
+        match evaluate_decimal_operation(op, left, left_scale, right, right_scale, result_scale) {
+            DecimalEvaluation::Value(value) => {
                 check_precision_i128(value, precision)?;
                 write_decimal(result, row, value)?;
             }
-            NativeDecimalResult::Null => result.set_null(row, true),
-            NativeDecimalResult::RetryWide => {
-                let Some(value) =
-                    wide_operation(i256::from(left), left_scale, i256::from(right), right_scale)?
-                else {
-                    result.set_null(row, true);
-                    continue;
-                };
-                let value = to_i128(value, precision)?;
-                write_decimal(result, row, value)?;
+            DecimalEvaluation::Null => result.set_null(row, true),
+            DecimalEvaluation::Overflow => {
+                match evaluate_decimal_operation(
+                    op,
+                    i256::from(left),
+                    left_scale,
+                    i256::from(right),
+                    right_scale,
+                    result_scale,
+                ) {
+                    DecimalEvaluation::Value(value) => {
+                        write_decimal(result, row, to_i128(value, precision)?)?;
+                    }
+                    DecimalEvaluation::Null => result.set_null(row, true),
+                    DecimalEvaluation::Overflow => return Err(decimal_overflow(op)),
+                }
             }
         }
     }
     Ok(())
+}
+
+fn evaluate_decimal_operation<T: DecimalInteger>(
+    op: DecimalArithmeticOp,
+    left: T,
+    left_scale: u8,
+    right: T,
+    right_scale: u8,
+    result_scale: u8,
+) -> DecimalEvaluation<T> {
+    let value = match op {
+        DecimalArithmeticOp::Add | DecimalArithmeticOp::Sub => {
+            let Some(left) = rescale_checked(left, left_scale, result_scale) else {
+                return DecimalEvaluation::Overflow;
+            };
+            let Some(right) = rescale_checked(right, right_scale, result_scale) else {
+                return DecimalEvaluation::Overflow;
+            };
+            if op == DecimalArithmeticOp::Add {
+                left.checked_add(right)
+            } else {
+                left.checked_sub(right)
+            }
+        }
+        DecimalArithmeticOp::Mul => left.checked_mul(right).and_then(|value| {
+            rescale_checked(value, left_scale.saturating_add(right_scale), result_scale)
+        }),
+        DecimalArithmeticOp::Div => {
+            if right == T::ZERO {
+                return DecimalEvaluation::Null;
+            }
+            divide_decimal_checked(left, left_scale, right, right_scale, result_scale)
+        }
+        DecimalArithmeticOp::Mod => {
+            if right == T::ZERO {
+                return DecimalEvaluation::Null;
+            }
+            let Some(left) = rescale_checked(left, left_scale, result_scale) else {
+                return DecimalEvaluation::Overflow;
+            };
+            let Some(right) = rescale_checked(right, right_scale, result_scale) else {
+                return DecimalEvaluation::Overflow;
+            };
+            left.checked_rem(right)
+        }
+    };
+    value
+        .map(DecimalEvaluation::Value)
+        .unwrap_or(DecimalEvaluation::Overflow)
+}
+
+fn decimal_overflow(op: DecimalArithmeticOp) -> paro_common::error::ParoError {
+    paro_error::out_of_range(format!("Decimal {} overflow", decimal_op_name(op)))
 }
 
 fn decimal_value_at(vector: &Vector, row: usize) -> Result<(i128, u8)> {
@@ -554,45 +482,20 @@ fn decimal_value_at(vector: &Vector, row: usize) -> Result<(i128, u8)> {
     Ok(value)
 }
 
-fn divide_decimal(
-    left: i256,
+fn divide_decimal_checked<T: DecimalInteger>(
+    left: T,
     left_scale: u8,
-    right: i256,
+    right: T,
     right_scale: u8,
     result_scale: u8,
-) -> Result<i256> {
+) -> Option<T> {
     let exponent = result_scale as i16 + right_scale as i16 - left_scale as i16;
     let (numerator, denominator) = if exponent >= 0 {
-        (
-            left.checked_mul(pow10(exponent as u8)?)
-                .ok_or_else(|| paro_error::out_of_range("Decimal division overflow"))?,
-            right,
-        )
+        (left.checked_mul(pow10_checked(exponent as u8)?)?, right)
     } else {
-        (
-            left,
-            right
-                .checked_mul(pow10((-exponent) as u8)?)
-                .ok_or_else(|| paro_error::out_of_range("Decimal division overflow"))?,
-        )
+        (left, right.checked_mul(pow10_checked((-exponent) as u8)?)?)
     };
-    round_divide(numerator, denominator)
-}
-
-fn divide_decimal_i128(
-    left: i128,
-    left_scale: u8,
-    right: i128,
-    right_scale: u8,
-    result_scale: u8,
-) -> Option<i128> {
-    let exponent = result_scale as i16 + right_scale as i16 - left_scale as i16;
-    let (numerator, denominator) = if exponent >= 0 {
-        (left.checked_mul(pow10_i128(exponent as u8)?)?, right)
-    } else {
-        (left, right.checked_mul(pow10_i128((-exponent) as u8)?)?)
-    };
-    round_divide_i128(numerator, denominator)
+    round_divide_checked(numerator, denominator)
 }
 
 fn execute_binary_numeric<T, OP>(chunk: &Chunk, result: &mut Vector) -> Result<()>

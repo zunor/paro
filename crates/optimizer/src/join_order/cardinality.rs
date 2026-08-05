@@ -239,16 +239,6 @@ impl CardinalityEstimator {
         result
     }
 
-    /// Estimate cardinality as an integer.
-    pub fn estimate_cardinality_idx(&mut self, new_set: &JoinRelationSet) -> usize {
-        let cardinality = self.estimate_cardinality(new_set);
-        if cardinality >= usize::MAX as f64 {
-            usize::MAX
-        } else {
-            cardinality as usize
-        }
-    }
-
     /// Remove empty total domains from the stats.
     pub fn remove_empty_total_domains(&mut self) {
         self.relation_set_stats
@@ -1014,6 +1004,27 @@ mod tests {
     }
 
     #[test]
+    fn filtered_relation_domains_produce_a_nonzero_join_estimate() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        estimator.init_equivalent_relations(&[filter]);
+
+        let set0 = set_manager.get_relation(0);
+        let mut stats0 = RelationStats::with_cardinality(9);
+        stats0.column_distinct_count = vec![DistinctCount::new(9, true)];
+        estimator.init_cardinality_estimator_props(&set0, &stats0);
+
+        let set1 = set_manager.get_relation(1);
+        let mut stats1 = RelationStats::with_cardinality(19);
+        stats1.column_distinct_count = vec![DistinctCount::new(19, true)];
+        estimator.init_cardinality_estimator_props(&set1, &stats1);
+
+        let join_set = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(estimator.estimate_cardinality(&join_set), 9.0);
+    }
+
+    #[test]
     fn test_estimate_cardinality_cached() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut estimator = CardinalityEstimator::new();
@@ -1028,19 +1039,6 @@ mod tests {
         let card2 = estimator.estimate_cardinality(&set0);
 
         assert_eq!(card1, card2);
-    }
-
-    #[test]
-    fn test_estimate_cardinality_idx() {
-        let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
-
-        let set0 = set_manager.get_relation(0);
-        let stats0 = RelationStats::with_cardinality(1000);
-        estimator.init_cardinality_estimator_props(&set0, &stats0);
-
-        let cardinality = estimator.estimate_cardinality_idx(&set0);
-        assert_eq!(cardinality, 1000);
     }
 
     #[test]

@@ -102,29 +102,50 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
         plan: LogicalPlan,
     ) -> Result<LogicalPlan> {
-        let plan =
-            plan.try_map_children(|child| self.optimize_plan_recursive(ctx, bind_context, child))?;
+        self.optimize_plan_recursive_with_properties(ctx, bind_context, plan)
+            .map(|(plan, _)| plan)
+    }
 
-        if self.can_optimize_join(&plan.operator) {
+    fn optimize_plan_recursive_with_properties(
+        &mut self,
+        ctx: &StatementContext,
+        bind_context: &BindContext,
+        plan: LogicalPlan,
+    ) -> Result<(LogicalPlan, bool)> {
+        let mut child_contains_control_region_reference = false;
+        let plan = plan.try_map_children(|child| {
+            let (child, contains_control_region_reference) =
+                self.optimize_plan_recursive_with_properties(ctx, bind_context, child)?;
+            child_contains_control_region_reference |= contains_control_region_reference;
+            Ok(child)
+        })?;
+        let contains_control_region_reference = child_contains_control_region_reference
+            || matches!(plan.operator, LogicalOperator::CTERef(_));
+
+        if self.can_optimize_join(&plan.operator, contains_control_region_reference) {
             if let Some(mut optimized) = self.optimize_join_tree(
                 ctx,
                 bind_context,
                 duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref()),
             )? {
                 optimized.id = plan.id;
-                return Ok(optimized);
+                return Ok((optimized, contains_control_region_reference));
             }
         }
 
-        Ok(plan)
+        Ok((plan, contains_control_region_reference))
     }
 
     /// Check if a join can be optimized.
-    fn can_optimize_join(&self, plan: &LogicalOperator) -> bool {
+    fn can_optimize_join(
+        &self,
+        plan: &LogicalOperator,
+        contains_control_region_reference: bool,
+    ) -> bool {
         // A CTE reference is bound to the control region that owns its runtime
         // state. It is therefore a join-reordering boundary, not an ordinary
         // relation leaf.
-        if Self::contains_control_region_reference(plan) {
+        if contains_control_region_reference {
             return false;
         }
         match plan {
@@ -137,18 +158,10 @@ impl JoinOrderOptimizer {
                     .expressions
                     .iter()
                     .any(|expression| expression.evaluation_properties().is_reorder_fence())
-                    && self.can_optimize_join(&filter.child.operator)
+                    && self.can_optimize_join(&filter.child.operator, false)
             }
             _ => false,
         }
-    }
-
-    fn contains_control_region_reference(plan: &LogicalOperator) -> bool {
-        matches!(plan, LogicalOperator::CTERef(_))
-            || plan
-                .children()
-                .into_iter()
-                .any(|child| Self::contains_control_region_reference(&child.operator))
     }
 
     /// Optimize a join tree.
@@ -296,20 +309,21 @@ impl JoinOrderOptimizer {
                     self.add_relation_plan(ctx, bind_context, plan);
                 }
             }
-            LogicalOperator::Join(join) if RelationManager::join_is_reorderable(join) => {
+            LogicalOperator::Join(join @ Join::Comparison(_))
+                if RelationManager::join_is_reorderable(join) =>
+            {
                 // Recursively extract from children first so table-index mappings exist
                 self.extract_join_relations(ctx, bind_context, join.left(), filters, false)?;
                 self.extract_join_relations(ctx, bind_context, join.right(), filters, false)?;
-
-                match join {
-                    Join::Comparison(cj) => {
-                        Self::extract_comparison_join_filters(cj, filters);
-                    }
-                    Join::Cross(_) => {
-                        // No conditions for cross product
-                    }
-                    Join::Any(_) => unreachable!("ANY joins are join-reordering boundaries"),
+                if let Join::Comparison(join) = join {
+                    Self::extract_comparison_join_filters(join, filters);
                 }
+            }
+            LogicalOperator::Join(join @ Join::Cross(_))
+                if RelationManager::join_is_reorderable(join) =>
+            {
+                self.extract_join_relations(ctx, bind_context, join.left(), filters, false)?;
+                self.extract_join_relations(ctx, bind_context, join.right(), filters, false)?;
             }
             LogicalOperator::Filter(filter) => {
                 // Continue with child
@@ -378,7 +392,10 @@ impl JoinOrderOptimizer {
                 let from_hll = distinct > 0;
                 DistinctCount::new(
                     if from_hll {
-                        distinct
+                        // A filter can reduce the relation cardinality without
+                        // rewriting base-column HLL statistics. The filtered
+                        // domain cannot contain more distinct values than rows.
+                        distinct.min(cardinality.max(1))
                     } else {
                         cardinality.max(1)
                     },
@@ -471,7 +488,7 @@ impl JoinOrderOptimizer {
                             },
                         )));
                         plan.stats.estimated_cardinality =
-                            Some(CardinalityEstimate::exact(node.cardinality as u64));
+                            Some(Self::join_cardinality_estimate(node.cardinality));
                         plan
                     }
                 } else {
@@ -508,13 +525,13 @@ impl JoinOrderOptimizer {
                             },
                         )));
                         plan.stats.estimated_cardinality =
-                            Some(CardinalityEstimate::exact(node.cardinality as u64));
+                            Some(Self::join_cardinality_estimate(node.cardinality));
                         plan
                     } else {
                         let mut plan =
                             LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
                         plan.stats.estimated_cardinality =
-                            Some(CardinalityEstimate::exact(node.cardinality as u64));
+                            Some(Self::join_cardinality_estimate(node.cardinality));
                         plan
                     }
                 }
@@ -525,7 +542,7 @@ impl JoinOrderOptimizer {
                         right: Box::new(right_plan),
                     })));
                 plan.stats.estimated_cardinality =
-                    Some(CardinalityEstimate::exact(node.cardinality as u64));
+                    Some(Self::join_cardinality_estimate(node.cardinality));
                 plan
             };
 
@@ -544,6 +561,15 @@ impl JoinOrderOptimizer {
                 set
             ))
         })
+    }
+
+    fn join_cardinality_estimate(cardinality: f64) -> CardinalityEstimate {
+        let expected = if !cardinality.is_finite() || cardinality >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            cardinality.max(1.0) as u64
+        };
+        CardinalityEstimate::exact(expected)
     }
 
     fn attach_remaining_filters(
@@ -740,7 +766,7 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, ReferenceExpression,
     };
-    use paro_planner::operator::{ColumnBinding, ExpressionGet, Projection};
+    use paro_planner::operator::{AnyJoin, ColumnBinding, ExpressionGet, Projection};
     use paro_planner::plan::{CardinalityEstimate, NodeStats};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 
@@ -901,6 +927,42 @@ mod tests {
     }
 
     #[test]
+    fn filtered_relation_hll_domain_is_bounded_by_its_cardinality() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let plan = projection_relation(&bind_context, 100, 0, 9);
+        let hashes = (0_u64..100)
+            .map(|value| {
+                let mut hasher = DefaultHasher::new();
+                value.hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+        let mut column_stats = ColumnStatistics::new(BaseStatistics::new(LogicalType::Integer));
+        column_stats.update_distinct_statistics_full(&hashes, hashes.len());
+        assert!(column_stats.get_distinct_count() > 9);
+
+        let mut optimizer = JoinOrderOptimizer::new();
+        optimizer
+            .column_stats
+            .insert(ColumnBinding::new(0, 0), Arc::new(column_stats));
+        optimizer.add_relation_plan(&session, &bind_context, &plan);
+
+        let stats = optimizer.relation_manager.get_relation_stats();
+        assert_eq!(stats[0].cardinality, 9);
+        assert_eq!(stats[0].column_distinct_count[0].distinct_count, 9);
+        assert!(stats[0].column_distinct_count[0].from_hll);
+    }
+
+    #[test]
+    fn reconstructed_join_cardinality_is_never_quantized_to_zero() {
+        let estimate = JoinOrderOptimizer::join_cardinality_estimate(0.125);
+        assert_eq!(estimate, CardinalityEstimate::exact(1));
+    }
+
+    #[test]
     fn optimize_preserves_relation_independent_filter_above_reordered_join() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new();
@@ -967,7 +1029,7 @@ mod tests {
         let predicate = volatile_boolean();
         let plan =
             LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![predicate.clone()]));
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan, false));
 
         let optimized = JoinOrderOptimizer::new()
             .optimize(&make_test_session(), &BindContext::new(), plan)
@@ -987,7 +1049,7 @@ mod tests {
             LogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join, false));
     }
 
     #[test]
@@ -1015,7 +1077,7 @@ mod tests {
             )],
         ));
 
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan, true));
     }
 
     #[test]
@@ -1119,7 +1181,7 @@ mod tests {
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
 
-        assert!(optimizer.can_optimize_join(&plan));
+        assert!(optimizer.can_optimize_join(&plan, false));
 
         let bind_context = BindContext::new();
         let optimized = optimizer.optimize(&session, &bind_context, plan).unwrap();
@@ -1178,6 +1240,42 @@ mod tests {
         assert_nested_join_is_atomic(JoinType::Left);
         assert_nested_join_is_atomic(JoinType::Semi);
         assert_nested_join_is_atomic(JoinType::Anti);
+    }
+
+    #[test]
+    fn extraction_treats_any_join_as_an_atomic_relation() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let boundary =
+            LogicalPlan::synthetic(LogicalOperator::Join(Join::Any(Box::new(AnyJoin::new(
+                JoinType::Inner,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Boolean(true),
+                    LogicalType::Boolean,
+                )),
+            )))));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                boundary,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 2)],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut filters = Vec::new();
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 2);
+        assert!(matches!(
+            optimizer.relation_plans[0].operator,
+            LogicalOperator::Join(Join::Any(_))
+        ));
     }
 
     #[test]

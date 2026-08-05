@@ -3,6 +3,7 @@
 
 //! ColumnBatch → columnar storage encoding (compaction / merge path).
 
+use crate::codec::physical_layout;
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageDecoder;
 use crate::rowset::ColumnData;
@@ -49,8 +50,8 @@ fn materialize_storage_dictionary(
     if batch.storage_dictionary.is_none() {
         return Ok(batch.data.clone());
     }
-    if !matches!(
-        logical_type,
+    let fixed_width = if matches!(
+        &logical_type,
         LogicalType::Varchar
             | LogicalType::VarcharCollation(_)
             | LogicalType::TsVector
@@ -59,10 +60,16 @@ fn materialize_storage_dictionary(
             | LogicalType::Jsonb
             | LogicalType::Blob
     ) {
-        return Err(paro_error::data_corrupted(format!(
-            "Storage dictionary batch has incompatible type {logical_type}"
-        )));
-    }
+        None
+    } else {
+        Some(
+            physical_layout::fixed_row_width(&logical_type).map_err(|_| {
+                paro_error::data_corrupted(format!(
+                    "Storage dictionary batch has incompatible type {logical_type}"
+                ))
+            })?,
+        )
+    };
 
     let storage_dictionary = batch
         .storage_dictionary
@@ -80,7 +87,11 @@ fn materialize_storage_dictionary(
     for row in 0..rows {
         let is_null = batch.nulls.as_ref().is_some_and(|nulls| nulls[row] != 0);
         if is_null {
-            data.extend_from_slice(&0_u32.to_le_bytes());
+            if let Some(width) = fixed_width {
+                data.resize(data.len() + width, 0);
+            } else {
+                data.extend_from_slice(&0_u32.to_le_bytes());
+            }
             continue;
         }
         let code_offset = row
@@ -99,9 +110,19 @@ fn materialize_storage_dictionary(
         let value = decoder.string_at(code).ok_or_else(|| {
             paro_error::data_corrupted(format!("Storage dictionary code {code} is out of range"))
         })?;
-        let len = u32::try_from(value.len())
-            .map_err(|_| paro_error::out_of_range("Storage dictionary value exceeds u32 length"))?;
-        data.extend_from_slice(&len.to_le_bytes());
+        if let Some(width) = fixed_width {
+            if value.len() != width {
+                return Err(paro_error::data_corrupted(format!(
+                    "Storage dictionary value width {} does not match {logical_type} physical width {width}",
+                    value.len(),
+                )));
+            }
+        } else {
+            let len = u32::try_from(value.len()).map_err(|_| {
+                paro_error::out_of_range("Storage dictionary value exceeds u32 length")
+            })?;
+            data.extend_from_slice(&len.to_le_bytes());
+        }
         data.extend_from_slice(value.as_ref());
     }
     Ok(Bytes::from(data))
@@ -165,5 +186,41 @@ mod tests {
             encoded[0].data.as_ref(),
             &[1, 0, 0, 0, b'N', 1, 0, 0, 0, b'R', 0, 0, 0, 0,]
         );
+    }
+
+    #[test]
+    fn encode_batch_materializes_storage_dictionary_codes_as_fixed_values() {
+        let mut dictionary = BinaryPlainPageBuilder::new(1024);
+        assert!(dictionary.add_slice(&7_i32.to_le_bytes()));
+        assert!(dictionary.add_slice(&11_i32.to_le_bytes()));
+        let dictionary = dictionary.finish().unwrap();
+        let codes = [0_u32, 1, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let batch = ColumnBatch::with_storage_dictionary(
+            dictionary,
+            Bytes::from(codes),
+            Some(Bytes::from(vec![0, 0, 1])),
+        );
+        let schema = Arc::new(
+            TabletSchema::new(
+                1,
+                vec![TabletColumn::new(0, "key", LogicalType::Integer)],
+                KeysType::DuplicateKeys,
+            )
+            .unwrap(),
+        );
+
+        let encoded = encode_batch(&schema, &[(0, batch)], 3).unwrap();
+
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].num_values, 3);
+        assert_eq!(encoded[0].null_flags.as_deref(), Some(&[0b0000_0100][..]));
+        let expected = [7_i32, 11, 0]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(encoded[0].data.as_ref(), expected);
     }
 }

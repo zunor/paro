@@ -17,6 +17,7 @@ pub mod grouped_aggregate_hashtable;
 pub(crate) mod ordered_helpers;
 pub(crate) mod payload_spill;
 pub mod perfect_aggregate_hashtable;
+pub(crate) mod perfect_hash_key;
 pub mod radix_partitioned_aggregate_hashtable;
 pub mod row_format;
 pub mod state;

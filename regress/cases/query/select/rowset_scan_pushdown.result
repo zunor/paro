@@ -145,10 +145,10 @@ PROJECTION  (rows=1)
     Output: aggr_0
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
-    ->  HASH_JOIN  (rows=0)
+    ->  HASH_JOIN  (rows=1)
       Join Type: INNER
       Join Condition: #0 = #0
-      Cardinality: [0, 0, 0]
+      Cardinality: [1, 1, 1]
       Output Schema: k INTEGER, k INTEGER
       ->  ROWSET_SCAN on public.rowset_pushdown_case c
         Columns: k

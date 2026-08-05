@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::operators::aggregate::perfect_hash_key::PerfectHashKeyDomain;
 use crate::operators::graph::state::graph_path_element_list_type;
 
 pub(crate) fn extract_payload_expression(
@@ -57,16 +58,8 @@ pub(crate) fn can_use_perfect_hash_aggregate(
             .group_stats
             .get(group_idx)
             .and_then(|stats| stats.as_ref());
-        let min_max = match &group_type {
-            ty if ty.is_integer() => group_stats
-                .and_then(integer_min_max_from_stats)
-                .or_else(|| integer_type_bounds(ty)),
-            paro_common::types::LogicalType::Varchar => {
-                group_stats.and_then(single_byte_string_min_max_from_stats)
-            }
-            _ => None,
-        };
-        let (min_value, max_value) = min_max?;
+        let domain = PerfectHashKeyDomain::try_new(group_type)?;
+        let (min_value, max_value) = domain.min_max_from_stats(group_stats)?;
         let range = max_value.checked_sub(min_value)?;
         let range_u128 = u128::try_from(range).ok()?;
         if range_u128 >= PERFECT_HASH_RANGE_LIMIT {
@@ -85,64 +78,6 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         group_minima,
         required_bits,
     })
-}
-
-fn single_byte_string_min_max_from_stats(
-    stats: &paro_storage::statistics::BaseStatistics,
-) -> Option<(i128, i128)> {
-    let string_stats = paro_storage::statistics::StringStats::get_data(stats)?;
-    if string_stats.max_string_length()? > 1 {
-        return None;
-    }
-    let min = encode_single_byte_string(string_stats.min_bytes())?;
-    let max = encode_single_byte_string(string_stats.max_bytes())?;
-    (min <= max).then_some((min, max))
-}
-
-fn encode_single_byte_string(value: &[u8]) -> Option<i128> {
-    match value {
-        [] => Some(0),
-        [byte] => Some(i128::from(*byte) + 1),
-        _ => None,
-    }
-}
-
-pub(crate) fn integer_min_max_from_stats(
-    stats: &paro_storage::statistics::BaseStatistics,
-) -> Option<(i128, i128)> {
-    let min = stats.min_value().and_then(|value| value_to_i128(&value))?;
-    let max = stats.max_value().and_then(|value| value_to_i128(&value))?;
-    Some((min, max))
-}
-
-pub(crate) fn value_to_i128(value: &Value) -> Option<i128> {
-    match value {
-        Value::TinyInt(v) => Some(*v as i128),
-        Value::SmallInt(v) => Some(*v as i128),
-        Value::Integer(v) => Some(*v as i128),
-        Value::BigInt(v) => Some(*v as i128),
-        Value::HugeInt(v) => Some(*v),
-        Value::UTinyInt(v) => Some(*v as i128),
-        Value::USmallInt(v) => Some(*v as i128),
-        Value::UInteger(v) => Some(*v as i128),
-        Value::UBigInt(v) => Some(*v as i128),
-        Value::UHugeInt(v) => i128::try_from(*v).ok(),
-        _ => None,
-    }
-}
-
-pub(crate) fn integer_type_bounds(ty: &paro_common::types::LogicalType) -> Option<(i128, i128)> {
-    match ty {
-        paro_common::types::LogicalType::TinyInt => Some((i8::MIN as i128, i8::MAX as i128)),
-        paro_common::types::LogicalType::SmallInt => Some((i16::MIN as i128, i16::MAX as i128)),
-        paro_common::types::LogicalType::Integer => Some((i32::MIN as i128, i32::MAX as i128)),
-        paro_common::types::LogicalType::BigInt => Some((i64::MIN as i128, i64::MAX as i128)),
-        paro_common::types::LogicalType::UTinyInt => Some((0, u8::MAX as i128)),
-        paro_common::types::LogicalType::USmallInt => Some((0, u16::MAX as i128)),
-        paro_common::types::LogicalType::UInteger => Some((0, u32::MAX as i128)),
-        paro_common::types::LogicalType::UBigInt => Some((0, u64::MAX as i128)),
-        _ => None,
-    }
 }
 
 pub(crate) fn required_bits_for_value(mut value: u128) -> Option<usize> {
@@ -199,27 +134,6 @@ pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
         LogicalOperator::GraphScan(_) => "GRAPH_SCAN",
         LogicalOperator::GraphExpand(_) => "GRAPH_EXPAND",
         LogicalOperator::DummyScan => "DUMMY_SCAN",
-    }
-}
-
-#[cfg(test)]
-mod perfect_hash_tests {
-    use super::*;
-    use paro_storage::statistics::StringStats;
-
-    #[test]
-    fn single_byte_varchar_stats_form_a_compact_perfect_hash_domain() {
-        let mut stats = StringStats::create_empty(LogicalType::Varchar);
-        StringStats::update(&mut stats, "A");
-        StringStats::update(&mut stats, "R");
-
-        assert_eq!(
-            single_byte_string_min_max_from_stats(&stats),
-            Some((66, 83))
-        );
-
-        StringStats::update(&mut stats, "AB");
-        assert_eq!(single_byte_string_min_max_from_stats(&stats), None);
     }
 }
 

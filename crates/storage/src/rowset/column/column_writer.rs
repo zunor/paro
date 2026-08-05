@@ -772,6 +772,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
 
     /// Add fixed-width values to the page builder.
     fn add_fixed_values(&mut self, data: &[u8], count: u32) -> u32 {
+        let fixed_width = fixed_type_size(&self.opts);
         match &mut self.page_builder {
             PageBuilderImpl::Plain(b) => b.add(data, count),
             PageBuilderImpl::BitShuffle(b) => b.add(data, count),
@@ -779,6 +780,20 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 // Convert bytes to u8 slice for RLE
                 let values: Vec<u8> = data.iter().take(count as usize).copied().collect();
                 b.add(&values)
+            }
+            PageBuilderImpl::BinaryDict(builder) => {
+                let Some(width) = fixed_width else {
+                    return 0;
+                };
+                let available = (data.len() / width).min(count as usize);
+                let mut added = 0usize;
+                for value in data.chunks_exact(width).take(available) {
+                    if !builder.add_slice(value) {
+                        break;
+                    }
+                    added += 1;
+                }
+                added as u32
             }
             _ => 0,
         }

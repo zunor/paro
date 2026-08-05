@@ -12,7 +12,7 @@ use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
-use paro_function::scalar::cast::CastExecCtx;
+use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::get::Get;
@@ -242,6 +242,9 @@ fn evaluate_bound_constant(expr: &Expression) -> Result<Option<Value>> {
     match expr {
         Expression::Constant(constant) => Ok(Some(constant.value.clone())),
         Expression::Cast(cast) => {
+            if cast.cast_info.context_dependency() == CastContextDependency::Runtime {
+                return Ok(None);
+            }
             let Some(value) = evaluate_bound_constant(cast.child.as_ref())? else {
                 return Ok(None);
             };
@@ -383,5 +386,20 @@ mod tests {
             evaluate_bound_constant(&expr).unwrap(),
             Some(Value::Decimal(5, 15, 2))
         );
+    }
+
+    #[test]
+    fn runtime_context_dependent_cast_is_not_folded_for_scan_pushdown() {
+        let expr = Expression::Cast(CastExpression::new(
+            Expression::Constant(ConstantExpression::new(
+                Value::Varchar("session-dependent".to_string()),
+                LogicalType::Varchar,
+            )),
+            LogicalType::Date,
+            BoundCastInfo::fixed(varchar_to_date).requiring_runtime_context(),
+            false,
+        ));
+
+        assert_eq!(evaluate_bound_constant(&expr).unwrap(), None);
     }
 }
