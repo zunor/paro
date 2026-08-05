@@ -417,6 +417,53 @@ fn parallel_scheduler_consumes_chunk_morsels_in_completed_and_streaming_paths() 
 }
 
 #[test]
+fn parallel_scheduler_drains_hash_aggregate_shared_workers_once() {
+    let row_count = VECTOR_SIZE * 8 + 17;
+    let statement = statement_from_logical(grouped_aggregate_logical_plan(row_count));
+    assert_pipeline_count_at_least(&statement, 2);
+
+    let session = TestStatementContextBuilder::minimal()
+        .with_limits(RuntimeLimits {
+            max_threads: 4,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: false,
+            temporary_directory: String::new(),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: true,
+        })
+        .build();
+    session.scheduler().set_threads(4).expect("worker threads");
+
+    let execution = execute_program(
+        session,
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("execute parallel hash aggregate");
+
+    let mut groups = Vec::with_capacity(row_count);
+    while let Some(chunk) = execution.query.output.pop_front() {
+        for row in 0..chunk.size() {
+            groups.push((
+                chunk.column(0).unwrap().get_i32(row).unwrap(),
+                chunk.column(1).unwrap().get_i64(row).unwrap(),
+            ));
+        }
+    }
+    groups.sort_unstable_by_key(|(key, _)| *key);
+
+    assert_eq!(groups.len(), row_count);
+    assert!(groups
+        .iter()
+        .enumerate()
+        .all(|(key, group)| *group == (key as i32, 1)));
+}
+
+#[test]
 fn completed_output_materializes_root_output_until_client_fetch() {
     let allocator = paro_common::test_utils::test_allocator();
     let chunk_count = 8usize;

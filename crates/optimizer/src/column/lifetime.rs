@@ -6,9 +6,11 @@
 use std::collections::HashSet;
 
 use paro_common::error::Result;
-use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
+use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
+
+use crate::expression::traversal::visit_expression as traverse_expression;
 
 pub struct ColumnLifetimeAnalyzer {
     column_references: HashSet<ColumnBinding>,
@@ -217,12 +219,11 @@ impl ColumnLifetimeAnalyzer {
     }
 
     fn visit_expression(&mut self, expr: &Expression) {
-        if let Expression::ColumnRef(column_ref) = expr {
-            self.add_binding(column_ref);
-            return;
-        }
-
-        ExpressionIterator::enumerate_children(expr, |child| self.visit_expression(child));
+        traverse_expression(expr, &mut |expression| {
+            if let Expression::ColumnRef(column_ref) = expression {
+                self.add_binding(column_ref);
+            }
+        });
     }
 
     fn add_binding(&mut self, col_ref: &ColumnRefExpression) {
@@ -296,13 +297,10 @@ impl ColumnLifetimeAnalyzer {
     }
 
     pub fn extract_column_bindings(expr: &Expression, bindings: &mut Vec<ColumnBinding>) {
-        if let Expression::ColumnRef(column_ref) = expr {
-            bindings.push(column_ref.binding);
-            return;
-        }
-
-        ExpressionIterator::enumerate_children(expr, |child| {
-            Self::extract_column_bindings(child, bindings);
+        traverse_expression(expr, &mut |expression| {
+            if let Expression::ColumnRef(column_ref) = expression {
+                bindings.push(column_ref.binding);
+            }
         });
     }
 }

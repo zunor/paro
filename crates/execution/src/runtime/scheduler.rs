@@ -3,10 +3,10 @@
 
 //! PipelineScheduler execution driver.
 //!
-//! The first production path parallelizes one morsel-capable pipeline at a
+//! The first production path parallelizes one source-capable pipeline at a
 //! time: one immutable `PipelineRuntime` owns global source/sink state, N data
-//! worker tasks create task-local state and pull source-owned morsels, and one
-//! finish worker seals the pipeline after the local merge barrier.
+//! worker tasks create task-local state and consume assigned morsels or shared
+//! source work, and one finish worker seals the pipeline after the local merge barrier.
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -198,9 +198,9 @@ impl<'a> PipelineScheduler<'a> {
     }
 }
 
-/// Execute one already-bound pipeline runtime with the same morsel scheduler
-/// used by the ordinary DAG driver. Control regions use this entry point to
-/// preserve their phase ordering while still parallelizing each ready phase.
+/// Execute one already-bound pipeline runtime with the same source scheduler used by the ordinary
+/// DAG driver. Control regions use this entry point to preserve their phase ordering while still
+/// parallelizing each ready phase.
 pub(crate) fn run_bound_pipeline_runtime(
     runtime: Arc<PipelineRuntime>,
     parallelism: Parallelism,
@@ -210,16 +210,16 @@ pub(crate) fn run_bound_pipeline_runtime(
     let Some(source_work) = source_work(&runtime.source_global) else {
         return run_single_pipeline(runtime, query.as_ref(), allocator, 0, 1);
     };
-    let morsel_count = source_work.morsel_count();
-    let total_threads = pipeline_thread_count(parallelism, morsel_count, query.as_ref());
-    if total_threads <= 1 || morsel_count <= 1 {
+    let work_unit_count = source_work.work_unit_count();
+    let total_threads = pipeline_thread_count(parallelism, work_unit_count, query.as_ref());
+    if total_threads <= 1 || work_unit_count <= 1 {
         return run_single_pipeline(runtime, query.as_ref(), allocator, 0, 1);
     }
 
-    let morsels = source_work.into_task_morsels(total_threads);
+    let assignments = source_work.into_task_assignments(total_threads);
     run_parallel_data_tasks(
         runtime.clone(),
-        morsels,
+        assignments,
         total_threads,
         query.clone(),
         allocator.clone(),
@@ -239,17 +239,17 @@ pub(crate) fn run_bound_pipeline_runtime(
 
 fn pipeline_thread_count(
     parallelism: Parallelism,
-    morsel_count: usize,
+    work_unit_count: usize,
     query: &QueryRuntimeContext,
 ) -> usize {
-    if !query.session.limits.parallel_scheduler || parallelism.max <= 1 || morsel_count <= 1 {
+    if !query.session.limits.parallel_scheduler || parallelism.max <= 1 || work_unit_count <= 1 {
         return 1;
     }
     let threads = query.session.number_of_threads().max(1);
     parallelism
         .max
         .min(threads)
-        .min(morsel_count)
+        .min(work_unit_count)
         .max(parallelism.min)
         .max(1)
 }
@@ -304,17 +304,17 @@ fn run_single_pipeline(
 
 fn run_parallel_data_tasks(
     runtime: Arc<PipelineRuntime>,
-    morsels: Vec<SourceMorsel>,
+    assignments: Vec<SourceTaskAssignment>,
     total_threads: usize,
     query: Arc<QueryRuntimeContext>,
     allocator: Arc<dyn Allocator>,
 ) -> Result<()> {
     let scheduler = query.session.scheduler().clone();
     let producer = scheduler.create_producer_with_priority(0);
-    let group = Arc::new(PipelineWorkerCoordinator::new(morsels.len()));
-    let mut tasks = Vec::with_capacity(morsels.len());
-    for (task_idx, morsel) in morsels.into_iter().enumerate() {
-        let work = WorkUnit::morsel(runtime.program.id, task_idx as u64, morsel);
+    let group = Arc::new(PipelineWorkerCoordinator::new(assignments.len()));
+    let mut tasks = Vec::with_capacity(assignments.len());
+    for (task_idx, assignment) in assignments.into_iter().enumerate() {
+        let work = WorkUnit::data(runtime.program.id, task_idx as u64, assignment);
         let task = PipelineWorkerTask::new_data(
             runtime.clone(),
             query.clone(),
@@ -323,7 +323,7 @@ fn run_parallel_data_tasks(
             work,
             task_idx % total_threads,
             total_threads,
-            Some(morsel),
+            Some(assignment),
         );
         tasks.push(as_scheduler_task(task));
     }
@@ -361,27 +361,53 @@ struct WorkUnitId(u64);
 enum SourceMorsel {
     RowsetScan { start: usize, end: usize },
     Chunks { start: usize, end: usize },
-    HashAggregatePartitions { start: usize, end: usize },
-    SortEmit { task_idx: usize },
 }
 
 impl SourceMorsel {
     fn morsel_count(self) -> usize {
         match self {
-            Self::RowsetScan { start, end }
-            | Self::Chunks { start, end }
-            | Self::HashAggregatePartitions { start, end } => end - start,
-            Self::SortEmit { .. } => 1,
+            Self::RowsetScan { start, end } | Self::Chunks { start, end } => end - start,
+        }
+    }
+}
+
+/// A worker that dynamically claims work from source-owned shared state.
+///
+/// Unlike a morsel, this assignment carries no data range. Its only contract is to bound the
+/// number of task-local consumers concurrently draining the source queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedSourceWorker {
+    HashAggregateEmit,
+    SortEmit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceTaskAssignment {
+    Morsel(SourceMorsel),
+    SharedWorker(SharedSourceWorker),
+}
+
+impl SourceTaskAssignment {
+    fn morsel_count(self) -> Option<usize> {
+        match self {
+            Self::Morsel(morsel) => Some(morsel.morsel_count()),
+            Self::SharedWorker(_) => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceWork {
-    RowsetScan { count: usize },
-    Chunks { count: usize },
-    HashAggregatePartitions { count: usize },
-    SortEmit { task_count: usize },
+    RowsetScan {
+        count: usize,
+    },
+    Chunks {
+        count: usize,
+    },
+    SharedWorkers {
+        count: usize,
+        worker: SharedSourceWorker,
+    },
 }
 
 // Keep enough independent work for load balancing without making task-state
@@ -389,30 +415,28 @@ enum SourceWork {
 const DATA_TASKS_PER_THREAD: usize = 4;
 
 impl SourceWork {
-    fn morsel_count(self) -> usize {
+    fn work_unit_count(self) -> usize {
         match self {
             Self::RowsetScan { count }
             | Self::Chunks { count }
-            | Self::HashAggregatePartitions { count } => count,
-            Self::SortEmit { task_count } => task_count,
+            | Self::SharedWorkers { count, .. } => count,
         }
     }
 
-    fn into_task_morsels(self, total_threads: usize) -> Vec<SourceMorsel> {
+    fn into_task_assignments(self, total_threads: usize) -> Vec<SourceTaskAssignment> {
         match self {
             Self::RowsetScan { count } => partition_morsel_ranges(count, total_threads)
-                .map(|(start, end)| SourceMorsel::RowsetScan { start, end })
+                .map(|(start, end)| {
+                    SourceTaskAssignment::Morsel(SourceMorsel::RowsetScan { start, end })
+                })
                 .collect(),
             Self::Chunks { count } => partition_morsel_ranges(count, total_threads)
-                .map(|(start, end)| SourceMorsel::Chunks { start, end })
+                .map(|(start, end)| {
+                    SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, end })
+                })
                 .collect(),
-            Self::HashAggregatePartitions { count } => {
-                partition_morsel_ranges(count, total_threads)
-                    .map(|(start, end)| SourceMorsel::HashAggregatePartitions { start, end })
-                    .collect()
-            }
-            Self::SortEmit { task_count } => (0..task_count)
-                .map(|task_idx| SourceMorsel::SortEmit { task_idx })
+            Self::SharedWorkers { count, worker } => (0..count.min(total_threads))
+                .map(|_| SourceTaskAssignment::SharedWorker(worker))
                 .collect(),
         }
     }
@@ -435,12 +459,10 @@ fn partition_morsel_ranges(
 
 const PROFILE_MORSEL_ROWSET_SCAN: &str = "rowset_scan";
 const PROFILE_MORSEL_CHUNK: &str = "chunk";
-const PROFILE_MORSEL_HASH_AGGREGATE_PARTITION: &str = "hash_aggregate_partition";
-const PROFILE_MORSEL_SORT_EMIT: &str = "sort_emit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkUnitKind {
-    Morsel(SourceMorsel),
+    Data(SourceTaskAssignment),
     Finish,
 }
 
@@ -452,11 +474,11 @@ struct WorkUnit {
 }
 
 impl WorkUnit {
-    fn morsel(pipeline: PipelineId, ordinal: u64, morsel: SourceMorsel) -> Self {
+    fn data(pipeline: PipelineId, ordinal: u64, assignment: SourceTaskAssignment) -> Self {
         Self {
             id: WorkUnitId(((pipeline.index() as u64) << 32) | ordinal),
             pipeline,
-            kind: WorkUnitKind::Morsel(morsel),
+            kind: WorkUnitKind::Data(assignment),
         }
     }
 
@@ -650,7 +672,7 @@ struct PipelineWorkerTask {
     thread_id: usize,
     total_threads: usize,
     mode: PipelineWorkerMode,
-    morsel: Option<SourceMorsel>,
+    source_assignment: Option<SourceTaskAssignment>,
     executor: Option<PipelineTaskExecutor>,
     profiler: Option<OperatorProfiler>,
     blocked: Option<Blocker>,
@@ -670,7 +692,7 @@ impl PipelineWorkerTask {
         work: WorkUnit,
         thread_id: usize,
         total_threads: usize,
-        morsel: Option<SourceMorsel>,
+        source_assignment: Option<SourceTaskAssignment>,
     ) -> Self {
         let ready_at = query.explain_profiler.as_ref().map(|_| Instant::now());
         Self {
@@ -682,7 +704,7 @@ impl PipelineWorkerTask {
             thread_id,
             total_threads,
             mode: PipelineWorkerMode::Data,
-            morsel,
+            source_assignment,
             executor: None,
             profiler: None,
             blocked: None,
@@ -713,7 +735,7 @@ impl PipelineWorkerTask {
             thread_id,
             total_threads,
             mode: PipelineWorkerMode::Finish,
-            morsel: None,
+            source_assignment: None,
             executor: None,
             profiler: None,
             blocked: None,
@@ -744,7 +766,7 @@ impl PipelineWorkerTask {
                 thread_id: self.thread_id,
                 total_threads: self.total_threads,
                 mode: self.mode,
-                morsel: self.morsel,
+                source_assignment: self.source_assignment,
                 executor: self.executor.take(),
                 profiler: self.profiler.take(),
                 blocked: self.blocked.take(),
@@ -785,8 +807,8 @@ impl PipelineWorkerTask {
         let mut task = self
             .runtime
             .create_task_state(self.query.as_ref(), self.allocator.clone())?;
-        if let Some(morsel) = self.morsel {
-            assign_source_morsel(&mut task.source, morsel)?;
+        if let Some(assignment) = self.source_assignment {
+            prepare_source_task(&mut task.source, assignment)?;
         }
         self.executor = Some(match self.mode {
             PipelineWorkerMode::Data => {
@@ -855,12 +877,15 @@ impl PipelineWorkerTask {
             wake: &wake,
             profiler: self.profiler.as_mut().expect("profiler initialized"),
         };
-        if self.morsel.is_some() && !self.recorded_start {
+        if self.source_assignment.is_some() && !self.recorded_start {
             ctx.profiler.record_runtime(
                 source_node_id,
                 ExplainRuntimeStats {
                     scheduler_worker_count: Some(1),
-                    scheduler_morsel_count: self.morsel.map(|morsel| morsel.morsel_count() as u64),
+                    scheduler_morsel_count: self
+                        .source_assignment
+                        .and_then(SourceTaskAssignment::morsel_count)
+                        .map(|count| count as u64),
                     ..ExplainRuntimeStats::default()
                 },
             );
@@ -1048,8 +1073,9 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
             count: global.chunks.len(),
         }),
         SourceGlobal::HashAggregateEmit(global) if global.work_count() > 1 => {
-            Some(SourceWork::HashAggregatePartitions {
+            Some(SourceWork::SharedWorkers {
                 count: global.work_count(),
+                worker: SharedSourceWorker::HashAggregateEmit,
             })
         }
         SourceGlobal::SortEmit(global) => {
@@ -1065,55 +1091,65 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
                 })
                 .unwrap_or(1)
                 .max(1);
-            Some(SourceWork::SortEmit { task_count })
+            Some(SourceWork::SharedWorkers {
+                count: task_count,
+                worker: SharedSourceWorker::SortEmit,
+            })
         }
         _ => None,
     }
 }
 
-fn assign_source_morsel(source: &mut SourceLocal, morsel: SourceMorsel) -> Result<()> {
-    match (source, morsel) {
-        (SourceLocal::Rowset(local), SourceMorsel::RowsetScan { start, end }) => {
+fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignment) -> Result<()> {
+    match (source, assignment) {
+        (
+            SourceLocal::Rowset(local),
+            SourceTaskAssignment::Morsel(SourceMorsel::RowsetScan { start, end }),
+        ) => {
             local.assign_morsel_range(start, end);
             Ok(())
         }
-        (SourceLocal::Chunk(local), SourceMorsel::Chunks { start, end }) => {
+        (
+            SourceLocal::Chunk(local),
+            SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, end }),
+        ) => {
             local.assign_chunk_range(start, end);
             Ok(())
         }
-        (SourceLocal::HashAggregateEmit(_), SourceMorsel::HashAggregatePartitions { .. }) => Ok(()),
-        (SourceLocal::SortEmit(_), SourceMorsel::SortEmit { .. }) => Ok(()),
-        (source, morsel) => Err(paro_error::internal(format!(
-            "source local {} cannot accept scheduler morsel {:?}",
+        (
+            SourceLocal::HashAggregateEmit(_),
+            SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit),
+        )
+        | (
+            SourceLocal::SortEmit(_),
+            SourceTaskAssignment::SharedWorker(SharedSourceWorker::SortEmit),
+        ) => Ok(()),
+        (source, assignment) => Err(paro_error::internal(format!(
+            "source local {} cannot accept scheduler assignment {:?}",
             source.variant_name(),
-            morsel
+            assignment
         ))),
     }
 }
 
 fn profile_morsel_range_from_work(work: WorkUnit) -> Option<ProfileMorselRange> {
     match work.kind {
-        WorkUnitKind::Morsel(SourceMorsel::RowsetScan { start, end }) => Some(
-            ProfileMorselRange::new(PROFILE_MORSEL_ROWSET_SCAN, start as u64, end as u64),
-        ),
-        WorkUnitKind::Morsel(SourceMorsel::Chunks { start, end }) => Some(ProfileMorselRange::new(
-            PROFILE_MORSEL_CHUNK,
+        WorkUnitKind::Data(SourceTaskAssignment::Morsel(SourceMorsel::RowsetScan {
+            start,
+            end,
+        })) => Some(ProfileMorselRange::new(
+            PROFILE_MORSEL_ROWSET_SCAN,
             start as u64,
             end as u64,
         )),
-        WorkUnitKind::Morsel(SourceMorsel::HashAggregatePartitions { start, end }) => {
+        WorkUnitKind::Data(SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, end })) => {
             Some(ProfileMorselRange::new(
-                PROFILE_MORSEL_HASH_AGGREGATE_PARTITION,
+                PROFILE_MORSEL_CHUNK,
                 start as u64,
                 end as u64,
             ))
         }
-        WorkUnitKind::Morsel(SourceMorsel::SortEmit { task_idx }) => Some(ProfileMorselRange::new(
-            PROFILE_MORSEL_SORT_EMIT,
-            task_idx as u64,
-            task_idx as u64 + 1,
-        )),
-        WorkUnitKind::Finish => None,
+        WorkUnitKind::Data(SourceTaskAssignment::SharedWorker(_)) | WorkUnitKind::Finish => None,
     }
 }
 
@@ -1167,46 +1203,67 @@ mod tests {
 
     #[test]
     fn source_work_batches_many_morsels_into_bounded_contiguous_ranges() {
-        let morsels = SourceWork::Chunks { count: 1_024 }.into_task_morsels(4);
+        let assignments = SourceWork::Chunks { count: 1_024 }.into_task_assignments(4);
 
-        assert_eq!(morsels.len(), 4 * DATA_TASKS_PER_THREAD);
+        assert_eq!(assignments.len(), 4 * DATA_TASKS_PER_THREAD);
         assert_eq!(
-            morsels.first(),
-            Some(&SourceMorsel::Chunks { start: 0, end: 64 })
+            assignments.first(),
+            Some(&SourceTaskAssignment::Morsel(SourceMorsel::Chunks {
+                start: 0,
+                end: 64
+            }))
         );
         assert_eq!(
-            morsels.last(),
-            Some(&SourceMorsel::Chunks {
+            assignments.last(),
+            Some(&SourceTaskAssignment::Morsel(SourceMorsel::Chunks {
                 start: 960,
-                end: 1_024,
-            })
+                end: 1_024
+            }))
         );
         assert_eq!(
-            morsels
+            assignments
                 .iter()
                 .copied()
-                .map(SourceMorsel::morsel_count)
+                .map(|assignment| assignment.morsel_count().expect("morsel assignment"))
                 .sum::<usize>(),
             1_024
         );
-        assert!(morsels.windows(2).all(|pair| match pair {
-            [SourceMorsel::Chunks { end, .. }, SourceMorsel::Chunks { start, .. }] => end == start,
+        assert!(assignments.windows(2).all(|pair| match pair {
+            [
+                SourceTaskAssignment::Morsel(SourceMorsel::Chunks { end, .. }),
+                SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, .. }),
+            ] => end == start,
             _ => false,
         }));
 
-        let uneven = SourceWork::RowsetScan { count: 19 }.into_task_morsels(4);
+        let uneven = SourceWork::RowsetScan { count: 19 }.into_task_assignments(4);
         assert_eq!(uneven.len(), 16);
         assert_eq!(
             uneven
                 .iter()
                 .copied()
-                .map(SourceMorsel::morsel_count)
+                .map(|assignment| assignment.morsel_count().expect("morsel assignment"))
                 .collect::<Vec<_>>(),
             [vec![2; 3], vec![1; 13]].concat()
         );
         assert!(SourceWork::Chunks { count: 0 }
-            .into_task_morsels(4)
+            .into_task_assignments(4)
             .is_empty());
+    }
+
+    #[test]
+    fn shared_queue_sources_spawn_workers_without_fake_morsels() {
+        let assignments = SourceWork::SharedWorkers {
+            count: 64,
+            worker: SharedSourceWorker::HashAggregateEmit,
+        }
+        .into_task_assignments(4);
+
+        assert_eq!(assignments.len(), 4);
+        assert!(assignments.iter().all(|assignment| {
+            *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit)
+                && assignment.morsel_count().is_none()
+        }));
     }
 
     #[test]

@@ -15,6 +15,8 @@ use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
 use paro_planner::expression::{ConstantExpression, Expression};
 use paro_planner::operator::LogicalOperator;
 
+use crate::expression::traversal::associative_terms;
+
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};
 
@@ -170,8 +172,14 @@ impl Rule for CommonConjunctionFactorRule {
 }
 
 fn factor_common_conjuncts(disjunction: &ConjunctionExpression) -> Option<Expression> {
-    let branches = associative_children(disjunction, ConjunctionType::Or);
-    let branch_factors = branches.into_iter().map(conjuncts).collect::<Vec<_>>();
+    let mut branches = Vec::new();
+    for child in &disjunction.children {
+        branches.extend(associative_terms(child, ConjunctionType::Or));
+    }
+    let branch_factors = branches
+        .into_iter()
+        .map(|branch| associative_terms(branch, ConjunctionType::And))
+        .collect::<Vec<_>>();
     let first_branch = branch_factors.first()?;
 
     let mut common = Vec::new();
@@ -220,39 +228,6 @@ fn factor_common_conjuncts(disjunction: &ConjunctionExpression) -> Option<Expres
     let mut result = common.into_iter().cloned().collect::<Vec<_>>();
     result.push(residual);
     Some(build_conjunction(result, ConjunctionType::And))
-}
-
-fn conjuncts(expression: &Expression) -> Vec<&Expression> {
-    let mut result = Vec::new();
-    collect_associative(expression, ConjunctionType::And, &mut result);
-    result
-}
-
-fn associative_children(
-    conjunction: &ConjunctionExpression,
-    conjunction_type: ConjunctionType,
-) -> Vec<&Expression> {
-    let mut result = Vec::new();
-    for child in &conjunction.children {
-        collect_associative(child, conjunction_type, &mut result);
-    }
-    result
-}
-
-fn collect_associative<'a>(
-    expression: &'a Expression,
-    conjunction_type: ConjunctionType,
-    result: &mut Vec<&'a Expression>,
-) {
-    if let Expression::Conjunction(conjunction) = expression {
-        if conjunction.conjunction_type == conjunction_type {
-            for child in &conjunction.children {
-                collect_associative(child, conjunction_type, result);
-            }
-            return;
-        }
-    }
-    result.push(expression);
 }
 
 fn build_conjunction(

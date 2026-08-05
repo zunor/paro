@@ -8,9 +8,7 @@
 //! - Moving filters above projections to enable further optimizations
 //! - Preparing filters for pushdown in a subsequent pass
 
-use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, Expression, ExpressionIterator,
-};
+use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, Expression};
 use paro_planner::operator::{
     AnyJoin, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinType, LogicalOperator,
     Projection, SetOpType, SetOperation,
@@ -18,6 +16,7 @@ use paro_planner::operator::{
 use paro_planner::plan::LogicalPlan;
 
 use crate::expression::join_has_evaluation_fence;
+use crate::expression::traversal::visit_expression;
 
 /// Filter pullup optimizer.
 ///
@@ -242,12 +241,10 @@ impl FilterPullup {
     }
 
     fn collect_column_refs(expr: &Expression, columns: &mut Vec<ColumnRefExpression>) {
-        if let Expression::ColumnRef(column) = expr {
-            columns.push(column.clone());
-            return;
-        }
-        ExpressionIterator::enumerate_children(expr, |child| {
-            Self::collect_column_refs(child, columns);
+        visit_expression(expr, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                columns.push(column.clone());
+            }
         });
     }
 

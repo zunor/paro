@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use paro_planner::expression::ConjunctionType;
-use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
+use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::empty_result::EmptyResult;
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{
@@ -15,6 +15,9 @@ use paro_planner::operator::{
 use paro_planner::plan::LogicalPlan;
 
 use crate::expression::join_has_evaluation_fence;
+use crate::expression::traversal::{
+    associative_terms, expression_join_side, into_associative_terms, visit_expression,
+};
 use crate::filter::combiner::{FilterCombiner, FilterResult};
 /// A filter with its table bindings extracted.
 #[derive(Debug)]
@@ -39,18 +42,11 @@ impl Filter {
     /// Extract table bindings from the filter expression.
     pub fn extract_bindings(&mut self) {
         self.bindings.clear();
-        Self::extract_bindings_from_expr(&self.filter, &mut self.bindings);
-    }
-
-    /// Recursively extract table bindings from an expression.
-    fn extract_bindings_from_expr(expr: &Expression, bindings: &mut HashSet<usize>) {
-        if let Expression::ColumnRef(column) = expr {
-            bindings.insert(column.binding.table_index);
-            return;
-        }
-
-        ExpressionIterator::enumerate_children(expr, |child| {
-            Self::extract_bindings_from_expr(child, bindings);
+        let bindings = &mut self.bindings;
+        visit_expression(&self.filter, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                bindings.insert(column.binding.table_index);
+            }
         });
     }
 }
@@ -139,22 +135,7 @@ impl FilterPushdown {
 
     /// Split an expression by AND predicates.
     fn split_predicates(expr: Expression) -> Vec<Expression> {
-        let mut result = Vec::new();
-        Self::split_predicates_recursive(expr, &mut result);
-        result
-    }
-
-    /// Recursively split AND predicates.
-    fn split_predicates_recursive(expr: Expression, result: &mut Vec<Expression>) {
-        if let Expression::Conjunction(conj) = &expr {
-            if conj.conjunction_type == ConjunctionType::And {
-                for child in conj.children.clone() {
-                    Self::split_predicates_recursive(child, result);
-                }
-                return;
-            }
-        }
-        result.push(expr);
+        into_associative_terms(expr, ConjunctionType::And)
     }
 
     /// Push current filters into the combiner.
@@ -717,15 +698,14 @@ impl FilterPushdown {
         left_bindings: &HashSet<usize>,
         right_bindings: &HashSet<usize>,
     ) -> JoinSide {
-        let mut bindings = HashSet::new();
-        Filter::extract_bindings_from_expr(expr, &mut bindings);
-
-        let mut side = JoinSide::None;
-        for binding in bindings {
-            let binding_side = JoinSide::get_side(binding, left_bindings, right_bindings);
-            side = JoinSide::combine(side, binding_side);
-        }
-        side
+        expression_join_side(expr, &mut |expression| match expression {
+            Expression::ColumnRef(column) => Some(JoinSide::get_side(
+                column.binding.table_index,
+                left_bindings,
+                right_bindings,
+            )),
+            _ => None,
+        })
     }
 
     /// Derive side-local domain predicates implied by every branch of an OR expression.
@@ -737,8 +717,7 @@ impl FilterPushdown {
         if expr.evaluation_properties().is_reorder_fence() {
             return Vec::new();
         }
-        let mut branches = Vec::new();
-        Self::flatten_disjunction(expr, &mut branches);
+        let branches = associative_terms(expr, ConjunctionType::Or);
         if branches.len() < 2 {
             return Vec::new();
         }
@@ -790,58 +769,39 @@ impl FilterPushdown {
             .collect()
     }
 
-    fn flatten_disjunction<'a>(expr: &'a Expression, output: &mut Vec<&'a Expression>) {
-        match expr {
-            Expression::Conjunction(conjunction)
-                if conjunction.conjunction_type == ConjunctionType::Or =>
-            {
-                for child in &conjunction.children {
-                    Self::flatten_disjunction(child, output);
-                }
-            }
-            expr => output.push(expr),
-        }
-    }
-
     fn collect_branch_equalities(
         expr: &Expression,
         domains: &mut HashMap<paro_planner::operator::ColumnBinding, Vec<Expression>>,
     ) {
-        if let Expression::Conjunction(conjunction) = expr {
-            if conjunction.conjunction_type == ConjunctionType::And {
-                for child in &conjunction.children {
-                    Self::collect_branch_equalities(child, domains);
-                }
-                return;
+        for term in associative_terms(expr, ConjunctionType::And) {
+            let Expression::Comparison(comparison) = term else {
+                continue;
+            };
+            if comparison.comparison_type != paro_planner::expression::ComparisonType::Equal {
+                continue;
             }
-        }
-        let Expression::Comparison(comparison) = expr else {
-            return;
-        };
-        if comparison.comparison_type != paro_planner::expression::ComparisonType::Equal {
-            return;
-        }
-        let (Expression::ColumnRef(column), Expression::Constant(_)) =
-            (comparison.left.as_ref(), comparison.right.as_ref())
-        else {
-            let (Expression::Constant(constant), Expression::ColumnRef(column)) =
+            let (Expression::ColumnRef(column), Expression::Constant(_)) =
                 (comparison.left.as_ref(), comparison.right.as_ref())
             else {
-                return;
+                let (Expression::Constant(constant), Expression::ColumnRef(column)) =
+                    (comparison.left.as_ref(), comparison.right.as_ref())
+                else {
+                    continue;
+                };
+                let canonical =
+                    Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                        paro_planner::expression::ComparisonType::Equal,
+                        Expression::ColumnRef(column.clone()),
+                        Expression::Constant(constant.clone()),
+                    ));
+                domains.entry(column.binding).or_default().push(canonical);
+                continue;
             };
-            let canonical =
-                Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-                    paro_planner::expression::ComparisonType::Equal,
-                    Expression::ColumnRef(column.clone()),
-                    Expression::Constant(constant.clone()),
-                ));
-            domains.entry(column.binding).or_default().push(canonical);
-            return;
-        };
-        domains
-            .entry(column.binding)
-            .or_default()
-            .push(expr.clone());
+            domains
+                .entry(column.binding)
+                .or_default()
+                .push(term.clone());
+        }
     }
 
     /// Push down through an Aggregate operator.
@@ -992,19 +952,19 @@ impl FilterPushdown {
 }
 
 fn projection_reference_crosses_execution_boundary(proj: &Projection, expr: &Expression) -> bool {
-    if let Expression::ColumnRef(column) = expr {
-        return column.binding.table_index == proj.table_index
+    let mut crosses_boundary = false;
+    visit_expression(expr, &mut |expression| {
+        if crosses_boundary {
+            return;
+        }
+        let Expression::ColumnRef(column) = expression else {
+            return;
+        };
+        crosses_boundary = column.binding.table_index == proj.table_index
             && proj
                 .expressions
                 .get(column.binding.column_index)
                 .is_some_and(Expression::contains_external_routine);
-    }
-
-    let mut crosses_boundary = false;
-    ExpressionIterator::enumerate_children(expr, |child| {
-        if !crosses_boundary {
-            crosses_boundary = projection_reference_crosses_execution_boundary(proj, child);
-        }
     });
     crosses_boundary
 }

@@ -6,6 +6,7 @@
 pub mod binding_replacer;
 pub mod in_clause;
 pub mod rewriter;
+pub(crate) mod traversal;
 
 use paro_planner::operator::{Join, LogicalOperator};
 

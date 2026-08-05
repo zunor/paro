@@ -32,14 +32,51 @@ use crate::thread_context::ThreadContext;
 use super::*;
 
 fn metadata() -> BreakerHandleMetadata {
+    metadata_with_consumers(&[])
+}
+
+fn metadata_with_consumers(consumers: &[PipelineId]) -> BreakerHandleMetadata {
     BreakerHandleMetadata {
         id: BreakerHandleId::new(0),
         kind: BreakerHandleKind::HashJoinBuild,
         row_type: RowType::new(vec!["a".to_string()], vec![LogicalType::Integer]),
         producer: None,
-        consumers: Box::new([]),
+        consumers: consumers.to_vec().into_boxed_slice(),
         properties: PipelineProperties::default(),
     }
+}
+
+#[test]
+fn duplicate_consumer_completion_cannot_release_join_build_early() {
+    let first = PipelineId::new(1);
+    let second = PipelineId::new(2);
+    let handle = JoinBuildHandle::new(metadata_with_consumers(&[first, second]));
+    handle
+        .initialize_table(
+            Arc::new(BufferPool::new(16 * 1024 * 1024)),
+            test_allocator(),
+            vec![JoinCondition::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                JoinComparisonType::Equal,
+            )],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+        .expect("initialize hash table");
+
+    assert!(!handle.consumer_finished(first));
+    assert!(handle.table().is_some());
+    assert!(!handle.consumer_finished(first));
+    assert!(handle.table().is_some());
+
+    assert!(handle.consumer_finished(second));
+    assert!(handle.table().is_none());
+    assert!(!handle.consumer_finished(second));
 }
 
 fn query_context() -> QueryRuntimeContext {

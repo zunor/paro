@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -48,7 +49,7 @@ pub struct JoinBuildHandle {
     pub completion: CompletionLatch,
     pub stats: JoinBuildStats,
     table: Mutex<JoinHashTableState>,
-    remaining_consumers: AtomicUsize,
+    pending_consumers: Mutex<HashSet<PipelineId>>,
     runtime_filter_builder: Mutex<Option<JoinRuntimeFilterSketch>>,
     runtime_filter_sketch: OnceLock<JoinRuntimeFilterSketch>,
     mode: AtomicU8,
@@ -61,7 +62,7 @@ pub struct JoinBuildHandle {
 
 impl JoinBuildHandle {
     pub fn new(metadata: BreakerHandleMetadata) -> Self {
-        let remaining_consumers = metadata.consumers.len();
+        let pending_consumers = metadata.consumers.iter().copied().collect();
         Self {
             join_id: JoinBuildId(metadata.id.index() as u32),
             metadata,
@@ -69,7 +70,7 @@ impl JoinBuildHandle {
             completion: CompletionLatch::default(),
             stats: JoinBuildStats::default(),
             table: Mutex::new(JoinHashTableState::Uninitialized),
-            remaining_consumers: AtomicUsize::new(remaining_consumers),
+            pending_consumers: Mutex::new(pending_consumers),
             runtime_filter_builder: Mutex::new(None),
             runtime_filter_sketch: OnceLock::new(),
             mode: AtomicU8::new(JoinBuildMode::InMemory as u8),
@@ -163,17 +164,16 @@ impl JoinBuildHandle {
     /// Release the build table when the last pipeline that consumes this
     /// breaker finishes. The catalog is the single source of truth for
     /// consumer ownership, so replay and unmatched-output branches naturally
-    /// extend the lifetime without relying on scheduler order.
+    /// extend the lifetime without relying on scheduler order. Removing from
+    /// the pending set also makes duplicate completion notifications idempotent.
     pub fn consumer_finished(&self, pipeline: PipelineId) -> bool {
-        if !self.metadata.consumers.contains(&pipeline) {
-            return false;
-        }
-        let released = self
-            .remaining_consumers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok_and(|previous| previous == 1);
+        let released = {
+            let mut pending = self.pending_consumers.lock();
+            if !pending.remove(&pipeline) {
+                return false;
+            }
+            pending.is_empty()
+        };
         if released {
             let old = std::mem::replace(&mut *self.table.lock(), JoinHashTableState::Released);
             drop(old);

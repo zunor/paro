@@ -11,13 +11,15 @@
 use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, Expression, ExpressionIterator,
+    ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
 };
 use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinType,
-    LogicalOperator,
+    ColumnBinding, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinSide,
+    JoinType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
+
+use crate::expression::traversal::{expression_join_side, into_associative_terms};
 
 pub struct JoinPredicateNormalizer<'a> {
     bind_context: &'a BindContext,
@@ -34,17 +36,41 @@ impl<'a> JoinPredicateNormalizer<'a> {
     }
 
     fn normalize_cross_product(&self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
-        let LogicalOperator::Filter(mut filter) = operator else {
-            return LogicalPlan {
-                id,
-                stats,
+        let LogicalOperator::Filter(filter) = &plan.operator else {
+            return plan;
+        };
+        let LogicalOperator::Join(Join::Cross(cross)) = &filter.child.operator else {
+            return plan;
+        };
+        if filter
+            .expressions
+            .iter()
+            .any(|expression| expression.evaluation_properties().is_reorder_fence())
+        {
+            return plan;
+        }
+
+        let left_bindings = cross.left.get_column_bindings();
+        let right_bindings = cross.right.get_column_bindings();
+        let left_width = left_bindings.len();
+        plan.map_operator(|operator| {
+            Self::normalize_cross_filter_operator(
                 operator,
-            };
+                left_width,
+                &left_bindings,
+                &right_bindings,
+            )
+        })
+    }
+
+    fn normalize_cross_filter_operator(
+        operator: LogicalOperator,
+        left_width: usize,
+        left_bindings: &[ColumnBinding],
+        right_bindings: &[ColumnBinding],
+    ) -> LogicalOperator {
+        let LogicalOperator::Filter(mut filter) = operator else {
+            return operator;
         };
         let LogicalPlan {
             id: cross_id,
@@ -57,47 +83,18 @@ impl<'a> JoinPredicateNormalizer<'a> {
                 stats: cross_stats,
                 operator: cross_operator,
             });
-            return LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Filter(filter),
-            };
+            return LogicalOperator::Filter(filter);
         };
 
-        let left_bindings = cross.left.get_column_bindings();
-        let right_bindings = cross.right.get_column_bindings();
-        let left_width = left_bindings.len();
-        if filter
-            .expressions
-            .iter()
-            .any(|expression| expression.evaluation_properties().is_reorder_fence())
-        {
-            filter.child = Box::new(LogicalPlan {
-                id: cross_id,
-                stats: cross_stats,
-                operator: LogicalOperator::Join(Join::Cross(cross)),
-            });
-            return LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Filter(filter),
-            };
-        }
         let mut conditions = Vec::new();
         let mut residuals = Vec::new();
-        let mut expressions = Vec::new();
         for expression in filter.expressions {
-            flatten_and_expression(expression, &mut expressions);
-        }
-        for expression in expressions {
-            match cross_product_hash_condition(
-                expression,
-                left_width,
-                &left_bindings,
-                &right_bindings,
-            ) {
-                HashCondition::Join(condition) => conditions.push(*condition),
-                HashCondition::Residual(expression) => residuals.push(*expression),
+            for term in into_associative_terms(expression, ConjunctionType::And) {
+                match cross_product_hash_condition(term, left_width, left_bindings, right_bindings)
+                {
+                    HashCondition::Join(condition) => conditions.push(*condition),
+                    HashCondition::Residual(expression) => residuals.push(*expression),
+                }
             }
         }
         if conditions.is_empty() {
@@ -107,55 +104,37 @@ impl<'a> JoinPredicateNormalizer<'a> {
                 stats: cross_stats,
                 operator: LogicalOperator::Join(Join::Cross(cross)),
             });
-            return LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Filter(filter),
-            };
+            return LogicalOperator::Filter(filter);
         }
 
         let join = ComparisonJoin::new(JoinType::Inner, *cross.left, *cross.right, conditions);
         if residuals.is_empty() {
-            LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Join(Join::Comparison(join)),
-            }
+            LogicalOperator::Join(Join::Comparison(join))
         } else {
-            LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Filter(Filter::new(
-                    LogicalPlan {
-                        id: cross_id,
-                        stats: cross_stats,
-                        operator: LogicalOperator::Join(Join::Comparison(join)),
-                    },
-                    residuals,
-                )),
-            }
+            LogicalOperator::Filter(Filter::new(
+                LogicalPlan {
+                    id: cross_id,
+                    // The equality join has a different cardinality from the cross product it
+                    // replaces. Preserve the enclosing filter estimate, but make the new child
+                    // explicitly unknown until statistics are derived for its actual predicate.
+                    stats: Default::default(),
+                    operator: LogicalOperator::Join(Join::Comparison(join)),
+                },
+                residuals,
+            ))
         }
     }
 
     fn normalize_join(&self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        plan.map_operator(|operator| self.normalize_join_operator(operator))
+    }
+
+    fn normalize_join_operator(&self, operator: LogicalOperator) -> LogicalOperator {
         let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
-            return LogicalPlan {
-                id,
-                stats,
-                operator,
-            };
+            return operator;
         };
         if join.join_type != JoinType::Inner {
-            return LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Join(Join::Comparison(join)),
-            };
+            return LogicalOperator::Join(Join::Comparison(join));
         }
 
         let mut hash_keys = Vec::new();
@@ -171,11 +150,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
         if hash_keys.is_empty() || residuals.is_empty() {
             join.conditions = hash_keys;
             join.conditions.extend(residuals);
-            return LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Join(Join::Comparison(join)),
-            };
+            return LogicalOperator::Join(Join::Comparison(join));
         }
 
         join.conditions = hash_keys;
@@ -191,36 +166,13 @@ impl<'a> JoinPredicateNormalizer<'a> {
             .collect();
         let join_plan = LogicalPlan {
             id: self.bind_context.next_plan_id(),
-            stats: stats.clone(),
+            // The original estimate includes the residual predicate. It belongs to the outer
+            // filter, not to this less selective hash-join child.
+            stats: Default::default(),
             operator: LogicalOperator::Join(Join::Comparison(join)),
         };
-        LogicalPlan {
-            id,
-            stats,
-            operator: LogicalOperator::Filter(Filter::new(join_plan, residuals)),
-        }
+        LogicalOperator::Filter(Filter::new(join_plan, residuals))
     }
-}
-
-fn flatten_and_expression(expression: Expression, output: &mut Vec<Expression>) {
-    match expression {
-        Expression::Conjunction(conjunction)
-            if conjunction.conjunction_type == paro_planner::expression::ConjunctionType::And =>
-        {
-            for child in conjunction.children {
-                flatten_and_expression(child, output);
-            }
-        }
-        expression => output.push(expression),
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExpressionInput {
-    Constant,
-    Left,
-    Right,
-    Mixed,
 }
 
 enum HashCondition {
@@ -244,8 +196,8 @@ fn cross_product_hash_condition(
     let right_input =
         expression_input(&comparison.right, left_width, left_bindings, right_bindings);
     let (left, right) = match (left_input, right_input) {
-        (ExpressionInput::Left, ExpressionInput::Right) => (*comparison.left, *comparison.right),
-        (ExpressionInput::Right, ExpressionInput::Left) => (*comparison.right, *comparison.left),
+        (JoinSide::Left, JoinSide::Right) => (*comparison.left, *comparison.right),
+        (JoinSide::Right, JoinSide::Left) => (*comparison.right, *comparison.left),
         _ => return HashCondition::Residual(Box::new(Expression::Comparison(comparison))),
     };
     HashCondition::Join(Box::new(JoinCondition::new(
@@ -260,42 +212,28 @@ fn expression_input(
     left_width: usize,
     left_bindings: &[ColumnBinding],
     right_bindings: &[ColumnBinding],
-) -> ExpressionInput {
-    let mut input = ExpressionInput::Constant;
-    visit_expression(expression, &mut |expression| {
-        let expression_input = match expression {
-            Expression::Reference(reference) => {
-                if reference.index < left_width {
-                    ExpressionInput::Left
-                } else {
-                    ExpressionInput::Right
-                }
+) -> JoinSide {
+    expression_join_side(expression, &mut |expression| match expression {
+        Expression::Reference(reference) => {
+            if reference.index < left_width {
+                Some(JoinSide::Left)
+            } else {
+                Some(JoinSide::Right)
             }
-            Expression::ColumnRef(column_ref) if column_ref.depth == 0 => {
-                match (
-                    left_bindings.contains(&column_ref.binding),
-                    right_bindings.contains(&column_ref.binding),
-                ) {
-                    (true, false) => ExpressionInput::Left,
-                    (false, true) => ExpressionInput::Right,
-                    _ => ExpressionInput::Mixed,
-                }
-            }
-            Expression::ColumnRef(_) => ExpressionInput::Mixed,
-            _ => return,
-        };
-        input = match (input, expression_input) {
-            (ExpressionInput::Constant, side) => side,
-            (side, next) if side == next => side,
-            _ => ExpressionInput::Mixed,
-        };
-    });
-    input
-}
-
-fn visit_expression(expression: &Expression, visitor: &mut impl FnMut(&Expression)) {
-    visitor(expression);
-    ExpressionIterator::enumerate_children(expression, |child| visit_expression(child, visitor));
+        }
+        Expression::ColumnRef(column_ref) if column_ref.depth == 0 => Some(
+            match (
+                left_bindings.contains(&column_ref.binding),
+                right_bindings.contains(&column_ref.binding),
+            ) {
+                (true, false) => JoinSide::Left,
+                (false, true) => JoinSide::Right,
+                _ => JoinSide::Both,
+            },
+        ),
+        Expression::ColumnRef(_) => Some(JoinSide::Both),
+        _ => None,
+    })
 }
 
 fn rebase_right_expression(mut expression: Expression, left_width: usize) -> Expression {
@@ -346,6 +284,7 @@ mod tests {
     use paro_planner::operator::{
         ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, JoinCondition,
     };
+    use paro_planner::plan::CardinalityEstimate;
 
     fn column(table: usize, column: usize) -> Expression {
         Expression::ColumnRef(ColumnRefExpression::new(
@@ -389,14 +328,21 @@ mod tests {
     #[test]
     fn inner_join_keeps_hash_keys_and_moves_residuals_to_filter() {
         let context = BindContext::new();
+        let mut plan = join(&context, JoinType::Inner);
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(7));
         let optimized = JoinPredicateNormalizer::new(&context)
-            .optimize_plan(join(&context, JoinType::Inner))
+            .optimize_plan(plan)
             .expect("normalize inner join");
 
+        assert_eq!(
+            optimized.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(7))
+        );
         let LogicalOperator::Filter(filter) = optimized.operator else {
             panic!("expected residual filter");
         };
         assert_eq!(filter.expressions.len(), 1);
+        assert_eq!(filter.child.stats.estimated_cardinality, None);
         let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
             panic!("expected comparison join");
         };
