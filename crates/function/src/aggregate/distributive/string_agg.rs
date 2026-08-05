@@ -12,6 +12,7 @@
 
 use crate::aggregate::{
     AggregateCombineType, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -177,7 +178,7 @@ mod string_agg_one_arg {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
@@ -186,8 +187,6 @@ mod string_agg_one_arg {
             &LogicalType::Varchar,
             "string_agg(expr) expects VARCHAR input"
         );
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if input.is_null(i) {
                 continue;
@@ -195,7 +194,7 @@ mod string_agg_one_arg {
             let Some(value) = input.get_string(i) else {
                 continue;
             };
-            let state_ptr = *state_ptrs.add(i);
+            let state_ptr = states.state_ptr(i);
             let state = &mut *(state_ptr as *mut State);
             append_value(state, value, ",");
             if state.combine_separator.is_none() {
@@ -312,7 +311,7 @@ mod string_agg_two_args {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let value_input = inputs[0];
@@ -327,8 +326,6 @@ mod string_agg_two_args {
             &LogicalType::Varchar,
             "string_agg(expr, sep) expects VARCHAR separator"
         );
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if value_input.is_null(i) {
                 continue;
@@ -343,7 +340,7 @@ mod string_agg_two_args {
                 sep_input.get_string(i).unwrap_or("")
             };
 
-            let state_ptr = *state_ptrs.add(i);
+            let state_ptr = states.state_ptr(i);
             let state = &mut *(state_ptr as *mut State);
             append_value(state, value, separator);
             if state.combine_separator.is_none() && !separator_is_null {

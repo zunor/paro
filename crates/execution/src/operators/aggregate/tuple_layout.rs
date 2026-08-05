@@ -819,14 +819,14 @@ fn eq_scalar<T: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_function::aggregate::{AggregateFunction, AggregateInputData};
+    use paro_function::aggregate::{AggregateFunction, AggregateInputData, AggregateStateInput};
     use paro_planner::expression::AggregateExpression;
 
     unsafe fn initialize(_state: *mut u8) {}
     unsafe fn update(
         _inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        _states: &Vector,
+        _states: &AggregateStateInput,
         _count: usize,
     ) {
     }

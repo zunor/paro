@@ -210,6 +210,11 @@ JOIN join_inner_chain_b AS b ON a.id = b.id
 JOIN join_inner_chain_c AS c ON b.id = c.id
 ORDER BY a.id;
 
+-- 10. Relation-independent predicates survive filtered cross-product reordering
+SELECT COUNT(*) AS impossible_count
+FROM join_inner_chain_a AS a, join_inner_chain_b AS b
+WHERE a.id = b.id AND FALSE;
+
 -- @teardown
 DROP TABLE IF EXISTS join_inner_basic_left;
 -- @teardown

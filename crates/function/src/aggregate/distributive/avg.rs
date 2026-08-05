@@ -10,7 +10,9 @@
 //! - Integer types: accumulate sum as i128, count as u64, finalize to f64
 //! - Float types: accumulate sum as f64, count as u64, finalize to f64
 
-use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use crate::aggregate::{
+    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+};
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -48,15 +50,13 @@ mod avg_i32 {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if !input.is_null(i) {
-                let state_ptr = *state_ptrs.add(i);
+                let state_ptr = states.state_ptr(i);
                 let state = state_ptr as *mut State;
 
                 let val: i32 = input.get_fixed(i);
@@ -147,15 +147,13 @@ mod avg_i64 {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if !input.is_null(i) {
-                let state_ptr = *state_ptrs.add(i);
+                let state_ptr = states.state_ptr(i);
                 let state = state_ptr as *mut State;
 
                 let val: i64 = input.get_fixed(i);
@@ -246,15 +244,13 @@ mod avg_f64 {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if !input.is_null(i) {
-                let state_ptr = *state_ptrs.add(i);
+                let state_ptr = states.state_ptr(i);
                 let state = state_ptr as *mut State;
 
                 let val: f64 = input.get_fixed(i);

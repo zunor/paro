@@ -10,7 +10,9 @@
 //! - Includes NULL values.
 //! - Returns NULL for empty input.
 
-use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use crate::aggregate::{
+    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -219,13 +221,12 @@ unsafe fn initialize(state: *mut u8) {
 unsafe fn update(
     inputs: &[&Vector],
     _input_data: &AggregateInputData,
-    states: &Vector,
+    states: &AggregateStateInput,
     count: usize,
 ) {
     let input = inputs[0];
-    let state_ptrs = states.flat_data::<*mut u8>();
     for i in 0..count {
-        let state_ptr = *state_ptrs.add(i);
+        let state_ptr = states.state_ptr(i);
         let state = &mut *(state_ptr as *mut ArrayAggState);
         state.values.push(input.get_value(i));
     }

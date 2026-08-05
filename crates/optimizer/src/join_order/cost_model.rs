@@ -26,8 +26,10 @@ pub struct DPJoinNode {
     pub right_set: Arc<JoinRelationSet>,
     /// The cost of this join node.
     pub cost: f64,
-    /// The estimated cardinality of this node.
-    pub cardinality: usize,
+    /// The estimated cardinality of this node. Keep the fractional estimate
+    /// throughout DP enumeration; logical plans quantize it only once when the
+    /// chosen tree is reconstructed.
+    pub cardinality: f64,
 }
 
 impl DPJoinNode {
@@ -42,7 +44,7 @@ impl DPJoinNode {
             left_set: set.clone(),
             right_set: set,
             cost: 0.0,
-            cardinality: 0,
+            cardinality: 0.0,
         }
     }
 
@@ -53,7 +55,7 @@ impl DPJoinNode {
         left_set: Arc<JoinRelationSet>,
         right_set: Arc<JoinRelationSet>,
         cost: f64,
-        cardinality: usize,
+        cardinality: f64,
     ) -> Self {
         Self {
             set,
@@ -136,7 +138,7 @@ impl CostModel {
         let cost = self.compute_cost(left, right, set_manager);
         let cardinality = self
             .cardinality_estimator
-            .estimate_cardinality_idx(&combination);
+            .estimate_cardinality(&combination);
 
         DPJoinNode::intermediate(
             combination,
@@ -151,11 +153,6 @@ impl CostModel {
     /// Get the estimated cardinality for a relation set.
     pub fn get_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
         self.cardinality_estimator.estimate_cardinality(set)
-    }
-
-    /// Get the estimated cardinality as an integer.
-    pub fn get_cardinality_idx(&mut self, set: &JoinRelationSet) -> usize {
-        self.cardinality_estimator.estimate_cardinality_idx(set)
     }
 }
 
@@ -225,7 +222,7 @@ mod tests {
 
         assert!(node.is_leaf);
         assert_eq!(node.cost, 0.0);
-        assert_eq!(node.cardinality, 0);
+        assert_eq!(node.cardinality, 0.0);
         assert!(Arc::ptr_eq(&node.set, &set));
     }
 
@@ -242,13 +239,13 @@ mod tests {
             left.clone(),
             right.clone(),
             100.0,
-            50,
+            50.0,
         );
 
         assert!(!node.is_leaf);
         assert!(node.info.is_none());
         assert_eq!(node.cost, 100.0);
-        assert_eq!(node.cardinality, 50);
+        assert_eq!(node.cardinality, 50.0);
         assert!(Arc::ptr_eq(&node.left_set, &left));
         assert!(Arc::ptr_eq(&node.right_set, &right));
     }
@@ -338,7 +335,7 @@ mod tests {
             left_set: left_set.clone(),
             right_set: left_set.clone(),
             cost: 100.0,
-            cardinality: 1000,
+            cardinality: 1000.0,
         };
 
         let right = DPJoinNode {
@@ -348,7 +345,7 @@ mod tests {
             left_set: right_set.clone(),
             right_set: right_set.clone(),
             cost: 50.0,
-            cardinality: 500,
+            cardinality: 500.0,
         };
 
         // Compute cost
@@ -388,7 +385,7 @@ mod tests {
 
         assert!(!join_node.is_leaf);
         assert!(join_node.cost > 0.0);
-        assert!(join_node.cardinality > 0);
+        assert!(join_node.cardinality > 0.0);
         assert_eq!(join_node.set.count(), 2);
     }
 
@@ -403,19 +400,6 @@ mod tests {
         let set = set_manager.get_relation(0);
         let card = cost_model.get_cardinality(&set);
         assert_eq!(card, 1000.0);
-    }
-
-    #[test]
-    fn test_get_cardinality_idx() {
-        let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
-
-        let stats = vec![RelationStats::with_cardinality(1000)];
-        cost_model.init_cost_model(&mut set_manager, &stats);
-
-        let set = set_manager.get_relation(0);
-        let card = cost_model.get_cardinality_idx(&set);
-        assert_eq!(card, 1000);
     }
 
     #[test]

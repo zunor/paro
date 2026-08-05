@@ -9,5 +9,4 @@ pub(crate) mod chunk_encoder;
 pub(crate) mod column_decoder;
 pub(crate) mod nested_payload_codec;
 pub(crate) mod physical_layout;
-pub(crate) mod value_decoder;
 pub(crate) mod vector_decoder;

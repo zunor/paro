@@ -58,7 +58,7 @@ impl<'a> PlanEnumerator<'a> {
             let mut node = DPJoinNode::leaf(set.clone());
 
             // Get cardinality from cost model
-            node.cardinality = self.cost_model.get_cardinality_idx(&set);
+            node.cardinality = self.cost_model.get_cardinality(&set);
 
             self.plans.insert(set.to_string(), node);
         }
@@ -576,7 +576,7 @@ mod tests {
 
         let plan0 = enumerator.plans.get(&set0_key).unwrap();
         assert!(plan0.is_leaf);
-        assert_eq!(plan0.cardinality, 1000);
+        assert_eq!(plan0.cardinality, 1000.0);
     }
 
     #[test]

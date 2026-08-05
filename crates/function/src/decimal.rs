@@ -10,6 +10,128 @@ use paro_common::vector::Vector;
 
 pub(crate) const MAX_DECIMAL_PRECISION: u8 = 38;
 
+/// Integer operations needed by exact DECIMAL intermediates.
+pub(crate) trait DecimalInteger: Copy + PartialEq + PartialOrd {
+    const ZERO: Self;
+    const ONE: Self;
+    const MINUS_ONE: Self;
+    const TWO: Self;
+    const TEN: Self;
+
+    fn checked_add(self, rhs: Self) -> Option<Self>;
+    fn checked_sub(self, rhs: Self) -> Option<Self>;
+    fn checked_mul(self, rhs: Self) -> Option<Self>;
+    fn checked_rem(self, rhs: Self) -> Option<Self>;
+    fn checked_div_rem(self, rhs: Self) -> Option<(Self, Self)>;
+    fn checked_abs(self) -> Option<Self>;
+}
+
+impl DecimalInteger for i128 {
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+    const MINUS_ONE: Self = -1;
+    const TWO: Self = 2;
+    const TEN: Self = 10;
+
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        i128::checked_add(self, rhs)
+    }
+
+    fn checked_sub(self, rhs: Self) -> Option<Self> {
+        i128::checked_sub(self, rhs)
+    }
+
+    fn checked_mul(self, rhs: Self) -> Option<Self> {
+        i128::checked_mul(self, rhs)
+    }
+
+    fn checked_rem(self, rhs: Self) -> Option<Self> {
+        i128::checked_rem(self, rhs)
+    }
+
+    fn checked_div_rem(self, rhs: Self) -> Option<(Self, Self)> {
+        Some((i128::checked_div(self, rhs)?, i128::checked_rem(self, rhs)?))
+    }
+
+    fn checked_abs(self) -> Option<Self> {
+        i128::checked_abs(self)
+    }
+}
+
+impl DecimalInteger for i256 {
+    const ZERO: Self = i256::ZERO;
+    const ONE: Self = i256::ONE;
+    const MINUS_ONE: Self = i256::MINUS_ONE;
+    const TWO: Self = i256::new(2);
+    const TEN: Self = i256::new(10);
+
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        i256::checked_add(self, rhs)
+    }
+
+    fn checked_sub(self, rhs: Self) -> Option<Self> {
+        i256::checked_sub(self, rhs)
+    }
+
+    fn checked_mul(self, rhs: Self) -> Option<Self> {
+        i256::checked_mul(self, rhs)
+    }
+
+    fn checked_rem(self, rhs: Self) -> Option<Self> {
+        i256::checked_rem(self, rhs)
+    }
+
+    fn checked_div_rem(self, rhs: Self) -> Option<(Self, Self)> {
+        i256::checked_div_rem(self, rhs)
+    }
+
+    fn checked_abs(self) -> Option<Self> {
+        i256::checked_abs(self)
+    }
+}
+
+pub(crate) fn pow10_checked<T: DecimalInteger>(exp: u8) -> Option<T> {
+    (0..exp).try_fold(T::ONE, |value, _| value.checked_mul(T::TEN))
+}
+
+pub(crate) fn rescale_checked<T: DecimalInteger>(
+    value: T,
+    from_scale: u8,
+    to_scale: u8,
+) -> Option<T> {
+    if from_scale == to_scale {
+        return Some(value);
+    }
+    if from_scale < to_scale {
+        return value.checked_mul(pow10_checked(to_scale - from_scale)?);
+    }
+    round_divide_checked(value, pow10_checked(from_scale - to_scale)?)
+}
+
+pub(crate) fn round_divide_checked<T: DecimalInteger>(value: T, divisor: T) -> Option<T> {
+    let (quotient, remainder) = value.checked_div_rem(divisor)?;
+    if remainder == T::ZERO {
+        return Some(quotient);
+    }
+
+    let divisor_abs = divisor.checked_abs()?;
+    let remainder_abs = remainder.checked_abs()?;
+    let threshold = divisor_abs
+        .checked_div_rem(T::TWO)?
+        .0
+        .checked_add(divisor_abs.checked_rem(T::TWO)?)?;
+    if remainder_abs < threshold {
+        return Some(quotient);
+    }
+
+    let adjustment = if (value < T::ZERO) == (divisor < T::ZERO) {
+        T::ONE
+    } else {
+        T::MINUS_ONE
+    };
+    quotient.checked_add(adjustment)
+}
+
 pub(crate) fn pow10(exp: u8) -> Result<i256> {
     // Two DECIMAL(38) operands can require up to 76 decimal digits while an
     // expression is being evaluated. The signed i256 range covers 10^76.
@@ -18,52 +140,35 @@ pub(crate) fn pow10(exp: u8) -> Result<i256> {
             "Decimal scale {exp} exceeds the exact intermediate range"
         )));
     }
-    (0..exp).try_fold(i256::ONE, |value, _| {
-        value
-            .checked_mul(i256::from(10))
-            .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))
-    })
+    pow10_checked(exp).ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))
+}
+
+/// Compute a decimal scale factor in the native DECIMAL storage width.
+///
+/// Every declared DECIMAL value fits in `i128`; callers can use this helper
+/// for the common arithmetic path and retry with `i256` when a checked native
+/// operation returns `None`.
+pub(crate) fn pow10_i128(exp: u8) -> Option<i128> {
+    if exp > MAX_DECIMAL_PRECISION {
+        return None;
+    }
+    pow10_checked(exp)
 }
 
 pub(crate) fn rescale(value: i256, from_scale: u8, to_scale: u8) -> Result<i256> {
-    if from_scale == to_scale {
-        return Ok(value);
+    let scale_delta = from_scale.abs_diff(to_scale);
+    if scale_delta > MAX_DECIMAL_PRECISION * 2 {
+        return Err(paro_error::out_of_range(format!(
+            "Decimal scale {scale_delta} exceeds the exact intermediate range"
+        )));
     }
-    if from_scale < to_scale {
-        return value
-            .checked_mul(pow10(to_scale - from_scale)?)
-            .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"));
-    }
-    round_divide(value, pow10(from_scale - to_scale)?)
+    rescale_checked(value, from_scale, to_scale)
+        .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))
 }
 
 pub(crate) fn round_divide(value: i256, divisor: i256) -> Result<i256> {
-    let (quotient, remainder) = value
-        .checked_div_rem(divisor)
-        .ok_or_else(|| paro_error::out_of_range("Decimal division overflow"))?;
-    if remainder == i256::ZERO {
-        return Ok(quotient);
-    }
-
-    let divisor_abs = divisor
-        .checked_abs()
-        .ok_or_else(|| paro_error::out_of_range("Decimal divisor overflow"))?;
-    let remainder_abs = remainder
-        .checked_abs()
-        .ok_or_else(|| paro_error::out_of_range("Decimal remainder overflow"))?;
-    let threshold = divisor_abs / i256::from(2) + divisor_abs % i256::from(2);
-    if remainder_abs < threshold {
-        return Ok(quotient);
-    }
-
-    let adjustment = if (value < i256::ZERO) == (divisor < i256::ZERO) {
-        i256::ONE
-    } else {
-        i256::MINUS_ONE
-    };
-    quotient
-        .checked_add(adjustment)
-        .ok_or_else(|| paro_error::out_of_range("Decimal rounding overflow"))
+    round_divide_checked(value, divisor)
+        .ok_or_else(|| paro_error::out_of_range("Decimal division overflow"))
 }
 
 pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
@@ -76,6 +181,22 @@ pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
         .checked_abs()
         .ok_or_else(|| paro_error::out_of_range("Decimal value overflow"))?;
     if absolute >= pow10(precision)? {
+        return Err(paro_error::out_of_range(format!(
+            "Decimal value exceeds precision {precision}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_precision_i128(value: i128, precision: u8) -> Result<()> {
+    if precision == 0 || precision > MAX_DECIMAL_PRECISION {
+        return Err(paro_error::invalid_input(format!(
+            "Decimal precision must be between 1 and {MAX_DECIMAL_PRECISION}"
+        )));
+    }
+    let limit = pow10_i128(precision)
+        .ok_or_else(|| paro_error::out_of_range("Decimal precision exceeds i128"))?;
+    if value.unsigned_abs() >= limit as u128 {
         return Err(paro_error::out_of_range(format!(
             "Decimal value exceeds precision {precision}"
         )));
@@ -137,6 +258,29 @@ mod tests {
             rescale(product, 76, 38).unwrap(),
             pow10(38).unwrap() - i256::from(2)
         );
+    }
+
+    #[test]
+    fn native_decimal_helpers_match_wide_rounding_and_signal_overflow() {
+        for (value, from_scale, to_scale) in [
+            (12_345_i128, 2, 4),
+            (12_345_i128, 3, 1),
+            (-12_355_i128, 3, 1),
+            (5_i128, 1, 0),
+            (-5_i128, 1, 0),
+        ] {
+            assert_eq!(
+                rescale_checked(value, from_scale, to_scale),
+                Some(
+                    i128::try_from(rescale(i256::from(value), from_scale, to_scale).unwrap())
+                        .unwrap()
+                )
+            );
+        }
+
+        assert_eq!(rescale_checked(i128::MAX, 0, 1), None);
+        assert!(check_precision_i128(99_999, 5).is_ok());
+        assert!(check_precision_i128(100_000, 5).is_err());
     }
 
     #[test]

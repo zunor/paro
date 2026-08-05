@@ -315,7 +315,7 @@ mod tests {
     use super::*;
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
-    use paro_function::aggregate::{AggregateFunction, AggregateInputData};
+    use paro_function::aggregate::{AggregateFunction, AggregateInputData, AggregateStateInput};
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
     use paro_storage::statistics::BaseStatistics;
@@ -325,7 +325,7 @@ mod tests {
     unsafe fn noop_update(
         _inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        _states: &Vector,
+        _states: &AggregateStateInput,
         _count: usize,
     ) {
     }

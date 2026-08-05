@@ -11,7 +11,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
-use super::{BindCastInput, BoundCastData, BoundCastInfo, CastExecCtx};
+use super::{BindCastInput, BoundCastData, BoundCastInfo, CastContextDependency, CastExecCtx};
 
 /// Bound cast data for Struct casts.
 #[derive(Debug)]
@@ -125,14 +125,16 @@ pub fn bind_struct_casts(
     }
 
     let mut field_casts = Vec::with_capacity(source_fields.len());
+    let mut dependency = CastContextDependency::Independent;
     for ((_, source_ty), (_, target_ty)) in source_fields.iter().zip(target_fields.iter()) {
         let cast_info = input.get_cast_function(source_ty, target_ty)?;
+        dependency = dependency.combine(cast_info.context_dependency());
         field_casts.push(cast_info);
     }
 
     let data = StructBoundCastData { field_casts };
-    Ok(Some(BoundCastInfo::struct_with_data(
-        struct_to_struct_cast,
-        Arc::new(data),
-    )))
+    Ok(Some(
+        BoundCastInfo::struct_with_data(struct_to_struct_cast, Arc::new(data))
+            .with_context_dependency(dependency),
+    ))
 }

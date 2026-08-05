@@ -5,7 +5,9 @@
 //!
 //!
 
-use crate::aggregate::{AggregateFunction, AggregateFunctionSet, AggregateInputData};
+use crate::aggregate::{
+    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+};
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -20,12 +22,11 @@ impl CountFunction {
     unsafe fn update_star(
         _inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
-        let state_ptrs = states.flat_data::<*mut u8>();
         for i in 0..count {
-            let state_ptr = *state_ptrs.add(i);
+            let state_ptr = states.state_ptr(i);
             *(state_ptr as *mut i64) += 1;
         }
     }
@@ -42,16 +43,14 @@ impl CountFunction {
     unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         // This is a simplified loop. In production we would use validity masks and vector types.
         for i in 0..count {
             if !input.is_null(i) {
-                let state_ptr = *state_ptrs.add(i);
+                let state_ptr = states.state_ptr(i);
                 *(state_ptr as *mut i64) += 1;
             }
         }

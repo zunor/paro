@@ -155,7 +155,7 @@ fn segment_predicate_fallback_uses_late_materialize() {
 
     let mut iter = SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
         &segment,
-        vec![1],
+        vec![0, 1],
         None,
         Some(predicate),
         None,
@@ -167,8 +167,80 @@ fn segment_predicate_fallback_uses_late_materialize() {
 
     let (rowids, batch) = iter.next_batch(32).unwrap();
     assert_eq!(rowids, vec![7]);
-    let value = i32::from_le_bytes(batch[0].1.data[0..4].try_into().unwrap());
-    assert_eq!(value, 107);
+    let predicate_value = i32::from_le_bytes(batch[0].1.data[0..4].try_into().unwrap());
+    let projected_value = i32::from_le_bytes(batch[1].1.data[0..4].try_into().unwrap());
+    assert_eq!(predicate_value, 7);
+    assert_eq!(projected_value, 107);
+}
+
+#[test]
+fn segment_reused_predicate_column_preserves_nulls_from_or_matches() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("predicate_reuse_nulls.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::new(0, "nullable", LogicalType::Integer).with_nullable(true),
+                TabletColumn::new(1, "fallback", LogicalType::Integer),
+            ],
+            KeysType::DuplicateKeys,
+        )
+        .unwrap(),
+    );
+    let opts = SegmentWriterOptions::new(0).with_compression(CompressionType::None);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, opts).unwrap();
+    let nullable = [1_i32, 0, 3]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let fallback = [0_i32, 1, 0]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[
+            ColumnData::with_nulls(nullable, vec![0b0000_0010_u8], 3),
+            ColumnData::new(fallback, 3),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let segment = Arc::new(
+        Segment::open(
+            0,
+            &file_path,
+            schema,
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    );
+    let predicate = PredicateTree::Or(vec![
+        PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(1),
+        }),
+        PredicateTree::leaf(Predicate::Eq {
+            column_id: 1,
+            value: Value::Integer(1),
+        }),
+    ]);
+    let mut iter = SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
+        &segment,
+        vec![0],
+        None,
+        Some(predicate),
+        None,
+    )
+    .unwrap();
+
+    let (rowids, columns) = iter.next_batch(32).unwrap();
+
+    assert_eq!(rowids, [0, 1]);
+    assert_eq!(columns[0].1.nulls.as_deref(), Some([0_u8, 1].as_slice()));
 }
 
 #[test]

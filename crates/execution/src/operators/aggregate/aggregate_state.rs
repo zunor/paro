@@ -78,7 +78,7 @@ mod tests {
     use super::*;
     use paro_common::types::LogicalType;
     use paro_function::aggregate::AggregateFunction;
-    use paro_function::aggregate::AggregateInputData;
+    use paro_function::aggregate::{AggregateInputData, AggregateStateInput};
     use paro_planner::expression::AggregateExpression;
 
     unsafe fn initialize(_state: *mut u8) {}
@@ -86,7 +86,7 @@ mod tests {
     unsafe fn update(
         _inputs: &[&paro_common::vector::Vector],
         _input_data: &AggregateInputData,
-        _states: &paro_common::vector::Vector,
+        _states: &AggregateStateInput,
         _count: usize,
     ) {
     }

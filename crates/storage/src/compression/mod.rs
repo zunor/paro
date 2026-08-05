@@ -37,6 +37,7 @@ mod zstd;
 
 pub use block_compression::BlockCompressionCodec;
 pub use block_compression_type::BlockCompressionType;
+pub(crate) use lz4::decompress_size_prepended_exact;
 pub use lz4::Lz4BlockCompression;
 pub use no_compression::NoBlockCompression;
 pub use parallel_decompress::{ParallelDecompressTask, ParallelDecompressor};

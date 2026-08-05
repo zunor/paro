@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::operators::aggregate::perfect_hash_key::PerfectHashKeyDomain;
 use crate::operators::graph::state::graph_path_element_list_type;
 
 pub(crate) fn extract_payload_expression(
@@ -53,17 +54,12 @@ pub(crate) fn can_use_perfect_hash_aggregate(
 
     for group_idx in 0..aggregate.groups.len() {
         let group_type = aggregate.groups[group_idx].return_type();
-        if !group_type.is_integer() {
-            return None;
-        }
-
-        let min_max = aggregate
+        let group_stats = aggregate
             .group_stats
             .get(group_idx)
-            .and_then(|stats| stats.as_ref())
-            .and_then(integer_min_max_from_stats)
-            .or_else(|| integer_type_bounds(&group_type));
-        let (min_value, max_value) = min_max?;
+            .and_then(|stats| stats.as_ref());
+        let domain = PerfectHashKeyDomain::try_new(group_type)?;
+        let (min_value, max_value) = domain.min_max_from_stats(group_stats)?;
         let range = max_value.checked_sub(min_value)?;
         let range_u128 = u128::try_from(range).ok()?;
         if range_u128 >= PERFECT_HASH_RANGE_LIMIT {
@@ -82,44 +78,6 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         group_minima,
         required_bits,
     })
-}
-
-pub(crate) fn integer_min_max_from_stats(
-    stats: &paro_storage::statistics::BaseStatistics,
-) -> Option<(i128, i128)> {
-    let min = stats.min_value().and_then(|value| value_to_i128(&value))?;
-    let max = stats.max_value().and_then(|value| value_to_i128(&value))?;
-    Some((min, max))
-}
-
-pub(crate) fn value_to_i128(value: &Value) -> Option<i128> {
-    match value {
-        Value::TinyInt(v) => Some(*v as i128),
-        Value::SmallInt(v) => Some(*v as i128),
-        Value::Integer(v) => Some(*v as i128),
-        Value::BigInt(v) => Some(*v as i128),
-        Value::HugeInt(v) => Some(*v),
-        Value::UTinyInt(v) => Some(*v as i128),
-        Value::USmallInt(v) => Some(*v as i128),
-        Value::UInteger(v) => Some(*v as i128),
-        Value::UBigInt(v) => Some(*v as i128),
-        Value::UHugeInt(v) => i128::try_from(*v).ok(),
-        _ => None,
-    }
-}
-
-pub(crate) fn integer_type_bounds(ty: &paro_common::types::LogicalType) -> Option<(i128, i128)> {
-    match ty {
-        paro_common::types::LogicalType::TinyInt => Some((i8::MIN as i128, i8::MAX as i128)),
-        paro_common::types::LogicalType::SmallInt => Some((i16::MIN as i128, i16::MAX as i128)),
-        paro_common::types::LogicalType::Integer => Some((i32::MIN as i128, i32::MAX as i128)),
-        paro_common::types::LogicalType::BigInt => Some((i64::MIN as i128, i64::MAX as i128)),
-        paro_common::types::LogicalType::UTinyInt => Some((0, u8::MAX as i128)),
-        paro_common::types::LogicalType::USmallInt => Some((0, u16::MAX as i128)),
-        paro_common::types::LogicalType::UInteger => Some((0, u32::MAX as i128)),
-        paro_common::types::LogicalType::UBigInt => Some((0, u64::MAX as i128)),
-        _ => None,
-    }
 }
 
 pub(crate) fn required_bits_for_value(mut value: u128) -> Option<usize> {

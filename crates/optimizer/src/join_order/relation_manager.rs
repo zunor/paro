@@ -20,6 +20,16 @@ pub struct ExtractedFilter {
     pub join_type: JoinType,
 }
 
+/// Predicates extracted from a reorderable join region.
+///
+/// Predicates that reference relations participate in the join graph. Predicates
+/// without relation dependencies cannot form graph edges, but still belong to
+/// the region and must be evaluated above the reconstructed join tree.
+pub struct ExtractedJoinPredicates {
+    pub graph_filters: Vec<Arc<FilterInfo>>,
+    pub root_filters: Vec<Expression>,
+}
+
 impl ExtractedFilter {
     pub fn new(expression: Expression, join_type: JoinType) -> Self {
         Self {
@@ -118,8 +128,6 @@ pub struct RelationManager {
     relations: Vec<SingleJoinRelation>,
     /// Mapping from table index to relation index.
     relation_mapping: HashMap<usize, usize>,
-    /// Relations that cannot have cross products.
-    no_cross_product_relations: HashSet<usize>,
 }
 
 impl RelationManager {
@@ -128,18 +136,12 @@ impl RelationManager {
         Self {
             relations: Vec::new(),
             relation_mapping: HashMap::new(),
-            no_cross_product_relations: HashSet::new(),
         }
     }
 
     /// Get the number of relations.
     pub fn num_relations(&self) -> usize {
         self.relations.len()
-    }
-
-    /// Check if a relation allows cross products.
-    pub fn cross_product_with_relation_allowed(&self, relation_id: usize) -> bool {
-        !self.no_cross_product_relations.contains(&relation_id)
     }
 
     /// Add a relation to the manager.
@@ -199,11 +201,6 @@ impl RelationManager {
             .push(SingleJoinRelation::new(op, parent, stats));
     }
 
-    /// Mark a relation as not allowing cross products.
-    pub fn mark_no_cross_product(&mut self, relation_id: usize) {
-        self.no_cross_product_relations.insert(relation_id);
-    }
-
     /// Get the relation ID for a table index.
     pub fn get_relation_id(&self, table_index: usize) -> Option<usize> {
         self.relation_mapping.get(&table_index).copied()
@@ -238,8 +235,13 @@ impl RelationManager {
             Expression::ColumnRef(colref) => {
                 if let Some(&relation_id) = self.relation_mapping.get(&colref.binding.table_index) {
                     bindings.insert(relation_id);
+                    true
+                } else {
+                    // A correlated or otherwise external binding cannot be moved
+                    // with this join region. Make the caller retain the original
+                    // tree instead of treating it as a relation-free predicate.
+                    false
                 }
-                true
             }
             Expression::Reference(_) => {
                 // Bound reference - cannot reorder
@@ -264,13 +266,15 @@ impl RelationManager {
 
     /// Extract edges (filters) from filter operators.
     ///
-    /// Returns a list of FilterInfo representing the join conditions.
+    /// Returns graph predicates plus relation-independent root predicates.
+    /// `None` means at least one predicate cannot be moved safely.
     pub fn extract_edges(
         &self,
         filter_expressions: &[ExtractedFilter],
         set_manager: &mut JoinRelationSetManager,
-    ) -> Vec<Arc<FilterInfo>> {
+    ) -> Option<ExtractedJoinPredicates> {
         let mut filters = Vec::new();
+        let mut root_filters = Vec::new();
         let mut seen_expressions = HashSet::new();
 
         for extracted_filter in filter_expressions {
@@ -287,11 +291,17 @@ impl RelationManager {
             // Extract bindings from the expression
             let mut bindings = HashSet::new();
             if !self.extract_bindings(&extracted_filter.expression, &mut bindings) {
-                continue;
+                return None;
             }
 
             if bindings.is_empty() {
-                // Expression doesn't reference any relations
+                // A relation-independent WHERE predicate is safe to move across
+                // an inner/cross join region, but it still has to be evaluated.
+                // Join predicates without bindings are not reorderable joins.
+                if extracted_filter.join_type != JoinType::Inner {
+                    return None;
+                }
+                root_filters.push(extracted_filter.expression.clone());
                 continue;
             }
 
@@ -310,7 +320,10 @@ impl RelationManager {
             filters.push(Arc::new(filter_info));
         }
 
-        filters
+        Some(ExtractedJoinPredicates {
+            graph_filters: filters,
+            root_filters,
+        })
     }
 
     /// Check if a join is reorderable.
@@ -682,22 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_product_allowed() {
-        let mut manager = RelationManager::new();
-
-        // Add a relation
-        let op = create_test_get(0);
-        manager.add_relation(op, None, RelationStats::new());
-
-        // By default, cross product is allowed
-        assert!(manager.cross_product_with_relation_allowed(0));
-
-        // Mark as no cross product
-        manager.mark_no_cross_product(0);
-        assert!(!manager.cross_product_with_relation_allowed(0));
-    }
-
-    #[test]
     fn test_get_relation_stats() {
         let mut manager = RelationManager::new();
 
@@ -738,15 +735,19 @@ mod tests {
             comparison_type: ComparisonType::GreaterThan,
         });
 
-        let filters = manager.extract_edges(
-            &[
-                ExtractedFilter::inner(filter1),
-                ExtractedFilter::inner(filter2),
-            ],
-            &mut set_manager,
-        );
+        let extracted = manager
+            .extract_edges(
+                &[
+                    ExtractedFilter::inner(filter1),
+                    ExtractedFilter::inner(filter2),
+                ],
+                &mut set_manager,
+            )
+            .expect("reorderable predicates");
+        let filters = extracted.graph_filters;
 
         assert_eq!(filters.len(), 2);
+        assert!(extracted.root_filters.is_empty());
         // First filter references both relations
         assert_eq!(filters[0].set.count(), 2);
         assert_eq!(filters[0].join_type, JoinType::Inner);
@@ -770,10 +771,13 @@ mod tests {
             comparison_type: ComparisonType::GreaterThan,
         });
 
-        let filters = manager.extract_edges(
-            &[ExtractedFilter::new(filter, JoinType::Semi)],
-            &mut set_manager,
-        );
+        let filters = manager
+            .extract_edges(
+                &[ExtractedFilter::new(filter, JoinType::Semi)],
+                &mut set_manager,
+            )
+            .expect("reorderable predicate")
+            .graph_filters;
 
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].join_type, JoinType::Semi);
@@ -781,6 +785,43 @@ mod tests {
         assert_eq!(filters[0].right_binding, Some(ColumnBinding::new(1, 0)));
         assert!(filters[0].left_set.is_some());
         assert!(filters[0].right_set.is_some());
+    }
+
+    #[test]
+    fn extract_edges_retains_relation_independent_filters_at_the_root() {
+        let manager = RelationManager::new();
+        let mut set_manager = JoinRelationSetManager::new();
+        let predicate = Expression::Constant(ConstantExpression::new(
+            Value::Boolean(false),
+            LogicalType::Boolean,
+        ));
+
+        let extracted = manager
+            .extract_edges(
+                &[ExtractedFilter::inner(predicate.clone())],
+                &mut set_manager,
+            )
+            .expect("constant predicates are movable within an inner join region");
+
+        assert!(extracted.graph_filters.is_empty());
+        assert_eq!(extracted.root_filters.len(), 1);
+        assert!(extracted.root_filters[0].equals(&predicate));
+    }
+
+    #[test]
+    fn extract_edges_rejects_external_column_bindings() {
+        let mut manager = RelationManager::new();
+        manager.add_relation(create_test_get(0), None, RelationStats::new());
+        let mut set_manager = JoinRelationSetManager::new();
+        let external = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            create_column_ref(99, 0),
+            create_constant(1),
+        ));
+
+        assert!(manager
+            .extract_edges(&[ExtractedFilter::inner(external)], &mut set_manager)
+            .is_none());
     }
 
     #[test]

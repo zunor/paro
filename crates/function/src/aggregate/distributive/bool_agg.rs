@@ -9,7 +9,7 @@
 //! - `bool_and(x)`: Returns TRUE if all values are TRUE, FALSE if any is FALSE, NULL if empty
 //! - `bool_or(x)`: Returns TRUE if any value is TRUE, FALSE if all are FALSE, NULL if empty
 
-use crate::aggregate::{AggregateFunction, AggregateInputData};
+use crate::aggregate::{AggregateFunction, AggregateInputData, AggregateStateInput};
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -39,15 +39,13 @@ mod bool_and_impl {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if !input.is_null(i) {
-                let state_ptr = *state_ptrs.add(i);
+                let state_ptr = states.state_ptr(i);
                 let state = state_ptr as *mut State;
 
                 let val: bool = input.get_fixed(i);
@@ -140,15 +138,13 @@ mod bool_or_impl {
     pub unsafe fn update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
-        states: &Vector,
+        states: &AggregateStateInput,
         count: usize,
     ) {
         let input = inputs[0];
-        let state_ptrs = states.flat_data::<*mut u8>();
-
         for i in 0..count {
             if !input.is_null(i) {
-                let state_ptr = *state_ptrs.add(i);
+                let state_ptr = states.state_ptr(i);
                 let state = state_ptr as *mut State;
 
                 let val: bool = input.get_fixed(i);
