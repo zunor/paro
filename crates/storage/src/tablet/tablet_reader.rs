@@ -64,20 +64,15 @@ impl RowsetCursor {
         // Segment-granular rowset scans pass the already-loaded segment handle
         // through TabletReaderParams to avoid rebuilding a cursor over every
         // segment in the rowset for each morsel.
-        if params.segment.is_none() {
-            if let Some(opts) = &params.segment_options {
-                rowset.load_with_options(opts.clone())?;
-            } else {
-                rowset.load()?;
-            }
-        }
-        rowset.acquire();
-
         let segments = if let Some(segment) = &params.segment {
             vec![Arc::clone(segment)]
+        } else if let Some(options) = &params.segment_options {
+            rowset.segments_with_options(options.clone())?
         } else {
+            rowset.load()?;
             rowset.segments()
         };
+        rowset.acquire();
         let mut segment_iters = Vec::with_capacity(segments.len());
         for seg in segments {
             let col_ids: Vec<ColumnId> = if params.projection.is_none() && projection.is_empty() {

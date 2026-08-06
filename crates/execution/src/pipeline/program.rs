@@ -29,10 +29,10 @@ use crate::runtime::{
     RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
     SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec, SortBuildSinkExec,
     SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec, SparseVectorSearchSourceExec,
-    StreamingAggregateTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
-    StreamingWindowTransformExec, TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec,
-    TransformExec, UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec,
-    ValuesSourceExec, VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
+    StreamingLimitTransformExec, StreamingTopNTransformExec, StreamingWindowTransformExec,
+    TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec, TransformExec,
+    UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec, ValuesSourceExec,
+    VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
 };
 use crate::runtime::{ChunkLayout, PipelineScratchLayout, RuntimeOperatorId};
 
@@ -512,11 +512,6 @@ impl OperatorRuntimeRegistry {
             }
             TransformSpec::StreamingTopN(spec) => {
                 TransformExec::StreamingTopN(StreamingTopNTransformExec { spec: spec.clone() })
-            }
-            TransformSpec::StreamingAggregate(spec) => {
-                TransformExec::StreamingAggregate(StreamingAggregateTransformExec {
-                    spec: spec.clone(),
-                })
             }
             TransformSpec::StreamingWindow(spec) => {
                 TransformExec::StreamingWindow(StreamingWindowTransformExec { spec: spec.clone() })

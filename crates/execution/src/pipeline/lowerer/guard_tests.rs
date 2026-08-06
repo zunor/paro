@@ -4,7 +4,7 @@
 use super::*;
 
 #[test]
-fn streaming_shape_guards_reject_misrouted_breakers() {
+fn streaming_topn_guard_rejects_missing_order() {
     let topn = TopNSpec {
         orders: Box::new([]),
         limit: 10,
@@ -14,24 +14,6 @@ fn streaming_shape_guards_reject_misrouted_breakers() {
         output_types: vec![LogicalType::Integer].into_boxed_slice(),
     };
     assert!(ensure_streaming_topn_supported(&topn).is_err());
-
-    let aggregate = AggregateSpec {
-        grouping_key_count: 1,
-        projection_exprs: Box::new([]),
-        payload_types: Box::new([]),
-        groups: Box::new([]),
-        grouping_sets: Box::new([]),
-        aggregates: Box::new([]),
-        grouping_functions: Box::new([]),
-        aggregate_inputs: Box::new([]),
-        aggregate_filters: Box::new([]),
-        aggregate_orders: Box::new([]),
-        having_filter: Box::new([]),
-        perfect_hash: None,
-        output_names: vec!["count".to_string()].into_boxed_slice(),
-        output_types: vec![LogicalType::BigInt].into_boxed_slice(),
-    };
-    assert!(ensure_streaming_aggregate_supported(&aggregate).is_err());
 }
 
 #[test]

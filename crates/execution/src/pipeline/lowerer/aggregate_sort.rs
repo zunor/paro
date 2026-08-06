@@ -198,19 +198,6 @@ impl<'a> PipelineLowerer<'a> {
                     transforms.push(TransformSpec::Limit(spec.clone()));
                     current = self.only_child(current)?;
                 }
-                PhysicalNodeKind::Aggregate(spec) if is_streaming_aggregate_supported(spec) => {
-                    let child = self.only_child(current)?;
-                    if self.subtree_root_needs_post_join_fanout(child)? {
-                        transforms.reverse();
-                        return Ok(Some(BreakerTail {
-                            breaker: current,
-                            transforms,
-                            output: self.plan.node(root).output.clone(),
-                        }));
-                    }
-                    transforms.push(TransformSpec::StreamingAggregate(spec.clone()));
-                    current = child;
-                }
                 PhysicalNodeKind::Window(spec) if is_streaming_window_supported(spec) => {
                     let child = self.only_child(current)?;
                     if self.subtree_root_needs_post_join_fanout(child)? {
@@ -284,9 +271,6 @@ impl<'a> PipelineLowerer<'a> {
             | PhysicalNodeKind::GraphProject(_)
             | PhysicalNodeKind::GraphShortestPath(_)
             | PhysicalNodeKind::ExternalProject(_) => Some(self.only_child(root)?),
-            PhysicalNodeKind::Aggregate(spec) if is_streaming_aggregate_supported(spec) => {
-                Some(self.only_child(root)?)
-            }
             PhysicalNodeKind::Window(spec) if is_streaming_window_supported(spec) => {
                 Some(self.only_child(root)?)
             }

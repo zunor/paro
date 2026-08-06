@@ -206,7 +206,6 @@ pub use state::{
     RecursiveTableScanSourceLocal, RowsetSourceGlobal, RowsetSourceLocal,
     SetOperationEmitSourceLocal, SetOperationInputSinkLocal, SinkGlobal, SinkLocal,
     SortBuildSinkLocal, SortEmitSourceLocal, SourceGlobal, SourceLocal,
-    StreamingAggregateTransformGlobal, StreamingAggregateTransformLocal,
     StreamingLimitTransformGlobal, StreamingLimitTransformLocal, StreamingTopNTransformGlobal,
     StreamingTopNTransformLocal, StreamingWindowTransformGlobal, StreamingWindowTransformLocal,
     TableFunctionSourceGlobal, TableFunctionSourceLocal, TopNBuildSinkLocal, TopNEmitSourceLocal,
@@ -221,9 +220,9 @@ pub use transform::{
     CrossProductProbeTransformExec, DynTransformExec, ExternalProjectTransformExec,
     FilterTransformExec, GraphExpandTransformExec, GraphProjectTransformExec,
     GraphShortestPathTransformExec, HashJoinProbeTransformExec, ProjectTransformExec,
-    PropertyRepairTransformExec, StreamingAggregateTransformExec, StreamingLimitTransformExec,
-    StreamingTopNTransformExec, StreamingWindowTransformExec, TransformExec, TransformFinishPoll,
-    TransformFlushPoll, TransformPoll,
+    PropertyRepairTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
+    StreamingWindowTransformExec, TransformExec, TransformFinishPoll, TransformFlushPoll,
+    TransformPoll,
 };
 pub use utility::{run_once as run_utility_once, UtilityRunResult};
 pub(crate) use work_group::WorkGroupCompletion;

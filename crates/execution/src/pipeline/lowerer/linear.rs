@@ -145,14 +145,10 @@ impl<'a> PipelineLowerer<'a> {
                         "cross product lowering is only supported when the join is a pipeline breaker root",
                     ));
                 }
-                PhysicalNodeKind::Aggregate(spec) => {
-                    if !is_streaming_aggregate_supported(spec) {
-                        return Err(paro_error::not_implemented(
-                            "blocking aggregate lowering is only supported when the aggregate is the pipeline root",
-                        ));
-                    }
-                    transforms.push(TransformSpec::StreamingAggregate(spec.clone()));
-                    current = self.only_child(current)?;
+                PhysicalNodeKind::Aggregate(_) => {
+                    return Err(paro_error::internal(
+                        "aggregate must be lowered through its build/combine/emit breaker",
+                    ));
                 }
                 PhysicalNodeKind::Window(spec) => {
                     if !is_streaming_window_supported(spec) {

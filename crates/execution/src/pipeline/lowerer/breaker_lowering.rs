@@ -27,9 +27,7 @@ impl<'a> PipelineLowerer<'a> {
         match &self.plan.node(root).kind {
             PhysicalNodeKind::TopN(spec) => Some(BreakerDispatch::TopN(spec.clone())),
             PhysicalNodeKind::Sort(spec) => Some(BreakerDispatch::Sort(spec.clone())),
-            PhysicalNodeKind::Aggregate(spec) if !is_streaming_aggregate_supported(spec) => {
-                Some(BreakerDispatch::Aggregate(spec.clone()))
-            }
+            PhysicalNodeKind::Aggregate(spec) => Some(BreakerDispatch::Aggregate(spec.clone())),
             PhysicalNodeKind::SetOperation(spec) => {
                 Some(BreakerDispatch::SetOperation(spec.clone()))
             }
@@ -99,7 +97,7 @@ impl<'a> PipelineLowerer<'a> {
             | PhysicalNodeKind::SetOperation(_)
             | PhysicalNodeKind::DelimJoin(_)
             | PhysicalNodeKind::RecursiveCte(_) => true,
-            PhysicalNodeKind::Aggregate(spec) => !is_streaming_aggregate_supported(spec),
+            PhysicalNodeKind::Aggregate(_) => true,
             PhysicalNodeKind::Window(spec) => !is_streaming_window_supported(spec),
             _ => false,
         }

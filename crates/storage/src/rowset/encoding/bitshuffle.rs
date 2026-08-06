@@ -232,7 +232,10 @@ pub struct BitShufflePageDecoder {
     expected_num_elements: u32,
     /// Element width supplied by the column schema.
     expected_type_size: usize,
-    /// Decompressed and unshuffled data
+    /// Decompressed bit-sliced data. Kept so point lookups and predicate
+    /// kernels do not need to materialize the full logical page.
+    shuffled_data: Option<Bytes>,
+    /// Lazily materialized logical values for sequential reads.
     decoded_data: Option<Bytes>,
     /// Number of elements
     num_elements: u32,
@@ -257,6 +260,7 @@ impl BitShufflePageDecoder {
             data,
             expected_num_elements,
             expected_type_size,
+            shuffled_data: None,
             decoded_data: None,
             num_elements: 0,
             compressed_size: 0,
@@ -266,6 +270,70 @@ impl BitShufflePageDecoder {
             cur_index: 0,
             parsed: false,
         }
+    }
+
+    /// Construct a decoder backed by a version-isolated logical page cache.
+    /// The encoded header is still parsed and cross-checked against schema and
+    /// ordinal metadata before cached bytes are accepted.
+    pub fn with_decoded_data(
+        data: Bytes,
+        expected_num_elements: u32,
+        expected_type_size: usize,
+        decoded_data: Bytes,
+    ) -> Self {
+        let mut decoder = Self::new(data, expected_num_elements, expected_type_size);
+        decoder.decoded_data = Some(decoded_data);
+        decoder
+    }
+
+    /// Construct directly from a version-isolated decoded-page cache entry.
+    /// Cache publication validates the encoded page first; lookup still
+    /// validates the logical byte length against current ordinal/schema data.
+    pub fn from_decoded_data(
+        expected_num_elements: u32,
+        expected_type_size: usize,
+        decoded_data: Bytes,
+    ) -> Result<Self> {
+        if !matches!(expected_type_size, 1 | 2 | 4 | 8 | 16) {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: invalid cached type size {expected_type_size}"
+            )));
+        }
+        let padded_num_elements = expected_num_elements
+            .checked_add(7)
+            .map(|count| count & !7)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "BitShufflePageDecoder: cached padded element count overflow",
+                )
+            })?;
+        let expected_size = (padded_num_elements as usize)
+            .checked_mul(expected_type_size)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "BitShufflePageDecoder: cached decoded page size overflow",
+                )
+            })?;
+        if decoded_data.len() != expected_size {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: cached decoded size {} does not match expected size {expected_size}",
+                decoded_data.len(),
+            )));
+        }
+        Ok(Self {
+            data: Bytes::new(),
+            expected_num_elements,
+            expected_type_size,
+            shuffled_data: None,
+            decoded_data: Some(decoded_data),
+            num_elements: expected_num_elements,
+            compressed_size: 0,
+            type_size: expected_type_size,
+            padded_num_elements,
+            block_elements: BITSHUFFLE_BLOCK_ELEMENTS,
+            cur_index: 0,
+            parsed: true,
+        })
     }
 
     /// Initialize the decoder.
@@ -359,14 +427,23 @@ impl BitShufflePageDecoder {
                     "BitShufflePageDecoder: decoded page size overflow",
                 )
             })?;
+        if let Some(decoded) = &self.decoded_data {
+            if decoded.len() != expected_size {
+                return Err(paro_common::error::data_corrupted(format!(
+                    "BitShufflePageDecoder: cached decoded size {} does not match expected size {expected_size}",
+                    decoded.len(),
+                )));
+            }
+            self.parsed = true;
+            self.cur_index = 0;
+            return Ok(());
+        }
         // Decompress only after the page header and the embedded LZ4 size
         // prefix agree on the exact output allocation.
         let compressed_data = &self.data[BITSHUFFLE_PAGE_HEADER_SIZE..];
         let decompressed = decompress_size_prepended_exact(compressed_data, expected_size)?;
 
-        // Unshuffle
-        let unshuffled = bitunshuffle(&decompressed, self.type_size, self.block_elements);
-        self.decoded_data = Some(Bytes::from(unshuffled));
+        self.shuffled_data = Some(Bytes::from(decompressed));
 
         self.parsed = true;
         self.cur_index = 0;
@@ -405,7 +482,11 @@ impl BitShufflePageDecoder {
             return Ok((0, Bytes::new()));
         }
 
-        let decoded = self.decoded_data.as_ref().unwrap();
+        self.ensure_decoded();
+        let decoded = self
+            .decoded_data
+            .as_ref()
+            .expect("initialized BitShuffle decoder has logical data");
         let start = self.cur_index as usize * self.type_size;
         let end = start + to_read * self.type_size;
 
@@ -418,10 +499,58 @@ impl BitShufflePageDecoder {
         if !self.parsed || idx >= self.num_elements {
             return None;
         }
-        let decoded = self.decoded_data.as_ref()?;
-        let start = idx as usize * self.type_size;
-        let end = start + self.type_size;
-        Some(decoded.slice(start..end))
+        if let Some(decoded) = &self.decoded_data {
+            let start = idx as usize * self.type_size;
+            let end = start + self.type_size;
+            return Some(decoded.slice(start..end));
+        }
+
+        let mut value = vec![0_u8; self.type_size];
+        self.copy_value_at(idx, &mut value).ok()?;
+        Some(Bytes::from(value))
+    }
+
+    /// Copy one logical value directly from the bit-sliced page.
+    ///
+    /// This is O(value width) and deliberately leaves the sequential cursor
+    /// untouched. It is the encoded-domain primitive used by sparse gathers.
+    pub fn copy_value_at(&self, idx: u32, output: &mut [u8]) -> Result<()> {
+        if !self.parsed {
+            return Err(paro_common::error::internal(
+                "BitShufflePageDecoder: not initialized",
+            ));
+        }
+        if idx >= self.num_elements {
+            return Err(paro_common::error::out_of_range(format!(
+                "BitShufflePageDecoder: value index {idx} exceeds element count {}",
+                self.num_elements,
+            )));
+        }
+        if output.len() != self.type_size {
+            return Err(paro_common::error::invalid_input(format!(
+                "BitShufflePageDecoder: output width {} does not match element width {}",
+                output.len(),
+                self.type_size,
+            )));
+        }
+        if let Some(decoded) = &self.decoded_data {
+            let start = idx as usize * self.type_size;
+            output.copy_from_slice(&decoded[start..start + self.type_size]);
+            return Ok(());
+        }
+
+        let shuffled = self
+            .shuffled_data
+            .as_ref()
+            .expect("initialized BitShuffle decoder has bit-sliced data");
+        copy_bit_sliced_value(
+            shuffled,
+            idx as usize,
+            self.padded_num_elements as usize,
+            self.type_size,
+            self.block_elements,
+            output,
+        )
     }
 
     /// Get element count.
@@ -438,6 +567,84 @@ impl BitShufflePageDecoder {
     pub fn type_size(&self) -> usize {
         self.type_size
     }
+
+    /// Return the logical page only when an operation has already required
+    /// materialization. Sparse point reads deliberately keep returning `None`.
+    #[cfg(test)]
+    fn materialized_data(&self) -> Option<Bytes> {
+        self.decoded_data.clone()
+    }
+
+    /// Materialize the logical representation for decoded-page caching.
+    pub fn materialize_all(&mut self) -> Result<Bytes> {
+        if !self.parsed {
+            return Err(paro_common::error::internal(
+                "BitShufflePageDecoder: not initialized",
+            ));
+        }
+        self.ensure_decoded();
+        Ok(self
+            .decoded_data
+            .as_ref()
+            .expect("initialized BitShuffle decoder has logical data")
+            .clone())
+    }
+
+    fn ensure_decoded(&mut self) {
+        if self.decoded_data.is_some() {
+            return;
+        }
+        let shuffled = self
+            .shuffled_data
+            .as_ref()
+            .expect("initialized BitShuffle decoder has bit-sliced data");
+        self.decoded_data = Some(Bytes::from(bitunshuffle(
+            shuffled,
+            self.type_size,
+            self.block_elements,
+        )));
+    }
+}
+
+fn copy_bit_sliced_value(
+    shuffled: &[u8],
+    idx: usize,
+    padded_num_elements: usize,
+    type_size: usize,
+    block_elements: usize,
+    output: &mut [u8],
+) -> Result<()> {
+    if output.len() != type_size {
+        return Err(paro_common::error::invalid_input(format!(
+            "BitShuffle output width {} does not match element width {type_size}",
+            output.len(),
+        )));
+    }
+    let block_start = idx / block_elements * block_elements;
+    let elements = (padded_num_elements - block_start).min(block_elements);
+    let plane_bytes = elements / 8;
+    let row_in_block = idx - block_start;
+    let bit_mask = 1_u8 << (row_in_block % 8);
+    let row_byte = row_in_block / 8;
+    let block_offset = block_start * type_size;
+
+    for (byte_idx, value_byte) in output.iter_mut().enumerate() {
+        let plane_base = block_offset + byte_idx * 8 * plane_bytes;
+        let mut value = 0_u8;
+        for bit in 0..8 {
+            let encoded = shuffled
+                .get(plane_base + bit * plane_bytes + row_byte)
+                .copied()
+                .ok_or_else(|| {
+                    paro_common::error::data_corrupted(
+                        "BitShuffle value extends past decompressed page",
+                    )
+                })?;
+            value |= u8::from(encoded & bit_mask != 0) << bit;
+        }
+        *value_byte = value;
+    }
+    Ok(())
 }
 
 /// Perform bitshuffle on data.
@@ -714,6 +921,62 @@ mod tests {
             ]);
             assert_eq!(value, i as i64 * 1000);
         }
+    }
+
+    #[test]
+    fn point_reads_do_not_materialize_logical_page() {
+        let mut builder = BitShufflePageBuilder::new(4, 256 * 1024);
+        let values: Vec<i32> = (0..2056).map(|value| value * 17 - 9).collect();
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(
+            builder.add(&bytes, values.len() as u32),
+            values.len() as u32
+        );
+
+        let mut decoder =
+            BitShufflePageDecoder::new(builder.finish().unwrap(), values.len() as u32, 4);
+        decoder.init().unwrap();
+        assert!(decoder.materialized_data().is_none());
+
+        for index in [0_usize, 1023, 1024, 2055] {
+            let mut output = [0_u8; 4];
+            decoder.copy_value_at(index as u32, &mut output).unwrap();
+            assert_eq!(i32::from_le_bytes(output), values[index]);
+        }
+        assert!(decoder.materialized_data().is_none());
+
+        decoder.next_batch(1).unwrap();
+        assert!(decoder.materialized_data().is_some());
+    }
+
+    #[test]
+    fn decoded_cache_entry_validates_current_layout() {
+        let values = [17_i32, -4, 99, 0, 0, 0, 0, 0];
+        let bytes = Bytes::from(
+            values
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = BitShufflePageDecoder::from_decoded_data(3, 4, bytes).unwrap();
+        let (count, decoded) = decoder.next_batch(3).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(decoded.len(), 12);
+
+        let error = BitShufflePageDecoder::from_decoded_data(4, 4, decoded)
+            .err()
+            .expect("mismatched cache layout must fail")
+            .to_string();
+        assert!(error.contains("does not match expected size"));
+
+        let invalid_width = BitShufflePageDecoder::from_decoded_data(1, 3, Bytes::from(vec![0; 8]))
+            .err()
+            .expect("unsupported cached physical width must fail")
+            .to_string();
+        assert!(invalid_width.contains("invalid cached type size"));
     }
 
     #[test]

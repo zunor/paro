@@ -143,6 +143,62 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&aggregate).unwrap()
 }
 
+fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["a".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(LogicalAggregate::new(
+            1,
+            2,
+            3,
+            values,
+            Vec::new(),
+            Vec::new(),
+            vec![Expression::Aggregate(AggregateExpression::new(
+                get_count_star_function(),
+                Vec::new(),
+                LogicalType::BigInt,
+            ))],
+            Vec::new(),
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let generated = generator.generate(&aggregate).unwrap();
+    let PhysicalNodeKind::Aggregate(spec) = &generated.node(generated.root).kind else {
+        panic!("expected ungrouped aggregate root");
+    };
+
+    let mut nodes = PhysicalPlanNodeArena::default();
+    let mut children = PlanChildrenArena::default();
+    let child = nodes.push(PhysicalPlanNode {
+        id: PhysicalPlanNodeId::INVALID,
+        output: RowType::new(vec!["a".to_string()], vec![LogicalType::Integer]),
+        cardinality: None,
+        kind: PhysicalNodeKind::RowsetScan(rowset_spec_for_test()),
+        children: PlanChildren::Empty,
+        label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "ROWSET_SCAN"),
+    });
+    let root = nodes.push(PhysicalPlanNode {
+        id: PhysicalPlanNodeId::INVALID,
+        output: generated.node(generated.root).output.clone(),
+        cardinality: None,
+        kind: PhysicalNodeKind::Aggregate(spec.clone()),
+        children: children.pack(vec![child]),
+        label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "UNGROUPED_AGGREGATE"),
+    });
+    PhysicalPlan::new(root, nodes, children, PlanPropertyMap::default())
+}
+
 fn topn_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(

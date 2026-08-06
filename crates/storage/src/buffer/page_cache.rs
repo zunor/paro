@@ -4,13 +4,14 @@
 //! PageCache - caching for storage pages with single-flight loading.
 //!
 //! This cache maps a PageKey (location + version isolation) to cached page
-//! buffers stored in the BufferPool. It supports two kinds of cached pages:
-//! compressed and decompressed.
+//! buffers stored in the BufferPool. Physical, block-decompressed, and
+//! codec-decoded representations have independent eviction slots.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
+use bytes::Bytes;
 use paro_common::allocator::MemoryTag;
 use paro_common::error::{self as paro_error, Result};
 
@@ -53,6 +54,7 @@ impl PageKey {
 pub enum PageContentKind {
     Compressed,
     Decompressed,
+    Decoded,
 }
 
 impl PageContentKind {
@@ -63,7 +65,9 @@ impl PageContentKind {
     fn buffer_type(self) -> FileBufferType {
         match self {
             PageContentKind::Compressed => FileBufferType::ExternalFile,
-            PageContentKind::Decompressed => FileBufferType::ManagedBuffer,
+            PageContentKind::Decompressed | PageContentKind::Decoded => {
+                FileBufferType::ManagedBuffer
+            }
         }
     }
 }
@@ -95,6 +99,12 @@ impl PageCacheHandle {
         self.buffer.data()
     }
 
+    /// Convert this pin into immutable shared bytes without copying. The
+    /// buffer remains pinned until the last clone or slice is dropped.
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+
     /// Returns mutable slice of the page data if available.
     ///
     /// # Safety
@@ -105,6 +115,13 @@ impl PageCacheHandle {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn data_mut(&self) -> Option<&mut [u8]> {
         self.buffer.data_mut()
+    }
+}
+
+impl AsRef<[u8]> for PageCacheHandle {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+            .expect("page cache handles always own a pinned buffer")
     }
 }
 
@@ -131,6 +148,7 @@ impl PageSlotState {
 struct PageCacheEntryState {
     compressed: PageSlotState,
     decompressed: PageSlotState,
+    decoded: PageSlotState,
 }
 
 impl PageCacheEntryState {
@@ -138,6 +156,7 @@ impl PageCacheEntryState {
         Self {
             compressed: PageSlotState::Empty,
             decompressed: PageSlotState::Empty,
+            decoded: PageSlotState::Empty,
         }
     }
 
@@ -145,6 +164,7 @@ impl PageCacheEntryState {
         match kind {
             PageContentKind::Compressed => &self.compressed,
             PageContentKind::Decompressed => &self.decompressed,
+            PageContentKind::Decoded => &self.decoded,
         }
     }
 
@@ -152,11 +172,12 @@ impl PageCacheEntryState {
         match kind {
             PageContentKind::Compressed => &mut self.compressed,
             PageContentKind::Decompressed => &mut self.decompressed,
+            PageContentKind::Decoded => &mut self.decoded,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.compressed.is_empty() && self.decompressed.is_empty()
+        self.compressed.is_empty() && self.decompressed.is_empty() && self.decoded.is_empty()
     }
 }
 
@@ -474,11 +495,9 @@ impl PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::storage_metrics;
 
     #[test]
     fn page_cache_insert_and_lookup() {
-        storage_metrics().reset_for_tests();
         let pool = BufferPool::new_arc(1024 * 1024);
         let cache = PageCache::new(pool);
         let key = PageKey::new(1, 2, 0, 3, 1024, 256);
@@ -500,10 +519,22 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.entries, 1);
+    }
 
-        let snap = storage_metrics().snapshot();
-        assert_eq!(snap.page_cache_misses, 1);
-        assert_eq!(snap.page_cache_hits, 1);
-        assert_eq!(snap.page_cache_entries, 1);
+    #[test]
+    fn page_cache_handle_converts_to_zero_copy_bytes() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let cache = PageCache::new(pool);
+        let key = PageKey::new(1, 2, 0, 3, 1024, 256);
+        let handle = cache
+            .insert(key, PageContentKind::Decoded, vec![1, 2, 3, 4])
+            .unwrap();
+        let cached_ptr = handle.data().unwrap().as_ptr();
+
+        let bytes = handle.into_bytes();
+        assert_eq!(bytes.as_ptr(), cached_ptr);
+        assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+        assert!(cache.remove(&key));
+        assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
     }
 }

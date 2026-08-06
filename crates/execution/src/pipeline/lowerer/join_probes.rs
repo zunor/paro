@@ -829,7 +829,6 @@ fn hash_join_requires_merge_barrier(transforms: &[TransformSpec]) -> bool {
             transform,
             TransformSpec::Limit(_)
                 | TransformSpec::StreamingTopN(_)
-                | TransformSpec::StreamingAggregate(_)
                 | TransformSpec::StreamingWindow(_)
         )
     })
@@ -851,7 +850,6 @@ fn is_stateful_transform(transform: &TransformSpec) -> bool {
         transform,
         TransformSpec::Limit(_)
             | TransformSpec::StreamingTopN(_)
-            | TransformSpec::StreamingAggregate(_)
             | TransformSpec::StreamingWindow(_)
     )
 }

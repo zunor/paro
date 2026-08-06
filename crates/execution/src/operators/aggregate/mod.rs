@@ -3,7 +3,6 @@
 
 pub mod hash;
 pub mod perfect_hash;
-pub(crate) mod streaming;
 pub mod ungrouped;
 
 pub(crate) mod accounted_rows;
@@ -23,5 +22,3 @@ pub mod radix_partitioned_aggregate_hashtable;
 pub mod row_format;
 pub mod state;
 pub mod tuple_layout;
-
-pub use streaming::StreamingAggregateTransformExec;

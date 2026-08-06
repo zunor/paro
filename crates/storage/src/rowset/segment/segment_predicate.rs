@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use super::fixed_predicate::{FixedComparisonValues, FixedConjunction};
 use super::segment::Segment;
 use crate::buffer::Prefetcher;
 use crate::codec::vector_decoder;
@@ -60,10 +61,30 @@ impl PredicateColumnBatch {
         }
     }
 
-    pub(super) fn raw(&self) -> Option<&ColumnBatch> {
+    pub(super) fn append_fixed_value(
+        &self,
+        row_idx: usize,
+        width: usize,
+        values: &mut Vec<u8>,
+        nulls: &mut Vec<u8>,
+    ) -> Result<()> {
         match self {
-            Self::Raw(batch) => Some(batch),
-            Self::Decoded(_) => None,
+            Self::Raw(batch) => {
+                let start = row_idx
+                    .checked_mul(width)
+                    .ok_or_else(|| paro_error::data_corrupted("Predicate row offset overflow"))?;
+                let end = start
+                    .checked_add(width)
+                    .ok_or_else(|| paro_error::data_corrupted("Predicate row width overflow"))?;
+                values.extend_from_slice(batch.data.get(start..end).ok_or_else(|| {
+                    paro_error::data_corrupted("Predicate row exceeds the fixed-width batch")
+                })?);
+                nulls.push(batch.nulls.as_ref().map_or(0, |nulls| nulls[row_idx]));
+                Ok(())
+            }
+            Self::Decoded(_) => Err(paro_error::internal(
+                "Reusable predicate column was decoded unexpectedly",
+            )),
         }
     }
 
@@ -114,7 +135,7 @@ impl PredicateColumnBatch {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ComparisonOperator {
+pub(super) enum ComparisonOperator {
     Equal,
     NotEqual,
     LessThan,
@@ -186,32 +207,6 @@ enum CompiledPredicateTree {
     Leaf(CompiledPredicate),
     And(Vec<CompiledPredicateTree>),
     Or(Vec<CompiledPredicateTree>),
-}
-
-enum FixedComparisonValues {
-    I32(Vec<(ComparisonOperator, i32)>),
-    I64(Vec<(ComparisonOperator, i64)>),
-    I128(Vec<(ComparisonOperator, i128)>),
-}
-
-impl FixedComparisonValues {
-    fn physical_width(&self) -> usize {
-        match self {
-            Self::I32(_) => std::mem::size_of::<i32>(),
-            Self::I64(_) => std::mem::size_of::<i64>(),
-            Self::I128(_) => std::mem::size_of::<i128>(),
-        }
-    }
-
-    fn extend_same_type(&mut self, other: &mut Self) -> bool {
-        match (self, other) {
-            (Self::I32(existing), Self::I32(incoming)) => existing.append(incoming),
-            (Self::I64(existing), Self::I64(incoming)) => existing.append(incoming),
-            (Self::I128(existing), Self::I128(incoming)) => existing.append(incoming),
-            _ => return false,
-        }
-        true
-    }
 }
 
 enum CompiledPredicate {
@@ -456,6 +451,15 @@ impl PredicateEvaluator {
         matches: &mut Vec<usize>,
     ) -> Result<()> {
         matches.clear();
+        if Self::is_fixed_constant_leaf(&self.tree) {
+            return Self::filter_fixed_constant_leaf(
+                &self.tree,
+                batches_by_col,
+                rows,
+                matches,
+                true,
+            );
+        }
         let CompiledPredicateTree::And(children) = &self.tree else {
             return self.evaluate_batch_generic(batches_by_col, rows, matches);
         };
@@ -463,6 +467,16 @@ impl PredicateEvaluator {
             matches.extend(0..rows);
             return Ok(());
         };
+        if children.iter().all(Self::is_fixed_constant_leaf) {
+            Self::filter_fixed_constant_leaf(first, batches_by_col, rows, matches, true)?;
+            for predicate in remaining {
+                Self::filter_fixed_constant_leaf(predicate, batches_by_col, rows, matches, false)?;
+                if matches.is_empty() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         if !children.iter().all(Self::is_fixed_comparison_leaf) {
             return self.evaluate_batch_generic(batches_by_col, rows, matches);
         }
@@ -477,6 +491,38 @@ impl PredicateEvaluator {
                 Self::evaluate_fixed_comparison_leaf(predicate, batches_by_col, row_idx)
             });
         }
+        Ok(())
+    }
+
+    fn is_fixed_constant_leaf(predicate: &CompiledPredicateTree) -> bool {
+        matches!(
+            predicate,
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons { .. })
+        )
+    }
+
+    fn filter_fixed_constant_leaf(
+        predicate: &CompiledPredicateTree,
+        batches_by_col: &[PredicateColumnBatch],
+        rows: usize,
+        selection: &mut Vec<usize>,
+        seed: bool,
+    ) -> Result<()> {
+        let CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
+            column_idx,
+            comparisons,
+        }) = predicate
+        else {
+            return Err(paro_error::internal(
+                "Fixed predicate batch path received a non-constant comparison",
+            ));
+        };
+        let batch = batches_by_col.get(*column_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "Fixed predicate column index {column_idx} has no batch"
+            ))
+        })?;
+        comparisons.filter_batch(batch, rows, selection, seed);
         Ok(())
     }
 
@@ -537,21 +583,15 @@ impl PredicateEvaluator {
                     match comparisons {
                         FixedComparisonValues::I32(comparisons) => {
                             let lhs = batch.i32_value(row_idx);
-                            comparisons
-                                .iter()
-                                .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+                            comparisons.matches(lhs)
                         }
                         FixedComparisonValues::I64(comparisons) => {
                             let lhs = batch.i64_value(row_idx);
-                            comparisons
-                                .iter()
-                                .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+                            comparisons.matches(lhs)
                         }
                         FixedComparisonValues::I128(comparisons) => {
                             let lhs = batch.i128_value(row_idx);
-                            comparisons
-                                .iter()
-                                .all(|(operator, rhs)| operator.matches(lhs.cmp(rhs)))
+                            comparisons.matches(lhs)
                         }
                     }
                 }
@@ -887,12 +927,12 @@ impl PredicateEvaluator {
             (LogicalType::Date, Value::Date(rhs)) | (LogicalType::Integer, Value::Integer(rhs)) => {
                 CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons: FixedComparisonValues::I32(vec![(operator, *rhs)]),
+                    comparisons: FixedComparisonValues::I32(FixedConjunction::new(operator, *rhs)),
                 }
             }
             (LogicalType::BigInt, Value::BigInt(rhs)) => CompiledPredicate::FixedComparisons {
                 column_idx,
-                comparisons: FixedComparisonValues::I64(vec![(operator, *rhs)]),
+                comparisons: FixedComparisonValues::I64(FixedConjunction::new(operator, *rhs)),
             },
             (LogicalType::Decimal { precision, .. }, Value::Decimal(rhs, _, _))
                 if *precision <= 18 =>
@@ -905,13 +945,13 @@ impl PredicateEvaluator {
                 };
                 CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons: FixedComparisonValues::I64(vec![(operator, rhs)]),
+                    comparisons: FixedComparisonValues::I64(FixedConjunction::new(operator, rhs)),
                 }
             }
             (LogicalType::Decimal { .. }, Value::Decimal(rhs, _, _)) => {
                 CompiledPredicate::FixedComparisons {
                     column_idx,
-                    comparisons: FixedComparisonValues::I128(vec![(operator, *rhs)]),
+                    comparisons: FixedComparisonValues::I128(FixedConjunction::new(operator, *rhs)),
                 }
             }
             _ => CompiledPredicate::Generic {
@@ -1027,7 +1067,7 @@ mod tests {
             CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                 column_idx: 0,
                 comparisons: FixedComparisonValues::I32(comparisons),
-            }) if comparisons.len() == 2
+            }) if comparisons.lower.is_some() && comparisons.upper.is_some()
         ));
 
         let compiled_or = PredicateEvaluator::compile_tree(

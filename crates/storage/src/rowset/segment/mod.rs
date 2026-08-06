@@ -37,6 +37,7 @@
 //!
 //! Implementation notes live alongside the module sources.
 
+mod fixed_predicate;
 mod segment;
 mod segment_delete_vector;
 mod segment_format;

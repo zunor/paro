@@ -53,17 +53,13 @@ impl PipelinePropertyAccumulator {
             | TransformSpec::GraphProject(_) => {}
             TransformSpec::Limit(_)
             | TransformSpec::StreamingTopN(_)
-            | TransformSpec::StreamingAggregate(_)
             | TransformSpec::StreamingWindow(_)
             | TransformSpec::GraphShortestPath(_) => {
                 self.capabilities.parallelism =
                     self.capabilities.parallelism.merge(Parallelism::single());
                 self.placement = self.placement.merge(Placement::SingleTask);
                 self.current.partitioning = PartitioningProperty::None;
-                if matches!(
-                    transform,
-                    TransformSpec::StreamingTopN(_) | TransformSpec::StreamingAggregate(_)
-                ) {
+                if matches!(transform, TransformSpec::StreamingTopN(_)) {
                     self.memory.class = self.memory.class.max(MemoryClass::Blocking);
                 }
             }

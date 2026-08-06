@@ -65,8 +65,7 @@ impl TableHandle {
         let rowsets = self.tablet().capture_consistent_rowsets(version)?;
         let mut segments = Vec::new();
         for rowset in rowsets {
-            rowset.load_with_options(options.clone())?;
-            for segment in rowset.segments() {
+            for segment in rowset.segments_with_options(options.clone())? {
                 segments.push((rowset.clone(), segment));
             }
         }

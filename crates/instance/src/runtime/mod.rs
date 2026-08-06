@@ -8,7 +8,7 @@ use paro_execution::memory_runtime::{MemoryArbitrator, SystemReserve};
 use paro_external::runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
-use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_storage::buffer::{BufferManager, BufferPool, PageCache};
 use paro_transaction::{CommitDrainWakePool, CommitDrainWakePoolOptions};
 use std::sync::Arc;
 
@@ -29,6 +29,7 @@ use self::session_registry::SessionExecutionRegistry;
 #[derive(Debug)]
 pub struct InstanceRuntime {
     buffer_pool: Arc<BufferPool>,
+    page_cache: Arc<PageCache>,
     buffer_manager: Arc<dyn BufferManager>,
     scheduler: Arc<TaskScheduler>,
     memory_arbitrator: Arc<MemoryArbitrator>,
@@ -70,8 +71,10 @@ impl InstanceRuntime {
             db_file_system,
             python_runtime,
         } = resources;
+        let page_cache = Arc::new(PageCache::new(Arc::clone(&buffer_pool)));
         Self {
             buffer_pool,
+            page_cache,
             buffer_manager,
             scheduler,
             memory_arbitrator,
@@ -91,6 +94,10 @@ impl InstanceRuntime {
 
     pub fn buffer_pool(&self) -> &Arc<BufferPool> {
         &self.buffer_pool
+    }
+
+    pub fn page_cache(&self) -> &Arc<PageCache> {
+        &self.page_cache
     }
 
     pub fn buffer_manager(&self) -> &Arc<dyn BufferManager> {
@@ -186,6 +193,10 @@ impl InstanceRuntime {
 impl Instance {
     pub fn get_buffer_pool(&self) -> &Arc<BufferPool> {
         self.runtime.buffer_pool()
+    }
+
+    pub fn get_page_cache(&self) -> &Arc<PageCache> {
+        self.runtime.page_cache()
     }
 
     pub fn get_buffer_manager(&self) -> &Arc<dyn BufferManager> {

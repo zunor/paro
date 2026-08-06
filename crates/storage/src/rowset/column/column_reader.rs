@@ -346,6 +346,8 @@ pub struct ColumnReaderMeta {
     pub dict_page_pointer: Option<PagePointer>,
     /// Whether the column is nullable
     pub is_nullable: bool,
+    /// Exact column NULL count when persisted by the segment format.
+    pub null_count: Option<u64>,
     /// Type size for fixed-width types
     pub type_size: Option<usize>,
 }
@@ -364,6 +366,7 @@ impl ColumnReaderMeta {
             zonemap_index_pointer: meta.zonemap_index_pointer,
             dict_page_pointer: meta.dict_page_pointer,
             is_nullable: true, // Default to nullable
+            null_count: Some(meta.null_count),
             type_size: field_type.size(),
         }
     }

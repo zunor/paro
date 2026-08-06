@@ -118,6 +118,32 @@ fn grouped_aggregate_lowers_to_build_emit_breaker_pipelines() {
 }
 
 #[test]
+fn ungrouped_aggregate_lowers_to_parallel_build_and_single_emit() {
+    let plan = ungrouped_aggregate_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 2);
+    assert!(matches!(
+        graph.pipelines[0].sink,
+        SinkSpec::UngroupedAggregate(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[1].source,
+        SourceSpec::UngroupedAggregateEmit(_)
+    ));
+    assert_eq!(
+        graph.pipelines[0].properties.capabilities.parallelism.max,
+        usize::MAX
+    );
+    assert_eq!(graph.dependencies.len(), 1);
+    assert_eq!(
+        graph.dependencies[0].kind,
+        DependencyKind::FinalizeBeforeEmit
+    );
+}
+
+#[test]
 fn topn_lowers_to_build_emit_breaker_pipelines() {
     let plan = topn_plan();
     let mut lowerer = PipelineLowerer::new(&plan);

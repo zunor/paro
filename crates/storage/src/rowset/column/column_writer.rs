@@ -1035,7 +1035,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         // Build null map if needed
         let mut null_data: Option<Bytes> = None;
         let nullmap_size = if let Some(ref mut null_builder) = self.null_builder {
-            if null_builder.count() > 0 {
+            if self.page_has_null && null_builder.count() > 0 {
                 let data = null_builder.finish()?;
                 let size = data.len() as u32;
                 null_data = Some(data);
@@ -1561,6 +1561,24 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn first_data_footer(null_flags: Option<&[u8]>) -> DataPageFooter {
+        let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+            .with_nullable(true)
+            .with_compression(CompressionType::None);
+        let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+        let values: Vec<u8> = (0_i32..8).flat_map(i32::to_le_bytes).collect();
+        writer.append(&values, null_flags, 8).unwrap();
+        let meta = writer.finish().unwrap();
+        let data = writer.get_data();
+        let start = meta.data_page_pointer.offset as usize;
+        let end = start + meta.data_page_pointer.size as usize;
+        let (footer, _, _) = PageIO::parse_page_footer(&data[start..end], true).unwrap();
+        match footer {
+            PageFooter::Data(footer) => footer,
+            _ => panic!("expected data page footer"),
+        }
+    }
+
     #[test]
     fn test_column_writer_options() {
         let opts = ColumnWriterOptions::new(FieldType::Int, 1)
@@ -1646,6 +1664,18 @@ mod tests {
 
         let meta = writer.finish().unwrap();
         assert_eq!(meta.num_rows, 10);
+    }
+
+    #[test]
+    fn nullable_page_omits_all_valid_null_map() {
+        let footer = first_data_footer(Some(&[0]));
+        assert_eq!(footer.nullmap_size, 0);
+    }
+
+    #[test]
+    fn nullable_page_preserves_non_empty_null_map() {
+        let footer = first_data_footer(Some(&[0b0000_0100]));
+        assert!(footer.nullmap_size > 0);
     }
 
     #[test]

@@ -67,6 +67,7 @@ pub struct SegmentIterator {
     delete_vector: Option<DeleteVector>,
     pub(super) evaluated_selection: PredicateResult,
     predicate_evaluator: Option<PredicateEvaluator>,
+    late_materialization: Option<LateMaterializationState>,
     selection_tracker: ColumnDataBytesTracker,
     rowid_tracker: ColumnDataBytesTracker,
     prefetcher: Option<Arc<Prefetcher>>,
@@ -86,6 +87,12 @@ struct ReusedPredicateColumn {
     nulls: Vec<u8>,
 }
 
+struct LateMaterializationState {
+    rowids: Vec<u32>,
+    predicate_matches: Vec<usize>,
+    reused_predicate_columns: Vec<ReusedPredicateColumn>,
+}
+
 impl ReusedPredicateColumn {
     fn new(column_id: ColumnId, predicate_idx: usize, width: usize, capacity: usize) -> Self {
         Self {
@@ -97,29 +104,72 @@ impl ReusedPredicateColumn {
         }
     }
 
-    fn append(&mut self, batch: &ColumnBatch, row_idx: usize) -> Result<()> {
-        let start = row_idx
+    fn take_prefix(&mut self, rows: usize) -> Result<ColumnBatch> {
+        if rows > self.nulls.len() {
+            return Err(paro_error::internal(
+                "Reusable predicate column is shorter than the staged selection",
+            ));
+        }
+        let data_len = rows
             .checked_mul(self.width)
-            .ok_or_else(|| paro_error::data_corrupted("Predicate row offset overflow"))?;
-        let end = start
-            .checked_add(self.width)
-            .ok_or_else(|| paro_error::data_corrupted("Predicate row width overflow"))?;
-        let value = batch.data.get(start..end).ok_or_else(|| {
-            paro_error::data_corrupted("Predicate row exceeds the fixed-width batch")
-        })?;
-        self.data.extend_from_slice(value);
-        self.nulls
-            .push(batch.nulls.as_ref().map_or(0, |nulls| nulls[row_idx]));
-        Ok(())
-    }
+            .ok_or_else(|| paro_error::internal("Reusable predicate prefix overflow"))?;
+        if data_len > self.data.len() {
+            return Err(paro_error::internal(
+                "Reusable predicate data is shorter than the staged selection",
+            ));
+        }
 
-    fn take_batch(&mut self) -> ColumnBatch {
-        let nulls = std::mem::take(&mut self.nulls);
+        let remaining_data = self.data.split_off(data_len);
+        let data = std::mem::replace(&mut self.data, remaining_data);
+        let remaining_nulls = self.nulls.split_off(rows);
+        let nulls = std::mem::replace(&mut self.nulls, remaining_nulls);
         let nulls = nulls
             .iter()
             .any(|is_null| *is_null != 0)
             .then(|| Bytes::from(nulls));
-        ColumnBatch::new(Bytes::from(std::mem::take(&mut self.data)), nulls)
+        Ok(ColumnBatch::new(Bytes::from(data), nulls))
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.nulls.clear();
+    }
+}
+
+impl LateMaterializationState {
+    fn new(
+        column_iterators: &[(ColumnId, Box<dyn ColumnIterator + Send + Sync>)],
+        evaluator: &PredicateEvaluator,
+    ) -> Self {
+        let reused_predicate_columns = column_iterators
+            .iter()
+            .filter_map(|(column_id, _)| {
+                evaluator
+                    .raw_column_info(*column_id)
+                    .map(|(predicate_idx, width)| {
+                        ReusedPredicateColumn::new(*column_id, predicate_idx, width, 0)
+                    })
+            })
+            .collect();
+        Self {
+            rowids: Vec::new(),
+            predicate_matches: Vec::new(),
+            reused_predicate_columns,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rowids.clear();
+        self.predicate_matches.clear();
+        for reused in &mut self.reused_predicate_columns {
+            reused.clear();
+        }
+    }
+
+    fn take_rowids(&mut self, max_rows: usize) -> Vec<u32> {
+        let rows = max_rows.min(self.rowids.len());
+        let remaining = self.rowids.split_off(rows);
+        std::mem::replace(&mut self.rowids, remaining)
     }
 }
 
@@ -166,6 +216,7 @@ impl SegmentIterator {
             delete_vector: None,
             evaluated_selection: PredicateResult::Unknown,
             predicate_evaluator: None,
+            late_materialization: None,
             selection_tracker: ColumnDataBytesTracker::new(buffer_pool.clone()),
             rowid_tracker: ColumnDataBytesTracker::new(buffer_pool),
             prefetcher,
@@ -249,6 +300,10 @@ impl SegmentIterator {
                 self.prefetcher.clone(),
                 explicit_predicate_columns,
             )?;
+            self.late_materialization = self
+                .predicate_evaluator
+                .as_ref()
+                .map(|evaluator| LateMaterializationState::new(&self.column_iterators, evaluator));
         }
         Ok(())
     }
@@ -279,6 +334,10 @@ impl SegmentIterator {
 
     pub fn has_next(&self) -> bool {
         self.current_ordinal < self.end_ordinal
+            || self
+                .late_materialization
+                .as_ref()
+                .is_some_and(|state| !state.rowids.is_empty())
     }
 
     /// Restrict this iterator to an ownership-disjoint ordinal range.
@@ -303,6 +362,13 @@ impl SegmentIterator {
             )));
         }
 
+        if let Some(state) = &mut self.late_materialization {
+            state.clear();
+        }
+        self.seek_columns_to_ordinal(ordinal)
+    }
+
+    fn seek_columns_to_ordinal(&mut self, ordinal: u64) -> Result<()> {
         for (_, iter) in &mut self.column_iterators {
             iter.seek_to_ordinal(ordinal)?;
         }
@@ -499,13 +565,33 @@ impl SegmentIterator {
     }
 
     fn next_batch_late_materialize(&mut self, batch_size: usize) -> Result<SegmentBatch> {
+        if batch_size == 0 {
+            self.rowid_tracker.reset();
+            return Ok(SegmentBatch::empty());
+        }
+
         loop {
-            if !self.has_next() {
+            if matches!(self.evaluated_selection, PredicateResult::NoneMatch) {
+                self.current_ordinal = self.end_ordinal;
+                if let Some(state) = &mut self.late_materialization {
+                    state.clear();
+                }
                 self.rowid_tracker.reset();
                 return Ok(SegmentBatch::empty());
             }
 
-            if matches!(self.evaluated_selection, PredicateResult::NoneMatch) {
+            let staged_rows = self
+                .late_materialization
+                .as_ref()
+                .expect("late materialization requires selection state")
+                .rowids
+                .len();
+            if staged_rows >= batch_size
+                || (self.current_ordinal >= self.end_ordinal && staged_rows > 0)
+            {
+                return self.materialize_staged_selection(batch_size);
+            }
+            if self.current_ordinal >= self.end_ordinal {
                 self.rowid_tracker.reset();
                 return Ok(SegmentBatch::empty());
             }
@@ -515,7 +601,7 @@ impl SegmentIterator {
                 for range in ranges {
                     if self.current_ordinal < range.end_row as u64 {
                         if self.current_ordinal < range.start_row as u64 {
-                            self.seek_to_ordinal(range.start_row as u64)?;
+                            self.seek_columns_to_ordinal(range.start_row as u64)?;
                         }
                         found = true;
                         break;
@@ -523,8 +609,7 @@ impl SegmentIterator {
                 }
                 if !found {
                     self.current_ordinal = self.end_ordinal;
-                    self.rowid_tracker.reset();
-                    return Ok(SegmentBatch::empty());
+                    continue;
                 }
             }
 
@@ -538,125 +623,97 @@ impl SegmentIterator {
                 }
             }
 
-            let mut rowids = Vec::with_capacity(batch_size);
-            let mut predicate_matches = Vec::with_capacity(batch_size);
-            let mut reused_predicate_columns = self
-                .column_iterators
-                .iter()
-                .filter_map(|(column_id, _)| {
-                    self.predicate_evaluator
-                        .as_ref()
-                        .and_then(|evaluator| evaluator.raw_column_info(*column_id))
-                        .map(|(predicate_idx, width)| {
-                            ReusedPredicateColumn::new(*column_id, predicate_idx, width, batch_size)
-                        })
-                })
-                .collect::<Vec<_>>();
-            while rowids.len() < batch_size && self.current_ordinal < max_rowid {
-                let remaining = (max_rowid - self.current_ordinal) as usize;
-                let output_remaining = batch_size - rowids.len();
-                let to_read = output_remaining.min(remaining);
-                if to_read == 0 {
-                    break;
-                }
+            let remaining = (max_rowid - self.current_ordinal) as usize;
+            let to_read = batch_size.min(remaining);
+            let (rows_read, predicate_batches) = self
+                .predicate_evaluator
+                .as_mut()
+                .expect("late materialization requires predicate evaluator")
+                .read_next_batch(to_read)?;
+            if rows_read == 0 {
+                self.current_ordinal = max_rowid;
+                continue;
+            }
 
-                let (rows_read, vectors_by_col) = self
-                    .predicate_evaluator
-                    .as_mut()
-                    .expect("late materialization requires predicate evaluator")
-                    .read_next_batch(to_read)?;
-                if rows_read == 0 {
-                    self.current_ordinal = max_rowid;
-                    break;
-                }
+            let state = self
+                .late_materialization
+                .as_mut()
+                .expect("late materialization requires selection state");
+            self.predicate_evaluator
+                .as_ref()
+                .expect("late materialization requires predicate evaluator")
+                .evaluate_batch(&predicate_batches, rows_read, &mut state.predicate_matches)?;
 
-                let selection_bitmap = match &self.evaluated_selection {
-                    PredicateResult::Bitmap(bm) => Some(bm),
-                    _ => None,
-                };
-
-                self.predicate_evaluator
-                    .as_ref()
-                    .expect("late materialization requires predicate evaluator")
-                    .evaluate_batch(&vectors_by_col, rows_read, &mut predicate_matches)?;
-
-                for &row_idx in &predicate_matches {
-                    let ord = self.current_ordinal + row_idx as u64;
-                    let matches_index = selection_bitmap.is_none_or(|bm| bm.contains(ord as u32));
-                    if !matches_index {
-                        continue;
-                    }
-                    let not_deleted = self
+            let selection_bitmap = match &self.evaluated_selection {
+                PredicateResult::Bitmap(bitmap) => Some(bitmap),
+                _ => None,
+            };
+            for &row_idx in &state.predicate_matches {
+                let ordinal = self.current_ordinal + row_idx as u64;
+                if selection_bitmap.is_some_and(|bitmap| !bitmap.contains(ordinal as u32))
+                    || self
                         .delete_vector
                         .as_ref()
-                        .is_none_or(|dv| !dv.is_deleted(ord as u32));
-                    if !not_deleted {
-                        continue;
-                    }
-
-                    for reused in &mut reused_predicate_columns {
-                        let batch = vectors_by_col
-                            .get(reused.predicate_idx)
-                            .and_then(|batch| batch.raw())
-                            .ok_or_else(|| {
-                                paro_error::internal(
-                                    "Reusable predicate column was decoded unexpectedly",
-                                )
-                            })?;
-                        reused.append(batch, row_idx)?;
-                    }
-                    rowids.push(ord as u32);
-                    if rowids.len() >= batch_size {
-                        break;
-                    }
-                }
-
-                self.current_ordinal += rows_read as u64;
-                if rows_read < to_read {
-                    break;
-                }
-            }
-
-            if rowids.is_empty() {
-                if self.current_ordinal >= max_rowid && self.current_ordinal < self.end_ordinal {
-                    self.rowid_tracker.reset();
+                        .is_some_and(|deletes| deletes.is_deleted(ordinal as u32))
+                {
                     continue;
                 }
-                self.rowid_tracker.reset();
-                return Ok(SegmentBatch::empty());
+
+                for reused in &mut state.reused_predicate_columns {
+                    let batch = predicate_batches
+                        .get(reused.predicate_idx)
+                        .ok_or_else(|| paro_error::internal("Reusable predicate batch missing"))?;
+                    batch.append_fixed_value(
+                        row_idx,
+                        reused.width,
+                        &mut reused.data,
+                        &mut reused.nulls,
+                    )?;
+                }
+                state.rowids.push(ordinal as u32);
             }
+            self.current_ordinal += rows_read as u64;
+        }
+    }
 
-            self.rowid_tracker
-                .set(rowids.capacity() * std::mem::size_of::<u32>());
+    fn materialize_staged_selection(&mut self, batch_size: usize) -> Result<SegmentBatch> {
+        let state = self
+            .late_materialization
+            .as_mut()
+            .expect("late materialization requires selection state");
+        let rowids = state.take_rowids(batch_size);
+        let rows = rowids.len();
+        self.rowid_tracker
+            .set(rowids.capacity() * std::mem::size_of::<u32>());
 
-            if self.column_iterators.is_empty() {
-                return Ok(SegmentBatch {
-                    rows: rowids.len(),
-                    rowids,
-                    columns: Vec::new(),
-                });
-            }
-
-            let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
-            let mut results = Vec::with_capacity(self.column_iterators.len());
-            for (col_id, iter) in &mut self.column_iterators {
-                let batch = if let Some(reused) = reused_predicate_columns
-                    .iter_mut()
-                    .find(|reused| reused.column_id == *col_id)
-                {
-                    reused.take_batch()
-                } else {
-                    iter.read_by_rowids(&rowids_u64)?
-                };
-                results.push((*col_id, batch));
-            }
-
+        if self.column_iterators.is_empty() {
             return Ok(SegmentBatch {
-                rows: rowids.len(),
+                rows,
                 rowids,
-                columns: results,
+                columns: Vec::new(),
             });
         }
+
+        let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
+        let mut columns = Vec::with_capacity(self.column_iterators.len());
+        for (column_id, iter) in &mut self.column_iterators {
+            let batch = if let Some(reused) = state
+                .reused_predicate_columns
+                .iter_mut()
+                .find(|reused| reused.column_id == *column_id)
+            {
+                reused.take_prefix(rows)?
+            } else {
+                iter.read_by_rowids(&rowids_u64)?
+            };
+            columns.push((*column_id, batch));
+        }
+
+        Ok(SegmentBatch {
+            rows,
+            rowids,
+            columns,
+        })
     }
 
     pub fn num_columns(&self) -> usize {

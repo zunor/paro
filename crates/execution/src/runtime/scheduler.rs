@@ -357,40 +357,27 @@ fn run_finish_task(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct WorkUnitId(u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceMorsel {
-    RowsetScan { start: usize, end: usize },
-    Chunks { start: usize, end: usize },
-}
-
-impl SourceMorsel {
-    fn morsel_count(self) -> usize {
-        match self {
-            Self::RowsetScan { start, end } | Self::Chunks { start, end } => end - start,
-        }
-    }
-}
-
 /// A worker that dynamically claims work from source-owned shared state.
 ///
 /// Unlike a morsel, this assignment carries no data range. Its only contract is to bound the
 /// number of task-local consumers concurrently draining the source queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SharedSourceWorker {
+    RowsetScan,
     HashAggregateEmit,
     SortEmit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceTaskAssignment {
-    Morsel(SourceMorsel),
+    ChunkRange { start: usize, end: usize },
     SharedWorker(SharedSourceWorker),
 }
 
 impl SourceTaskAssignment {
     fn morsel_count(self) -> Option<usize> {
         match self {
-            Self::Morsel(morsel) => Some(morsel.morsel_count()),
+            Self::ChunkRange { start, end } => Some(end - start),
             Self::SharedWorker(_) => None,
         }
     }
@@ -425,15 +412,11 @@ impl SourceWork {
 
     fn into_task_assignments(self, total_threads: usize) -> Vec<SourceTaskAssignment> {
         match self {
-            Self::RowsetScan { count } => partition_morsel_ranges(count, total_threads)
-                .map(|(start, end)| {
-                    SourceTaskAssignment::Morsel(SourceMorsel::RowsetScan { start, end })
-                })
+            Self::RowsetScan { count } => (0..count.min(total_threads))
+                .map(|_| SourceTaskAssignment::SharedWorker(SharedSourceWorker::RowsetScan))
                 .collect(),
             Self::Chunks { count } => partition_morsel_ranges(count, total_threads)
-                .map(|(start, end)| {
-                    SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, end })
-                })
+                .map(|(start, end)| SourceTaskAssignment::ChunkRange { start, end })
                 .collect(),
             Self::SharedWorkers { count, worker } => (0..count.min(total_threads))
                 .map(|_| SourceTaskAssignment::SharedWorker(worker))
@@ -457,7 +440,6 @@ fn partition_morsel_ranges(
     })
 }
 
-const PROFILE_MORSEL_ROWSET_SCAN: &str = "rowset_scan";
 const PROFILE_MORSEL_CHUNK: &str = "chunk";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,8 +568,9 @@ impl PipelineWorkerCoordinator {
         self.completion.remaining()
     }
 
-    fn wait_for_worker_completion_with_timeout(&self) {
-        self.completion.wait_for_worker_completion_with_timeout();
+    fn wait_for_progress_with_timeout(&self, observed_remaining: usize) {
+        self.completion
+            .wait_for_progress_with_timeout(observed_remaining);
     }
 }
 
@@ -1029,17 +1012,15 @@ fn wait_for_group(
             cancel_and_drain(scheduler, producer, group);
             return Err(paro_error::internal(error.to_string()));
         }
-        match group.snapshot() {
+        let remaining = match group.snapshot() {
             Ok(None) => return Ok(()),
-            Ok(Some(_)) => {}
+            Ok(Some(remaining)) => remaining,
             Err(error) => {
                 cancel_and_drain(scheduler, producer, group);
                 return Err(error);
             }
-        }
-        if !scheduler.wait_for_task_for_producer(producer) {
-            group.wait_for_worker_completion_with_timeout();
-        }
+        };
+        group.wait_for_progress_with_timeout(remaining);
     }
 }
 
@@ -1055,8 +1036,12 @@ fn cancel_and_drain(
 }
 
 fn wait_for_running_workers(group: &PipelineWorkerCoordinator) {
-    while group.remaining() > 0 {
-        group.wait_for_worker_completion_with_timeout();
+    loop {
+        let remaining = group.remaining();
+        if remaining == 0 {
+            return;
+        }
+        group.wait_for_progress_with_timeout(remaining);
     }
 }
 
@@ -1103,16 +1088,10 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
 fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignment) -> Result<()> {
     match (source, assignment) {
         (
-            SourceLocal::Rowset(local),
-            SourceTaskAssignment::Morsel(SourceMorsel::RowsetScan { start, end }),
-        ) => {
-            local.assign_morsel_range(start, end);
-            Ok(())
-        }
-        (
-            SourceLocal::Chunk(local),
-            SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, end }),
-        ) => {
+            SourceLocal::Rowset(_),
+            SourceTaskAssignment::SharedWorker(SharedSourceWorker::RowsetScan),
+        ) => Ok(()),
+        (SourceLocal::Chunk(local), SourceTaskAssignment::ChunkRange { start, end }) => {
             local.assign_chunk_range(start, end);
             Ok(())
         }
@@ -1134,21 +1113,9 @@ fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignmen
 
 fn profile_morsel_range_from_work(work: WorkUnit) -> Option<ProfileMorselRange> {
     match work.kind {
-        WorkUnitKind::Data(SourceTaskAssignment::Morsel(SourceMorsel::RowsetScan {
-            start,
-            end,
-        })) => Some(ProfileMorselRange::new(
-            PROFILE_MORSEL_ROWSET_SCAN,
-            start as u64,
-            end as u64,
-        )),
-        WorkUnitKind::Data(SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, end })) => {
-            Some(ProfileMorselRange::new(
-                PROFILE_MORSEL_CHUNK,
-                start as u64,
-                end as u64,
-            ))
-        }
+        WorkUnitKind::Data(SourceTaskAssignment::ChunkRange { start, end }) => Some(
+            ProfileMorselRange::new(PROFILE_MORSEL_CHUNK, start as u64, end as u64),
+        ),
         WorkUnitKind::Data(SourceTaskAssignment::SharedWorker(_)) | WorkUnitKind::Finish => None,
     }
 }
@@ -1208,17 +1175,14 @@ mod tests {
         assert_eq!(assignments.len(), 4 * DATA_TASKS_PER_THREAD);
         assert_eq!(
             assignments.first(),
-            Some(&SourceTaskAssignment::Morsel(SourceMorsel::Chunks {
-                start: 0,
-                end: 64
-            }))
+            Some(&SourceTaskAssignment::ChunkRange { start: 0, end: 64 })
         );
         assert_eq!(
             assignments.last(),
-            Some(&SourceTaskAssignment::Morsel(SourceMorsel::Chunks {
+            Some(&SourceTaskAssignment::ChunkRange {
                 start: 960,
                 end: 1_024
-            }))
+            })
         );
         assert_eq!(
             assignments
@@ -1230,22 +1194,12 @@ mod tests {
         );
         assert!(assignments.windows(2).all(|pair| match pair {
             [
-                SourceTaskAssignment::Morsel(SourceMorsel::Chunks { end, .. }),
-                SourceTaskAssignment::Morsel(SourceMorsel::Chunks { start, .. }),
+                SourceTaskAssignment::ChunkRange { end, .. },
+                SourceTaskAssignment::ChunkRange { start, .. },
             ] => end == start,
             _ => false,
         }));
 
-        let uneven = SourceWork::RowsetScan { count: 19 }.into_task_assignments(4);
-        assert_eq!(uneven.len(), 16);
-        assert_eq!(
-            uneven
-                .iter()
-                .copied()
-                .map(|assignment| assignment.morsel_count().expect("morsel assignment"))
-                .collect::<Vec<_>>(),
-            [vec![2; 3], vec![1; 13]].concat()
-        );
         assert!(SourceWork::Chunks { count: 0 }
             .into_task_assignments(4)
             .is_empty());
@@ -1262,6 +1216,13 @@ mod tests {
         assert_eq!(assignments.len(), 4);
         assert!(assignments.iter().all(|assignment| {
             *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit)
+                && assignment.morsel_count().is_none()
+        }));
+
+        let rowset_assignments = SourceWork::RowsetScan { count: 19 }.into_task_assignments(4);
+        assert_eq!(rowset_assignments.len(), 4);
+        assert!(rowset_assignments.iter().all(|assignment| {
+            *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::RowsetScan)
                 && assignment.morsel_count().is_none()
         }));
     }

@@ -151,6 +151,10 @@ impl StatementContext {
         &self.services.infra.buffer_pool
     }
 
+    pub fn page_cache(&self) -> &Arc<paro_storage::buffer::PageCache> {
+        &self.services.infra.page_cache
+    }
+
     pub fn buffer_manager(&self) -> &Arc<dyn paro_storage::buffer::BufferManager> {
         &self.services.infra.buffer_manager
     }

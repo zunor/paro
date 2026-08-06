@@ -76,17 +76,15 @@ fn wait_for_parallel_finish_group(
             cancel_parallel_finish_and_drain(scheduler, producer, coordinator);
             return Err(paro_error::internal(error.to_string()));
         }
-        match coordinator.snapshot() {
+        let remaining = match coordinator.snapshot() {
             Ok(None) => return Ok(()),
-            Ok(Some(_)) => {}
+            Ok(Some(remaining)) => remaining,
             Err(error) => {
                 cancel_parallel_finish_and_drain(scheduler, producer, coordinator);
                 return Err(error);
             }
-        }
-        if !scheduler.wait_for_task_for_producer(producer) {
-            coordinator.wait_for_worker_completion_with_timeout();
-        }
+        };
+        coordinator.wait_for_progress_with_timeout(remaining);
     }
 }
 
@@ -101,8 +99,12 @@ fn cancel_parallel_finish_and_drain(
 }
 
 fn wait_for_finish_workers(coordinator: &WorkGroupCompletion) {
-    while coordinator.remaining() > 0 {
-        coordinator.wait_for_worker_completion_with_timeout();
+    loop {
+        let remaining = coordinator.remaining();
+        if remaining == 0 {
+            return;
+        }
+        coordinator.wait_for_progress_with_timeout(remaining);
     }
 }
 

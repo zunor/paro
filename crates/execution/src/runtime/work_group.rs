@@ -68,11 +68,17 @@ impl WorkGroupCompletion {
             .remaining
     }
 
-    pub(crate) fn wait_for_worker_completion_with_timeout(&self) {
+    /// Wait until the observed completion state changes, or until the runtime
+    /// must poll cancellation and operator wake sources again. Comparing the
+    /// observed count while holding the same mutex as `finish` closes the
+    /// lost-notification window between `snapshot` and this wait.
+    pub(crate) fn wait_for_progress_with_timeout(&self, observed_remaining: usize) {
         let guard = self.inner.lock().expect("work group lock poisoned");
         let _ = self
             .cv
-            .wait_timeout(guard, RUNTIME_WAIT_TIMEOUT)
+            .wait_timeout_while(guard, RUNTIME_WAIT_TIMEOUT, |inner| {
+                inner.remaining == observed_remaining && inner.error.is_none()
+            })
             .expect("work group condvar poisoned");
     }
 }

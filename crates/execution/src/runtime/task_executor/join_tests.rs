@@ -1216,7 +1216,7 @@ fn table_function_source_runs_bound_function_in_typed_source_path() {
 }
 
 #[test]
-fn topn_aggregate_and_window_stream_through_typed_transforms() {
+fn topn_and_window_stream_through_typed_transforms() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let spec = PipelineSpec {
@@ -1263,106 +1263,6 @@ fn topn_aggregate_and_window_stream_through_typed_transforms() {
     assert_eq!(chunk.size(), 2);
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(1));
     assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(2));
-
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let aggregate = Expression::Aggregate(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    ));
-    let spec = PipelineSpec {
-        id: PipelineId::new(0),
-        source: SourceSpec::Values(values_spec(
-            vec![
-                vec![int_constant(10)],
-                vec![int_constant(20)],
-                vec![int_constant(30)],
-            ],
-            vec![LogicalType::Integer],
-        )),
-        transforms: vec![TransformSpec::StreamingAggregate(AggregateSpec {
-            grouping_key_count: 0,
-            projection_exprs: Box::new([]),
-            payload_types: Box::new([]),
-            groups: Box::new([]),
-            grouping_sets: Box::new([]),
-            aggregates: vec![aggregate].into_boxed_slice(),
-            grouping_functions: Box::new([]),
-            aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
-            aggregate_filters: vec![None].into_boxed_slice(),
-            aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
-            having_filter: Box::new([]),
-            perfect_hash: None,
-            output_names: vec!["count".to_string()].into_boxed_slice(),
-            output_types: vec![LogicalType::BigInt].into_boxed_slice(),
-        })],
-        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-        sink_sharing: SinkSharing::Exclusive,
-        properties: PipelineProperties::default(),
-        output: RowType::new(vec!["count".to_string()], vec![LogicalType::BigInt]),
-    };
-    let runtime = runtime_from_spec(&query, spec);
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task state");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let mut profiler = OperatorProfiler::disabled();
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    let chunk = output.pop_front().expect("aggregate output");
-    assert_eq!(chunk.size(), 1);
-    assert_eq!(chunk.column(0).unwrap().get_i64(0), Some(3));
-
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let aggregate = Expression::Aggregate(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    ));
-    let spec = PipelineSpec {
-        id: PipelineId::new(0),
-        source: SourceSpec::Values(values_spec(
-            vec![vec![int_constant(10)], vec![int_constant(20)]],
-            vec![LogicalType::Integer],
-        )),
-        transforms: vec![TransformSpec::StreamingAggregate(AggregateSpec {
-            grouping_key_count: 0,
-            projection_exprs: Box::new([]),
-            payload_types: Box::new([]),
-            groups: Box::new([]),
-            grouping_sets: Box::new([]),
-            aggregates: vec![aggregate].into_boxed_slice(),
-            grouping_functions: Box::new([]),
-            aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
-            aggregate_filters: vec![None].into_boxed_slice(),
-            aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
-            having_filter: vec![Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                reference(0, LogicalType::BigInt),
-                Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(2),
-                    LogicalType::BigInt,
-                )),
-            ))]
-            .into_boxed_slice(),
-            perfect_hash: None,
-            output_names: vec!["count".to_string()].into_boxed_slice(),
-            output_types: vec![LogicalType::BigInt].into_boxed_slice(),
-        })],
-        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-        sink_sharing: SinkSharing::Exclusive,
-        properties: PipelineProperties::default(),
-        output: RowType::new(vec!["count".to_string()], vec![LogicalType::BigInt]),
-    };
-    let runtime = runtime_from_spec(&query, spec);
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task state");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let mut profiler = OperatorProfiler::disabled();
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    assert!(output.pop_front().is_none());
 
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());

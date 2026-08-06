@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -205,40 +204,5 @@ impl Drop for PerfectHashAggregateSinkLocal {
         if let Some(table) = self.table.as_mut() {
             let _ = table.destroy();
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct StreamingAggregateTransformGlobal {
-    pub aggregate_objects: Arc<[AggregateObject]>,
-    pub layout: AggregateStateLayout,
-    pub aggregate_inputs: Arc<[Vec<usize>]>,
-}
-
-pub struct StreamingAggregateTransformLocal {
-    pub aggregate_objects: Arc<[AggregateObject]>,
-    pub layout: AggregateStateLayout,
-    pub aggregate_inputs: Arc<[Vec<usize>]>,
-    pub projection_executor: Option<ExpressionExecutor>,
-    pub having_executor: Option<ExpressionExecutor>,
-    pub having_selection: Option<SelectionVector>,
-    pub payload_chunk: Chunk,
-    /// U64-aligned aggregate states. Aggregate kernels access this buffer
-    /// through raw state-address vectors; `destroyed` makes cleanup idempotent
-    /// when flush/finalize exits through an error and `Drop` still runs.
-    pub state_buffer: Vec<u64>,
-    pub arena_allocator: ArenaAllocator,
-    pub emitted: bool,
-    pub destroyed: bool,
-}
-
-impl fmt::Debug for StreamingAggregateTransformLocal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamingAggregateTransformLocal")
-            .field("aggregate_count", &self.aggregate_objects.len())
-            .field("state_buffer_words", &self.state_buffer.len())
-            .field("emitted", &self.emitted)
-            .field("destroyed", &self.destroyed)
-            .finish()
     }
 }

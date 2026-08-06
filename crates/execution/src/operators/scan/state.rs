@@ -39,17 +39,7 @@ pub struct RowsetScanMorsel {
 
 #[derive(Debug, Default)]
 pub struct RowsetSourceLocal {
-    pub next_morsel: usize,
-    pub assigned_morsel_end: Option<usize>,
     pub reader: Option<TabletReader>,
-}
-
-impl RowsetSourceLocal {
-    pub fn assign_morsel_range(&mut self, start: usize, end: usize) {
-        debug_assert!(start < end);
-        self.next_morsel = start;
-        self.assigned_morsel_end = Some(end);
-    }
 }
 
 #[derive(Debug)]

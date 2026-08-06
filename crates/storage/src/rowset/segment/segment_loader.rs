@@ -82,6 +82,7 @@ impl Segment {
             options.page_cache.clone(),
             PageReaderOptions {
                 cache_decompressed: options.cache_decompressed,
+                cache_decoded: options.cache_decoded,
                 parallel_decompressor: options.parallel_decompressor.clone(),
             },
         );
@@ -179,6 +180,7 @@ impl Segment {
             options.page_cache.clone(),
             PageReaderOptions {
                 cache_decompressed: options.cache_decompressed,
+                cache_decoded: options.cache_decoded,
                 parallel_decompressor: options.parallel_decompressor.clone(),
             },
         );

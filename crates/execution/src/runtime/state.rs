@@ -22,7 +22,6 @@ pub use super::breaker::{
 pub use crate::operators::aggregate::state::{
     HashAggregateBuildSinkLocal, HashAggregateEmitSourceGlobal, HashAggregateEmitSourceLocal,
     HashAggregateEmitWork, PerfectHashAggregateEmitSourceLocal, PerfectHashAggregateSinkLocal,
-    StreamingAggregateTransformGlobal, StreamingAggregateTransformLocal,
     UngroupedAggregateEmitSourceLocal, UngroupedAggregateSinkLocal,
 };
 pub use crate::operators::dml::state::{
@@ -302,7 +301,6 @@ pub enum TransformGlobal {
     Project(Arc<ProjectTransformGlobal>),
     StreamingLimit(Arc<StreamingLimitTransformGlobal>),
     StreamingTopN(Arc<StreamingTopNTransformGlobal>),
-    StreamingAggregate(Arc<StreamingAggregateTransformGlobal>),
     StreamingWindow(Arc<StreamingWindowTransformGlobal>),
     HashJoinProbe(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     NestedLoopJoinProbe(Arc<crate::operators::join::nested_loop::runtime::NljProbeGlobal>),
@@ -322,7 +320,6 @@ pub enum TransformLocal {
     Project(ProjectTransformLocal),
     StreamingLimit(StreamingLimitTransformLocal),
     StreamingTopN(StreamingTopNTransformLocal),
-    StreamingAggregate(StreamingAggregateTransformLocal),
     StreamingWindow(StreamingWindowTransformLocal),
     HashJoinProbe(HashJoinProbeTransformLocal),
     NestedLoopJoinProbe(NestedLoopJoinProbeTransformLocal),

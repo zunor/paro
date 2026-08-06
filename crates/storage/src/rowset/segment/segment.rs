@@ -41,6 +41,7 @@ pub struct SegmentOptions {
     pub predicates: Vec<()>,
     pub page_cache: Option<Arc<PageCache>>,
     pub cache_decompressed: bool,
+    pub cache_decoded: bool,
     pub parallel_decompressor: Option<crate::compression::ParallelDecompressor>,
 }
 
@@ -53,6 +54,7 @@ impl Default for SegmentOptions {
             predicates: Vec::new(),
             page_cache: None,
             cache_decompressed: false,
+            cache_decoded: false,
             parallel_decompressor: None,
         }
     }
@@ -88,12 +90,36 @@ impl SegmentOptions {
         self
     }
 
+    pub fn with_cache_decoded(mut self, enable: bool) -> Self {
+        self.cache_decoded = enable;
+        self
+    }
+
     pub fn with_parallel_decompressor(
         mut self,
         decompressor: crate::compression::ParallelDecompressor,
     ) -> Self {
         self.parallel_decompressor = Some(decompressor);
         self
+    }
+
+    pub(crate) fn runtime_equivalent(&self, other: &Self) -> bool {
+        self.verify_checksum == other.verify_checksum
+            && self.compression == other.compression
+            && self.column_ids == other.column_ids
+            && self.predicates.len() == other.predicates.len()
+            && self.cache_decompressed == other.cache_decompressed
+            && self.cache_decoded == other.cache_decoded
+            && match (&self.page_cache, &other.page_cache) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.parallel_decompressor, &other.parallel_decompressor) {
+                (Some(left), Some(right)) => left.runtime_equivalent(right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 
@@ -364,6 +390,7 @@ impl Segment {
             zonemap_index_pointer: col_meta.zonemap_index_pointer,
             dict_page_pointer: col_meta.dict_page_pointer,
             is_nullable: col_meta.is_nullable,
+            null_count: col_meta.null_count,
             type_size: logical_type
                 .and_then(|logical_type| fixed_row_width(logical_type).ok())
                 .or_else(|| col_meta.field_type.size()),

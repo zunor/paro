@@ -98,7 +98,9 @@ impl RowsetSourceExec {
             ctx.query.transaction.read_snapshot().lease(),
         )?;
         let overlay = TxnOverlayReader::for_tablet(&table.tablet(), &ctx.query.transaction)?;
-        let segment_options = SegmentOptions::default();
+        let segment_options = SegmentOptions::default()
+            .with_page_cache(ctx.query.session.page_cache().clone())
+            .with_cache_decoded(true);
         let mut segments = storage_snapshot.segments_with_options(segment_options.clone())?;
         if let Some(overlay) = &overlay {
             let visible_rowsets = segments
@@ -165,16 +167,7 @@ impl RowsetSourceExec {
         loop {
             ctx.cancel.check()?;
             if local.reader.is_none() {
-                let morsel_idx = if let Some(end) = local.assigned_morsel_end {
-                    if local.next_morsel >= end {
-                        return Ok(SourcePoll::Finished);
-                    }
-                    let morsel_idx = local.next_morsel;
-                    local.next_morsel += 1;
-                    morsel_idx
-                } else {
-                    global.next_morsel.fetch_add(1, Ordering::AcqRel)
-                };
+                let morsel_idx = global.next_morsel.fetch_add(1, Ordering::AcqRel);
                 let Some(morsel) = global.morsels.get(morsel_idx) else {
                     return Ok(SourcePoll::Finished);
                 };

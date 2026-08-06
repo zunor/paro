@@ -46,6 +46,7 @@ impl PageReaderContext {
 #[derive(Debug, Clone)]
 pub struct PageReaderOptions {
     pub cache_decompressed: bool,
+    pub cache_decoded: bool,
     pub parallel_decompressor: Option<ParallelDecompressor>,
 }
 
@@ -53,6 +54,7 @@ impl Default for PageReaderOptions {
     fn default() -> Self {
         Self {
             cache_decompressed: false,
+            cache_decoded: false,
             parallel_decompressor: None,
         }
     }
@@ -186,11 +188,38 @@ impl PageReader {
         self.make_key(pointer)
     }
 
+    /// Whether this reader is configured to retain codec-decoded pages.
+    pub fn decoded_cache_enabled(&self) -> bool {
+        self.options.cache_decoded && self.cache.is_some()
+    }
+
+    /// Look up a codec-decoded logical page. Page keys include rowset
+    /// generation, so compaction and replacement cannot return stale values.
+    pub fn lookup_decoded(&self, pointer: PagePointer) -> Option<Bytes> {
+        self.decoded_cache_enabled()
+            .then(|| self.lookup_cached(&self.make_key(pointer), PageContentKind::Decoded))
+            .flatten()
+    }
+
+    /// Publish a codec-decoded logical page into the shared buffer pool.
+    pub fn cache_decoded(&self, pointer: PagePointer, data: &[u8]) -> Result<()> {
+        if !self.options.cache_decoded {
+            return Ok(());
+        }
+        if let Some(cache) = &self.cache {
+            cache.insert(
+                self.make_key(pointer),
+                PageContentKind::Decoded,
+                data.to_vec(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn lookup_cached(&self, key: &PageKey, kind: PageContentKind) -> Option<Bytes> {
         let cache = self.cache.as_ref()?;
         let handle = cache.lookup(key, kind)?;
-        let data = handle.data()?;
-        Some(Bytes::copy_from_slice(data))
+        Some(handle.into_bytes())
     }
 
     fn read_raw_page<R: Read + Seek>(
@@ -354,6 +383,7 @@ struct PendingPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferPool, PageCache};
     use crate::compression::{Lz4BlockCompression, ParallelDecompressor};
     use crate::rowset::page::{
         CompressionType, DataPageFooter, NullEncoding, PageFooter, PageIO, PageReadOptions,
@@ -388,6 +418,30 @@ mod tests {
         buffer.set_position(0);
         let (read_body, _, _) = reader.read_page(&mut buffer, &opts).unwrap();
         assert_eq!(read_body.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn decoded_cache_is_version_isolated() {
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let pointer = PagePointer::new(128, 64);
+        let options = PageReaderOptions {
+            cache_decoded: true,
+            ..PageReaderOptions::default()
+        };
+        let reader = PageReader::new(
+            PageReaderContext::new(1, 2, 3, 4),
+            Some(cache.clone()),
+            options.clone(),
+        );
+        reader.cache_decoded(pointer, b"logical page").unwrap();
+        assert_eq!(
+            reader.lookup_decoded(pointer).unwrap().as_ref(),
+            b"logical page"
+        );
+
+        let next_generation =
+            PageReader::new(PageReaderContext::new(1, 2, 4, 4), Some(cache), options);
+        assert!(next_generation.lookup_decoded(pointer).is_none());
     }
 
     #[test]
@@ -429,6 +483,7 @@ mod tests {
             None,
             PageReaderOptions {
                 cache_decompressed: false,
+                cache_decoded: false,
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),
@@ -496,6 +551,7 @@ mod tests {
             None,
             PageReaderOptions {
                 cache_decompressed: false,
+                cache_decoded: false,
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),

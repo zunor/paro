@@ -10,7 +10,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::window::WindowFunctionType;
 use paro_planner::binder::ir::OrderByNode;
-use paro_planner::expression::{AggregateType, Expression, ReferenceExpression};
+use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;

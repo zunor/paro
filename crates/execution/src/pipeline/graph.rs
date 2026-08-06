@@ -707,7 +707,6 @@ pub enum TransformSpec {
     CrossProductProbe(CrossProductProbeSpec),
     Limit(LimitSpec),
     StreamingTopN(TopNSpec),
-    StreamingAggregate(AggregateSpec),
     StreamingWindow(WindowSpec),
     ExternalProject(ExternalProjectSpec),
     GraphExpand(GraphExpandSpec),
@@ -728,9 +727,6 @@ impl TransformSpec {
                     .collect(),
             ),
             Self::StreamingTopN(spec) => {
-                RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
-            }
-            Self::StreamingAggregate(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
             Self::StreamingWindow(spec) => {

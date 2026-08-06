@@ -509,6 +509,7 @@ impl Session {
                 infra: Arc::new(ExecutionResources {
                     scheduler: self.instance.get_scheduler().clone(),
                     buffer_pool: self.instance.get_buffer_pool().clone(),
+                    page_cache: self.instance.get_page_cache().clone(),
                     buffer_manager: self.instance.get_buffer_manager().clone(),
                     query_memory_coordinator: Some(self.instance.get_memory_arbitrator().clone()),
                 }),
