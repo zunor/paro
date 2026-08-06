@@ -30,7 +30,7 @@ pub use buffer_pool::{BufferPool, BufferPoolStats, EvictionResult};
 pub use buffer_pool_reservation::{BufferPoolReservation, TempBufferPoolReservation};
 pub use file_buffer_type::FileBufferType;
 pub use page_cache::{
-    PageCache, PageCacheHandle, PageCacheStatsSnapshot, PageContentKind, PageKey,
+    PageCache, PageCacheHandle, PageCacheOptions, PageCacheStatsSnapshot, PageContentKind, PageKey,
 };
 pub use paro_common::allocator::MemoryTag;
 pub use prefetch::{PrefetchBudget, PrefetchItem, PrefetchOptions, Prefetcher};

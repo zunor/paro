@@ -83,8 +83,12 @@ struct ReusedPredicateColumn {
     column_id: ColumnId,
     predicate_idx: usize,
     width: usize,
-    data: Vec<u8>,
-    nulls: Vec<u8>,
+    state: PredicateColumnReuseState,
+}
+
+enum PredicateColumnReuseState {
+    Collecting { data: Vec<u8>, nulls: Vec<u8> },
+    Readback,
 }
 
 struct LateMaterializationState {
@@ -99,13 +103,32 @@ impl ReusedPredicateColumn {
             column_id,
             predicate_idx,
             width,
-            data: Vec::with_capacity(capacity.saturating_mul(width)),
-            nulls: Vec::with_capacity(capacity),
+            state: PredicateColumnReuseState::Collecting {
+                data: Vec::with_capacity(capacity.saturating_mul(width)),
+                nulls: Vec::with_capacity(capacity),
+            },
         }
     }
 
-    fn take_prefix(&mut self, rows: usize) -> Result<ColumnBatch> {
-        if rows > self.nulls.len() {
+    fn append(
+        &mut self,
+        batch: &super::segment_predicate::PredicateColumnBatch,
+        row: usize,
+    ) -> Result<()> {
+        let PredicateColumnReuseState::Collecting { data, nulls } = &mut self.state else {
+            return Ok(());
+        };
+        if !batch.append_raw_fixed_value(row, self.width, data, nulls)? {
+            self.state = PredicateColumnReuseState::Readback;
+        }
+        Ok(())
+    }
+
+    fn take_prefix(&mut self, rows: usize) -> Result<Option<ColumnBatch>> {
+        let PredicateColumnReuseState::Collecting { data, nulls } = &mut self.state else {
+            return Ok(None);
+        };
+        if rows > nulls.len() {
             return Err(paro_error::internal(
                 "Reusable predicate column is shorter than the staged selection",
             ));
@@ -113,26 +136,31 @@ impl ReusedPredicateColumn {
         let data_len = rows
             .checked_mul(self.width)
             .ok_or_else(|| paro_error::internal("Reusable predicate prefix overflow"))?;
-        if data_len > self.data.len() {
+        if data_len > data.len() {
             return Err(paro_error::internal(
                 "Reusable predicate data is shorter than the staged selection",
             ));
         }
 
-        let remaining_data = self.data.split_off(data_len);
-        let data = std::mem::replace(&mut self.data, remaining_data);
-        let remaining_nulls = self.nulls.split_off(rows);
-        let nulls = std::mem::replace(&mut self.nulls, remaining_nulls);
+        let remaining_data = data.split_off(data_len);
+        let data = std::mem::replace(data, remaining_data);
+        let remaining_nulls = nulls.split_off(rows);
+        let nulls = std::mem::replace(nulls, remaining_nulls);
         let nulls = nulls
             .iter()
             .any(|is_null| *is_null != 0)
             .then(|| Bytes::from(nulls));
-        Ok(ColumnBatch::new(Bytes::from(data), nulls))
+        Ok(Some(ColumnBatch::new(Bytes::from(data), nulls)))
     }
 
     fn clear(&mut self) {
-        self.data.clear();
-        self.nulls.clear();
+        match &mut self.state {
+            PredicateColumnReuseState::Collecting { data, nulls } => {
+                data.clear();
+                nulls.clear();
+            }
+            PredicateColumnReuseState::Readback => {}
+        }
     }
 }
 
@@ -663,12 +691,7 @@ impl SegmentIterator {
                     let batch = predicate_batches
                         .get(reused.predicate_idx)
                         .ok_or_else(|| paro_error::internal("Reusable predicate batch missing"))?;
-                    batch.append_fixed_value(
-                        row_idx,
-                        reused.width,
-                        &mut reused.data,
-                        &mut reused.nulls,
-                    )?;
+                    reused.append(batch, row_idx)?;
                 }
                 state.rowids.push(ordinal as u32);
             }
@@ -697,14 +720,16 @@ impl SegmentIterator {
         let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
         let mut columns = Vec::with_capacity(self.column_iterators.len());
         for (column_id, iter) in &mut self.column_iterators {
-            let batch = if let Some(reused) = state
+            let reused_batch = state
                 .reused_predicate_columns
                 .iter_mut()
                 .find(|reused| reused.column_id == *column_id)
-            {
-                reused.take_prefix(rows)?
-            } else {
-                iter.read_by_rowids(&rowids_u64)?
+                .map(|reused| reused.take_prefix(rows))
+                .transpose()?
+                .flatten();
+            let batch = match reused_batch {
+                Some(batch) => batch,
+                None => iter.read_by_rowids(&rowids_u64)?,
             };
             columns.push((*column_id, batch));
         }
@@ -734,5 +759,27 @@ impl std::fmt::Debug for SegmentIterator {
             .field("prefetcher", &self.prefetcher.is_some())
             .field("options", &self.options)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rowset::segment::segment_predicate::PredicateColumnBatch;
+    use crate::test_utils::test_i32_vector;
+
+    #[test]
+    fn decoded_predicate_batch_disables_column_reuse_for_readback() {
+        let mut reused = ReusedPredicateColumn::new(7, 0, 4, 1);
+        let raw = PredicateColumnBatch::Raw(ColumnBatch::new(
+            Bytes::copy_from_slice(&11_i32.to_le_bytes()),
+            None,
+        ));
+        reused.append(&raw, 0).unwrap();
+
+        let dictionary_decoded = PredicateColumnBatch::Decoded(test_i32_vector(&[11]));
+        reused.append(&dictionary_decoded, 0).unwrap();
+
+        assert!(reused.take_prefix(1).unwrap().is_none());
     }
 }

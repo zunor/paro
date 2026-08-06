@@ -61,13 +61,13 @@ impl PredicateColumnBatch {
         }
     }
 
-    pub(super) fn append_fixed_value(
+    pub(super) fn append_raw_fixed_value(
         &self,
         row_idx: usize,
         width: usize,
         values: &mut Vec<u8>,
         nulls: &mut Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match self {
             Self::Raw(batch) => {
                 let start = row_idx
@@ -80,11 +80,9 @@ impl PredicateColumnBatch {
                     paro_error::data_corrupted("Predicate row exceeds the fixed-width batch")
                 })?);
                 nulls.push(batch.nulls.as_ref().map_or(0, |nulls| nulls[row_idx]));
-                Ok(())
+                Ok(true)
             }
-            Self::Decoded(_) => Err(paro_error::internal(
-                "Reusable predicate column was decoded unexpectedly",
-            )),
+            Self::Decoded(_) => Ok(false),
         }
     }
 

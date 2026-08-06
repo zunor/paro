@@ -482,7 +482,7 @@ impl BitShufflePageDecoder {
             return Ok((0, Bytes::new()));
         }
 
-        self.ensure_decoded();
+        self.ensure_materialized()?;
         let decoded = self
             .decoded_data
             .as_ref()
@@ -568,6 +568,11 @@ impl BitShufflePageDecoder {
         self.type_size
     }
 
+    #[inline]
+    pub fn is_materialized(&self) -> bool {
+        self.decoded_data.is_some()
+    }
+
     /// Return the logical page only when an operation has already required
     /// materialization. Sparse point reads deliberately keep returning `None`.
     #[cfg(test)]
@@ -575,34 +580,72 @@ impl BitShufflePageDecoder {
         self.decoded_data.clone()
     }
 
-    /// Materialize the logical representation for decoded-page caching.
-    pub fn materialize_all(&mut self) -> Result<Bytes> {
+    /// Exact logical allocation size, including encoded padding rows.
+    pub fn decoded_size(&self) -> Result<usize> {
         if !self.parsed {
             return Err(paro_common::error::internal(
                 "BitShufflePageDecoder: not initialized",
             ));
         }
-        self.ensure_decoded();
-        Ok(self
-            .decoded_data
-            .as_ref()
-            .expect("initialized BitShuffle decoder has logical data")
-            .clone())
+        (self.padded_num_elements as usize)
+            .checked_mul(self.type_size)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "BitShufflePageDecoder: decoded page size overflow",
+                )
+            })
     }
 
-    fn ensure_decoded(&mut self) {
-        if self.decoded_data.is_some() {
-            return;
+    /// Decode directly into a caller-owned allocation.
+    pub fn materialize_into(&self, output: &mut [u8]) -> Result<()> {
+        let expected_size = self.decoded_size()?;
+        if output.len() != expected_size {
+            return Err(paro_common::error::invalid_input(format!(
+                "BitShufflePageDecoder: output size {} does not match decoded size {expected_size}",
+                output.len(),
+            )));
         }
-        let shuffled = self
-            .shuffled_data
-            .as_ref()
-            .expect("initialized BitShuffle decoder has bit-sliced data");
-        self.decoded_data = Some(Bytes::from(bitunshuffle(
-            shuffled,
-            self.type_size,
-            self.block_elements,
-        )));
+        if let Some(decoded) = &self.decoded_data {
+            output.copy_from_slice(decoded);
+            return Ok(());
+        }
+        let shuffled = self.shuffled_data.as_ref().ok_or_else(|| {
+            paro_common::error::internal(
+                "BitShufflePageDecoder: initialized page has no bit-sliced data",
+            )
+        })?;
+        bitunshuffle_into(shuffled, self.type_size, self.block_elements, output)
+    }
+
+    /// Attach a validated immutable logical representation.
+    pub fn install_decoded(&mut self, decoded: Bytes) -> Result<()> {
+        let expected_size = self.decoded_size()?;
+        if decoded.len() != expected_size {
+            return Err(paro_common::error::data_corrupted(format!(
+                "BitShufflePageDecoder: decoded size {} does not match expected size {expected_size}",
+                decoded.len(),
+            )));
+        }
+        self.decoded_data = Some(decoded);
+        Ok(())
+    }
+
+    /// Materialize the logical representation for sequential reads.
+    pub fn materialize_all(&mut self) -> Result<Bytes> {
+        self.ensure_materialized()?;
+        self.decoded_data
+            .clone()
+            .ok_or_else(|| paro_common::error::internal("BitShuffle logical page is missing"))
+    }
+
+    fn ensure_materialized(&mut self) -> Result<()> {
+        if self.decoded_data.is_some() {
+            return Ok(());
+        }
+        let mut decoded = vec![0_u8; self.decoded_size()?];
+        self.materialize_into(&mut decoded)?;
+        self.decoded_data = Some(Bytes::from(decoded));
+        Ok(())
     }
 }
 
@@ -677,19 +720,31 @@ fn bitshuffle(data: &[u8], type_size: usize) -> Vec<u8> {
     output
 }
 
-/// Reverse bitshuffle operation.
-fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8> {
+/// Reverse bitshuffle operation into an accounted caller-owned allocation.
+fn bitunshuffle_into(
+    data: &[u8],
+    type_size: usize,
+    block_elements: usize,
+    output: &mut [u8],
+) -> Result<()> {
+    if type_size == 0 || data.len() % type_size != 0 || output.len() != data.len() {
+        return Err(paro_common::error::data_corrupted(
+            "BitShuffle page has an invalid decoded layout",
+        ));
+    }
     let total_bits = data.len() * 8;
     let bits_per_element = type_size * 8;
     let num_elements = total_bits / bits_per_element;
 
     if num_elements == 0 {
-        return Vec::new();
+        return Ok(());
     }
-
-    debug_assert!(num_elements.is_multiple_of(8));
-
-    let mut output = vec![0u8; num_elements * type_size];
+    if !num_elements.is_multiple_of(8) || block_elements == 0 {
+        return Err(paro_common::error::data_corrupted(
+            "BitShuffle page has an invalid block layout",
+        ));
+    }
+    output.fill(0);
 
     for block_start in (0..num_elements).step_by(block_elements) {
         let current_block_elements = (num_elements - block_start).min(block_elements);
@@ -709,6 +764,13 @@ fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8>
         }
     }
 
+    Ok(())
+}
+
+#[cfg(test)]
+fn bitunshuffle(data: &[u8], type_size: usize, block_elements: usize) -> Vec<u8> {
+    let mut output = vec![0_u8; data.len()];
+    bitunshuffle_into(data, type_size, block_elements, &mut output).unwrap();
     output
 }
 

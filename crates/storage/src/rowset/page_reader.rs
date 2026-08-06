@@ -22,6 +22,12 @@ const SLOW_PAGE_IO_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PAGE_DECOMPRESS_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PAGE_FALLBACK_THRESHOLD: Duration = Duration::from_millis(12);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodedPageAccess {
+    Sequential,
+    SparseGather,
+}
+
 /// Page reader context used for PageKey construction and version isolation.
 #[derive(Debug, Clone)]
 pub struct PageReaderContext {
@@ -201,25 +207,54 @@ impl PageReader {
             .flatten()
     }
 
-    /// Publish a codec-decoded logical page into the shared buffer pool.
-    pub fn cache_decoded(&self, pointer: PagePointer, data: &[u8]) -> Result<()> {
+    /// Initialize and publish a logical page directly in its cache allocation.
+    /// `None` means the decoded-cache policy rejected admission; callers should
+    /// retain an uncached materialization.
+    pub fn cache_decoded_with<F>(
+        &self,
+        pointer: PagePointer,
+        size: usize,
+        initializer: F,
+    ) -> Result<Option<Bytes>>
+    where
+        F: FnOnce(&mut [u8]) -> Result<()>,
+    {
         if !self.options.cache_decoded {
-            return Ok(());
+            return Ok(None);
         }
-        if let Some(cache) = &self.cache {
-            cache.insert(
-                self.make_key(pointer),
-                PageContentKind::Decoded,
-                data.to_vec(),
-            )?;
+        let Some(cache) = &self.cache else {
+            return Ok(None);
+        };
+        cache
+            .get_or_load_decoded_into(self.make_key(pointer), size, initializer)?
+            .map(|handle| handle.try_into_bytes())
+            .transpose()
+    }
+
+    /// Sequential consumers necessarily materialize a logical page. Sparse
+    /// gathers do so only after the page has survived one probationary access,
+    /// avoiding cache pollution from one-off point lookups while recognizing
+    /// repeated analytical reuse.
+    pub(crate) fn should_materialize_decoded(
+        &self,
+        pointer: PagePointer,
+        access: DecodedPageAccess,
+    ) -> bool {
+        match access {
+            DecodedPageAccess::Sequential => true,
+            DecodedPageAccess::SparseGather => {
+                self.options.cache_decoded
+                    && self.cache.as_ref().is_some_and(|cache| {
+                        cache.should_promote_sparse_decoded(&self.make_key(pointer))
+                    })
+            }
         }
-        Ok(())
     }
 
     fn lookup_cached(&self, key: &PageKey, kind: PageContentKind) -> Option<Bytes> {
         let cache = self.cache.as_ref()?;
         let handle = cache.lookup(key, kind)?;
-        Some(handle.into_bytes())
+        handle.try_into_bytes().ok()
     }
 
     fn read_raw_page<R: Read + Seek>(
@@ -433,7 +468,13 @@ mod tests {
             Some(cache.clone()),
             options.clone(),
         );
-        reader.cache_decoded(pointer, b"logical page").unwrap();
+        reader
+            .cache_decoded_with(pointer, b"logical page".len(), |destination| {
+                destination.copy_from_slice(b"logical page");
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         assert_eq!(
             reader.lookup_decoded(pointer).unwrap().as_ref(),
             b"logical page"
