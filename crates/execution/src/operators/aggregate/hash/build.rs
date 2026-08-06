@@ -19,6 +19,7 @@ use paro_storage::row::{RowSpillWriter, RowStoreSpillWriter};
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::operators::aggregate::accounted_rows::DistinctAggregateState;
 use crate::operators::aggregate::aggregate_kernel::{
     aggregate_state_spill_requires_serialization, aggregate_state_spill_supported, combine_states,
     deserialize_aggregate_state_blob, destroy_states,
@@ -94,6 +95,7 @@ impl HashAggregateBuildSinkExec {
         let group_refs = group_payload_refs(&self.spec)?;
         handle.initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
             tables,
+            distinct: DistinctAggregateState::new(aggregate_objects(&self.spec)?.len()),
             spilled_payloads: Vec::new(),
             spilled_states: Vec::new(),
             spilled_outputs: None,
@@ -252,7 +254,7 @@ impl HashAggregateBuildSinkExec {
                 query_modifier_memory(ctx.query),
             )?,
             modifier_memory: query_modifier_memory(ctx.query),
-            distinct_sets: aggregate_objects.iter().map(|_| None).collect(),
+            distinct: DistinctAggregateState::new(aggregate_objects.len()),
         }))
     }
 
@@ -303,7 +305,7 @@ impl HashAggregateBuildSinkExec {
                 &local.group_refs,
                 ctx.query.session.buffer_pool(),
                 &local.modifier_memory,
-                &mut local.distinct_sets,
+                &mut local.distinct,
             )?;
         }
         if has_aggregate_ordered(&self.spec) {
@@ -345,7 +347,7 @@ impl HashAggregateBuildSinkExec {
 
     pub(crate) fn merge_local(
         &self,
-        _ctx: &mut OperatorCallContext,
+        ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -377,15 +379,7 @@ impl HashAggregateBuildSinkExec {
             })?;
             return Ok(MergePoll::Done);
         }
-        finalize_distinct_into_tables(
-            &self.spec,
-            &local.aggregate_objects,
-            &local.group_refs,
-            &local.grouping_sets,
-            &local.modifier_memory,
-            &mut local.distinct_sets,
-            &mut local.tables.lock(),
-        )?;
+        let distinct_allocator = ctx.query.allocator(MemoryTag::HashTable);
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Hash(global) = state else {
                 return Err(paro_error::internal(
@@ -393,6 +387,9 @@ impl HashAggregateBuildSinkExec {
                 ));
             };
             let mut local_tables = local.tables.lock();
+            global
+                .distinct
+                .merge_from(&mut local.distinct, distinct_allocator)?;
             if global.tables.len() != local_tables.len() {
                 return Err(paro_error::internal(format!(
                     "hash aggregate table count mismatch: global={} local={}",
@@ -472,6 +469,15 @@ impl HashAggregateBuildSinkExec {
             if global.spilled_outputs.is_some() {
                 return Ok(());
             }
+            finalize_distinct_into_tables(
+                &self.spec,
+                &aggregate_objects,
+                &group_refs,
+                &grouping_sets,
+                &query_modifier_memory(ctx.query),
+                &mut global.distinct,
+                &mut global.tables,
+            )?;
             finalize_ordered_into_hash_tables(
                 &self.spec,
                 &aggregate_objects,
@@ -1400,6 +1406,7 @@ mod tests {
 
         let mut state = HashAggregateRuntimeState {
             tables,
+            distinct: Default::default(),
             spilled_payloads: Vec::new(),
             spilled_states: Vec::new(),
             spilled_outputs: None,
@@ -1527,6 +1534,7 @@ mod tests {
 
         let mut state = HashAggregateRuntimeState {
             tables,
+            distinct: Default::default(),
             spilled_payloads: Vec::new(),
             spilled_states: Vec::new(),
             spilled_outputs: None,

@@ -19,7 +19,7 @@ use paro_storage::row::Ordering;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::operators::aggregate::accounted_rows::{
-    aggregate_modifier_memory_context, DistinctRowSet, DistinctRows,
+    aggregate_modifier_memory_context, DistinctAggregateState, DistinctRowSet, DistinctRows,
 };
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::build_helpers::{
@@ -192,7 +192,7 @@ fn distinct_modifier_rows_are_query_memory_accounted() {
     let spec = distinct_spec();
     let object = distinct_count_object();
     let pool = Arc::new(QueryMemoryPool::new(8));
-    let mut distinct_sets = vec![None];
+    let mut distinct = DistinctAggregateState::new(1);
 
     let err = collect_distinct_rows(
         &spec,
@@ -201,7 +201,7 @@ fn distinct_modifier_rows_are_query_memory_accounted() {
         &[],
         &test_buffer_pool(),
         &modifier_memory(pool),
-        &mut distinct_sets,
+        &mut distinct,
     )
     .expect_err("tiny query memory quota must reject DISTINCT rows");
     assert!(err.to_string().contains("distinct aggregate"));
@@ -275,7 +275,8 @@ fn grouped_distinct_finalization_deduplicates_after_grouping_set_projection() {
         ],
         memory.clone(),
     );
-    let mut distinct_sets = vec![Some(distinct)];
+    let mut distinct_state = DistinctAggregateState::new(1);
+    *distinct_state.slot_mut(0).expect("distinct slot") = Some(distinct);
 
     finalize_distinct_into_tables(
         &spec,
@@ -283,7 +284,7 @@ fn grouped_distinct_finalization_deduplicates_after_grouping_set_projection() {
         &group_refs,
         &grouping_sets,
         &memory,
-        &mut distinct_sets,
+        &mut distinct_state,
         &mut tables,
     )
     .expect("finalize DISTINCT rows");
@@ -309,6 +310,51 @@ fn grouped_distinct_finalization_deduplicates_after_grouping_set_projection() {
     assert!(!tables[0]
         .scan(&mut position, &mut result)
         .expect("scan complete"));
+}
+
+#[test]
+fn distinct_aggregate_state_unions_keys_across_local_states() {
+    let pool = Arc::new(QueryMemoryPool::new(8 * 1024 * 1024));
+    let memory = modifier_memory(pool);
+    let mut global = DistinctAggregateState::new(1);
+    let mut first = DistinctAggregateState::new(1);
+    let mut second = DistinctAggregateState::new(1);
+    *first.slot_mut(0).expect("first slot") = Some(distinct_set_from_values(
+        vec![LogicalType::Integer],
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Null(LogicalType::Integer)],
+        ],
+        memory.clone(),
+    ));
+    *second.slot_mut(0).expect("second slot") = Some(distinct_set_from_values(
+        vec![LogicalType::Integer],
+        vec![
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+            vec![Value::Null(LogicalType::Integer)],
+        ],
+        memory,
+    ));
+
+    let allocator = paro_common::test_utils::test_allocator();
+    global
+        .merge_from(&mut first, allocator.clone())
+        .expect("merge first local state");
+    global
+        .merge_from(&mut second, allocator)
+        .expect("merge second local state");
+
+    let rows = global
+        .take(0)
+        .expect("global slot")
+        .expect("global distinct set")
+        .into_rows()
+        .expect("distinct rows");
+    assert_eq!(rows.len(), 4);
+    assert!(first.take(0).expect("first slot").is_none());
+    assert!(second.take(0).expect("second slot").is_none());
 }
 
 #[test]

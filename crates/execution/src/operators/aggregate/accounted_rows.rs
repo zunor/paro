@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of_val;
 use std::sync::Arc;
 
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{
@@ -15,9 +16,9 @@ use paro_common::memory::{
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
+use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
 use paro_storage::buffer::{BufferPool, MemoryTag};
-use paro_storage::row::{RowLayout, RowStore, RowStoreBuilder, RowValidityType};
+use paro_storage::row::{Ordering, RowLayout, RowStore, RowStoreBuilder, RowValidityType};
 
 fn grant_for_context(memory: &MemoryAccountingContext) -> MemoryGrant {
     if let Some(owner) = memory.owner() {
@@ -277,6 +278,47 @@ impl DistinctRowSet {
         Ok(())
     }
 
+    /// Merge another local DISTINCT set into this set while preserving the
+    /// original rows for newly observed keys. DISTINCT is a property of the
+    /// complete aggregate input, so local sets must be unioned before any
+    /// aggregate function consumes them.
+    pub(crate) fn try_merge(&mut self, other: Self, allocator: Arc<dyn Allocator>) -> Result<()> {
+        if self.row_types != other.row_types {
+            return Err(paro_error::internal(format!(
+                "cannot merge distinct row sets with different schemas: target={:?}, source={:?}",
+                self.row_types, other.row_types
+            )));
+        }
+
+        let rows = other.into_rows()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let capacity = rows.len().min(VECTOR_SIZE);
+        let mut chunk = Chunk::try_initialize(&self.row_types, capacity, allocator.clone())?;
+        let mut selection = SelectionVector::try_with_capacity(capacity, allocator)?;
+        let columns = (0..self.row_types.len()).collect::<Vec<_>>();
+        let mut key_scratch = Vec::new();
+
+        for ordinals in rows.ordinals().chunks(VECTOR_SIZE) {
+            chunk.try_set_cardinality(ordinals.len())?;
+            let pinned = rows.pin_ordinals(ordinals, Ordering::Sequential)?;
+            pinned.gather_columns(&columns, &mut chunk, 0)?;
+
+            selection.set_len(ordinals.len());
+            let mut selected_count = 0usize;
+            for row_idx in 0..ordinals.len() {
+                if self.try_insert_key_from_chunk(&chunk, row_idx, &mut key_scratch)? {
+                    selection.try_set(selected_count, row_idx)?;
+                    selected_count += 1;
+                }
+            }
+            selection.set_len(selected_count);
+            self.append_selected_rows(&chunk, &selection, selected_count)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_rows(self) -> Result<DistinctRows> {
         let Self {
             key_memory: _,
@@ -291,6 +333,63 @@ impl DistinctRowSet {
             store,
             row_ordinals: row_ordinals.into_boxed_slice(),
         })
+    }
+}
+
+/// Per-aggregate DISTINCT key state shared by grouped and ungrouped sinks.
+///
+/// Local states deduplicate eagerly to bound input volume. During sink merge,
+/// those sets are unioned into the global state. Aggregate functions consume
+/// the global sets only after every local state has merged.
+#[derive(Debug, Default)]
+pub(crate) struct DistinctAggregateState {
+    sets: Box<[Option<DistinctRowSet>]>,
+}
+
+impl DistinctAggregateState {
+    pub(crate) fn new(aggregate_count: usize) -> Self {
+        Self {
+            sets: (0..aggregate_count).map(|_| None).collect(),
+        }
+    }
+
+    pub(crate) fn slot_mut(&mut self, aggregate_idx: usize) -> Result<&mut Option<DistinctRowSet>> {
+        let aggregate_count = self.sets.len();
+        self.sets.get_mut(aggregate_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "distinct aggregate index out of bounds: index={aggregate_idx}, count={}",
+                aggregate_count
+            ))
+        })
+    }
+
+    pub(crate) fn take(&mut self, aggregate_idx: usize) -> Result<Option<DistinctRowSet>> {
+        Ok(self.slot_mut(aggregate_idx)?.take())
+    }
+
+    pub(crate) fn merge_from(
+        &mut self,
+        other: &mut Self,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<()> {
+        if self.sets.len() != other.sets.len() {
+            return Err(paro_error::internal(format!(
+                "distinct aggregate state count mismatch: target={}, source={}",
+                self.sets.len(),
+                other.sets.len()
+            )));
+        }
+        for (target, source) in self.sets.iter_mut().zip(other.sets.iter_mut()) {
+            let Some(source) = source.take() else {
+                continue;
+            };
+            if let Some(target) = target {
+                target.try_merge(source, allocator.clone())?;
+            } else {
+                *target = Some(source);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -320,7 +419,7 @@ impl DistinctRows {
     pub(crate) fn pin_ordinals(
         &self,
         ordinals: &[u64],
-        ordering: paro_storage::row::Ordering,
+        ordering: Ordering,
     ) -> Result<paro_storage::row::PinnedRows<'_>> {
         self.store.pin_ordinals(ordinals, ordering)
     }

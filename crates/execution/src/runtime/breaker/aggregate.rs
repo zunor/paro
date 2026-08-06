@@ -24,6 +24,7 @@ use paro_storage::buffer::BufferPool;
 use paro_storage::row::{RowSpillWriter, RowStore, RowStoreSpillReader, RowStoreSpillWriter};
 
 use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
+use crate::operators::aggregate::accounted_rows::DistinctAggregateState;
 use crate::operators::aggregate::aggregate_kernel::destroy_states;
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
@@ -705,6 +706,7 @@ impl AggregateRuntimeState {
 #[derive(Debug)]
 pub struct HashAggregateRuntimeState {
     pub tables: Vec<AggregateHashTable>,
+    pub(crate) distinct: DistinctAggregateState,
     pub(crate) spilled_payloads: Vec<AggregateSpilledPayload>,
     pub(crate) spilled_states: Vec<AggregateSpilledState>,
     pub spilled_outputs: Option<Vec<Option<AggregateSpilledOutput>>>,
@@ -860,6 +862,7 @@ pub struct UngroupedAggregateRuntimeState {
     pub layout: AggregateStateLayout,
     pub aggregate_inputs: std::sync::Arc<[Vec<usize>]>,
     pub(crate) ordered_collectors: Vec<OrderedAggregateCollector>,
+    pub(crate) distinct: DistinctAggregateState,
     pub state_buffer: Vec<u64>,
     pub arena_allocator: ArenaAllocator,
     pub destroyed: bool,
@@ -960,6 +963,7 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,
@@ -1215,6 +1219,7 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,
@@ -1288,6 +1293,7 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,

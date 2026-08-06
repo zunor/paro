@@ -18,7 +18,7 @@ use paro_storage::buffer::BufferPool;
 use paro_storage::row::{Ordering, PinnedRows};
 
 use crate::operators::aggregate::accounted_rows::{
-    AccountedDistinctKey, DistinctRowSet, DistinctRows,
+    AccountedDistinctKey, DistinctAggregateState, DistinctRowSet, DistinctRows,
 };
 use crate::operators::aggregate::aggregate_kernel::{
     build_state_vector, update_states, AggregatePayload,
@@ -31,7 +31,7 @@ use crate::operators::aggregate::build_helpers::{
 };
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::physical::specs::AggregateSpec;
-use crate::runtime::state::UngroupedAggregateSinkLocal;
+use crate::runtime::breaker::UngroupedAggregateRuntimeState;
 
 /// Collect distinct rows from the payload into per-aggregate row sets.
 pub(crate) fn collect_distinct_rows(
@@ -41,7 +41,7 @@ pub(crate) fn collect_distinct_rows(
     group_refs: &[usize],
     buffer_pool: &Arc<BufferPool>,
     modifier_memory: &MemoryAccountingContext,
-    distinct_sets: &mut [Option<DistinctRowSet>],
+    distinct: &mut DistinctAggregateState,
 ) -> Result<()> {
     let row_count = payload.size();
     let filter_selections = if has_aggregate_filters(spec) {
@@ -57,16 +57,10 @@ pub(crate) fn collect_distinct_rows(
         let row_refs = distinct_row_refs(group_refs, input_refs);
         validate_distinct_row_refs(payload, &row_refs, agg_idx)?;
         let row_types = distinct_row_types(spec, &row_refs, agg_idx)?;
-        if distinct_sets[agg_idx].is_none() {
-            distinct_sets[agg_idx] = Some(DistinctRowSet::new(
-                Arc::clone(buffer_pool),
-                row_types,
-                modifier_memory.clone(),
-            ));
-        }
-        let seen = distinct_sets[agg_idx]
-            .as_mut()
-            .expect("distinct set initialized");
+        let slot = distinct.slot_mut(agg_idx)?;
+        let seen = slot.get_or_insert_with(|| {
+            DistinctRowSet::new(Arc::clone(buffer_pool), row_types, modifier_memory.clone())
+        });
         let mut projected_payload =
             Chunk::try_init_empty(seen.row_types(), payload.allocator().clone())?;
         projected_payload.reference_columns(payload, &row_refs);
@@ -297,7 +291,7 @@ pub(crate) fn finalize_distinct_into_tables(
     group_refs: &[usize],
     grouping_sets: &[Box<[usize]>],
     modifier_memory: &MemoryAccountingContext,
-    distinct_sets: &mut [Option<DistinctRowSet>],
+    distinct: &mut DistinctAggregateState,
     tables: &mut [AggregateHashTable],
 ) -> Result<()> {
     let group_count = group_refs.len();
@@ -313,7 +307,7 @@ pub(crate) fn finalize_distinct_into_tables(
         if !object.is_distinct() || !object.order_bys.is_empty() {
             continue;
         }
-        let rows = match distinct_sets[agg_idx].take() {
+        let rows = match distinct.take(agg_idx)? {
             Some(set) => set.into_rows()?,
             None => continue,
         };
@@ -505,13 +499,16 @@ impl DistinctTableBatchUpdater<'_> {
 /// Finalize ungrouped DISTINCT aggregates from collected rows.
 pub(crate) fn finalize_ungrouped_distinct(
     spec: &AggregateSpec,
-    local: &mut UngroupedAggregateSinkLocal,
+    state: &mut UngroupedAggregateRuntimeState,
 ) -> Result<()> {
-    for (agg_idx, object) in local.aggregate_objects.iter().enumerate() {
+    let aggregate_objects = Arc::clone(&state.aggregate_objects);
+    let allocator = state.arena_allocator.get_allocator().clone();
+    let mut addresses = Vector::try_new(LogicalType::BigInt, VECTOR_SIZE, allocator.clone())?;
+    for (agg_idx, object) in aggregate_objects.iter().enumerate() {
         if !object.is_distinct() || !object.order_bys.is_empty() {
             continue;
         }
-        let rows = match local.distinct_sets[agg_idx].take() {
+        let rows = match state.distinct.take(agg_idx)? {
             Some(set) => set.into_rows()?,
             None => continue,
         };
@@ -525,9 +522,8 @@ pub(crate) fn finalize_ungrouped_distinct(
             .filter_map(|&idx| spec.payload_types.get(idx))
             .cloned()
             .collect();
-        let allocator = local.arena_allocator.get_allocator().clone();
-        let state_offset = local.layout.state_offset(agg_idx);
-        let agg_ptr = unsafe { (local.state_buffer.as_mut_ptr() as *mut u8).add(state_offset) };
+        let state_offset = state.layout.state_offset(agg_idx);
+        let agg_ptr = unsafe { (state.state_buffer.as_mut_ptr() as *mut u8).add(state_offset) };
         let single_input = vec![(0..input_count).collect::<Vec<usize>>()];
         let mut input_chunk = Chunk::try_initialize(
             &input_types,
@@ -546,21 +542,21 @@ pub(crate) fn finalize_ungrouped_distinct(
                 input_count,
                 agg_idx,
             )?;
-            fill_repeated_state_addresses(&mut local.addresses, agg_ptr, batch.len())?;
+            fill_repeated_state_addresses(&mut addresses, agg_ptr, batch.len())?;
             let payload_desc = AggregatePayload {
                 chunk: &input_chunk,
                 aggregate_inputs: &single_input,
             };
             let mut input_data = AggregateInputData::new(
                 object.bind_info.as_deref(),
-                &mut local.arena_allocator,
+                &mut state.arena_allocator,
                 AggregateCombineType::PreserveInput,
             );
             update_states(
                 std::slice::from_ref(object),
                 &mut input_data,
                 &payload_desc,
-                &local.addresses,
+                &addresses,
                 batch.len(),
             )?;
         }

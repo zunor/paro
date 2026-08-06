@@ -19,7 +19,7 @@ use crate::operators::aggregate::payload_spill::{
 };
 use crate::runtime::breaker::{AggregateHandle, UngroupedAggregateRuntimeState};
 
-use super::accounted_rows::DistinctRowSet;
+use super::accounted_rows::DistinctAggregateState;
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
 use super::ordered_helpers::OrderedAggregateCollector;
@@ -128,7 +128,7 @@ pub struct HashAggregateBuildSinkLocal {
     pub(crate) state_spill: Arc<Mutex<Option<AggregateStateSpillBuffer>>>,
     pub(crate) ordered_collectors: Vec<OrderedAggregateCollector>,
     pub(crate) modifier_memory: MemoryAccountingContext,
-    pub(crate) distinct_sets: Vec<Option<DistinctRowSet>>,
+    pub(crate) distinct: DistinctAggregateState,
 }
 
 #[derive(Debug)]
@@ -144,7 +144,7 @@ pub struct UngroupedAggregateSinkLocal {
     pub arena_allocator: ArenaAllocator,
     pub destroyed: bool,
     pub(crate) modifier_memory: MemoryAccountingContext,
-    pub(crate) distinct_sets: Vec<Option<DistinctRowSet>>,
+    pub(crate) distinct: DistinctAggregateState,
 }
 
 #[derive(Debug)]

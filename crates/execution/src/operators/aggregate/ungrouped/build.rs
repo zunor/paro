@@ -14,6 +14,7 @@ use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::scalar::FunctionExecContext;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
+use crate::operators::aggregate::accounted_rows::DistinctAggregateState;
 use crate::operators::aggregate::aggregate_kernel::{
     update_filtered_states, update_states, AggregatePayload,
 };
@@ -110,7 +111,7 @@ impl UngroupedAggregateSinkExec {
             arena_allocator: state.arena_allocator,
             destroyed: state.destroyed,
             modifier_memory: query_modifier_memory(ctx.query),
-            distinct_sets: state.aggregate_objects.iter().map(|_| None).collect(),
+            distinct: DistinctAggregateState::new(state.aggregate_objects.len()),
         }))
     }
 
@@ -165,7 +166,7 @@ impl UngroupedAggregateSinkExec {
                 &[],
                 ctx.query.session.buffer_pool(),
                 &local.modifier_memory,
-                &mut local.distinct_sets,
+                &mut local.distinct,
             )?;
         }
         if has_ordered {
@@ -254,7 +255,7 @@ impl UngroupedAggregateSinkExec {
 
     pub(crate) fn merge_local(
         &self,
-        _ctx: &mut OperatorCallContext,
+        ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -268,13 +269,16 @@ impl UngroupedAggregateSinkExec {
                 "ungrouped aggregate sink local state mismatch",
             ));
         };
-        finalize_ungrouped_distinct(&self.spec, local)?;
+        let distinct_allocator = ctx.query.allocator(MemoryTag::HashTable);
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Ungrouped(global) = state else {
                 return Err(paro_error::internal(
                     "aggregate handle does not contain ungrouped aggregate state",
                 ));
             };
+            global
+                .distinct
+                .merge_from(&mut local.distinct, distinct_allocator)?;
             combine_ungrouped_states(global, local)?;
             merge_ordered_collectors(
                 &mut global.ordered_collectors,
@@ -317,6 +321,7 @@ impl UngroupedAggregateSinkExec {
                     "aggregate handle does not contain ungrouped aggregate state",
                 ));
             };
+            finalize_ungrouped_distinct(&self.spec, global)?;
             finalize_ordered_ungrouped(&self.spec, &query_modifier_memory(ctx.query), global)
         })?;
         global.handle.mark_finalized();

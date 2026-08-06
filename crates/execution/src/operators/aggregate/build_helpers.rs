@@ -17,7 +17,9 @@ use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::operators::aggregate::accounted_rows::aggregate_modifier_memory_context;
+use crate::operators::aggregate::accounted_rows::{
+    aggregate_modifier_memory_context, DistinctAggregateState,
+};
 use crate::operators::aggregate::aggregate_kernel::{
     combine_states, destroy_states, initialize_states,
 };
@@ -416,6 +418,7 @@ pub(crate) fn create_ungrouped_runtime_state(
         allocator.clone(),
     )?;
     Ok(UngroupedAggregateRuntimeState {
+        distinct: DistinctAggregateState::new(aggregate_objects.len()),
         aggregate_objects,
         layout,
         aggregate_inputs,
