@@ -10,13 +10,14 @@ use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{
-    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant, MemoryReleaseHandle,
+    AccountedVec, GrantBuffer, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+    MemoryReleaseHandle,
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, VECTOR_SIZE};
+use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
 use paro_storage::buffer::{BufferPool, MemoryTag, DEFAULT_BLOCK_ALLOC_SIZE};
-use paro_storage::row::codec::unsafe_api;
+use paro_storage::row::codec::{unsafe_api, PreparedRowScatter, RowHeapUsage, RowHeapWriter};
 use paro_storage::row::{RowFormat, RowFormatHandle, RowLayout, RowValidityType};
 
 use crate::operators::join::hash::row_format::HashJoinRowFormat;
@@ -186,27 +187,154 @@ impl BuildRowLayout {
     pub fn read_value(&self, row_ptr: *const u8, col_idx: usize) -> Value {
         unsafe { unsafe_api::read_row_value(self.base.as_ref(), row_ptr, col_idx) }
     }
+
+    /// Gather one build payload column directly into a flat output vector.
+    ///
+    /// # Safety
+    /// Every non-zero entry in `row_ptrs` must reference a live row owned by
+    /// the corresponding hash-build store.
+    pub unsafe fn gather_payload_column(
+        &self,
+        row_ptrs: &[usize],
+        build_idx: usize,
+        output: &mut Vector,
+    ) -> Result<()> {
+        if build_idx >= self.payload_count {
+            return Err(paro_error::internal(format!(
+                "build payload column {build_idx} out of range {}",
+                self.payload_count
+            )));
+        }
+        let column_idx = self.payload_base_col_idx(build_idx);
+        // SAFETY: upheld by this method's caller; a zero address is deliberately
+        // mapped to a null row for unmatched outer/single join results.
+        unsafe {
+            paro_storage::row::codec::gather_column_from_rows(
+                self.base.as_ref(),
+                column_idx,
+                output,
+                row_ptrs.len(),
+                |row_idx| row_ptrs[row_idx] as *const u8,
+            )
+        }
+    }
 }
 
-/// One contiguous build-row slab plus the heap ownership that keeps row pointers valid.
+/// One contiguous build-row slab.
 ///
 /// Row pointers derived from this block remain valid only while the block itself is alive.
-/// The varlen / nested heap owners stored alongside the slab intentionally share the same
-/// lifetime so callers must not retain row pointers after the owning `HashBuildStore` drops.
+/// Out-of-line values are retained by the owning [`HashBuildStore`], so callers must not
+/// retain row pointers after that store drops.
 struct BuildBlock {
     data: paro_common::memory::GrantBuffer,
-    memory: MemoryAccountingContext,
     row_width: usize,
     row_count: usize,
     max_rows: usize,
-    heap_bytes: usize,
     used_bytes: usize,
-    heap_releases: Vec<MemoryReleaseHandle>,
-    owned_bytes: Vec<Box<[u8]>>,
-    // These boxed values back row pointers written into the slab, so their
-    // allocation addresses must remain stable even if the Vec grows.
-    #[allow(clippy::vec_box)]
-    owned_values: Vec<Box<Value>>,
+}
+
+/// Owns nested row values without allowing their addresses to move.
+#[derive(Default)]
+struct StableValueHeap {
+    #[allow(clippy::vec_box)] // Each box address is embedded in a serialized row.
+    values: Vec<Box<Value>>,
+}
+
+impl StableValueHeap {
+    fn push(&mut self, value: Box<Value>) {
+        self.values.push(value);
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        self.values.append(&mut other.values);
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+/// Append-scoped writer over one exactly sized byte allocation.
+///
+/// Moving the owning [`GrantBuffer`] after the append does not move its
+/// allocation, and nested values are boxed before their pointers enter rows.
+struct BatchRowHeap<'a> {
+    bytes: Option<&'a GrantBuffer>,
+    byte_offset: usize,
+    values: &'a mut StableValueHeap,
+    value_bytes: usize,
+}
+
+impl<'a> BatchRowHeap<'a> {
+    fn new(bytes: Option<&'a GrantBuffer>, values: &'a mut StableValueHeap) -> Self {
+        Self {
+            bytes,
+            byte_offset: 0,
+            values,
+            value_bytes: 0,
+        }
+    }
+
+    fn validate_complete(&self, expected: RowHeapUsage) -> Result<()> {
+        if self.byte_offset != expected.varlen_bytes()
+            || self.value_bytes != expected.nested_value_bytes()
+        {
+            return Err(paro_error::internal(format!(
+                "prepared row heap measurement changed while scattering: expected_bytes={}, actual_bytes={}, expected_values={}, actual_values={}",
+                expected.varlen_bytes(),
+                self.byte_offset,
+                expected.nested_value_bytes(),
+                self.value_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RowHeapWriter for BatchRowHeap<'_> {
+    fn store_bytes(&mut self, bytes: &[u8]) -> Result<*const u8> {
+        let buffer = self.bytes.ok_or_else(|| {
+            paro_error::internal("row scatter wrote bytes without measured byte heap")
+        })?;
+        let end = self
+            .byte_offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| paro_error::out_of_range("row byte heap cursor overflow"))?;
+        if end > buffer.size() {
+            return Err(paro_error::internal(format!(
+                "row scatter exceeded measured byte heap: end={end}, capacity={}",
+                buffer.size()
+            )));
+        }
+        let target = unsafe { buffer.as_ptr().add(self.byte_offset) };
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
+        self.byte_offset = end;
+        Ok(target)
+    }
+
+    fn store_value(&mut self, value: Value) -> Result<*const Value> {
+        self.value_bytes = self
+            .value_bytes
+            .checked_add(size_of::<Value>())
+            .and_then(|bytes| bytes.checked_add(value.allocation_size()))
+            .ok_or_else(|| paro_error::out_of_range("row nested-value heap size overflow"))?;
+        let retained = Box::new(value);
+        let pointer = retained.as_ref() as *const Value;
+        self.values.push(retained);
+        Ok(pointer)
+    }
+}
+
+struct RetainedMemory(MemoryReleaseHandle);
+
+impl Drop for RetainedMemory {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl BuildBlock {
@@ -220,15 +348,10 @@ impl BuildBlock {
         let data = memory.allocate_zeroed_buffer(allocator, allocated_bytes)?;
         Ok(Self {
             data,
-            memory,
             row_width,
             row_count: 0,
             max_rows,
-            heap_bytes: 0,
             used_bytes: 0,
-            heap_releases: Vec::new(),
-            owned_bytes: Vec::new(),
-            owned_values: Vec::new(),
         })
     }
 
@@ -252,14 +375,16 @@ impl BuildBlock {
         unsafe { self.data.as_ptr().add(row_idx * self.row_width) }
     }
 
-    fn append_row<F>(
+    fn append_row<H, F>(
         &mut self,
         layout: &BuildRowLayout,
-        estimated_heap_bytes: usize,
+        row_heap_bytes: usize,
+        heap: &mut H,
         write_row: F,
     ) -> Result<*mut u8>
     where
-        F: FnOnce(*mut u8, &mut Vec<Box<[u8]>>, &mut Vec<Box<Value>>, &mut usize) -> Result<()>,
+        H: RowHeapWriter,
+        F: FnOnce(*mut u8, &mut H) -> Result<()>,
     {
         if !self.can_accept() {
             return Err(paro_error::internal(
@@ -273,65 +398,21 @@ impl BuildBlock {
             ptr::write_bytes(row_ptr, 0, self.row_width);
         }
 
-        if !layout.base().all_valid() {
-            let validity_width = layout.base().validity().flag_width();
-            unsafe {
-                std::slice::from_raw_parts_mut(row_ptr, validity_width).fill(0xFF);
-            }
-        }
-
-        let mut row_used_bytes = self.row_width;
-        let heap_release = if estimated_heap_bytes == 0 {
-            None
-        } else {
-            Some(self.memory.retain(estimated_heap_bytes)?)
-        };
-
-        let write_result = write_row(
-            row_ptr,
-            &mut self.owned_bytes,
-            &mut self.owned_values,
-            &mut row_used_bytes,
-        );
-        if let Err(err) = write_result {
-            if let Some(release) = heap_release {
-                release.release();
-            }
-            return Err(err);
-        }
+        write_row(row_ptr, heap)?;
 
         if let Some(heap_size_offset) = layout.base().heap_size_offset() {
-            let heap_used = row_used_bytes.saturating_sub(self.row_width) as u64;
+            let heap_used = u64::try_from(row_heap_bytes)
+                .map_err(|_| paro_error::out_of_range("hash build row heap size exceeds u64"))?;
             unsafe {
                 ptr::write_unaligned(row_ptr.add(heap_size_offset) as *mut u64, heap_used);
             }
         }
 
-        let row_heap_bytes = row_used_bytes.saturating_sub(self.row_width);
-        match heap_release {
-            Some(release) if row_heap_bytes == estimated_heap_bytes => {
-                self.heap_releases.push(release);
-            }
-            Some(release) if row_heap_bytes == 0 => {
-                release.release();
-            }
-            Some(release) if row_heap_bytes < estimated_heap_bytes => {
-                release.release();
-                self.heap_releases.push(self.memory.retain(row_heap_bytes)?);
-            }
-            Some(release) => {
-                self.heap_releases.push(release);
-                self.heap_releases
-                    .push(self.memory.retain(row_heap_bytes - estimated_heap_bytes)?);
-            }
-            None if row_heap_bytes > 0 => {
-                self.heap_releases.push(self.memory.retain(row_heap_bytes)?);
-            }
-            None => {}
-        }
         self.row_count += 1;
-        self.heap_bytes = self.heap_bytes.saturating_add(row_heap_bytes);
-        self.used_bytes = self.used_bytes.saturating_add(row_used_bytes);
+        self.used_bytes = self
+            .used_bytes
+            .saturating_add(self.row_width)
+            .saturating_add(row_heap_bytes);
         Ok(row_ptr)
     }
 }
@@ -343,14 +424,6 @@ impl std::fmt::Debug for BuildBlock {
             .field("max_rows", &self.max_rows)
             .field("used_bytes", &self.used_bytes)
             .finish()
-    }
-}
-
-impl Drop for BuildBlock {
-    fn drop(&mut self) {
-        for release in &self.heap_releases {
-            release.release();
-        }
     }
 }
 
@@ -367,6 +440,9 @@ pub struct HashBuildStore {
     tag: MemoryTag,
     memory: MemoryAccountingContext,
     blocks: AccountedVec<BuildBlock>,
+    heap_buffers: Vec<GrantBuffer>,
+    owned_values: StableValueHeap,
+    value_releases: Vec<RetainedMemory>,
     count: u32,
 }
 
@@ -383,6 +459,8 @@ impl std::fmt::Debug for HashBuildStore {
             .field("tag", &self.tag)
             .field("memory", &self.memory)
             .field("blocks", &self.blocks)
+            .field("heap_buffers", &self.heap_buffers.len())
+            .field("owned_values", &self.owned_values.len())
             .field("count", &self.count)
             .finish()
     }
@@ -417,6 +495,9 @@ impl HashBuildStore {
             tag,
             memory,
             blocks,
+            heap_buffers: Vec::new(),
+            owned_values: StableValueHeap::default(),
+            value_releases: Vec::new(),
             count: 0,
         }
     }
@@ -442,10 +523,13 @@ impl HashBuildStore {
 
     pub fn reset(&mut self) {
         self.blocks.clear();
+        self.heap_buffers.clear();
+        self.owned_values.clear();
+        self.value_releases.clear();
         self.count = 0;
     }
 
-    pub fn merge(&mut self, other: HashBuildStore) -> Result<()> {
+    pub fn merge(&mut self, mut other: HashBuildStore) -> Result<()> {
         if self.layout.row_format() != other.layout.row_format() {
             return Err(paro_error::internal(
                 "cannot merge HashBuildStore with mismatched layouts".to_string(),
@@ -457,6 +541,9 @@ impl HashBuildStore {
         for block in other_blocks.drain() {
             self.blocks.try_push(block)?;
         }
+        self.heap_buffers.append(&mut other.heap_buffers);
+        self.owned_values.append(&mut other.owned_values);
+        self.value_releases.append(&mut other.value_releases);
         Ok(())
     }
 
@@ -479,7 +566,6 @@ impl HashBuildStore {
             )));
         }
 
-        let mut appended = 0usize;
         let base_columns = (0..self.layout.base().column_count())
             .map(|col_idx| {
                 chunk.column(col_idx).ok_or_else(|| {
@@ -501,48 +587,28 @@ impl HashBuildStore {
                 })
             })
             .transpose()?;
-
-        let layout = self.layout.clone();
-        for row_idx in 0..chunk.size() {
-            let estimated_heap_bytes = estimate_row_heap_bytes(&layout, &base_columns, row_idx);
-            let block = self.ensure_current_block()?;
-            block.append_row(
-                &layout,
-                estimated_heap_bytes,
-                |row_ptr, owned_bytes, owned_values, used_bytes| {
-                    for (col_idx, column) in base_columns.iter().enumerate() {
-                        unsafe {
-                            unsafe_api::write_vector_value(
-                                layout.base(),
-                                row_ptr,
-                                col_idx,
-                                column.as_ref(),
-                                row_idx,
-                                owned_bytes,
-                                owned_values,
-                                used_bytes,
-                            )
-                        }?;
-                    }
-
-                    let hash = hash_vector.get_u64(row_idx).ok_or_else(|| {
-                        paro_error::internal("HashBuildStore hash must not be NULL".to_string())
-                    })?;
-                    layout.set_hash(row_ptr, hash);
-                    layout.set_next(row_ptr, ptr::null());
-
-                    let found = found_vector
-                        .as_ref()
-                        .and_then(|vector| vector.get_bool(row_idx))
-                        .unwrap_or(false);
-                    layout.set_found(row_ptr, found);
-                    Ok(())
-                },
-            )?;
-            appended += 1;
-        }
-        self.count = self.count.saturating_add(appended as u32);
-        Ok(appended)
+        let base_columns = base_columns
+            .iter()
+            .map(|column| column.as_ref())
+            .collect::<Vec<_>>();
+        let source =
+            PreparedRowScatter::try_new(self.layout.base().as_ref(), &base_columns, chunk.size())?;
+        self.append_prepared_rows(
+            &source,
+            chunk.size(),
+            |output_idx| output_idx,
+            |output_idx, _| {
+                hash_vector.get_u64(output_idx).ok_or_else(|| {
+                    paro_error::internal("HashBuildStore hash must not be NULL".to_string())
+                })
+            },
+            |output_idx, _| {
+                found_vector
+                    .as_ref()
+                    .and_then(|vector| vector.get_bool(output_idx))
+                    .unwrap_or(false)
+            },
+        )
     }
 
     pub fn append_key_payload_chunk(
@@ -606,43 +672,108 @@ impl HashBuildStore {
             })?);
         }
 
-        let layout = self.layout.clone();
-        let mut appended = 0usize;
-        for out_idx in 0..selected_count {
-            let source_row_idx = selection.get(out_idx);
-            let estimated_heap_bytes =
-                estimate_row_heap_bytes(&layout, &base_columns, source_row_idx);
-            let block = self.ensure_current_block()?;
-            block.append_row(
-                &layout,
-                estimated_heap_bytes,
-                |row_ptr, owned_bytes, owned_values, used_bytes| {
-                    for (col_idx, column) in base_columns.iter().enumerate() {
-                        unsafe {
-                            unsafe_api::write_vector_value(
-                                layout.base(),
-                                row_ptr,
-                                col_idx,
-                                column.as_ref(),
-                                source_row_idx,
-                                owned_bytes,
-                                owned_values,
-                                used_bytes,
-                            )
-                        }?;
-                    }
+        let base_columns = base_columns
+            .iter()
+            .map(|column| column.as_ref())
+            .collect::<Vec<_>>();
+        let source =
+            PreparedRowScatter::try_new(self.layout.base().as_ref(), &base_columns, keys.size())?;
+        self.append_prepared_rows(
+            &source,
+            selected_count,
+            |output_idx| selection.get(output_idx),
+            |output_idx, _| Ok(hashes[output_idx]),
+            |_, _| found,
+        )
+    }
 
-                    layout.set_hash(row_ptr, hashes[out_idx]);
-                    layout.set_next(row_ptr, ptr::null());
-                    layout.set_found(row_ptr, found);
-                    Ok(())
-                },
-            )?;
-            appended += 1;
+    fn append_prepared_rows<S, H, F>(
+        &mut self,
+        source: &PreparedRowScatter<'_>,
+        output_count: usize,
+        source_row_at: S,
+        hash_at: H,
+        found_at: F,
+    ) -> Result<usize>
+    where
+        S: Fn(usize) -> usize,
+        H: Fn(usize, usize) -> Result<u64>,
+        F: Fn(usize, usize) -> bool,
+    {
+        let mut row_usage = Vec::with_capacity(output_count);
+        let mut total_usage = RowHeapUsage::default();
+        for output_idx in 0..output_count {
+            let usage = source.heap_usage(source_row_at(output_idx))?;
+            total_usage = total_usage.checked_add(usage)?;
+            row_usage.push(usage);
         }
 
-        self.count = self.count.saturating_add(appended as u32);
-        Ok(appended)
+        let byte_buffer = if total_usage.varlen_bytes() == 0 {
+            None
+        } else {
+            Some(
+                self.memory
+                    .allocate_buffer(self.allocator.clone(), total_usage.varlen_bytes())?,
+            )
+        };
+        let value_release = if total_usage.nested_value_bytes() == 0 {
+            None
+        } else {
+            match self.memory.retain(total_usage.nested_value_bytes()) {
+                Ok(release) => Some(release),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let mut batch_values = StableValueHeap::default();
+        let layout = self.layout.clone();
+
+        let write_result = {
+            let mut heap = BatchRowHeap::new(byte_buffer.as_ref(), &mut batch_values);
+            (|| {
+                for output_idx in 0..output_count {
+                    let source_row_idx = source_row_at(output_idx);
+                    let usage = row_usage[output_idx];
+                    let row_heap_bytes = usage
+                        .varlen_bytes()
+                        .checked_add(usage.nested_value_bytes())
+                        .ok_or_else(|| {
+                            paro_error::out_of_range("hash build row heap size overflow")
+                        })?;
+                    let block = self.ensure_current_block()?;
+                    block.append_row(&layout, row_heap_bytes, &mut heap, |row_ptr, heap| {
+                        unsafe {
+                            source.scatter_row(
+                                layout.base().as_ref(),
+                                row_ptr,
+                                source_row_idx,
+                                heap,
+                            )?;
+                        }
+                        layout.set_hash(row_ptr, hash_at(output_idx, source_row_idx)?);
+                        layout.set_next(row_ptr, ptr::null());
+                        layout.set_found(row_ptr, found_at(output_idx, source_row_idx));
+                        Ok(())
+                    })?;
+                }
+                heap.validate_complete(total_usage)
+            })()
+        };
+        if let Err(error) = write_result {
+            if let Some(release) = value_release {
+                release.release();
+            }
+            return Err(error);
+        }
+
+        if let Some(buffer) = byte_buffer {
+            self.heap_buffers.push(buffer);
+        }
+        self.owned_values.append(&mut batch_values);
+        if let Some(release) = value_release {
+            self.value_releases.push(RetainedMemory(release));
+        }
+        self.count = self.count.saturating_add(output_count as u32);
+        Ok(output_count)
     }
 
     fn ensure_current_block(&mut self) -> Result<&mut BuildBlock> {
@@ -806,6 +937,15 @@ impl HashBuildStore {
             .collect()
     }
 
+    pub fn visit_row_ptrs(&self, mut visitor: impl FnMut(usize) -> Result<()>) -> Result<()> {
+        for block in self.blocks.iter() {
+            for row_idx in 0..block.row_count() {
+                visitor(block.row_ptr(row_idx) as usize)?;
+            }
+        }
+        Ok(())
+    }
+
     fn write_spill_row(
         layout: &BuildRowLayout,
         row_ptr: *const u8,
@@ -856,92 +996,6 @@ fn accounted_vec_for_context<T>(
         MemoryGrant::detached(usize::MAX / 4, memory.domain())
     };
     AccountedVec::new_with_accounting(grant, tag, class)
-}
-
-fn estimate_row_heap_bytes(
-    layout: &BuildRowLayout,
-    columns: &[&Arc<paro_common::vector::Vector>],
-    row_idx: usize,
-) -> usize {
-    layout
-        .base()
-        .types()
-        .iter()
-        .enumerate()
-        .map(|(col_idx, logical_type)| {
-            estimate_vector_heap_bytes(logical_type, columns[col_idx].as_ref(), row_idx)
-        })
-        .sum()
-}
-
-fn estimate_vector_heap_bytes(
-    logical_type: &LogicalType,
-    vector: &paro_common::vector::Vector,
-    row_idx: usize,
-) -> usize {
-    if vector.is_null(row_idx) {
-        return 0;
-    }
-
-    match logical_type {
-        LogicalType::Varchar
-        | LogicalType::VarcharCollation(_)
-        | LogicalType::TsVector
-        | LogicalType::TsQuery
-        | LogicalType::Json
-        | LogicalType::Jsonb
-        | LogicalType::StringLiteral => vector
-            .get_string(row_idx)
-            .map(|value| if value.len() > 12 { value.len() } else { 0 })
-            .unwrap_or_else(|| {
-                let value = vector.get_value(row_idx);
-                estimate_value_heap_bytes(logical_type, &value)
-            }),
-        LogicalType::Blob => vector
-            .get_blob(row_idx)
-            .map(|value| if value.len() > 12 { value.len() } else { 0 })
-            .unwrap_or_else(|| {
-                let value = vector.get_value(row_idx);
-                estimate_value_heap_bytes(logical_type, &value)
-            }),
-        LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Array(_, _) => {
-            let value = vector.get_value(row_idx);
-            estimate_value_heap_bytes(logical_type, &value)
-        }
-        _ => 0,
-    }
-}
-
-fn estimate_value_heap_bytes(logical_type: &LogicalType, value: &Value) -> usize {
-    match (logical_type, value) {
-        (
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb
-            | LogicalType::StringLiteral,
-            Value::Varchar(value),
-        ) => {
-            if value.len() > 12 {
-                value.len()
-            } else {
-                0
-            }
-        }
-        (LogicalType::Blob, Value::Blob(value)) => {
-            if value.len() > 12 {
-                value.len()
-            } else {
-                0
-            }
-        }
-        (LogicalType::List(_) | LogicalType::Array(_, _) | LogicalType::Struct(_), value) => {
-            std::mem::size_of::<Value>().saturating_add(value.allocation_size())
-        }
-        _ => 0,
-    }
 }
 
 #[cfg(test)]
@@ -1034,18 +1088,8 @@ mod tests {
             create_test_store(vec![LogicalType::Integer], vec![LogicalType::Varchar], true);
         store.append_chunk(&chunk).unwrap();
 
-        assert!(store
-            .blocks
-            .iter()
-            .all(|block| block.owned_values.is_empty()));
-        assert_eq!(
-            store
-                .blocks
-                .iter()
-                .map(|block| block.owned_bytes.len())
-                .sum::<usize>(),
-            1
-        );
+        assert_eq!(store.owned_values.len(), 0);
+        assert_eq!(store.heap_buffers.len(), 1);
 
         let mut scan_state = BuildStoreScanState::default();
         let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())

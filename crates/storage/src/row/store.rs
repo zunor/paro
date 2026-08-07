@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use paro_common::error::{self as paro_error, Result};
 
@@ -33,7 +33,7 @@ pub struct RowStore {
     count: u64,
     region_row_prefix: Vec<u64>,
     ordinal_locations: Vec<RowLocation>,
-    addr_to_ordinal: HashMap<RowAddr, u64>,
+    addr_to_ordinal: OnceLock<HashMap<RowAddr, u64>>,
     scan_chunks: Vec<ScanChunkMeta>,
 }
 
@@ -62,7 +62,6 @@ impl RowStore {
         let mut regions = Vec::with_capacity(raw_regions.len());
         let mut region_row_prefix = Vec::with_capacity(raw_regions.len() + 1);
         let mut ordinal_locations = Vec::with_capacity(indexed_count);
-        let mut addr_to_ordinal = HashMap::with_capacity(indexed_count);
         let mut scan_chunks = Vec::new();
         let mut ordinal_base = 0u64;
         region_row_prefix.push(0);
@@ -102,17 +101,6 @@ impl RowStore {
             );
             ordinal_base += region.row_count();
             region_row_prefix.push(ordinal_base);
-            for location in &locations {
-                if addr_to_ordinal
-                    .insert(location.addr, location.ordinal)
-                    .is_some()
-                {
-                    return Err(paro_error::internal(format!(
-                        "duplicate row address while sealing: {}",
-                        location.addr
-                    )));
-                }
-            }
             ordinal_locations.extend(locations);
             regions.push(region);
         }
@@ -123,7 +111,7 @@ impl RowStore {
             count,
             region_row_prefix,
             ordinal_locations,
-            addr_to_ordinal,
+            addr_to_ordinal: OnceLock::new(),
             scan_chunks,
         })
     }
@@ -187,12 +175,13 @@ impl RowStore {
     }
 
     pub fn pin_rows(&self, addrs: &[RowAddr]) -> Result<PinnedRows<'_>> {
+        let addr_to_ordinal = self.address_index()?;
         let mut rows = Vec::with_capacity(addrs.len());
         for &addr in addrs {
             if addr.is_invalid() {
                 return Err(paro_error::internal("cannot pin RowAddr::INVALID"));
             }
-            let ordinal = self.addr_to_ordinal.get(&addr).copied().ok_or_else(|| {
+            let ordinal = addr_to_ordinal.get(&addr).copied().ok_or_else(|| {
                 paro_error::internal(format!(
                     "row address {} does not belong to this store",
                     addr
@@ -200,12 +189,34 @@ impl RowStore {
             })?;
             rows.push(*self.location_for_ordinal(ordinal)?);
         }
-        Ok(PinnedRows::new(
-            self,
-            rows,
-            Ordering::Arbitrary,
-            PinSet::none(),
-        ))
+        PinnedRows::try_new(self, rows, Ordering::Arbitrary, PinSet::none())
+    }
+
+    fn address_index(&self) -> Result<&HashMap<RowAddr, u64>> {
+        if let Some(index) = self.addr_to_ordinal.get() {
+            return Ok(index);
+        }
+
+        let mut index = HashMap::with_capacity(self.ordinal_locations.len());
+        for location in &self.ordinal_locations {
+            if index.insert(location.addr, location.ordinal).is_some() {
+                return Err(paro_error::internal(format!(
+                    "duplicate row address while building reverse index: {}",
+                    location.addr
+                )));
+            }
+        }
+        // Concurrent readers may build the same immutable index. Exactly one
+        // wins installation and every loser observes that installed value.
+        let _ = self.addr_to_ordinal.set(index);
+        self.addr_to_ordinal
+            .get()
+            .ok_or_else(|| paro_error::internal("row address reverse index was not installed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn address_index_initialized(&self) -> bool {
+        self.addr_to_ordinal.get().is_some()
     }
 
     pub fn pin_ordinals<O>(&self, ordinals: &[O], ordering: Ordering) -> Result<PinnedRows<'_>>
@@ -216,7 +227,7 @@ impl RowStore {
         for &ordinal in ordinals {
             rows.push(*self.location_for_ordinal(ordinal.into())?);
         }
-        Ok(PinnedRows::new(self, rows, ordering, PinSet::none()))
+        PinnedRows::try_new(self, rows, ordering, PinSet::none())
     }
 
     pub fn pin_ordinal_range(&self, start: u64, len: u64) -> Result<PinnedRows<'_>> {
@@ -233,12 +244,7 @@ impl RowStore {
         let start_idx = self.ordinal_to_index(start)?;
         let end_idx = self.ordinal_to_index(end)?;
         let rows = self.ordinal_locations[start_idx..end_idx].to_vec();
-        Ok(PinnedRows::new(
-            self,
-            rows,
-            Ordering::Sequential,
-            PinSet::none(),
-        ))
+        PinnedRows::try_new(self, rows, Ordering::Sequential, PinSet::none())
     }
 
     pub fn scanner(&self) -> RowScanCursor<'_> {
@@ -352,12 +358,12 @@ impl PrefixReleasableRowStore {
 
     pub fn pin_ordinal_range(&self, start: u64, len: u64) -> Result<PinnedRows<'_>> {
         if len == 0 {
-            return Ok(PinnedRows::new(
+            return PinnedRows::try_new(
                 &self.store,
                 Vec::new(),
                 Ordering::Sequential,
                 PinSet::none(),
-            ));
+            );
         }
 
         let pin_set = PinSet::prefix(&self.store, &self.release_state);
@@ -384,12 +390,7 @@ impl PrefixReleasableRowStore {
         let start_idx = self.store.ordinal_to_index(start)?;
         let end_idx = self.store.ordinal_to_index(end)?;
         let rows = self.store.ordinal_locations[start_idx..end_idx].to_vec();
-        Ok(PinnedRows::new(
-            &self.store,
-            rows,
-            Ordering::Sequential,
-            pin_set,
-        ))
+        PinnedRows::try_new(&self.store, rows, Ordering::Sequential, pin_set)
     }
 
     pub fn advance_release_frontier(&self, frontier: u64) -> Result<()> {

@@ -14,18 +14,18 @@ use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::scalar::FunctionExecContext;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::operators::aggregate::accounted_rows::DistinctAggregateState;
 use crate::operators::aggregate::aggregate_kernel::{
     update_filtered_states, update_states, AggregatePayload,
 };
 use crate::operators::aggregate::build_helpers::{
-    build_per_aggregate_filters, combine_ungrouped_states, create_ungrouped_runtime_state,
-    destroy_ungrouped_local, fill_repeated_state_addresses, has_aggregate_distinct,
-    has_aggregate_filters, has_aggregate_ordered, query_modifier_memory,
+    build_per_aggregate_filters, can_skip_regular_aggregate_sink, combine_ungrouped_states,
+    create_ungrouped_runtime_state, destroy_ungrouped_local, fill_repeated_state_addresses,
+    has_aggregate_distinct, has_aggregate_filters, has_aggregate_ordered, query_modifier_memory,
 };
 use crate::operators::aggregate::distinct_helpers::{
     collect_distinct_rows, finalize_ungrouped_distinct,
 };
+use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::ordered_helpers::{
     collect_ordered_rows, finalize_ordered_ungrouped, merge_ordered_collectors,
 };
@@ -159,12 +159,20 @@ impl UngroupedAggregateSinkExec {
         let has_filters = has_aggregate_filters(&self.spec);
         let has_ordered = has_aggregate_ordered(&self.spec);
         if has_distinct {
+            // Ungrouped DISTINCT still needs a zero-column key prefix with the
+            // same logical row count as the payload. Scan batches may exceed
+            // VECTOR_SIZE, so its capacity must come from the batch rather
+            // than Chunk::try_new's default.
+            let mut groups =
+                Chunk::try_initialize(&[], payload.size().max(1), payload.allocator().clone())?;
+            groups.try_set_cardinality(payload.size())?;
             collect_distinct_rows(
                 &self.spec,
                 &local.aggregate_objects,
                 payload,
-                &[],
-                ctx.query.session.buffer_pool(),
+                &groups,
+                ctx.query.session.number_of_threads(),
+                ctx.query.memory.capacity_bytes(),
                 &local.modifier_memory,
                 &mut local.distinct,
             )?;
@@ -255,7 +263,7 @@ impl UngroupedAggregateSinkExec {
 
     pub(crate) fn merge_local(
         &self,
-        ctx: &mut OperatorCallContext,
+        _ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -269,17 +277,16 @@ impl UngroupedAggregateSinkExec {
                 "ungrouped aggregate sink local state mismatch",
             ));
         };
-        let distinct_allocator = ctx.query.allocator(MemoryTag::HashTable);
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Ungrouped(global) = state else {
                 return Err(paro_error::internal(
                     "aggregate handle does not contain ungrouped aggregate state",
                 ));
             };
-            global
-                .distinct
-                .merge_from(&mut local.distinct, distinct_allocator)?;
-            combine_ungrouped_states(global, local)?;
+            global.distinct.merge_from(&mut local.distinct)?;
+            if !can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects) {
+                combine_ungrouped_states(global, local)?;
+            }
             merge_ordered_collectors(
                 &mut global.ordered_collectors,
                 &mut local.ordered_collectors,

@@ -3,11 +3,12 @@
 
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
 #[derive(Debug, Clone)]
 pub struct HashJoinSpec {
     pub join_type: JoinType,
+    pub anti_join_mode: AntiJoinMode,
     pub conditions: Box<[JoinCondition]>,
     pub left_projection: Box<[usize]>,
     /// Columns copied from the build input into the hash-table payload.

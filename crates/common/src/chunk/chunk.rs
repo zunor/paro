@@ -242,7 +242,12 @@ impl Chunk {
                 self.capacity
             )));
         }
-        if self.count == count {
+        if self.count == count
+            && self
+                .data
+                .iter()
+                .all(|vector| vector.count_matches_cardinality(count))
+        {
             return Ok(());
         }
 

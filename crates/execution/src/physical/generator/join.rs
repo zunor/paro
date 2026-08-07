@@ -23,6 +23,15 @@ impl PhysicalPlanGenerator {
         join: &ComparisonJoin,
         join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        if join.anti_join_mode == AntiJoinMode::NullAware
+            && (join.join_type != JoinType::Anti
+                || join.conditions.len() != 1
+                || join.conditions[0].comparison != JoinComparisonType::Equal)
+        {
+            return Err(paro_error::internal(
+                "null-aware anti join requires one ordinary equality condition",
+            ));
+        }
         if !supports_typed_hash_join_type(join.join_type) {
             return self.unsupported_preserving_children(
                 "JOIN",
@@ -40,6 +49,11 @@ impl PhysicalPlanGenerator {
                 .all(|c| is_hash_join_comparison(c.comparison));
         if all_hashable {
             return self.lower_comparison_hash_join(join);
+        }
+        if join.anti_join_mode == AntiJoinMode::NullAware {
+            return Err(paro_error::internal(
+                "null-aware anti join requires hashable equality conditions",
+            ));
         }
         if is_classic_ie_join_candidate(join, join_cardinality) {
             return self.lower_classic_ie_join(join);
@@ -262,6 +276,7 @@ impl PhysicalPlanGenerator {
         let output_types = join.get_types();
         let spec = HashJoinSpec {
             join_type: join.join_type,
+            anti_join_mode: join.anti_join_mode,
             conditions: join.conditions.clone().into_boxed_slice(),
             left_projection: left_projection.into_boxed_slice(),
             build_input_projection: right_projection.into_boxed_slice(),
@@ -400,6 +415,7 @@ impl PhysicalPlanGenerator {
         let output_types = join.get_types();
         let spec = HashJoinSpec {
             join_type: join.join_type,
+            anti_join_mode: join.anti_join_mode,
             conditions: join.conditions.clone().into_boxed_slice(),
             left_projection: left_projection.into_boxed_slice(),
             build_input_projection: right_projection.into_boxed_slice(),

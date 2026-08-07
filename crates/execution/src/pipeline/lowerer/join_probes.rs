@@ -562,6 +562,7 @@ impl<'a> PipelineLowerer<'a> {
         let replay_source = SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
             handle,
             join_type: spec.join_type,
+            anti_join_mode: spec.anti_join_mode,
             conditions: spec.conditions.clone(),
             probe_types: self.plan.node(*left).output.types.clone(),
             build_payload_types: spec.build_payload_types.clone(),

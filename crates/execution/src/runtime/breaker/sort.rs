@@ -117,7 +117,43 @@ impl SortHandle {
         Ok(())
     }
 
-    pub fn seal(&self, num_threads: usize) -> Result<()> {
+    pub fn prepare_parallel_materialization(
+        &self,
+        num_threads: usize,
+        memory_budget_bytes: usize,
+    ) -> Result<Option<SortMaterializationBuild>> {
+        if self.is_sealed() || self.is_external() || num_threads <= 1 {
+            return Ok(None);
+        }
+
+        let mut pending = self.pending_runs.lock();
+        if pending.len() <= 1 || pending.iter().any(SortedRun::is_external) {
+            return Ok(None);
+        }
+        let total_count = checked_sorted_row_count(&pending)?;
+        let task_count = num_threads.min(total_count.div_ceil(VECTOR_SIZE)).max(1);
+        if task_count <= 1 {
+            return Ok(None);
+        }
+        let materialized_bytes = checked_sorted_run_bytes(&pending)?;
+        if materialized_bytes > memory_budget_bytes {
+            return Ok(None);
+        }
+
+        let runs = std::mem::take(&mut *pending);
+        drop(pending);
+        let merger = Arc::new(SortedRunMerger::new(self.sort()?, runs));
+        let partition_size = total_count.div_ceil(task_count);
+        Ok(Some(SortMaterializationBuild {
+            merger,
+            output_types: self.output_types()?.to_vec().into_boxed_slice(),
+            partition_size,
+            task_count,
+            total_count,
+        }))
+    }
+
+    pub fn seal_streaming(&self) -> Result<()> {
         if self.is_sealed() {
             return Ok(());
         }
@@ -128,53 +164,70 @@ impl SortHandle {
             let mut pending = self.pending_runs.lock();
             std::mem::take(&mut *pending)
         };
-        let total_count = runs.iter().map(SortedRun::count).sum::<usize>();
+        let total_count = checked_sorted_row_count(&runs)?;
         let external = self.is_external();
-        let partition_size = if num_threads <= 1 {
-            VECTOR_SIZE
-        } else {
-            total_count.min(paro_storage::meta::DEFAULT_SORT_PARTITION_SIZE)
-        }
-        .max(1);
 
-        let state = if total_count == 0 {
-            SortSealedState {
-                sort,
-                output_types,
-                single_run: None,
-                merger: None,
-                merger_gstate: None,
-                total_count,
-            }
+        let output = if total_count == 0 {
+            SortOutputState::Empty
         } else if !external && runs.len() == 1 {
-            SortSealedState {
-                sort,
-                output_types,
-                single_run: Some(Arc::new(runs.into_iter().next().expect("single run"))),
-                merger: None,
-                merger_gstate: None,
-                total_count,
-            }
+            SortOutputState::SingleRun(Arc::new(runs.into_iter().next().expect("single run")))
         } else {
             let merger = Arc::new(SortedRunMerger::new(Arc::clone(&sort), runs));
             let merger_gstate = Arc::new(SortedRunMergerGlobalState::new(
                 total_count,
-                partition_size,
+                total_count.max(1),
                 external,
-                num_threads.max(1),
+                1,
             ));
-            SortSealedState {
-                sort,
-                output_types,
-                single_run: None,
-                merger: Some(merger),
-                merger_gstate: Some(merger_gstate),
-                total_count,
+            SortOutputState::StreamingMerge {
+                merger,
+                global: merger_gstate,
             }
         };
 
-        let _ = self.sealed.set(Arc::new(state));
-        Ok(())
+        self.install_sealed(SortSealedState {
+            sort,
+            output_types,
+            output,
+            total_count,
+        })
+    }
+
+    pub(crate) fn install_materialized(
+        &self,
+        chunks: Vec<Chunk>,
+        expected_count: usize,
+    ) -> Result<()> {
+        let output_types = self.output_types()?.to_vec().into_boxed_slice();
+        let total_count = chunks.iter().try_fold(0usize, |count, chunk| {
+            if chunk.types() != output_types.as_ref() {
+                return Err(paro_error::internal(format!(
+                    "materialized sort chunk schema mismatch: expected={:?}, actual={:?}",
+                    output_types,
+                    chunk.types()
+                )));
+            }
+            count
+                .checked_add(chunk.size())
+                .ok_or_else(|| paro_error::internal("materialized sort row count overflow"))
+        })?;
+        if total_count != expected_count {
+            return Err(paro_error::internal(format!(
+                "materialized sort row count mismatch: expected={expected_count}, actual={total_count}"
+            )));
+        }
+        self.install_sealed(SortSealedState {
+            sort: self.sort()?,
+            output_types,
+            output: SortOutputState::Materialized(Arc::from(chunks.into_boxed_slice())),
+            total_count,
+        })
+    }
+
+    fn install_sealed(&self, state: SortSealedState) -> Result<()> {
+        self.sealed
+            .set(Arc::new(state))
+            .map_err(|_| paro_error::internal("sort handle was sealed more than once"))
     }
 
     #[inline]
@@ -337,10 +390,44 @@ impl Reclaimer for SortPendingRunsReclaimer {
 pub struct SortSealedState {
     pub sort: Arc<Sort>,
     pub output_types: Box<[LogicalType]>,
-    pub single_run: Option<Arc<SortedRun>>,
-    pub merger: Option<Arc<SortedRunMerger>>,
-    pub merger_gstate: Option<Arc<SortedRunMergerGlobalState>>,
+    pub output: SortOutputState,
     pub total_count: usize,
+}
+
+#[derive(Debug)]
+pub enum SortOutputState {
+    Empty,
+    SingleRun(Arc<SortedRun>),
+    Materialized(Arc<[Chunk]>),
+    StreamingMerge {
+        merger: Arc<SortedRunMerger>,
+        global: Arc<SortedRunMergerGlobalState>,
+    },
+}
+
+#[derive(Debug)]
+pub struct SortMaterializationBuild {
+    pub merger: Arc<SortedRunMerger>,
+    pub output_types: Box<[LogicalType]>,
+    pub partition_size: usize,
+    pub task_count: usize,
+    pub total_count: usize,
+}
+
+fn checked_sorted_row_count(runs: &[SortedRun]) -> Result<usize> {
+    runs.iter().try_fold(0usize, |count, run| {
+        count
+            .checked_add(run.count())
+            .ok_or_else(|| paro_error::internal("sorted row count overflow"))
+    })
+}
+
+fn checked_sorted_run_bytes(runs: &[SortedRun]) -> Result<usize> {
+    runs.iter().try_fold(0usize, |bytes, run| {
+        bytes
+            .checked_add(run.size_in_bytes())
+            .ok_or_else(|| paro_error::internal("sorted run byte count overflow"))
+    })
 }
 
 #[derive(Debug)]
@@ -612,9 +699,11 @@ mod tests {
             ReclaimStats::empty(1)
         );
 
-        handle.seal(1).expect("seal sort");
+        handle.seal_streaming().expect("seal sort");
         let state = handle.sealed_state().expect("sealed state");
-        let merger = state.merger.as_ref().expect("external run merger");
+        let SortOutputState::StreamingMerge { merger, .. } = &state.output else {
+            panic!("external sort should seal as a streaming merge");
+        };
         assert!(merger.sorted_runs.iter().all(SortedRun::is_external));
     }
 

@@ -43,10 +43,12 @@ pub use states::{
 pub use allocator::{HeapAllocation, RawRowAllocator, RawRowBlock, RowAllocation};
 
 // Re-export segment types
+pub(crate) use segment::RawRowLocation;
 #[allow(unused_imports)]
 pub use segment::{ContinuousIdSet, RawRowChunk, RawRowChunkPart, RawRowSegment};
 
 // Re-export collection types
+pub(crate) use collection::RawPinnedRows;
 pub use collection::RawRowCollection;
 
 // Re-export partitioned raw-row substrate

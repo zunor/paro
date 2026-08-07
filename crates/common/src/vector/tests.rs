@@ -1764,3 +1764,41 @@ fn test_try_copy_at_list_child_growth_propagates_allocation_error() {
 
     assert!(err.to_string().contains("injected allocation failure"));
 }
+
+#[test]
+fn test_try_copy_at_array_out_of_order_preserves_written_extent() {
+    let source = crate::test_utils::test_embeddings_vector(
+        &[vec![1.0_f32, 2.0, 3.0], vec![4.0_f32, 5.0, 6.0]],
+        3,
+    );
+    let mut destination = Vector::try_new(
+        LogicalType::Array(Box::new(LogicalType::Float), 3),
+        4,
+        source.allocator().clone(),
+    )
+    .unwrap();
+    destination.try_set_count(4).unwrap();
+
+    destination.try_copy_at(3, &source, 0).unwrap();
+    destination.try_copy_at(1, &source, 1).unwrap();
+
+    let child = destination.child().expect("array child");
+    assert_eq!(child.len(), 12);
+    assert_eq!(child.validity().len(), 12);
+    assert_eq!(
+        destination.get_value(3),
+        Value::Array(
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+            LogicalType::Float,
+            3,
+        )
+    );
+    assert_eq!(
+        destination.get_value(1),
+        Value::Array(
+            vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)],
+            LogicalType::Float,
+            3,
+        )
+    );
+}

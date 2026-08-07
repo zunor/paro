@@ -19,9 +19,10 @@ use crate::operators::aggregate::payload_spill::{
 };
 use crate::runtime::breaker::{AggregateHandle, UngroupedAggregateRuntimeState};
 
-use super::accounted_rows::DistinctAggregateState;
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
+use super::distinct_state::DistinctAggregateState;
+use super::group_key_codec::GroupKeyEncoder;
 use super::ordered_helpers::OrderedAggregateCollector;
 use super::perfect_aggregate_hashtable::{PerfectAggregateHashTable, PerfectHTScanPosition};
 use super::radix_partitioned_aggregate_hashtable::{AggregateHTScanPosition, AggregateHashTable};
@@ -30,6 +31,7 @@ use super::row_format::AggregateGroupFormat;
 #[derive(Debug, Default)]
 pub struct HashAggregateEmitSourceLocal {
     pub work: Option<HashAggregateEmitWork>,
+    pub scan_chunk: Option<Chunk>,
     pub spilled_chunk: Option<Chunk>,
     pub position: AggregateHTScanPosition,
     pub having_executor: Option<ExpressionExecutor>,
@@ -114,6 +116,7 @@ pub struct HashAggregateBuildSinkLocal {
     pub projection_executor: Option<ExpressionExecutor>,
     pub payload_chunk: Option<Chunk>,
     pub group_refs: Box<[usize]>,
+    pub(crate) group_key_encoder: GroupKeyEncoder,
     pub grouping_sets: Box<[Box<[usize]>]>,
     pub addresses: Vector,
     pub new_groups: SelectionVector,

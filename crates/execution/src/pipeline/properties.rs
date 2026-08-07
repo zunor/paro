@@ -193,8 +193,8 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
         }
         SourceSpec::SortEmit(spec) => {
             properties.provided.ordering = OrderingProperty::Fixed(spec.ordering.clone());
-            properties.capabilities.parallelism = Parallelism::unbounded();
-            properties.placement = Placement::Local;
+            properties.capabilities.parallelism = Parallelism::single();
+            properties.placement = Placement::SingleTask;
             properties.memory.class = MemoryClass::Blocking;
         }
         SourceSpec::TopNEmit(spec) => {

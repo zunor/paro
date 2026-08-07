@@ -40,7 +40,7 @@ use crate::rowset::encoding::{
 };
 use crate::rowset::page::{
     CompressionType, DataPageFooter, EncodingType, IndexPageFooter, IndexPageType, NullEncoding,
-    PageFooter, PageIO, PagePointer,
+    PageFooter, PageIO, PagePointer, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
 use crate::statistics::{BaseStatistics, ColumnStatistics};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -94,7 +94,7 @@ pub struct ColumnWriterOptions {
     pub min_space_saving: f64,
     /// Encoding type (Default = auto-select)
     pub encoding: EncodingType,
-    /// Format version (1 or 2)
+    /// Data-page format version.
     pub format_version: u32,
     /// Whether to build a bloom filter index
     pub build_bloom_filter: bool,
@@ -126,7 +126,7 @@ impl ColumnWriterOptions {
             compression: CompressionType::Lz4,
             min_space_saving: DEFAULT_MIN_SPACE_SAVING,
             encoding: EncodingType::Default,
-            format_version: 2,
+            format_version: CURRENT_DATA_PAGE_FORMAT_VERSION,
             build_bloom_filter: false,
             build_bitmap_index: false,
             fixed_len: 0,
@@ -1477,12 +1477,22 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 data[offset + 3],
             ]) as usize;
 
-            let value_end = value_start + len;
+            let value_end = value_start.checked_add(len).ok_or_else(|| {
+                paro_error::invalid_input("Variable-length value offset overflow")
+            })?;
             if value_end > data.len() {
                 break;
             }
 
             let value = &data[value_start..value_end];
+            if self.opts.field_type.requires_valid_utf8() {
+                std::str::from_utf8(value).map_err(|_| {
+                    paro_error::invalid_input(format!(
+                        "Invalid UTF-8 for {:?} column {}",
+                        self.opts.field_type, self.opts.column_id
+                    ))
+                })?;
+            }
             let success = match &mut self.page_builder {
                 PageBuilderImpl::BinaryPlain(b) => b.add_slice(value),
                 PageBuilderImpl::BinaryDict(b) => b.add_slice(value),
@@ -1720,5 +1730,19 @@ mod tests {
 
         let meta = writer.finish().unwrap();
         assert_eq!(meta.num_rows, 4);
+    }
+
+    #[test]
+    fn utf8_storage_types_reject_invalid_bytes_before_encoding() {
+        let encoded = [2, 0, 0, 0, 0xff, 0xfe];
+        for field_type in [FieldType::Char, FieldType::Varchar, FieldType::Json] {
+            let opts = ColumnWriterOptions::new(field_type, 7)
+                .with_nullable(false)
+                .with_encoding(EncodingType::Plain);
+            let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+
+            assert!(writer.append(&encoded, None, 1).is_err());
+            assert_eq!(writer.num_rows(), 0);
+        }
     }
 }

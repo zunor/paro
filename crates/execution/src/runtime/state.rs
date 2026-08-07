@@ -335,14 +335,12 @@ pub enum TransformLocal {
 
 #[derive(Debug)]
 pub struct TransformGlobalSlots {
-    slots: Box<[TransformGlobal]>,
+    slots: Vec<TransformGlobal>,
 }
 
 impl TransformGlobalSlots {
     pub fn new(slots: Vec<TransformGlobal>) -> Self {
-        Self {
-            slots: slots.into_boxed_slice(),
-        }
+        Self { slots }
     }
 
     #[inline]

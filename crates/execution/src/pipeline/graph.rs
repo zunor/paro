@@ -614,6 +614,7 @@ pub struct NljUnmatchedSourceSpec {
 pub struct HashJoinSpillReplaySourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
+    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
     pub conditions: Box<[JoinCondition]>,
     pub probe_types: Box<[LogicalType]>,
     pub build_payload_types: Box<[LogicalType]>,
@@ -793,6 +794,7 @@ pub struct PropertyRepairSpec {
 pub struct HashJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
+    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
     pub conditions: Box<[JoinCondition]>,
     pub left_projection: Box<[usize]>,
     pub output_names: Box<[String]>,

@@ -5,7 +5,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::hash::hashing::compute_hashes_for_keys_into;
@@ -29,6 +29,7 @@ use std::sync::Arc;
 pub struct HashJoinProbeTransformExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
+    pub anti_join_mode: AntiJoinMode,
     pub conditions: Box<[JoinCondition]>,
     pub left_projection: Box<[usize]>,
     pub output_types: Box<[LogicalType]>,
@@ -96,6 +97,11 @@ impl HashJoinProbeTransformExec {
         }
         let hash_table = global.handle.require_table()?;
         ensure_transform_output(output, &self.output_types, VECTOR_SIZE)?;
+
+        if self.anti_join_mode == AntiJoinMode::NullAware && hash_table.has_null_keys() {
+            output.try_set_cardinality(0)?;
+            return Ok(TransformPoll::NeedMoreInput);
+        }
 
         if global.handle.is_external() {
             if input.is_empty() {
@@ -215,6 +221,7 @@ impl HashJoinProbeTransformExec {
                     .ok_or_else(|| paro_error::internal("hash join scan structure missing"))?;
                 let count = scan_hash_join_results(
                     self.join_type,
+                    self.anti_join_mode,
                     probe_keys,
                     input,
                     output,

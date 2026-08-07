@@ -54,7 +54,7 @@ PROJECTION  (rows=6)
   ->  WINDOW  (rows=6)
     ->  ROWSET_SCAN on public.window_spill_test  (rows=6)
       Columns: part, id, score
-      Pushed Predicate: col#0 = 1 OR col#0 = 2
+      Pushed Predicate: col#0 IN (1, 2)
       Late Materialize: auto
 
 CREATE TABLE window_large_partition_test (part INT, id INT, payload VARCHAR);

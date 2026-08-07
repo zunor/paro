@@ -30,7 +30,7 @@ mod page_io;
 
 pub use page::{
     DataPageFooter, DictPageFooter, IndexPageFooter, IndexPageType, NullEncoding, Page, PageFooter,
-    PagePointer, PageType, ShortKeyFooter,
+    PagePointer, PageType, ShortKeyFooter, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
 pub use page_builder::{PageBuilder, PageBuilderOptions};
 pub use page_decoder::{EncodingType, PageDecoder, PageDecoderOptions};

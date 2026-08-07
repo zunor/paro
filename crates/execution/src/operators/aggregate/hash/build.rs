@@ -19,22 +19,25 @@ use paro_storage::row::{RowSpillWriter, RowStoreSpillWriter};
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
-use crate::operators::aggregate::accounted_rows::DistinctAggregateState;
 use crate::operators::aggregate::aggregate_kernel::{
     aggregate_state_spill_requires_serialization, aggregate_state_spill_supported, combine_states,
     deserialize_aggregate_state_blob, destroy_states,
 };
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
+#[cfg(test)]
+use crate::operators::aggregate::build_helpers::build_groups_chunk;
 use crate::operators::aggregate::build_helpers::{
-    aggregate_objects, build_groups_chunk, create_hash_aggregate_tables, group_payload_refs,
-    group_types, has_aggregate_distinct, has_aggregate_ordered, normalized_grouping_sets,
-    projected_payload_chunk, query_hash_table_memory, query_modifier_memory,
-    update_hash_aggregate_tables,
+    aggregate_objects, can_skip_regular_aggregate_sink, create_hash_aggregate_tables,
+    group_payload_refs, group_types, has_aggregate_distinct, has_aggregate_ordered,
+    normalized_grouping_sets, projected_payload_chunk, query_hash_table_memory,
+    query_modifier_memory, update_hash_aggregate_tables,
 };
 use crate::operators::aggregate::distinct_helpers::{
     collect_distinct_rows, finalize_distinct_into_tables,
 };
-use crate::operators::aggregate::grouped_aggregate_hashtable::hash_group_columns;
+use crate::operators::aggregate::distinct_state::DistinctAggregateState;
+use crate::operators::aggregate::group_hash::hash_group_columns;
+use crate::operators::aggregate::group_key_codec::GroupKeyEncoder;
 use crate::operators::aggregate::ordered_helpers::{
     collect_ordered_rows, empty_ordered_collectors_with_memory, finalize_ordered_into_hash_tables,
     merge_ordered_collectors,
@@ -58,6 +61,8 @@ use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll,
 use crate::runtime::state::{
     BreakerHandleGlobal, HashAggregateBuildSinkLocal, SinkGlobal, SinkLocal,
 };
+
+use super::distinct_finalize::prepare_parallel_distinct_finalize;
 
 const HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD: usize =
     paro_storage::buffer::DEFAULT_BLOCK_ALLOC_SIZE * 4;
@@ -130,16 +135,19 @@ impl HashAggregateBuildSinkExec {
         let raw_payload_spill_enabled =
             hash_aggregate_local_payload_spill_enabled(ctx.query, &self.spec);
         let aggregate_objects = Arc::from(aggregate_objects(&self.spec)?.into_boxed_slice());
-        let tables = Arc::new(parking_lot::Mutex::new(if raw_payload_spill_enabled {
-            Vec::new()
-        } else {
-            create_hash_aggregate_tables(
-                &self.spec,
-                ctx.query.allocator(MemoryTag::HashTable),
-                query_hash_table_memory(ctx.query),
-                ctx.query.session.number_of_threads(),
-            )?
-        }));
+        let skip_regular_sink = can_skip_regular_aggregate_sink(&self.spec, &aggregate_objects);
+        let tables = Arc::new(parking_lot::Mutex::new(
+            if raw_payload_spill_enabled || skip_regular_sink {
+                Vec::new()
+            } else {
+                create_hash_aggregate_tables(
+                    &self.spec,
+                    ctx.query.allocator(MemoryTag::HashTable),
+                    query_hash_table_memory(ctx.query),
+                    ctx.query.session.number_of_threads(),
+                )?
+            },
+        ));
         let raw_payload_spill_requested = Arc::new(AtomicBool::new(raw_payload_spill_enabled));
         let state_spill = Arc::new(parking_lot::Mutex::new(None));
         let (
@@ -147,7 +155,7 @@ impl HashAggregateBuildSinkExec {
             local_payload_spill_reclaimer_name,
             local_state_spill_reclaimer_name,
             query_memory,
-        ) = if raw_payload_spill_enabled {
+        ) = if raw_payload_spill_enabled || skip_regular_sink {
             (None, None, None, None)
         } else {
             let local_id = AggregateLocalBuildCompactionReclaimer::next_local_id();
@@ -186,7 +194,7 @@ impl HashAggregateBuildSinkExec {
                             Arc::clone(&state_spill),
                             Arc::clone(&raw_payload_spill_requested),
                             ctx.query.session.buffer_pool().clone(),
-                            group_types(&self.spec),
+                            group_types(&self.spec)?,
                             state_width,
                             state_encoding,
                             aggregate_payload_spill_radix_bits(
@@ -224,6 +232,11 @@ impl HashAggregateBuildSinkExec {
                 })
                 .transpose()?,
             group_refs: group_payload_refs(&self.spec)?.into_boxed_slice(),
+            group_key_encoder: GroupKeyEncoder::try_new(
+                &self.spec,
+                VECTOR_SIZE,
+                ctx.query.allocator(MemoryTag::HashTable),
+            )?,
             grouping_sets: normalized_grouping_sets(&self.spec)?
                 .into_iter()
                 .map(Vec::into_boxed_slice)
@@ -285,15 +298,13 @@ impl HashAggregateBuildSinkExec {
         } else {
             input
         };
+        let groups = local
+            .group_key_encoder
+            .encode_payload(payload, &local.group_refs)?;
         if local.raw_payload_spill_enabled
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
-            append_payload_to_local_spill(
-                ctx,
-                payload,
-                &local.group_refs,
-                &mut local.payload_spill,
-            )?;
+            append_payload_to_local_spill(ctx, payload, groups, &mut local.payload_spill)?;
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
@@ -302,8 +313,9 @@ impl HashAggregateBuildSinkExec {
                 &self.spec,
                 &local.aggregate_objects,
                 payload,
-                &local.group_refs,
-                ctx.query.session.buffer_pool(),
+                groups,
+                ctx.query.session.number_of_threads(),
+                ctx.query.memory.capacity_bytes(),
                 &local.modifier_memory,
                 &mut local.distinct,
             )?;
@@ -317,18 +329,16 @@ impl HashAggregateBuildSinkExec {
                 &mut local.ordered_collectors,
             )?;
         }
+        if can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects) {
+            return Ok(SinkPoll::NeedMoreInput);
+        }
         let tables_ref = Arc::clone(&local.tables);
         let mut tables = tables_ref.lock();
         if local.raw_payload_spill_enabled
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
             drop(tables);
-            append_payload_to_local_spill(
-                ctx,
-                payload,
-                &local.group_refs,
-                &mut local.payload_spill,
-            )?;
+            append_payload_to_local_spill(ctx, payload, groups, &mut local.payload_spill)?;
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
@@ -336,7 +346,7 @@ impl HashAggregateBuildSinkExec {
             &self.spec,
             &local.aggregate_objects,
             payload,
-            &local.group_refs,
+            groups,
             &local.grouping_sets,
             &mut tables,
             &mut local.addresses,
@@ -347,7 +357,7 @@ impl HashAggregateBuildSinkExec {
 
     pub(crate) fn merge_local(
         &self,
-        ctx: &mut OperatorCallContext,
+        _ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -379,7 +389,6 @@ impl HashAggregateBuildSinkExec {
             })?;
             return Ok(MergePoll::Done);
         }
-        let distinct_allocator = ctx.query.allocator(MemoryTag::HashTable);
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Hash(global) = state else {
                 return Err(paro_error::internal(
@@ -387,9 +396,14 @@ impl HashAggregateBuildSinkExec {
                 ));
             };
             let mut local_tables = local.tables.lock();
-            global
-                .distinct
-                .merge_from(&mut local.distinct, distinct_allocator)?;
+            global.distinct.merge_from(&mut local.distinct)?;
+            if can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects) {
+                merge_ordered_collectors(
+                    &mut global.ordered_collectors,
+                    &mut local.ordered_collectors,
+                )?;
+                return Ok(());
+            }
             if global.tables.len() != local_tables.len() {
                 return Err(paro_error::internal(format!(
                     "hash aggregate table count mismatch: global={} local={}",
@@ -428,9 +442,19 @@ impl HashAggregateBuildSinkExec {
     pub(crate) fn finish_work(
         &self,
         _ctx: &mut OperatorFinishContext,
-        _global: &SinkGlobal,
+        global: &SinkGlobal,
     ) -> Result<FinishWork> {
-        Ok(FinishWork::None)
+        let SinkGlobal::HashAggregateBuild(global) = global else {
+            return Err(paro_error::internal(
+                "hash aggregate sink global state mismatch",
+            ));
+        };
+        Ok(
+            match prepare_parallel_distinct_finalize(global.handle.clone(), &self.spec)? {
+                Some(group) => FinishWork::Parallel(group),
+                None => FinishWork::None,
+            },
+        )
     }
 
     pub(crate) fn finish(
@@ -564,11 +588,10 @@ fn aggregate_payload_spill_radix_bits(parallelism: usize) -> usize {
 fn append_payload_to_local_spill(
     ctx: &mut OperatorCallContext,
     payload: &Chunk,
-    group_refs: &[usize],
+    groups: &Chunk,
     payload_spill: &mut Option<AggregatePayloadSpillBuffer>,
 ) -> Result<()> {
-    let groups = build_groups_chunk(payload, group_refs)?;
-    let hashes = hash_group_columns(&groups)?;
+    let hashes = hash_group_columns(groups)?;
     if payload_spill.is_none() {
         *payload_spill = Some(AggregatePayloadSpillBuffer::new(
             ctx.query.session.buffer_pool().clone(),
@@ -939,6 +962,8 @@ fn spill_payload_partitions_to_outputs(
     )?;
     let mut new_groups =
         SelectionVector::try_with_capacity(VECTOR_SIZE, ctx.query.allocator(MemoryTag::HashTable))?;
+    let mut group_key_encoder =
+        GroupKeyEncoder::try_new(spec, VECTOR_SIZE, ctx.query.allocator(MemoryTag::HashTable))?;
 
     for partition_idx in 0..partition_count {
         let mut partition_tables = create_hash_aggregate_tables(
@@ -992,11 +1017,12 @@ fn spill_payload_partitions_to_outputs(
                 partition_idx,
                 ctx.query.allocator(MemoryTag::HashTable),
                 |payload_batch| {
+                    let groups = group_key_encoder.encode_payload(payload_batch, group_refs)?;
                     update_hash_aggregate_tables(
                         spec,
                         aggregate_objects,
                         payload_batch,
-                        group_refs,
+                        groups,
                         grouping_sets,
                         &mut partition_tables,
                         &mut addresses,
@@ -1055,7 +1081,7 @@ fn spill_in_memory_tables_to_state_partitions(
     let state_width = AggregateStateLayout::new(aggregate_objects)?.total_size();
     let mut state_spill = AggregateStateSpillBuffer::new(
         ctx.query.session.buffer_pool().clone(),
-        group_types(spec),
+        group_types(spec)?,
         state_width,
         hash_aggregate_state_spill_encoding(aggregate_objects),
         aggregate_payload_spill_radix_bits(ctx.query.session.number_of_threads()),
@@ -1099,6 +1125,8 @@ fn replay_spilled_payloads_into_tables(
     )?;
     let mut new_groups =
         SelectionVector::try_with_capacity(VECTOR_SIZE, ctx.query.allocator(MemoryTag::HashTable))?;
+    let mut group_key_encoder =
+        GroupKeyEncoder::try_new(spec, VECTOR_SIZE, ctx.query.allocator(MemoryTag::HashTable))?;
     for partition_idx in 0..partition_count {
         let mut partition_tables = create_hash_aggregate_tables(
             spec,
@@ -1111,11 +1139,12 @@ fn replay_spilled_payloads_into_tables(
                 partition_idx,
                 ctx.query.allocator(MemoryTag::HashTable),
                 |payload_batch| {
+                    let groups = group_key_encoder.encode_payload(payload_batch, group_refs)?;
                     update_hash_aggregate_tables(
                         spec,
                         aggregate_objects,
                         payload_batch,
-                        group_refs,
+                        groups,
                         grouping_sets,
                         &mut partition_tables,
                         &mut addresses,
@@ -1227,6 +1256,7 @@ mod tests {
 
     use crate::explain::profiler::OperatorProfiler;
     use crate::memory_runtime::QueryMemoryPool;
+    use crate::physical::specs::GroupKeyEncoding;
     use crate::pipeline::graph::PipelineId;
     use crate::runtime::parameter::ParameterBindings;
     use crate::runtime::scratch::TaskMemoryGrants;
@@ -1243,9 +1273,11 @@ mod tests {
     fn grouped_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Integer]),
             groups: Box::new([reference(0, LogicalType::Integer)]),
+            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
                 get_count_star_function(),
@@ -1269,9 +1301,11 @@ mod tests {
             .expect("bind string_agg");
         AggregateSpec {
             grouping_key_count: 1,
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Integer, LogicalType::Varchar]),
             groups: Box::new([reference(0, LogicalType::Integer)]),
+            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
                 string_agg,
@@ -1377,11 +1411,12 @@ mod tests {
         let mut addresses =
             paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
         let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
+        let global_groups = build_groups_chunk(&global_payload, &group_refs).expect("groups");
         update_hash_aggregate_tables(
             &spec,
             &aggregate_objects,
             &global_payload,
-            &group_refs,
+            &global_groups,
             &grouping_sets,
             &mut tables,
             &mut addresses,
@@ -1505,11 +1540,12 @@ mod tests {
         let mut addresses =
             paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
         let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
+        let global_groups = build_groups_chunk(&global_payload, &group_refs).expect("groups");
         update_hash_aggregate_tables(
             &spec,
             &aggregate_objects,
             &global_payload,
-            &group_refs,
+            &global_groups,
             &grouping_sets,
             &mut tables,
             &mut addresses,

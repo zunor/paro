@@ -10,6 +10,22 @@ fn aggregate_breaker_graph(
     input_types: Vec<LogicalType>,
     output: RowType,
 ) -> PipelineGraph {
+    aggregate_breaker_graph_from_source(
+        build_sink,
+        emit_source,
+        SourceSpec::Values(values_spec(input_rows, input_types.clone())),
+        RowType::new(vec!["k".to_string()], input_types),
+        output,
+    )
+}
+
+fn aggregate_breaker_graph_from_source(
+    build_sink: SinkSpec,
+    emit_source: SourceSpec,
+    input_source: SourceSpec,
+    input: RowType,
+    output: RowType,
+) -> PipelineGraph {
     let mut handles = BreakerHandleCatalogBuilder::default();
     let handle = handles.register(
         BreakerHandleKind::Aggregate,
@@ -54,12 +70,12 @@ fn aggregate_breaker_graph(
         pipelines: vec![
             PipelineSpec {
                 id: build,
-                source: SourceSpec::Values(values_spec(input_rows, input_types.clone())),
+                source: input_source,
                 transforms: Vec::new(),
                 sink: build_sink,
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
-                output: RowType::new(vec!["k".to_string()], input_types),
+                output: input,
             },
             PipelineSpec {
                 id: emit,
@@ -369,6 +385,57 @@ fn ungrouped_aggregate_breaker_merges_and_emits_count() {
     let chunk = output.pop_front().expect("ungrouped aggregate output");
     assert_eq!(chunk.size(), 1);
     assert_eq!(chunk.column(0).unwrap().get_i64(0), Some(3));
+}
+
+#[test]
+fn ungrouped_distinct_accepts_batches_larger_than_vector_size() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let row_count = VECTOR_SIZE * 2;
+    let distinct_count = 257usize;
+    let mut input =
+        Chunk::try_initialize(&[LogicalType::Integer], row_count, allocator).expect("input chunk");
+    input.set_cardinality(row_count);
+    for row_idx in 0..row_count {
+        input
+            .set_value(
+                0,
+                row_idx,
+                &Value::Integer((row_idx % distinct_count) as i32),
+            )
+            .expect("input value");
+    }
+
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let spec = ungrouped_distinct_count_spec();
+    let graph = aggregate_breaker_graph_from_source(
+        SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
+            handle: BreakerHandleId::new(0),
+            spec: spec.clone(),
+            required: Default::default(),
+        }),
+        SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
+            handle: BreakerHandleId::new(0),
+            spec,
+        }),
+        SourceSpec::Chunk(ChunkScanSpec {
+            chunks: Arc::from(vec![input].into_boxed_slice()),
+            output_names: vec!["v".to_string()].into_boxed_slice(),
+            output_types: vec![LogicalType::Integer].into_boxed_slice(),
+        }),
+        RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+        RowType::new(vec!["count".to_string()], vec![LogicalType::BigInt]),
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(20),
+        generation: WakeGeneration(0),
+    };
+    run_two_stage_breaker(graph, &query, &thread, &wake);
+
+    let chunk = output.pop_front().expect("ungrouped DISTINCT output");
+    assert_eq!(chunk.size(), 1);
+    assert_eq!(chunk.column(0).unwrap().get_i64(0), Some(257));
 }
 
 #[test]

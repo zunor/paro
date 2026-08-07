@@ -5,6 +5,7 @@
 
 mod comparison;
 mod execution_state;
+mod like_pattern;
 mod predicate;
 mod program;
 

@@ -109,7 +109,7 @@ PROJECTION  (rows=1)
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
       Columns: k
-      Pushed Predicate: col#1 = 1 OR col#1 = 4 OR col#1 = 9
+      Pushed Predicate: col#1 IN (1, 4, 9)
       Cardinality: [9, 19, 29]
       Output Schema: k INTEGER
 

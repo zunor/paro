@@ -15,6 +15,8 @@ use paro_common::types::LogicalType;
 
 use crate::index::ColumnId;
 
+use super::fixed_membership::FixedMembership;
+
 /// Ordering operation used by a row-level column comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredicateComparison {
@@ -59,6 +61,12 @@ pub enum Predicate {
         column_id: ColumnId,
         values: Vec<Value>,
     },
+    /// Physical fixed-width membership. Runtime filters use this form to
+    /// preserve their frozen dense/sorted representation across scan readers.
+    FixedIn {
+        column_id: ColumnId,
+        values: FixedMembership,
+    },
     /// column BETWEEN lower AND upper (inclusive)
     Range {
         column_id: ColumnId,
@@ -69,6 +77,12 @@ pub enum Predicate {
     IsNull { column_id: ColumnId },
     /// column IS NOT NULL
     IsNotNull { column_id: ColumnId },
+    /// Binary VARCHAR prefix test. `negated` represents `NOT LIKE 'prefix%'`.
+    StringPrefix {
+        column_id: ColumnId,
+        prefix: String,
+        negated: bool,
+    },
     /// left_column op right_column. This cannot be answered by a single-column
     /// index and is always verified against rows selected by other predicates.
     ColumnComparison {
@@ -90,9 +104,11 @@ impl Predicate {
             | Predicate::Gt { column_id, .. }
             | Predicate::Ge { column_id, .. }
             | Predicate::In { column_id, .. }
+            | Predicate::FixedIn { column_id, .. }
             | Predicate::Range { column_id, .. }
             | Predicate::IsNull { column_id }
-            | Predicate::IsNotNull { column_id } => Some(*column_id),
+            | Predicate::IsNotNull { column_id }
+            | Predicate::StringPrefix { column_id, .. } => Some(*column_id),
             Predicate::ColumnComparison { .. } => None,
         }
     }
@@ -115,6 +131,9 @@ impl fmt::Display for Predicate {
                     .join(", ");
                 write!(f, "col#{column_id} IN ({values})")
             }
+            Predicate::FixedIn { column_id, values } => {
+                write!(f, "col#{column_id} IN ({} fixed values)", values.len())
+            }
             Predicate::Range {
                 column_id,
                 lower,
@@ -122,6 +141,15 @@ impl fmt::Display for Predicate {
             } => write!(f, "col#{column_id} BETWEEN {lower} AND {upper}"),
             Predicate::IsNull { column_id } => write!(f, "col#{column_id} IS NULL"),
             Predicate::IsNotNull { column_id } => write!(f, "col#{column_id} IS NOT NULL"),
+            Predicate::StringPrefix {
+                column_id,
+                prefix,
+                negated,
+            } => write!(
+                f,
+                "col#{column_id} {} PREFIX {prefix:?}",
+                if *negated { "NOT" } else { "HAS" }
+            ),
             Predicate::ColumnComparison {
                 left_column_id,
                 right_column_id,

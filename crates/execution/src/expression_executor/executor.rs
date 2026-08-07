@@ -28,6 +28,7 @@ use crate::runtime::{ExpressionEvalInput, ParameterBindings};
 
 use super::comparison::{compile_comparison_dispatch, COMPARISON_EXEC_CTX};
 use super::execution_state::BoundFunctionContext;
+use super::like_pattern::{select_prepared_like, sql_like, PreparedLikePattern};
 use super::predicate::{
     accumulate_selected_rows, build_marked_selection, copy_selection, scan_bool_selection,
     scan_false_bool_selection, scan_null_selection, select_all_rows,
@@ -399,6 +400,7 @@ impl ExpressionExecutor {
                         .map(|_| ValueSlot::default())
                         .collect(),
                     in_list: Self::prepare_in_list(e),
+                    like_pattern: Self::prepare_like_pattern(e),
                     result: ValueSlot::default(),
                     aux: ValueSlot::default(),
                     scratch: ValueSlot::default(),
@@ -1050,6 +1052,19 @@ impl ExpressionExecutor {
         }
     }
 
+    fn prepare_like_pattern(expr: &PhysicalOperatorExpression) -> Option<PreparedLikePattern> {
+        if !matches!(expr.operator_type, OperatorType::Like | OperatorType::ILike) {
+            return None;
+        }
+        let PhysicalExpression::Constant(pattern) = expr.children.get(1)? else {
+            return None;
+        };
+        let Value::Varchar(pattern) = &pattern.value else {
+            return None;
+        };
+        PreparedLikePattern::try_new(pattern, matches!(expr.operator_type, OperatorType::ILike))
+    }
+
     fn prepare_i32_in_values(values: &[Value]) -> Option<Vec<i32>> {
         let mut typed = values
             .iter()
@@ -1275,6 +1290,29 @@ impl ExpressionExecutor {
                             count,
                             output_sel,
                         )))
+                    }
+                    OperatorType::Like | OperatorType::ILike => {
+                        let Some(pattern) = state.like_pattern.as_ref() else {
+                            return Ok(None);
+                        };
+                        let value = Self::execute_value(
+                            &expr.children[0],
+                            &mut state.child_states[0],
+                            chunk,
+                            input_sel,
+                            count,
+                            runtime,
+                            params,
+                            shared,
+                        )?;
+                        Self::store_value(&mut state.child_results[0], &value);
+                        Ok(Some(select_prepared_like(
+                            value.as_vector(),
+                            pattern,
+                            input_sel,
+                            count,
+                            output_sel,
+                        )?))
                     }
                     _ => Ok(None),
                 }
@@ -2204,39 +2242,61 @@ impl ExpressionExecutor {
                     params,
                     shared,
                 )?;
-                let pattern = Self::execute_value(
-                    &expr.children[1],
-                    &mut state.child_states[1],
-                    chunk,
-                    sel,
-                    count,
-                    runtime,
-                    params,
-                    shared,
-                )?;
                 Self::store_value(&mut state.child_results[0], &value);
-                Self::store_value(&mut state.child_results[1], &pattern);
 
-                let result = Self::prepare_slot_result(
-                    &mut state.result,
-                    &LogicalType::Boolean,
-                    count,
-                    runtime.allocator(MemoryTag::BaseTable),
-                )?;
                 let case_insensitive = matches!(expr.operator_type, OperatorType::ILike);
-                for row_idx in 0..count {
-                    if value.as_vector().is_null(row_idx) || pattern.as_vector().is_null(row_idx) {
-                        result.set_null(row_idx, true);
-                        continue;
+                if let Some(pattern) = state.like_pattern.as_ref() {
+                    let result = Self::prepare_slot_result(
+                        &mut state.result,
+                        &LogicalType::Boolean,
+                        count,
+                        runtime.allocator(MemoryTag::BaseTable),
+                    )?;
+                    let values = value.as_vector().try_to_varlen_view(count)?;
+                    for row_idx in 0..count {
+                        if !values.is_valid(row_idx) {
+                            result.set_null(row_idx, true);
+                            continue;
+                        }
+                        result.set_bool(
+                            row_idx,
+                            pattern.matches(values.get_inline_string(row_idx).as_str()),
+                        );
                     }
-                    let value = value
-                        .as_vector()
-                        .get_string(row_idx)
-                        .ok_or_else(|| paro_error::internal("LIKE left operand was not VARCHAR"))?;
-                    let pattern = pattern.as_vector().get_string(row_idx).ok_or_else(|| {
-                        paro_error::internal("LIKE pattern operand was not VARCHAR")
-                    })?;
-                    result.set_bool(row_idx, sql_like(value, pattern, case_insensitive));
+                } else {
+                    let pattern = Self::execute_value(
+                        &expr.children[1],
+                        &mut state.child_states[1],
+                        chunk,
+                        sel,
+                        count,
+                        runtime,
+                        params,
+                        shared,
+                    )?;
+                    Self::store_value(&mut state.child_results[1], &pattern);
+                    let result = Self::prepare_slot_result(
+                        &mut state.result,
+                        &LogicalType::Boolean,
+                        count,
+                        runtime.allocator(MemoryTag::BaseTable),
+                    )?;
+                    let values = value.as_vector().try_to_varlen_view(count)?;
+                    let patterns = pattern.as_vector().try_to_varlen_view(count)?;
+                    for row_idx in 0..count {
+                        if !values.is_valid(row_idx) || !patterns.is_valid(row_idx) {
+                            result.set_null(row_idx, true);
+                            continue;
+                        }
+                        result.set_bool(
+                            row_idx,
+                            sql_like(
+                                values.get_inline_string(row_idx).as_str(),
+                                patterns.get_inline_string(row_idx).as_str(),
+                                case_insensitive,
+                            ),
+                        );
+                    }
                 }
 
                 Ok(state
@@ -2595,91 +2655,6 @@ impl ExpressionExecutor {
         result.set_len(count);
         Ok(())
     }
-}
-
-fn sql_like(value: &str, pattern: &str, case_insensitive: bool) -> bool {
-    // TPC-H strings and patterns are ASCII. Keep that path allocation-free;
-    // the Unicode path below only allocates the two linear character arrays.
-    if value.is_ascii() && pattern.is_ascii() {
-        return sql_like_tokens(
-            value.as_bytes(),
-            pattern.as_bytes(),
-            b'%',
-            b'_',
-            b'\\',
-            |left, right| {
-                if case_insensitive {
-                    left.eq_ignore_ascii_case(&right)
-                } else {
-                    left == right
-                }
-            },
-        );
-    }
-
-    // Unicode case folding can change the number of scalar values, so normalize
-    // both strings before tokenization instead of folding individual characters.
-    let (value, pattern) = if case_insensitive {
-        (value.to_lowercase(), pattern.to_lowercase())
-    } else {
-        (value.to_owned(), pattern.to_owned())
-    };
-    let value = value.chars().collect::<Vec<_>>();
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    sql_like_tokens(&value, &pattern, '%', '_', '\\', |left, right| {
-        left == right
-    })
-}
-
-fn sql_like_tokens<T, F>(value: &[T], pattern: &[T], any: T, one: T, escape: T, equals: F) -> bool
-where
-    T: Copy + PartialEq,
-    F: Fn(T, T) -> bool,
-{
-    let mut value_idx = 0;
-    let mut pattern_idx = 0;
-    let mut wildcard = None;
-    let mut wildcard_value_idx = 0;
-
-    while value_idx < value.len() {
-        if pattern_idx < pattern.len() {
-            let token = pattern[pattern_idx];
-            if token == any {
-                wildcard = Some(pattern_idx);
-                pattern_idx += 1;
-                wildcard_value_idx = value_idx;
-                continue;
-            }
-            if token == one {
-                value_idx += 1;
-                pattern_idx += 1;
-                continue;
-            }
-            if token == escape && pattern_idx + 1 < pattern.len() {
-                if equals(value[value_idx], pattern[pattern_idx + 1]) {
-                    value_idx += 1;
-                    pattern_idx += 2;
-                    continue;
-                }
-            } else if equals(value[value_idx], token) {
-                value_idx += 1;
-                pattern_idx += 1;
-                continue;
-            }
-        }
-
-        let Some(wildcard_idx) = wildcard else {
-            return false;
-        };
-        wildcard_value_idx += 1;
-        value_idx = wildcard_value_idx;
-        pattern_idx = wildcard_idx + 1;
-    }
-
-    while pattern_idx < pattern.len() && pattern[pattern_idx] == any {
-        pattern_idx += 1;
-    }
-    pattern_idx == pattern.len()
 }
 
 #[cfg(test)]

@@ -17,14 +17,14 @@ use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::operators::aggregate::accounted_rows::{
-    aggregate_modifier_memory_context, DistinctAggregateState,
-};
+use crate::operators::aggregate::accounted_rows::aggregate_modifier_memory_context;
 use crate::operators::aggregate::aggregate_kernel::{
     combine_states, destroy_states, initialize_states,
 };
 use crate::operators::aggregate::aggregate_object::{create_aggregate_objects, AggregateObject};
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
+use crate::operators::aggregate::distinct_state::DistinctAggregateState;
+use crate::operators::aggregate::group_key_codec::{logical_group_types, physical_group_types};
 use crate::operators::aggregate::grouped_aggregate_data::reference_index;
 use paro_storage::buffer::BufferPool;
 
@@ -102,8 +102,8 @@ pub(crate) fn group_payload_refs(spec: &AggregateSpec) -> Result<Vec<usize>> {
 }
 
 /// Extract logical types from group expressions.
-pub(crate) fn group_types(spec: &AggregateSpec) -> Vec<LogicalType> {
-    spec.groups.iter().map(Expression::return_type).collect()
+pub(crate) fn group_types(spec: &AggregateSpec) -> Result<Vec<LogicalType>> {
+    physical_group_types(spec)
 }
 
 /// Normalize grouping sets, deduplicating indices within each set.
@@ -152,6 +152,23 @@ pub(crate) fn has_aggregate_ordered(spec: &AggregateSpec) -> bool {
     spec.aggregate_orders
         .iter()
         .any(|orders| !orders.is_empty())
+}
+
+/// Whether DISTINCT key collection fully determines every aggregate group.
+///
+/// With only unfiltered, unordered DISTINCT aggregates, inserting the input
+/// into the regular aggregate table duplicates the same grouping work. The
+/// globally unique `(groups..., inputs...)` keys create every required group
+/// during DISTINCT finalization, including groups whose only input is NULL.
+pub(crate) fn can_skip_regular_aggregate_sink(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+) -> bool {
+    !aggregate_objects.is_empty()
+        && !has_aggregate_filters(spec)
+        && aggregate_objects
+            .iter()
+            .all(|object| object.is_distinct() && object.order_bys.is_empty())
 }
 
 /// Build per-aggregate filter selection vectors from the payload chunk.
@@ -443,7 +460,7 @@ pub(crate) fn create_hash_aggregate_tables(
     }
     let objects = aggregate_objects(spec)?;
     let inputs = aggregate_inputs(spec);
-    let group_types = group_types(spec);
+    let group_types = group_types(spec)?;
     let strategy = choose_hash_aggregate_table_strategy(spec, &group_types, parallelism)?;
     normalized_grouping_sets(spec)?
         .iter()
@@ -481,10 +498,12 @@ fn choose_hash_aggregate_table_strategy(
     parallelism: usize,
 ) -> Result<HashAggregateTableStrategy> {
     let grouping_sets = normalized_grouping_sets(spec)?;
+    let can_finalize_distinct_in_parallel =
+        can_skip_regular_aggregate_sink(spec, &aggregate_objects(spec)?);
     if parallelism <= 1
         || grouping_sets.len() != 1
         || has_aggregate_filters(spec)
-        || has_aggregate_distinct(spec)
+        || (has_aggregate_distinct(spec) && !can_finalize_distinct_in_parallel)
         || has_aggregate_ordered(spec)
     {
         return Ok(HashAggregateTableStrategy::Flat);
@@ -521,7 +540,7 @@ pub(crate) fn create_perfect_aggregate_table(
         ));
     };
     PerfectAggregateHashTable::new_with_memory(
-        group_types(spec),
+        logical_group_types(spec),
         aggregate_objects(spec)?,
         aggregate_inputs(spec),
         perfect.group_minima.to_vec(),
@@ -536,7 +555,7 @@ pub(crate) fn update_hash_aggregate_tables(
     spec: &AggregateSpec,
     aggregate_objects: &[AggregateObject],
     payload: &Chunk,
-    group_refs: &[usize],
+    all_groups: &Chunk,
     grouping_sets: &[Box<[usize]>],
     tables: &mut [AggregateHashTable],
     addresses: &mut Vector,
@@ -570,13 +589,9 @@ pub(crate) fn update_hash_aggregate_tables(
     } else {
         None
     };
-    let all_groups = build_groups_chunk(payload, group_refs)?;
     for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
-        let groups = build_groups_chunk_for_set(
-            &all_groups,
-            grouping_set.as_ref(),
-            spec.grouping_key_count,
-        )?;
+        let groups =
+            build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
         let hashes = table.hash_groups(&groups)?;
         ensure_group_update_scratch(
             addresses,

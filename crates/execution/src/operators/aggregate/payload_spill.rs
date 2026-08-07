@@ -399,9 +399,9 @@ mod tests {
         aggregate_objects, build_groups_chunk, create_hash_aggregate_tables, group_payload_refs,
         group_types, normalized_grouping_sets, update_hash_aggregate_tables,
     };
-    use crate::operators::aggregate::grouped_aggregate_hashtable::hash_group_columns;
+    use crate::operators::aggregate::group_hash::hash_group_columns;
     use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHTScanPosition;
-    use crate::physical::specs::AggregateSpec;
+    use crate::physical::specs::{AggregateSpec, GroupKeyEncoding};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
         Expression::Reference(ReferenceExpression::new(index, ty))
@@ -418,9 +418,11 @@ mod tests {
     fn grouped_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Integer]),
             groups: Box::new([reference(0, LogicalType::Integer)]),
+            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([count_star_expression()]),
             grouping_functions: Box::new([]),
@@ -437,9 +439,11 @@ mod tests {
     fn grouped_varchar_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Varchar]),
             groups: Box::new([reference(0, LogicalType::Varchar)]),
+            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([count_star_expression()]),
             grouping_functions: Box::new([]),
@@ -506,11 +510,12 @@ mod tests {
         for partition_idx in 0..spilled.partition_count() {
             spilled
                 .replay_partition_payloads(partition_idx, allocator.clone(), |payload_batch| {
+                    let groups = build_groups_chunk(payload_batch, &group_refs)?;
                     update_hash_aggregate_tables(
                         &spec,
                         &aggregate_objects,
                         payload_batch,
-                        &group_refs,
+                        &groups,
                         &grouping_sets,
                         &mut tables,
                         &mut addresses,
@@ -603,11 +608,12 @@ mod tests {
         for partition_idx in 0..spilled.partition_count() {
             spilled
                 .replay_partition_payloads(partition_idx, allocator.clone(), |payload_batch| {
+                    let groups = build_groups_chunk(payload_batch, &group_refs)?;
                     update_hash_aggregate_tables(
                         &spec,
                         &aggregate_objects,
                         payload_batch,
-                        &group_refs,
+                        &groups,
                         &grouping_sets,
                         &mut tables,
                         &mut addresses,
@@ -685,11 +691,12 @@ mod tests {
         let mut addresses =
             paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, 5);
         let mut new_groups = paro_common::test_utils::test_selection_with_capacity(5);
+        let groups = build_groups_chunk(&payload, &group_refs).expect("groups");
         update_hash_aggregate_tables(
             &spec,
             &aggregate_objects,
             &payload,
-            &group_refs,
+            &groups,
             &grouping_sets,
             &mut source_tables,
             &mut addresses,
@@ -702,7 +709,7 @@ mod tests {
             .total_size();
         let mut spill = AggregateStateSpillBuffer::new(
             Arc::clone(&buffer_pool),
-            group_types(&spec),
+            group_types(&spec).expect("group types"),
             state_width,
             AggregateStateEncoding::RawBytes,
             1,

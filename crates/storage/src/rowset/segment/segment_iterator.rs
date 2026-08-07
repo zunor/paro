@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use super::predicate_column::PredicateColumnReuse;
 use super::segment::{Segment, SegmentOptions};
 use super::segment_predicate::PredicateEvaluator;
 use crate::buffer::{BufferPool, Prefetcher};
@@ -82,12 +83,23 @@ pub struct SegmentBatch {
 struct ReusedPredicateColumn {
     column_id: ColumnId,
     predicate_idx: usize,
-    width: usize,
+    encoding: PredicateColumnReuse,
     state: PredicateColumnReuseState,
 }
 
 enum PredicateColumnReuseState {
-    Collecting { data: Vec<u8>, nulls: Vec<u8> },
+    Collecting {
+        data: Vec<u8>,
+        nulls: Vec<u8>,
+        row_ends: Vec<usize>,
+        utf8_verified: bool,
+    },
+    Dictionary {
+        dictionary: Bytes,
+        codes: Vec<u8>,
+        nulls: Vec<u8>,
+        utf8_verified: bool,
+    },
     Readback,
 }
 
@@ -98,44 +110,122 @@ struct LateMaterializationState {
 }
 
 impl ReusedPredicateColumn {
-    fn new(column_id: ColumnId, predicate_idx: usize, width: usize, capacity: usize) -> Self {
+    fn new(
+        column_id: ColumnId,
+        predicate_idx: usize,
+        encoding: PredicateColumnReuse,
+        capacity: usize,
+    ) -> Self {
+        let estimated_width = match encoding {
+            PredicateColumnReuse::Fixed { width } => width,
+            PredicateColumnReuse::Varlen => 16,
+        };
         Self {
             column_id,
             predicate_idx,
-            width,
+            encoding,
             state: PredicateColumnReuseState::Collecting {
-                data: Vec::with_capacity(capacity.saturating_mul(width)),
+                data: Vec::with_capacity(capacity.saturating_mul(estimated_width)),
                 nulls: Vec::with_capacity(capacity),
+                row_ends: Vec::with_capacity(capacity),
+                utf8_verified: true,
             },
         }
     }
 
-    fn append(
+    fn append_rows(
         &mut self,
-        batch: &super::segment_predicate::PredicateColumnBatch,
-        row: usize,
+        batch: &super::predicate_column::PredicateColumnBatch,
+        rows: &[usize],
     ) -> Result<()> {
-        let PredicateColumnReuseState::Collecting { data, nulls } = &mut self.state else {
+        if let Some(dictionary_batch) = batch.storage_dictionary() {
+            return self.append_dictionary_rows(dictionary_batch, rows);
+        }
+        if matches!(self.state, PredicateColumnReuseState::Dictionary { .. }) {
+            self.state = PredicateColumnReuseState::Readback;
+            return Ok(());
+        }
+        let PredicateColumnReuseState::Collecting {
+            data,
+            nulls,
+            row_ends,
+            utf8_verified,
+        } = &mut self.state
+        else {
             return Ok(());
         };
-        if !batch.append_raw_fixed_value(row, self.width, data, nulls)? {
+        if batch.append_reusable_rows(self.encoding, rows, data, nulls, row_ends)? {
+            *utf8_verified &= batch.reusable_rows_have_verified_utf8();
+        } else {
             self.state = PredicateColumnReuseState::Readback;
         }
         Ok(())
     }
 
+    fn append_dictionary_rows(
+        &mut self,
+        batch: &super::predicate_column::StorageDictionaryPredicateBatch,
+        rows: &[usize],
+    ) -> Result<()> {
+        let can_start_dictionary = matches!(
+            &self.state,
+            PredicateColumnReuseState::Collecting {
+                data,
+                nulls,
+                row_ends,
+                ..
+            } if data.is_empty() && nulls.is_empty() && row_ends.is_empty()
+        );
+        if can_start_dictionary {
+            self.state = PredicateColumnReuseState::Dictionary {
+                dictionary: batch.encoded_dictionary().clone(),
+                codes: Vec::with_capacity(rows.len().saturating_mul(std::mem::size_of::<u32>())),
+                nulls: Vec::with_capacity(rows.len()),
+                utf8_verified: true,
+            };
+        }
+
+        let PredicateColumnReuseState::Dictionary {
+            dictionary,
+            codes,
+            nulls,
+            utf8_verified,
+        } = &mut self.state
+        else {
+            self.state = PredicateColumnReuseState::Readback;
+            return Ok(());
+        };
+        if dictionary != batch.encoded_dictionary() {
+            self.state = PredicateColumnReuseState::Readback;
+            return Ok(());
+        }
+        for &row_idx in rows {
+            codes.extend_from_slice(batch.encoded_code(row_idx));
+            nulls.push(u8::from(batch.is_null(row_idx)));
+        }
+        *utf8_verified &= batch.has_verified_utf8();
+        Ok(())
+    }
+
     fn take_prefix(&mut self, rows: usize) -> Result<Option<ColumnBatch>> {
-        let PredicateColumnReuseState::Collecting { data, nulls } = &mut self.state else {
+        if matches!(self.state, PredicateColumnReuseState::Dictionary { .. }) {
+            return self.take_dictionary_prefix(rows).map(Some);
+        }
+        let PredicateColumnReuseState::Collecting {
+            data,
+            nulls,
+            row_ends,
+            utf8_verified,
+        } = &mut self.state
+        else {
             return Ok(None);
         };
-        if rows > nulls.len() {
+        if rows > nulls.len() || rows > row_ends.len() {
             return Err(paro_error::internal(
                 "Reusable predicate column is shorter than the staged selection",
             ));
         }
-        let data_len = rows
-            .checked_mul(self.width)
-            .ok_or_else(|| paro_error::internal("Reusable predicate prefix overflow"))?;
+        let data_len = rows.checked_sub(1).map_or(0, |last_row| row_ends[last_row]);
         if data_len > data.len() {
             return Err(paro_error::internal(
                 "Reusable predicate data is shorter than the staged selection",
@@ -146,18 +236,95 @@ impl ReusedPredicateColumn {
         let data = std::mem::replace(data, remaining_data);
         let remaining_nulls = nulls.split_off(rows);
         let nulls = std::mem::replace(nulls, remaining_nulls);
+        let mut remaining_ends = row_ends.split_off(rows);
+        for end in &mut remaining_ends {
+            *end = end.checked_sub(data_len).ok_or_else(|| {
+                paro_error::internal("Reusable predicate row boundary moved backwards")
+            })?;
+        }
+        *row_ends = remaining_ends;
         let nulls = nulls
             .iter()
             .any(|is_null| *is_null != 0)
             .then(|| Bytes::from(nulls));
-        Ok(Some(ColumnBatch::new(Bytes::from(data), nulls)))
+        let batch = ColumnBatch::new(Bytes::from(data), nulls);
+        Ok(Some(
+            if matches!(self.encoding, PredicateColumnReuse::Varlen) && *utf8_verified {
+                batch.with_verified_utf8()
+            } else {
+                batch
+            },
+        ))
+    }
+
+    fn take_dictionary_prefix(&mut self, rows: usize) -> Result<ColumnBatch> {
+        let PredicateColumnReuseState::Dictionary {
+            dictionary,
+            codes,
+            nulls,
+            utf8_verified,
+        } = &mut self.state
+        else {
+            return Err(paro_error::internal(
+                "Reusable dictionary column lost its dictionary state",
+            ));
+        };
+        if rows > nulls.len() {
+            return Err(paro_error::internal(
+                "Reusable dictionary column is shorter than the staged selection",
+            ));
+        }
+        let code_bytes = rows
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::internal("Reusable dictionary code size overflow"))?;
+        if code_bytes > codes.len() {
+            return Err(paro_error::internal(
+                "Reusable dictionary codes are shorter than the staged selection",
+            ));
+        }
+
+        let remaining_codes = codes.split_off(code_bytes);
+        let prefix_codes = std::mem::replace(codes, remaining_codes);
+        let remaining_nulls = nulls.split_off(rows);
+        let prefix_nulls = std::mem::replace(nulls, remaining_nulls);
+        let nulls = prefix_nulls
+            .iter()
+            .any(|is_null| *is_null != 0)
+            .then(|| Bytes::from(prefix_nulls));
+        let batch = ColumnBatch::with_storage_dictionary(
+            dictionary.clone(),
+            Bytes::from(prefix_codes),
+            nulls,
+        );
+        Ok(if *utf8_verified {
+            batch.with_verified_utf8()
+        } else {
+            batch
+        })
     }
 
     fn clear(&mut self) {
         match &mut self.state {
-            PredicateColumnReuseState::Collecting { data, nulls } => {
+            PredicateColumnReuseState::Collecting {
+                data,
+                nulls,
+                row_ends,
+                utf8_verified,
+            } => {
                 data.clear();
                 nulls.clear();
+                row_ends.clear();
+                *utf8_verified = true;
+            }
+            PredicateColumnReuseState::Dictionary {
+                codes,
+                nulls,
+                utf8_verified,
+                ..
+            } => {
+                codes.clear();
+                nulls.clear();
+                *utf8_verified = true;
             }
             PredicateColumnReuseState::Readback => {}
         }
@@ -173,9 +340,9 @@ impl LateMaterializationState {
             .iter()
             .filter_map(|(column_id, _)| {
                 evaluator
-                    .raw_column_info(*column_id)
-                    .map(|(predicate_idx, width)| {
-                        ReusedPredicateColumn::new(*column_id, predicate_idx, width, 0)
+                    .reusable_column_info(*column_id)
+                    .map(|(predicate_idx, encoding)| {
+                        ReusedPredicateColumn::new(*column_id, predicate_idx, encoding, 0)
                     })
             })
             .collect();
@@ -676,23 +843,22 @@ impl SegmentIterator {
                 PredicateResult::Bitmap(bitmap) => Some(bitmap),
                 _ => None,
             };
-            for &row_idx in &state.predicate_matches {
+            state.predicate_matches.retain(|&row_idx| {
                 let ordinal = self.current_ordinal + row_idx as u64;
-                if selection_bitmap.is_some_and(|bitmap| !bitmap.contains(ordinal as u32))
+                !(selection_bitmap.is_some_and(|bitmap| !bitmap.contains(ordinal as u32))
                     || self
                         .delete_vector
                         .as_ref()
-                        .is_some_and(|deletes| deletes.is_deleted(ordinal as u32))
-                {
-                    continue;
-                }
-
-                for reused in &mut state.reused_predicate_columns {
-                    let batch = predicate_batches
-                        .get(reused.predicate_idx)
-                        .ok_or_else(|| paro_error::internal("Reusable predicate batch missing"))?;
-                    reused.append(batch, row_idx)?;
-                }
+                        .is_some_and(|deletes| deletes.is_deleted(ordinal as u32)))
+            });
+            for reused in &mut state.reused_predicate_columns {
+                let batch = predicate_batches
+                    .get(reused.predicate_idx)
+                    .ok_or_else(|| paro_error::internal("Reusable predicate batch missing"))?;
+                reused.append_rows(batch, &state.predicate_matches)?;
+            }
+            for &row_idx in &state.predicate_matches {
+                let ordinal = self.current_ordinal + row_idx as u64;
                 state.rowids.push(ordinal as u32);
             }
             self.current_ordinal += rows_read as u64;
@@ -765,21 +931,90 @@ impl std::fmt::Debug for SegmentIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rowset::segment::segment_predicate::PredicateColumnBatch;
-    use crate::test_utils::test_i32_vector;
+    use crate::rowset::encoding::BinaryPlainPageBuilder;
+    use crate::rowset::segment::predicate_column::{PredicateColumnAccess, PredicateColumnBatch};
+    use crate::test_utils::{test_i32_vector, test_nullable_string_vector};
 
     #[test]
     fn decoded_predicate_batch_disables_column_reuse_for_readback() {
-        let mut reused = ReusedPredicateColumn::new(7, 0, 4, 1);
+        let mut reused =
+            ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 }, 1);
         let raw = PredicateColumnBatch::Raw(ColumnBatch::new(
             Bytes::copy_from_slice(&11_i32.to_le_bytes()),
             None,
         ));
-        reused.append(&raw, 0).unwrap();
+        reused.append_rows(&raw, &[0]).unwrap();
 
         let dictionary_decoded = PredicateColumnBatch::Decoded(test_i32_vector(&[11]));
-        reused.append(&dictionary_decoded, 0).unwrap();
+        reused.append_rows(&dictionary_decoded, &[0]).unwrap();
 
         assert!(reused.take_prefix(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn decoded_varlen_predicate_values_are_reused_across_output_batches() {
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen, 3);
+        let decoded = PredicateColumnBatch::Decoded(test_nullable_string_vector(&[
+            Some("alpha"),
+            None,
+            Some("a value longer than the inline string capacity"),
+        ]));
+        reused.append_rows(&decoded, &[0, 1, 2]).unwrap();
+
+        let first = reused.take_prefix(2).unwrap().expect("reused prefix");
+        assert_eq!(
+            first.varlen_row(0).unwrap().as_deref(),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(first.varlen_row(1).unwrap(), None);
+
+        let second = reused.take_prefix(1).unwrap().expect("reused suffix");
+        assert_eq!(
+            second.varlen_row(0).unwrap().as_deref(),
+            Some(b"a value longer than the inline string capacity".as_slice())
+        );
+    }
+
+    #[test]
+    fn storage_dictionary_predicate_reuse_preserves_dictionary_codes() {
+        let mut dictionary = BinaryPlainPageBuilder::new(1024);
+        for value in [b"alpha".as_slice(), b"beta", b"gamma"] {
+            assert!(dictionary.add_slice(value));
+        }
+        let dictionary = dictionary.finish().unwrap();
+        let codes = [2_u32, 0, 1]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let batch = PredicateColumnBatch::prepare(
+            &paro_common::types::LogicalType::Varchar,
+            PredicateColumnAccess::Typed { raw_width: None },
+            ColumnBatch::with_storage_dictionary(dictionary, Bytes::from(codes), None)
+                .with_verified_utf8(),
+            3,
+            paro_common::test_utils::test_allocator(),
+        )
+        .unwrap();
+
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen, 3);
+        reused.append_rows(&batch, &[2, 0, 2]).unwrap();
+
+        let first = reused.take_prefix(2).unwrap().expect("reused prefix");
+        assert!(first.storage_dictionary.is_some());
+        assert_eq!(
+            first.varlen_row(0).unwrap().as_deref(),
+            Some(b"beta".as_slice())
+        );
+        assert_eq!(
+            first.varlen_row(1).unwrap().as_deref(),
+            Some(b"gamma".as_slice())
+        );
+
+        let second = reused.take_prefix(1).unwrap().expect("reused suffix");
+        assert!(second.storage_dictionary.is_some());
+        assert_eq!(
+            second.varlen_row(0).unwrap().as_deref(),
+            Some(b"beta".as_slice())
+        );
     }
 }

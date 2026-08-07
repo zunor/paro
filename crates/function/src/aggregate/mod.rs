@@ -181,6 +181,20 @@ pub type AggregateStateDeserializeFn =
 pub type AggregateSimpleUpdateFn =
     unsafe fn(inputs: &[&Vector], input_data: &AggregateInputData, state: *mut u8, count: usize);
 
+/// Update DISTINCT inputs that have already been partitioned into contiguous
+/// group-state runs.
+///
+/// `states` contains one state per entry in `run_starts`; input vectors contain
+/// `count` globally distinct argument rows. The callback can reduce each run
+/// without materializing a repeated state pointer for every input row.
+pub type AggregateDistinctRunUpdateFn = unsafe fn(
+    inputs: &[&Vector],
+    input_data: &AggregateInputData,
+    states: &AggregateStateInput,
+    run_starts: &[u32],
+    count: usize,
+);
+
 // ============================================================================
 // AggregateFunction
 // ============================================================================
@@ -226,6 +240,9 @@ pub struct AggregateFunction {
     /// Simple update (for ungrouped aggregation optimization).
     /// If None, the execution engine must use `update` with a vector of identical pointers.
     pub simple_update: Option<AggregateSimpleUpdateFn>,
+
+    /// Optional reducer for pre-deduplicated, group-clustered input runs.
+    pub distinct_run_update: Option<AggregateDistinctRunUpdateFn>,
 
     /// Destructor for the state (optional).
     pub destructor: Option<AggregateDestructorFn>,
@@ -281,12 +298,19 @@ impl AggregateFunction {
             combine,
             finalize,
             simple_update,
+            distinct_run_update: None,
             destructor,
             state_serialize: None,
             state_deserialize: None,
             varargs: None,
             bind_data: None,
         }
+    }
+
+    /// Set the reducer used when DISTINCT finalization has contiguous group runs.
+    pub fn with_distinct_run_update(mut self, update: AggregateDistinctRunUpdateFn) -> Self {
+        self.distinct_run_update = Some(update);
+        self
     }
 
     /// Set explicit state serialization hooks for build-phase spill.

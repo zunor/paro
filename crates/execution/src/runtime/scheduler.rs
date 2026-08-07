@@ -3,10 +3,10 @@
 
 //! PipelineScheduler execution driver.
 //!
-//! The first production path parallelizes one source-capable pipeline at a
-//! time: one immutable `PipelineRuntime` owns global source/sink state, N data
-//! worker tasks create task-local state and consume assigned morsels or shared
-//! source work, and one finish worker seals the pipeline after the local merge barrier.
+//! Ready source pipelines share the query worker pool. Each immutable
+//! `PipelineRuntime` owns global source/sink state, data tasks create task-local
+//! state and consume assigned morsels or shared source work, and one finish
+//! worker seals each pipeline after its local merge barrier.
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -123,14 +123,55 @@ impl<'a> PipelineScheduler<'a> {
                     "pipeline scheduler dequeued a pipeline before its gates opened",
                 ));
             }
-            self.run_pipeline(pipeline)?;
-            self.mark_pipeline_finished(pipeline);
+            let mut candidates = vec![(entry, self.create_runtime(pipeline)?)];
+            while candidates.len() < self.query.session.number_of_threads().max(1) {
+                let Some(entry) = self.ready.pop() else {
+                    break;
+                };
+                let pipeline = entry.payload;
+                if self.finished[pipeline.index()] {
+                    continue;
+                }
+                if !self.gates.is_ready(pipeline) {
+                    return Err(paro_error::internal(
+                        "pipeline scheduler dequeued a pipeline before its gates opened",
+                    ));
+                }
+                candidates.push((entry, self.create_runtime(pipeline)?));
+            }
+
+            let source_capable = candidates
+                .iter()
+                .filter(|(_, runtime)| has_schedulable_source_work(runtime))
+                .count();
+            if source_capable < 2 {
+                let (_, runtime) = candidates.remove(0);
+                for (entry, _) in candidates {
+                    self.ready.push(entry);
+                }
+                self.run_runtime(runtime)?;
+                self.mark_pipeline_finished(pipeline);
+                continue;
+            }
+
+            let mut wave = Vec::with_capacity(source_capable);
+            for (entry, runtime) in candidates {
+                if has_schedulable_source_work(&runtime) {
+                    wave.push((entry.payload, runtime));
+                } else {
+                    self.ready.push(entry);
+                }
+            }
+            self.run_pipeline_wave(&wave)?;
+            for (pipeline, _) in wave {
+                self.mark_pipeline_finished(pipeline);
+            }
         }
         Ok(())
     }
 
-    fn run_pipeline(&mut self, pipeline: PipelineId) -> Result<()> {
-        let runtime = self.create_runtime(pipeline)?;
+    fn run_runtime(&self, runtime: Arc<PipelineRuntime>) -> Result<()> {
+        let pipeline = runtime.program.id;
         let properties = &self
             .graph
             .pipeline(pipeline)
@@ -142,6 +183,41 @@ impl<'a> PipelineScheduler<'a> {
             self.query.clone(),
             self.allocator.clone(),
         )
+    }
+
+    fn run_pipeline_wave(&self, wave: &[(PipelineId, Arc<PipelineRuntime>)]) -> Result<()> {
+        let mut scheduled = Vec::with_capacity(wave.len());
+        for (pipeline, runtime) in wave {
+            let properties = &self
+                .graph
+                .pipeline(*pipeline)
+                .ok_or_else(|| paro_error::internal("pipeline spec missing"))?
+                .properties;
+            match schedule_pipeline_data_tasks(
+                runtime.clone(),
+                properties.capabilities.parallelism,
+                self.query.clone(),
+                self.allocator.clone(),
+            ) {
+                Ok(execution) => scheduled.push(execution),
+                Err(error) => {
+                    for execution in &scheduled {
+                        execution.cancel();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        for execution_idx in 0..scheduled.len() {
+            if let Err(error) = scheduled[execution_idx].wait_and_finish() {
+                for execution in &scheduled[execution_idx + 1..] {
+                    execution.cancel();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn create_runtime(&self, pipeline: PipelineId) -> Result<Arc<PipelineRuntime>> {
@@ -309,6 +385,43 @@ fn run_parallel_data_tasks(
     query: Arc<QueryRuntimeContext>,
     allocator: Arc<dyn Allocator>,
 ) -> Result<()> {
+    schedule_data_tasks(runtime, assignments, total_threads, query, allocator)?.wait()
+}
+
+struct ScheduledDataTasks {
+    scheduler: Arc<paro_scheduler::scheduler::TaskScheduler>,
+    producer: ProducerToken,
+    group: Arc<PipelineWorkerCoordinator>,
+    query: Arc<QueryRuntimeContext>,
+}
+
+impl ScheduledDataTasks {
+    fn wait(&self) -> Result<()> {
+        wait_for_group(
+            self.query.as_ref(),
+            self.scheduler.as_ref(),
+            &self.producer,
+            &self.group,
+        )
+    }
+
+    fn cancel(&self) {
+        cancel_and_drain(self.scheduler.as_ref(), &self.producer, &self.group);
+    }
+}
+
+fn schedule_data_tasks(
+    runtime: Arc<PipelineRuntime>,
+    assignments: Vec<SourceTaskAssignment>,
+    total_threads: usize,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+) -> Result<ScheduledDataTasks> {
+    if assignments.is_empty() {
+        return Err(paro_error::internal(
+            "cannot schedule a source pipeline without data assignments",
+        ));
+    }
     let scheduler = query.session.scheduler().clone();
     let producer = scheduler.create_producer_with_priority(0);
     let group = Arc::new(PipelineWorkerCoordinator::new(assignments.len()));
@@ -328,7 +441,73 @@ fn run_parallel_data_tasks(
         tasks.push(as_scheduler_task(task));
     }
     producer.schedule_tasks(tasks);
-    wait_for_group(query.as_ref(), scheduler.as_ref(), &producer, &group)
+    Ok(ScheduledDataTasks {
+        scheduler,
+        producer,
+        group,
+        query,
+    })
+}
+
+struct ScheduledPipelineExecution {
+    runtime: Arc<PipelineRuntime>,
+    total_threads: usize,
+    data: ScheduledDataTasks,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+}
+
+impl ScheduledPipelineExecution {
+    fn wait_and_finish(&self) -> Result<()> {
+        self.data.wait()?;
+        if let Some(shared) = self.runtime.shared_sink.as_ref() {
+            match shared.mark_producer_merged()? {
+                SharedSinkMergeEvent::WaitingForProducers { .. } => return Ok(()),
+                SharedSinkMergeEvent::ReadyToFinish => {
+                    if !shared.try_begin_finish()? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        run_finish_task(
+            self.runtime.clone(),
+            self.total_threads,
+            self.query.clone(),
+            self.allocator.clone(),
+        )
+    }
+
+    fn cancel(&self) {
+        self.data.cancel();
+    }
+}
+
+fn schedule_pipeline_data_tasks(
+    runtime: Arc<PipelineRuntime>,
+    parallelism: Parallelism,
+    query: Arc<QueryRuntimeContext>,
+    allocator: Arc<dyn Allocator>,
+) -> Result<ScheduledPipelineExecution> {
+    let work = source_work(&runtime.source_global)
+        .filter(|work| work.work_unit_count() > 0)
+        .ok_or_else(|| paro_error::internal("pipeline wave requires source work"))?;
+    let total_threads = pipeline_thread_count(parallelism, work.work_unit_count(), query.as_ref());
+    let assignments = work.into_task_assignments(total_threads);
+    let data = schedule_data_tasks(
+        runtime.clone(),
+        assignments,
+        total_threads,
+        query.clone(),
+        allocator.clone(),
+    )?;
+    Ok(ScheduledPipelineExecution {
+        runtime,
+        total_threads,
+        data,
+        query,
+        allocator,
+    })
 }
 
 fn run_finish_task(
@@ -1063,26 +1242,16 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
                 worker: SharedSourceWorker::HashAggregateEmit,
             })
         }
-        SourceGlobal::SortEmit(global) => {
-            let task_count = global
-                .handle
-                .sealed_state()
-                .ok()
-                .and_then(|state| {
-                    state
-                        .merger_gstate
-                        .as_ref()
-                        .map(|merger| merger.max_threads())
-                })
-                .unwrap_or(1)
-                .max(1);
-            Some(SourceWork::SharedWorkers {
-                count: task_count,
-                worker: SharedSourceWorker::SortEmit,
-            })
-        }
+        SourceGlobal::SortEmit(_) => Some(SourceWork::SharedWorkers {
+            count: 1,
+            worker: SharedSourceWorker::SortEmit,
+        }),
         _ => None,
     }
+}
+
+fn has_schedulable_source_work(runtime: &PipelineRuntime) -> bool {
+    source_work(&runtime.source_global).is_some_and(|work| work.work_unit_count() > 0)
 }
 
 fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignment) -> Result<()> {

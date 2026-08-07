@@ -767,6 +767,7 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
@@ -1014,6 +1015,7 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Left,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),

@@ -8,7 +8,7 @@ use paro_common::error::{self as paro_error, Result};
 
 use crate::row::addr::{MAX_BLOCK_INDEX, MAX_ROW_WITHIN_BLOCK};
 use crate::row::block::{BlockBacking, HeapBlock, RowBlock};
-use crate::row::raw::RawRowCollection;
+use crate::row::raw::{RawRowCollection, RawRowLocation};
 use crate::row::RowAddr;
 
 /// Physical row location inside one sealed store.
@@ -18,6 +18,7 @@ pub(crate) struct RowLocation {
     pub addr: RowAddr,
     pub region_index: usize,
     pub local_ordinal: usize,
+    pub raw: RawRowLocation,
 }
 
 #[derive(Debug, Default)]
@@ -78,7 +79,7 @@ impl RowRegion {
         segment_row_block_prefix.push(0);
         segment_heap_block_prefix.push(0);
 
-        for segment in collection.segments() {
+        for (segment_index, segment) in collection.segments().iter().enumerate() {
             for chunk in segment.chunks() {
                 if chunk.part_indices.is_empty() {
                     continue;
@@ -124,6 +125,11 @@ impl RowRegion {
                             addr,
                             region_index: index as usize,
                             local_ordinal,
+                            raw: RawRowLocation {
+                                segment_index,
+                                part_index: part_idx as usize,
+                                row_in_part,
+                            },
                         });
                         local_ordinal += 1;
                     }

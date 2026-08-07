@@ -11,10 +11,11 @@ use paro_function::scalar::{ExpressionState, FunctionStability, ScalarFunction};
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConjunctionExpression, ConstantExpression,
-    FunctionExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+    FunctionExpression, OperatorExpression, WindowExpression, WindowFrame, WindowFrameBound,
+    WindowFrameType,
 };
 use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
+    AntiJoinMode, ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -550,6 +551,87 @@ fn positive_mark_filter_lowers_mark_join_to_semi_join() {
     assert_eq!(join.mark_index, None);
     assert_eq!(join.mark_null_condition_start, None);
     assert!(matches!(join.left.operator, LogicalOperator::Filter(_)));
+}
+
+#[test]
+fn negative_scalar_mark_filter_lowers_to_null_aware_anti_join() {
+    let ctx = BindContext::new();
+    let mut join = ComparisonJoin::new(
+        JoinType::Mark,
+        plan(&ctx, make_get(0)),
+        plan(&ctx, make_get(1)),
+        vec![JoinCondition::new(
+            make_column_ref(0, 0),
+            make_column_ref(1, 0),
+            JoinComparisonType::Equal,
+        )],
+    );
+    let mark_index = 90;
+    join.mark_index = Some(mark_index);
+    let marker = Expression::ColumnRef(ColumnRefExpression::new(
+        ColumnBinding::new(mark_index, 0),
+        LogicalType::Boolean,
+    ));
+    let not_marker = Expression::Operator(OperatorExpression::new_unary(
+        OperatorType::Not,
+        marker,
+        LogicalType::Boolean,
+    ));
+    let filter = PlannerFilter::new(
+        plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
+        vec![not_marker],
+    );
+
+    let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
+
+    let LogicalOperator::Join(Join::Comparison(join)) = result else {
+        panic!("negative scalar marker should become a null-aware ANTI join");
+    };
+    assert_eq!(join.join_type, JoinType::Anti);
+    assert_eq!(join.anti_join_mode, AntiJoinMode::NullAware);
+    assert_eq!(join.mark_index, None);
+    assert_eq!(join.mark_null_condition_start, None);
+}
+
+#[test]
+fn negative_marker_with_null_safe_condition_remains_mark_join() {
+    let ctx = BindContext::new();
+    let mut join = ComparisonJoin::new(
+        JoinType::Mark,
+        plan(&ctx, make_get(0)),
+        plan(&ctx, make_get(1)),
+        vec![JoinCondition::new(
+            make_column_ref(0, 0),
+            make_column_ref(1, 0),
+            JoinComparisonType::NotDistinctFrom,
+        )],
+    );
+    let mark_index = 90;
+    join.mark_index = Some(mark_index);
+    let marker = Expression::ColumnRef(ColumnRefExpression::new(
+        ColumnBinding::new(mark_index, 0),
+        LogicalType::Boolean,
+    ));
+    let not_marker = Expression::Operator(OperatorExpression::new_unary(
+        OperatorType::Not,
+        marker,
+        LogicalType::Boolean,
+    ));
+    let filter = PlannerFilter::new(
+        plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
+        vec![not_marker],
+    );
+
+    let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
+
+    let LogicalOperator::Filter(filter) = result else {
+        panic!("non-scalar negative marker must remain above the MARK join");
+    };
+    let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
+        panic!("expected MARK join below negative marker filter");
+    };
+    assert_eq!(join.join_type, JoinType::Mark);
+    assert_eq!(join.anti_join_mode, AntiJoinMode::Regular);
 }
 
 #[test]

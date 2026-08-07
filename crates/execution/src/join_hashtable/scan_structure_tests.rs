@@ -81,6 +81,38 @@ fn build_hash_table(
     ht
 }
 
+fn build_string_hash_table(build_keys: &[i32], build_payload: &[&str]) -> JoinHashTable {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Varchar],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    let keys = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                build_keys,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let payload = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_string_vector_with_allocator(
+                build_payload,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    ht.build(&keys, &payload).unwrap();
+    ht.finalize().unwrap();
+    ht
+}
+
 fn chunk_from_optional_i32(values: &[Option<i32>]) -> Chunk {
     let mut chunk =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], values.len());
@@ -429,4 +461,37 @@ fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
         .unwrap();
     assert_eq!(unmatched_count, 1);
     assert_eq!(unmatched.data[0].get_value(0).to_string(), "20");
+}
+
+#[test]
+fn repeated_build_matches_preserve_varlen_payload_as_dictionary() {
+    let ht = build_string_hash_table(&[1, 2], &["shared-build-value", "other"]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1, 1, 1]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Varchar],
+        3,
+    );
+
+    let count = scan
+        .next_inner_join(&keys, &left, &mut result, &ht, &[], &[])
+        .unwrap();
+
+    assert_eq!(count, 3);
+    assert_eq!(
+        result.data[1].vector_type(),
+        paro_common::vector::VectorType::Dictionary
+    );
+    assert_eq!(
+        result.data[1]
+            .dictionary_info()
+            .expect("build dictionary metadata")
+            .unique_len,
+        1
+    );
+    for row_idx in 0..count {
+        assert_eq!(
+            result.data[1].get_value(row_idx),
+            Value::Varchar("shared-build-value".to_string())
+        );
+    }
 }

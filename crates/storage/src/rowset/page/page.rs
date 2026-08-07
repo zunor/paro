@@ -8,6 +8,13 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 
+/// Current data-page format emitted by column writers.
+///
+/// Version 3 establishes that UTF-8 storage types (`CHAR`, `VARCHAR`, and
+/// `JSON`) are validated before they enter a page. Readers may rely on that
+/// semantic invariant only after also verifying the page checksum.
+pub const CURRENT_DATA_PAGE_FORMAT_VERSION: u32 = 3;
+
 /// Page type enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
@@ -102,9 +109,10 @@ pub struct DataPageFooter {
     pub nullmap_size: u32,
     /// For array columns: corresponding element ordinal
     pub corresponding_element_ordinal: Option<u64>,
-    /// Format version (1 or 2)
+    /// Format version
     /// - Version 1: No default value for NULL, RLE null encoding
     /// - Version 2: Default value for NULL, BitShuffle null encoding
+    /// - Version 3: UTF-8 storage types are validated before encoding
     pub format_version: u32,
     /// Null encoding type
     pub null_encoding: NullEncoding,

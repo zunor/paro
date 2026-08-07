@@ -38,6 +38,7 @@ fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds(
             source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                 handle,
                 join_type: JoinType::Inner,
+                anti_join_mode: AntiJoinMode::Regular,
                 conditions: vec![join_condition()].into_boxed_slice(),
                 probe_types: vec![LogicalType::Integer].into_boxed_slice(),
                 build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
@@ -152,6 +153,7 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
@@ -168,6 +170,7 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                 source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -302,6 +305,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Right,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
@@ -318,6 +322,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                 source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                     handle,
                     join_type: JoinType::Right,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -474,6 +479,7 @@ fn hash_join_external_right_replay_outputs_build_rows_when_probe_never_spilled()
                 source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                     handle,
                     join_type: JoinType::Right,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -607,6 +613,7 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Mark,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
@@ -623,6 +630,7 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                 source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                     handle,
                     join_type: JoinType::Mark,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),

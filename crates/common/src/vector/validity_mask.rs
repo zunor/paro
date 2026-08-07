@@ -461,9 +461,7 @@ impl ValidityMask {
             return Ok(());
         }
 
-        if dst_end > self.capacity {
-            self.try_resize(dst_end)?;
-        }
+        self.try_ensure_capacity(dst_end)?;
 
         if source.all_valid() {
             return self.try_set_range_valid(dst_offset, count);
@@ -507,9 +505,7 @@ impl ValidityMask {
                         "ValidityMask copy selection destination overflow: offset={dst_offset}, count={count}"
                     ))
                 })?;
-                if dst_end > self.capacity {
-                    self.try_resize(dst_end)?;
-                }
+                self.try_ensure_capacity(dst_end)?;
                 if source.all_valid() {
                     return self.try_set_range_valid(dst_offset, count);
                 }
@@ -560,9 +556,7 @@ impl ValidityMask {
             .max()
             .and_then(|idx| idx.checked_add(1))
             .ok_or_else(|| paro_error::internal("ValidityMask scatter destination overflow"))?;
-        if required_capacity > self.capacity {
-            self.try_resize(required_capacity)?;
-        }
+        self.try_ensure_capacity(required_capacity)?;
 
         if source.all_valid() {
             for &dst_idx in dst_positions {
@@ -889,6 +883,19 @@ impl ValidityMask {
 
         self.bits = Some(new_buf);
         self.capacity = new_size;
+        Ok(())
+    }
+
+    /// Ensure that at least `required_capacity` rows remain addressable.
+    ///
+    /// Unlike [`Self::try_resize`], this operation never shrinks the logical
+    /// range. Writers that update a subrange must preserve validity state for
+    /// rows written by earlier, potentially out-of-order operations.
+    #[inline]
+    pub fn try_ensure_capacity(&mut self, required_capacity: usize) -> Result<()> {
+        if required_capacity > self.capacity {
+            self.try_resize(required_capacity)?;
+        }
         Ok(())
     }
 

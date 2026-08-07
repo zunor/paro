@@ -226,10 +226,13 @@ mod tests {
     #[test]
     fn row_addrs_are_stable_in_addressable_store() {
         let store = build_store();
+        assert!(!store.address_index_initialized());
         let addr = store.addr_at_ordinal(1).unwrap();
         assert!(!addr.is_invalid());
+        assert!(!store.address_index_initialized());
 
         let pinned = store.pin_rows(&[addr]).unwrap();
+        assert!(store.address_index_initialized());
         let row = pinned.row(0).unwrap();
         assert_eq!(row.addr(), addr);
         assert_eq!(row.read_value(0).unwrap(), Value::Integer(20));
@@ -484,5 +487,38 @@ mod tests {
                 ],
             ))
         );
+    }
+
+    #[test]
+    fn array_codec_scatter_preserves_out_of_order_output_positions() {
+        let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
+        let codec = ColumnCodec::from_logical_type(&array_type);
+        let gathered = paro_common::test_utils::test_embeddings_vector(
+            &[vec![1.0_f32, 2.0, 3.0], vec![4.0_f32, 5.0, 6.0]],
+            3,
+        );
+        let mut output = test_chunk_with_capacity(&[array_type], 4);
+        output.set_cardinality(4);
+
+        crate::row::codec::scatter_to_positions(&codec, 0, &gathered, &mut output, &[3, 1])
+            .unwrap();
+
+        assert_eq!(
+            output.get_value(0, 3),
+            Some(Value::Array(
+                vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+                LogicalType::Float,
+                3,
+            ))
+        );
+        assert_eq!(
+            output.get_value(0, 1),
+            Some(Value::Array(
+                vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)],
+                LogicalType::Float,
+                3,
+            ))
+        );
+        assert_eq!(output.column(0).unwrap().child().unwrap().len(), 12);
     }
 }

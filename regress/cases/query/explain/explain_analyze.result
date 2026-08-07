@@ -2,9 +2,9 @@
 EXPLAIN ANALYZE SELECT 1;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 DUMMY_SCAN (actual time=<time-range> rows=1 loops=2)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=1 loops=1)
-  SINK #2 CLIENT_RESULT (actual time=<time-range> rows=1 loops=1)
+  SOURCE #0 DUMMY_SCAN (actual time=<time-range> rows=1 loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=1 loops=<loops>)
+  SINK #2 CLIENT_RESULT (actual time=<time-range> rows=1 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -27,13 +27,13 @@ WHERE score >= 20
 ORDER BY score DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=2 loops=2)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=2 loops=1)
-  SINK #2 SORT_BUILD (actual time=<time-range> rows=2 loops=1 peak_memory_bytes=262155)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=262145)
 PIPELINE 1
-  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=2 loops=2)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=2 loops=1)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=2 loops=1)
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -48,7 +48,7 @@ WHERE score >= 20
 ORDER BY score DESC
 FORMAT JSON;
 QUERY PLAN
-{"format_version":1,"mode":"analyze","operators":[{"actual":{"loops":2,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"ROWSET_SCAN","pipeline":0,"role":"source","runtime_id":0},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"PROJECTION","pipeline":0,"role":"transform","runtime_id":1},{"actual":{"loops":1,"peak_memory_bytes":262155,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"SORT_BUILD","pipeline":0,"role":"sink","runtime_id":2},{"actual":{"loops":2,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"SORT_EMIT","pipeline":1,"role":"source","runtime_id":3},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"PROJECTION","pipeline":1,"role":"transform","runtime_id":4},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"CLIENT_RESULT","pipeline":1,"role":"sink","runtime_id":5}],"profile":{"memory":{"grant_bytes":0,"repartition_depth":0,"revocable_bytes":0,"revoked_bytes":0,"spill_bytes":0,"spill_latency_us": 0,"yield_latency_us": 0},"parallelism":{"backpressure_count": 0,"max_threads": 0,"observed_workers": 0,"operator_time_ms": 0.0,"ready_time_us": 0,"wait_time_us": 0,"wake_coalesce_count": 0,"wake_count": 0,"worker_utilization": 0.0},"runtime_filters":{"installed_count":0,"no_wait_fallback_count":0}},"profile_events":[{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":0,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":0,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":0,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":1,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":2,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":3,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":3,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":0,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":4,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":5,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1}],"profile_schema":["query_id","pipeline_id","work_unit_id","operator_id","thread_id","morsel_range","phase","rows","bytes","time","wait_reason","memory_class"],"profile_schema_version":1,"query_id": 0,"summary":{"Execution Time": "<time-ms>","Rows Returned":2}}
+{"format_version":1,"mode":"analyze","operators":[{"actual":{"loops":2,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"ROWSET_SCAN","pipeline":0,"role":"source","runtime_id":0},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"PROJECTION","pipeline":0,"role":"transform","runtime_id":1},{"actual":{"loops":1,"peak_memory_bytes":262145,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"SORT_BUILD","pipeline":0,"role":"sink","runtime_id":2},{"actual":{"loops":2,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"SORT_EMIT","pipeline":1,"role":"source","runtime_id":3},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"PROJECTION","pipeline":1,"role":"transform","runtime_id":4},{"actual":{"loops":1,"rows":2,"startup_time_ms": 0.0,"total_time_ms": 0.0},"operator":"CLIENT_RESULT","pipeline":1,"role":"sink","runtime_id":5}],"profile":{"memory":{"grant_bytes":0,"repartition_depth":0,"revocable_bytes":0,"revoked_bytes":0,"spill_bytes":0,"spill_latency_us": 0,"yield_latency_us": 0},"parallelism":{"backpressure_count": 0,"max_threads": 0,"observed_workers": 0,"operator_time_ms": 0.0,"ready_time_us": 0,"wait_time_us": 0,"wake_coalesce_count": 0,"wake_count": 0,"worker_utilization": 0.0},"runtime_filters":{"installed_count":0,"no_wait_fallback_count":0}},"profile_events":[{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":0,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":0,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":0,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":1,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":2,"phase":"operator","pipeline_id":0,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":0},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":3,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":3,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":0,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":4,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1},{"bytes":0,"memory_class":null,"morsel_range":null,"operator_id":5,"phase":"operator","pipeline_id":1,"query_id": 0,"rows":2,"thread_id": 0,"time":{"duration_ms": 0.0,"end_ms": 0.0,"start_ms": 0.0},"total_threads": 0,"wait_reason":null,"work_unit_id":1}],"profile_schema":["query_id","pipeline_id","work_unit_id","operator_id","thread_id","morsel_range","phase","rows","bytes","time","wait_reason","memory_class"],"profile_schema_version":1,"query_id": 0,"summary":{"Execution Time": "<time-ms>","Rows Returned":2}}
 
 DROP TABLE explain_analyze_rt;
 DROP TABLE
@@ -72,13 +72,13 @@ ORDER BY score DESC
 LIMIT 3;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=7000 loops=3)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=7000 loops=2)
-  SINK #2 TOP_N_BUILD (actual time=<time-range> rows=7000 loops=2)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=7000 loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=7000 loops=<loops>)
+  SINK #2 TOP_N_BUILD (actual time=<time-range> rows=7000 loops=<loops>)
 PIPELINE 1
-  SOURCE #3 TOP_N_EMIT (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
+  SOURCE #3 TOP_N_EMIT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=3 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>

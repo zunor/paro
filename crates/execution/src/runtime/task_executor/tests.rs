@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
+use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_context::{
     NoopStatementTimeoutDriver, RuntimeLimits, StatementCancelReason, StatementCancellation,
     TestStatementContextBuilder,
 };
-use paro_function::aggregate::distributive::count::get_count_star_function;
+use paro_function::aggregate::distributive::count::{get_count_function, get_count_star_function};
 use paro_function::table::{
     LocalTableFunctionState, TableFunction, TableFunctionInitInput, TableFunctionInput,
     TableFunctionResult,
@@ -20,10 +20,10 @@ use paro_function::table::{
 use paro_function::window::WindowFunction;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{
-    AggregateExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
-    OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
+    AggregateExpression, AggregateType, ComparisonExpression, ComparisonType, ConstantExpression,
+    Expression, OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinComparisonType, JoinCondition, JoinType};
 
 use crate::explain::profiler::{ExplainProfileSnapshot, ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::QueryMemoryPool;
@@ -226,9 +226,12 @@ fn count_star_expression() -> Expression {
 fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([]),
         groups: vec![reference(0, LogicalType::Integer)].into_boxed_slice(),
+        group_key_encodings: vec![crate::physical::specs::GroupKeyEncoding::Identity]
+            .into_boxed_slice(),
         grouping_sets: Box::new([]),
         aggregates: vec![count_star_expression()].into_boxed_slice(),
         grouping_functions: Box::new([]),
@@ -245,13 +248,47 @@ fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> Aggrega
 fn ungrouped_count_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 0,
+        estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([]),
         groups: Box::new([]),
+        group_key_encodings: Box::new([]),
         grouping_sets: Box::new([]),
         aggregates: vec![count_star_expression()].into_boxed_slice(),
         grouping_functions: Box::new([]),
         aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+        aggregate_filters: vec![None].into_boxed_slice(),
+        aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+        having_filter: Box::new([]),
+        perfect_hash: None,
+        output_names: vec!["count".to_string()].into_boxed_slice(),
+        output_types: vec![LogicalType::BigInt].into_boxed_slice(),
+    }
+}
+
+fn ungrouped_distinct_count_spec() -> AggregateSpec {
+    let (function, _) = get_count_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind count(integer)");
+    AggregateSpec {
+        grouping_key_count: 0,
+        estimated_input_rows: None,
+        projection_exprs: Box::new([]),
+        payload_types: Box::new([LogicalType::Integer]),
+        groups: Box::new([]),
+        group_key_encodings: Box::new([]),
+        grouping_sets: Box::new([]),
+        aggregates: vec![Expression::Aggregate(
+            AggregateExpression::new(
+                function,
+                vec![reference(0, LogicalType::Integer)],
+                LogicalType::BigInt,
+            )
+            .with_aggr_type(AggregateType::Distinct),
+        )]
+        .into_boxed_slice(),
+        grouping_functions: Box::new([]),
+        aggregate_inputs: vec![vec![0].into_boxed_slice()].into_boxed_slice(),
         aggregate_filters: vec![None].into_boxed_slice(),
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         having_filter: Box::new([]),

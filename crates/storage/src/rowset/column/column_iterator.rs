@@ -18,7 +18,9 @@ use crate::rowset::encoding::{
     BinaryDictPageDecoder, BinaryPlainPageDecoder, BitShufflePageDecoder, PlainPageDecoder,
     RlePageDecoder,
 };
-use crate::rowset::page::{EncodingType, NullEncoding, PageFooter, PageReadOptions};
+use crate::rowset::page::{
+    EncodingType, NullEncoding, PageFooter, PageReadOptions, CURRENT_DATA_PAGE_FORMAT_VERSION,
+};
 use crate::rowset::page_reader::{DecodedPageAccess, PageReader};
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
@@ -42,6 +44,15 @@ pub struct ColumnBatch {
     pub storage_dictionary: Option<StorageDictionaryBatch>,
     /// Page-local span seeks used by read_by_rowids() to assemble this batch.
     pub page_run_seeks: usize,
+    /// Semantic guarantees established before this batch reached execution.
+    integrity: ColumnBatchIntegrity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ColumnBatchIntegrity {
+    #[default]
+    Unverified,
+    VerifiedUtf8,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +77,7 @@ impl ColumnBatch {
             nulls,
             storage_dictionary: None,
             page_run_seeks: 0,
+            integrity: ColumnBatchIntegrity::Unverified,
         }
     }
 
@@ -75,6 +87,7 @@ impl ColumnBatch {
             nulls,
             storage_dictionary: Some(StorageDictionaryBatch { dictionary, codes }),
             page_run_seeks: 0,
+            integrity: ColumnBatchIntegrity::Unverified,
         }
     }
 
@@ -83,12 +96,22 @@ impl ColumnBatch {
         self
     }
 
+    pub(crate) fn with_verified_utf8(mut self) -> Self {
+        self.integrity = ColumnBatchIntegrity::VerifiedUtf8;
+        self
+    }
+
+    pub(crate) fn has_verified_utf8(&self) -> bool {
+        self.integrity == ColumnBatchIntegrity::VerifiedUtf8
+    }
+
     pub fn empty() -> Self {
         Self {
             data: Bytes::new(),
             nulls: None,
             storage_dictionary: None,
             page_run_seeks: 0,
+            integrity: ColumnBatchIntegrity::Unverified,
         }
     }
 
@@ -299,6 +322,14 @@ impl PageDecoderImpl {
             PageDecoderImpl::Dictionary { decoder, .. } => decoder.current_index(),
         }
     }
+
+    fn decoded_cache_decoder_mut(&mut self) -> Option<&mut BitShufflePageDecoder> {
+        match self {
+            PageDecoderImpl::BitShuffle(decoder) => Some(decoder),
+            PageDecoderImpl::Dictionary { decoder, .. } => decoder.code_decoder_mut(),
+            _ => None,
+        }
+    }
 }
 
 /// Scalar column iterator for non-nested types.
@@ -333,6 +364,8 @@ pub struct ScalarColumnIterator<R: Read + Seek> {
     current_page_pointer: Option<crate::rowset::page::PagePointer>,
     /// Current row ordinal
     current_ordinal: u64,
+    /// Whether the current page carries the checksummed v3 UTF-8 invariant.
+    current_page_utf8_verified: bool,
 }
 
 impl<R: Read + Seek> ScalarColumnIterator<R> {
@@ -364,6 +397,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             current_page_first_ordinal: 0,
             current_page_pointer: None,
             current_ordinal: 0,
+            current_page_utf8_verified: false,
         })
     }
 
@@ -410,7 +444,15 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 let decoder = PageDecoderImpl::BitShuffle(
                     BitShufflePageDecoder::from_decoded_data(page_num_rows, type_size, decoded)?,
                 );
-                self.install_page(page_idx, first_ordinal, page_pointer, decoder, None, false);
+                self.install_page(
+                    page_idx,
+                    first_ordinal,
+                    page_pointer,
+                    decoder,
+                    None,
+                    false,
+                    false,
+                );
                 return Ok(());
             }
         }
@@ -428,6 +470,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         };
 
         let (data_body, null_body) = Self::split_page_body(body, data_footer.nullmap_size)?;
+        let utf8_verified = self.opts.verify_checksum
+            && self.meta.field_type.requires_valid_utf8()
+            && data_footer.format_version == CURRENT_DATA_PAGE_FORMAT_VERSION;
         // Create decoder based on encoding type
         let decoder = self.create_decoder(data_body, page_num_rows, page_pointer)?;
 
@@ -452,6 +497,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             decoder,
             null_decoder,
             true,
+            utf8_verified,
         );
         Ok(())
     }
@@ -464,12 +510,14 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         decoder: PageDecoderImpl,
         null_decoder: Option<PageDecoderImpl>,
         schedule_prefetch: bool,
+        utf8_verified: bool,
     ) {
         self.current_page_idx = Some(page_idx);
         self.current_decoder = Some(decoder);
         self.current_null_decoder = null_decoder;
         self.current_page_first_ordinal = first_ordinal;
         self.current_page_pointer = Some(page_pointer);
+        self.current_page_utf8_verified = utf8_verified;
         if schedule_prefetch {
             let (Some(prefetcher), Some(file_path)) = (&self.prefetcher, &self.file_path) else {
                 return;
@@ -542,7 +590,16 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             }
             EncodingType::Rle => PageDecoderImpl::Rle(RlePageDecoder::new(data, 1)),
             EncodingType::Dict => {
-                let mut decoder = BinaryDictPageDecoder::new(data, expected_num_elements);
+                let cached = self.page_reader.lookup_decoded(page_pointer);
+                let mut decoder = if let Some(decoded_codes) = cached {
+                    BinaryDictPageDecoder::with_decoded_codes(
+                        data,
+                        expected_num_elements,
+                        decoded_codes,
+                    )
+                } else {
+                    BinaryDictPageDecoder::new(data, expected_num_elements)
+                };
                 if let Some(ref dict_data) = self.dict_data {
                     decoder.set_dict_decoder(dict_data.clone())?;
                 }
@@ -608,6 +665,15 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             self.page_end_ordinal(page_idx) - self.current_page_first_ordinal
         } else {
             0
+        }
+    }
+
+    #[inline]
+    fn attach_current_page_integrity(&self, batch: ColumnBatch) -> ColumnBatch {
+        if self.current_page_utf8_verified {
+            batch.with_verified_utf8()
+        } else {
+            batch
         }
     }
 
@@ -753,7 +819,10 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         };
 
         self.current_ordinal += count as u64;
-        Ok((count, ColumnBatch::new(data, nulls)))
+        Ok((
+            count,
+            self.attach_current_page_integrity(ColumnBatch::new(data, nulls)),
+        ))
     }
 
     /// Check if we need to load the next page.
@@ -790,7 +859,11 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
     }
 
     fn prepare_page_access(&mut self, access: DecodedPageAccess) -> Result<()> {
-        let Some(PageDecoderImpl::BitShuffle(decoder)) = self.current_decoder.as_mut() else {
+        let Some(decoder) = self
+            .current_decoder
+            .as_mut()
+            .and_then(PageDecoderImpl::decoded_cache_decoder_mut)
+        else {
             return Ok(());
         };
         if decoder.is_materialized() {
@@ -848,6 +921,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         self.current_decoder = None;
         self.current_null_decoder = None;
         self.current_page_pointer = None;
+        self.current_page_utf8_verified = false;
         Ok(())
     }
 
@@ -897,7 +971,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         self.current_ordinal += count as u64;
         Ok(Some((
             count,
-            ColumnBatch::with_storage_dictionary(dictionary, codes, nulls),
+            self.attach_current_page_integrity(ColumnBatch::with_storage_dictionary(
+                dictionary, codes, nulls,
+            )),
         )))
     }
 
@@ -917,6 +993,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             None
         };
         let mut page_run_seeks = 0usize;
+        let mut utf8_verified = true;
 
         let mut idx = 0usize;
         while idx < sorted_rowids.len() {
@@ -931,6 +1008,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                     row_run.span_start
                 )));
             }
+            utf8_verified &= self.current_page_utf8_verified;
 
             let (count, code_bytes) = match self.current_decoder.as_mut() {
                 Some(PageDecoderImpl::Dictionary { decoder, .. }) if decoder.is_dict_encoded() => {
@@ -1012,14 +1090,17 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             encoded_codes.extend_from_slice(&code.to_le_bytes());
         }
 
-        Ok(Some(
-            ColumnBatch::with_storage_dictionary(
-                dictionary,
-                Bytes::from(encoded_codes),
-                nulls_out.map(Bytes::from),
-            )
-            .with_page_run_seeks(page_run_seeks),
-        ))
+        let batch = ColumnBatch::with_storage_dictionary(
+            dictionary,
+            Bytes::from(encoded_codes),
+            nulls_out.map(Bytes::from),
+        )
+        .with_page_run_seeks(page_run_seeks);
+        Ok(Some(if utf8_verified {
+            batch.with_verified_utf8()
+        } else {
+            batch
+        }))
     }
 
     fn read_plain_varlen_by_rowids(
@@ -1036,6 +1117,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
 
         let mut idx = 0usize;
         let mut page_run_seeks = 0usize;
+        let mut utf8_verified = true;
         while idx < sorted_rowids.len() {
             let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
             let run = &sorted_rowids[row_run.run_start..row_run.run_end];
@@ -1043,6 +1125,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
             let (count, batch) = self.next_batch_within_current_page(row_run.span_len)?;
+            utf8_verified &= batch.has_verified_utf8();
             if count != row_run.span_len {
                 return Err(paro_error::out_of_range(format!(
                     "rowid {} not found",
@@ -1079,10 +1162,13 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         for v in values {
             result.extend_from_slice(&v);
         }
-        Ok(
-            ColumnBatch::new(Bytes::from(result), nulls_out.map(Bytes::from))
-                .with_page_run_seeks(page_run_seeks),
-        )
+        let batch = ColumnBatch::new(Bytes::from(result), nulls_out.map(Bytes::from))
+            .with_page_run_seeks(page_run_seeks);
+        Ok(if utf8_verified {
+            batch.with_verified_utf8()
+        } else {
+            batch
+        })
     }
 
     fn read_fixed_width_by_rowids(
@@ -1255,12 +1341,14 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
         } else {
             None
         };
+        let mut utf8_verified = true;
 
         while total_read < n && self.current_ordinal < self.meta.num_rows {
             // Ensure page is loaded
             if !self.ensure_page_loaded(DecodedPageAccess::Sequential)? {
                 break;
             }
+            utf8_verified &= self.current_page_utf8_verified;
 
             let decoder = self.current_decoder.as_mut().unwrap();
 
@@ -1274,6 +1362,7 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
                 self.current_decoder = None;
                 self.current_null_decoder = None;
                 self.current_page_pointer = None;
+                self.current_page_utf8_verified = false;
                 continue;
             }
 
@@ -1301,9 +1390,14 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
             self.current_ordinal += count as u64;
         }
 
+        let batch = ColumnBatch::new(Bytes::from(result_data), result_nulls.map(Bytes::from));
         Ok((
             total_read,
-            ColumnBatch::new(Bytes::from(result_data), result_nulls.map(Bytes::from)),
+            if utf8_verified {
+                batch.with_verified_utf8()
+            } else {
+                batch
+            },
         ))
     }
 
@@ -1409,6 +1503,7 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for FilteredColumnIterator<R> 
                     self.inner.current_decoder = None;
                     self.inner.current_null_decoder = None;
                     self.inner.current_page_pointer = None;
+                    self.inner.current_page_utf8_verified = false;
                 } else {
                     // No more pages
                     self.inner.current_ordinal = self.inner.meta.num_rows;
@@ -1615,6 +1710,13 @@ mod tests {
     }
 
     fn create_plain_varchar_iterator(nullable: bool) -> Box<dyn ColumnIterator + Send + Sync> {
+        create_plain_varchar_iterator_with_checksum(nullable, true)
+    }
+
+    fn create_plain_varchar_iterator_with_checksum(
+        nullable: bool,
+        verify_checksum: bool,
+    ) -> Box<dyn ColumnIterator + Send + Sync> {
         let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
             .with_nullable(nullable)
             .with_encoding(EncodingType::Plain)
@@ -1641,7 +1743,7 @@ mod tests {
         let mut reader = ColumnReader::create(
             reader_meta,
             buffer,
-            ColumnReaderOptions::default(),
+            ColumnReaderOptions::default().with_verify_checksum(verify_checksum),
             create_page_reader(),
             None,
             None,
@@ -1860,6 +1962,60 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_code_stream_is_retained_in_decoded_cache() {
+        let opts = ColumnWriterOptions::new(FieldType::Varchar, 0)
+            .with_nullable(false)
+            .with_encoding(EncodingType::Dict)
+            .with_compression(CompressionType::None)
+            .with_page_size(16 * 1024);
+        let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+        let values = (0..4096)
+            .map(|row| if row % 3 == 0 { "alpha" } else { "beta" })
+            .collect::<Vec<_>>();
+        writer
+            .append(&encode_varlen_strings(&values), None, values.len() as u32)
+            .unwrap();
+        let meta = writer.finish().unwrap();
+        let physical_page = writer.into_inner().into_inner();
+        let reader_meta = ColumnReaderMeta::from_writer_meta(&meta, FieldType::Varchar);
+        let page_cache = Arc::new(PageCache::new(BufferPool::new_arc(4 * 1024 * 1024)));
+        let page_reader = PageReader::new(
+            PageReaderContext::new(1, 2, 3, 4),
+            Some(page_cache.clone()),
+            PageReaderOptions {
+                cache_decoded: true,
+                ..PageReaderOptions::default()
+            },
+        );
+
+        let mut expected_codes = None;
+        for _ in 0..2 {
+            let mut reader = ColumnReader::create(
+                reader_meta.clone(),
+                Cursor::new(physical_page.clone()),
+                ColumnReaderOptions::default(),
+                page_reader.clone(),
+                None,
+                None,
+            )
+            .unwrap();
+            let mut iterator = reader.new_iterator().unwrap();
+            let (count, batch) = iterator.next_batch(values.len()).unwrap();
+            assert_eq!(count, values.len());
+            let codes = batch
+                .storage_dictionary
+                .expect("dictionary scan should retain storage codes")
+                .codes;
+            if let Some(expected) = &expected_codes {
+                assert_eq!(&codes, expected);
+            } else {
+                expected_codes = Some(codes);
+            }
+            assert_eq!(page_cache.stats().decoded_entries, 1);
+        }
+    }
+
+    #[test]
     fn fixed_width_dictionary_roundtrips_as_a_typed_dictionary_batch() {
         let mut iter = create_dict_i32_iterator();
         let (count, batch) = iter.next_batch(6).unwrap();
@@ -2050,6 +2206,7 @@ mod tests {
 
         let (count, batch) = iter.next_batch(4).unwrap();
         assert_eq!(count, 4);
+        assert!(batch.has_verified_utf8());
         let storage_dictionary = batch
             .storage_dictionary
             .as_ref()
@@ -2080,6 +2237,17 @@ mod tests {
             .expect("decoded storage dictionary should keep provenance");
         assert_eq!(info.provenance_id, Some(77));
         assert_eq!(info.source, DictionarySource::Storage);
+    }
+
+    #[test]
+    fn utf8_integrity_requires_a_checksum_verified_current_page() {
+        let mut verified = create_plain_varchar_iterator_with_checksum(false, true);
+        let (_, verified_batch) = verified.next_batch(5).unwrap();
+        assert!(verified_batch.has_verified_utf8());
+
+        let mut unverified = create_plain_varchar_iterator_with_checksum(false, false);
+        let (_, unverified_batch) = unverified.next_batch(5).unwrap();
+        assert!(!unverified_batch.has_verified_utf8());
     }
 
     #[test]

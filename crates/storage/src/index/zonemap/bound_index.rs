@@ -449,7 +449,9 @@ impl BoundIndex for ZoneMapIndex {
             }
             // NotEq: ZoneMap cannot precisely exclude a single value
             Predicate::NotEq { .. } => PredicateResult::Unknown,
-            Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
+            Predicate::FixedIn { .. }
+            | Predicate::StringPrefix { .. }
+            | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
     }
 }

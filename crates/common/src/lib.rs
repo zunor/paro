@@ -37,6 +37,7 @@ pub mod effect;
 pub mod error;
 pub mod expression_type;
 pub mod filter_propagate;
+pub mod hash;
 pub mod identity;
 pub mod journal;
 pub mod logging;

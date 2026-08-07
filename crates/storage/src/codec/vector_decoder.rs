@@ -18,6 +18,16 @@ pub(crate) fn build_vector_from_bytes(
     rows: usize,
     allocator: Arc<dyn Allocator>,
 ) -> Result<Vector> {
+    build_vector_from_bytes_with_utf8_validation(logical_type, data, rows, allocator, true)
+}
+
+fn build_vector_from_bytes_with_utf8_validation(
+    logical_type: &LogicalType,
+    data: &Bytes,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    validate_utf8: bool,
+) -> Result<Vector> {
     let mut vector = match logical_type {
         LogicalType::Boolean => build_bool_vector(data, rows, allocator),
         LogicalType::TinyInt => {
@@ -75,23 +85,9 @@ pub(crate) fn build_vector_from_bytes(
         | LogicalType::TsQuery
         | LogicalType::Json
         | LogicalType::Jsonb => {
-            let values = parse_strings(data, rows)?;
-            let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
-            for (idx, value) in values.iter().enumerate() {
-                vector.try_set_string(idx, value)?;
-            }
-            vector.try_set_count(rows)?;
-            Ok(vector)
+            build_varlen_vector(logical_type, data, rows, allocator, validate_utf8)
         }
-        LogicalType::Blob => {
-            let values = parse_blobs(data, rows)?;
-            let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
-            for (idx, value) in values.iter().enumerate() {
-                vector.try_set_blob(idx, value)?;
-            }
-            vector.try_set_count(rows)?;
-            Ok(vector)
-        }
+        LogicalType::Blob => build_varlen_vector(logical_type, data, rows, allocator, false),
         LogicalType::List(child_type) => {
             build_list_vector(data, rows, child_type.as_ref(), allocator)
         }
@@ -135,6 +131,7 @@ fn decode_storage_dictionary_batch(
     rows: usize,
     allocator: Arc<dyn Allocator>,
     provenance_id: Option<u64>,
+    utf8_verified: bool,
 ) -> Result<Vector> {
     let mut dictionary_decoder = BinaryPlainPageDecoder::new(batch.dictionary.clone());
     dictionary_decoder.init()?;
@@ -154,10 +151,12 @@ fn decode_storage_dictionary_batch(
                 let value = dictionary_decoder
                     .string_at(idx as u32)
                     .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                let value = std::str::from_utf8(&value).map_err(|_| {
-                    paro_error::data_corrupted("dictionary entry is not valid UTF-8")
-                })?;
-                child.try_set_string(idx, value)?;
+                if !utf8_verified {
+                    std::str::from_utf8(&value).map_err(|_| {
+                        paro_error::data_corrupted("dictionary entry is not valid UTF-8")
+                    })?;
+                }
+                child.try_set_blob(idx, &value)?;
             }
         }
         LogicalType::Blob => {
@@ -267,10 +266,17 @@ pub(crate) fn decode_column_batch(
             rows,
             allocator,
             storage_provenance_id,
+            batch.has_verified_utf8(),
         );
     }
 
-    let mut vector = build_vector_from_bytes(logical_type, &batch.data, rows, allocator)?;
+    let mut vector = build_vector_from_bytes_with_utf8_validation(
+        logical_type,
+        &batch.data,
+        rows,
+        allocator,
+        !batch.has_verified_utf8(),
+    )?;
     if !matches!(logical_type, LogicalType::Null) {
         if let Some(nulls) = batch.nulls.as_deref() {
             apply_nulls(&mut vector, nulls, rows)?;
@@ -393,6 +399,52 @@ where
         }
     }
     vector.try_set_count(rows)?;
+    Ok(vector)
+}
+
+fn build_varlen_vector(
+    logical_type: &LogicalType,
+    data: &Bytes,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    validate_utf8: bool,
+) -> Result<Vector> {
+    let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
+    let (entries, _validity, heap) = vector.begin_varlen_write(rows);
+    let mut offset = 0usize;
+    for row_idx in 0..rows {
+        let length_end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("Variable-length column offset overflow"))?;
+        let length_bytes = data.get(offset..length_end).ok_or_else(|| {
+            paro_error::data_corrupted("Variable-length column length prefix is truncated")
+        })?;
+        let length = u32::from_le_bytes(
+            length_bytes
+                .try_into()
+                .expect("varlen length slice was checked"),
+        ) as usize;
+        let value_end = length_end.checked_add(length).ok_or_else(|| {
+            paro_error::data_corrupted("Variable-length column value offset overflow")
+        })?;
+        let value = data
+            .get(length_end..value_end)
+            .ok_or_else(|| paro_error::data_corrupted("Variable-length value exceeds buffer"))?;
+        if validate_utf8 {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        let entry = heap.try_add_blob(value)?;
+        // SAFETY: `begin_varlen_write(rows)` returns an `InlineString` array
+        // with exactly `rows` writable entries and `row_idx < rows`.
+        unsafe { entries.add(row_idx).write(entry) };
+        offset = value_end;
+    }
+    if offset != data.len() {
+        return Err(paro_error::data_corrupted(
+            "Variable-length column contains trailing bytes",
+        ));
+    }
     Ok(vector)
 }
 
@@ -693,20 +745,6 @@ pub(crate) fn decode_struct_payload(
     Ok(values)
 }
 
-fn parse_strings(data: &Bytes, rows: usize) -> Result<Vec<String>> {
-    parse_varlen_values(data, rows)?
-        .into_iter()
-        .map(|raw| {
-            String::from_utf8(raw)
-                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))
-        })
-        .collect()
-}
-
-fn parse_blobs(data: &Bytes, rows: usize) -> Result<Vec<Vec<u8>>> {
-    parse_varlen_values(data, rows)
-}
-
 pub(crate) fn parse_varlen_values(data: &Bytes, rows: usize) -> Result<Vec<Vec<u8>>> {
     let mut offset = 0usize;
     let bytes = data.as_ref();
@@ -876,5 +914,48 @@ impl FromPrimitiveLe for f32 {
     fn from_le_bytes(bytes: &[u8]) -> Self {
         let arr: [u8; 4] = bytes.try_into().expect("slice with incorrect length");
         f32::from_le_bytes(arr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_common::allocator::default_allocator;
+
+    fn encode_varlen(values: &[&[u8]]) -> Bytes {
+        let mut encoded = Vec::new();
+        for value in values {
+            encoded.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(value);
+        }
+        Bytes::from(encoded)
+    }
+
+    #[test]
+    fn varlen_vector_decodes_directly_from_canonical_rows() {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let encoded = encode_varlen(&[b"short", b"a value longer than twelve bytes"]);
+
+        let vector = build_vector_from_bytes(&LogicalType::Varchar, &encoded, 2, allocator)
+            .expect("valid varlen column");
+
+        assert_eq!(vector.get_string(0), Some("short"));
+        assert_eq!(
+            vector.get_string(1),
+            Some("a value longer than twelve bytes")
+        );
+    }
+
+    #[test]
+    fn varchar_decoder_rejects_invalid_utf8_while_blob_preserves_it() {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let encoded = encode_varlen(&[&[0xff, 0xfe]]);
+
+        assert!(
+            build_vector_from_bytes(&LogicalType::Varchar, &encoded, 1, allocator.clone()).is_err()
+        );
+        let blob = build_vector_from_bytes(&LogicalType::Blob, &encoded, 1, allocator)
+            .expect("blob bytes need not be UTF-8");
+        assert_eq!(blob.get_blob(0), Some([0xff, 0xfe].as_slice()));
     }
 }

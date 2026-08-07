@@ -11,6 +11,7 @@ use paro_common::test_utils::{
     test_vector_with_capacity,
 };
 use paro_common::types::LogicalType;
+use paro_common::vector::SelectionVector;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::JoinComparisonType;
@@ -180,7 +181,7 @@ fn join_build_mode_uses_atomic_discriminant_and_once_external_config() {
 }
 
 #[test]
-fn join_build_finalize_publishes_min_max_runtime_filter() {
+fn join_build_finalize_publishes_exact_runtime_filter() {
     let allocator = test_allocator();
     let handle = JoinBuildHandle::new(metadata());
     let table = handle
@@ -228,10 +229,36 @@ fn join_build_finalize_publishes_min_max_runtime_filter() {
 
     assert_eq!(
         handle.runtime_filter_predicate(0, 7).expect("predicate"),
+        PredicateTree::leaf(Predicate::FixedIn {
+            column_id: 7,
+            values: paro_storage::index::FixedMembership::i32(vec![10, 20, 30]),
+        })
+    );
+}
+
+#[test]
+fn oversized_join_runtime_filter_falls_back_to_min_max() {
+    let allocator = test_allocator();
+    let value_count = HASH_JOIN_RUNTIME_FILTER_MAX_VALUES + 1;
+    let mut values = test_vector_with_capacity(LogicalType::Integer, value_count);
+    for value in 0..value_count {
+        values.set_i32(value, value as i32);
+    }
+    values.set_count(value_count);
+    let keys = Chunk::from_arc_vectors(vec![Arc::new(values)], allocator.clone());
+    let selection = SelectionVector::try_incremental(value_count, allocator).unwrap();
+    let mut sketch = JoinRuntimeFilterSketch::empty(&[LogicalType::Integer]);
+    sketch
+        .add_key_chunk(&keys, &selection, value_count)
+        .expect("update oversized runtime filter sketch");
+    sketch.freeze();
+
+    assert_eq!(
+        sketch.predicate_for_column(0, 7).expect("predicate"),
         PredicateTree::leaf(Predicate::Range {
             column_id: 7,
-            lower: Value::Integer(10),
-            upper: Value::Integer(30),
+            lower: Value::Integer(0),
+            upper: Value::Integer(HASH_JOIN_RUNTIME_FILTER_MAX_VALUES as i32),
         })
     );
 }

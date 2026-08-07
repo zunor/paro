@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::fixed_predicate::{FixedComparisonValues, FixedConjunction};
+use super::predicate_column::{PredicateColumnAccess, PredicateColumnBatch, PredicateColumnReuse};
 use super::segment::Segment;
+use super::varlen_predicate::VarlenConjunction;
 use crate::buffer::Prefetcher;
-use crate::codec::vector_decoder;
 use crate::index::{
     collect_predicate_columns, IndexEvaluator, Predicate, PredicateComparison, PredicateResult,
     PredicateTree,
 };
-use crate::rowset::column::{ColumnBatch, ColumnIterator};
+#[cfg(test)]
+use crate::rowset::column::ColumnBatch;
+use crate::rowset::column::ColumnIterator;
 use crate::tablet::ColumnId;
 use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::error::{self as paro_error, Result};
@@ -27,109 +30,6 @@ pub(super) struct PredicateEvaluator {
     predicate_iterators: Vec<Option<Box<dyn ColumnIterator + Send + Sync>>>,
     predicate_column_access: Vec<PredicateColumnAccess>,
     allocator: Arc<dyn Allocator>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PredicateColumnAccess {
-    Unused,
-    Raw { width: usize },
-    Decoded,
-}
-
-pub(super) enum PredicateColumnBatch {
-    Raw(ColumnBatch),
-    Decoded(Vector),
-}
-
-impl PredicateColumnBatch {
-    #[inline]
-    fn is_null(&self, row_idx: usize) -> bool {
-        match self {
-            Self::Raw(batch) => batch
-                .nulls
-                .as_ref()
-                .is_some_and(|nulls| nulls[row_idx] != 0),
-            Self::Decoded(vector) => vector.is_null(row_idx),
-        }
-    }
-
-    #[inline]
-    fn decoded(&self) -> Option<&Vector> {
-        match self {
-            Self::Raw(_) => None,
-            Self::Decoded(vector) => Some(vector),
-        }
-    }
-
-    pub(super) fn append_raw_fixed_value(
-        &self,
-        row_idx: usize,
-        width: usize,
-        values: &mut Vec<u8>,
-        nulls: &mut Vec<u8>,
-    ) -> Result<bool> {
-        match self {
-            Self::Raw(batch) => {
-                let start = row_idx
-                    .checked_mul(width)
-                    .ok_or_else(|| paro_error::data_corrupted("Predicate row offset overflow"))?;
-                let end = start
-                    .checked_add(width)
-                    .ok_or_else(|| paro_error::data_corrupted("Predicate row width overflow"))?;
-                values.extend_from_slice(batch.data.get(start..end).ok_or_else(|| {
-                    paro_error::data_corrupted("Predicate row exceeds the fixed-width batch")
-                })?);
-                nulls.push(batch.nulls.as_ref().map_or(0, |nulls| nulls[row_idx]));
-                Ok(true)
-            }
-            Self::Decoded(_) => Ok(false),
-        }
-    }
-
-    #[inline]
-    unsafe fn i32_value(&self, row_idx: usize) -> i32 {
-        match self {
-            Self::Raw(batch) => i32::from_le(unsafe {
-                batch
-                    .data
-                    .as_ptr()
-                    .add(row_idx * std::mem::size_of::<i32>())
-                    .cast::<i32>()
-                    .read_unaligned()
-            }),
-            Self::Decoded(vector) => unsafe { vector.get_fixed::<i32>(row_idx) },
-        }
-    }
-
-    #[inline]
-    unsafe fn i64_value(&self, row_idx: usize) -> i64 {
-        match self {
-            Self::Raw(batch) => i64::from_le(unsafe {
-                batch
-                    .data
-                    .as_ptr()
-                    .add(row_idx * std::mem::size_of::<i64>())
-                    .cast::<i64>()
-                    .read_unaligned()
-            }),
-            Self::Decoded(vector) => unsafe { vector.get_fixed::<i64>(row_idx) },
-        }
-    }
-
-    #[inline]
-    unsafe fn i128_value(&self, row_idx: usize) -> i128 {
-        match self {
-            Self::Raw(batch) => i128::from_le(unsafe {
-                batch
-                    .data
-                    .as_ptr()
-                    .add(row_idx * std::mem::size_of::<i128>())
-                    .cast::<i128>()
-                    .read_unaligned()
-            }),
-            Self::Decoded(vector) => unsafe { vector.get_fixed::<i128>(row_idx) },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +112,10 @@ enum CompiledPredicate {
         column_idx: usize,
         comparisons: FixedComparisonValues,
     },
+    VarlenComparisons {
+        column_idx: usize,
+        comparisons: VarlenConjunction,
+    },
     Generic {
         column_idx: usize,
         predicate: Predicate,
@@ -225,15 +129,22 @@ enum CompiledPredicate {
 }
 
 impl PredicateEvaluator {
-    pub(super) fn raw_column_info(&self, column_id: ColumnId) -> Option<(usize, usize)> {
+    pub(super) fn reusable_column_info(
+        &self,
+        column_id: ColumnId,
+    ) -> Option<(usize, PredicateColumnReuse)> {
         let column_idx = self
             .predicate_columns
             .iter()
             .position(|candidate| *candidate == column_id)?;
-        match self.predicate_column_access[column_idx] {
-            PredicateColumnAccess::Raw { width } => Some((column_idx, width)),
-            PredicateColumnAccess::Unused | PredicateColumnAccess::Decoded => None,
+        if self.predicate_types[column_idx].physical_type()
+            == paro_common::types::PhysicalType::Varchar
+        {
+            return Some((column_idx, PredicateColumnReuse::Varlen));
         }
+        self.predicate_column_access[column_idx]
+            .raw_width()
+            .map(|width| (column_idx, PredicateColumnReuse::Fixed { width }))
     }
 
     pub(super) fn new(
@@ -290,15 +201,17 @@ impl PredicateEvaluator {
         Self::mark_column_access(&tree, &mut predicate_column_access)?;
         for (idx, access) in predicate_column_access.iter_mut().enumerate() {
             match access {
-                PredicateColumnAccess::Raw { width } if *width != types[idx].physical_size() => {
+                PredicateColumnAccess::Typed {
+                    raw_width: Some(width),
+                } if *width != types[idx].physical_size() => {
                     return Err(paro_error::internal(format!(
                         "Compiled predicate width {width} disagrees with {:?} physical width {}",
                         types[idx],
                         types[idx].physical_size(),
                     )));
                 }
-                PredicateColumnAccess::Unused => *access = PredicateColumnAccess::Decoded,
-                PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
+                PredicateColumnAccess::Unused => access.require_decoded(),
+                PredicateColumnAccess::Typed { .. } | PredicateColumnAccess::Decoded => {}
             }
         }
         Ok(Some(Self {
@@ -378,7 +291,7 @@ impl PredicateEvaluator {
                 } else {
                     rows_read = Some(count);
                 }
-                batches_by_col.push(Some(Self::prepare_column_batch(
+                batches_by_col.push(Some(PredicateColumnBatch::prepare(
                     ty,
                     self.predicate_column_access[idx],
                     batch,
@@ -406,42 +319,6 @@ impl PredicateEvaluator {
         Ok((rows, filled))
     }
 
-    fn prepare_column_batch(
-        ty: &LogicalType,
-        access: PredicateColumnAccess,
-        batch: ColumnBatch,
-        rows: usize,
-        allocator: Arc<dyn Allocator>,
-    ) -> Result<PredicateColumnBatch> {
-        if let PredicateColumnAccess::Raw { width } = access {
-            if batch.storage_dictionary.is_none() {
-                Self::validate_raw_batch(&batch, width, rows)?;
-                return Ok(PredicateColumnBatch::Raw(batch));
-            }
-        }
-
-        Ok(PredicateColumnBatch::Decoded(
-            vector_decoder::decode_column_batch(ty, &batch, rows, allocator, None)?,
-        ))
-    }
-
-    fn validate_raw_batch(batch: &ColumnBatch, width: usize, rows: usize) -> Result<()> {
-        let expected = rows
-            .checked_mul(width)
-            .ok_or_else(|| paro_error::data_corrupted("Predicate batch width overflow"))?;
-        if width == 0 || batch.data.len() != expected {
-            return Err(paro_error::data_corrupted(
-                "Fixed predicate batch has an invalid physical layout",
-            ));
-        }
-        if batch.nulls.as_ref().is_some_and(|nulls| nulls.len() < rows) {
-            return Err(paro_error::data_corrupted(
-                "Predicate null map is shorter than the batch",
-            ));
-        }
-        Ok(())
-    }
-
     pub(super) fn evaluate_batch(
         &self,
         batches_by_col: &[PredicateColumnBatch],
@@ -449,8 +326,8 @@ impl PredicateEvaluator {
         matches: &mut Vec<usize>,
     ) -> Result<()> {
         matches.clear();
-        if Self::is_fixed_constant_leaf(&self.tree) {
-            return Self::filter_fixed_constant_leaf(
+        if Self::is_typed_constant_leaf(&self.tree) {
+            return Self::filter_typed_constant_leaf(
                 &self.tree,
                 batches_by_col,
                 rows,
@@ -465,63 +342,94 @@ impl PredicateEvaluator {
             matches.extend(0..rows);
             return Ok(());
         };
-        if children.iter().all(Self::is_fixed_constant_leaf) {
-            Self::filter_fixed_constant_leaf(first, batches_by_col, rows, matches, true)?;
+        if children.iter().all(Self::is_typed_constant_leaf) {
+            Self::filter_typed_constant_leaf(first, batches_by_col, rows, matches, true)?;
             for predicate in remaining {
-                Self::filter_fixed_constant_leaf(predicate, batches_by_col, rows, matches, false)?;
+                Self::filter_typed_constant_leaf(predicate, batches_by_col, rows, matches, false)?;
                 if matches.is_empty() {
                     break;
                 }
             }
             return Ok(());
         }
-        if !children.iter().all(Self::is_fixed_comparison_leaf) {
+        if !children.iter().all(Self::is_typed_comparison_leaf) {
             return self.evaluate_batch_generic(batches_by_col, rows, matches);
         }
 
         for row_idx in 0..rows {
-            if Self::evaluate_fixed_comparison_leaf(first, batches_by_col, row_idx) {
+            if Self::evaluate_typed_comparison_leaf(first, batches_by_col, row_idx) {
                 matches.push(row_idx);
             }
         }
         for predicate in remaining {
             matches.retain(|&row_idx| {
-                Self::evaluate_fixed_comparison_leaf(predicate, batches_by_col, row_idx)
+                Self::evaluate_typed_comparison_leaf(predicate, batches_by_col, row_idx)
             });
         }
         Ok(())
     }
 
-    fn is_fixed_constant_leaf(predicate: &CompiledPredicateTree) -> bool {
+    fn is_typed_constant_leaf(predicate: &CompiledPredicateTree) -> bool {
         matches!(
             predicate,
-            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons { .. })
+            CompiledPredicateTree::Leaf(
+                CompiledPredicate::FixedComparisons { .. }
+                    | CompiledPredicate::VarlenComparisons { .. }
+            )
         )
     }
 
-    fn filter_fixed_constant_leaf(
+    fn constant_filter_priority(predicate: &CompiledPredicateTree) -> (u8, usize) {
+        match predicate {
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
+                comparisons,
+                ..
+            }) => comparisons.evaluation_priority(),
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons {
+                comparisons,
+                ..
+            }) => comparisons.evaluation_priority(),
+            _ => (u8::MAX, usize::MAX),
+        }
+    }
+
+    fn filter_typed_constant_leaf(
         predicate: &CompiledPredicateTree,
         batches_by_col: &[PredicateColumnBatch],
         rows: usize,
         selection: &mut Vec<usize>,
         seed: bool,
     ) -> Result<()> {
-        let CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
-            column_idx,
-            comparisons,
-        }) = predicate
-        else {
+        let CompiledPredicateTree::Leaf(predicate) = predicate else {
             return Err(paro_error::internal(
-                "Fixed predicate batch path received a non-constant comparison",
+                "Typed predicate batch path received a non-leaf comparison",
             ));
         };
-        let batch = batches_by_col.get(*column_idx).ok_or_else(|| {
+        let column_idx = match predicate {
+            CompiledPredicate::FixedComparisons { column_idx, .. }
+            | CompiledPredicate::VarlenComparisons { column_idx, .. } => *column_idx,
+            CompiledPredicate::Generic { .. } | CompiledPredicate::FixedColumnComparison { .. } => {
+                return Err(paro_error::internal(
+                    "Typed predicate batch path received a non-constant comparison",
+                ));
+            }
+        };
+        let batch = batches_by_col.get(column_idx).ok_or_else(|| {
             paro_error::internal(format!(
                 "Fixed predicate column index {column_idx} has no batch"
             ))
         })?;
-        comparisons.filter_batch(batch, rows, selection, seed);
-        Ok(())
+        match predicate {
+            CompiledPredicate::FixedComparisons { comparisons, .. } => {
+                comparisons.filter_batch(batch, rows, selection, seed)
+            }
+            CompiledPredicate::VarlenComparisons { comparisons, .. } => {
+                comparisons.filter_batch(batch, rows, selection, seed)
+            }
+            CompiledPredicate::Generic { .. } | CompiledPredicate::FixedColumnComparison { .. } => {
+                unreachable!("validated constant comparison above")
+            }
+        }
     }
 
     fn evaluate_batch_generic(
@@ -538,18 +446,19 @@ impl PredicateEvaluator {
         Ok(())
     }
 
-    fn is_fixed_comparison_leaf(predicate: &CompiledPredicateTree) -> bool {
+    fn is_typed_comparison_leaf(predicate: &CompiledPredicateTree) -> bool {
         matches!(
             predicate,
             CompiledPredicateTree::Leaf(
                 CompiledPredicate::FixedComparisons { .. }
+                    | CompiledPredicate::VarlenComparisons { .. }
                     | CompiledPredicate::FixedColumnComparison { .. }
             )
         )
     }
 
     #[inline]
-    fn evaluate_fixed_comparison_leaf(
+    fn evaluate_typed_comparison_leaf(
         predicate: &CompiledPredicateTree,
         batches_by_col: &[PredicateColumnBatch],
         row_idx: usize,
@@ -557,11 +466,11 @@ impl PredicateEvaluator {
         let CompiledPredicateTree::Leaf(predicate) = predicate else {
             return false;
         };
-        Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx).unwrap_or(false)
+        Self::evaluate_typed_comparison(predicate, batches_by_col, row_idx).unwrap_or(false)
     }
 
     #[inline]
-    fn evaluate_fixed_comparison(
+    fn evaluate_typed_comparison(
         predicate: &CompiledPredicate,
         batches_by_col: &[PredicateColumnBatch],
         row_idx: usize,
@@ -580,20 +489,47 @@ impl PredicateEvaluator {
                 unsafe {
                     match comparisons {
                         FixedComparisonValues::I32(comparisons) => {
-                            let lhs = batch.i32_value(row_idx);
+                            let lhs = i32::from_le(batch.fixed_value::<i32>(row_idx));
                             comparisons.matches(lhs)
                         }
                         FixedComparisonValues::I64(comparisons) => {
-                            let lhs = batch.i64_value(row_idx);
+                            let lhs = i64::from_le(batch.fixed_value::<i64>(row_idx));
                             comparisons.matches(lhs)
                         }
                         FixedComparisonValues::I128(comparisons) => {
-                            let lhs = batch.i128_value(row_idx);
+                            let lhs = i128::from_le(batch.fixed_value::<i128>(row_idx));
                             comparisons.matches(lhs)
                         }
                     }
                 }
             })),
+            CompiledPredicate::VarlenComparisons {
+                column_idx,
+                comparisons,
+            } => {
+                let batch = batches_by_col.get(*column_idx)?;
+                if batch.is_null(row_idx) {
+                    return Some(false);
+                }
+                let matches = match batch {
+                    PredicateColumnBatch::RawVarlen(batch) => batch
+                        .row_value(row_idx)
+                        .is_some_and(|value| comparisons.matches(value)),
+                    PredicateColumnBatch::StorageDictionary(batch) => batch
+                        .row_value(row_idx)
+                        .is_some_and(|value| comparisons.matches(&value)),
+                    PredicateColumnBatch::Decoded(vector) => match vector.logical_type() {
+                        LogicalType::Blob => vector
+                            .get_blob(row_idx)
+                            .is_some_and(|value| comparisons.matches(value)),
+                        _ => vector
+                            .get_string(row_idx)
+                            .is_some_and(|value| comparisons.matches(value.as_bytes())),
+                    },
+                    PredicateColumnBatch::Raw(_) => false,
+                };
+                Some(matches)
+            }
             CompiledPredicate::Generic { .. } => None,
             CompiledPredicate::FixedColumnComparison {
                 left_column_idx,
@@ -611,14 +547,13 @@ impl PredicateEvaluator {
                 // bounded by the shared predicate batch row count.
                 Some(unsafe {
                     let ordering = match width {
-                        FixedComparisonWidth::I32 => {
-                            left.i32_value(row_idx).cmp(&right.i32_value(row_idx))
-                        }
-                        FixedComparisonWidth::I64 => {
-                            left.i64_value(row_idx).cmp(&right.i64_value(row_idx))
-                        }
+                        FixedComparisonWidth::I32 => i32::from_le(left.fixed_value::<i32>(row_idx))
+                            .cmp(&i32::from_le(right.fixed_value::<i32>(row_idx))),
+                        FixedComparisonWidth::I64 => i64::from_le(left.fixed_value::<i64>(row_idx))
+                            .cmp(&i64::from_le(right.fixed_value::<i64>(row_idx))),
                         FixedComparisonWidth::I128 => {
-                            left.i128_value(row_idx).cmp(&right.i128_value(row_idx))
+                            i128::from_le(left.fixed_value::<i128>(row_idx))
+                                .cmp(&i128::from_le(right.fixed_value::<i128>(row_idx)))
                         }
                     };
                     comparison.matches(ordering)
@@ -664,8 +599,9 @@ impl PredicateEvaluator {
     ) -> Result<bool> {
         match predicate {
             CompiledPredicate::FixedComparisons { .. }
+            | CompiledPredicate::VarlenComparisons { .. }
             | CompiledPredicate::FixedColumnComparison { .. } => Ok(
-                Self::evaluate_fixed_comparison(predicate, batches_by_col, row_idx)
+                Self::evaluate_typed_comparison(predicate, batches_by_col, row_idx)
                     .unwrap_or(false),
             ),
             CompiledPredicate::Generic {
@@ -712,6 +648,9 @@ impl PredicateEvaluator {
                     Self::compare_value(vector, row_idx, rhs).is_some_and(Ordering::is_eq)
                 }))
             }
+            Predicate::FixedIn { .. } => Err(paro_error::internal(
+                "Fixed membership was not compiled to its typed evaluator",
+            )),
             Predicate::Range { lower, upper, .. } => {
                 let ge = Self::compare_value(vector, row_idx, lower).is_some_and(Ordering::is_ge);
                 let le = Self::compare_value(vector, row_idx, upper).is_some_and(Ordering::is_le);
@@ -721,6 +660,11 @@ impl PredicateEvaluator {
             Predicate::IsNotNull { .. } => {
                 Ok(vector.is_some_and(|vector| !vector.is_null(row_idx)))
             }
+            Predicate::StringPrefix {
+                prefix, negated, ..
+            } => Ok(vector
+                .and_then(|vector| vector.get_string(row_idx))
+                .is_some_and(|value| value.starts_with(prefix) != *negated)),
             Predicate::ColumnComparison { .. } => Err(paro_error::internal(
                 "Column comparison was not compiled to its fixed-width evaluator",
             )),
@@ -836,9 +780,11 @@ impl PredicateEvaluator {
                         child => compiled.push(child),
                     }
                 }
-                Ok(CompiledPredicateTree::And(
-                    Self::coalesce_fixed_comparisons(compiled),
-                ))
+                let mut compiled = Self::coalesce_constant_comparisons(compiled);
+                if compiled.iter().all(Self::is_typed_constant_leaf) {
+                    compiled.sort_by_key(Self::constant_filter_priority);
+                }
+                Ok(CompiledPredicateTree::And(compiled))
             }
             PredicateTree::Or(children) => Ok(CompiledPredicateTree::Or(
                 children
@@ -855,26 +801,20 @@ impl PredicateEvaluator {
     ) -> Result<()> {
         match tree {
             CompiledPredicateTree::Leaf(CompiledPredicate::Generic { column_idx, .. }) => {
-                access[*column_idx] = PredicateColumnAccess::Decoded;
+                access[*column_idx].require_decoded();
+            }
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons {
+                column_idx,
+                ..
+            }) => {
+                access[*column_idx].require_typed(None)?;
             }
             CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                 column_idx,
                 comparisons,
             }) => {
                 let width = comparisons.physical_width();
-                match access[*column_idx] {
-                    PredicateColumnAccess::Unused => {
-                        access[*column_idx] = PredicateColumnAccess::Raw { width };
-                    }
-                    PredicateColumnAccess::Raw {
-                        width: existing_width,
-                    } if existing_width != width => {
-                        return Err(paro_error::internal(format!(
-                            "Predicate column {column_idx} compiled with conflicting widths {existing_width} and {width}"
-                        )));
-                    }
-                    PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
-                }
+                access[*column_idx].require_typed(Some(width))?;
             }
             CompiledPredicateTree::Leaf(CompiledPredicate::FixedColumnComparison {
                 left_column_idx,
@@ -883,22 +823,7 @@ impl PredicateEvaluator {
                 ..
             }) => {
                 for column_idx in [*left_column_idx, *right_column_idx] {
-                    match access[column_idx] {
-                        PredicateColumnAccess::Unused => {
-                            access[column_idx] = PredicateColumnAccess::Raw {
-                                width: width.bytes(),
-                            };
-                        }
-                        PredicateColumnAccess::Raw {
-                            width: existing_width,
-                        } if existing_width != width.bytes() => {
-                            return Err(paro_error::internal(format!(
-                                "Predicate column {column_idx} compiled with conflicting widths {existing_width} and {}",
-                                width.bytes()
-                            )));
-                        }
-                        PredicateColumnAccess::Raw { .. } | PredicateColumnAccess::Decoded => {}
-                    }
+                    access[column_idx].require_typed(Some(width.bytes()))?;
                 }
             }
             CompiledPredicateTree::And(children) | CompiledPredicateTree::Or(children) => {
@@ -915,12 +840,58 @@ impl PredicateEvaluator {
         logical_type: &LogicalType,
         predicate: &Predicate,
     ) -> CompiledPredicate {
+        if let Predicate::StringPrefix {
+            prefix, negated, ..
+        } = predicate
+        {
+            return if matches!(logical_type, LogicalType::Varchar) {
+                CompiledPredicate::VarlenComparisons {
+                    column_idx,
+                    comparisons: VarlenConjunction::from_prefix(prefix.as_bytes(), *negated),
+                }
+            } else {
+                CompiledPredicate::Generic {
+                    column_idx,
+                    predicate: predicate.clone(),
+                }
+            };
+        }
+        if let Predicate::FixedIn { values, .. } = predicate {
+            return CompiledPredicate::FixedComparisons {
+                column_idx,
+                comparisons: FixedComparisonValues::from_membership(values.clone()),
+            };
+        }
+        if let Predicate::In { values, .. } = predicate {
+            if let Some(comparisons) = Self::compile_varlen_in(logical_type, values) {
+                return CompiledPredicate::VarlenComparisons {
+                    column_idx,
+                    comparisons,
+                };
+            }
+            return match Self::compile_fixed_in(logical_type, values) {
+                Some(comparisons) => CompiledPredicate::FixedComparisons {
+                    column_idx,
+                    comparisons,
+                },
+                None => CompiledPredicate::Generic {
+                    column_idx,
+                    predicate: predicate.clone(),
+                },
+            };
+        }
         let Some((operator, rhs)) = Self::comparison_parts(predicate) else {
             return CompiledPredicate::Generic {
                 column_idx,
                 predicate: predicate.clone(),
             };
         };
+        if let Some(rhs) = Self::varlen_comparison_value(logical_type, rhs) {
+            return CompiledPredicate::VarlenComparisons {
+                column_idx,
+                comparisons: VarlenConjunction::new(operator, rhs),
+            };
+        }
         match (logical_type, rhs) {
             (LogicalType::Date, Value::Date(rhs)) | (LogicalType::Integer, Value::Integer(rhs)) => {
                 CompiledPredicate::FixedComparisons {
@@ -959,6 +930,82 @@ impl PredicateEvaluator {
         }
     }
 
+    fn compile_fixed_in(
+        logical_type: &LogicalType,
+        values: &[Value],
+    ) -> Option<FixedComparisonValues> {
+        match logical_type {
+            LogicalType::Date => values
+                .iter()
+                .map(|value| match value {
+                    Value::Date(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(FixedConjunction::from_in)
+                .map(FixedComparisonValues::I32),
+            LogicalType::Integer => values
+                .iter()
+                .map(|value| match value {
+                    Value::Integer(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(FixedConjunction::from_in)
+                .map(FixedComparisonValues::I32),
+            LogicalType::BigInt => values
+                .iter()
+                .map(|value| match value {
+                    Value::BigInt(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(FixedConjunction::from_in)
+                .map(FixedComparisonValues::I64),
+            LogicalType::Decimal { precision, .. } if *precision <= 18 => values
+                .iter()
+                .map(|value| match value {
+                    Value::Decimal(value, _, _) => i64::try_from(*value).ok(),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(FixedConjunction::from_in)
+                .map(FixedComparisonValues::I64),
+            LogicalType::Decimal { .. } => values
+                .iter()
+                .map(|value| match value {
+                    Value::Decimal(value, _, _) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(FixedConjunction::from_in)
+                .map(FixedComparisonValues::I128),
+            _ => None,
+        }
+    }
+
+    fn compile_varlen_in(
+        logical_type: &LogicalType,
+        values: &[Value],
+    ) -> Option<VarlenConjunction> {
+        values
+            .iter()
+            .map(|value| Self::varlen_comparison_value(logical_type, value).map(Box::<[u8]>::from))
+            .collect::<Option<Vec<_>>>()
+            .map(VarlenConjunction::from_in)
+    }
+
+    fn varlen_comparison_value<'a>(
+        logical_type: &LogicalType,
+        value: &'a Value,
+    ) -> Option<&'a [u8]> {
+        match (logical_type, value) {
+            (LogicalType::Varchar, Value::Varchar(value)) => Some(value.as_bytes()),
+            (LogicalType::Blob, Value::Blob(value)) => Some(value),
+            _ => None,
+        }
+    }
+
     fn comparison_parts(predicate: &Predicate) -> Option<(ComparisonOperator, &Value)> {
         match predicate {
             Predicate::Eq { value, .. } => Some((ComparisonOperator::Equal, value)),
@@ -971,7 +1018,7 @@ impl PredicateEvaluator {
         }
     }
 
-    fn coalesce_fixed_comparisons(
+    fn coalesce_constant_comparisons(
         predicates: Vec<CompiledPredicateTree>,
     ) -> Vec<CompiledPredicateTree> {
         let mut result: Vec<CompiledPredicateTree> = Vec::with_capacity(predicates.len());
@@ -998,6 +1045,28 @@ impl PredicateEvaluator {
                         ));
                     }
                 }
+                CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons {
+                    column_idx,
+                    comparisons,
+                }) => {
+                    let existing = result.iter_mut().find_map(|predicate| match predicate {
+                        CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons {
+                            column_idx: existing_idx,
+                            comparisons,
+                        }) if *existing_idx == column_idx => Some(comparisons),
+                        _ => None,
+                    });
+                    if let Some(existing) = existing {
+                        existing.merge(comparisons);
+                    } else {
+                        result.push(CompiledPredicateTree::Leaf(
+                            CompiledPredicate::VarlenComparisons {
+                                column_idx,
+                                comparisons,
+                            },
+                        ));
+                    }
+                }
                 predicate => result.push(predicate),
             }
         }
@@ -1018,7 +1087,9 @@ impl PredicateVerificationExt for Predicate {
                 | Predicate::Le { .. }
                 | Predicate::Gt { .. }
                 | Predicate::Ge { .. }
+                | Predicate::FixedIn { .. }
                 | Predicate::Range { .. }
+                | Predicate::StringPrefix { .. }
                 | Predicate::ColumnComparison { .. }
         )
     }
@@ -1095,8 +1166,8 @@ mod tests {
             predicate_columns: vec![7],
             predicate_types: column_types.to_vec(),
             predicate_iterators: std::iter::once(None).collect(),
-            predicate_column_access: vec![PredicateColumnAccess::Raw {
-                width: std::mem::size_of::<i32>(),
+            predicate_column_access: vec![PredicateColumnAccess::Typed {
+                raw_width: Some(std::mem::size_of::<i32>()),
             }],
             allocator: Arc::new(default_allocator()),
         };
@@ -1113,6 +1184,54 @@ mod tests {
         let mut matches = Vec::new();
         evaluator.evaluate_batch(&batches, 4, &mut matches).unwrap();
         assert_eq!(matches, [1]);
+    }
+
+    #[test]
+    fn fixed_in_set_coalesces_with_ranges_and_reads_raw_batches() {
+        let column_map = HashMap::from([(7, 0)]);
+        let column_types = [LogicalType::Integer];
+        let tree = PredicateEvaluator::compile_tree(
+            &PredicateTree::And(vec![
+                PredicateTree::leaf(Predicate::In {
+                    column_id: 7,
+                    values: vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)],
+                }),
+                PredicateTree::leaf(Predicate::Gt {
+                    column_id: 7,
+                    value: Value::Integer(10),
+                }),
+            ]),
+            &column_map,
+            &column_types,
+        )
+        .unwrap();
+        let CompiledPredicateTree::And(children) = tree else {
+            panic!("expected compiled AND");
+        };
+        assert_eq!(children.len(), 1);
+        let evaluator = PredicateEvaluator {
+            tree: CompiledPredicateTree::And(children),
+            predicate_columns: vec![7],
+            predicate_types: column_types.to_vec(),
+            predicate_iterators: std::iter::once(None).collect(),
+            predicate_column_access: vec![PredicateColumnAccess::Typed {
+                raw_width: Some(std::mem::size_of::<i32>()),
+            }],
+            allocator: Arc::new(default_allocator()),
+        };
+        let values = [5_i32, 10, 20, 30, 40];
+        let data = values
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let batches = [PredicateColumnBatch::Raw(ColumnBatch::new(
+            Bytes::from(data),
+            Some(Bytes::from_static(&[0, 0, 0, 1, 0])),
+        ))];
+
+        let mut matches = Vec::new();
+        evaluator.evaluate_batch(&batches, 5, &mut matches).unwrap();
+        assert_eq!(matches, [2]);
     }
 
     #[test]
@@ -1134,8 +1253,8 @@ mod tests {
         assert_eq!(
             access,
             [
-                PredicateColumnAccess::Raw { width: 4 },
-                PredicateColumnAccess::Raw { width: 4 }
+                PredicateColumnAccess::Typed { raw_width: Some(4) },
+                PredicateColumnAccess::Typed { raw_width: Some(4) }
             ]
         );
         let evaluator = PredicateEvaluator {
@@ -1192,6 +1311,54 @@ mod tests {
     }
 
     #[test]
+    fn varchar_comparison_filters_raw_varlen_bytes_without_materializing_a_vector() {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let column_map = HashMap::from([(7, 0)]);
+        let column_types = [LogicalType::Varchar];
+        let tree = PredicateEvaluator::compile_tree(
+            &PredicateTree::leaf(Predicate::NotEq {
+                column_id: 7,
+                value: Value::Varchar("Brand#45".to_string()),
+            }),
+            &column_map,
+            &column_types,
+        )
+        .unwrap();
+        assert!(matches!(
+            &tree,
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons { .. })
+        ));
+        let mut data = Vec::new();
+        for value in ["Brand#12", "Brand#45", "Brand#46", "Brand#99"] {
+            data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            data.extend_from_slice(value.as_bytes());
+        }
+        let batch = PredicateColumnBatch::prepare(
+            &LogicalType::Varchar,
+            PredicateColumnAccess::Typed { raw_width: None },
+            ColumnBatch::new(Bytes::from(data), Some(Bytes::from_static(&[0, 0, 0, 1]))),
+            4,
+            allocator.clone(),
+        )
+        .unwrap();
+        assert!(matches!(batch, PredicateColumnBatch::RawVarlen(_)));
+        let evaluator = PredicateEvaluator {
+            tree,
+            predicate_columns: vec![7],
+            predicate_types: column_types.to_vec(),
+            predicate_iterators: std::iter::once(None).collect(),
+            predicate_column_access: vec![PredicateColumnAccess::Typed { raw_width: None }],
+            allocator,
+        };
+        let batches = [batch];
+        let mut matches = Vec::new();
+
+        evaluator.evaluate_batch(&batches, 4, &mut matches).unwrap();
+
+        assert_eq!(matches, [0, 2]);
+    }
+
+    #[test]
     fn narrow_decimal_never_compiles_to_a_wider_physical_reader() {
         let predicate = Predicate::Eq {
             column_id: 7,
@@ -1211,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_fixed_predicate_falls_back_to_decoding_a_storage_dictionary() {
+    fn fixed_predicate_preserves_a_validated_storage_dictionary() {
         let mut dictionary = BinaryPlainPageBuilder::new(1024);
         assert!(dictionary.add_slice(&5_i32.to_le_bytes()));
         assert!(dictionary.add_slice(&11_i32.to_le_bytes()));
@@ -1222,10 +1389,10 @@ mod tests {
             .collect::<Vec<_>>();
         let batch = ColumnBatch::with_storage_dictionary(dictionary, Bytes::from(codes), None);
 
-        let prepared = PredicateEvaluator::prepare_column_batch(
+        let prepared = PredicateColumnBatch::prepare(
             &LogicalType::Integer,
-            PredicateColumnAccess::Raw {
-                width: std::mem::size_of::<i32>(),
+            PredicateColumnAccess::Typed {
+                raw_width: Some(std::mem::size_of::<i32>()),
             },
             batch,
             3,
@@ -1233,11 +1400,15 @@ mod tests {
         )
         .unwrap();
 
-        let PredicateColumnBatch::Decoded(vector) = prepared else {
-            panic!("storage dictionary must be decoded before fixed predicate evaluation");
+        let PredicateColumnBatch::StorageDictionary(_) = &prepared else {
+            panic!("typed predicate must retain the storage dictionary");
         };
-        assert_eq!(unsafe { vector.get_fixed::<i32>(0) }, 5);
-        assert_eq!(unsafe { vector.get_fixed::<i32>(1) }, 11);
-        assert_eq!(unsafe { vector.get_fixed::<i32>(2) }, 5);
+        let comparisons =
+            FixedComparisonValues::I32(FixedConjunction::new(ComparisonOperator::Equal, 11));
+        let mut selection = Vec::new();
+        comparisons
+            .filter_batch(&prepared, 3, &mut selection, true)
+            .unwrap();
+        assert_eq!(selection, [1]);
     }
 }

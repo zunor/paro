@@ -426,7 +426,9 @@ impl BoundIndex for BitmapIndex {
             Predicate::Range { lower, upper, .. } => self.evaluate_range(lower, upper),
             Predicate::IsNull { .. } => self.evaluate_is_null(),
             Predicate::IsNotNull { .. } => self.evaluate_is_not_null(),
-            Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
+            Predicate::FixedIn { .. }
+            | Predicate::StringPrefix { .. }
+            | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
     }
 }

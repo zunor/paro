@@ -3,6 +3,7 @@
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -10,14 +11,32 @@ pub mod unsafe_api;
 
 mod array;
 mod fixed;
+mod gather;
 mod list;
+mod scatter;
 mod struct_codec;
 mod varlen;
 
 pub use array::ArrayCodec;
+pub use gather::gather_column_from_rows;
 pub use list::ListCodec;
+pub use scatter::{PreparedRowScatter, RowHeapUsage};
 pub use struct_codec::StructCodec;
 pub use varlen::VarlenCodec;
+
+/// Ownership boundary used while scattering retained execution rows.
+///
+/// Row codecs write pointers for out-of-line values, so the operator that owns
+/// the row storage must also own the referenced allocations. Implementations
+/// keep those allocations alive for at least as long as every row written
+/// through this interface.
+pub trait RowHeapWriter {
+    /// Copy bytes into stable storage and return their retained address.
+    fn store_bytes(&mut self, bytes: &[u8]) -> Result<*const u8>;
+
+    /// Retain an owned nested value and return its stable address.
+    fn store_value(&mut self, value: Value) -> Result<*const Value>;
+}
 
 /// Precompiled scatter/gather strategy for one logical column.
 #[derive(Debug, Clone, PartialEq, Eq)]

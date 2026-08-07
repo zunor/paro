@@ -38,6 +38,19 @@ pub enum JoinType {
     RightAnti,
 }
 
+/// NULL semantics used by a left anti join.
+///
+/// A regular anti join implements `NOT EXISTS`: NULL probe keys simply do not
+/// match. A null-aware anti join implements a scalar `NOT IN`: a NULL anywhere
+/// on the build side rejects every probe row, while NULL probe keys are
+/// rejected whenever the build side is non-empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AntiJoinMode {
+    #[default]
+    Regular,
+    NullAware,
+}
+
 impl JoinType {
     /// Returns true if this is a left or full outer join.
     pub fn is_left_outer(&self) -> bool {
@@ -278,6 +291,8 @@ impl JoinSide {
 pub struct ComparisonJoin {
     /// The type of join (INNER, LEFT, RIGHT, etc.)
     pub join_type: JoinType,
+    /// Three-valued-logic mode for `JoinType::Anti`.
+    pub anti_join_mode: AntiJoinMode,
     /// Left child operator.
     pub left: Box<LogicalPlan>,
     /// Right child operator.
@@ -320,6 +335,7 @@ impl ComparisonJoin {
     ) -> Self {
         Self {
             join_type,
+            anti_join_mode: AntiJoinMode::Regular,
             left: Box::new(left),
             right: Box::new(right),
             conditions,
@@ -330,6 +346,14 @@ impl ComparisonJoin {
             left_projection_map: vec![],
             right_projection_map: vec![],
         }
+    }
+
+    /// Lower a MARK join consumed by `NOT(marker)` to a null-aware anti join.
+    pub fn make_null_aware_anti(&mut self) {
+        self.join_type = JoinType::Anti;
+        self.anti_join_mode = AntiJoinMode::NullAware;
+        self.mark_index = None;
+        self.mark_null_condition_start = None;
     }
 
     /// Check if this join has at least one equality condition.

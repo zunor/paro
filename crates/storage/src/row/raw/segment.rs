@@ -113,6 +113,18 @@ pub struct RawRowChunkPart {
     pub heap_base_address: Arc<Mutex<Option<usize>>>,
 }
 
+/// Stable append-time location of one row inside a raw row collection.
+///
+/// Sealed [`RowStore`](crate::row::RowStore) metadata retains this location so
+/// later gathers can pin the exact chunk part without scanning segments and
+/// chunks again for every projected column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawRowLocation {
+    pub(crate) segment_index: usize,
+    pub(crate) part_index: usize,
+    pub(crate) row_in_part: usize,
+}
+
 impl RawRowChunkPart {
     /// Create a new chunk part.
     pub fn new(

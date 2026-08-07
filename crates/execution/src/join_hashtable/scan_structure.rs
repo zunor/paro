@@ -45,6 +45,11 @@ pub struct ScanStructure {
     pub lhs_sel: SelectionVector,
     /// Pointers to build-side rows that passed all predicates.
     pub rhs_pointers: Vec<usize>,
+    /// Adjacent-unique build pointers used to preserve one-to-many build
+    /// matches as dictionary vectors instead of copying repeated payloads.
+    rhs_unique_pointers: Vec<usize>,
+    /// Logical output row to adjacent-unique build row mapping.
+    rhs_dictionary_sel: SelectionVector,
     /// Build pointers retained while a match batch is drained across output vectors.
     pending_rhs_pointers: Vec<usize>,
     /// Accepted matches in the current chain step.
@@ -73,6 +78,13 @@ pub struct ScanStructure {
     pub pointer_offset: usize,
     /// Whether chains longer than one exist in HT.
     pub has_long_chains: bool,
+    /// Whether every published pointer came from an exact-key index lookup.
+    ///
+    /// Direct-address indexes map a typed key ordinal to a unique build row,
+    /// so repeating the row-key comparison while draining the scan would only
+    /// duplicate work. Chained hash-table probes leave this disabled because
+    /// their salt match still requires an exact equality check.
+    pub exact_key_matches: bool,
 }
 
 impl std::fmt::Debug for ScanStructure {
@@ -202,6 +214,8 @@ impl ScanStructure {
             found_match: vec![false; VECTOR_SIZE],
             lhs_sel: SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone())?,
             rhs_pointers: vec![0; VECTOR_SIZE],
+            rhs_unique_pointers: Vec::with_capacity(VECTOR_SIZE),
+            rhs_dictionary_sel: SelectionVector::try_with_capacity(VECTOR_SIZE, allocator.clone())?,
             pending_rhs_pointers: vec![0; VECTOR_SIZE],
             pending_match_count: 0,
             pending_match_offset: 0,
@@ -216,6 +230,7 @@ impl ScanStructure {
             has_null_value_filter: false,
             pointer_offset,
             has_long_chains: false,
+            exact_key_matches: false,
         })
     }
 
@@ -238,6 +253,10 @@ impl ScanStructure {
         self.chain_match_sel = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
         self.scratch_sel = SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
         self.lhs_sel = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
+        self.rhs_unique_pointers
+            .reserve(capacity.saturating_sub(self.rhs_unique_pointers.len()));
+        self.rhs_dictionary_sel =
+            SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
         Ok(())
     }
 
@@ -248,6 +267,7 @@ impl ScanStructure {
         self.finished = false;
         self.is_null = false;
         self.has_null_value_filter = false;
+        self.exact_key_matches = false;
         self.pending_match_count = 0;
         self.pending_match_offset = 0;
         self.single_output_offset = 0;
@@ -552,6 +572,49 @@ impl ScanStructure {
         Ok(result.size())
     }
 
+    /// Emit SQL `NOT IN` semantics after an equality probe.
+    ///
+    /// The caller handles a NULL on the build side globally. For a non-empty,
+    /// all-valid build side, only the non-NULL probe rows retained in
+    /// `probe_sel` can produce output, and only when no equality match exists.
+    pub fn next_null_aware_anti_join(
+        &mut self,
+        keys: &paro_common::chunk::Chunk,
+        left: &paro_common::chunk::Chunk,
+        result: &mut paro_common::chunk::Chunk,
+        hash_table: &JoinHashTable,
+        left_projection_map: &[usize],
+    ) -> Result<usize> {
+        if self.finished {
+            result.set_cardinality(0);
+            return Ok(0);
+        }
+
+        self.scan_key_matches_with_filter(keys, hash_table, Self::accept_all_matches)?;
+
+        self.scratch_sel.set_len(self.probe_sel.len());
+        let mut selected_count = 0usize;
+        let selected_rows = self.scratch_sel.as_mut_slice();
+        for candidate_idx in 0..self.probe_sel.len() {
+            let row_idx = self.probe_sel.get(candidate_idx);
+            if !self.found_match[row_idx] {
+                selected_rows[selected_count] = row_idx as u32;
+                selected_count += 1;
+            }
+        }
+        self.scratch_sel.set_len(selected_count);
+
+        construct_anti_join_result(
+            left,
+            &self.scratch_sel,
+            selected_count,
+            left_projection_map,
+            result,
+        )?;
+        self.finished = true;
+        Ok(result.size())
+    }
+
     /// Resolve predicates for the current set of matching candidates.
     ///
     /// This compares the probe-side keys with the keys stored in the build-side rows.
@@ -571,7 +634,7 @@ impl ScanStructure {
                 continue;
             }
 
-            if hash_table.key_values_match_build_row(keys, idx, row_ptr) {
+            if self.exact_key_matches || hash_table.key_values_match_build_row(keys, idx, row_ptr) {
                 self.chain_match_sel.set(match_count, idx);
                 self.rhs_pointers[base_offset + match_count] = row_ptr as usize;
                 match_count += 1;
@@ -590,7 +653,10 @@ impl ScanStructure {
         for active_idx in 0..self.count {
             let probe_idx = self.sel_vector.get(active_idx);
             let row_ptr = self.pointers[probe_idx];
-            if row_ptr != 0 && hash_table.key_values_match_build_row(keys, probe_idx, row_ptr) {
+            if row_ptr != 0
+                && (self.exact_key_matches
+                    || hash_table.key_values_match_build_row(keys, probe_idx, row_ptr))
+            {
                 self.chain_match_sel.set(match_count, probe_idx);
                 self.pending_rhs_pointers[match_count] = row_ptr;
                 match_count += 1;
@@ -999,18 +1065,11 @@ impl ScanStructure {
             let vector = result
                 .column_mut(right_offset + out_idx)
                 .expect("single join output vector must exist");
-
-            for output_idx in 0..emit_count {
-                let probe_idx = self.single_output_offset + output_idx;
-                let row_ptr = self.single_match_pointers[probe_idx];
-                if row_ptr != 0 {
-                    let value = hash_table.read_build_value(row_ptr, *build_idx);
-                    vector.set_value(output_idx, &value);
-                    vector.set_null(output_idx, false);
-                } else {
-                    vector.set_null(output_idx, true);
-                }
-            }
+            let start = self.single_output_offset;
+            let row_ptrs = &self.single_match_pointers[start..start + emit_count];
+            // SAFETY: match pointers are either zero for an unmatched probe row
+            // or were obtained from `hash_table` while probing it.
+            unsafe { hash_table.gather_build_column(row_ptrs, *build_idx, vector)? };
         }
 
         result.set_cardinality(emit_count);
@@ -1047,7 +1106,7 @@ impl ScanStructure {
 
     /// Gather data from build-side hash table to fill result chunk.
     pub fn gather_result(
-        &self,
+        &mut self,
         left: &paro_common::chunk::Chunk,
         result: &mut paro_common::chunk::Chunk,
         count: usize,
@@ -1101,18 +1160,69 @@ impl ScanStructure {
 
         // 2. Gather projected RHS columns
         let right_result_offset = left_indices.len();
+        let unique_rhs_count = self.prepare_rhs_dictionary(count)?;
         for (out_idx, build_idx) in right_indices.iter().enumerate() {
-            for row_idx in 0..count {
-                let row_ptr = self.rhs_pointers[row_idx];
-                let val = hash_table.read_build_value(row_ptr, *build_idx);
-                result
-                    .column_mut(right_result_offset + out_idx)
-                    .unwrap()
-                    .set_value(row_idx, &val);
+            let output_idx = right_result_offset + out_idx;
+            let build_type = hash_table.build_types.get(*build_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "join build projection index out of bounds: index={build_idx}, columns={}",
+                    hash_table.build_types.len()
+                ))
+            })?;
+            let use_dictionary = unique_rhs_count < count
+                && dictionary_gather_is_smaller(build_type, count, unique_rhs_count);
+            let row_ptrs = if use_dictionary {
+                &self.rhs_unique_pointers[..unique_rhs_count]
+            } else {
+                &self.rhs_pointers[..count]
+            };
+            let output = result
+                .column_mut(output_idx)
+                .expect("join output vector must exist");
+            // SAFETY: these row pointers were obtained from `hash_table` while
+            // resolving the current probe matches.
+            unsafe { hash_table.gather_build_column(row_ptrs, *build_idx, output)? };
+            if use_dictionary {
+                let child = Arc::clone(&result.data[output_idx]);
+                result.data[output_idx] = Arc::new(Vector::try_dictionary(
+                    child,
+                    self.rhs_dictionary_sel.clone(),
+                )?);
             }
         }
         Ok(())
     }
+
+    fn prepare_rhs_dictionary(&mut self, count: usize) -> Result<usize> {
+        self.rhs_unique_pointers.clear();
+        self.rhs_dictionary_sel.try_make_exclusive()?;
+        self.rhs_dictionary_sel.set_len(count);
+        let mut previous = None;
+        let mut dictionary_idx = 0usize;
+        for row_idx in 0..count {
+            let pointer = self.rhs_pointers[row_idx];
+            if previous != Some(pointer) {
+                self.rhs_unique_pointers.push(pointer);
+                previous = Some(pointer);
+                dictionary_idx = self.rhs_unique_pointers.len() - 1;
+            }
+            self.rhs_dictionary_sel.set(row_idx, dictionary_idx);
+        }
+        Ok(self.rhs_unique_pointers.len())
+    }
+}
+
+fn dictionary_gather_is_smaller(
+    logical_type: &LogicalType,
+    row_count: usize,
+    unique_count: usize,
+) -> bool {
+    let value_width = logical_type.physical_size();
+    let flat_bytes = row_count.saturating_mul(value_width);
+    let dictionary_bytes = unique_count
+        .saturating_mul(value_width)
+        .saturating_add(row_count.saturating_mul(std::mem::size_of::<u32>()));
+    dictionary_bytes < flat_bytes
 }
 
 #[cfg(test)]

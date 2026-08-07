@@ -386,6 +386,7 @@ impl OperatorRuntimeRegistry {
                 SourceExec::HashJoinSpillReplay(HashJoinSpillReplaySourceExec {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
+                    anti_join_mode: spec.anti_join_mode,
                     conditions: spec.conditions.clone(),
                     probe_types: spec.probe_types.clone(),
                     build_payload_types: spec.build_payload_types.clone(),
@@ -470,6 +471,7 @@ impl OperatorRuntimeRegistry {
                 TransformExec::HashJoinProbe(HashJoinProbeTransformExec {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
+                    anti_join_mode: spec.anti_join_mode,
                     conditions: spec.conditions.clone(),
                     left_projection: spec.left_projection.clone(),
                     output_types: spec.output_types.clone(),
@@ -827,7 +829,7 @@ mod tests {
     use paro_planner::expression::{
         ConstantExpression, Expression, ReferenceExpression, WindowExpression, WindowFrame,
     };
-    use paro_planner::operator::join::{JoinCondition, JoinType};
+    use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
     use crate::physical::properties::{
         NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PipelineProperties,
@@ -899,9 +901,11 @@ mod tests {
     fn empty_aggregate_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 0,
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([]),
             groups: Box::new([]),
+            group_key_encodings: Box::new([]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([]),
             grouping_functions: Box::new([]),
@@ -1329,6 +1333,7 @@ mod tests {
                         super::super::graph::HashJoinSpillReplaySourceSpec {
                             handle: join,
                             join_type: JoinType::Inner,
+                            anti_join_mode: AntiJoinMode::Regular,
                             conditions: Box::new([join_condition()]),
                             probe_types: Box::new([LogicalType::Integer]),
                             build_payload_types: Box::new([LogicalType::Integer]),
@@ -1341,6 +1346,7 @@ mod tests {
                         super::super::graph::HashJoinProbeSpec {
                             handle: join,
                             join_type: JoinType::Inner,
+                            anti_join_mode: AntiJoinMode::Regular,
                             conditions: Box::new([join_condition()]),
                             left_projection: Box::new([0]),
                             output_names: Box::new(["l".to_string(), "r".to_string()]),

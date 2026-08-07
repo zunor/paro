@@ -2,7 +2,193 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::operators::aggregate::tuple_layout::TupleLayout;
+use crate::physical::specs::GroupKeyEncoding;
 use paro_planner::operator::DistinctType;
+use paro_storage::statistics::{NumericStats, StringStats};
+
+fn plan_group_key_encodings(aggregate: &LogicalAggregate) -> Box<[GroupKeyEncoding]> {
+    let supports_physical_keys = aggregate.aggregates.iter().all(|expression| {
+        matches!(expression, Expression::Aggregate(bound) if bound.order_bys.is_empty())
+    });
+    let logical_types = aggregate
+        .groups
+        .iter()
+        .map(Expression::return_type)
+        .collect::<Vec<_>>();
+    let mut encodings = aggregate
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(group_idx, expression)| {
+            if !supports_physical_keys {
+                return GroupKeyEncoding::Identity;
+            }
+            let Some(stats) = aggregate
+                .group_stats
+                .get(group_idx)
+                .and_then(Option::as_ref)
+            else {
+                return GroupKeyEncoding::Identity;
+            };
+            if stats.get_type() != &expression.return_type() {
+                return GroupKeyEncoding::Identity;
+            }
+            match expression.return_type() {
+                LogicalType::Varchar => plan_string_group_key(stats),
+                LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::HugeInt
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+                | LogicalType::UHugeInt => plan_integer_group_key(&expression.return_type(), stats),
+                _ => GroupKeyEncoding::Identity,
+            }
+        })
+        .collect::<Vec<_>>();
+    retain_row_reducing_encodings(&logical_types, &mut encodings);
+    encodings.into_boxed_slice()
+}
+
+/// Drop physical encodings that do not reduce the aligned group-key prefix.
+///
+/// Per-column width is insufficient here: aggregate states start at an
+/// eight-byte boundary, so a narrow integer at the end of the group list can
+/// merely turn useful bytes into padding while every input row still pays the
+/// encoding cost. Starting from the compact layout and removing redundant
+/// encodings also handles alignment interactions between adjacent keys.
+fn retain_row_reducing_encodings(
+    logical_types: &[LogicalType],
+    encodings: &mut [GroupKeyEncoding],
+) {
+    let Some(logical_width) = TupleLayout::group_storage_width(logical_types).ok() else {
+        encodings.fill(GroupKeyEncoding::Identity);
+        return;
+    };
+    let Some(compact_width) = encoded_group_storage_width(logical_types, encodings) else {
+        encodings.fill(GroupKeyEncoding::Identity);
+        return;
+    };
+    if compact_width >= logical_width {
+        encodings.fill(GroupKeyEncoding::Identity);
+        return;
+    }
+
+    for encoding_idx in 0..encodings.len() {
+        if matches!(encodings[encoding_idx], GroupKeyEncoding::Identity) {
+            continue;
+        }
+        let candidate = std::mem::replace(&mut encodings[encoding_idx], GroupKeyEncoding::Identity);
+        if encoded_group_storage_width(logical_types, encodings) != Some(compact_width) {
+            encodings[encoding_idx] = candidate;
+        }
+    }
+}
+
+fn encoded_group_storage_width(
+    logical_types: &[LogicalType],
+    encodings: &[GroupKeyEncoding],
+) -> Option<usize> {
+    if logical_types.len() != encodings.len() {
+        return None;
+    }
+    let physical_types = logical_types
+        .iter()
+        .zip(encodings)
+        .map(|(logical_type, encoding)| match encoding {
+            GroupKeyEncoding::Identity => logical_type.clone(),
+            GroupKeyEncoding::PackedString { physical_type, .. }
+            | GroupKeyEncoding::OffsetInteger { physical_type, .. } => physical_type.clone(),
+        })
+        .collect::<Vec<_>>();
+    TupleLayout::group_storage_width(&physical_types).ok()
+}
+
+fn plan_string_group_key(stats: &paro_storage::statistics::BaseStatistics) -> GroupKeyEncoding {
+    let Some(max_length) =
+        StringStats::max_string_length(stats).and_then(|length| usize::try_from(length).ok())
+    else {
+        return GroupKeyEncoding::Identity;
+    };
+    [
+        LogicalType::UTinyInt,
+        LogicalType::USmallInt,
+        LogicalType::UInteger,
+        LogicalType::UBigInt,
+        LogicalType::UHugeInt,
+    ]
+    .into_iter()
+    .find(|ty| {
+        max_length < ty.physical_size() && ty.physical_size() < LogicalType::Varchar.physical_size()
+    })
+    .map(|physical_type| GroupKeyEncoding::PackedString {
+        physical_type,
+        max_length,
+    })
+    .unwrap_or(GroupKeyEncoding::Identity)
+}
+
+fn plan_integer_group_key(
+    logical_type: &LogicalType,
+    stats: &paro_storage::statistics::BaseStatistics,
+) -> GroupKeyEncoding {
+    let Some(minimum) = NumericStats::min(stats)
+        .as_ref()
+        .and_then(integer_value_as_i128)
+    else {
+        return GroupKeyEncoding::Identity;
+    };
+    let Some(maximum) = NumericStats::max(stats)
+        .as_ref()
+        .and_then(integer_value_as_i128)
+    else {
+        return GroupKeyEncoding::Identity;
+    };
+    let Some(range) = maximum
+        .checked_sub(minimum)
+        .and_then(|range| u128::try_from(range).ok())
+    else {
+        return GroupKeyEncoding::Identity;
+    };
+    [
+        (LogicalType::UTinyInt, u8::MAX as u128),
+        (LogicalType::USmallInt, u16::MAX as u128),
+        (LogicalType::UInteger, u32::MAX as u128),
+        (LogicalType::UBigInt, u64::MAX as u128),
+        (LogicalType::UHugeInt, u128::MAX),
+    ]
+    .into_iter()
+    .find(|(physical_type, maximum)| {
+        range <= *maximum && physical_type.physical_size() < logical_type.physical_size()
+    })
+    .map(|(physical_type, _)| GroupKeyEncoding::OffsetInteger {
+        physical_type,
+        minimum,
+    })
+    .unwrap_or(GroupKeyEncoding::Identity)
+}
+
+fn integer_value_as_i128(value: &paro_common::runtime_value::Value) -> Option<i128> {
+    use paro_common::runtime_value::Value;
+
+    match value {
+        Value::TinyInt(value) => Some(*value as i128),
+        Value::SmallInt(value) => Some(*value as i128),
+        Value::Integer(value) => Some(*value as i128),
+        Value::BigInt(value) => Some(*value as i128),
+        Value::HugeInt(value) => Some(*value),
+        Value::UTinyInt(value) => Some(*value as i128),
+        Value::USmallInt(value) => Some(*value as i128),
+        Value::UInteger(value) => Some(*value as i128),
+        Value::UBigInt(value) => Some(i128::from(*value)),
+        Value::UHugeInt(value) => i128::try_from(*value).ok(),
+        _ => None,
+    }
+}
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_aggregate(
@@ -102,9 +288,15 @@ impl PhysicalPlanGenerator {
 
         let spec = AggregateSpec {
             grouping_key_count: groups.len(),
+            estimated_input_rows: aggregate
+                .child
+                .stats
+                .estimated_cardinality
+                .map(|estimate| estimate.expected),
             projection_exprs: projection_exprs.into_boxed_slice(),
             payload_types: payload_types.into_boxed_slice(),
             groups: groups.into_boxed_slice(),
+            group_key_encodings: plan_group_key_encodings(aggregate),
             grouping_sets: aggregate
                 .grouping_sets
                 .iter()
@@ -167,9 +359,18 @@ impl PhysicalPlanGenerator {
 
         let spec = AggregateSpec {
             grouping_key_count: groups.len(),
+            estimated_input_rows: distinct
+                .child
+                .stats
+                .estimated_cardinality
+                .map(|estimate| estimate.expected),
             projection_exprs: projection_exprs.into_boxed_slice(),
             payload_types: child_types.clone().into_boxed_slice(),
             groups: groups.into_boxed_slice(),
+            group_key_encodings: (0..child_types.len())
+                .map(|_| GroupKeyEncoding::Identity)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             grouping_sets: Box::new([]),
             aggregates: Box::new([]),
             grouping_functions: Box::new([]),

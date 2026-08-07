@@ -7,12 +7,16 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::vector::VECTOR_SIZE;
+use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
 use paro_storage::row::RowSpillReader;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
+use crate::operators::aggregate::group_key_codec::{decode_group_columns, has_encoded_group_keys};
 use crate::operators::aggregate::output_filter::copy_selected_rows;
+use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
+    AggregateHTScanPosition, AggregateHashTable,
+};
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
@@ -114,29 +118,34 @@ impl HashAggregateEmitSourceExec {
                     grouping_idx,
                     table,
                 } => {
-                    let produced = if let (Some(executor), Some(selection)) = (
-                        local.having_executor.as_mut(),
-                        local.having_selection.as_mut(),
-                    ) {
-                        table.scan_with_aggregate_filter(
+                    let encoded_groups = has_encoded_group_keys(&self.spec);
+                    let produced = if encoded_groups {
+                        let scan_types = table.scan_output_types();
+                        let scratch = local
+                            .scan_chunk
+                            .get_or_insert(Chunk::try_new(output.allocator().clone())?);
+                        ensure_source_output(scratch, &scan_types, VECTOR_SIZE)?;
+                        let produced = scan_table_batch(
+                            table,
+                            &mut local.position,
+                            scratch,
+                            local.having_executor.as_mut(),
+                            local.having_selection.as_mut(),
+                            ctx.query,
+                        )?;
+                        if produced {
+                            decode_aggregate_output(&self.spec, scratch, output)?;
+                        }
+                        produced
+                    } else {
+                        scan_table_batch(
+                            table,
                             &mut local.position,
                             output,
-                            selection,
-                            |aggregates, count, selection| {
-                                executor.select_kernel(
-                                    0,
-                                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
-                                        params: ctx.query.params.as_ref(),
-                                        columns: aggregates,
-                                    })
-                                    .with_count(count),
-                                    ctx.query,
-                                    selection,
-                                )
-                            },
+                            local.having_executor.as_mut(),
+                            local.having_selection.as_mut(),
+                            ctx.query,
                         )?
-                    } else {
-                        table.scan(&mut local.position, output)?
                     };
                     if produced {
                         populate_grouping_columns(&self.spec, output, *grouping_idx)?;
@@ -177,7 +186,18 @@ impl HashAggregateEmitSourceExec {
                             if selected_count == 0 {
                                 continue;
                             }
-                            copy_selected_rows(scratch, output, selection, selected_count)?;
+                            if has_encoded_group_keys(&self.spec) {
+                                let filtered = local
+                                    .scan_chunk
+                                    .get_or_insert(Chunk::try_new(output.allocator().clone())?);
+                                ensure_source_output(filtered, &scratch.types(), VECTOR_SIZE)?;
+                                copy_selected_rows(scratch, filtered, selection, selected_count)?;
+                                decode_aggregate_output(&self.spec, filtered, output)?;
+                            } else {
+                                copy_selected_rows(scratch, output, selection, selected_count)?;
+                            }
+                        } else if has_encoded_group_keys(&self.spec) {
+                            decode_aggregate_output(&self.spec, scratch, output)?;
                         } else {
                             copy_spilled_output_rows(scratch, output)?;
                         }
@@ -189,6 +209,73 @@ impl HashAggregateEmitSourceExec {
             local.work = None;
         }
     }
+}
+
+fn scan_table_batch(
+    table: &mut AggregateHashTable,
+    position: &mut AggregateHTScanPosition,
+    output: &mut Chunk,
+    having_executor: Option<&mut ExpressionExecutor>,
+    having_selection: Option<&mut SelectionVector>,
+    query: &QueryRuntimeContext,
+) -> Result<bool> {
+    match (having_executor, having_selection) {
+        (Some(executor), Some(selection)) => table.scan_with_aggregate_filter(
+            position,
+            output,
+            selection,
+            |aggregates, count, selection| {
+                executor.select_kernel(
+                    0,
+                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                        params: query.params.as_ref(),
+                        columns: aggregates,
+                    })
+                    .with_count(count),
+                    query,
+                    selection,
+                )
+            },
+        ),
+        (None, None) => table.scan(position, output),
+        _ => Err(paro_error::internal(
+            "aggregate HAVING executor and selection state disagree",
+        )),
+    }
+}
+
+fn decode_aggregate_output(spec: &AggregateSpec, source: &Chunk, output: &mut Chunk) -> Result<()> {
+    decode_group_columns(spec, source, output)?;
+    let group_count = spec.grouping_key_count;
+    if source.column_count() < group_count + spec.aggregates.len() {
+        return Err(paro_error::internal(format!(
+            "encoded aggregate output is too narrow: groups={group_count}, aggregates={}, columns={}",
+            spec.aggregates.len(),
+            source.column_count()
+        )));
+    }
+    for aggregate_idx in 0..spec.aggregates.len() {
+        let column_idx = group_count + aggregate_idx;
+        let source_column = source.column(column_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "encoded aggregate source column not found: index={column_idx}"
+            ))
+        })?;
+        let output_column = output.column(column_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "decoded aggregate output column not found: index={column_idx}"
+            ))
+        })?;
+        if output_column.logical_type() != source_column.logical_type() {
+            return Err(paro_error::internal(format!(
+                "decoded aggregate output type mismatch at index {column_idx}: expected={:?}, actual={:?}",
+                output_column.logical_type(),
+                source_column.logical_type()
+            )));
+        }
+        output.data[column_idx] = Arc::clone(source_column);
+    }
+    output.try_set_cardinality(source.size())
 }
 
 fn initialize_work(

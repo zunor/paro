@@ -9,7 +9,7 @@ use paro_common::vector::VECTOR_SIZE;
 
 use crate::operators::output::ensure_source_output;
 use crate::result_type::SourceResultType;
-use crate::runtime::breaker::{HandleRef, SortHandle};
+use crate::runtime::breaker::{HandleRef, SortHandle, SortOutputState};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{BreakerHandleGlobal, SortEmitSourceLocal, SourceGlobal, SourceLocal};
@@ -59,42 +59,50 @@ impl SortEmitSourceExec {
             .state
             .as_ref()
             .expect("sort emit source state initialized");
-        if state.total_count == 0 {
+        if local.current_position >= state.total_count {
             output.try_set_cardinality(0)?;
             return Ok(SourcePoll::Finished);
         }
 
         ensure_source_output(output, &state.output_types, VECTOR_SIZE)?;
-        if let Some(single_run) = state.single_run.as_ref() {
-            if local.current_position >= state.total_count {
+        match &state.output {
+            SortOutputState::Empty => {
                 output.try_set_cardinality(0)?;
-                return Ok(SourcePoll::Finished);
+                Ok(SourcePoll::Finished)
             }
-            single_run.scan(
-                output,
-                local.current_position,
-                state.sort.output_projection_columns(),
-            )?;
-            local.current_position += output.size();
-            if output.is_empty() {
-                return Ok(SourcePoll::Finished);
+            SortOutputState::SingleRun(run) => {
+                run.scan(
+                    output,
+                    local.current_position,
+                    state.sort.output_projection_columns(),
+                )?;
+                local.current_position += output.size();
+                if output.is_empty() {
+                    Ok(SourcePoll::Finished)
+                } else {
+                    Ok(SourcePoll::Output)
+                }
             }
-            return Ok(SourcePoll::Output);
-        }
-
-        let (Some(merger), Some(merger_gstate)) =
-            (state.merger.as_ref(), state.merger_gstate.as_ref())
-        else {
-            output.try_set_cardinality(0)?;
-            return Ok(SourcePoll::Finished);
-        };
-        match merger.get_data(output, merger_gstate, &mut local.merger_lstate)? {
-            SourceResultType::HaveMoreOutput => Ok(SourcePoll::Output),
-            SourceResultType::Finished if !output.is_empty() => Ok(SourcePoll::Output),
-            SourceResultType::Finished => Ok(SourcePoll::Finished),
-            SourceResultType::Blocked => Err(paro_error::internal(
-                "sorted run merger returned blocked without a wake registration",
-            )),
+            SortOutputState::Materialized(chunks) => {
+                let Some(chunk) = chunks.get(local.materialized_chunk_idx) else {
+                    output.try_set_cardinality(0)?;
+                    return Ok(SourcePoll::Finished);
+                };
+                local.materialized_chunk_idx += 1;
+                local.current_position += chunk.size();
+                output.reference(chunk);
+                Ok(SourcePoll::Output)
+            }
+            SortOutputState::StreamingMerge { merger, global } => {
+                match merger.get_data(output, global, &mut local.merger_lstate)? {
+                    SourceResultType::HaveMoreOutput => Ok(SourcePoll::Output),
+                    SourceResultType::Finished if !output.is_empty() => Ok(SourcePoll::Output),
+                    SourceResultType::Finished => Ok(SourcePoll::Finished),
+                    SourceResultType::Blocked => Err(paro_error::internal(
+                        "sorted run merger returned blocked without a wake registration",
+                    )),
+                }
+            }
         }
     }
 }

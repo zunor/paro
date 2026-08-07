@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::{ColumnBinding, JoinType};
+use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
 use crate::join_order::relation::JoinRelationSet;
 
@@ -27,6 +27,8 @@ pub struct FilterInfo {
     pub filter_index: usize,
     /// The type of join this filter is part of.
     pub join_type: JoinType,
+    /// NULL semantics for an anti-join edge.
+    pub anti_join_mode: AntiJoinMode,
     /// The left side of the join (if applicable).
     pub left_set: Option<Arc<JoinRelationSet>>,
     /// The right side of the join (if applicable).
@@ -44,12 +46,14 @@ impl FilterInfo {
         set: Arc<JoinRelationSet>,
         filter_index: usize,
         join_type: JoinType,
+        anti_join_mode: AntiJoinMode,
     ) -> Self {
         Self {
             filter,
             set,
             filter_index,
             join_type,
+            anti_join_mode,
             left_set: None,
             right_set: None,
             left_binding: None,
@@ -59,7 +63,13 @@ impl FilterInfo {
 
     /// Create a new FilterInfo with default INNER join type.
     pub fn new_inner(filter: Expression, set: Arc<JoinRelationSet>, filter_index: usize) -> Self {
-        Self::new(filter, set, filter_index, JoinType::Inner)
+        Self::new(
+            filter,
+            set,
+            filter_index,
+            JoinType::Inner,
+            AntiJoinMode::Regular,
+        )
     }
 
     /// Set the left relation set.
@@ -381,7 +391,7 @@ mod tests {
             value: Value::Boolean(true),
             return_type: LogicalType::Boolean,
         });
-        let mut filter = FilterInfo::new(expr, set, 0, JoinType::Left);
+        let mut filter = FilterInfo::new(expr, set, 0, JoinType::Left, AntiJoinMode::Regular);
         filter.set_left_set(left.clone());
         filter.set_right_set(right.clone());
         filter.set_left_binding(ColumnBinding::new(0, 0));

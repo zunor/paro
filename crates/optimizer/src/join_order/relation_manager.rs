@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_planner::expression::{Expression, ExpressionIterator};
-use paro_planner::operator::{ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType};
+use paro_planner::operator::{
+    AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType,
+};
 
 use crate::expression::join_tree_has_evaluation_fence;
 use crate::join_order::query_graph::FilterInfo;
@@ -18,6 +20,7 @@ use crate::join_order::relation::JoinRelationSetManager;
 pub struct ExtractedFilter {
     pub expression: Expression,
     pub join_type: JoinType,
+    pub anti_join_mode: AntiJoinMode,
 }
 
 /// Predicates extracted from a reorderable join region.
@@ -31,15 +34,16 @@ pub struct ExtractedJoinPredicates {
 }
 
 impl ExtractedFilter {
-    pub fn new(expression: Expression, join_type: JoinType) -> Self {
+    pub fn new(expression: Expression, join_type: JoinType, anti_join_mode: AntiJoinMode) -> Self {
         Self {
             expression,
             join_type,
+            anti_join_mode,
         }
     }
 
     pub fn inner(expression: Expression) -> Self {
-        Self::new(expression, JoinType::Inner)
+        Self::new(expression, JoinType::Inner, AntiJoinMode::Regular)
     }
 }
 
@@ -314,6 +318,7 @@ impl RelationManager {
                 set,
                 filters.len(),
                 extracted_filter.join_type,
+                extracted_filter.anti_join_mode,
             );
 
             self.populate_filter_info_bindings(extracted_filter, set_manager, &mut filter_info);
@@ -761,14 +766,19 @@ mod tests {
 
         let filters = manager
             .extract_edges(
-                &[ExtractedFilter::new(filter, JoinType::Semi)],
+                &[ExtractedFilter::new(
+                    filter,
+                    JoinType::Anti,
+                    AntiJoinMode::NullAware,
+                )],
                 &mut set_manager,
             )
             .expect("reorderable predicate")
             .graph_filters;
 
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].join_type, JoinType::Semi);
+        assert_eq!(filters[0].join_type, JoinType::Anti);
+        assert_eq!(filters[0].anti_join_mode, AntiJoinMode::NullAware);
         assert_eq!(filters[0].left_binding, Some(ColumnBinding::new(0, 0)));
         assert_eq!(filters[0].right_binding, Some(ColumnBinding::new(1, 0)));
         assert!(filters[0].left_set.is_some());

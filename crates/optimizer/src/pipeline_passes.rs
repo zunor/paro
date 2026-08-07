@@ -397,8 +397,12 @@ impl Rewriter for InClausePass {
         OptimizerType::InClause
     }
 
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        InClauseRewriter::new().rewrite(plan, ctx)
+    fn rewrite(
+        &mut self,
+        plan: LogicalPlan,
+        _ctx: &mut OptimizationContext,
+    ) -> Result<LogicalPlan> {
+        InClauseRewriter::new().rewrite(plan)
     }
 }
 

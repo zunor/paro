@@ -5,12 +5,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use paro_planner::expression::ConjunctionType;
 use paro_planner::expression::{ColumnRefExpression, Expression};
+use paro_planner::expression::{ConjunctionType, OperatorType};
 use paro_planner::operator::empty_result::EmptyResult;
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{
-    AnyJoin, ComparisonJoin, CrossProduct, Join, JoinSide, JoinType, LogicalOperator, Projection,
+    AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinSide, JoinType,
+    LogicalOperator, Projection,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -375,6 +376,18 @@ impl FilterPushdown {
                     if column.depth == 0 && column.binding == mark_binding
             )
         });
+        let negative_marker = self.filters.iter().position(|filter| {
+            matches!(
+                &filter.filter,
+                Expression::Operator(operator)
+                    if operator.operator_type == OperatorType::Not
+                        && matches!(
+                            operator.children.as_slice(),
+                            [Expression::ColumnRef(column)]
+                                if column.depth == 0 && column.binding == mark_binding
+                        )
+            )
+        });
         let marker_reference_count = self
             .filters
             .iter()
@@ -386,6 +399,18 @@ impl FilterPushdown {
             join.join_type = JoinType::Semi;
             join.mark_index = None;
             join.mark_null_condition_start = None;
+            self.pushdown_semi_anti_join(join)
+        } else if let Some(marker_index) = negative_marker.filter(|_| {
+            marker_reference_count == 1
+                && join.mark_null_condition_start == Some(0)
+                && join.conditions.len() == 1
+                && join.conditions[0].comparison == JoinComparisonType::Equal
+        }) {
+            // A scalar NOT IN marker is observable only through this top-level
+            // filter. Preserve its UNKNOWN cases directly in a null-aware anti
+            // join instead of materializing a boolean column and filtering it.
+            self.filters.remove(marker_index);
+            join.make_null_aware_anti();
             self.pushdown_semi_anti_join(join)
         } else {
             // MARK outputs the left schema plus one marker. Predicates over

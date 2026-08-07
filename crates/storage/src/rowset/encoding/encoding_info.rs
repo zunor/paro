@@ -88,6 +88,11 @@ impl FieldType {
         self.size().is_none()
     }
 
+    /// Whether persisted values must satisfy the UTF-8 storage invariant.
+    pub fn requires_valid_utf8(self) -> bool {
+        matches!(self, FieldType::Char | FieldType::Varchar | FieldType::Json)
+    }
+
     /// Check if this type supports dictionary encoding.
     pub fn supports_dict_encoding(&self) -> bool {
         match self {

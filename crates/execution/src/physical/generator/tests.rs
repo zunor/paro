@@ -26,8 +26,10 @@ use paro_storage::search::{
     NormalizedSearchRequest, ProjectionSpec, SearchCapabilityState, SearchIntent,
     SearchRequestMode,
 };
+use paro_storage::statistics::StringStats;
 
 use super::*;
+use crate::physical::specs::GroupKeyEncoding;
 
 #[test]
 fn arena_generator_builds_streaming_subset_without_runtime_objects() {
@@ -96,6 +98,106 @@ fn arena_generator_lowers_distinct_to_hash_aggregate() {
     assert_eq!(spec.output_names.as_ref(), ["a"]);
     assert_eq!(plan.child_ids(&plan.node(plan.root).children).len(), 1);
     assert!(PhysicalPlanGenerator::ensure_fully_typed(&plan).is_ok());
+}
+
+#[test]
+fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["brand".to_string()],
+            vec![LogicalType::Varchar],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![ref_expr(0, LogicalType::Varchar)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let mut stats = StringStats::create_empty(LogicalType::Varchar);
+    StringStats::update(&mut stats, "Brand45");
+    aggregate.group_stats[0] = Some(stats);
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+    assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::PackedString {
+            physical_type: LogicalType::UBigInt,
+            max_length: 7,
+        }]
+    );
+}
+
+#[test]
+fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["size".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![ref_expr(0, LogicalType::Integer)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let mut stats = paro_storage::statistics::NumericStats::create_empty(LogicalType::Integer);
+    paro_storage::statistics::NumericStats::set_min(
+        &mut stats,
+        &paro_common::runtime_value::Value::Integer(-5),
+    );
+    paro_storage::statistics::NumericStats::set_max(
+        &mut stats,
+        &paro_common::runtime_value::Value::Integer(250),
+    );
+    aggregate.group_stats[0] = Some(stats);
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+    assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::Identity]
+    );
 }
 
 #[test]

@@ -296,7 +296,7 @@ pub(crate) fn finalize_ordered_into_hash_tables(
         )));
     }
     let group_count = group_refs.len();
-    let group_types = group_types(spec);
+    let group_types = group_types(spec)?;
     let full_layout = AggregateStateLayout::new(aggregate_objects)?;
     for (agg_idx, object) in aggregate_objects.iter().enumerate() {
         let collector = &mut ordered_collectors[agg_idx];

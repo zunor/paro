@@ -11,18 +11,17 @@ use std::ptr;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::hash::{
+    combine_hash, hash_bytes, hash_i64, hash_u128, hash_u64, HASH_SEED, NULL_HASH,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector, VectorType};
+use paro_common::vector::{DataRef, SelectionVector, Vector, VectorType};
 use paro_planner::operator::join::JoinComparisonType;
 use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::RowLayout;
 
 use super::build_store::BuildRowLayout;
-
-const HASH_SEED: u64 = 0xa076_1d64_78bd_642f;
-const FIELD_SEED: u64 = 0xe703_7ed1_a0b4_28db;
-const NULL_HASH: u64 = 0x9e37_79b9_7f4a_7c15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinKeyColumn {
@@ -128,7 +127,7 @@ impl JoinKeyLayout {
             None,
             count,
             &mut hashes.as_mut_slice::<u64>()[..count],
-        );
+        )?;
         Ok(())
     }
 
@@ -138,9 +137,9 @@ impl JoinKeyLayout {
         selection: &SelectionVector,
         count: usize,
         hashes: &mut [u64],
-    ) {
+    ) -> Result<()> {
         debug_assert!(hashes.len() >= count);
-        self.hash_rows_into(keys, Some(selection), count, hashes);
+        self.hash_rows_into(keys, Some(selection), count, hashes)
     }
 
     fn hash_rows_into(
@@ -149,7 +148,7 @@ impl JoinKeyLayout {
         selection: Option<&SelectionVector>,
         count: usize,
         hashes: &mut [u64],
-    ) {
+    ) -> Result<()> {
         debug_assert!(hashes.len() >= count);
         let hashes = &mut hashes[..count];
         hashes.fill(HASH_SEED);
@@ -159,8 +158,9 @@ impl JoinKeyLayout {
             let vector = keys
                 .column(col_idx)
                 .expect("hash join key column must exist");
-            apply_column_hash(column_kind, vector, selected_rows, count, hashes);
+            apply_column_hash(column_kind, vector, selected_rows, count, hashes)?;
         }
+        Ok(())
     }
 
     pub(crate) fn keys_match_build_row(
@@ -348,7 +348,7 @@ fn apply_column_hash(
     selected_rows: Option<&[u32]>,
     count: usize,
     hashes: &mut [u64],
-) {
+) -> Result<()> {
     match column_kind {
         JoinKeyColumn::Boolean => apply_fixed_hash_column::<bool>(
             vector,
@@ -454,20 +454,15 @@ fn apply_column_hash(
             |value| hash_u64(value.to_bits()),
             |vector, row| vector.get_f64(row),
         ),
-        JoinKeyColumn::Varchar => {
-            apply_varlen_hash_column(vector, selected_rows, count, hashes, |vector, row| {
-                vector.get_string(row).map(str::as_bytes)
-            })
-        }
-        JoinKeyColumn::Blob => {
-            apply_varlen_hash_column(vector, selected_rows, count, hashes, |vector, row| {
-                vector.get_blob(row)
-            })
+        JoinKeyColumn::Varchar | JoinKeyColumn::Blob => {
+            apply_varlen_hash_column(vector, selected_rows, count, hashes)
         }
         JoinKeyColumn::ValueFallback { type_hash } => {
-            apply_value_fallback_hash_column(vector, selected_rows, count, hashes, type_hash)
+            apply_value_fallback_hash_column(vector, selected_rows, count, hashes, type_hash);
+            Ok(())
         }
-    }
+    }?;
+    Ok(())
 }
 
 fn apply_fixed_hash_column<T: Copy>(
@@ -477,99 +472,86 @@ fn apply_fixed_hash_column<T: Copy>(
     hashes: &mut [u64],
     hash_value: impl Fn(T) -> u64,
     read_value: impl Fn(&Vector, usize) -> Option<T>,
-) {
-    match (selected_rows, vector.vector_type()) {
-        (None, VectorType::Flat) => {
-            let values = vector.as_slice::<T>();
-            for row_idx in 0..count {
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(values[row_idx])
-                };
-                hashes[row_idx] = combine_hash(hashes[row_idx], value_hash);
-            }
-        }
-        (Some(selection), VectorType::Flat) => {
-            let values = vector.as_slice::<T>();
-            for out_idx in 0..count {
-                let row_idx = selection[out_idx] as usize;
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(values[row_idx])
-                };
-                hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
-            }
-        }
-        (_, VectorType::Constant) => {
-            let value_hash = if vector.is_null(0) {
-                NULL_HASH
-            } else {
-                hash_value(vector.as_slice::<T>()[0])
-            };
-            for slot in hashes.iter_mut().take(count) {
-                *slot = combine_hash(*slot, value_hash);
-            }
-        }
-        (None, _) => {
-            for row_idx in 0..count {
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(
-                        read_value(vector, row_idx)
-                            .expect("hash join key vector must contain the expected type"),
-                    )
-                };
-                hashes[row_idx] = combine_hash(hashes[row_idx], value_hash);
-            }
-        }
-        (Some(selection), _) => {
-            for out_idx in 0..count {
-                let row_idx = selection[out_idx] as usize;
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(
-                        read_value(vector, row_idx)
-                            .expect("hash join key vector must contain the expected type"),
-                    )
-                };
-                hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
-            }
-        }
-    }
-}
-
-fn apply_varlen_hash_column<'a>(
-    vector: &'a Vector,
-    selected_rows: Option<&[u32]>,
-    count: usize,
-    hashes: &mut [u64],
-    read_value: impl Fn(&'a Vector, usize) -> Option<&'a [u8]>,
-) {
+) -> Result<()> {
+    let view = vector.try_to_view(vector.len())?;
     if vector.vector_type() == VectorType::Constant {
-        let value_hash = if vector.is_null(0) {
+        let value_hash = if !view.is_valid(0) {
             NULL_HASH
+        } else if let DataRef::Ptr(data) = view.data() {
+            hash_value(unsafe { *(data as *const T) })
         } else {
-            hash_bytes(read_value(vector, 0).unwrap_or_default())
+            hash_value(
+                read_value(vector, 0).expect("hash join key vector must contain the expected type"),
+            )
         };
         for slot in hashes.iter_mut().take(count) {
             *slot = combine_hash(*slot, value_hash);
         }
-        return;
+        return Ok(());
+    }
+
+    if let DataRef::Ptr(data) = view.data() {
+        let values = data as *const T;
+        let all_valid = view.validity().all_valid();
+        for out_idx in 0..count {
+            let logical_idx =
+                selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
+            let physical_idx = view.physical_index(logical_idx);
+            let value_hash = if all_valid || view.validity().is_valid(physical_idx) {
+                hash_value(unsafe { *values.add(physical_idx) })
+            } else {
+                NULL_HASH
+            };
+            hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
+        }
+        return Ok(());
     }
 
     for out_idx in 0..count {
         let row_idx = selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
-        let value_hash = if vector.is_null(row_idx) {
+        let value_hash = if !view.is_valid(row_idx) {
             NULL_HASH
         } else {
-            hash_bytes(read_value(vector, row_idx).unwrap_or_default())
+            hash_value(
+                read_value(vector, row_idx)
+                    .expect("hash join key vector must contain the expected type"),
+            )
         };
         hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
     }
+    Ok(())
+}
+
+fn apply_varlen_hash_column(
+    vector: &Vector,
+    selected_rows: Option<&[u32]>,
+    count: usize,
+    hashes: &mut [u64],
+) -> Result<()> {
+    let view = vector.try_to_varlen_view(vector.len())?;
+    if vector.vector_type() == VectorType::Constant {
+        let value_hash = if !view.is_valid(0) {
+            NULL_HASH
+        } else {
+            hash_bytes(view.get_inline_string(0).as_bytes())
+        };
+        for slot in hashes.iter_mut().take(count) {
+            *slot = combine_hash(*slot, value_hash);
+        }
+        return Ok(());
+    }
+
+    let all_valid = view.validity().all_valid();
+    for out_idx in 0..count {
+        let row_idx = selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
+        let value_hash = if all_valid || view.is_valid(row_idx) {
+            hash_bytes(view.get_inline_string(row_idx).as_bytes())
+        } else {
+            NULL_HASH
+        };
+        hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
+    }
+    Ok(())
 }
 
 fn apply_value_fallback_hash_column(
@@ -736,50 +718,6 @@ fn hash_logical_type_signature(logical_type: &LogicalType) -> u64 {
     hash
 }
 
-#[inline]
-fn hash_i64(value: i64) -> u64 {
-    hash_u64(value as u64)
-}
-
-#[inline]
-fn hash_u128(value: u128) -> u64 {
-    combine_hash(hash_u64(value as u64), hash_u64((value >> 64) as u64))
-}
-
-#[inline]
-fn hash_u64(value: u64) -> u64 {
-    let left = value.wrapping_mul(0xa076_1d64_78bd_642f) ^ HASH_SEED;
-    let right = value.rotate_left(31).wrapping_mul(0xe703_7ed1_a0b4_28db) ^ FIELD_SEED;
-    mul_xor_mix(left, right)
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = combine_hash(hash_u64(bytes.len() as u64), FIELD_SEED);
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in chunks.by_ref() {
-        let word = u64::from_le_bytes(chunk.try_into().expect("chunk length is exactly 8"));
-        hash = combine_hash(hash, hash_u64(word));
-    }
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let mut tail = [0u8; 8];
-        tail[..remainder.len()].copy_from_slice(remainder);
-        hash = combine_hash(hash, hash_u64(u64::from_le_bytes(tail)));
-    }
-    hash
-}
-
-#[inline]
-fn combine_hash(left: u64, right: u64) -> u64 {
-    mul_xor_mix(left ^ FIELD_SEED, right.wrapping_add(0x9e37_79b9_7f4a_7c15))
-}
-
-#[inline]
-fn mul_xor_mix(left: u64, right: u64) -> u64 {
-    let product = (left as u128).wrapping_mul(right as u128);
-    ((product >> 64) as u64) ^ (product as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,7 +782,9 @@ mod tests {
         let selection =
             SelectionVector::try_from_indices(vec![2, 1], allocator).expect("selection");
         let mut hashes = vec![0; 2];
-        layout.hash_selected_into(&chunk, &selection, 2, &mut hashes);
+        layout
+            .hash_selected_into(&chunk, &selection, 2, &mut hashes)
+            .unwrap();
 
         assert_eq!(hashes[0], layout.hash_key_at(&chunk, 2));
         assert_eq!(hashes[1], layout.hash_key_at(&chunk, 1));

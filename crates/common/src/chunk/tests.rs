@@ -6,7 +6,7 @@ use crate::allocator::{Allocator, DefaultAllocator};
 use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
 use crate::types::LogicalType;
-use crate::vector::{AllocationSet, VectorType, VECTOR_SIZE};
+use crate::vector::{AllocationSet, Vector, VectorType, VECTOR_SIZE};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -215,6 +215,26 @@ fn test_set_cardinality_same_count_skips_shared_cow() {
 
     assert!(Arc::ptr_eq(chunk.column(0).unwrap(), &shared));
     assert_eq!(Arc::strong_count(&shared), 2);
+}
+
+#[test]
+fn test_set_cardinality_same_count_repairs_array_child_shape() {
+    let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
+    let mut chunk = crate::test_utils::test_chunk_with_capacity(&[array_type], 4);
+    chunk.set_cardinality(4);
+
+    let array = chunk.column_mut(0).unwrap();
+    let child = array.child_mut().expect("array child");
+    Vector::try_make_arc_mut(child)
+        .unwrap()
+        .try_set_count(6)
+        .unwrap();
+    assert_eq!(chunk.column(0).unwrap().child().unwrap().len(), 6);
+
+    chunk.try_set_cardinality(4).unwrap();
+
+    assert_eq!(chunk.column(0).unwrap().len(), 4);
+    assert_eq!(chunk.column(0).unwrap().child().unwrap().len(), 12);
 }
 
 #[test]

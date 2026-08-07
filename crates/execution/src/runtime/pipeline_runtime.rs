@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use paro_common::allocator::{Allocator, MemoryTag};
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
 
 use crate::memory_runtime::{
@@ -92,7 +92,15 @@ impl PipelineRuntime {
             program.source.exec.create_global(&mut ctx)?
         };
 
-        let mut transform_globals = Vec::with_capacity(program.transforms.len());
+        let mut transform_globals = Vec::new();
+        transform_globals
+            .try_reserve_exact(program.transforms.len())
+            .map_err(|error| {
+                paro_error::out_of_memory(format!(
+                    "failed to allocate {} transform global slots: {error}",
+                    program.transforms.len()
+                ))
+            })?;
         for transform in program.transforms.iter() {
             let mut ctx = init_context(
                 query,

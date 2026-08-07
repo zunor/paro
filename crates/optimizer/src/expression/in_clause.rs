@@ -1,65 +1,46 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_common::types::LogicalType;
 use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, ComparisonType, ConjunctionExpression,
-    ConjunctionType, Expression, OperatorExpression, OperatorType, WindowFrameBound,
+    ComparisonExpression, ComparisonType, Expression, OperatorExpression, OperatorType,
+    WindowFrameBound,
 };
-use paro_planner::operator::ExpressionGet;
-use paro_planner::operator::{
-    ComparisonJoin, Filter, Join, JoinCondition, JoinType, LogicalOperator, Projection,
-};
+use paro_planner::operator::{Filter, Join, LogicalOperator, Projection};
 use paro_planner::plan::LogicalPlan;
 
-use crate::context::OptimizationContext;
-
-const MARK_JOIN_IN_THRESHOLD: usize = 6;
-
 pub struct InClauseRewriter;
-
-struct RootRewriteContext {
-    child: Option<LogicalPlan>,
-    filter_projection_map: Option<Vec<usize>>,
-}
 
 impl InClauseRewriter {
     pub fn new() -> Self {
         Self
     }
 
-    pub fn rewrite(
-        &mut self,
-        plan: LogicalPlan,
-        ctx: &mut OptimizationContext,
-    ) -> paro_common::error::Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.rewrite(child, ctx))?;
-        Ok(self.rewrite_current(plan, ctx))
+    pub fn rewrite(&mut self, plan: LogicalPlan) -> paro_common::error::Result<LogicalPlan> {
+        let plan = plan.try_map_children(|child| self.rewrite(child))?;
+        Ok(self.rewrite_current(plan))
     }
 
-    fn rewrite_current(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> LogicalPlan {
+    fn rewrite_current(&mut self, plan: LogicalPlan) -> LogicalPlan {
         let LogicalPlan {
             id,
             stats,
             operator,
         } = plan;
         let operator = match operator {
-            LogicalOperator::Filter(filter) => {
-                LogicalOperator::Filter(self.rewrite_filter(filter, ctx))
-            }
+            LogicalOperator::Filter(filter) => LogicalOperator::Filter(self.rewrite_filter(filter)),
             LogicalOperator::Projection(projection) => {
-                LogicalOperator::Projection(self.rewrite_projection(projection, ctx))
+                LogicalOperator::Projection(self.rewrite_projection(projection))
             }
             LogicalOperator::Aggregate(mut aggregate) => {
                 aggregate.groups = aggregate
                     .groups
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 aggregate.aggregates = aggregate
                     .aggregates
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 aggregate.recompute_returned_types();
                 LogicalOperator::Aggregate(aggregate)
@@ -67,15 +48,13 @@ impl InClauseRewriter {
             LogicalOperator::Join(join) => LogicalOperator::Join(self.rewrite_join(join)),
             LogicalOperator::Order(mut order) => {
                 for order_by in &mut order.orders {
-                    order_by.expression =
-                        self.rewrite_expression_no_root(order_by.expression.clone());
+                    order_by.expression = self.rewrite_expression(order_by.expression.clone());
                 }
                 LogicalOperator::Order(order)
             }
             LogicalOperator::TopN(mut topn) => {
                 for order_by in &mut topn.orders {
-                    order_by.expression =
-                        self.rewrite_expression_no_root(order_by.expression.clone());
+                    order_by.expression = self.rewrite_expression(order_by.expression.clone());
                 }
                 LogicalOperator::TopN(topn)
             }
@@ -83,12 +62,11 @@ impl InClauseRewriter {
                 distinct.distinct_targets = distinct
                     .distinct_targets
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 if let Some(order_by) = &mut distinct.order_by {
                     for order in order_by {
-                        order.expression =
-                            self.rewrite_expression_no_root(order.expression.clone());
+                        order.expression = self.rewrite_expression(order.expression.clone());
                     }
                 }
                 LogicalOperator::Distinct(distinct)
@@ -98,19 +76,18 @@ impl InClauseRewriter {
                     expr.children = expr
                         .children
                         .drain(..)
-                        .map(|child| self.rewrite_expression_no_root(child))
+                        .map(|child| self.rewrite_expression(child))
                         .collect();
                     expr.partitions = expr
                         .partitions
                         .drain(..)
-                        .map(|child| self.rewrite_expression_no_root(child))
+                        .map(|child| self.rewrite_expression(child))
                         .collect();
                     for order in &mut expr.orders {
-                        order.expression =
-                            self.rewrite_expression_no_root(order.expression.clone());
+                        order.expression = self.rewrite_expression(order.expression.clone());
                     }
                     rewrite_window_frame_bounds(expr, &mut |bound_expr| {
-                        self.rewrite_expression_no_root(bound_expr)
+                        self.rewrite_expression(bound_expr)
                     });
                 }
                 LogicalOperator::Window(window)
@@ -119,14 +96,14 @@ impl InClauseRewriter {
                 update.expressions = update
                     .expressions
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 LogicalOperator::Update(update)
             }
             LogicalOperator::ExpressionGet(mut expr_get) => {
                 for row in &mut expr_get.expressions {
                     for expr in row {
-                        *expr = self.rewrite_expression_no_root(expr.clone());
+                        *expr = self.rewrite_expression(expr.clone());
                     }
                 }
                 LogicalOperator::ExpressionGet(expr_get)
@@ -135,32 +112,32 @@ impl InClauseRewriter {
                 search.projections = search
                     .projections
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 search.absorbed_predicates = search
                     .absorbed_predicates
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 search.residual_predicates = search
                     .residual_predicates
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
-                search.score_expression = self.rewrite_expression_no_root(search.score_expression);
+                search.score_expression = self.rewrite_expression(search.score_expression);
                 LogicalOperator::SearchScan(search)
             }
             LogicalOperator::FullTextFilterScan(mut scan) => {
-                scan.match_expression = self.rewrite_expression_no_root(scan.match_expression);
+                scan.match_expression = self.rewrite_expression(scan.match_expression);
                 scan.other_predicates = scan
                     .other_predicates
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 scan.residual_predicates = scan
                     .residual_predicates
                     .into_iter()
-                    .map(|expr| self.rewrite_expression_no_root(expr))
+                    .map(|expr| self.rewrite_expression(expr))
                     .collect();
                 LogicalOperator::FullTextFilterScan(scan)
             }
@@ -173,138 +150,98 @@ impl InClauseRewriter {
         }
     }
 
-    fn rewrite_filter(&mut self, filter: Filter, ctx: &mut OptimizationContext) -> Filter {
-        let Filter {
-            expressions,
-            child,
-            projection_map,
-        } = filter;
-        let mut root = RootRewriteContext {
-            child: Some(*child),
-            filter_projection_map: Some(projection_map),
-        };
-        let expressions = expressions
+    fn rewrite_filter(&mut self, mut filter: Filter) -> Filter {
+        filter.expressions = filter
+            .expressions
             .into_iter()
-            .map(|expr| self.rewrite_expression_with_root(expr, &mut root, ctx))
+            .map(|expr| self.rewrite_expression(expr))
             .collect();
-        let (child, projection_map) = root.into_parts();
-        Filter {
-            expressions,
-            child: Box::new(child),
-            projection_map,
-        }
+        filter
     }
 
-    fn rewrite_projection(
-        &mut self,
-        projection: Projection,
-        ctx: &mut OptimizationContext,
-    ) -> Projection {
-        let Projection {
-            table_index,
-            expressions,
-            output_names,
-            child,
-            ..
-        } = projection;
-        let mut root = RootRewriteContext {
-            child: Some(*child),
-            filter_projection_map: None,
-        };
-        let expressions: Vec<_> = expressions
+    fn rewrite_projection(&mut self, mut projection: Projection) -> Projection {
+        projection.expressions = projection
+            .expressions
             .into_iter()
-            .map(|expr| self.rewrite_expression_with_root(expr, &mut root, ctx))
+            .map(|expr| self.rewrite_expression(expr))
             .collect();
-        let (child, _) = root.into_parts();
-        let returned_types = expressions.iter().map(Expression::return_type).collect();
-        Projection {
-            table_index,
-            expressions,
-            output_names,
-            child: Box::new(child),
-            returned_types,
-        }
+        projection.returned_types = projection
+            .expressions
+            .iter()
+            .map(Expression::return_type)
+            .collect();
+        projection
     }
 
     fn rewrite_join(&mut self, join: Join) -> Join {
         match join {
             Join::Comparison(mut comparison) => {
                 for condition in &mut comparison.conditions {
-                    condition.left = self.rewrite_expression_no_root(condition.left.clone());
-                    condition.right = self.rewrite_expression_no_root(condition.right.clone());
+                    condition.left = self.rewrite_expression(condition.left.clone());
+                    condition.right = self.rewrite_expression(condition.right.clone());
                 }
                 Join::Comparison(comparison)
             }
             Join::Any(mut any) => {
-                any.condition = self.rewrite_expression_no_root(any.condition);
+                any.condition = self.rewrite_expression(any.condition);
                 Join::Any(any)
             }
             Join::Cross(cross) => Join::Cross(cross),
         }
     }
 
-    fn rewrite_expression_with_root(
-        &mut self,
-        expr: Expression,
-        root: &mut RootRewriteContext,
-        ctx: &mut OptimizationContext,
-    ) -> Expression {
+    fn rewrite_expression(&mut self, expr: Expression) -> Expression {
         match expr {
             Expression::Function(mut function) => {
                 function.children = function
                     .children
                     .into_iter()
-                    .map(|child| self.rewrite_expression_with_root(child, root, ctx))
+                    .map(|child| self.rewrite_expression(child))
                     .collect();
                 Expression::Function(function)
             }
             Expression::Cast(mut cast) => {
-                cast.child = Box::new(self.rewrite_expression_with_root(*cast.child, root, ctx));
+                cast.child = Box::new(self.rewrite_expression(*cast.child));
                 Expression::Cast(cast)
             }
             Expression::Conjunction(mut conjunction) => {
                 conjunction.children = conjunction
                     .children
                     .into_iter()
-                    .map(|child| self.rewrite_expression_with_root(child, root, ctx))
+                    .map(|child| self.rewrite_expression(child))
                     .collect();
                 Expression::Conjunction(conjunction)
             }
             Expression::Case(mut case) => {
-                case.check = Box::new(self.rewrite_expression_with_root(*case.check, root, ctx));
-                case.result_if_true =
-                    Box::new(self.rewrite_expression_with_root(*case.result_if_true, root, ctx));
-                case.result_if_false =
-                    Box::new(self.rewrite_expression_with_root(*case.result_if_false, root, ctx));
+                case.check = Box::new(self.rewrite_expression(*case.check));
+                case.result_if_true = Box::new(self.rewrite_expression(*case.result_if_true));
+                case.result_if_false = Box::new(self.rewrite_expression(*case.result_if_false));
                 Expression::Case(case)
             }
             Expression::Comparison(mut comparison) => {
-                comparison.left =
-                    Box::new(self.rewrite_expression_with_root(*comparison.left, root, ctx));
-                comparison.right =
-                    Box::new(self.rewrite_expression_with_root(*comparison.right, root, ctx));
+                comparison.left = Box::new(self.rewrite_expression(*comparison.left));
+                comparison.right = Box::new(self.rewrite_expression(*comparison.right));
                 Expression::Comparison(comparison)
             }
             Expression::Operator(mut operator) => {
                 operator.children = operator
                     .children
                     .into_iter()
-                    .map(|child| self.rewrite_expression_with_root(child, root, ctx))
+                    .map(|child| self.rewrite_expression(child))
                     .collect();
-                self.rewrite_in_operator_with_root(operator, root, ctx)
+                rewrite_in_operator(operator)
             }
             Expression::Aggregate(mut aggregate) => {
                 aggregate.children = aggregate
                     .children
                     .into_iter()
-                    .map(|child| self.rewrite_expression_with_root(child, root, ctx))
+                    .map(|child| self.rewrite_expression(child))
                     .collect();
                 aggregate.filter = aggregate
                     .filter
-                    .map(|filter| Box::new(self.rewrite_expression_with_root(*filter, root, ctx)));
+                    .map(|filter| Box::new(self.rewrite_expression(*filter)));
                 for order in &mut aggregate.order_bys {
-                    order.expression =
-                        self.rewrite_expression_with_root(order.expression.clone(), root, ctx);
+                    order.expression = self.rewrite_expression(order.expression.clone());
                 }
                 Expression::Aggregate(aggregate)
             }
@@ -312,19 +249,18 @@ impl InClauseRewriter {
                 window.children = window
                     .children
                     .into_iter()
-                    .map(|child| self.rewrite_expression_with_root(child, root, ctx))
+                    .map(|child| self.rewrite_expression(child))
                     .collect();
                 window.partitions = window
                     .partitions
                     .into_iter()
-                    .map(|partition| self.rewrite_expression_with_root(partition, root, ctx))
+                    .map(|partition| self.rewrite_expression(partition))
                     .collect();
                 for order in &mut window.orders {
-                    order.expression =
-                        self.rewrite_expression_with_root(order.expression.clone(), root, ctx);
+                    order.expression = self.rewrite_expression(order.expression.clone());
                 }
                 rewrite_window_frame_bounds(&mut window, &mut |bound_expr| {
-                    self.rewrite_expression_with_root(bound_expr, root, ctx)
+                    self.rewrite_expression(bound_expr)
                 });
                 Expression::Window(window)
             }
@@ -332,127 +268,12 @@ impl InClauseRewriter {
                 subquery.children = subquery
                     .children
                     .into_iter()
-                    .map(|child| self.rewrite_expression_with_root(child, root, ctx))
+                    .map(|child| self.rewrite_expression(child))
                     .collect();
                 Expression::Subquery(subquery)
             }
             leaf => leaf,
         }
-    }
-
-    fn rewrite_expression_no_root(&mut self, expr: Expression) -> Expression {
-        match expr {
-            Expression::Function(mut function) => {
-                function.children = function
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression_no_root(child))
-                    .collect();
-                Expression::Function(function)
-            }
-            Expression::Cast(mut cast) => {
-                cast.child = Box::new(self.rewrite_expression_no_root(*cast.child));
-                Expression::Cast(cast)
-            }
-            Expression::Conjunction(mut conjunction) => {
-                conjunction.children = conjunction
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression_no_root(child))
-                    .collect();
-                Expression::Conjunction(conjunction)
-            }
-            Expression::Case(mut case) => {
-                case.check = Box::new(self.rewrite_expression_no_root(*case.check));
-                case.result_if_true =
-                    Box::new(self.rewrite_expression_no_root(*case.result_if_true));
-                case.result_if_false =
-                    Box::new(self.rewrite_expression_no_root(*case.result_if_false));
-                Expression::Case(case)
-            }
-            Expression::Comparison(mut comparison) => {
-                comparison.left = Box::new(self.rewrite_expression_no_root(*comparison.left));
-                comparison.right = Box::new(self.rewrite_expression_no_root(*comparison.right));
-                Expression::Comparison(comparison)
-            }
-            Expression::Operator(mut operator) => {
-                operator.children = operator
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression_no_root(child))
-                    .collect();
-                self.rewrite_in_operator_without_root(operator)
-            }
-            Expression::Aggregate(mut aggregate) => {
-                aggregate.children = aggregate
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression_no_root(child))
-                    .collect();
-                aggregate.filter = aggregate
-                    .filter
-                    .map(|filter| Box::new(self.rewrite_expression_no_root(*filter)));
-                for order in &mut aggregate.order_bys {
-                    order.expression = self.rewrite_expression_no_root(order.expression.clone());
-                }
-                Expression::Aggregate(aggregate)
-            }
-            Expression::Window(mut window) => {
-                window.children = window
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression_no_root(child))
-                    .collect();
-                window.partitions = window
-                    .partitions
-                    .into_iter()
-                    .map(|partition| self.rewrite_expression_no_root(partition))
-                    .collect();
-                for order in &mut window.orders {
-                    order.expression = self.rewrite_expression_no_root(order.expression.clone());
-                }
-                rewrite_window_frame_bounds(&mut window, &mut |bound_expr| {
-                    self.rewrite_expression_no_root(bound_expr)
-                });
-                Expression::Window(window)
-            }
-            Expression::Subquery(mut subquery) => {
-                subquery.children = subquery
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression_no_root(child))
-                    .collect();
-                Expression::Subquery(subquery)
-            }
-            leaf => leaf,
-        }
-    }
-
-    fn rewrite_in_operator_with_root(
-        &mut self,
-        operator: OperatorExpression,
-        root: &mut RootRewriteContext,
-        ctx: &mut OptimizationContext,
-    ) -> Expression {
-        if !matches!(
-            operator.operator_type,
-            OperatorType::In | OperatorType::NotIn
-        ) {
-            return Expression::Operator(operator);
-        }
-        rewrite_in_operator(operator, Some(root), ctx)
-    }
-
-    fn rewrite_in_operator_without_root(&mut self, operator: OperatorExpression) -> Expression {
-        if !matches!(
-            operator.operator_type,
-            OperatorType::In | OperatorType::NotIn
-        ) {
-            return Expression::Operator(operator);
-        }
-
-        let negate = matches!(operator.operator_type, OperatorType::NotIn);
-        build_in_fallback(operator.children, negate)
     }
 }
 
@@ -462,112 +283,16 @@ impl Default for InClauseRewriter {
     }
 }
 
-impl RootRewriteContext {
-    fn child(&self) -> &LogicalPlan {
-        self.child.as_ref().expect("root child must exist")
-    }
-
-    fn into_parts(self) -> (LogicalPlan, Vec<usize>) {
-        (
-            self.child.expect("root child must exist"),
-            self.filter_projection_map.unwrap_or_default(),
-        )
-    }
-
-    fn introduce_mark_join(
-        &mut self,
-        lhs: Expression,
-        rhs_constants: Vec<Expression>,
-        negate: bool,
-        ctx: &mut OptimizationContext,
-    ) -> Expression {
-        let old_output_len = self.child().types().len();
-        let input_type = lhs.return_type();
-        let rhs_table_index = ctx.bind_context.generate_table_index();
-        let mark_index = ctx.bind_context.generate_table_index();
-        let rhs_values = rhs_constants.into_iter().map(|value| vec![value]).collect();
-        let rhs = LogicalPlan::new(
-            &ctx.bind_context,
-            LogicalOperator::ExpressionGet(ExpressionGet::new(
-                rhs_table_index,
-                rhs_values,
-                vec!["in_value".to_string()],
-                vec![input_type.clone()],
-            )),
-        );
-
-        let left = self.child.take().expect("root child must exist");
-        let mut join = ComparisonJoin::new(
-            JoinType::Mark,
-            left,
-            rhs,
-            vec![JoinCondition::new(
-                lhs,
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(rhs_table_index, 0),
-                    input_type,
-                )),
-                paro_planner::operator::JoinComparisonType::Equal,
-            )],
-        );
-        join.mark_index = Some(mark_index);
-        self.child = Some(LogicalPlan::new(
-            &ctx.bind_context,
-            LogicalOperator::Join(Join::Comparison(join)),
-        ));
-
-        if let Some(projection_map) = self.filter_projection_map.as_mut() {
-            if projection_map.is_empty() {
-                projection_map.extend(0..old_output_len);
-            }
-        }
-
-        let mark_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(mark_index, 0),
-            LogicalType::Boolean,
-        ));
-        if negate {
-            Expression::Operator(OperatorExpression::new_unary(
-                OperatorType::Not,
-                mark_ref,
-                LogicalType::Boolean,
-            ))
-        } else {
-            mark_ref
-        }
-    }
-}
-
-fn rewrite_in_operator(
-    operator: OperatorExpression,
-    root: Option<&mut RootRewriteContext>,
-    ctx: &mut OptimizationContext,
-) -> Expression {
-    let negate = matches!(operator.operator_type, OperatorType::NotIn);
-    if operator.children.len() < 2 {
+fn rewrite_in_operator(operator: OperatorExpression) -> Expression {
+    if !matches!(
+        operator.operator_type,
+        OperatorType::In | OperatorType::NotIn
+    ) || operator.children.len() != 2
+    {
         return Expression::Operator(operator);
     }
-
-    if operator.children.len() == 2 {
-        return build_single_item_in(operator.children, negate);
-    }
-
-    let mut children = operator.children;
-    let lhs = children.remove(0);
-    if children.len() + 1 >= MARK_JOIN_IN_THRESHOLD
-        && children
-            .iter()
-            .all(|child| matches!(child, Expression::Constant(_)))
-    {
-        if let Some(root) = root {
-            return root.introduce_mark_join(lhs, children, negate, ctx);
-        }
-    }
-
-    let mut all_children = Vec::with_capacity(children.len() + 1);
-    all_children.push(lhs);
-    all_children.extend(children);
-    build_in_fallback(all_children, negate)
+    let negate = matches!(operator.operator_type, OperatorType::NotIn);
+    build_single_item_in(operator.children, negate)
 }
 
 fn build_single_item_in(mut children: Vec<Expression>, negate: bool) -> Expression {
@@ -579,44 +304,6 @@ fn build_single_item_in(mut children: Vec<Expression>, negate: bool) -> Expressi
     let rhs = children.pop().expect("single-item IN rhs");
     let lhs = children.pop().expect("single-item IN lhs");
     Expression::Comparison(ComparisonExpression::new(comparison_type, lhs, rhs))
-}
-
-fn build_in_fallback(children: Vec<Expression>, negate: bool) -> Expression {
-    if children.len() < 2 {
-        return Expression::Operator(OperatorExpression::new(
-            if negate {
-                OperatorType::NotIn
-            } else {
-                OperatorType::In
-            },
-            children,
-            LogicalType::Boolean,
-        ));
-    }
-
-    let lhs = children[0].clone();
-    let comparison_type = if negate {
-        ComparisonType::NotEqual
-    } else {
-        ComparisonType::Equal
-    };
-    let conjunction_type = if negate {
-        ConjunctionType::And
-    } else {
-        ConjunctionType::Or
-    };
-    let comparisons: Vec<_> = children
-        .into_iter()
-        .skip(1)
-        .map(|rhs| {
-            Expression::Comparison(ComparisonExpression::new(comparison_type, lhs.clone(), rhs))
-        })
-        .collect();
-    if comparisons.len() == 1 {
-        comparisons.into_iter().next().expect("single comparison")
-    } else {
-        Expression::Conjunction(ConjunctionExpression::new(conjunction_type, comparisons))
-    }
 }
 
 fn rewrite_window_frame_bounds(
@@ -633,27 +320,13 @@ fn rewrite_window_frame_bounds(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use paro_common::runtime_value::Value;
-    use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::operator::{ColumnBinding, JoinComparisonType};
+    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::operator::{ColumnBinding, ExpressionGet, JoinType};
 
     use super::*;
-    use crate::context::OptimizationContext;
-
-    fn make_test_session() -> Arc<StatementContext> {
-        TestStatementContextBuilder::minimal().build()
-    }
-
-    fn make_ctx() -> (BindContext, OptimizationContext) {
-        let bind_context = BindContext::new();
-        let session = make_test_session();
-        let ctx = OptimizationContext::new(session, bind_context.clone());
-        (bind_context, ctx)
-    }
-
     fn integer_get(bind_context: &BindContext, table_index: usize) -> LogicalPlan {
         LogicalPlan::new(
             bind_context,
@@ -682,7 +355,7 @@ mod tests {
 
     #[test]
     fn rewrites_single_item_in_to_comparison() {
-        let (bind_context, mut ctx) = make_ctx();
+        let bind_context = BindContext::new();
         let child = integer_get(&bind_context, 0);
         let expr = Expression::Operator(OperatorExpression::new(
             OperatorType::In,
@@ -695,7 +368,7 @@ mod tests {
         );
 
         let rewritten = InClauseRewriter::new()
-            .rewrite(plan, &mut ctx)
+            .rewrite(plan)
             .expect("rewrite succeeds");
 
         let LogicalOperator::Filter(filter) = rewritten.operator else {
@@ -709,8 +382,8 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_large_constant_in_filter_to_mark_join() {
-        let (bind_context, mut ctx) = make_ctx();
+    fn preserves_large_constant_in_filter_for_execution_and_pushdown() {
+        let bind_context = BindContext::new();
         let child = integer_get(&bind_context, 0);
         let expr = Expression::Operator(OperatorExpression::new(
             OperatorType::In,
@@ -730,33 +403,27 @@ mod tests {
         );
 
         let rewritten = InClauseRewriter::new()
-            .rewrite(plan, &mut ctx)
+            .rewrite(plan)
             .expect("rewrite succeeds");
 
         let LogicalOperator::Filter(filter) = rewritten.operator else {
             panic!("expected filter");
         };
-        assert_eq!(filter.projection_map, vec![0]);
-        let Expression::ColumnRef(mark_ref) = &filter.expressions[0] else {
-            panic!("expected mark column reference");
+        assert!(filter.projection_map.is_empty());
+        let Expression::Operator(operator) = &filter.expressions[0] else {
+            panic!("expected preserved IN operator");
         };
-        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
-            panic!("expected mark join child");
-        };
-        assert_eq!(join.join_type, JoinType::Mark);
-        assert_eq!(join.mark_index, Some(mark_ref.binding.table_index));
-        assert_eq!(join.conditions.len(), 1);
-        assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
-
-        let LogicalOperator::ExpressionGet(expr_get) = &join.right.operator else {
-            panic!("expected constant rhs");
-        };
-        assert_eq!(expr_get.expressions.len(), 5);
+        assert_eq!(operator.operator_type, OperatorType::In);
+        assert_eq!(operator.children.len(), 6);
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::ExpressionGet(_)
+        ));
     }
 
     #[test]
-    fn rewrites_large_in_outside_filter_projection_to_disjunction() {
-        let (bind_context, mut ctx) = make_ctx();
+    fn preserves_large_in_outside_filter() {
+        let bind_context = BindContext::new();
         let left = integer_get(&bind_context, 0);
         let right = integer_get(&bind_context, 1);
         let condition = Expression::Operator(OperatorExpression::new(
@@ -775,16 +442,16 @@ mod tests {
         let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(join));
 
         let rewritten = InClauseRewriter::new()
-            .rewrite(plan, &mut ctx)
+            .rewrite(plan)
             .expect("rewrite succeeds");
 
         let LogicalOperator::Join(Join::Any(join)) = rewritten.operator else {
             panic!("expected any join");
         };
-        let Expression::Conjunction(conjunction) = &join.condition else {
-            panic!("expected OR fallback");
+        let Expression::Operator(operator) = &join.condition else {
+            panic!("expected preserved IN operator");
         };
-        assert_eq!(conjunction.conjunction_type, ConjunctionType::Or);
-        assert_eq!(conjunction.children.len(), 5);
+        assert_eq!(operator.operator_type, OperatorType::In);
+        assert_eq!(operator.children.len(), 6);
     }
 }

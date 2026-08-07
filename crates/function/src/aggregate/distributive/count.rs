@@ -79,6 +79,30 @@ impl CountFunction {
         }
     }
 
+    unsafe fn update_distinct_runs(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        states: &AggregateStateInput,
+        run_starts: &[u32],
+        count: usize,
+    ) {
+        let input = inputs[0];
+        let all_valid = input.validity().all_valid();
+        for (run_idx, &start) in run_starts.iter().enumerate() {
+            let start = start as usize;
+            let end = run_starts
+                .get(run_idx + 1)
+                .map_or(count, |next| *next as usize);
+            let increment = if all_valid {
+                end - start
+            } else {
+                (start..end).filter(|&row| !input.is_null(row)).count()
+            };
+            let state = states.state_ptr(run_idx) as *mut i64;
+            *state += increment as i64;
+        }
+    }
+
     unsafe fn combine(
         source: &Vector,
         target: &Vector,
@@ -143,18 +167,21 @@ pub fn get_count_function() -> AggregateFunctionSet {
     ];
 
     for t in types {
-        set.add_function(AggregateFunction::new(
-            "count".to_string(),
-            vec![t],
-            LogicalType::BigInt,
-            std::mem::size_of::<i64>(),
-            CountFunction::initialize,
-            CountFunction::update,
-            CountFunction::combine,
-            CountFunction::finalize,
-            Some(CountFunction::simple_update),
-            None,
-        ));
+        set.add_function(
+            AggregateFunction::new(
+                "count".to_string(),
+                vec![t],
+                LogicalType::BigInt,
+                std::mem::size_of::<i64>(),
+                CountFunction::initialize,
+                CountFunction::update,
+                CountFunction::combine,
+                CountFunction::finalize,
+                Some(CountFunction::simple_update),
+                None,
+            )
+            .with_distinct_run_update(CountFunction::update_distinct_runs),
+        );
     }
 
     set

@@ -14,8 +14,8 @@ use paro_planner::binder::deep_copy::{
 };
 use paro_planner::expression::{ComparisonType, Expression};
 use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType, JoinCondition,
-    JoinType, LogicalOperator,
+    AntiJoinMode, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType,
+    JoinCondition, JoinType, LogicalOperator,
 };
 use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
 use paro_storage::statistics::ColumnStatistics;
@@ -368,7 +368,7 @@ impl JoinOrderOptimizer {
                     right: Box::new(condition.right.clone()),
                     comparison_type: Self::to_comparison_type(condition.comparison),
                 });
-            ExtractedFilter::new(expression, join.join_type)
+            ExtractedFilter::new(expression, join.join_type, join.anti_join_mode)
         }));
     }
 
@@ -495,7 +495,8 @@ impl JoinOrderOptimizer {
                         plan
                     }
                 } else {
-                    let chosen_join_type = Self::choose_join_type(predicates);
+                    let (chosen_join_type, chosen_anti_join_mode) =
+                        Self::choose_join_semantics(predicates);
                     if matches!(chosen_join_type, JoinType::Semi | JoinType::Anti)
                         && Self::edge_is_inverted(
                             &left_set,
@@ -516,6 +517,7 @@ impl JoinOrderOptimizer {
 
                     let mut join =
                         ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
+                    join.anti_join_mode = chosen_anti_join_mode;
                     for filter in &predicates.filters {
                         if self.append_join_conditions(&mut join, filter, &left_set, &right_set) {
                             used_filters.insert(filter.filter_index);
@@ -700,8 +702,8 @@ impl JoinOrderOptimizer {
         ))
     }
 
-    fn choose_join_type(predicates: &JoinPredicateSet) -> JoinType {
-        predicates
+    fn choose_join_semantics(predicates: &JoinPredicateSet) -> (JoinType, AntiJoinMode) {
+        let filter = predicates
             .filters
             .iter()
             .find(|filter| matches!(filter.join_type, JoinType::Semi | JoinType::Anti))
@@ -711,8 +713,10 @@ impl JoinOrderOptimizer {
                     .iter()
                     .find(|filter| filter.join_type != JoinType::Invalid)
             })
-            .map(|filter| filter.join_type)
-            .unwrap_or(JoinType::Inner)
+            .map(Arc::as_ref);
+        filter.map_or((JoinType::Inner, AntiJoinMode::Regular), |filter| {
+            (filter.join_type, filter.anti_join_mode)
+        })
     }
 
     fn edge_is_inverted(
@@ -1208,6 +1212,35 @@ mod tests {
             }
             other => panic!("expected semi comparison join, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn null_aware_anti_join_semantics_survive_reconstruction() {
+        let session = make_test_session();
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut join = ComparisonJoin::new(
+            JoinType::Anti,
+            LogicalPlan::synthetic(create_scan(0)),
+            LogicalPlan::synthetic(create_scan(1)),
+            vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+        );
+        join.anti_join_mode = AntiJoinMode::NullAware;
+
+        let bind_context = BindContext::new();
+        let optimized = optimizer
+            .optimize(
+                &session,
+                &bind_context,
+                LogicalOperator::Join(Join::Comparison(join)),
+            )
+            .unwrap();
+
+        let LogicalOperator::Join(Join::Comparison(join)) = optimized else {
+            panic!("expected anti comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::Anti);
+        assert_eq!(join.anti_join_mode, AntiJoinMode::NullAware);
+        assert_eq!(join.conditions.len(), 1);
     }
 
     fn assert_nested_join_is_atomic(boundary_type: JoinType) {

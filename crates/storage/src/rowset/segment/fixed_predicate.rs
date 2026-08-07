@@ -1,7 +1,16 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::segment_predicate::{ComparisonOperator, PredicateColumnBatch};
+use super::predicate_column::PredicateColumnBatch;
+use super::segment_predicate::ComparisonOperator;
+use crate::index::{
+    FixedMembership, FixedMembershipKind, FixedMembershipSet, FixedMembershipValue,
+};
+use paro_common::error::{self as paro_error, Result};
+
+pub(super) trait FixedPhysical: Copy + Ord + FixedMembershipValue {
+    fn from_le(value: Self) -> Self;
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct FixedBound<T> {
@@ -13,12 +22,9 @@ pub(super) struct FixedConjunction<T> {
     pub(super) equality: Option<T>,
     pub(super) lower: Option<FixedBound<T>>,
     pub(super) upper: Option<FixedBound<T>>,
+    inclusions: Option<FixedMembershipSet<T>>,
     exclusions: Vec<T>,
     contradiction: bool,
-}
-
-trait FixedPhysical: Copy + Ord {
-    fn from_le(value: Self) -> Self;
 }
 
 impl FixedPhysical for i32 {
@@ -42,17 +48,43 @@ impl FixedPhysical for i128 {
     }
 }
 
-impl<T: Copy + Ord> FixedConjunction<T> {
+impl<T: FixedPhysical> FixedConjunction<T> {
     pub(super) fn new(operator: ComparisonOperator, rhs: T) -> Self {
         let mut conjunction = Self {
             equality: None,
             lower: None,
             upper: None,
+            inclusions: None,
             exclusions: Vec::new(),
             contradiction: false,
         };
         conjunction.add(operator, rhs);
         conjunction
+    }
+
+    pub(super) fn from_in(values: Vec<T>) -> Self {
+        let inclusions = FixedMembershipSet::from_values(values);
+        let contradiction = inclusions.is_empty();
+        Self {
+            equality: None,
+            lower: None,
+            upper: None,
+            inclusions: Some(inclusions),
+            exclusions: Vec::new(),
+            contradiction,
+        }
+    }
+
+    fn from_membership(inclusions: FixedMembershipSet<T>) -> Self {
+        let contradiction = inclusions.is_empty();
+        Self {
+            equality: None,
+            lower: None,
+            upper: None,
+            inclusions: Some(inclusions),
+            exclusions: Vec::new(),
+            contradiction,
+        }
     }
 
     fn add(&mut self, operator: ComparisonOperator, rhs: T) {
@@ -116,9 +148,17 @@ impl<T: Copy + Ord> FixedConjunction<T> {
                 bound.value,
             );
         }
+        if let Some(incoming) = other.inclusions.take() {
+            if let Some(existing) = &mut self.inclusions {
+                existing.intersect(&incoming);
+            } else {
+                self.inclusions = Some(incoming);
+            }
+        }
         for value in other.exclusions.drain(..) {
             self.add(ComparisonOperator::NotEqual, value);
         }
+        self.validate();
     }
 
     fn tighten_lower(current: &mut Option<FixedBound<T>>, incoming: FixedBound<T>) {
@@ -146,6 +186,10 @@ impl<T: Copy + Ord> FixedConjunction<T> {
         }
         if let Some(value) = self.equality {
             self.contradiction |= self.exclusions.contains(&value)
+                || self
+                    .inclusions
+                    .as_ref()
+                    .is_some_and(|values| !values.contains(value))
                 || self.lower.is_some_and(|bound| {
                     value < bound.value || (value == bound.value && !bound.inclusive)
                 })
@@ -153,12 +197,54 @@ impl<T: Copy + Ord> FixedConjunction<T> {
                     value > bound.value || (value == bound.value && !bound.inclusive)
                 });
         }
+        if let Some(values) = &mut self.inclusions {
+            let equality = self.equality;
+            let lower = self.lower;
+            let upper = self.upper;
+            let exclusions = &self.exclusions;
+            let first = values.first();
+            let last = values.last();
+            let equality_restricts =
+                equality.is_some_and(|expected| values.len() != 1 || first != Some(expected));
+            let lower_restricts = lower.is_some_and(|bound| {
+                first.is_some_and(|value| {
+                    value < bound.value || (value == bound.value && !bound.inclusive)
+                })
+            });
+            let upper_restricts = upper.is_some_and(|bound| {
+                last.is_some_and(|value| {
+                    value > bound.value || (value == bound.value && !bound.inclusive)
+                })
+            });
+            let exclusion_restricts = exclusions.iter().any(|value| values.contains(*value));
+            if equality_restricts || lower_restricts || upper_restricts || exclusion_restricts {
+                values.retain(|value| {
+                    equality.is_none_or(|expected| value == expected)
+                        && lower.is_none_or(|bound| {
+                            value > bound.value || (bound.inclusive && value == bound.value)
+                        })
+                        && upper.is_none_or(|bound| {
+                            value < bound.value || (bound.inclusive && value == bound.value)
+                        })
+                        && !exclusions.contains(&value)
+                });
+            }
+            self.contradiction |= values.is_empty();
+        }
     }
 
     #[inline]
     pub(super) fn matches(&self, value: T) -> bool {
-        !self.contradiction
-            && self.equality.is_none_or(|expected| value == expected)
+        if self.contradiction {
+            return false;
+        }
+        // Validation canonicalizes every other constraint into the inclusion
+        // set. Once present, membership is therefore both necessary and
+        // sufficient and the hot loop need not re-check bounds/exclusions.
+        if let Some(values) = &self.inclusions {
+            return values.contains(value);
+        }
+        self.equality.is_none_or(|expected| value == expected)
             && self.lower.is_none_or(|bound| {
                 value > bound.value || (bound.inclusive && value == bound.value)
             })
@@ -166,6 +252,28 @@ impl<T: Copy + Ord> FixedConjunction<T> {
                 value < bound.value || (bound.inclusive && value == bound.value)
             })
             && !self.exclusions.contains(&value)
+    }
+
+    /// Static fallback ordering for conjunction evaluation when no histogram
+    /// selectivity is available. Positive membership and bounded predicates
+    /// usually discard rows; exclusions usually retain them. The second field
+    /// keeps smaller membership sets ahead of larger sets within that class.
+    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
+        if self.contradiction {
+            return (0, 0);
+        }
+        if self.equality.is_some() {
+            return (1, 1);
+        }
+        if let Some(values) = &self.inclusions {
+            return (2, values.len());
+        }
+        match (self.lower.is_some(), self.upper.is_some()) {
+            (true, true) => (3, 0),
+            (true, false) | (false, true) => (4, 0),
+            (false, false) if !self.exclusions.is_empty() => (6, self.exclusions.len()),
+            (false, false) => (7, 0),
+        }
     }
 }
 
@@ -176,6 +284,20 @@ pub(super) enum FixedComparisonValues {
 }
 
 impl FixedComparisonValues {
+    pub(super) fn from_membership(values: FixedMembership) -> Self {
+        match values.into_kind() {
+            FixedMembershipKind::I32(values) => {
+                Self::I32(FixedConjunction::from_membership(values))
+            }
+            FixedMembershipKind::I64(values) => {
+                Self::I64(FixedConjunction::from_membership(values))
+            }
+            FixedMembershipKind::I128(values) => {
+                Self::I128(FixedConjunction::from_membership(values))
+            }
+        }
+    }
+
     pub(super) fn physical_width(&self) -> usize {
         match self {
             Self::I32(_) => std::mem::size_of::<i32>(),
@@ -200,11 +322,19 @@ impl FixedComparisonValues {
         rows: usize,
         selection: &mut Vec<usize>,
         seed: bool,
-    ) {
+    ) -> Result<()> {
         match self {
             Self::I32(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
             Self::I64(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
             Self::I128(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
+        }
+    }
+
+    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
+        match self {
+            Self::I32(kernel) => kernel.evaluation_priority(),
+            Self::I64(kernel) => kernel.evaluation_priority(),
+            Self::I128(kernel) => kernel.evaluation_priority(),
         }
     }
 }
@@ -215,7 +345,7 @@ fn filter_fixed_batch<T: FixedPhysical>(
     rows: usize,
     selection: &mut Vec<usize>,
     seed: bool,
-) {
+) -> Result<()> {
     match batch {
         PredicateColumnBatch::Raw(batch) => {
             let data = batch.data.as_ptr();
@@ -235,6 +365,20 @@ fn filter_fixed_batch<T: FixedPhysical>(
             } else {
                 dispatch_fixed_kernel(kernel, rows, selection, seed, load, |_| true);
             }
+            Ok(())
+        }
+        PredicateColumnBatch::StorageDictionary(batch) => {
+            let code_matches = (0..batch.dictionary_len())
+                .map(|code| {
+                    let value = batch.dictionary_value(code);
+                    // SAFETY: dictionary batch construction validates every
+                    // entry against this predicate's compiled physical width.
+                    let value = unsafe { value.as_ptr().cast::<T>().read_unaligned() };
+                    kernel.matches(T::from_le(value))
+                })
+                .collect::<Vec<_>>();
+            batch.filter_codes(&code_matches, selection, seed);
+            Ok(())
         }
         PredicateColumnBatch::Decoded(vector) => {
             let load = |row_idx: usize| {
@@ -249,7 +393,11 @@ fn filter_fixed_batch<T: FixedPhysical>(
                     !vector.is_null(row_idx)
                 });
             }
+            Ok(())
         }
+        PredicateColumnBatch::RawVarlen(_) => Err(paro_error::internal(
+            "fixed predicate received a variable-length column batch",
+        )),
     }
 }
 
@@ -261,7 +409,7 @@ fn dispatch_fixed_kernel<T, L, V>(
     load: L,
     valid: V,
 ) where
-    T: Copy + Ord,
+    T: FixedPhysical,
     L: Fn(usize) -> T + Copy,
     V: Fn(usize) -> bool + Copy,
 {
@@ -272,6 +420,12 @@ fn dispatch_fixed_kernel<T, L, V>(
     if let Some(expected) = kernel.equality {
         filter_selection(rows, selection, seed, load, valid, |value| {
             value == expected
+        });
+        return;
+    }
+    if let Some(inclusions) = &kernel.inclusions {
+        filter_selection(rows, selection, seed, load, valid, |value| {
+            inclusions.contains(value)
         });
         return;
     }

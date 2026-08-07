@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};
@@ -35,6 +35,7 @@ use crate::runtime::state::{
 pub struct HashJoinSpillReplaySourceExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
+    pub anti_join_mode: AntiJoinMode,
     pub conditions: Box<[JoinCondition]>,
     pub probe_types: Box<[LogicalType]>,
     pub build_payload_types: Box<[LogicalType]>,
@@ -95,6 +96,12 @@ impl HashJoinSpillReplaySourceExec {
         };
         ensure_source_output(output, &self.output_types, VECTOR_SIZE)?;
         if !global.handle.is_external() {
+            return Ok(SourcePoll::Finished);
+        }
+        if self.anti_join_mode == AntiJoinMode::NullAware
+            && global.handle.require_table()?.has_null_keys()
+        {
+            output.try_set_cardinality(0)?;
             return Ok(SourcePoll::Finished);
         }
 
@@ -253,6 +260,7 @@ impl HashJoinSpillReplaySourceExec {
             .ok_or_else(|| paro_error::internal("hash join replay probe input missing"))?;
         let count = scan_hash_join_results(
             self.join_type,
+            self.anti_join_mode,
             probe_keys,
             probe_input,
             output,

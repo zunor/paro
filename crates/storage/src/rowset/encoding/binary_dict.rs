@@ -281,6 +281,8 @@ pub struct BinaryDictPageDecoder {
     plain_decoder: Option<BinaryPlainPageDecoder>,
     /// Dictionary decoder (set externally)
     dict_decoder: Option<BinaryPlainPageDecoder>,
+    /// Version-isolated logical code stream supplied by the decoded-page cache.
+    decoded_codes: Option<Bytes>,
     /// Whether init() has been called
     parsed: bool,
 }
@@ -295,8 +297,22 @@ impl BinaryDictPageDecoder {
             code_decoder: None,
             plain_decoder: None,
             dict_decoder: None,
+            decoded_codes: None,
             parsed: false,
         }
+    }
+
+    /// Create a decoder backed by a cached logical dictionary-code stream.
+    /// The physical marker and BitShuffle header are still validated by
+    /// [`Self::init`] before the cached bytes become observable.
+    pub fn with_decoded_codes(
+        data: Bytes,
+        expected_num_elements: u32,
+        decoded_codes: Bytes,
+    ) -> Self {
+        let mut decoder = Self::new(data, expected_num_elements);
+        decoder.decoded_codes = Some(decoded_codes);
+        decoder
     }
 
     /// Set the dictionary decoder.
@@ -326,13 +342,22 @@ impl BinaryDictPageDecoder {
         match marker {
             DICT_ENCODING_MARKER => {
                 self.encoding_type = EncodingMode::Dict;
-                let mut decoder =
-                    BitShufflePageDecoder::new(page_data, self.expected_num_elements, 4);
+                let mut decoder = if let Some(decoded_codes) = self.decoded_codes.take() {
+                    BitShufflePageDecoder::with_decoded_data(
+                        page_data,
+                        self.expected_num_elements,
+                        4,
+                        decoded_codes,
+                    )
+                } else {
+                    BitShufflePageDecoder::new(page_data, self.expected_num_elements, 4)
+                };
                 decoder.init()?;
                 self.code_decoder = Some(decoder);
             }
             PLAIN_ENCODING_MARKER => {
                 self.encoding_type = EncodingMode::Plain;
+                self.decoded_codes = None;
                 let mut decoder = BinaryPlainPageDecoder::new(page_data);
                 decoder.init()?;
                 if decoder.count() != self.expected_num_elements {
@@ -474,6 +499,10 @@ impl BinaryDictPageDecoder {
     /// Check if this page uses dictionary encoding.
     pub fn is_dict_encoded(&self) -> bool {
         self.encoding_type == EncodingMode::Dict
+    }
+
+    pub(crate) fn code_decoder_mut(&mut self) -> Option<&mut BitShufflePageDecoder> {
+        self.code_decoder.as_mut()
     }
 }
 
@@ -676,5 +705,39 @@ mod tests {
         assert_eq!(code2, 2); // "two"
         assert_eq!(code3, 0); // "zero" again
         assert_eq!(code4, 1); // "one" again
+    }
+
+    #[test]
+    fn cached_codes_skip_inner_bitshuffle_decompression() {
+        let mut builder = BinaryDictPageBuilder::new(256 * 1024);
+        for value in [b"zero".as_slice(), b"one", b"two", b"zero", b"one"] {
+            assert!(builder.add_slice(value));
+        }
+        let mut data_page = builder.finish().unwrap().to_vec();
+
+        // Keep the physical marker and BitShuffle header intact, but make the
+        // embedded LZ4 size prefix disagree with the validated logical size.
+        let lz4_size_prefix = 1 + super::super::bitshuffle::BITSHUFFLE_PAGE_HEADER_SIZE;
+        data_page[lz4_size_prefix..lz4_size_prefix + 4].fill(0);
+        let corrupted = Bytes::from(data_page);
+        let mut uncached = BinaryDictPageDecoder::new(corrupted.clone(), 5);
+        assert!(uncached.init().is_err());
+
+        let mut logical_codes = Vec::new();
+        for code in [0_u32, 1, 2, 0, 1, 0, 0, 0] {
+            logical_codes.extend_from_slice(&code.to_le_bytes());
+        }
+        let mut cached =
+            BinaryDictPageDecoder::with_decoded_codes(corrupted, 5, Bytes::from(logical_codes));
+        cached.init().unwrap();
+        let (count, codes) = cached.next_dict_codes(5).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(
+            codes
+                .chunks_exact(4)
+                .map(|code| u32::from_le_bytes(code.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 0, 1]
+        );
     }
 }

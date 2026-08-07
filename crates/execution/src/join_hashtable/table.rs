@@ -27,17 +27,20 @@ use std::sync::{Arc, Mutex};
 
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::{self as paro_error, ErrorClass, Result};
 use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::SelectionVector;
+use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use paro_storage::buffer::BufferPool;
 use paro_storage::buffer::MemoryTag;
 use paro_storage::row::RowLayout;
 
 use super::build_store::{BuildRowLayout, BuildStoreScanState, HashBuildStore};
+use super::dense_index::{
+    DenseJoinIndex, IntegerKeyKind, MAX_DENSE_JOIN_SLOTS, MAX_SLOTS_PER_BUILD_ROW,
+};
 use super::hash_kernel::JoinKeyLayout;
 use super::ht_entry::HtEntry;
 use super::scan_structure::ScanStructure;
@@ -165,6 +168,12 @@ pub struct JoinHashTable {
 
     /// Hash table entries (pointer table).
     entries: Mutex<HtEntryTable>,
+
+    /// Optional direct-address index owner for a bounded unique integer key.
+    dense_index: Mutex<Option<Box<DenseJoinIndex>>>,
+
+    /// Lock-free read pointer published with `finalized`.
+    probe_dense_index: AtomicPtr<DenseJoinIndex>,
 
     /// Lock-free read pointer published after finalize.
     probe_entries: AtomicPtr<HtEntry>,
@@ -313,6 +322,8 @@ impl JoinHashTable {
             spill_layout,
             build_store: Mutex::new(build_store),
             entries: Mutex::new(HtEntryTable::default()),
+            dense_index: Mutex::new(None),
+            probe_dense_index: AtomicPtr::new(ptr::null_mut()),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
             bitmask: AtomicUsize::new(0),
@@ -377,7 +388,14 @@ impl JoinHashTable {
     pub fn size_in_bytes(&self) -> usize {
         let data_size = self.build_store.lock().unwrap().size_in_bytes();
         let entries_size = self.entries.lock().unwrap().size_in_bytes();
-        data_size + entries_size
+        let dense_size = self
+            .dense_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|index| index.size_in_bytes())
+            .unwrap_or(0);
+        data_size + entries_size + dense_size
     }
 
     /// Estimate pointer-table size for a given row count.
@@ -404,11 +422,22 @@ impl JoinHashTable {
             .read_value(row_ptr as *const u8, key_idx)
     }
 
-    pub fn read_build_value(&self, row_ptr: usize, build_idx: usize) -> Value {
-        self.build_row_layout.read_value(
-            row_ptr as *const u8,
-            self.build_row_layout.payload_base_col_idx(build_idx),
-        )
+    /// Gather one build-side payload column for matched row pointers.
+    ///
+    /// # Safety
+    /// Every non-zero entry in `row_ptrs` must come from this hash table's build
+    /// store and remain live for this call.
+    pub unsafe fn gather_build_column(
+        &self,
+        row_ptrs: &[usize],
+        build_idx: usize,
+        output: &mut Vector,
+    ) -> Result<()> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe {
+            self.build_row_layout
+                .gather_payload_column(row_ptrs, build_idx, output)
+        }
     }
 
     pub fn scan_spill_chunk(
@@ -506,7 +535,23 @@ impl JoinHashTable {
         let input_rows = input_sel.map(SelectionVector::as_slice);
         let output_rows = output_sel.as_mut_slice();
 
-        if build_side && Self::propagates_build_side(self.join_type) {
+        let preserve_all_rows = build_side && Self::propagates_build_side(self.join_type);
+        let mut all_null_sensitive_keys_valid = true;
+        if !preserve_all_rows {
+            for (column_idx, nulls_equal) in self.null_values_are_equal.iter().enumerate() {
+                if !*nulls_equal
+                    && !keys.data[column_idx]
+                        .try_to_view(keys.size())?
+                        .validity()
+                        .all_valid()
+                {
+                    all_null_sensitive_keys_valid = false;
+                    break;
+                }
+            }
+        }
+
+        if preserve_all_rows || all_null_sensitive_keys_valid {
             for idx in 0..input_count {
                 let row_idx = input_rows.map_or(idx, |rows| rows[idx] as usize);
                 output_rows[idx] = row_idx as u32;
@@ -576,13 +621,17 @@ impl JoinHashTable {
     pub fn reset_runtime_state(&self) {
         self.finalized.store(false, Ordering::Release);
         self.probe_entries.store(ptr::null_mut(), Ordering::Release);
+        self.probe_dense_index
+            .store(ptr::null_mut(), Ordering::Release);
         *self.entries.lock().unwrap() = HtEntryTable::default();
+        *self.dense_index.lock().unwrap() = None;
         self.capacity.store(0, Ordering::Relaxed);
         self.bitmask.store(0, Ordering::Relaxed);
         self.chains_longer_than_one.store(false, Ordering::Relaxed);
     }
 
     pub fn reset_data_collection(&self) {
+        self.reset_runtime_state();
         self.build_store.lock().unwrap().reset();
         self.count.store(0, Ordering::Relaxed);
     }
@@ -636,7 +685,7 @@ impl JoinHashTable {
 
         hashes.resize(appended_count, 0);
         self.key_layout
-            .hash_selected_into(keys, build_sel, appended_count, hashes);
+            .hash_selected_into(keys, build_sel, appended_count, hashes)?;
         let appended_count = self.build_store.lock().unwrap().append_key_payload_chunk(
             keys,
             payload,
@@ -705,6 +754,15 @@ impl JoinHashTable {
             return Ok(());
         }
 
+        if let Some(index) = self.try_build_dense_index()? {
+            let index = Box::new(index);
+            let index_ptr = std::ptr::from_ref(index.as_ref()) as *mut DenseJoinIndex;
+            *self.dense_index.lock().unwrap() = Some(index);
+            self.probe_dense_index.store(index_ptr, Ordering::Release);
+            self.finalized.store(true, Ordering::Release);
+            return Ok(());
+        }
+
         // Step 1: Allocate and initialize pointer table
         self.allocate_pointer_table()?;
         self.initialize_pointer_table();
@@ -723,6 +781,86 @@ impl JoinHashTable {
         self.probe_entries.store(entries_ptr, Ordering::Release);
         self.finalized.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Build a direct-address index when one integer equality key is bounded,
+    /// unique, and dense enough to justify its slot array.
+    fn try_build_dense_index(&self) -> Result<Option<DenseJoinIndex>> {
+        if self.join_type != JoinType::Inner
+            || self.conditions.len() != 1
+            || self.conditions[0].comparison != JoinComparisonType::Equal
+            || self.equality_types.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(kind) = IntegerKeyKind::from_logical_type(&self.equality_types[0]) else {
+            return Ok(None);
+        };
+
+        let store = self.build_store.lock().unwrap();
+        let mut min_ordinal = u128::MAX;
+        let mut max_ordinal = 0_u128;
+        let mut measured_count = 0usize;
+        store.visit_row_ptrs(|row_ptr| {
+            let ordinal = kind
+                .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "dense join build key does not match declared type {:?}",
+                        self.equality_types[0]
+                    ))
+                })?;
+            min_ordinal = min_ordinal.min(ordinal);
+            max_ordinal = max_ordinal.max(ordinal);
+            measured_count += 1;
+            Ok(())
+        })?;
+        if measured_count == 0 {
+            return Ok(None);
+        }
+        let Some(slot_count) = max_ordinal
+            .checked_sub(min_ordinal)
+            .and_then(|range| usize::try_from(range).ok())
+            .and_then(|range| range.checked_add(1))
+        else {
+            return Ok(None);
+        };
+        if slot_count > MAX_DENSE_JOIN_SLOTS
+            || slot_count > measured_count.saturating_mul(MAX_SLOTS_PER_BUILD_ROW)
+        {
+            return Ok(None);
+        }
+
+        let mut index = match DenseJoinIndex::try_new(
+            kind,
+            min_ordinal,
+            max_ordinal,
+            self.allocator.clone(),
+            &self.pointer_memory,
+        ) {
+            Ok(index) => index,
+            Err(error) if error.error_class() == ErrorClass::Resource => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut unique = true;
+        store.visit_row_ptrs(|row_ptr| {
+            let ordinal = kind
+                .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "dense join build key does not match declared type {:?}",
+                        self.equality_types[0]
+                    ))
+                })?;
+            unique &= index.insert(ordinal, row_ptr)?;
+            Ok(())
+        })?;
+        Ok(unique.then_some(index))
+    }
+
+    #[cfg(test)]
+    fn has_dense_index(&self) -> bool {
+        !self.probe_dense_index.load(Ordering::Acquire).is_null()
     }
 
     /// Check if salt should be used for probing.
@@ -813,6 +951,15 @@ impl JoinHashTable {
             return Ok(());
         }
 
+        let dense_index = self.probe_dense_index.load(Ordering::Acquire);
+        if !dense_index.is_null() {
+            let index = unsafe { &*dense_index };
+            Self::probe_exact_integer_index(keys, scan_structure, filtered_count, |key, row| {
+                index.lookup_vector_row(key, row)
+            })?;
+            return Ok(());
+        }
+
         if scan_structure.hashes.len() < filtered_count {
             scan_structure.hashes.resize(filtered_count, 0);
         }
@@ -821,7 +968,7 @@ impl JoinHashTable {
             &scan_structure.probe_sel,
             filtered_count,
             &mut scan_structure.hashes,
-        );
+        )?;
 
         let capacity = self.capacity.load(Ordering::Relaxed);
         let bitmask = self.bitmask.load(Ordering::Relaxed);
@@ -861,6 +1008,33 @@ impl JoinHashTable {
 
         scan_structure.count = matched_count;
         scan_structure.sel_vector.set_len(matched_count);
+        Ok(())
+    }
+
+    fn probe_exact_integer_index(
+        keys: &Chunk,
+        scan_structure: &mut ScanStructure,
+        filtered_count: usize,
+        mut lookup: impl FnMut(&Vector, usize) -> Option<usize>,
+    ) -> Result<()> {
+        let key = keys.column(0).ok_or_else(|| {
+            paro_error::internal("integer join index probe is missing its key column")
+        })?;
+        let prepared_rows = scan_structure.probe_sel.as_slice();
+        scan_structure.sel_vector.set_len(keys.size());
+        let matched_rows = scan_structure.sel_vector.as_mut_slice();
+        let mut matched_count = 0usize;
+        for &row_idx in &prepared_rows[..filtered_count] {
+            let row_idx = row_idx as usize;
+            if let Some(row_ptr) = lookup(key.as_ref(), row_idx) {
+                scan_structure.pointers[row_idx] = row_ptr;
+                matched_rows[matched_count] = row_idx as u32;
+                matched_count += 1;
+            }
+        }
+        scan_structure.count = matched_count;
+        scan_structure.sel_vector.set_len(matched_count);
+        scan_structure.exact_key_matches = true;
         Ok(())
     }
 
@@ -1095,6 +1269,51 @@ mod tests {
         assert!(!ht.finalized.load(Ordering::Relaxed));
         ht.finalize().unwrap();
         assert!(ht.finalized.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn bounded_unique_integer_inner_join_uses_dense_index() {
+        let ht = JoinHashTable::new(
+            create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
+            vec![equality_condition()],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            JoinHashTableConfig::default(),
+        );
+        let keys = chunk_from_optional_i32(&[Some(-2), Some(0), Some(3)]);
+        let payload = chunk_from_optional_i32(&[Some(20), Some(30), Some(40)]);
+        ht.build(&keys, &payload).expect("build keys");
+        ht.finalize().expect("finalize join");
+        assert!(ht.has_dense_index());
+
+        let probe_keys =
+            chunk_from_optional_i32(&[Some(-3), Some(-2), None, Some(0), Some(2), Some(3)]);
+        let mut scan = ht.create_scan_structure().expect("scan state");
+        ht.probe(&probe_keys, &mut scan, None, probe_keys.size())
+            .expect("probe dense index");
+        assert_eq!(scan.count, 3);
+        assert_eq!(scan.sel_vector.as_slice(), &[1, 3, 5]);
+    }
+
+    #[test]
+    fn duplicate_or_sparse_integer_build_falls_back_to_hash_index() {
+        for keys in [vec![Some(10), Some(10)], vec![Some(0), Some(10_000)]] {
+            let ht = JoinHashTable::new(
+                create_test_buffer_pool(),
+                paro_common::test_utils::test_allocator(),
+                vec![equality_condition()],
+                vec![LogicalType::Integer],
+                JoinType::Inner,
+                JoinHashTableConfig::default(),
+            );
+            let payload = chunk_from_optional_i32(&[Some(20), Some(30)]);
+            ht.build(&chunk_from_optional_i32(&keys), &payload)
+                .expect("build keys");
+            ht.finalize().expect("finalize join");
+            assert!(!ht.has_dense_index());
+            assert!(!ht.probe_entries.load(Ordering::Acquire).is_null());
+        }
     }
 
     #[test]

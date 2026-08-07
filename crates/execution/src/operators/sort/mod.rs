@@ -3,6 +3,7 @@
 
 pub mod build;
 pub(crate) mod emit;
+mod finalize;
 pub mod row_format;
 pub mod state;
 pub(crate) mod streaming_topn;

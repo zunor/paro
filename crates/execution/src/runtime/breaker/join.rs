@@ -12,12 +12,10 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::MemoryAccountingClass;
 use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::{JoinCondition, JoinType};
 use paro_storage::buffer::{BufferPool, MemoryTag};
-use paro_storage::index::{ColumnId, Predicate, PredicateTree};
+use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::row::{
     RadixPartitionedRows, RadixPartitionedRowsBuilder, ReclaimableRowStore, RowLayout, RowStore,
     RowValidityType,
@@ -30,6 +28,12 @@ use crate::runtime::context::OperatorCleanupContext;
 
 use super::cleanup::{CleanupReason, CleanupState, CleanupStatus, RuntimeCleanup};
 use super::registry::BreakerHandleMetadata;
+
+#[path = "join_runtime_filter.rs"]
+mod runtime_filter;
+pub use runtime_filter::JoinRuntimeFilterSketch;
+#[cfg(test)]
+use runtime_filter::HASH_JOIN_RUNTIME_FILTER_MAX_VALUES;
 
 pub const HASH_JOIN_SPILL_MIN_RADIX_BITS: usize = 1;
 pub const HASH_JOIN_SPILL_MAX_RADIX_BITS: usize = 12;
@@ -205,23 +209,26 @@ impl JoinBuildHandle {
         };
         let mut builder = self.runtime_filter_builder.lock();
         match builder.as_mut() {
-            Some(existing) => existing.merge(&sketch)?,
+            Some(existing) => existing.merge(sketch)?,
             None => *builder = Some(sketch),
         }
         Ok(())
     }
 
     pub fn publish_runtime_filter_from_builder(&self) -> Result<()> {
+        let mut builder = self.runtime_filter_builder.lock();
         if self.runtime_filter_sketch.get().is_some() {
             return Ok(());
         }
-        let sketch = self
-            .runtime_filter_builder
-            .lock()
-            .clone()
+        let mut sketch = builder
+            .take()
             .unwrap_or_else(|| JoinRuntimeFilterSketch::empty(&[]));
-        // Idempotent publish: concurrent finalize paths may race, and keeping the first sketch is fine.
-        let _ = self.runtime_filter_sketch.set(sketch);
+        sketch.freeze();
+        // The builder lock serializes concurrent finalize/reclaim publishers,
+        // so ownership can move into the immutable sketch without cloning it.
+        self.runtime_filter_sketch.set(sketch).map_err(|_| {
+            paro_error::internal("hash join runtime filter was published concurrently")
+        })?;
         Ok(())
     }
 
@@ -507,349 +514,6 @@ impl Reclaimer for HashJoinLocalBuildSpillReclaimer {
 
     fn spill_cost(&self) -> SpillCost {
         SpillCost::SpillToDisk
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct JoinRuntimeFilterSketch {
-    pub row_count: u64,
-    pub keys: Box<[JoinRuntimeFilterKeySketch]>,
-}
-
-impl JoinRuntimeFilterSketch {
-    pub fn empty(key_types: &[LogicalType]) -> Self {
-        Self {
-            row_count: 0,
-            keys: key_types
-                .iter()
-                .cloned()
-                .map(JoinRuntimeFilterKeySketch::new)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
-    }
-
-    pub fn add_key_chunk(
-        &mut self,
-        keys: &Chunk,
-        selection: &SelectionVector,
-        selected_count: usize,
-    ) -> Result<()> {
-        if keys.column_count() != self.keys.len() {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter key count mismatch: sketch={}, chunk={}",
-                self.keys.len(),
-                keys.column_count()
-            )));
-        }
-        if selected_count > selection.len() {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter selected count exceeds selection length: selected={selected_count}, selection={}",
-                selection.len()
-            )));
-        }
-        self.row_count += selected_count as u64;
-        let selected_rows = selection.as_slice();
-        for selected in selected_rows.iter().take(selected_count) {
-            let row_idx = *selected as usize;
-            for (key_idx, key) in self.keys.iter_mut().enumerate() {
-                let vector = keys.column(key_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter key column missing")
-                })?;
-                key.add_vector_value(vector, row_idx)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn merge(&mut self, other: &Self) -> Result<()> {
-        if self.keys.len() != other.keys.len() {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter sketch merge key count mismatch: left={}, right={}",
-                self.keys.len(),
-                other.keys.len()
-            )));
-        }
-        self.row_count += other.row_count;
-        for (left, right) in self.keys.iter_mut().zip(other.keys.iter()) {
-            left.merge(right)?;
-        }
-        Ok(())
-    }
-
-    fn predicate_for_column(
-        &self,
-        build_key_index: usize,
-        probe_column_id: ColumnId,
-    ) -> Option<PredicateTree> {
-        self.keys
-            .get(build_key_index)
-            .and_then(|key| key.predicate_for_column(probe_column_id))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct JoinRuntimeFilterKeySketch {
-    pub logical_type: LogicalType,
-    pub non_null_count: u64,
-    pub has_null: bool,
-    comparable: bool,
-    pub min: Option<Value>,
-    pub max: Option<Value>,
-}
-
-impl JoinRuntimeFilterKeySketch {
-    fn new(logical_type: LogicalType) -> Self {
-        Self {
-            logical_type,
-            non_null_count: 0,
-            has_null: false,
-            comparable: true,
-            min: None,
-            max: None,
-        }
-    }
-
-    fn add_vector_value(&mut self, vector: &Vector, row_idx: usize) -> Result<()> {
-        if vector.logical_type() != &self.logical_type {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter key type mismatch: sketch={}, vector={}",
-                self.logical_type,
-                vector.logical_type()
-            )));
-        }
-        if vector.is_null(row_idx) {
-            self.has_null = true;
-            return Ok(());
-        }
-        self.non_null_count += 1;
-        match &self.logical_type {
-            LogicalType::Boolean => {
-                self.add_value(Value::Boolean(vector.get_bool(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter boolean value missing"),
-                )?))
-            }
-            LogicalType::TinyInt => {
-                self.add_value(Value::TinyInt(vector.get_i8(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter tinyint value missing")
-                })?))
-            }
-            LogicalType::SmallInt => {
-                self.add_value(Value::SmallInt(vector.get_i16(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter smallint value missing"),
-                )?))
-            }
-            LogicalType::Integer => {
-                self.add_value(Value::Integer(vector.get_i32(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter integer value missing"),
-                )?))
-            }
-            LogicalType::BigInt => {
-                self.add_value(Value::BigInt(vector.get_i64(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter bigint value missing")
-                })?))
-            }
-            LogicalType::HugeInt => {
-                self.add_value(Value::HugeInt(vector.get_i128(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter hugeint value missing"),
-                )?))
-            }
-            LogicalType::UTinyInt => {
-                self.add_value(Value::UTinyInt(vector.get_u8(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter utinyint value missing"),
-                )?))
-            }
-            LogicalType::USmallInt => {
-                self.add_value(Value::USmallInt(vector.get_u16(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter usmallint value missing"),
-                )?))
-            }
-            LogicalType::UInteger => {
-                self.add_value(Value::UInteger(vector.get_u32(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter uinteger value missing"),
-                )?))
-            }
-            LogicalType::UBigInt => {
-                self.add_value(Value::UBigInt(vector.get_u64(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter ubigint value missing"),
-                )?))
-            }
-            LogicalType::UHugeInt => {
-                self.add_value(Value::UHugeInt(vector.get_u128(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter uhugeint value missing"),
-                )?))
-            }
-            LogicalType::Uuid => {
-                self.add_value(Value::Uuid(vector.get_u128(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter uuid value missing")
-                })?))
-            }
-            LogicalType::Float => {
-                self.add_value(Value::Float(vector.get_f32(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter float value missing")
-                })?))
-            }
-            LogicalType::Double => {
-                self.add_value(Value::Double(vector.get_f64(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter double value missing")
-                })?))
-            }
-            LogicalType::Decimal { precision, scale } => {
-                let value = if *precision <= 18 {
-                    vector.get_i64(row_idx).ok_or_else(|| {
-                        paro_error::internal("hash join runtime filter decimal value missing")
-                    })? as i128
-                } else {
-                    vector.get_i128(row_idx).ok_or_else(|| {
-                        paro_error::internal("hash join runtime filter decimal value missing")
-                    })?
-                };
-                self.add_value(Value::Decimal(value, *precision, *scale));
-            }
-            LogicalType::Date => {
-                self.add_value(Value::Date(vector.get_i32(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter date value missing")
-                })?))
-            }
-            LogicalType::Timestamp => {
-                self.add_value(Value::Timestamp(vector.get_i64(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter timestamp value missing"),
-                )?))
-            }
-            LogicalType::TimestampTz => {
-                self.add_value(Value::TimestampTz(vector.get_i64(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter timestamptz value missing"),
-                )?))
-            }
-            LogicalType::Time => {
-                self.add_value(Value::Time(vector.get_i64(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter time value missing")
-                })?))
-            }
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb => {
-                let value = vector.get_string(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter string value missing")
-                })?;
-                self.add_string_value(value);
-            }
-            _ => {
-                self.comparable = false;
-            }
-        }
-        Ok(())
-    }
-
-    fn add_value(&mut self, value: Value) {
-        Self::update_extreme(&mut self.min, &value, &mut self.comparable, true);
-        if self.comparable {
-            Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
-        }
-    }
-
-    fn add_string_value(&mut self, value: &str) {
-        Self::update_string_extreme(&mut self.min, value, &mut self.comparable, true);
-        if self.comparable {
-            Self::update_string_extreme(&mut self.max, value, &mut self.comparable, false);
-        }
-    }
-
-    fn merge(&mut self, other: &Self) -> Result<()> {
-        if self.logical_type != other.logical_type {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter key sketch merge type mismatch: left={}, right={}",
-                self.logical_type, other.logical_type
-            )));
-        }
-        self.has_null |= other.has_null;
-        self.non_null_count += other.non_null_count;
-        if !other.comparable {
-            self.comparable = false;
-            return Ok(());
-        }
-        if let Some(min) = other.min.as_ref() {
-            Self::update_extreme(&mut self.min, min, &mut self.comparable, true);
-        }
-        if self.comparable {
-            if let Some(max) = other.max.as_ref() {
-                Self::update_extreme(&mut self.max, max, &mut self.comparable, false);
-            }
-        }
-        Ok(())
-    }
-
-    fn update_extreme(
-        slot: &mut Option<Value>,
-        value: &Value,
-        comparable: &mut bool,
-        is_min: bool,
-    ) {
-        let Some(current) = slot.as_ref() else {
-            *slot = Some(value.clone());
-            return;
-        };
-        let Some(ordering) = value.partial_cmp(current) else {
-            *comparable = false;
-            return;
-        };
-        let should_replace = if is_min {
-            ordering == std::cmp::Ordering::Less
-        } else {
-            ordering == std::cmp::Ordering::Greater
-        };
-        if should_replace {
-            *slot = Some(value.clone());
-        }
-    }
-
-    fn update_string_extreme(
-        slot: &mut Option<Value>,
-        value: &str,
-        comparable: &mut bool,
-        is_min: bool,
-    ) {
-        let Some(current) = slot.as_ref() else {
-            *slot = Some(Value::Varchar(value.to_owned()));
-            return;
-        };
-        let Value::Varchar(current) = current else {
-            *comparable = false;
-            return;
-        };
-        let should_replace = if is_min {
-            value < current.as_str()
-        } else {
-            value > current.as_str()
-        };
-        if should_replace {
-            *slot = Some(Value::Varchar(value.to_owned()));
-        }
-    }
-
-    fn predicate_for_column(&self, column_id: ColumnId) -> Option<PredicateTree> {
-        if self.non_null_count == 0 || !self.comparable {
-            return None;
-        }
-        let min = self.min.clone()?;
-        let max = self.max.clone()?;
-        min.partial_cmp(&max)?;
-        let predicate = if min == max {
-            Predicate::Eq {
-                column_id,
-                value: min,
-            }
-        } else {
-            Predicate::Range {
-                column_id,
-                lower: min,
-                upper: max,
-            }
-        };
-        Some(PredicateTree::leaf(predicate))
     }
 }
 

@@ -24,10 +24,10 @@ use paro_storage::buffer::BufferPool;
 use paro_storage::row::{RowSpillWriter, RowStore, RowStoreSpillReader, RowStoreSpillWriter};
 
 use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
-use crate::operators::aggregate::accounted_rows::DistinctAggregateState;
 use crate::operators::aggregate::aggregate_kernel::destroy_states;
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
+use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::ordered_helpers::OrderedAggregateCollector;
 use crate::operators::aggregate::payload_spill::{
     AggregateSpilledPayload, AggregateSpilledState, AggregateStateEncoding,

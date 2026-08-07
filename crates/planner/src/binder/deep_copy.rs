@@ -394,6 +394,7 @@ impl LogicalPlanDeepCopy {
                     }
                     JoinOp::Comparison(ComparisonJoin {
                         join_type: cj.join_type,
+                        anti_join_mode: cj.anti_join_mode,
                         left: Box::new(left),
                         right: Box::new(right),
                         conditions: cj.conditions.clone(),

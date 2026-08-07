@@ -813,7 +813,7 @@ impl Vector {
         })?;
 
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
         self.validity
             .try_copy_range_from(dst_offset, &source.validity, src_offset, count)?;
 
@@ -844,7 +844,7 @@ impl Vector {
         let element_size = self.logical_type.physical_size();
 
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
 
         unsafe {
             let src_base = child.buffer.data();
@@ -877,7 +877,7 @@ impl Vector {
         count: usize,
     ) -> Result<()> {
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
 
         let mut heap: Option<StringHeap> = None;
         let allocator = self.buffer.allocator().clone();
@@ -917,7 +917,7 @@ impl Vector {
         count: usize,
     ) -> Result<()> {
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
 
         let allocator = self.buffer.allocator().clone();
         if self
@@ -1062,9 +1062,7 @@ impl Vector {
         count: usize,
         required_count: usize,
     ) -> Result<()> {
-        if self.validity.len() < required_count {
-            self.validity.try_resize(required_count)?;
-        }
+        self.validity.try_ensure_capacity(required_count)?;
         for logical_idx in 0..count {
             let src_idx = src_rows.source_index(logical_idx);
             let dst_idx = dst_rows.destination_index(logical_idx);
@@ -1264,9 +1262,7 @@ impl Vector {
         required_count: usize,
         dest_child_start: usize,
     ) -> Result<()> {
-        if self.validity.len() < required_count {
-            self.validity.try_resize(required_count)?;
-        }
+        self.validity.try_ensure_capacity(required_count)?;
         let mut dest_child_offset = dest_child_start;
         for logical_idx in 0..count {
             let src_idx = src_rows.source_index(logical_idx);
@@ -1465,8 +1461,15 @@ impl Vector {
                     source.row_idx
                 ))
             })?;
+            let required_child_count = dest_offset.checked_add(array_size).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "array destination child count overflow: offset={dest_offset}, array_size={array_size}"
+                ))
+            })?;
             dest_child.try_copy_range(dest_offset, src_child, src_offset, array_size)?;
-            dest_child.try_set_count(dest_offset + array_size)?;
+            if dest_child.len() < required_child_count {
+                dest_child.try_set_count(required_child_count)?;
+            }
         }
         self.try_set_null(idx, false)
     }

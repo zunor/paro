@@ -2,24 +2,58 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::Ordering;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use paro_common::allocator::{Allocator, BufferAllocator, BufferManager};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle};
-use paro_common::sort_key::{compare_keys, SortKeyEncoding};
+use paro_common::memory::{
+    GrantBuffer, MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle,
+};
+use paro_common::sort_key::{compare_keys, SortKeyEncoding, MAX_SORT_KEY_SLOT_SIZE};
 use paro_storage::buffer::{
     BlockId, BufferHandle, BufferPool, FileBufferType, MemoryTag, SharedBlockHandle,
     DEFAULT_BLOCK_SIZE,
 };
 
-const VARIABLE_TOTAL_LEN_OFFSET: usize = 16;
-const VARIABLE_OVERFLOW_LEN_OFFSET: usize = 20;
-const VARIABLE_OVERFLOW_BLOCK_OFFSET: usize = 24;
-const VARIABLE_OVERFLOW_OFFSET_OFFSET: usize = 28;
-const VARIABLE_INLINE_PREFIX_LEN: usize = 16;
+const MATERIALIZED_SORT_PREFIX_LEN: usize = 32;
+const PREFIX_SORT_MIN_ROWS: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+struct VariableSlotLayout {
+    inline_len: usize,
+    total_len_offset: usize,
+    overflow_len_offset: usize,
+    overflow_block_offset: usize,
+    overflow_offset_offset: usize,
+}
+
+impl VariableSlotLayout {
+    #[inline]
+    fn new(encoding: &SortKeyEncoding) -> Self {
+        debug_assert!(encoding.is_variable());
+        let inline_len = encoding.inline_prefix_len();
+        let layout = Self {
+            inline_len,
+            total_len_offset: inline_len,
+            overflow_len_offset: inline_len + 4,
+            overflow_block_offset: inline_len + 8,
+            overflow_offset_offset: inline_len + 12,
+        };
+        debug_assert_eq!(layout.metadata_end(), encoding.slot_size());
+        layout
+    }
+
+    #[inline]
+    fn metadata_end(self) -> usize {
+        self.overflow_offset_offset + std::mem::size_of::<u32>()
+    }
+}
 
 #[derive(Debug)]
 struct SlotBlockMeta {
@@ -103,6 +137,22 @@ enum CursorMode {
     OnDemand(OnDemandPinnedBlocks),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OverflowKeyRef {
+    block_idx: usize,
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SlotComparison {
+    Ordered(Ordering),
+    Overflow {
+        left: OverflowKeyRef,
+        right: OverflowKeyRef,
+    },
+}
+
 /// Immutable block-backed store for encoded sort keys.
 #[derive(Debug)]
 pub struct SortKeyStore {
@@ -119,6 +169,121 @@ pub struct SortKeyStore {
     current_overflow: Option<BufferHandle>,
     release_state: KeyReleaseState,
 }
+
+/// Query-accounted typed storage for sort finalize scratch and retained
+/// permutations.
+///
+/// The raw grant buffer is `Send + Sync`, unlike a mutable `MemoryGrant`, so a
+/// sealed run can safely share its immutable permutation across merge workers.
+mod sort_buffer_element {
+    pub(crate) trait Sealed {}
+
+    impl Sealed for u32 {}
+    impl Sealed for super::MaterializedSortPrefix {}
+}
+
+pub(crate) trait ZeroValidSortElement:
+    sort_buffer_element::Sealed + Copy + Send + Sync + 'static
+{
+}
+
+impl ZeroValidSortElement for u32 {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C)]
+struct MaterializedSortPrefix {
+    bytes: [u8; MATERIALIZED_SORT_PREFIX_LEN],
+    effective_len: u8,
+}
+
+impl ZeroValidSortElement for MaterializedSortPrefix {}
+
+#[derive(Debug)]
+pub(crate) struct AccountedSortBuffer<T: ZeroValidSortElement> {
+    buffer: GrantBuffer,
+    len: usize,
+    _value: PhantomData<T>,
+}
+
+impl<T: ZeroValidSortElement> AccountedSortBuffer<T> {
+    fn try_new(
+        memory: &MemoryAccountingContext,
+        buffer_pool: Arc<BufferPool>,
+        len: usize,
+    ) -> Result<Self> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| paro_error::internal("sort finalize allocation overflow"))?;
+        let manager: Arc<dyn BufferManager> = buffer_pool;
+        let allocator: Arc<dyn Allocator> =
+            Arc::new(BufferAllocator::new(manager, MemoryTag::OrderBy));
+        let buffer = memory.allocate_zeroed_buffer(allocator, bytes)?;
+        if bytes > 0 && buffer.as_ptr().is_null() {
+            return Err(paro_error::internal(
+                "sort finalize allocation returned no storage",
+            ));
+        }
+        if !(Self::slice_ptr(&buffer, len) as usize).is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(paro_error::internal(
+                "sort finalize allocation does not satisfy element alignment",
+            ));
+        }
+        Ok(Self {
+            buffer,
+            len,
+            _value: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn slice_ptr(buffer: &GrantBuffer, len: usize) -> *mut T {
+        if len == 0 {
+            NonNull::<T>::dangling().as_ptr()
+        } else {
+            buffer.as_ptr().cast::<T>()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn size_in_bytes(&self) -> usize {
+        self.buffer.size()
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[T] {
+        self
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        self
+    }
+}
+
+impl<T: ZeroValidSortElement> Deref for AccountedSortBuffer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: construction allocates and zero-initializes exactly
+        // `len * size_of::<T>()` bytes with `T` alignment. The sealed
+        // `ZeroValidSortElement` bound admits only integer types whose all-zero
+        // bit pattern is valid. Empty buffers use an aligned, non-null dangling
+        // pointer as required by Rust's slice representation.
+        unsafe { std::slice::from_raw_parts(Self::slice_ptr(&self.buffer, self.len), self.len) }
+    }
+}
+
+impl<T: ZeroValidSortElement> DerefMut for AccountedSortBuffer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: mutable access requires `&mut self`, so the backing grant
+        // buffer is exclusively borrowed for the returned slice. Empty buffers
+        // use an aligned, non-null dangling pointer and expose no elements.
+        unsafe { std::slice::from_raw_parts_mut(Self::slice_ptr(&self.buffer, self.len), self.len) }
+    }
+}
+
+pub(crate) type SortPermutation = AccountedSortBuffer<u32>;
+type SortPrefixes = AccountedSortBuffer<MaterializedSortPrefix>;
 
 /// Cursor over encoded sort keys.
 #[derive(Debug)]
@@ -316,6 +481,53 @@ impl SortKeyStore {
         KeyComparator::new(cursor)
     }
 
+    /// Sort row ordinals using the byte-comparable key representation.
+    ///
+    /// Encoded inline prefixes are materialized once and sorted as integers;
+    /// only equal-prefix ranges pay for full key comparisons.
+    pub(crate) fn sorted_permutation(&self) -> Result<SortPermutation> {
+        let count = self.count as usize;
+        let mut permutation = self.accounted_ordinal_buffer(count)?;
+        for (ordinal, slot) in permutation.iter_mut().enumerate() {
+            *slot = ordinal as u32;
+        }
+        if count <= 1 {
+            return Ok(permutation);
+        }
+
+        let mut cursor = self.cursor_pinned()?;
+        if count < PREFIX_SORT_MIN_ROWS {
+            permutation.sort_unstable_by(|left, right| {
+                cursor
+                    .compare(*left, *right)
+                    .expect("sort key comparison must succeed during finalize")
+            });
+            return Ok(permutation);
+        }
+
+        let mut prefixes =
+            SortPrefixes::try_new(&self.memory, Arc::clone(&self.buffer_pool), count)?;
+        for (ordinal, prefix) in prefixes.iter_mut().enumerate() {
+            *prefix = cursor.materialized_sort_prefix(ordinal as u32)?;
+        }
+        permutation.sort_unstable_by(|left, right| {
+            prefixes[*left as usize].cmp(&prefixes[*right as usize])
+        });
+
+        let prefix_is_complete = self
+            .encoding
+            .fixed_key_len()
+            .is_some_and(|width| width <= MATERIALIZED_SORT_PREFIX_LEN);
+        if !prefix_is_complete {
+            refine_equal_prefix_ranges(&mut cursor, &mut permutation, &prefixes)?;
+        }
+        Ok(permutation)
+    }
+
+    fn accounted_ordinal_buffer(&self, len: usize) -> Result<SortPermutation> {
+        SortPermutation::try_new(&self.memory, Arc::clone(&self.buffer_pool), len)
+    }
+
     pub fn advance_release_frontier(&self, frontier: u64) -> Result<()> {
         if frontier > self.count as u64 {
             return Err(paro_error::internal(format!(
@@ -371,6 +583,10 @@ impl SortKeyStore {
         let slot_offset = row_in_block * self.slot_size;
         let inline_len = total_len.min(self.encoding.inline_prefix_len());
         let overflow_len = total_len.saturating_sub(inline_len);
+        let variable_layout = self
+            .encoding
+            .is_variable()
+            .then(|| VariableSlotLayout::new(&self.encoding));
         let overflow_location = if overflow_len > 0 {
             Some(self.reserve_overflow_block(overflow_len, ordinal)?)
         } else {
@@ -402,23 +618,20 @@ impl SortKeyStore {
             let overflow =
                 &mut overflow_data[overflow_offset..overflow_offset.saturating_add(overflow_len)];
             write_key(&mut slot[..inline_len], overflow)?;
-            write_u32(slot, VARIABLE_TOTAL_LEN_OFFSET, total_len as u32);
-            write_u32(slot, VARIABLE_OVERFLOW_LEN_OFFSET, overflow_len as u32);
+            let layout = variable_layout.expect("overflow keys require variable slot metadata");
+            write_u32(slot, layout.total_len_offset, total_len as u32);
+            write_u32(slot, layout.overflow_len_offset, overflow_len as u32);
             write_u32(
                 slot,
-                VARIABLE_OVERFLOW_BLOCK_OFFSET,
+                layout.overflow_block_offset,
                 overflow_block_idx as u32,
             );
-            write_u32(
-                slot,
-                VARIABLE_OVERFLOW_OFFSET_OFFSET,
-                overflow_offset as u32,
-            );
+            write_u32(slot, layout.overflow_offset_offset, overflow_offset as u32);
         } else {
             write_key(&mut slot[..inline_len], &mut [])?;
-            if self.encoding.fixed_key_len().is_none() {
-                write_u32(slot, VARIABLE_TOTAL_LEN_OFFSET, total_len as u32);
-                write_u32(slot, VARIABLE_OVERFLOW_LEN_OFFSET, 0);
+            if let Some(layout) = variable_layout {
+                write_u32(slot, layout.total_len_offset, total_len as u32);
+                write_u32(slot, layout.overflow_len_offset, 0);
             }
         }
 
@@ -428,7 +641,7 @@ impl SortKeyStore {
     }
 
     fn append_key_from_cursor(&mut self, cursor: &mut KeyCursor<'_>, ordinal: u32) -> Result<()> {
-        let mut slot = [0u8; 32];
+        let mut slot = [0u8; MAX_SORT_KEY_SLOT_SIZE];
         cursor.copy_slot(ordinal, &mut slot)?;
 
         if let Some(fixed_len) = self.encoding.fixed_key_len() {
@@ -438,13 +651,14 @@ impl SortKeyStore {
             });
         }
 
-        let total_len = read_u32(&slot, VARIABLE_TOTAL_LEN_OFFSET) as usize;
-        let inline_len = total_len.min(VARIABLE_INLINE_PREFIX_LEN);
-        let overflow_len = read_u32(&slot, VARIABLE_OVERFLOW_LEN_OFFSET) as usize;
+        let source_layout = VariableSlotLayout::new(&cursor.store.encoding);
+        let total_len = read_u32(&slot, source_layout.total_len_offset) as usize;
+        let inline_len = total_len.min(source_layout.inline_len);
+        let overflow_len = read_u32(&slot, source_layout.overflow_len_offset) as usize;
         let source_overflow = if overflow_len > 0 {
             Some((
-                read_u32(&slot, VARIABLE_OVERFLOW_BLOCK_OFFSET) as usize,
-                read_u32(&slot, VARIABLE_OVERFLOW_OFFSET_OFFSET) as usize,
+                read_u32(&slot, source_layout.overflow_block_offset) as usize,
+                read_u32(&slot, source_layout.overflow_offset_offset) as usize,
             ))
         } else {
             None
@@ -723,105 +937,66 @@ impl KeyCursor<'_> {
             return left_cursor.compare(left, right);
         }
 
-        let mut left_slot = [0u8; 32];
-        let mut right_slot = [0u8; 32];
-        left_cursor.copy_slot(left, &mut left_slot)?;
-        right_cursor.copy_slot(right, &mut right_slot)?;
-
-        let fixed_left = left_cursor.store.encoding.fixed_key_len();
-        let fixed_right = right_cursor.store.encoding.fixed_key_len();
-        if fixed_left != fixed_right {
+        let left_encoding = &left_cursor.store.encoding;
+        let right_encoding = &right_cursor.store.encoding;
+        if left_encoding.fixed_key_len() != right_encoding.fixed_key_len()
+            || left_encoding.inline_prefix_len() != right_encoding.inline_prefix_len()
+            || left_encoding.slot_size() != right_encoding.slot_size()
+        {
             return Err(paro_error::internal(
-                "cannot compare sort keys built with different fixed-width contracts",
+                "cannot compare sort keys built with different storage layouts",
             ));
         }
-
-        if let Some(fixed_len) = fixed_left {
-            return Ok(compare_keys(
-                &left_slot[..fixed_len],
-                &right_slot[..fixed_len],
-            ));
+        let comparison = left_cursor.with_slot(left, |left_slot| {
+            right_cursor.with_slot(right, |right_slot| {
+                compare_slot_prefixes(left_slot, right_slot, left_encoding)
+            })
+        })?;
+        let comparison = comparison?;
+        let comparison = comparison?;
+        match comparison {
+            SlotComparison::Ordered(ordering) => Ok(ordering),
+            SlotComparison::Overflow { left, right } => left_cursor.with_overflow_slice(
+                left.block_idx,
+                left.offset,
+                left.len,
+                |left_bytes| {
+                    right_cursor.with_overflow_slice(
+                        right.block_idx,
+                        right.offset,
+                        right.len,
+                        |right_bytes| compare_keys(left_bytes, right_bytes),
+                    )
+                },
+            )?,
         }
-
-        let left_total = read_u32(&left_slot, VARIABLE_TOTAL_LEN_OFFSET) as usize;
-        let right_total = read_u32(&right_slot, VARIABLE_TOTAL_LEN_OFFSET) as usize;
-        let left_inline = left_total.min(VARIABLE_INLINE_PREFIX_LEN);
-        let right_inline = right_total.min(VARIABLE_INLINE_PREFIX_LEN);
-        let shared_inline = left_inline.min(right_inline);
-        let inline_order = compare_keys(&left_slot[..shared_inline], &right_slot[..shared_inline]);
-        if inline_order != Ordering::Equal {
-            return Ok(inline_order);
-        }
-
-        if left_total <= VARIABLE_INLINE_PREFIX_LEN || right_total <= VARIABLE_INLINE_PREFIX_LEN {
-            return Ok(left_total.cmp(&right_total));
-        }
-
-        let left_overflow_len = read_u32(&left_slot, VARIABLE_OVERFLOW_LEN_OFFSET) as usize;
-        let right_overflow_len = read_u32(&right_slot, VARIABLE_OVERFLOW_LEN_OFFSET) as usize;
-        let left_block_idx = read_u32(&left_slot, VARIABLE_OVERFLOW_BLOCK_OFFSET) as usize;
-        let right_block_idx = read_u32(&right_slot, VARIABLE_OVERFLOW_BLOCK_OFFSET) as usize;
-        let left_offset = read_u32(&left_slot, VARIABLE_OVERFLOW_OFFSET_OFFSET) as usize;
-        let right_offset = read_u32(&right_slot, VARIABLE_OVERFLOW_OFFSET_OFFSET) as usize;
-
-        left_cursor.with_overflow_slice(
-            left_block_idx,
-            left_offset,
-            left_overflow_len,
-            |left_bytes| {
-                right_cursor.with_overflow_slice(
-                    right_block_idx,
-                    right_offset,
-                    right_overflow_len,
-                    |right_bytes| compare_keys(left_bytes, right_bytes),
-                )
-            },
-        )?
     }
 
     pub fn compare(&mut self, left: u32, right: u32) -> Result<Ordering> {
-        let mut left_slot = [0u8; 32];
-        let mut right_slot = [0u8; 32];
-        self.copy_slot(left, &mut left_slot)?;
-        self.copy_slot(right, &mut right_slot)?;
-
-        if let Some(fixed_len) = self.store.encoding.fixed_key_len() {
-            return Ok(compare_keys(
-                &left_slot[..fixed_len],
-                &right_slot[..fixed_len],
-            ));
+        if let CursorMode::Pinned(blocks) = &self.mode {
+            return compare_pinned_slots(self.store, blocks, left, right);
         }
 
-        let left_total = read_u32(&left_slot, VARIABLE_TOTAL_LEN_OFFSET) as usize;
-        let right_total = read_u32(&right_slot, VARIABLE_TOTAL_LEN_OFFSET) as usize;
-        let left_inline = left_total.min(VARIABLE_INLINE_PREFIX_LEN);
-        let right_inline = right_total.min(VARIABLE_INLINE_PREFIX_LEN);
-        let shared_inline = left_inline.min(right_inline);
-        let inline_order = compare_keys(&left_slot[..shared_inline], &right_slot[..shared_inline]);
-        if inline_order != Ordering::Equal {
-            return Ok(inline_order);
+        let mut left_slot = [0u8; MAX_SORT_KEY_SLOT_SIZE];
+        let mut right_slot = [0u8; MAX_SORT_KEY_SLOT_SIZE];
+        let left_len = self.copy_slot(left, &mut left_slot)?;
+        let right_len = self.copy_slot(right, &mut right_slot)?;
+        match compare_slot_prefixes(
+            &left_slot[..left_len],
+            &right_slot[..right_len],
+            &self.store.encoding,
+        )? {
+            SlotComparison::Ordered(ordering) => Ok(ordering),
+            SlotComparison::Overflow { left, right } => self.with_overflow_slices(
+                left.block_idx,
+                left.offset,
+                left.len,
+                right.block_idx,
+                right.offset,
+                right.len,
+                |left_bytes, right_bytes| compare_keys(left_bytes, right_bytes),
+            ),
         }
-
-        if left_total <= VARIABLE_INLINE_PREFIX_LEN || right_total <= VARIABLE_INLINE_PREFIX_LEN {
-            return Ok(left_total.cmp(&right_total));
-        }
-
-        let left_overflow_len = read_u32(&left_slot, VARIABLE_OVERFLOW_LEN_OFFSET) as usize;
-        let right_overflow_len = read_u32(&right_slot, VARIABLE_OVERFLOW_LEN_OFFSET) as usize;
-        let left_block_idx = read_u32(&left_slot, VARIABLE_OVERFLOW_BLOCK_OFFSET) as usize;
-        let right_block_idx = read_u32(&right_slot, VARIABLE_OVERFLOW_BLOCK_OFFSET) as usize;
-        let left_offset = read_u32(&left_slot, VARIABLE_OVERFLOW_OFFSET_OFFSET) as usize;
-        let right_offset = read_u32(&right_slot, VARIABLE_OVERFLOW_OFFSET_OFFSET) as usize;
-
-        self.with_overflow_slices(
-            left_block_idx,
-            left_offset,
-            left_overflow_len,
-            right_block_idx,
-            right_offset,
-            right_overflow_len,
-            |left_bytes, right_bytes| compare_keys(left_bytes, right_bytes),
-        )
     }
 
     pub fn read_key(&mut self, ordinal: u32) -> Result<Vec<u8>> {
@@ -831,7 +1006,7 @@ impl KeyCursor<'_> {
     }
 
     pub fn read_key_into(&mut self, ordinal: u32, out: &mut Vec<u8>) -> Result<()> {
-        let mut slot = [0u8; 32];
+        let mut slot = [0u8; MAX_SORT_KEY_SLOT_SIZE];
         let _slot_len = self.copy_slot(ordinal, &mut slot)?;
         if let Some(fixed_len) = self.store.encoding.fixed_key_len() {
             out.clear();
@@ -839,15 +1014,16 @@ impl KeyCursor<'_> {
             return Ok(());
         }
 
-        let total_len = read_u32(&slot, VARIABLE_TOTAL_LEN_OFFSET) as usize;
-        let inline_len = total_len.min(VARIABLE_INLINE_PREFIX_LEN);
-        let overflow_len = read_u32(&slot, VARIABLE_OVERFLOW_LEN_OFFSET) as usize;
+        let layout = VariableSlotLayout::new(&self.store.encoding);
+        let total_len = read_u32(&slot, layout.total_len_offset) as usize;
+        let inline_len = total_len.min(layout.inline_len);
+        let overflow_len = read_u32(&slot, layout.overflow_len_offset) as usize;
         out.clear();
         out.extend_from_slice(&slot[..inline_len]);
 
         if overflow_len > 0 {
-            let block_idx = read_u32(&slot, VARIABLE_OVERFLOW_BLOCK_OFFSET) as usize;
-            let offset = read_u32(&slot, VARIABLE_OVERFLOW_OFFSET_OFFSET) as usize;
+            let block_idx = read_u32(&slot, layout.overflow_block_offset) as usize;
+            let offset = read_u32(&slot, layout.overflow_offset_offset) as usize;
             self.with_overflow_slice(block_idx, offset, overflow_len, |bytes| {
                 out.extend_from_slice(bytes);
             })?;
@@ -856,7 +1032,7 @@ impl KeyCursor<'_> {
         Ok(())
     }
 
-    fn copy_slot(&mut self, ordinal: u32, out: &mut [u8; 32]) -> Result<usize> {
+    fn copy_slot(&mut self, ordinal: u32, out: &mut [u8; MAX_SORT_KEY_SLOT_SIZE]) -> Result<usize> {
         let (block_idx, within_block) = self.store.slot_block_index(ordinal)?;
         let slot_offset = within_block * self.store.slot_size;
         let slot_size = self.store.slot_size;
@@ -882,6 +1058,72 @@ impl KeyCursor<'_> {
             }
         }
         Ok(slot_size)
+    }
+
+    fn with_slot<T>(&mut self, ordinal: u32, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        let (block_idx, within_block) = self.store.slot_block_index(ordinal)?;
+        let slot_offset = within_block * self.store.slot_size;
+        let slot_size = self.store.slot_size;
+        match &mut self.mode {
+            CursorMode::Pinned(blocks) => {
+                let slot = pinned_slot(blocks, block_idx, slot_offset, slot_size)?;
+                Ok(f(slot))
+            }
+            CursorMode::OnDemand(cache) => {
+                let handle_idx = Self::cached_slot_handle(self.store, cache, block_idx)?;
+                let handle = &cache.slot_handles[handle_idx].handle;
+                let data = handle
+                    .data()
+                    .ok_or_else(|| paro_error::internal("slot block missing data"))?;
+                Ok(f(&data[slot_offset..slot_offset + slot_size]))
+            }
+        }
+    }
+
+    fn materialized_sort_prefix(&mut self, ordinal: u32) -> Result<MaterializedSortPrefix> {
+        let mut slot = [0u8; MAX_SORT_KEY_SLOT_SIZE];
+        let slot_len = self.copy_slot(ordinal, &mut slot)?;
+        if let Some(fixed_len) = self.store.encoding.fixed_key_len() {
+            let effective_len = fixed_len.min(MATERIALIZED_SORT_PREFIX_LEN);
+            let mut prefix = MaterializedSortPrefix {
+                effective_len: effective_len as u8,
+                ..MaterializedSortPrefix::default()
+            };
+            prefix.bytes[..effective_len].copy_from_slice(&slot[..effective_len]);
+            return Ok(prefix);
+        }
+        let layout = VariableSlotLayout::new(&self.store.encoding);
+        if slot_len < layout.metadata_end() {
+            return Err(paro_error::internal(format!(
+                "variable sort-key slot is too short: actual={slot_len}"
+            )));
+        }
+
+        let total_len = read_u32(&slot, layout.total_len_offset) as usize;
+        let effective_len = total_len.min(MATERIALIZED_SORT_PREFIX_LEN);
+        let inline_len = total_len.min(layout.inline_len);
+        let mut prefix = MaterializedSortPrefix {
+            effective_len: effective_len as u8,
+            ..MaterializedSortPrefix::default()
+        };
+        prefix.bytes[..inline_len].copy_from_slice(&slot[..inline_len]);
+
+        let overflow_prefix_len = effective_len.saturating_sub(inline_len);
+        if overflow_prefix_len == 0 {
+            return Ok(prefix);
+        }
+        let overflow_len = read_u32(&slot, layout.overflow_len_offset) as usize;
+        if overflow_prefix_len > overflow_len {
+            return Err(paro_error::internal(format!(
+                "sort-key overflow is shorter than its prefix: required={overflow_prefix_len}, actual={overflow_len}"
+            )));
+        }
+        let block_idx = read_u32(&slot, layout.overflow_block_offset) as usize;
+        let offset = read_u32(&slot, layout.overflow_offset_offset) as usize;
+        self.with_overflow_slice(block_idx, offset, overflow_prefix_len, |bytes| {
+            prefix.bytes[inline_len..effective_len].copy_from_slice(bytes);
+        })?;
+        Ok(prefix)
     }
 
     fn with_overflow_slice<T, F>(
@@ -1074,6 +1316,154 @@ impl BlockHandleProvider for OverflowBlockMeta {
     }
 }
 
+fn refine_equal_prefix_ranges(
+    cursor: &mut KeyCursor<'_>,
+    permutation: &mut SortPermutation,
+    prefixes: &SortPrefixes,
+) -> Result<()> {
+    if permutation.len() != prefixes.len() {
+        return Err(paro_error::internal(format!(
+            "sort prefix size mismatch: permutation={}, prefixes={}",
+            permutation.len(),
+            prefixes.len()
+        )));
+    }
+    let mut start = 0usize;
+    while start < permutation.len() {
+        let prefix = prefixes[permutation[start] as usize];
+        let mut end = start + 1;
+        while end < permutation.len() && prefixes[permutation[end] as usize] == prefix {
+            end += 1;
+        }
+        if end - start > 1 {
+            permutation.as_mut_slice()[start..end].sort_unstable_by(|left, right| {
+                cursor
+                    .compare(*left, *right)
+                    .expect("sort key comparison must succeed during radix refinement")
+            });
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+fn compare_pinned_slots(
+    store: &SortKeyStore,
+    blocks: &PinnedBlocks,
+    left: u32,
+    right: u32,
+) -> Result<Ordering> {
+    let (left_block, left_row) = store.slot_block_index(left)?;
+    let (right_block, right_row) = store.slot_block_index(right)?;
+    let left_slot = pinned_slot(
+        blocks,
+        left_block,
+        left_row * store.slot_size,
+        store.slot_size,
+    )?;
+    let right_slot = pinned_slot(
+        blocks,
+        right_block,
+        right_row * store.slot_size,
+        store.slot_size,
+    )?;
+    match compare_slot_prefixes(left_slot, right_slot, &store.encoding)? {
+        SlotComparison::Ordered(ordering) => Ok(ordering),
+        SlotComparison::Overflow { left, right } => {
+            let left_bytes = pinned_overflow_slice(blocks, left)?;
+            let right_bytes = pinned_overflow_slice(blocks, right)?;
+            Ok(compare_keys(left_bytes, right_bytes))
+        }
+    }
+}
+
+fn compare_slot_prefixes(
+    left_slot: &[u8],
+    right_slot: &[u8],
+    encoding: &SortKeyEncoding,
+) -> Result<SlotComparison> {
+    if let Some(fixed_len) = encoding.fixed_key_len() {
+        let left = left_slot.get(..fixed_len).ok_or_else(|| {
+            paro_error::internal(format!(
+                "fixed sort-key slot is too short: required={fixed_len}, actual={}",
+                left_slot.len()
+            ))
+        })?;
+        let right = right_slot.get(..fixed_len).ok_or_else(|| {
+            paro_error::internal(format!(
+                "fixed sort-key slot is too short: required={fixed_len}, actual={}",
+                right_slot.len()
+            ))
+        })?;
+        return Ok(SlotComparison::Ordered(compare_keys(left, right)));
+    }
+    let layout = VariableSlotLayout::new(encoding);
+    if left_slot.len() < layout.metadata_end() || right_slot.len() < layout.metadata_end() {
+        return Err(paro_error::internal(format!(
+            "variable sort-key slot is too short: left={}, right={}",
+            left_slot.len(),
+            right_slot.len()
+        )));
+    }
+
+    let left_total = read_u32(left_slot, layout.total_len_offset) as usize;
+    let right_total = read_u32(right_slot, layout.total_len_offset) as usize;
+    let left_inline = left_total.min(layout.inline_len);
+    let right_inline = right_total.min(layout.inline_len);
+    let shared_inline = left_inline.min(right_inline);
+    let inline_order = compare_keys(&left_slot[..shared_inline], &right_slot[..shared_inline]);
+    if inline_order != Ordering::Equal {
+        return Ok(SlotComparison::Ordered(inline_order));
+    }
+    if left_total <= layout.inline_len || right_total <= layout.inline_len {
+        return Ok(SlotComparison::Ordered(left_total.cmp(&right_total)));
+    }
+
+    Ok(SlotComparison::Overflow {
+        left: OverflowKeyRef {
+            block_idx: read_u32(left_slot, layout.overflow_block_offset) as usize,
+            offset: read_u32(left_slot, layout.overflow_offset_offset) as usize,
+            len: read_u32(left_slot, layout.overflow_len_offset) as usize,
+        },
+        right: OverflowKeyRef {
+            block_idx: read_u32(right_slot, layout.overflow_block_offset) as usize,
+            offset: read_u32(right_slot, layout.overflow_offset_offset) as usize,
+            len: read_u32(right_slot, layout.overflow_len_offset) as usize,
+        },
+    })
+}
+
+fn pinned_slot(
+    blocks: &PinnedBlocks,
+    block_idx: usize,
+    offset: usize,
+    len: usize,
+) -> Result<&[u8]> {
+    let handle = blocks
+        .slot_handles
+        .get(block_idx)
+        .and_then(|handle| handle.as_ref())
+        .ok_or_else(|| paro_error::internal("slot block was already released"))?;
+    let data = handle
+        .data()
+        .ok_or_else(|| paro_error::internal("slot block missing data"))?;
+    data.get(offset..offset.saturating_add(len))
+        .ok_or_else(|| paro_error::internal("sort-key slot range is out of bounds"))
+}
+
+fn pinned_overflow_slice(blocks: &PinnedBlocks, key: OverflowKeyRef) -> Result<&[u8]> {
+    let handle = blocks
+        .overflow_handles
+        .get(key.block_idx)
+        .and_then(|handle| handle.as_ref())
+        .ok_or_else(|| paro_error::internal("overflow block was already released"))?;
+    let data = handle
+        .data()
+        .ok_or_else(|| paro_error::internal("overflow block missing data"))?;
+    data.get(key.offset..key.offset.saturating_add(key.len))
+        .ok_or_else(|| paro_error::internal("sort-key overflow range is out of bounds"))
+}
+
 #[inline]
 fn write_u32(slot: &mut [u8], offset: usize, value: u32) {
     slot[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -1097,6 +1487,18 @@ mod tests {
         store.encode_batch(&chunk).unwrap();
         store.finish_writing();
         store
+    }
+
+    #[test]
+    fn empty_accounted_sort_buffer_exposes_valid_slices() {
+        let pool = Arc::new(BufferPool::new(32 * 1024 * 1024));
+        let memory =
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
+        let mut buffer = AccountedSortBuffer::<u32>::try_new(&memory, pool, 0).unwrap();
+
+        assert_eq!(buffer.size_in_bytes(), 0);
+        assert!(buffer.as_slice().is_empty());
+        assert!(buffer.as_mut_slice().is_empty());
     }
 
     #[test]
@@ -1157,6 +1559,43 @@ mod tests {
         assert_eq!(cursor.read_key(0).unwrap(), b"\x01bmqib\0");
         assert_eq!(cursor.compare(0, 1).unwrap(), Ordering::Less);
         assert_eq!(cursor.compare(2, 1).unwrap(), Ordering::Greater);
+    }
+
+    #[test]
+    fn prefix_permutation_refines_variable_prefix_collisions() {
+        let row_count = PREFIX_SORT_MIN_ROWS + 64;
+        let mut values = paro_common::test_utils::test_vector(LogicalType::Varchar);
+        for row_idx in 0..row_count {
+            let value = row_count - row_idx;
+            values.set_string(
+                row_idx,
+                &format!("shared-prefix-0123456789-abcdefghijklmnop-{value:04}"),
+            );
+        }
+        values.set_count(row_count);
+        let chunk = Chunk::from_arc_vectors(
+            vec![Arc::new(values)],
+            paro_common::test_utils::test_allocator(),
+        );
+        let store = build_store(chunk, vec![LogicalType::Varchar]);
+        let permutation = store.sorted_permutation().expect("radix permutation");
+        assert_eq!(permutation.len(), row_count);
+
+        let mut cursor = store.cursor_pinned().expect("pinned cursor");
+        assert_eq!(
+            cursor
+                .materialized_sort_prefix(permutation[0])
+                .expect("first prefix"),
+            cursor
+                .materialized_sort_prefix(permutation[row_count - 1])
+                .expect("last prefix")
+        );
+        for adjacent in permutation.windows(2) {
+            assert_ne!(
+                cursor.compare(adjacent[0], adjacent[1]).expect("compare"),
+                Ordering::Greater
+            );
+        }
     }
 
     #[test]

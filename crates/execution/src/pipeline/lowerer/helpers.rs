@@ -68,6 +68,7 @@ pub(crate) fn hash_join_probe_transform(
     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
         handle,
         join_type: spec.join_type,
+        anti_join_mode: spec.anti_join_mode,
         conditions: spec.conditions.clone(),
         left_projection: spec.left_projection.clone(),
         output_names: spec.output_names.clone(),

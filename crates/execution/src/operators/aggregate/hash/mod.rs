@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub(crate) mod build;
+mod distinct_finalize;
 pub(crate) mod emit;
 
 #[cfg(test)]

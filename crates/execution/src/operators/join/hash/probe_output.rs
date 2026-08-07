@@ -7,7 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
-use paro_planner::operator::join::JoinType;
+use paro_planner::operator::join::{AntiJoinMode, JoinType};
 
 use crate::join_hashtable::scan_structure::ScanStructure;
 use crate::join_hashtable::JoinHashTable;
@@ -17,6 +17,7 @@ use crate::operators::join::join_result_helpers::{
 
 pub(crate) fn scan_hash_join_results(
     join_type: JoinType,
+    anti_join_mode: AntiJoinMode,
     probe_keys: &Chunk,
     input: &Chunk,
     output: &mut Chunk,
@@ -45,9 +46,22 @@ pub(crate) fn scan_hash_join_results(
         JoinType::Semi => {
             scan_structure.next_semi_join(probe_keys, input, output, hash_table, left_projection)
         }
-        JoinType::Anti => {
-            scan_structure.next_anti_join(probe_keys, input, output, hash_table, left_projection)
-        }
+        JoinType::Anti => match anti_join_mode {
+            AntiJoinMode::Regular => scan_structure.next_anti_join(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+            ),
+            AntiJoinMode::NullAware => scan_structure.next_null_aware_anti_join(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+            ),
+        },
         JoinType::Mark => {
             scan_structure.next_mark_join(probe_keys, input, output, hash_table, left_projection)
         }

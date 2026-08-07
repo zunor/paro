@@ -14,9 +14,51 @@ use paro_common::vector::SelectionVector;
 
 use super::{
     RawRowAllocator, RawRowAppendState, RawRowChunkPart, RawRowChunkState, RawRowLayout,
-    RawRowParallelScanState, RawRowPinProperties, RawRowPinState, RawRowScanState, RawRowSegment,
-    RawRowValidityType,
+    RawRowLocation, RawRowParallelScanState, RawRowPinProperties, RawRowPinState, RawRowScanState,
+    RawRowSegment, RawRowValidityType,
 };
+
+/// Exact row pointers held stable by one raw-row pin state.
+///
+/// Addresses are stored as integers so this guard remains `Send`; consumers
+/// can move a suspended pipeline task between scheduler workers while the
+/// owned buffer handles keep every address valid.
+#[derive(Debug)]
+pub(crate) struct RawPinnedRows<'a> {
+    collection: &'a RawRowCollection,
+    row_addresses: Vec<usize>,
+    _pin_state: RawRowPinState,
+}
+
+impl RawPinnedRows<'_> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.row_addresses.len()
+    }
+
+    pub(crate) fn gather_column(
+        &self,
+        column_idx: usize,
+        output: &mut paro_common::vector::Vector,
+    ) -> paro_common::error::Result<()> {
+        // SAFETY: every address was produced by `pin_locations` and the owned
+        // pin state keeps its row and heap blocks resident for this guard's
+        // lifetime. `usize` and a data pointer have identical layout.
+        let row_pointers = unsafe {
+            std::slice::from_raw_parts(
+                self.row_addresses.as_ptr().cast::<*const u8>(),
+                self.row_addresses.len(),
+            )
+        };
+        super::gather::gather_column_from_row_locations(
+            self.collection,
+            row_pointers,
+            column_idx,
+            output,
+            row_pointers.len(),
+        )
+    }
+}
 
 /// A collection of raw row data.
 ///
@@ -208,6 +250,64 @@ impl RawRowCollection {
             }
         }
         Ok(())
+    }
+
+    /// Pin exact append-time row locations once for repeated projected gathers.
+    pub(crate) fn pin_locations(
+        &self,
+        locations: &[RawRowLocation],
+    ) -> paro_common::error::Result<RawPinnedRows<'_>> {
+        let mut pin_state = RawRowPinState::new(RawRowPinProperties::KeepEverythingPinned);
+        let mut row_addresses = Vec::with_capacity(locations.len());
+        let row_width = self.layout.get_row_width();
+        let mut pinned_part = None;
+
+        for location in locations {
+            let segment = self.segments.get(location.segment_index).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "raw row segment is out of bounds: index={}, count={}",
+                    location.segment_index,
+                    self.segments.len()
+                ))
+            })?;
+            let part = segment
+                .chunk_parts()
+                .get(location.part_index)
+                .ok_or_else(|| {
+                    paro_common::error::internal(format!(
+                        "raw row chunk part is out of bounds: segment={}, index={}, count={}",
+                        location.segment_index,
+                        location.part_index,
+                        segment.chunk_parts().len()
+                    ))
+                })?;
+            if location.row_in_part >= part.count as usize {
+                return Err(paro_common::error::internal(format!(
+                    "raw row offset is out of bounds: segment={}, part={}, row={}, count={}",
+                    location.segment_index, location.part_index, location.row_in_part, part.count
+                )));
+            }
+
+            let identity = (location.segment_index, location.part_index);
+            let base = match pinned_part {
+                Some((cached_identity, base)) if cached_identity == identity => base,
+                _ => {
+                    let base = segment.allocator().pin_chunk_part(&mut pin_state, part)?;
+                    pinned_part = Some((identity, base));
+                    base
+                }
+            };
+            // SAFETY: `row_in_part < part.count`; the chunk part owns a
+            // contiguous `part.count * row_width` range starting at `base`.
+            let row = unsafe { base.add(location.row_in_part * row_width) };
+            row_addresses.push(row as usize);
+        }
+
+        Ok(RawPinnedRows {
+            collection: self,
+            row_addresses,
+            _pin_state: pin_state,
+        })
     }
 
     /// How many rows fit per block.

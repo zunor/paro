@@ -44,3 +44,11 @@ validate = "scalar_equals"
 expected = "16.3807786264"
 collect_explain_profile = true
 allow_reexecute = true
+
+[[query]]
+id = "q16_parts_supplier_relationship"
+file = "sql/q16.sql"
+validate = "row_count"
+expected = 18314
+collect_explain_profile = true
+allow_reexecute = true

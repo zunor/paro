@@ -10,6 +10,153 @@ fn value_to_i32(value: &Value) -> Option<i32> {
     }
 }
 
+fn run_null_aware_anti_join(
+    build_rows: Vec<Vec<Expression>>,
+    probe_rows: Vec<Vec<Expression>>,
+) -> Vec<Option<i32>> {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let handle = handles.register(
+        BreakerHandleKind::HashJoinBuild,
+        RowType::new(
+            vec!["key".to_string(), "payload".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        ),
+        Default::default(),
+    );
+    let build_id = PipelineId::new(0);
+    let probe_id = PipelineId::new(1);
+    handles.set_producer(handle, build_id).unwrap();
+    handles.add_consumer(handle, probe_id).unwrap();
+
+    let graph = PipelineGraph {
+        pipelines: vec![
+            PipelineSpec {
+                id: build_id,
+                source: SourceSpec::Values(values_spec(
+                    build_rows,
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                )),
+                transforms: Vec::new(),
+                sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
+                    handle,
+                    join_type: JoinType::Anti,
+                    conditions: vec![join_condition()].into_boxed_slice(),
+                    build_projection: vec![1].into_boxed_slice(),
+                    build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    required: Default::default(),
+                    force_external: false,
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: RowType::new(
+                    vec!["key".to_string(), "payload".to_string()],
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                ),
+            },
+            PipelineSpec {
+                id: probe_id,
+                source: SourceSpec::Values(values_spec(
+                    probe_rows,
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                )),
+                transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+                    handle,
+                    join_type: JoinType::Anti,
+                    anti_join_mode: AntiJoinMode::NullAware,
+                    conditions: vec![join_condition()].into_boxed_slice(),
+                    left_projection: vec![1].into_boxed_slice(),
+                    output_names: vec!["payload".to_string()].into_boxed_slice(),
+                    output_types: vec![LogicalType::Integer].into_boxed_slice(),
+                })],
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: RowType::new(vec!["payload".to_string()], vec![LogicalType::Integer]),
+            },
+        ],
+        dependencies: vec![PipelineDependency {
+            producer: build_id,
+            consumer: probe_id,
+            kind: DependencyKind::BuildBeforeProbe,
+        }],
+        handles: handles.finish(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(probe_id),
+    };
+    let (build_runtime, probe_runtime) = runtimes_from_graph(&query, &graph);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(29),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+
+    let build_task = build_runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("build task");
+    run_to_done(
+        &mut PipelineTaskExecutor::new(build_runtime, build_task),
+        &query,
+        &thread,
+        &wake,
+        &mut profiler,
+    );
+    let probe_task = probe_runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("probe task");
+    run_to_done(
+        &mut PipelineTaskExecutor::new(probe_runtime, probe_task),
+        &query,
+        &thread,
+        &wake,
+        &mut profiler,
+    );
+
+    let mut values = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        for row_idx in 0..chunk.size() {
+            values.push(value_to_i32(&chunk.data[0].get_value(row_idx)));
+        }
+    }
+    values
+}
+
+#[test]
+fn null_aware_anti_join_preserves_not_in_three_valued_logic() {
+    let null_int = || {
+        Expression::Constant(ConstantExpression::new(
+            Value::Null(LogicalType::Integer),
+            LogicalType::Integer,
+        ))
+    };
+    let probe_rows = || {
+        vec![
+            vec![int_constant(1), int_constant(10)],
+            vec![int_constant(2), int_constant(20)],
+            vec![null_int(), int_constant(30)],
+        ]
+    };
+
+    assert_eq!(
+        run_null_aware_anti_join(vec![vec![int_constant(2), int_constant(200)]], probe_rows(),),
+        vec![Some(10)]
+    );
+    assert_eq!(
+        run_null_aware_anti_join(Vec::new(), probe_rows()),
+        vec![Some(10), Some(20), Some(30)]
+    );
+    assert!(run_null_aware_anti_join(
+        vec![
+            vec![int_constant(2), int_constant(200)],
+            vec![null_int(), int_constant(300)],
+        ],
+        probe_rows(),
+    )
+    .is_empty());
+}
+
 #[test]
 fn hash_join_output_more_yields_between_output_chunks() {
     let output = QueryOutputPort::unbounded();
@@ -70,6 +217,7 @@ fn hash_join_output_more_yields_between_output_chunks() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
@@ -227,6 +375,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: first_handle,
                         join_type: JoinType::Inner,
+                        anti_join_mode: AntiJoinMode::Regular,
                         conditions: vec![join_condition()].into_boxed_slice(),
                         left_projection: vec![0, 1].into_boxed_slice(),
                         output_names: vec!["k".into(), "probe".into(), "first".into()]
@@ -241,6 +390,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: second_handle,
                         join_type: JoinType::Inner,
+                        anti_join_mode: AntiJoinMode::Regular,
                         conditions: vec![join_condition()].into_boxed_slice(),
                         left_projection: vec![1, 2].into_boxed_slice(),
                         output_names: vec!["probe".into(), "first".into(), "second".into()]
@@ -442,6 +592,7 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: hash_handle,
                         join_type: JoinType::Inner,
+                        anti_join_mode: AntiJoinMode::Regular,
                         conditions: vec![join_condition()].into_boxed_slice(),
                         left_projection: vec![1].into_boxed_slice(),
                         output_names: vec!["nation".into(), "payload".into()].into_boxed_slice(),
@@ -778,6 +929,7 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Single,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
@@ -905,6 +1057,7 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Right,
+                    anti_join_mode: AntiJoinMode::Regular,
                     conditions: vec![join_condition()].into_boxed_slice(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),

@@ -13,7 +13,7 @@ use paro_planner::expression::{
     ConjunctionExpression, ConjunctionType, ConstantExpression, Expression, ReferenceExpression,
 };
 use paro_planner::operator::join::{
-    ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
+    AntiJoinMode, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
 };
 use paro_planner::operator::{
     Aggregate as LogicalAggregate, CTERef as LogicalCteRef, CopyTo as LogicalCopyTo,

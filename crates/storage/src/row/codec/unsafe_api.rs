@@ -1,13 +1,13 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::mem::size_of;
 use std::ptr;
 
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::vector::Vector;
 
+use super::RowHeapWriter;
 use crate::row::RowLayout;
 
 const STRING_INLINE_LENGTH: usize = 12;
@@ -30,6 +30,18 @@ pub unsafe fn clear_row_validity(row_ptr: *mut u8, col_idx: usize) {
     let current = unsafe { ptr::read(byte_ptr) };
     // SAFETY: caller guarantees `row_ptr` points at a valid row for `col_idx`.
     unsafe { ptr::write(byte_ptr, current & !(1 << bit_idx)) };
+}
+
+#[inline]
+pub unsafe fn set_row_validity(row_ptr: *mut u8, col_idx: usize) {
+    let byte_idx = col_idx / 8;
+    let bit_idx = col_idx % 8;
+    // SAFETY: caller guarantees `row_ptr` points at a valid row for `col_idx`.
+    let byte_ptr = unsafe { row_ptr.add(byte_idx) };
+    // SAFETY: caller guarantees `row_ptr` points at a valid row for `col_idx`.
+    let current = unsafe { ptr::read(byte_ptr) };
+    // SAFETY: caller guarantees `row_ptr` points at a valid row for `col_idx`.
+    unsafe { ptr::write(byte_ptr, current | (1 << bit_idx)) };
 }
 
 pub unsafe fn read_row_value(layout: &RowLayout, row_ptr: *const u8, col_idx: usize) -> Value {
@@ -159,9 +171,7 @@ pub unsafe fn write_row_value(
     row_ptr: *mut u8,
     col_idx: usize,
     value: &Value,
-    owned_bytes: &mut Vec<Box<[u8]>>,
-    owned_values: &mut Vec<Box<Value>>,
-    used_bytes: &mut usize,
+    heap: &mut impl RowHeapWriter,
 ) -> Result<()> {
     let offset = layout.offsets()[col_idx];
     // SAFETY: caller guarantees `row_ptr` is valid for this layout.
@@ -208,23 +218,14 @@ pub unsafe fn write_row_value(
                 unsafe { ptr::write_unaligned(cell_ptr as *mut i128, *value) };
             }
         }
-        Value::Varchar(v) => unsafe {
-            write_varlen_bytes(cell_ptr, v.as_bytes(), owned_bytes, used_bytes)
-        },
-        Value::Blob(v) => unsafe {
-            write_varlen_bytes(cell_ptr, v.as_slice(), owned_bytes, used_bytes)
-        },
+        Value::Varchar(v) => unsafe { write_varlen_bytes(cell_ptr, v.as_bytes(), heap)? },
+        Value::Blob(v) => unsafe { write_varlen_bytes(cell_ptr, v.as_slice(), heap)? },
         Value::List(_, _) | Value::Array(_, _, _) | Value::Struct(_, _) => {
-            let boxed = Box::new(value.clone());
-            let value_ptr = boxed.as_ref() as *const Value;
+            let value_ptr = heap.store_value(value.clone())?;
             unsafe {
                 ptr::write_bytes(cell_ptr, 0, cell_size);
                 ptr::write_unaligned(cell_ptr as *mut *const Value, value_ptr);
             }
-            *used_bytes = used_bytes
-                .saturating_add(size_of::<Value>())
-                .saturating_add(boxed.allocation_size());
-            owned_values.push(boxed);
         }
         Value::Null(_) => unreachable!("NULL is handled before write_row_value dispatch"),
     }
@@ -238,9 +239,7 @@ pub unsafe fn write_vector_value(
     col_idx: usize,
     vector: &Vector,
     row_idx: usize,
-    owned_bytes: &mut Vec<Box<[u8]>>,
-    owned_values: &mut Vec<Box<Value>>,
-    used_bytes: &mut usize,
+    heap: &mut impl RowHeapWriter,
 ) -> Result<()> {
     let offset = layout.offsets()[col_idx];
     // SAFETY: caller guarantees `row_ptr` is valid for this layout.
@@ -384,39 +383,24 @@ pub unsafe fn write_vector_value(
         | paro_common::types::LogicalType::Jsonb
         | paro_common::types::LogicalType::StringLiteral => {
             let value = vector.get_string(row_idx).unwrap_or_default();
-            unsafe { write_varlen_bytes(cell_ptr, value.as_bytes(), owned_bytes, used_bytes) };
+            unsafe { write_varlen_bytes(cell_ptr, value.as_bytes(), heap)? };
         }
         paro_common::types::LogicalType::Blob => {
             let value = vector.get_blob(row_idx).unwrap_or_default();
-            unsafe { write_varlen_bytes(cell_ptr, value, owned_bytes, used_bytes) };
+            unsafe { write_varlen_bytes(cell_ptr, value, heap)? };
         }
         paro_common::types::LogicalType::List(_)
         | paro_common::types::LogicalType::Array(_, _)
         | paro_common::types::LogicalType::Struct(_) => {
-            let boxed = Box::new(vector.get_value(row_idx));
-            let value_ptr = boxed.as_ref() as *const Value;
+            let value_ptr = heap.store_value(vector.get_value(row_idx))?;
             unsafe {
                 ptr::write_bytes(cell_ptr, 0, cell_size);
                 ptr::write_unaligned(cell_ptr as *mut *const Value, value_ptr);
             }
-            *used_bytes = used_bytes
-                .saturating_add(size_of::<Value>())
-                .saturating_add(boxed.allocation_size());
-            owned_values.push(boxed);
         }
         _ => {
             let value = vector.get_value(row_idx);
-            unsafe {
-                write_row_value(
-                    layout,
-                    row_ptr,
-                    col_idx,
-                    &value,
-                    owned_bytes,
-                    owned_values,
-                    used_bytes,
-                )
-            }?;
+            unsafe { write_row_value(layout, row_ptr, col_idx, &value, heap) }?;
         }
     }
 
@@ -426,11 +410,12 @@ pub unsafe fn write_vector_value(
 unsafe fn write_varlen_bytes(
     cell_ptr: *mut u8,
     bytes: &[u8],
-    owned_bytes: &mut Vec<Box<[u8]>>,
-    used_bytes: &mut usize,
-) {
+    heap: &mut impl RowHeapWriter,
+) -> Result<()> {
     unsafe {
-        ptr::write_unaligned(cell_ptr as *mut u32, bytes.len() as u32);
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| paro_common::error::out_of_range("row varlen value exceeds u32 length"))?;
+        ptr::write_unaligned(cell_ptr as *mut u32, len);
         if bytes.len() <= STRING_INLINE_LENGTH {
             if !bytes.is_empty() {
                 ptr::copy_nonoverlapping(bytes.as_ptr(), cell_ptr.add(4), bytes.len());
@@ -444,11 +429,9 @@ unsafe fn write_varlen_bytes(
             }
         } else {
             ptr::copy_nonoverlapping(bytes.as_ptr(), cell_ptr.add(4), 4);
-            let boxed = bytes.to_vec().into_boxed_slice();
-            let heap_ptr = boxed.as_ptr();
+            let heap_ptr = heap.store_bytes(bytes)?;
             ptr::write_unaligned(cell_ptr.add(8) as *mut *const u8, heap_ptr);
-            *used_bytes = used_bytes.saturating_add(boxed.len());
-            owned_bytes.push(boxed);
         }
     }
+    Ok(())
 }

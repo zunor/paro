@@ -218,6 +218,16 @@ fn build_operator_predicate(
     get: &Get,
 ) -> Result<Option<PredicateTree>> {
     match op.operator_type {
+        OperatorType::Like => build_like_prefix_predicate(op, get, false),
+        OperatorType::Not => {
+            let Some(Expression::Operator(child)) = op.children.first() else {
+                return Ok(None);
+            };
+            if child.operator_type != OperatorType::Like || op.children.len() != 1 {
+                return Ok(None);
+            }
+            build_like_prefix_predicate(child, get, true)
+        }
         OperatorType::IsNull | OperatorType::IsNotNull => {
             let child = match op.children.get(0) {
                 Some(child) => child,
@@ -264,6 +274,64 @@ fn build_operator_predicate(
         }
         _ => Ok(None),
     }
+}
+
+fn build_like_prefix_predicate(
+    op: &paro_planner::expression::OperatorExpression,
+    get: &Get,
+    negated: bool,
+) -> Result<Option<PredicateTree>> {
+    let [value, pattern] = op.children.as_slice() else {
+        return Ok(None);
+    };
+    let Some(col_idx) = extract_scan_column_index(value) else {
+        return Ok(None);
+    };
+    if get.column_types.get(col_idx) != Some(&LogicalType::Varchar) {
+        return Ok(None);
+    }
+    let Some(Value::Varchar(pattern)) = evaluate_bound_constant(pattern)? else {
+        return Ok(None);
+    };
+    let Some(prefix) = extract_like_prefix(&pattern) else {
+        return Ok(None);
+    };
+    let Some(column_id) = get.column_ids.get(col_idx) else {
+        return Ok(None);
+    };
+    Ok(Some(PredicateTree::leaf(Predicate::StringPrefix {
+        column_id: *column_id as u32,
+        prefix,
+        negated,
+    })))
+}
+
+/// Return the literal prefix when a LIKE pattern consists only of literal
+/// characters followed by one or more unescaped `%` wildcards.
+fn extract_like_prefix(pattern: &str) -> Option<String> {
+    let mut chars = pattern.chars();
+    let mut prefix = String::with_capacity(pattern.len());
+    let mut saw_suffix_wildcard = false;
+    while let Some(token) = chars.next() {
+        match token {
+            '\\' => {
+                let literal = chars.next().unwrap_or('\\');
+                if saw_suffix_wildcard {
+                    return None;
+                }
+                prefix.push(literal);
+            }
+            '%' => saw_suffix_wildcard = true,
+            '_' => return None,
+            literal => {
+                if saw_suffix_wildcard {
+                    return None;
+                }
+                prefix.push(literal);
+            }
+        }
+    }
+    saw_suffix_wildcard.then_some(prefix)
 }
 
 fn extract_constant_value(expr: &Expression, get: &Get, col_idx: usize) -> Result<Option<Value>> {
@@ -367,7 +435,9 @@ mod tests {
     use paro_function::scalar::cast::date_casts::{parse_date_text, varchar_to_date};
     use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
     use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
-    use paro_planner::expression::{CastExpression, ConstantExpression};
+    use paro_planner::expression::{
+        CastExpression, ConstantExpression, OperatorExpression, ReferenceExpression,
+    };
     use paro_planner::operator::Get;
 
     #[test]
@@ -489,5 +559,64 @@ mod tests {
         ));
 
         assert_eq!(evaluate_bound_constant(&expr).unwrap(), None);
+    }
+
+    fn like_expression(pattern: &str, negated: bool) -> Expression {
+        let like = Expression::Operator(OperatorExpression::new(
+            OperatorType::Like,
+            vec![
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar(pattern.to_string()),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+        if negated {
+            Expression::Operator(OperatorExpression::new_unary(
+                OperatorType::Not,
+                like,
+                LogicalType::Boolean,
+            ))
+        } else {
+            like
+        }
+    }
+
+    #[test]
+    fn literal_suffix_like_is_pushed_as_an_exact_prefix_predicate() {
+        let get = Get::new_without_table(7, vec!["type".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&like_expression("MEDIUM POLISHED%", true), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringPrefix {
+                column_id: 0,
+                prefix: "MEDIUM POLISHED".to_string(),
+                negated: true,
+            }))
+        );
+        assert_eq!(
+            build_predicate(&like_expression(r"MEDIUM\%%", false), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringPrefix {
+                column_id: 0,
+                prefix: "MEDIUM%".to_string(),
+                negated: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn non_prefix_like_remains_an_execution_predicate() {
+        let get = Get::new_without_table(7, vec!["type".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&like_expression("MEDIUM%POLISHED%", false), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&like_expression("MEDIUM_POLISHED%", false), &get).unwrap(),
+            None
+        );
     }
 }

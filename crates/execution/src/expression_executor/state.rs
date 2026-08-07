@@ -15,6 +15,7 @@ use paro_common::vector::Vector;
 use paro_function::scalar::FunctionLocalState;
 
 use super::comparison::{ComparisonFn, ComparisonSelectFn};
+use super::like_pattern::PreparedLikePattern;
 
 #[derive(Debug, Clone)]
 pub enum EvaluatedValue {
@@ -196,6 +197,7 @@ pub struct OperatorExpressionState {
     pub child_states: Vec<CompiledExpressionState>,
     pub child_results: Vec<ValueSlot>,
     pub(crate) in_list: Option<PreparedInList>,
+    pub(crate) like_pattern: Option<PreparedLikePattern>,
     pub result: ValueSlot,
     pub aux: ValueSlot,
     pub(crate) scratch: ValueSlot,

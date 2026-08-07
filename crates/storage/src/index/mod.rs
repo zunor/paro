@@ -54,6 +54,7 @@ pub mod zonemap;
 
 mod bound_index;
 mod evaluator;
+mod fixed_membership;
 mod fixed_size_allocator;
 mod fixed_size_buffer;
 mod index;
@@ -69,6 +70,8 @@ mod predicate_result;
 
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
 pub use evaluator::IndexEvaluator;
+pub use fixed_membership::FixedMembership;
+pub(crate) use fixed_membership::{FixedMembershipKind, FixedMembershipSet, FixedMembershipValue};
 pub use fixed_size_allocator::{
     FixedSizeAllocator, FixedSizeAllocatorInfo, DEFAULT_BLOCK_SIZE, VACUUM_THRESHOLD,
 };

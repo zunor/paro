@@ -25,9 +25,13 @@ use crate::runtime::state::{
     RowsetScanMorsel, RowsetSourceGlobal, RowsetSourceLocal, SourceGlobal, SourceLocal,
 };
 
-/// A scan task owns enough batches to amortize iterator initialization while
-/// exposing useful parallelism for tables stored in only one or two segments.
-const ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
+/// Bounds for scheduler-aware scan morsels.
+///
+/// Large scans retain coarse morsels so reader construction stays amortized.
+/// Smaller scans are split just far enough to occupy the query's worker set;
+/// this matters for single-segment dimension tables feeding blocking joins.
+const MIN_ROWSET_MORSEL_ROWS: u64 = 32 * 1024;
+const MAX_ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RowsetSourceExec {
@@ -129,7 +133,7 @@ impl RowsetSourceExec {
             .map(collect_predicate_columns)
             .unwrap_or_default()
             .into_boxed_slice();
-        let morsels = build_scan_morsels(&segments);
+        let morsels = build_scan_morsels(&segments, ctx.query.session.number_of_threads().max(1));
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
             table_index: self.desc.table_index,
@@ -238,22 +242,59 @@ impl RowsetSourceExec {
     }
 }
 
-fn build_scan_morsels(segments: &[(RowsetSharedPtr, SegmentSharedPtr)]) -> Box<[RowsetScanMorsel]> {
+fn build_scan_morsels(
+    segments: &[(RowsetSharedPtr, SegmentSharedPtr)],
+    parallelism: usize,
+) -> Box<[RowsetScanMorsel]> {
+    let total_rows = segments.iter().fold(0u64, |total, (_, segment)| {
+        total.saturating_add(segment.num_rows())
+    });
+    let morsel_rows = rowset_morsel_rows(total_rows, parallelism);
     segments
         .iter()
         .enumerate()
         .flat_map(|(segment_idx, (_, segment))| {
             let row_count = segment.num_rows();
             (0..row_count)
-                .step_by(ROWSET_MORSEL_ROWS as usize)
+                .step_by(morsel_rows as usize)
                 .map(move |start_ordinal| RowsetScanMorsel {
                     segment_idx,
                     start_ordinal,
-                    end_ordinal: row_count.min(start_ordinal + ROWSET_MORSEL_ROWS),
+                    end_ordinal: row_count.min(start_ordinal + morsel_rows),
                 })
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
+    let parallelism = u64::try_from(parallelism).unwrap_or(u64::MAX).max(1);
+    total_rows
+        .div_ceil(parallelism)
+        .clamp(MIN_ROWSET_MORSEL_ROWS, MAX_ROWSET_MORSEL_ROWS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn morsels_expose_workers_without_fragmenting_large_scans() {
+        assert_eq!(rowset_morsel_rows(10_000, 4), MIN_ROWSET_MORSEL_ROWS);
+        assert_eq!(rowset_morsel_rows(200_000, 4), 50_000);
+        assert_eq!(rowset_morsel_rows(800_000, 4), 200_000);
+        assert_eq!(rowset_morsel_rows(6_000_000, 4), MAX_ROWSET_MORSEL_ROWS);
+    }
+
+    #[test]
+    fn morsel_policy_handles_empty_and_single_thread_scans() {
+        assert_eq!(rowset_morsel_rows(0, 0), MIN_ROWSET_MORSEL_ROWS);
+        assert_eq!(rowset_morsel_rows(200_000, 1), 200_000);
+        assert_eq!(
+            rowset_morsel_rows(u64::MAX, usize::MAX),
+            MIN_ROWSET_MORSEL_ROWS
+        );
+    }
 }
 
 fn combine_predicates(predicates: Vec<PredicateTree>) -> Option<PredicateTree> {

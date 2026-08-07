@@ -49,6 +49,7 @@ pub use shared_sink::{
     SharedSinkCoordinator, SharedSinkMergeEvent, SharedSinkProducerIndex, SharedSinkState,
 };
 pub use sort::{
-    SortHandle, SortPendingRunsReclaimer, SortSealedState, TopNHandle, TopNRuntimeState,
+    SortHandle, SortMaterializationBuild, SortOutputState, SortPendingRunsReclaimer,
+    SortSealedState, TopNHandle, TopNRuntimeState,
 };
 pub use window::WindowHandle;
