@@ -297,12 +297,13 @@ impl JoinOrderOptimizer {
                 if matches!(join.join_type, JoinType::Semi | JoinType::Anti) =>
             {
                 if at_region_root {
-                    // A semi/anti join is not associative with surrounding
-                    // joins. At its own optimization root, keep both inputs
-                    // atomic and optimize only their orientation and join
-                    // implementation. Each input was optimized recursively
-                    // before this pass.
-                    self.add_relation_plan(ctx, bind_context, &join.left);
+                    // The preserved side remains visible after a reduction
+                    // join, so its inner-join region may be reordered around
+                    // the SEMI/ANTI edge. The non-preserved side must remain
+                    // atomic: extracting any of its relations would allow the
+                    // enumerator to move them past the reduction point, after
+                    // which their bindings no longer exist.
+                    self.extract_join_relations(ctx, bind_context, &join.left, filters, false)?;
                     self.add_relation_plan(ctx, bind_context, &join.right);
                     Self::extract_comparison_join_filters(join, filters);
                 } else {
@@ -1186,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn semi_join_optimization_keeps_inputs_atomic() {
+    fn semi_join_optimization_preserves_join_semantics() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new();
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -1280,10 +1281,47 @@ mod tests {
     }
 
     #[test]
-    fn extraction_keeps_non_associative_joins_as_atomic_relations() {
+    fn extraction_keeps_nested_non_associative_joins_as_atomic_relations() {
         assert_nested_join_is_atomic(JoinType::Left);
         assert_nested_join_is_atomic(JoinType::Semi);
         assert_nested_join_is_atomic(JoinType::Anti);
+    }
+
+    #[test]
+    fn root_semi_join_reorders_preserved_side_but_keeps_rhs_atomic() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let preserved = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ),
+        )));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Semi,
+                preserved,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 2)],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut filters = Vec::new();
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 3);
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].join_type, JoinType::Inner);
+        assert_eq!(filters[1].join_type, JoinType::Semi);
+        assert!(matches!(
+            optimizer.relation_plans[2].operator,
+            LogicalOperator::ExpressionGet(_)
+        ));
     }
 
     #[test]

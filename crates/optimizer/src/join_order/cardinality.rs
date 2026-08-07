@@ -13,8 +13,8 @@ use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::RelationStats;
 
-/// Default selectivity for SEMI/ANTI joins.
-pub const DEFAULT_SEMI_ANTI_SELECTIVITY: f64 = 5.0;
+/// Default fraction of preserved-side rows that match a SEMI/ANTI join.
+const DEFAULT_SEMI_ANTI_MATCH_FRACTION: f64 = 0.2;
 
 /// Information about the denominator calculation.
 #[derive(Debug)]
@@ -140,6 +140,12 @@ pub struct CardinalityHelper {
     pub cardinality_before_filters: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BindingCardinalityStats {
+    distinct_count: usize,
+    relation_cardinality: usize,
+}
+
 impl CardinalityHelper {
     pub fn new(cardinality_before_filters: f64) -> Self {
         Self {
@@ -157,6 +163,12 @@ impl CardinalityHelper {
 pub struct CardinalityEstimator {
     /// Statistics for equivalent relation sets.
     relation_set_stats: Vec<RelationsSetToStats>,
+    /// Distinct-count estimates before equivalence classes merge their domains.
+    ///
+    /// A semi join needs the two sides independently: the fraction of preserved
+    /// keys that can match is bounded by `right_ndv / left_ndv`. The merged
+    /// equivalence-class domain deliberately loses that directionality.
+    binding_stats: HashMap<ColumnBinding, BindingCardinalityStats>,
     /// Cached cardinalities for relation sets.
     relation_set_2_cardinality: HashMap<String, CardinalityHelper>,
     /// Set manager for creating/looking up relation sets.
@@ -204,6 +216,17 @@ impl CardinalityEstimator {
         let card_helper = CardinalityHelper::new(relation_cardinality);
         self.relation_set_2_cardinality
             .insert(set.to_string(), card_helper);
+
+        self.binding_stats
+            .extend(stats.column_distinct_count.iter().map(|(binding, count)| {
+                (
+                    *binding,
+                    BindingCardinalityStats {
+                        distinct_count: count.distinct_count,
+                        relation_cardinality: stats.cardinality,
+                    },
+                )
+            }));
 
         self.update_total_domains(set, stats);
 
@@ -540,7 +563,7 @@ impl CardinalityEstimator {
                 new_denom
             }
             JoinType::Semi | JoinType::Anti => {
-                // For SEMI/ANTI, use default selectivity
+                let output_fraction = self.semi_anti_output_fraction(filter);
                 if let (Some(ref left_rels), Some(ref filter_left)) =
                     (&left.relations, &filter.filter_info.left_set)
                 {
@@ -549,18 +572,59 @@ impl CardinalityEstimator {
                             if JoinRelationSet::is_subset(left_rels, filter_left)
                                 && JoinRelationSet::is_subset(right_rels, filter_right)
                             {
-                                return left.denom * DEFAULT_SEMI_ANTI_SELECTIVITY;
+                                return left.denom / output_fraction;
                             }
                         }
                     }
                 }
-                right.denom * DEFAULT_SEMI_ANTI_SELECTIVITY
+                right.denom / output_fraction
             }
             _ => {
                 // Cross product
                 new_denom
             }
         }
+    }
+
+    /// Estimate the output fraction of the preserved side of a SEMI/ANTI join.
+    ///
+    /// For an equality predicate, the right-hand key domain bounds how many
+    /// distinct left-hand keys can match. This is especially important for a
+    /// semi join against a selective grouped subquery: its output cardinality
+    /// already bounds its NDV, whereas a fixed selectivity discards that signal.
+    fn semi_anti_output_fraction(&self, filter: &FilterInfoWithTotalDomains) -> f64 {
+        let (matched_fraction, minimum_output_fraction) =
+            if Self::get_comparison_type(&filter.filter_info.filter) == Some(ComparisonKind::Equal)
+            {
+                filter
+                    .filter_info
+                    .left_binding
+                    .zip(filter.filter_info.right_binding)
+                    .and_then(|(left, right)| {
+                        let left = *self.binding_stats.get(&left)?;
+                        let right = *self.binding_stats.get(&right)?;
+                        (left.distinct_count > 0).then_some((
+                            (right.distinct_count as f64
+                                / left.distinct_count.max(right.distinct_count) as f64)
+                                .clamp(0.0, 1.0),
+                            1.0 / left.relation_cardinality.max(1) as f64,
+                        ))
+                    })
+                    .unwrap_or((DEFAULT_SEMI_ANTI_MATCH_FRACTION, f64::EPSILON))
+            } else {
+                (DEFAULT_SEMI_ANTI_MATCH_FRACTION, f64::EPSILON)
+            };
+
+        let output_fraction = match filter.filter_info.join_type {
+            JoinType::Semi => matched_fraction,
+            JoinType::Anti => 1.0 - matched_fraction,
+            _ => return DEFAULT_SEMI_ANTI_MATCH_FRACTION,
+        };
+
+        // Cardinality estimates participate in divisions and plan costs. Keep
+        // an empty estimate representable as a single expected row instead of
+        // introducing infinity into the denominator graph.
+        output_fraction.max(minimum_output_fraction)
     }
 
     /// Get the comparison type from an expression.
@@ -862,6 +926,32 @@ mod tests {
         Arc::new(filter)
     }
 
+    fn create_semi_anti_filter(
+        set_manager: &mut JoinRelationSetManager,
+        join_type: JoinType,
+    ) -> Arc<FilterInfo> {
+        let expr = Expression::Comparison(ComparisonExpression {
+            left: Box::new(create_column_ref(0, 0)),
+            right: Box::new(create_column_ref(1, 0)),
+            comparison_type: ComparisonType::Equal,
+        });
+        let set = set_manager.get_relation_from_vec(vec![0, 1]);
+        let left_set = set_manager.get_relation(0);
+        let right_set = set_manager.get_relation(1);
+        let mut filter = FilterInfo::new(
+            expr,
+            set,
+            0,
+            join_type,
+            paro_planner::operator::AntiJoinMode::Regular,
+        );
+        filter.set_left_set(left_set);
+        filter.set_right_set(right_set);
+        filter.set_left_binding(ColumnBinding::new(0, 0));
+        filter.set_right_binding(ColumnBinding::new(1, 0));
+        Arc::new(filter)
+    }
+
     fn create_single_column_filter(
         set_manager: &mut JoinRelationSetManager,
         table: usize,
@@ -1030,6 +1120,52 @@ mod tests {
 
         let join_set = set_manager.get_relation_from_vec(vec![0, 1]);
         assert_eq!(estimator.estimate_cardinality(&join_set), 9.0);
+    }
+
+    #[test]
+    fn semi_join_uses_the_build_side_distinct_domain() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filter = create_semi_anti_filter(&mut set_manager, JoinType::Semi);
+        estimator.init_equivalent_relations(&[filter]);
+
+        let left = set_manager.get_relation(0);
+        let mut left_stats = RelationStats::with_cardinality(1_500_000);
+        left_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(1_500_000, false)]);
+        estimator.init_cardinality_estimator_props(&left, &left_stats);
+
+        let right = set_manager.get_relation(1);
+        let mut right_stats = RelationStats::with_cardinality(735);
+        right_stats.column_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(735, false)]);
+        estimator.init_cardinality_estimator_props(&right, &right_stats);
+
+        let join_set = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(estimator.estimate_cardinality(&join_set), 735.0);
+    }
+
+    #[test]
+    fn anti_join_estimates_the_unmatched_preserved_rows() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filter = create_semi_anti_filter(&mut set_manager, JoinType::Anti);
+        estimator.init_equivalent_relations(&[filter]);
+
+        let left = set_manager.get_relation(0);
+        let mut left_stats = RelationStats::with_cardinality(1_000);
+        left_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(1_000, true)]);
+        estimator.init_cardinality_estimator_props(&left, &left_stats);
+
+        let right = set_manager.get_relation(1);
+        let mut right_stats = RelationStats::with_cardinality(100);
+        right_stats.column_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(100, true)]);
+        estimator.init_cardinality_estimator_props(&right, &right_stats);
+
+        let join_set = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(estimator.estimate_cardinality(&join_set), 900.0);
     }
 
     #[test]
