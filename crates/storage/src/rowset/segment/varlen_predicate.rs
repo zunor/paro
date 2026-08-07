@@ -60,6 +60,12 @@ impl VarlenConjunction {
         }
     }
 
+    pub(super) fn from_range(lower: &[u8], upper: &[u8]) -> Self {
+        let mut conjunction = Self::new(ComparisonOperator::GreaterThanOrEqual, lower);
+        conjunction.add(ComparisonOperator::LessThanOrEqual, upper.into());
+        conjunction
+    }
+
     pub(super) fn from_prefix(prefix: &[u8], negated: bool) -> Self {
         let mut conjunction = Self::empty();
         conjunction.add_prefix(prefix.into(), negated);

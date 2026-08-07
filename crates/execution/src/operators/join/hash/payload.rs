@@ -32,11 +32,7 @@ pub(crate) fn build_payload_chunk_ref<'a>(
         return Ok(payload);
     }
 
-    let projected_len = if projection.is_empty() {
-        input.column_count()
-    } else {
-        projection.len()
-    };
+    let projected_len = projection.len();
     if projected_len != output_types.len() {
         return Err(paro_error::internal(format!(
             "hash join build payload projection has {projected_len} columns but {} types",
@@ -44,13 +40,12 @@ pub(crate) fn build_payload_chunk_ref<'a>(
         )));
     }
 
-    let identity_projection = projection.is_empty()
-        || (projection.len() == input.column_count()
-            && projection
-                .iter()
-                .copied()
-                .enumerate()
-                .all(|(output_idx, input_idx)| output_idx == input_idx));
+    let identity_projection = projection.len() == input.column_count()
+        && projection
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(output_idx, input_idx)| output_idx == input_idx);
     if identity_projection {
         return Ok(input);
     }
@@ -99,12 +94,12 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_empty_projection_reuses_input_columns_without_projection_vec() {
+    fn build_payload_identity_projection_reuses_input_columns() {
         let input = input_chunk();
         let mut slot = None;
         let payload = build_payload_chunk_ref(
             &input,
-            &[],
+            &[0, 1],
             &[LogicalType::Integer, LogicalType::Integer],
             &mut slot,
         )

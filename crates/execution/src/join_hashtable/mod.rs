@@ -4,8 +4,8 @@
 //! Hash table primitives used by join operators.
 
 mod build_store;
-mod dense_index;
 pub(crate) mod hash_kernel;
+mod integer_index;
 
 pub mod ht_entry;
 pub mod scan_structure;

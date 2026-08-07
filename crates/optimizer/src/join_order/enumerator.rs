@@ -6,6 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use paro_common::logging::targets;
+use tracing::debug;
+
 use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinPredicateSet};
 use crate::join_order::query_graph::{NeighborInfo, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
@@ -78,12 +81,28 @@ impl<'a> PlanEnumerator<'a> {
             }
             let total_set = self.set_manager.get_relation_from_set(&all_relations);
 
-            if self.plans.contains_key(&total_set.to_string()) {
+            if let Some(final_plan) = self.plans.get(&total_set.to_string()) {
+                debug!(
+                    target: targets::OPTIMIZER,
+                    relations = self.num_relations,
+                    pairs = self.pairs,
+                    left = %final_plan.left_set,
+                    right = %final_plan.right_set,
+                    cardinality = final_plan.cardinality,
+                    cost = final_plan.cost,
+                    "Completed exact join-order enumeration"
+                );
                 return true;
             }
         }
 
         // Fall back to approximate algorithm
+        debug!(
+            target: targets::OPTIMIZER,
+            relations = self.num_relations,
+            exact_pairs = self.pairs,
+            "Falling back to greedy join-order enumeration"
+        );
         self.solve_join_order_approximately();
         true
     }

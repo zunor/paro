@@ -196,16 +196,8 @@ impl PhysicalPlanGenerator {
         }
         let left = self.generate_node(any.left.as_ref())?;
         let right = self.generate_node(any.right.as_ref())?;
-        let left_projection = if any.left_projection_map.is_empty() {
-            (0..any.left.types().len()).collect()
-        } else {
-            any.left_projection_map.clone()
-        };
-        let right_projection = if any.right_projection_map.is_empty() {
-            (0..any.right.types().len()).collect()
-        } else {
-            any.right_projection_map.clone()
-        };
+        let left_projection = any.left_projection_map.clone();
+        let right_projection = any.right_projection_map.clone();
         let left_names =
             project_by_index(&any.left.output_names(), &left_projection, "any join left")?;
         let left_types = project_by_index(&any.left.types(), &left_projection, "any join left")?;

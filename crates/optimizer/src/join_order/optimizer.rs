@@ -197,6 +197,7 @@ impl JoinOrderOptimizer {
             return Ok(None);
         };
         let filter_infos = extracted_predicates.graph_filters;
+        self.apply_relation_local_selectivity(&filter_infos);
         self.filter_infos = filter_infos.clone();
 
         // Initialize cardinality estimator
@@ -281,6 +282,44 @@ impl JoinOrderOptimizer {
             reconstructed,
             extracted_predicates.root_filters,
         )))
+    }
+
+    /// Fold relation-local predicates into the leaf statistics consumed by DP.
+    ///
+    /// Filter extraction deliberately separates predicates from their scans so
+    /// they can be reattached to the reconstructed tree. Without this step the
+    /// enumerator still costs every filtered scan at its base-table cardinality,
+    /// hiding selective date/range predicates from join ordering.
+    fn apply_relation_local_selectivity(&mut self, filters: &[Arc<FilterInfo>]) {
+        let mut filters_by_relation = HashMap::<usize, Vec<Expression>>::new();
+        for filter in filters {
+            if filter.join_type == JoinType::Inner && filter.set.count() == 1 {
+                filters_by_relation
+                    .entry(filter.set.relations()[0])
+                    .or_default()
+                    .push(filter.filter.clone());
+            }
+        }
+
+        let cost_model = LogicalCostModel::default();
+        for (relation_id, expressions) in filters_by_relation {
+            let Some(relation) = self.relation_manager.get_relation_mut(relation_id) else {
+                continue;
+            };
+            let estimate = cost_model.estimate_filter_cardinality(
+                relation.stats.cardinality as u64,
+                &expressions,
+                &self.column_stats,
+            );
+            relation.stats.cardinality = estimate.expected.max(1) as usize;
+            for distinct in relation.stats.column_distinct_count.values_mut() {
+                if distinct.from_hll {
+                    distinct.distinct_count = distinct
+                        .distinct_count
+                        .min(relation.stats.cardinality.max(1));
+                }
+            }
+        }
     }
 
     /// Extract relations and filters from a join tree.

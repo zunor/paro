@@ -394,9 +394,10 @@ impl BuildBlock {
 
         let row_idx = self.row_count;
         let row_ptr = self.row_ptr_mut(row_idx);
-        unsafe {
-            ptr::write_bytes(row_ptr, 0, self.row_width);
-        }
+        // Build blocks are zero-initialized once and row slots are append-only.
+        // PreparedRowScatter initializes every logical field and the code below
+        // initializes all join metadata, so clearing the fresh slot again here
+        // only duplicates an O(row_width) write for every build row.
 
         write_row(row_ptr, heap)?;
 
@@ -700,13 +701,20 @@ impl HashBuildStore {
         H: Fn(usize, usize) -> Result<u64>,
         F: Fn(usize, usize) -> bool,
     {
-        let mut row_usage = Vec::with_capacity(output_count);
-        let mut total_usage = RowHeapUsage::default();
-        for output_idx in 0..output_count {
-            let usage = source.heap_usage(source_row_at(output_idx))?;
-            total_usage = total_usage.checked_add(usage)?;
-            row_usage.push(usage);
-        }
+        let (row_usage, total_usage) = if source.has_heap_values() {
+            let mut row_usage = Vec::with_capacity(output_count);
+            let mut total_usage = RowHeapUsage::default();
+            for output_idx in 0..output_count {
+                let usage = source.heap_usage(source_row_at(output_idx))?;
+                total_usage = total_usage.checked_add(usage)?;
+                row_usage.push(usage);
+            }
+            (Some(row_usage), total_usage)
+        } else {
+            // Fixed-width rows own no external data. Avoid a redundant pass
+            // over every row merely to rediscover zero heap usage.
+            (None, RowHeapUsage::default())
+        };
 
         let byte_buffer = if total_usage.varlen_bytes() == 0 {
             None
@@ -732,7 +740,9 @@ impl HashBuildStore {
             (|| {
                 for output_idx in 0..output_count {
                     let source_row_idx = source_row_at(output_idx);
-                    let usage = row_usage[output_idx];
+                    let usage = row_usage
+                        .as_ref()
+                        .map_or(RowHeapUsage::default(), |usage| usage[output_idx]);
                     let row_heap_bytes = usage
                         .varlen_bytes()
                         .checked_add(usage.nested_value_bytes())

@@ -239,7 +239,8 @@ fn join_build_finalize_publishes_exact_runtime_filter() {
 #[test]
 fn oversized_join_runtime_filter_falls_back_to_min_max() {
     let allocator = test_allocator();
-    let value_count = HASH_JOIN_RUNTIME_FILTER_MAX_VALUES + 1;
+    let exact_value_limit = 3;
+    let value_count = exact_value_limit + 1;
     let mut values = test_vector_with_capacity(LogicalType::Integer, value_count);
     for value in 0..value_count {
         values.set_i32(value, value as i32);
@@ -247,7 +248,10 @@ fn oversized_join_runtime_filter_falls_back_to_min_max() {
     values.set_count(value_count);
     let keys = Chunk::from_arc_vectors(vec![Arc::new(values)], allocator.clone());
     let selection = SelectionVector::try_incremental(value_count, allocator).unwrap();
-    let mut sketch = JoinRuntimeFilterSketch::empty(&[LogicalType::Integer]);
+    let mut sketch = JoinRuntimeFilterSketch::empty_with_exact_value_limit(
+        &[LogicalType::Integer],
+        exact_value_limit,
+    );
     sketch
         .add_key_chunk(&keys, &selection, value_count)
         .expect("update oversized runtime filter sketch");
@@ -258,7 +262,7 @@ fn oversized_join_runtime_filter_falls_back_to_min_max() {
         PredicateTree::leaf(Predicate::Range {
             column_id: 7,
             lower: Value::Integer(0),
-            upper: Value::Integer(HASH_JOIN_RUNTIME_FILTER_MAX_VALUES as i32),
+            upper: Value::Integer(exact_value_limit as i32),
         })
     );
 }

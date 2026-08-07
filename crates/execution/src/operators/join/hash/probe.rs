@@ -168,7 +168,6 @@ impl HashJoinProbeTransformExec {
                 self.join_type,
                 input,
                 &self.left_projection,
-                &[],
                 &self.output_types,
                 output,
             )?;
@@ -228,7 +227,6 @@ impl HashJoinProbeTransformExec {
                     &hash_table,
                     scan_structure,
                     &self.left_projection,
-                    &[],
                 )?;
                 (count, scan_structure.finished)
             };

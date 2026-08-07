@@ -18,14 +18,31 @@ use paro_common::hash::ExecutionHashBuilder;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, SelectionVector, Vector};
-use paro_storage::index::{ColumnId, FixedMembership, Predicate, PredicateTree};
+use paro_storage::index::{
+    ColumnId, FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateTree,
+};
 
-/// Maximum number of build-side values retained for an exact runtime filter.
+/// Bounded construction policy for analytical join filters.
 ///
-/// Beyond this bound the domain retains only min/max. This avoids duplicating
-/// an unbounded fraction of a join table while preserving exact filters for
-/// selective dimensions.
-pub(crate) const HASH_JOIN_RUNTIME_FILTER_MAX_VALUES: usize = 32 * 1024;
+/// The mutable domain is capped independently from its frozen representation.
+/// A frozen dense set can spend up to 8 MiB and at most 256 bits per retained
+/// value, which covers fact-table key domains without allowing sparse endpoint
+/// ranges to dictate allocation size. Domains beyond the exact-value budget
+/// retain min/max only.
+#[derive(Debug, Clone, Copy)]
+struct JoinRuntimeFilterPolicy {
+    max_exact_values: usize,
+    membership: FixedMembershipBuildPolicy,
+}
+
+impl Default for JoinRuntimeFilterPolicy {
+    fn default() -> Self {
+        Self {
+            max_exact_values: 512 * 1024,
+            membership: FixedMembershipBuildPolicy::new(64 * 1024 * 1024, 256),
+        }
+    }
+}
 
 type ExecutionHashSet<T> = HashSet<T, ExecutionHashBuilder>;
 
@@ -44,18 +61,18 @@ where
         Self::Mutable(ExecutionHashSet::with_hasher(ExecutionHashBuilder))
     }
 
-    fn insert(&mut self, value: T) {
+    fn insert(&mut self, value: T, max_values: usize) {
         let Self::Mutable(values) = self else {
             return;
         };
-        if values.len() == HASH_JOIN_RUNTIME_FILTER_MAX_VALUES && !values.contains(&value) {
+        if values.len() == max_values && !values.contains(&value) {
             *self = Self::Disabled;
             return;
         }
         values.insert(value);
     }
 
-    fn merge(&mut self, incoming: Self) {
+    fn merge(&mut self, incoming: Self, max_values: usize) {
         match incoming {
             Self::Disabled => *self = Self::Disabled,
             Self::Frozen(_) => {
@@ -70,9 +87,7 @@ where
                     std::mem::swap(values, &mut incoming);
                 }
                 for value in incoming {
-                    if values.len() == HASH_JOIN_RUNTIME_FILTER_MAX_VALUES
-                        && !values.contains(&value)
-                    {
+                    if values.len() == max_values && !values.contains(&value) {
                         *self = Self::Disabled;
                         return;
                     }
@@ -102,17 +117,19 @@ struct ExactDomain<T> {
     min: Option<T>,
     max: Option<T>,
     values: ExactValues<T>,
+    policy: JoinRuntimeFilterPolicy,
 }
 
 impl<T> ExactDomain<T>
 where
     T: Copy + Eq + Hash + Ord,
 {
-    fn new() -> Self {
+    fn new(policy: JoinRuntimeFilterPolicy) -> Self {
         Self {
             min: None,
             max: None,
             values: ExactValues::mutable(),
+            policy,
         }
     }
 
@@ -120,7 +137,7 @@ where
     fn add(&mut self, value: T) {
         self.min = Some(self.min.map_or(value, |current| current.min(value)));
         self.max = Some(self.max.map_or(value, |current| current.max(value)));
-        self.values.insert(value);
+        self.values.insert(value, self.policy.max_exact_values);
     }
 
     fn merge(&mut self, incoming: Self) {
@@ -130,11 +147,20 @@ where
         if let Some(value) = incoming.max {
             self.max = Some(self.max.map_or(value, |current| current.max(value)));
         }
-        self.values.merge(incoming.values);
+        debug_assert_eq!(
+            self.policy.max_exact_values, incoming.policy.max_exact_values,
+            "runtime filter policies must match across local sketches"
+        );
+        self.values
+            .merge(incoming.values, self.policy.max_exact_values);
     }
 
-    fn freeze_with(&mut self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) {
-        self.values.freeze_with(freeze);
+    fn freeze_with(
+        &mut self,
+        freeze: impl FnOnce(Vec<T>, FixedMembershipBuildPolicy) -> FixedMembership,
+    ) {
+        let membership = self.policy.membership;
+        self.values.freeze_with(|values| freeze(values, membership));
     }
 }
 
@@ -241,23 +267,23 @@ enum RuntimeFilterDomain {
 }
 
 impl RuntimeFilterDomain {
-    fn for_type(logical_type: &LogicalType) -> Self {
+    fn for_type(logical_type: &LogicalType, policy: JoinRuntimeFilterPolicy) -> Self {
         match logical_type {
-            LogicalType::Integer | LogicalType::Date => Self::I32(ExactDomain::new()),
+            LogicalType::Integer | LogicalType::Date => Self::I32(ExactDomain::new(policy)),
             LogicalType::BigInt
             | LogicalType::Decimal {
                 precision: 0..=18, ..
-            } => Self::I64(ExactDomain::new()),
-            LogicalType::Decimal { .. } => Self::I128(ExactDomain::new()),
+            } => Self::I64(ExactDomain::new(policy)),
+            LogicalType::Decimal { .. } => Self::I128(ExactDomain::new(policy)),
             _ => Self::Generic(GenericDomain::new()),
         }
     }
 
     fn freeze(&mut self) {
         match self {
-            Self::I32(domain) => domain.freeze_with(FixedMembership::i32),
-            Self::I64(domain) => domain.freeze_with(FixedMembership::i64),
-            Self::I128(domain) => domain.freeze_with(FixedMembership::i128),
+            Self::I32(domain) => domain.freeze_with(FixedMembership::i32_with_policy),
+            Self::I64(domain) => domain.freeze_with(FixedMembership::i64_with_policy),
+            Self::I128(domain) => domain.freeze_with(FixedMembership::i128_with_policy),
             Self::Generic(_) => {}
         }
     }
@@ -271,15 +297,33 @@ pub struct JoinRuntimeFilterSketch {
 
 impl JoinRuntimeFilterSketch {
     pub fn empty(key_types: &[LogicalType]) -> Self {
+        Self::empty_with_policy(key_types, JoinRuntimeFilterPolicy::default())
+    }
+
+    fn empty_with_policy(key_types: &[LogicalType], policy: JoinRuntimeFilterPolicy) -> Self {
         Self {
             row_count: 0,
             keys: key_types
                 .iter()
                 .cloned()
-                .map(JoinRuntimeFilterKeySketch::new)
+                .map(|logical_type| JoinRuntimeFilterKeySketch::new(logical_type, policy))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_with_exact_value_limit(
+        key_types: &[LogicalType],
+        max_exact_values: usize,
+    ) -> Self {
+        Self::empty_with_policy(
+            key_types,
+            JoinRuntimeFilterPolicy {
+                max_exact_values,
+                ..JoinRuntimeFilterPolicy::default()
+            },
+        )
     }
 
     pub fn add_key_chunk(
@@ -352,9 +396,9 @@ pub struct JoinRuntimeFilterKeySketch {
 }
 
 impl JoinRuntimeFilterKeySketch {
-    fn new(logical_type: LogicalType) -> Self {
+    fn new(logical_type: LogicalType, policy: JoinRuntimeFilterPolicy) -> Self {
         Self {
-            domain: RuntimeFilterDomain::for_type(&logical_type),
+            domain: RuntimeFilterDomain::for_type(&logical_type, policy),
             logical_type,
             non_null_count: 0,
             has_null: false,
@@ -555,6 +599,13 @@ fn exact_or_range_predicate<T: Copy + Eq + Hash + Ord>(
             return Some(Predicate::Eq {
                 column_id,
                 value: to_value(min),
+            });
+        }
+        if values.is_contiguous() {
+            return Some(Predicate::Range {
+                column_id,
+                lower: to_value(min),
+                upper: to_value(max),
             });
         }
         return Some(Predicate::FixedIn {

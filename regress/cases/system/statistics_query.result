@@ -49,7 +49,7 @@ PROJECTION  (rows=1)
     Join Type: INNER
     Join Condition: #0 = #0
     Cardinality: [5, 5, 5]
-    Output Schema: id INTEGER, payload VARCHAR, id INTEGER
+    Output Schema: payload VARCHAR, id INTEGER
     ->  ROWSET_SCAN on public.stats_big b
       Columns: id, payload
       Pushed Predicate: col#0 <= 1 AND col#0 = 1

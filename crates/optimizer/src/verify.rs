@@ -113,6 +113,10 @@ impl Verifier {
                         )));
                     }
                 }
+                let child_bindings = proj.child.get_column_bindings();
+                for expression in &proj.expressions {
+                    self.verify_expression_bindings(expression, &child_bindings, "Projection")?;
+                }
             }
             LogicalOperator::Filter(filter) => {
                 let child_bindings = filter.child.get_column_bindings();
@@ -147,6 +151,10 @@ impl Verifier {
                             idx, agg.returned_types[idx]
                         )));
                     }
+                }
+                let child_bindings = agg.child.get_column_bindings();
+                for expression in agg.groups.iter().chain(agg.aggregates.iter()) {
+                    self.verify_expression_bindings(expression, &child_bindings, "Aggregate")?;
                 }
             }
             LogicalOperator::Join(join) => {

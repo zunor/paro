@@ -32,8 +32,6 @@ use super::registry::BreakerHandleMetadata;
 #[path = "join_runtime_filter.rs"]
 mod runtime_filter;
 pub use runtime_filter::JoinRuntimeFilterSketch;
-#[cfg(test)]
-use runtime_filter::HASH_JOIN_RUNTIME_FILTER_MAX_VALUES;
 
 pub const HASH_JOIN_SPILL_MIN_RADIX_BITS: usize = 1;
 pub const HASH_JOIN_SPILL_MAX_RADIX_BITS: usize = 12;

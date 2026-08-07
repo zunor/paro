@@ -112,7 +112,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
         mut residual_filter: F,
     ) -> Result<usize>
     where
@@ -181,14 +180,7 @@ impl ScanStructure {
         }
 
         if base_count > 0 {
-            self.gather_result(
-                left,
-                result,
-                base_count,
-                hash_table,
-                left_projection_map,
-                right_projection_map,
-            )?;
+            self.gather_result(left, result, base_count, hash_table, left_projection_map)?;
         } else {
             result.set_cardinality(0);
         }
@@ -398,20 +390,6 @@ impl ScanStructure {
             output_sel.set(i, i);
         }
         Ok(match_count)
-    }
-
-    fn projected_build_types(
-        hash_table: &JoinHashTable,
-        right_projection_map: &[usize],
-    ) -> Vec<LogicalType> {
-        if right_projection_map.is_empty() {
-            hash_table.build_types.clone()
-        } else {
-            right_projection_map
-                .iter()
-                .filter_map(|&idx| hash_table.build_types.get(idx).cloned())
-                .collect()
-        }
     }
 
     fn probe_row_has_null(
@@ -674,7 +652,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
     ) -> Result<usize> {
         self.next_inner_join_impl(
             keys,
@@ -682,7 +659,6 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
-            right_projection_map,
             |_, _, match_count, output_sel| {
                 for i in 0..match_count {
                     output_sel.set(i, i);
@@ -700,7 +676,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
         residual_filter: F,
     ) -> Result<usize>
     where
@@ -712,7 +687,6 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
-            right_projection_map,
             residual_filter,
         )
     }
@@ -724,7 +698,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
     ) -> Result<usize> {
         self.next_left_join_with_filter(
             keys,
@@ -732,7 +705,6 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
-            right_projection_map,
             Self::accept_all_matches,
         )
     }
@@ -744,7 +716,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
         mut residual_filter: F,
     ) -> Result<usize>
     where
@@ -791,14 +762,7 @@ impl ScanStructure {
         }
 
         if base_count > 0 {
-            self.gather_result(
-                left,
-                result,
-                base_count,
-                hash_table,
-                left_projection_map,
-                right_projection_map,
-            )?;
+            self.gather_result(left, result, base_count, hash_table, left_projection_map)?;
             return Ok(base_count);
         }
 
@@ -816,14 +780,12 @@ impl ScanStructure {
         if unmatched_count == 0 {
             result.set_cardinality(0);
         } else {
-            let projected_right_types =
-                Self::projected_build_types(hash_table, right_projection_map);
             construct_left_outer_result(
                 left,
                 &self.scratch_sel,
                 unmatched_count,
                 left_projection_map,
-                &projected_right_types,
+                &hash_table.build_types,
                 result,
             )?;
         }
@@ -977,7 +939,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
     ) -> Result<usize> {
         self.next_single_join_with_filter(
             keys,
@@ -985,7 +946,6 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
-            right_projection_map,
             Self::accept_all_matches,
         )
     }
@@ -997,7 +957,6 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
         mut residual_filter: F,
     ) -> Result<usize>
     where
@@ -1043,16 +1002,7 @@ impl ScanStructure {
         for output_idx in 0..emit_count {
             left_sel.set(output_idx, self.probe_output_offset + output_idx);
         }
-        let left_indices: Vec<usize> = if left_projection_map.is_empty() {
-            (0..left.column_count()).collect()
-        } else {
-            left_projection_map.to_vec()
-        };
-        let right_indices: Vec<usize> = if right_projection_map.is_empty() {
-            (0..hash_table.build_types.len()).collect()
-        } else {
-            right_projection_map.to_vec()
-        };
+        let left_indices = left_projection_map.to_vec();
 
         for (out_idx, left_idx) in left_indices.iter().enumerate() {
             result.data[out_idx] = Arc::new(Vector::try_dictionary(
@@ -1062,15 +1012,15 @@ impl ScanStructure {
         }
 
         let right_offset = left_indices.len();
-        for (out_idx, build_idx) in right_indices.iter().enumerate() {
+        for build_idx in 0..hash_table.build_types.len() {
             let vector = result
-                .column_mut(right_offset + out_idx)
+                .column_mut(right_offset + build_idx)
                 .expect("single join output vector must exist");
             let start = self.probe_output_offset;
             let row_ptrs = &self.single_match_pointers[start..start + emit_count];
             // SAFETY: match pointers are either zero for an unmatched probe row
             // or were obtained from `hash_table` while probing it.
-            unsafe { hash_table.gather_build_column(row_ptrs, *build_idx, vector)? };
+            unsafe { hash_table.gather_build_column(row_ptrs, build_idx, vector)? };
         }
 
         result.set_cardinality(emit_count);
@@ -1113,27 +1063,13 @@ impl ScanStructure {
         count: usize,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
-        right_projection_map: &[usize],
     ) -> Result<()> {
-        let left_indices: Vec<usize> = if left_projection_map.is_empty() {
-            (0..left.column_count()).collect()
-        } else {
-            left_projection_map.to_vec()
-        };
-        let right_indices: Vec<usize> = if right_projection_map.is_empty() {
-            (0..hash_table.build_types.len()).collect()
-        } else {
-            right_projection_map.to_vec()
-        };
+        let left_indices = left_projection_map.to_vec();
         let mut expected_types = left_indices
             .iter()
             .map(|left_idx| left.data[*left_idx].logical_type().clone())
             .collect::<Vec<_>>();
-        expected_types.extend(
-            right_indices
-                .iter()
-                .filter_map(|build_idx| hash_table.build_types.get(*build_idx).cloned()),
-        );
+        expected_types.extend(hash_table.build_types.iter().cloned());
         if result.column_count() != expected_types.len()
             || result.capacity() < count
             || result.types() != expected_types
@@ -1162,14 +1098,8 @@ impl ScanStructure {
         // 2. Gather projected RHS columns
         let right_result_offset = left_indices.len();
         let unique_rhs_count = self.prepare_rhs_dictionary(count)?;
-        for (out_idx, build_idx) in right_indices.iter().enumerate() {
-            let output_idx = right_result_offset + out_idx;
-            let build_type = hash_table.build_types.get(*build_idx).ok_or_else(|| {
-                paro_common::error::internal(format!(
-                    "join build projection index out of bounds: index={build_idx}, columns={}",
-                    hash_table.build_types.len()
-                ))
-            })?;
+        for (build_idx, build_type) in hash_table.build_types.iter().enumerate() {
+            let output_idx = right_result_offset + build_idx;
             let use_dictionary = unique_rhs_count < count
                 && dictionary_gather_is_smaller(build_type, count, unique_rhs_count);
             let row_ptrs = if use_dictionary {
@@ -1182,7 +1112,7 @@ impl ScanStructure {
                 .expect("join output vector must exist");
             // SAFETY: these row pointers were obtained from `hash_table` while
             // resolving the current probe matches.
-            unsafe { hash_table.gather_build_column(row_ptrs, *build_idx, output)? };
+            unsafe { hash_table.gather_build_column(row_ptrs, build_idx, output)? };
             if use_dictionary {
                 let child = Arc::clone(&result.data[output_idx]);
                 result.data[output_idx] = Arc::new(Vector::try_dictionary(

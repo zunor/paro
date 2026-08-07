@@ -185,6 +185,35 @@ impl<'a> RemoveUnusedColumns<'a> {
         get.returned_types = new_column_types;
         get.names = new_names;
     }
+
+    fn projected_bindings(plan: &LogicalPlan, projection: &[usize]) -> Vec<ColumnBinding> {
+        let bindings = plan.get_column_bindings();
+        projection
+            .iter()
+            .filter_map(|index| bindings.get(*index).copied())
+            .collect()
+    }
+
+    fn remap_bindings(bindings: &mut [ColumnBinding], replacements: &[ReplacementBinding]) {
+        for replacement in replacements {
+            for binding in bindings.iter_mut() {
+                if *binding == replacement.old_binding {
+                    *binding = replacement.new_binding;
+                }
+            }
+        }
+    }
+
+    fn rebuild_projection_map(
+        plan: &LogicalPlan,
+        projected_bindings: &[ColumnBinding],
+    ) -> Vec<usize> {
+        plan.get_column_bindings()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, binding)| projected_bindings.contains(&binding).then_some(index))
+            .collect()
+    }
 }
 
 impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
@@ -354,6 +383,21 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 // Copy parent's column references
                 child_optimizer.column_references = std::mem::take(&mut self.column_references);
 
+                // Projection maps are positional, while child pruning below
+                // may compact either input. Preserve their binding identity so
+                // the maps can be rebuilt against the final child layouts.
+                let (mut projected_left_bindings, mut projected_right_bindings) = match join {
+                    paro_planner::operator::Join::Comparison(join) => (
+                        Self::projected_bindings(join.left.as_ref(), &join.left_projection_map),
+                        Self::projected_bindings(join.right.as_ref(), &join.right_projection_map),
+                    ),
+                    paro_planner::operator::Join::Any(join) => (
+                        Self::projected_bindings(join.left.as_ref(), &join.left_projection_map),
+                        Self::projected_bindings(join.right.as_ref(), &join.right_projection_map),
+                    ),
+                    paro_planner::operator::Join::Cross(_) => (Vec::new(), Vec::new()),
+                };
+
                 // For INNER JOIN with equality predicates, we can optimize:
                 // Replace references to RHS with references to LHS to reduce columns extracted from hash table
                 if let paro_planner::operator::Join::Comparison(cj) = join {
@@ -440,6 +484,31 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 for replacement in &right_optimizer.replacements {
                     right_optimizer
                         .replace_binding(replacement.old_binding, replacement.new_binding);
+                }
+                Self::remap_bindings(&mut projected_left_bindings, &left_optimizer.replacements);
+                Self::remap_bindings(&mut projected_right_bindings, &right_optimizer.replacements);
+                match join {
+                    paro_planner::operator::Join::Comparison(join) => {
+                        join.left_projection_map = Self::rebuild_projection_map(
+                            join.left.as_ref(),
+                            &projected_left_bindings,
+                        );
+                        join.right_projection_map = Self::rebuild_projection_map(
+                            join.right.as_ref(),
+                            &projected_right_bindings,
+                        );
+                    }
+                    paro_planner::operator::Join::Any(join) => {
+                        join.left_projection_map = Self::rebuild_projection_map(
+                            join.left.as_ref(),
+                            &projected_left_bindings,
+                        );
+                        join.right_projection_map = Self::rebuild_projection_map(
+                            join.right.as_ref(),
+                            &projected_right_bindings,
+                        );
+                    }
+                    paro_planner::operator::Join::Cross(_) => {}
                 }
                 // After replacing bindings, we may have duplicate conditions
                 if let paro_planner::operator::Join::Comparison(cj) = join {

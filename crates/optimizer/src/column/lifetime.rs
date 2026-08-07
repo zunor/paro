@@ -139,6 +139,11 @@ impl ColumnLifetimeAnalyzer {
     fn optimize_join(&mut self, join: Join) -> Result<LogicalOperator> {
         match join {
             Join::Comparison(mut comp_join) => {
+                // Projection maps describe values visible above the join. Join
+                // conditions are execution requirements, not output demands:
+                // mixing the two keeps dead key columns alive through every
+                // downstream join in a chain.
+                let output_references = self.column_references.clone();
                 for condition in &comp_join.conditions {
                     self.visit_expression(&condition.left);
                     self.visit_expression(&condition.right);
@@ -166,18 +171,16 @@ impl ColumnLifetimeAnalyzer {
                 if comp_join.duplicate_eliminated_columns.is_empty()
                     && !self.has_unknown_references(&known_bindings)
                 {
-                    let left_unused = self.extract_unused_column_bindings(&left_bindings);
-                    let right_unused = self.extract_unused_column_bindings(&right_bindings);
-
                     comp_join.left_projection_map =
-                        Self::generate_projection_map_from_unused(&left_bindings, &left_unused);
+                        self.generate_exact_projection_map(&left_bindings, &output_references);
                     comp_join.right_projection_map =
-                        Self::generate_projection_map_from_unused(&right_bindings, &right_unused);
+                        self.generate_exact_projection_map(&right_bindings, &output_references);
                 }
 
                 Ok(LogicalOperator::Join(Join::Comparison(comp_join)))
             }
             Join::Any(mut any_join) => {
+                let output_references = self.column_references.clone();
                 self.visit_expression(&any_join.condition);
 
                 let left = *any_join.left;
@@ -192,19 +195,12 @@ impl ColumnLifetimeAnalyzer {
                 known_bindings.extend(left_bindings.iter().copied());
                 known_bindings.extend(right_bindings.iter().copied());
 
-                let (left_unused, right_unused) = if self.has_unknown_references(&known_bindings) {
-                    (HashSet::new(), HashSet::new())
-                } else {
-                    (
-                        self.extract_unused_column_bindings(&left_bindings),
-                        self.extract_unused_column_bindings(&right_bindings),
-                    )
-                };
-
-                any_join.left_projection_map =
-                    Self::generate_projection_map_from_unused(&left_bindings, &left_unused);
-                any_join.right_projection_map =
-                    Self::generate_projection_map_from_unused(&right_bindings, &right_unused);
+                if !self.has_unknown_references(&known_bindings) {
+                    any_join.left_projection_map =
+                        self.generate_exact_projection_map(&left_bindings, &output_references);
+                    any_join.right_projection_map =
+                        self.generate_exact_projection_map(&right_bindings, &output_references);
+                }
 
                 Ok(LogicalOperator::Join(Join::Any(any_join)))
             }
@@ -228,20 +224,6 @@ impl ColumnLifetimeAnalyzer {
 
     fn add_binding(&mut self, col_ref: &ColumnRefExpression) {
         self.column_references.insert(col_ref.binding);
-    }
-
-    fn extract_unused_column_bindings(&self, bindings: &[ColumnBinding]) -> HashSet<ColumnBinding> {
-        if self.everything_referenced {
-            return HashSet::new();
-        }
-
-        let mut unused = HashSet::new();
-        for binding in bindings {
-            if !self.column_references.contains(binding) {
-                unused.insert(*binding);
-            }
-        }
-        unused
     }
 
     /// Correlated-subquery flattening can temporarily leave stale table-index bindings.
@@ -274,26 +256,19 @@ impl ColumnLifetimeAnalyzer {
         }
     }
 
-    fn generate_projection_map_from_unused(
+    fn generate_exact_projection_map(
+        &self,
         bindings: &[ColumnBinding],
-        unused: &HashSet<ColumnBinding>,
+        output_references: &HashSet<ColumnBinding>,
     ) -> Vec<usize> {
-        if unused.is_empty() {
-            return Vec::new();
+        if self.everything_referenced {
+            return (0..bindings.len()).collect();
         }
-
-        let mut projection_map = Vec::new();
-        for (idx, binding) in bindings.iter().enumerate() {
-            if !unused.contains(binding) {
-                projection_map.push(idx);
-            }
-        }
-
-        if projection_map.len() == bindings.len() {
-            Vec::new()
-        } else {
-            projection_map
-        }
+        bindings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, binding)| output_references.contains(binding).then_some(index))
+            .collect()
     }
 
     pub fn extract_column_bindings(expr: &Expression, bindings: &mut Vec<ColumnBinding>) {
@@ -316,7 +291,8 @@ mod tests {
         WindowFrameType,
     };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinType, LogicalOperator,
+        ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
+        JoinType, LogicalOperator, Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -382,5 +358,67 @@ mod tests {
         };
         assert_eq!(join.right_projection_map, vec![0]);
         assert_eq!(join.get_types().len(), 2);
+    }
+
+    #[test]
+    fn join_condition_columns_are_not_forced_into_join_output() {
+        let ctx = BindContext::new();
+        let left = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["left_key".into(), "payload".into()],
+                vec![LogicalType::Integer, LogicalType::BigInt],
+            )),
+        );
+        let right = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                20,
+                Vec::new(),
+                vec!["right_key".into(), "dead_payload".into()],
+                vec![LogicalType::Integer, LogicalType::Varchar],
+            )),
+        );
+        let join = ComparisonJoin::new(
+            JoinType::Inner,
+            left,
+            right,
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(10, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(20, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        let joined = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+        let plan = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                joined,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(10, 1),
+                    LogicalType::BigInt,
+                ))],
+            )),
+        );
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Projection(projection) = optimized.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = projection.child.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.left_projection_map, vec![1]);
+        assert!(join.right_projection_map.is_empty());
+        assert_eq!(join.get_types(), vec![LogicalType::BigInt]);
     }
 }

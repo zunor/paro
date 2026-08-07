@@ -159,7 +159,6 @@ impl HashJoinSpillReplaySourceExec {
                     self.join_type,
                     &replay_input,
                     &self.left_projection,
-                    &[],
                     &self.output_types,
                     output,
                 )?;
@@ -267,7 +266,6 @@ impl HashJoinSpillReplaySourceExec {
             current.hash_table.as_ref(),
             &mut current.scan_structure,
             &self.left_projection,
-            &[],
         )?;
         if current.scan_structure.finished {
             current.probe_in_progress = false;
@@ -308,16 +306,20 @@ impl HashJoinSpillReplaySourceExec {
 
         let build_sel = SelectionVector::try_incremental(count, output.allocator().clone())?;
         match self.join_type {
-            JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
-                &build_chunk,
-                &build_sel,
-                count,
-                &self.left_output_types(),
-                &[],
-                output,
-            )?,
+            JoinType::Right | JoinType::Outer => {
+                let projection = (0..build_chunk.column_count()).collect::<Vec<_>>();
+                construct_right_outer_scan_result(
+                    &build_chunk,
+                    &build_sel,
+                    count,
+                    &self.left_output_types(),
+                    &projection,
+                    output,
+                )?
+            }
             JoinType::RightSemi | JoinType::RightAnti => {
-                construct_semi_join_result(&build_chunk, &build_sel, count, &[], output)?
+                let projection = (0..build_chunk.column_count()).collect::<Vec<_>>();
+                construct_semi_join_result(&build_chunk, &build_sel, count, &projection, output)?
             }
             _ => unreachable!("checked build-propagating join types above"),
         }
@@ -325,9 +327,6 @@ impl HashJoinSpillReplaySourceExec {
     }
 
     fn left_output_types(&self) -> Vec<LogicalType> {
-        if self.left_projection.is_empty() {
-            return self.probe_types.to_vec();
-        }
         self.left_projection
             .iter()
             .map(|idx| self.probe_types[*idx].clone())

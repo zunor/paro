@@ -78,6 +78,7 @@ impl RowHeapUsage {
 /// than recursively dispatching through `Vector` for every cell.
 pub struct PreparedRowScatter<'a> {
     columns: Vec<PreparedColumn<'a>>,
+    heap_columns: Vec<usize>,
     count: usize,
 }
 
@@ -92,6 +93,7 @@ impl<'a> PreparedRowScatter<'a> {
         }
 
         let mut prepared = Vec::with_capacity(columns.len());
+        let mut heap_columns = Vec::new();
         for (column_idx, source) in columns.iter().copied().enumerate() {
             let expected = &layout.types()[column_idx];
             if source.logical_type() != expected {
@@ -109,25 +111,37 @@ impl<'a> PreparedRowScatter<'a> {
                     source,
                     width: *size,
                 },
-                ColumnCodec::Varlen(_) => PreparedColumn::Varlen {
-                    view: source.try_to_varlen_view(count)?,
-                },
+                ColumnCodec::Varlen(_) => {
+                    heap_columns.push(column_idx);
+                    PreparedColumn::Varlen {
+                        view: source.try_to_varlen_view(count)?,
+                    }
+                }
                 ColumnCodec::List(_) | ColumnCodec::Array(_) | ColumnCodec::Struct(_) => {
+                    heap_columns.push(column_idx);
                     PreparedColumn::Nested { source }
                 }
             });
         }
         Ok(Self {
             columns: prepared,
+            heap_columns,
             count,
         })
+    }
+
+    /// Whether any source column can retain data outside its destination row.
+    #[inline]
+    pub fn has_heap_values(&self) -> bool {
+        !self.heap_columns.is_empty()
     }
 
     /// Measure allocations owned outside the row for one logical source row.
     pub fn heap_usage(&self, row_idx: usize) -> Result<RowHeapUsage> {
         self.validate_row(row_idx)?;
         let mut usage = RowHeapUsage::default();
-        for column in &self.columns {
+        for &column_idx in &self.heap_columns {
+            let column = &self.columns[column_idx];
             if !column.is_valid(row_idx) {
                 continue;
             }
@@ -322,6 +336,7 @@ mod tests {
             RowValidityType::CanHaveNullValues,
         );
         let scatter = PreparedRowScatter::try_new(&layout, &[&integers, &strings], 2).unwrap();
+        assert!(scatter.has_heap_values());
         assert_eq!(scatter.heap_usage(0).unwrap().varlen_bytes(), 42);
         assert_eq!(scatter.heap_usage(1).unwrap().varlen_bytes(), 0);
 
@@ -360,5 +375,23 @@ mod tests {
             Some("a retained string longer than twelve bytes")
         );
         assert_eq!(gathered_string.get_string(1), Some("short"));
+    }
+
+    #[test]
+    fn fixed_width_scatter_has_no_heap_planning_pass() {
+        let allocator = Arc::new(DefaultAllocator::new());
+        let mut integers = Vector::try_new(LogicalType::Integer, 2, allocator).unwrap();
+        integers.set_i32(0, 10);
+        integers.set_i32(1, 20);
+        integers.set_count(2);
+
+        let layout = RowLayout::from_types(
+            vec![LogicalType::Integer],
+            RowValidityType::CanHaveNullValues,
+        );
+        let scatter = PreparedRowScatter::try_new(&layout, &[&integers], 2).unwrap();
+
+        assert!(!scatter.has_heap_values());
+        assert_eq!(scatter.heap_usage(1).unwrap(), RowHeapUsage::default());
     }
 }

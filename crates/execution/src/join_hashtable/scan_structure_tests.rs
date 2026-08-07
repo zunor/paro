@@ -237,14 +237,14 @@ fn test_next_left_join_emits_matches_then_unmatched_rows() {
     );
 
     let first = scan
-        .next_left_join(&keys, &left, &mut result, &ht, &[], &[])
+        .next_left_join(&keys, &left, &mut result, &ht, &[0])
         .unwrap();
     assert_eq!(first, 1);
     assert_eq!(result.data[0].get_value(0).to_string(), "1");
     assert_eq!(result.data[1].get_value(0).to_string(), "10");
 
     let second = scan
-        .next_left_join(&keys, &left, &mut result, &ht, &[], &[])
+        .next_left_join(&keys, &left, &mut result, &ht, &[0])
         .unwrap();
     assert_eq!(second, 1);
     assert_eq!(result.data[0].get_value(0).to_string(), "3");
@@ -259,7 +259,7 @@ fn test_next_semi_anti_and_mark_join() {
     let mut semi_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
     let semi_count = semi_scan
-        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[])
+        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[0])
         .unwrap();
     assert_eq!(semi_count, 1);
     assert_eq!(semi_result.data[0].get_value(0).to_string(), "1");
@@ -268,7 +268,7 @@ fn test_next_semi_anti_and_mark_join() {
     let mut anti_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
     let anti_count = anti_scan
-        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[])
+        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[0])
         .unwrap();
     assert_eq!(anti_count, 1);
     assert_eq!(anti_result.data[0].get_value(0).to_string(), "3");
@@ -279,7 +279,7 @@ fn test_next_semi_anti_and_mark_join() {
         2,
     );
     let mark_count = mark_scan
-        .next_mark_join(&keys, &left, &mut mark_result, &ht, &[])
+        .next_mark_join(&keys, &left, &mut mark_result, &ht, &[0])
         .unwrap();
     assert_eq!(mark_count, 2);
     assert_eq!(mark_result.data[1].get_value(0).to_string(), "true");
@@ -298,7 +298,7 @@ fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
     let (mut semi_scan, probe_keys, left) = prepare_probe(&semi_table, &keys);
     for batch in 0..2 {
         let count = semi_scan
-            .next_semi_join(&probe_keys, &left, &mut result, &semi_table, &[])
+            .next_semi_join(&probe_keys, &left, &mut result, &semi_table, &[0])
             .unwrap();
         assert_eq!(count, VECTOR_SIZE);
         assert_eq!(
@@ -312,7 +312,7 @@ fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
     let (mut anti_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
     for batch in 0..2 {
         let count = anti_scan
-            .next_anti_join(&probe_keys, &left, &mut result, &anti_table, &[])
+            .next_anti_join(&probe_keys, &left, &mut result, &anti_table, &[0])
             .unwrap();
         assert_eq!(count, VECTOR_SIZE);
         assert_eq!(
@@ -325,7 +325,7 @@ fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
     let (mut null_aware_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
     for batch in 0..2 {
         let count = null_aware_scan
-            .next_null_aware_anti_join(&probe_keys, &left, &mut result, &anti_table, &[])
+            .next_null_aware_anti_join(&probe_keys, &left, &mut result, &anti_table, &[0])
             .unwrap();
         assert_eq!(count, VECTOR_SIZE);
         assert_eq!(
@@ -355,7 +355,7 @@ fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
     let mut semi_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
     let semi_count = semi_scan
-        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[])
+        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[0])
         .unwrap();
     assert_eq!(semi_count, 2);
     assert!(semi_result.data[0].is_null(0));
@@ -368,7 +368,7 @@ fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
     let mut anti_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
     let anti_count = anti_scan
-        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[])
+        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[0])
         .unwrap();
     assert_eq!(anti_count, 1);
     assert_eq!(anti_result.data[0].get_value(0).to_string(), "1");
@@ -384,7 +384,7 @@ fn test_next_single_join_null_fills_unmatched_rows() {
     );
 
     let count = scan
-        .next_single_join(&keys, &left, &mut result, &ht, &[], &[])
+        .next_single_join(&keys, &left, &mut result, &ht, &[0])
         .unwrap();
     assert_eq!(count, 2);
     assert_eq!(result.data[0].get_value(0).to_string(), "1");
@@ -403,7 +403,7 @@ fn test_next_single_join_errors_on_duplicates() {
     );
 
     let err = scan
-        .next_single_join(&keys, &left, &mut result, &ht, &[], &[])
+        .next_single_join(&keys, &left, &mut result, &ht, &[0])
         .unwrap_err();
     assert!(err
         .to_string()
@@ -423,7 +423,7 @@ fn test_next_single_join_drains_probe_larger_than_output_vector() {
     );
 
     let first = scan
-        .next_single_join(&probe_keys, &left, &mut result, &ht, &[], &[])
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
         .unwrap();
     assert_eq!(first, VECTOR_SIZE);
     assert!(!scan.finished);
@@ -434,7 +434,7 @@ fn test_next_single_join_drains_probe_larger_than_output_vector() {
     );
 
     let second = scan
-        .next_single_join(&probe_keys, &left, &mut result, &ht, &[], &[])
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
         .unwrap();
     assert_eq!(second, VECTOR_SIZE);
     assert!(scan.finished);
@@ -512,7 +512,7 @@ fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
     );
 
     let count = scan
-        .next_inner_join(&keys, &left, &mut result, &ht, &[], &[])
+        .next_inner_join(&keys, &left, &mut result, &ht, &[0])
         .unwrap();
     assert_eq!(count, 1);
     assert_eq!(result.data[0].get_value(0).to_string(), "1");
@@ -538,7 +538,7 @@ fn repeated_build_matches_preserve_varlen_payload_as_dictionary() {
     );
 
     let count = scan
-        .next_inner_join(&keys, &left, &mut result, &ht, &[], &[])
+        .next_inner_join(&keys, &left, &mut result, &ht, &[0])
         .unwrap();
 
     assert_eq!(count, 3);

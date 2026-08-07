@@ -100,18 +100,23 @@ impl HashJoinUnmatchedSourceExec {
 
         ensure_source_output(output, &self.output_types, VECTOR_SIZE)?;
         let build_sel = SelectionVector::try_incremental(count, output.allocator().clone())?;
+        let build_projection = (0..build_chunk.column_count()).collect::<Vec<_>>();
         match self.join_type {
             JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
                 &build_chunk,
                 &build_sel,
                 count,
                 &self.left_output_types,
-                &[],
+                &build_projection,
                 output,
             )?,
-            JoinType::RightSemi | JoinType::RightAnti => {
-                construct_semi_join_result(&build_chunk, &build_sel, count, &[], output)?
-            }
+            JoinType::RightSemi | JoinType::RightAnti => construct_semi_join_result(
+                &build_chunk,
+                &build_sel,
+                count,
+                &build_projection,
+                output,
+            )?,
             _ => unreachable!("unmatched source only emits right-side joins"),
         }
         Ok(SourcePoll::Output)

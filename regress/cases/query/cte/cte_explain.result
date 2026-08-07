@@ -39,7 +39,7 @@ MATERIALIZED_CTE
           ->  PROJECTION
             Output: l.id, peer_id, l.grp
             ->  FILTER
-              Filter: #0 < #3
+              Filter: #0 < #2
               ->  HASH_JOIN
                 Join Type: INNER
                 Join Condition: #1 = #1

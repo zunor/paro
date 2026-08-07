@@ -110,24 +110,15 @@ struct LateMaterializationState {
 }
 
 impl ReusedPredicateColumn {
-    fn new(
-        column_id: ColumnId,
-        predicate_idx: usize,
-        encoding: PredicateColumnReuse,
-        capacity: usize,
-    ) -> Self {
-        let estimated_width = match encoding {
-            PredicateColumnReuse::Fixed { width } => width,
-            PredicateColumnReuse::Varlen => 16,
-        };
+    fn new(column_id: ColumnId, predicate_idx: usize, encoding: PredicateColumnReuse) -> Self {
         Self {
             column_id,
             predicate_idx,
             encoding,
             state: PredicateColumnReuseState::Collecting {
-                data: Vec::with_capacity(capacity.saturating_mul(estimated_width)),
-                nulls: Vec::with_capacity(capacity),
-                row_ends: Vec::with_capacity(capacity),
+                data: Vec::new(),
+                nulls: Vec::new(),
+                row_ends: Vec::new(),
                 utf8_verified: true,
             },
         }
@@ -220,12 +211,21 @@ impl ReusedPredicateColumn {
         else {
             return Ok(None);
         };
-        if rows > nulls.len() || rows > row_ends.len() {
+        if rows > nulls.len()
+            || (matches!(self.encoding, PredicateColumnReuse::Varlen) && rows > row_ends.len())
+        {
             return Err(paro_error::internal(
                 "Reusable predicate column is shorter than the staged selection",
             ));
         }
-        let data_len = rows.checked_sub(1).map_or(0, |last_row| row_ends[last_row]);
+        let data_len = match self.encoding {
+            PredicateColumnReuse::Fixed { width } => rows.checked_mul(width).ok_or_else(|| {
+                paro_error::internal("Reusable fixed predicate prefix size overflow")
+            })?,
+            PredicateColumnReuse::Varlen => {
+                rows.checked_sub(1).map_or(0, |last_row| row_ends[last_row])
+            }
+        };
         if data_len > data.len() {
             return Err(paro_error::internal(
                 "Reusable predicate data is shorter than the staged selection",
@@ -236,13 +236,15 @@ impl ReusedPredicateColumn {
         let data = std::mem::replace(data, remaining_data);
         let remaining_nulls = nulls.split_off(rows);
         let nulls = std::mem::replace(nulls, remaining_nulls);
-        let mut remaining_ends = row_ends.split_off(rows);
-        for end in &mut remaining_ends {
-            *end = end.checked_sub(data_len).ok_or_else(|| {
-                paro_error::internal("Reusable predicate row boundary moved backwards")
-            })?;
+        if matches!(self.encoding, PredicateColumnReuse::Varlen) {
+            let mut remaining_ends = row_ends.split_off(rows);
+            for end in &mut remaining_ends {
+                *end = end.checked_sub(data_len).ok_or_else(|| {
+                    paro_error::internal("Reusable predicate row boundary moved backwards")
+                })?;
+            }
+            *row_ends = remaining_ends;
         }
-        *row_ends = remaining_ends;
         let nulls = nulls
             .iter()
             .any(|is_null| *is_null != 0)
@@ -342,7 +344,7 @@ impl LateMaterializationState {
                 evaluator
                     .reusable_column_info(*column_id)
                     .map(|(predicate_idx, encoding)| {
-                        ReusedPredicateColumn::new(*column_id, predicate_idx, encoding, 0)
+                        ReusedPredicateColumn::new(*column_id, predicate_idx, encoding)
                     })
             })
             .collect();
@@ -857,6 +859,7 @@ impl SegmentIterator {
                     .ok_or_else(|| paro_error::internal("Reusable predicate batch missing"))?;
                 reused.append_rows(batch, &state.predicate_matches)?;
             }
+            state.rowids.reserve(state.predicate_matches.len());
             for &row_idx in &state.predicate_matches {
                 let ordinal = self.current_ordinal + row_idx as u64;
                 state.rowids.push(ordinal as u32);
@@ -937,8 +940,7 @@ mod tests {
 
     #[test]
     fn decoded_predicate_batch_disables_column_reuse_for_readback() {
-        let mut reused =
-            ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 }, 1);
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 });
         let raw = PredicateColumnBatch::Raw(ColumnBatch::new(
             Bytes::copy_from_slice(&11_i32.to_le_bytes()),
             None,
@@ -952,8 +954,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_predicate_values_are_reused_across_output_batches() {
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 });
+        let values = [10_i32, 20, 30]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let raw = PredicateColumnBatch::Raw(ColumnBatch::new(Bytes::from(values), None));
+        reused.append_rows(&raw, &[2, 0, 1]).unwrap();
+
+        let first = reused.take_prefix(2).unwrap().expect("reused prefix");
+        assert_eq!(
+            first.data.as_ref(),
+            &[30_i32.to_le_bytes(), 10_i32.to_le_bytes()].concat()
+        );
+
+        let second = reused.take_prefix(1).unwrap().expect("reused suffix");
+        assert_eq!(second.data.as_ref(), 20_i32.to_le_bytes());
+    }
+
+    #[test]
     fn decoded_varlen_predicate_values_are_reused_across_output_batches() {
-        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen, 3);
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen);
         let decoded = PredicateColumnBatch::Decoded(test_nullable_string_vector(&[
             Some("alpha"),
             None,
@@ -996,7 +1018,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen, 3);
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen);
         reused.append_rows(&batch, &[2, 0, 2]).unwrap();
 
         let first = reused.take_prefix(2).unwrap().expect("reused prefix");

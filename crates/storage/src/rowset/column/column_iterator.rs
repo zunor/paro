@@ -1220,19 +1220,18 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                     _ => unreachable!("BitShuffle decoder checked above"),
                 };
 
-                for &(orig_idx, rowid) in run {
-                    let page_idx = u32::try_from(rowid - page_start).map_err(|_| {
-                        paro_error::data_corrupted("BitShuffle page row offset overflow")
-                    })?;
-                    let dst_start = orig_idx.checked_mul(type_size).ok_or_else(|| {
-                        paro_error::data_corrupted("fixed-width destination overflow")
-                    })?;
-                    let dst_end = dst_start.checked_add(type_size).ok_or_else(|| {
-                        paro_error::data_corrupted("fixed-width destination end overflow")
-                    })?;
-                    decoder.copy_value_at(page_idx, &mut result[dst_start..dst_end])?;
+                let page_span_end = u32::try_from(row_run.span_end - page_start).map_err(|_| {
+                    paro_error::data_corrupted("BitShuffle page row offset overflow")
+                })?;
+                debug_assert!(page_span_end < decoder.count());
+                decoder.gather_values_at(
+                    run.iter()
+                        .map(|&(orig_idx, rowid)| ((rowid - page_start) as u32, orig_idx)),
+                    &mut result,
+                )?;
 
-                    if let Some(ref mut nulls_out) = result_nulls {
+                if let Some(ref mut nulls_out) = result_nulls {
+                    for &(orig_idx, rowid) in run {
                         let span_idx =
                             usize::try_from(rowid - row_run.span_start).map_err(|_| {
                                 paro_error::data_corrupted("fixed-width null offset overflow")

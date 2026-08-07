@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_context::StatementContext;
 use paro_planner::binder::Binder;
@@ -129,8 +129,12 @@ impl Optimizer {
             current = rewrite_result?;
 
             if self.ctx.verify_enabled {
-                verify_logical_plan(&self.ctx.bind_context, &current)
-                    .map_err(|error| error.context(format!("after optimizer pass {opt_type}")))?;
+                verify_logical_plan(&self.ctx.bind_context, &current).map_err(|error| {
+                    paro_error::internal(format!(
+                        "Logical plan invariant failed after optimizer pass {opt_type}: {}",
+                        error.message()
+                    ))
+                })?;
             }
         }
 
@@ -183,7 +187,6 @@ impl Optimizer {
             Box::new(UnusedColumnsPass {
                 binder: unused_columns_binder,
             }),
-            Box::new(ColumnLifetimePass),
             Box::new(BuildProbeSidePass),
             Box::new(JoinFilterPushdownPass),
             Box::new(MixedJoinPredicatePass),
@@ -193,6 +196,10 @@ impl Optimizer {
             Box::new(SearchOptimizationPass),
             Box::new(SegmentPrunerPass),
             Box::new(StatisticsPropagationPass),
+            // Projection maps are positional annotations over the final logical
+            // layout. Derive them only after every structural rewrite (most
+            // notably build/probe-side flips) has settled that layout.
+            Box::new(ColumnLifetimePass),
         ]
     }
 }
@@ -203,6 +210,19 @@ mod tests {
     use paro_planner::planner::Planner;
 
     use super::Optimizer;
+    use crate::optimizer_type::OptimizerType;
+
+    #[test]
+    fn column_lifetime_is_the_terminal_optimizer_pass() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let planner = Planner::new(session.clone());
+        let optimizer = Optimizer::new(planner.binder.clone(), session);
+
+        assert_eq!(
+            optimizer.pipeline_types().last(),
+            Some(&OptimizerType::ColumnLifetime)
+        );
+    }
 
     #[test]
     fn correlated_having_retains_delim_capture_key_through_optimization() {

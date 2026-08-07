@@ -553,6 +553,126 @@ impl BitShufflePageDecoder {
         )
     }
 
+    /// Gather logical values into arbitrary output slots.
+    ///
+    /// Adjacent source indices share an eight-row bit-slice group. Decoding
+    /// that group once amortizes the transpose across every selected row in
+    /// it, while preserving the sparse-gather property: unrelated rows and
+    /// groups are never materialized.
+    pub fn gather_values_at<I>(&self, values: I, output: &mut [u8]) -> Result<()>
+    where
+        I: IntoIterator<Item = (u32, usize)>,
+    {
+        if !self.parsed {
+            return Err(paro_common::error::internal(
+                "BitShufflePageDecoder: not initialized",
+            ));
+        }
+        if output.len() % self.type_size != 0 {
+            return Err(paro_common::error::invalid_input(
+                "BitShuffle gather output is not aligned to the element width",
+            ));
+        }
+
+        match self.type_size {
+            1 => self.gather_fixed_values::<u8, _>(values, output),
+            2 => self.gather_fixed_values::<u16, _>(values, output),
+            4 => self.gather_fixed_values::<u32, _>(values, output),
+            8 => self.gather_fixed_values::<u64, _>(values, output),
+            16 => self.gather_fixed_values::<u128, _>(values, output),
+            _ => Err(paro_common::error::internal(format!(
+                "initialized BitShuffle decoder has invalid type size {}",
+                self.type_size
+            ))),
+        }
+    }
+
+    fn gather_fixed_values<T, I>(&self, values: I, output: &mut [u8]) -> Result<()>
+    where
+        T: Copy,
+        I: IntoIterator<Item = (u32, usize)>,
+    {
+        debug_assert_eq!(std::mem::size_of::<T>(), self.type_size);
+
+        let output_rows = output.len() / self.type_size;
+        if let Some(decoded) = &self.decoded_data {
+            for (source_idx, output_idx) in values {
+                self.validate_gather_indices(source_idx, output_idx, output_rows)?;
+                let source_start = source_idx as usize * self.type_size;
+                let output_start = output_idx * self.type_size;
+                // SAFETY: the index validation above proves both fixed-width
+                // ranges are in bounds. T is selected from the decoder's
+                // validated physical width and unaligned access is required
+                // because the byte buffers do not promise T's alignment.
+                unsafe {
+                    copy_fixed_unaligned::<T>(
+                        decoded.as_ptr().add(source_start),
+                        output.as_mut_ptr().add(output_start),
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let shuffled = self
+            .shuffled_data
+            .as_ref()
+            .expect("initialized BitShuffle decoder has bit-sliced data");
+        let mut decoded_group = [0_u8; 16 * 8];
+        let mut decoded_group_start = None;
+        for (source_idx, output_idx) in values {
+            self.validate_gather_indices(source_idx, output_idx, output_rows)?;
+            let source_idx = source_idx as usize;
+            let block_start = source_idx / self.block_elements * self.block_elements;
+            let row_in_block = source_idx - block_start;
+            let group_start = block_start + row_in_block / 8 * 8;
+            if decoded_group_start != Some(group_start) {
+                decode_bit_sliced_group(
+                    shuffled,
+                    group_start,
+                    self.padded_num_elements as usize,
+                    self.type_size,
+                    self.block_elements,
+                    &mut decoded_group,
+                )?;
+                decoded_group_start = Some(group_start);
+            }
+
+            let source_start = (source_idx - group_start) * self.type_size;
+            let output_start = output_idx * self.type_size;
+            // SAFETY: decoded_group contains eight values at the validated
+            // physical width, and validate_gather_indices proves the output
+            // slot is in bounds. Both buffers may be unaligned for T.
+            unsafe {
+                copy_fixed_unaligned::<T>(
+                    decoded_group.as_ptr().add(source_start),
+                    output.as_mut_ptr().add(output_start),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_gather_indices(
+        &self,
+        source_idx: u32,
+        output_idx: usize,
+        output_rows: usize,
+    ) -> Result<()> {
+        if source_idx >= self.num_elements {
+            return Err(paro_common::error::out_of_range(format!(
+                "BitShufflePageDecoder: value index {source_idx} exceeds element count {}",
+                self.num_elements,
+            )));
+        }
+        if output_idx >= output_rows {
+            return Err(paro_common::error::out_of_range(format!(
+                "BitShufflePageDecoder: gather output index {output_idx} exceeds row count {output_rows}",
+            )));
+        }
+        Ok(())
+    }
+
     /// Get element count.
     pub fn count(&self) -> u32 {
         self.num_elements
@@ -649,6 +769,16 @@ impl BitShufflePageDecoder {
     }
 }
 
+#[inline(always)]
+unsafe fn copy_fixed_unaligned<T: Copy>(source: *const u8, output: *mut u8) {
+    // SAFETY: callers guarantee that both pointers address at least
+    // size_of::<T>() readable/writable bytes. read_unaligned/write_unaligned
+    // deliberately impose no alignment requirement, and the buffers do not
+    // overlap because the decoded page/group and destination are distinct.
+    let value = unsafe { (source.cast::<T>()).read_unaligned() };
+    unsafe { (output.cast::<T>()).write_unaligned(value) };
+}
+
 fn copy_bit_sliced_value(
     shuffled: &[u8],
     idx: usize,
@@ -686,6 +816,38 @@ fn copy_bit_sliced_value(
             value |= u8::from(encoded & bit_mask != 0) << bit;
         }
         *value_byte = value;
+    }
+    Ok(())
+}
+
+fn decode_bit_sliced_group(
+    shuffled: &[u8],
+    group_start: usize,
+    padded_num_elements: usize,
+    type_size: usize,
+    block_elements: usize,
+    output: &mut [u8; 16 * 8],
+) -> Result<()> {
+    let block_start = group_start / block_elements * block_elements;
+    let elements = (padded_num_elements - block_start).min(block_elements);
+    let plane_bytes = elements / 8;
+    let group_in_block = (group_start - block_start) / 8;
+    let block_offset = block_start * type_size;
+
+    for byte_idx in 0..type_size {
+        let plane_base = block_offset + byte_idx * 8 * plane_bytes;
+        let last_plane_byte = plane_base + 7 * plane_bytes + group_in_block;
+        if last_plane_byte >= shuffled.len() {
+            return Err(paro_common::error::data_corrupted(
+                "BitShuffle group extends past decompressed page",
+            ));
+        }
+        let planes =
+            std::array::from_fn(|bit| shuffled[plane_base + bit * plane_bytes + group_in_block]);
+        let values = transpose_8x8(u64::from_le_bytes(planes)).to_le_bytes();
+        for (row_idx, value) in values.into_iter().enumerate() {
+            output[row_idx * type_size + byte_idx] = value;
+        }
     }
     Ok(())
 }
@@ -1012,6 +1174,36 @@ mod tests {
 
         decoder.next_batch(1).unwrap();
         assert!(decoder.materialized_data().is_some());
+    }
+
+    #[test]
+    fn sparse_gather_reuses_bit_slice_groups_and_preserves_output_order() {
+        let mut builder = BitShufflePageBuilder::new(8, 256 * 1024);
+        let values: Vec<i64> = (0..2056).map(|value| value * 101 - 37).collect();
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(
+            builder.add(&bytes, values.len() as u32),
+            values.len() as u32
+        );
+
+        let mut decoder =
+            BitShufflePageDecoder::new(builder.finish().unwrap(), values.len() as u32, 8);
+        decoder.init().unwrap();
+        let gather = [(0, 3), (1, 0), (7, 5), (8, 1), (8, 4), (1024, 2)];
+        let mut output = [0_u8; 6 * 8];
+        decoder.gather_values_at(gather, &mut output).unwrap();
+
+        for (source_idx, output_idx) in gather {
+            let start = output_idx * 8;
+            assert_eq!(
+                i64::from_le_bytes(output[start..start + 8].try_into().unwrap()),
+                values[source_idx as usize]
+            );
+        }
+        assert!(decoder.materialized_data().is_none());
     }
 
     #[test]

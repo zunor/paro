@@ -9,10 +9,37 @@
 
 use std::sync::Arc;
 
-/// Bound dense membership so an adversarial sparse range cannot reserve memory
-/// proportional to its endpoints.
-const MAX_DENSE_MEMBERSHIP_BITS: usize = 1 << 20;
-const MAX_DENSE_MEMBERSHIP_BITS_PER_VALUE: usize = 16;
+/// Construction limits for the dense representation of a fixed-width set.
+///
+/// Callers with different access patterns can choose a policy without changing
+/// the set's lookup contract. Static predicates use the conservative default;
+/// analytical runtime filters may spend more bounded memory to avoid a binary
+/// search for every scanned row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedMembershipBuildPolicy {
+    max_dense_bits: usize,
+    max_dense_bits_per_value: usize,
+}
+
+impl FixedMembershipBuildPolicy {
+    pub const fn new(max_dense_bits: usize, max_dense_bits_per_value: usize) -> Self {
+        Self {
+            max_dense_bits,
+            max_dense_bits_per_value,
+        }
+    }
+
+    fn permits_dense(self, span: usize, value_count: usize) -> bool {
+        span <= self.max_dense_bits
+            && span <= value_count.saturating_mul(self.max_dense_bits_per_value)
+    }
+}
+
+impl Default for FixedMembershipBuildPolicy {
+    fn default() -> Self {
+        Self::new(1 << 20, 16)
+    }
+}
 
 pub(crate) trait FixedMembershipValue: Copy + Ord {
     fn offset_from(self, base: Self) -> Option<usize>;
@@ -20,11 +47,17 @@ pub(crate) trait FixedMembershipValue: Copy + Ord {
 }
 
 macro_rules! impl_fixed_membership_value {
-    ($ty:ty, $wide:ty) => {
+    ($ty:ty, $unsigned:ty, $wide:ty) => {
         impl FixedMembershipValue for $ty {
             #[inline]
             fn offset_from(self, base: Self) -> Option<usize> {
-                let offset = <$wide>::from(self).checked_sub(<$wide>::from(base))?;
+                if self < base {
+                    return None;
+                }
+                // With ordered signed endpoints, wrapping subtraction in the
+                // corresponding unsigned domain is exactly their mathematical
+                // non-negative distance, including ranges crossing zero.
+                let offset = (self as $unsigned).wrapping_sub(base as $unsigned);
                 usize::try_from(offset).ok()
             }
 
@@ -37,13 +70,16 @@ macro_rules! impl_fixed_membership_value {
     };
 }
 
-impl_fixed_membership_value!(i32, i64);
-impl_fixed_membership_value!(i64, i128);
+impl_fixed_membership_value!(i32, u32, i64);
+impl_fixed_membership_value!(i64, u64, i128);
 
 impl FixedMembershipValue for i128 {
     #[inline]
     fn offset_from(self, base: Self) -> Option<usize> {
-        usize::try_from(self.checked_sub(base)?).ok()
+        if self < base {
+            return None;
+        }
+        usize::try_from((self as u128).wrapping_sub(base as u128)).ok()
     }
 
     #[inline]
@@ -70,7 +106,11 @@ pub(crate) struct FixedMembershipSet<T> {
 }
 
 impl<T: FixedMembershipValue> FixedMembershipSet<T> {
-    pub(crate) fn from_values(mut values: Vec<T>) -> Self {
+    pub(crate) fn from_values(values: Vec<T>) -> Self {
+        Self::from_values_with_policy(values, FixedMembershipBuildPolicy::default())
+    }
+
+    fn from_values_with_policy(mut values: Vec<T>, policy: FixedMembershipBuildPolicy) -> Self {
         if values.is_empty() {
             return Self {
                 representation: FixedMembershipRepresentation::Sorted(Arc::from([])),
@@ -86,13 +126,7 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
         if let Some(span) = max
             .offset_from(min)
             .and_then(|offset| offset.checked_add(1))
-            .filter(|span| {
-                *span <= MAX_DENSE_MEMBERSHIP_BITS
-                    && *span
-                        <= values
-                            .len()
-                            .saturating_mul(MAX_DENSE_MEMBERSHIP_BITS_PER_VALUE)
-            })
+            .filter(|span| policy.permits_dense(*span, values.len()))
         {
             let mut bits = vec![0_u64; span.div_ceil(u64::BITS as usize)];
             let mut count = 0usize;
@@ -148,6 +182,20 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub(crate) fn is_contiguous(&self) -> bool {
+        match &self.representation {
+            FixedMembershipRepresentation::Sorted(values) => {
+                let (Some(first), Some(last)) = (values.first(), values.last()) else {
+                    return false;
+                };
+                last.offset_from(*first)
+                    .and_then(|offset| offset.checked_add(1))
+                    == Some(values.len())
+            }
+            FixedMembershipRepresentation::Dense { span, count, .. } => span == count,
+        }
     }
 
     pub(crate) fn first(&self) -> Option<T> {
@@ -262,6 +310,30 @@ impl FixedMembership {
         }
     }
 
+    pub fn i32_with_policy(values: Vec<i32>, policy: FixedMembershipBuildPolicy) -> Self {
+        Self {
+            kind: FixedMembershipKind::I32(FixedMembershipSet::from_values_with_policy(
+                values, policy,
+            )),
+        }
+    }
+
+    pub fn i64_with_policy(values: Vec<i64>, policy: FixedMembershipBuildPolicy) -> Self {
+        Self {
+            kind: FixedMembershipKind::I64(FixedMembershipSet::from_values_with_policy(
+                values, policy,
+            )),
+        }
+    }
+
+    pub fn i128_with_policy(values: Vec<i128>, policy: FixedMembershipBuildPolicy) -> Self {
+        Self {
+            kind: FixedMembershipKind::I128(FixedMembershipSet::from_values_with_policy(
+                values, policy,
+            )),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.kind {
             FixedMembershipKind::I32(values) => values.len(),
@@ -272,6 +344,14 @@ impl FixedMembership {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn is_contiguous(&self) -> bool {
+        match &self.kind {
+            FixedMembershipKind::I32(values) => values.is_contiguous(),
+            FixedMembershipKind::I64(values) => values.is_contiguous(),
+            FixedMembershipKind::I128(values) => values.is_contiguous(),
+        }
     }
 
     pub(crate) fn into_kind(self) -> FixedMembershipKind {
@@ -305,5 +385,38 @@ mod tests {
         assert!(values.contains(0));
         values.intersect(&FixedMembershipSet::from_values(vec![-5, 7]));
         assert_eq!(values.iter().collect::<Vec<_>>(), vec![-5]);
+    }
+
+    #[test]
+    fn physical_offsets_are_exact_across_signed_boundaries() {
+        assert_eq!(5_i32.offset_from(-5), Some(10));
+        assert_eq!((-5_i32).offset_from(5), None);
+        assert_eq!(i32::MAX.offset_from(i32::MIN), Some(u32::MAX as usize));
+        assert_eq!(5_i64.offset_from(-5), Some(10));
+        assert_eq!((-5_i64).offset_from(5), None);
+        assert_eq!(5_i128.offset_from(-5), Some(10));
+    }
+
+    #[test]
+    fn construction_policy_selects_representation_without_changing_contract() {
+        let source = vec![0_i64, 128, 256];
+        let conservative = FixedMembershipSet::from_values(source.clone());
+        let analytical = FixedMembershipSet::from_values_with_policy(
+            source,
+            FixedMembershipBuildPolicy::new(512, 256),
+        );
+
+        assert!(matches!(
+            conservative.representation,
+            FixedMembershipRepresentation::Sorted(_)
+        ));
+        assert!(matches!(
+            analytical.representation,
+            FixedMembershipRepresentation::Dense { .. }
+        ));
+        assert_eq!(
+            conservative.iter().collect::<Vec<_>>(),
+            analytical.iter().collect::<Vec<_>>()
+        );
     }
 }

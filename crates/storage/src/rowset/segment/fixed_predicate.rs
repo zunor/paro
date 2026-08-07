@@ -75,6 +75,12 @@ impl<T: FixedPhysical> FixedConjunction<T> {
         }
     }
 
+    pub(super) fn from_range(lower: T, upper: T) -> Self {
+        let mut conjunction = Self::new(ComparisonOperator::GreaterThanOrEqual, lower);
+        conjunction.add(ComparisonOperator::LessThanOrEqual, upper);
+        conjunction
+    }
+
     fn from_membership(inclusions: FixedMembershipSet<T>) -> Self {
         let contradiction = inclusions.is_empty();
         Self {

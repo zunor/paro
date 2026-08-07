@@ -113,13 +113,17 @@ pub enum LogicalOperator {
 impl LogicalOperator {
     pub fn output_names(&self) -> Vec<String> {
         fn project_names(child_names: &[String], projection_map: &[usize]) -> Vec<String> {
+            projection_map
+                .iter()
+                .filter_map(|&idx| child_names.get(idx).cloned())
+                .collect()
+        }
+
+        fn project_or_all_names(child_names: &[String], projection_map: &[usize]) -> Vec<String> {
             if projection_map.is_empty() {
                 child_names.to_vec()
             } else {
-                projection_map
-                    .iter()
-                    .filter_map(|&idx| child_names.get(idx).cloned())
-                    .collect()
+                project_names(child_names, projection_map)
             }
         }
 
@@ -127,7 +131,7 @@ impl LogicalOperator {
             LogicalOperator::Get(op) => op.names.clone(),
             LogicalOperator::Filter(op) => {
                 let child_names = op.child.output_names();
-                project_names(&child_names, &op.projection_map)
+                project_or_all_names(&child_names, &op.projection_map)
             }
             LogicalOperator::Projection(op) => op.output_names.clone(),
             LogicalOperator::ExternalProject(op) => op.output_names.clone(),
@@ -135,7 +139,7 @@ impl LogicalOperator {
             LogicalOperator::Limit(op) => op.child.output_names(),
             LogicalOperator::Order(op) => {
                 let child_names = op.child.output_names();
-                project_names(&child_names, &op.projection_map)
+                project_or_all_names(&child_names, &op.projection_map)
             }
             LogicalOperator::TopN(op) => op.child.output_names(),
             LogicalOperator::CreateTable(_)
@@ -1448,6 +1452,37 @@ mod tests {
             LogicalOperator::Join(Join::Any(Box::new(any))).get_column_bindings(),
             vec![ColumnBinding::new(10, 1), ColumnBinding::new(20, 0)]
         );
+    }
+
+    #[test]
+    fn empty_join_projection_maps_produce_no_output_names() {
+        let mut comparison = ComparisonJoin::new(
+            JoinType::Inner,
+            lp(expression_get(10, vec![LogicalType::Integer])),
+            lp(expression_get(20, vec![LogicalType::Varchar])),
+            vec![],
+        );
+        comparison.left_projection_map.clear();
+        comparison.right_projection_map.clear();
+
+        let mut any = AnyJoin::new(
+            JoinType::Inner,
+            lp(expression_get(10, vec![LogicalType::Integer])),
+            lp(expression_get(20, vec![LogicalType::Varchar])),
+            Expression::Constant(crate::expression::ConstantExpression::new(
+                paro_common::runtime_value::Value::Boolean(true),
+                LogicalType::Boolean,
+            )),
+        );
+        any.left_projection_map.clear();
+        any.right_projection_map.clear();
+
+        assert!(LogicalOperator::Join(Join::Comparison(comparison))
+            .output_names()
+            .is_empty());
+        assert!(LogicalOperator::Join(Join::Any(Box::new(any)))
+            .output_names()
+            .is_empty());
     }
 
     #[test]

@@ -13,7 +13,7 @@ impl PipelineLowerer<'_> {
         handle: BreakerHandleId,
         spec: &HashJoinSpec,
     ) -> SourceSpec {
-        if !can_push_hash_join_runtime_filter(spec.join_type) || !transforms.is_empty() {
+        if !can_push_hash_join_runtime_filter(spec.join_type) {
             return source;
         }
         let SourceSpec::Rowset(rowset) = &mut source else {
@@ -26,7 +26,11 @@ impl PipelineLowerer<'_> {
             let Expression::Reference(reference) = &condition.left else {
                 continue;
             };
-            let Some(&probe_column_id) = rowset.scan.column_ids.get(reference.index) else {
+            let Some(source_index) = trace_probe_reference_to_source(reference.index, transforms)
+            else {
+                continue;
+            };
+            let Some(&probe_column_id) = rowset.scan.column_ids.get(source_index) else {
                 continue;
             };
             let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
@@ -76,4 +80,27 @@ impl PipelineLowerer<'_> {
 
 fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
     matches!(join_type, JoinType::Inner | JoinType::Semi)
+}
+
+/// Trace a downstream join-key reference back to the rowset source.
+///
+/// A chained inner/semi hash probe emits its projected left columns before
+/// any build payload, so a reference inside `left_projection` has exact
+/// lineage to the preceding transform. Other transforms are deliberate
+/// barriers: crossing one would require its own expression-lineage proof and
+/// could move a dynamic predicate across a limit or volatile expression.
+fn trace_probe_reference_to_source(
+    mut reference_index: usize,
+    transforms: &[TransformSpec],
+) -> Option<usize> {
+    for transform in transforms.iter().rev() {
+        let TransformSpec::HashJoinProbe(probe) = transform else {
+            return None;
+        };
+        if !matches!(probe.join_type, JoinType::Inner | JoinType::Semi) {
+            return None;
+        }
+        reference_index = *probe.left_projection.get(reference_index)?;
+    }
+    Some(reference_index)
 }

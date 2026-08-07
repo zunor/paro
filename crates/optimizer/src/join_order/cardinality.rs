@@ -6,8 +6,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use paro_common::logging::targets;
 use paro_planner::expression::Expression;
 use paro_planner::operator::{ColumnBinding, JoinType};
+use tracing::trace;
 
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
@@ -144,6 +146,56 @@ pub struct CardinalityHelper {
 struct BindingCardinalityStats {
     distinct_count: usize,
     relation_cardinality: usize,
+    from_hll: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DistinctDomainEstimate {
+    hll_max: usize,
+    upper_bound_min: usize,
+    has_hll: bool,
+}
+
+impl DistinctDomainEstimate {
+    fn observed(value: usize) -> Self {
+        Self {
+            hll_max: value.max(1),
+            upper_bound_min: usize::MAX,
+            has_hll: true,
+        }
+    }
+
+    fn upper_bound(value: usize) -> Self {
+        Self {
+            hll_max: 0,
+            upper_bound_min: value.max(1),
+            has_hll: false,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.hll_max = self.hll_max.max(other.hll_max);
+        self.upper_bound_min = self.upper_bound_min.min(other.upper_bound_min);
+        self.has_hll |= other.has_hll;
+    }
+
+    fn value(self) -> usize {
+        if self.has_hll {
+            self.hll_max.max(1)
+        } else {
+            self.upper_bound_min.max(1)
+        }
+    }
+}
+
+fn find_component(parents: &mut [usize], index: usize) -> usize {
+    let parent = parents[index];
+    if parent == index {
+        return index;
+    }
+    let root = find_component(parents, parent);
+    parents[index] = root;
+    root
 }
 
 impl CardinalityHelper {
@@ -224,6 +276,7 @@ impl CardinalityEstimator {
                     BindingCardinalityStats {
                         distinct_count: count.distinct_count,
                         relation_cardinality: stats.cardinality,
+                        from_hll: count.from_hll,
                     },
                 )
             }));
@@ -387,6 +440,9 @@ impl CardinalityEstimator {
                     .equivalent_relations
                     .insert(binding);
             }
+
+            let filters_to_add = std::mem::take(&mut self.relation_set_stats[idx1].filters);
+            self.relation_set_stats[idx0].filters.extend(filters_to_add);
             self.relation_set_stats[idx0].filters.push(filter_info);
 
             // Clear the second set (will be removed later)
@@ -451,6 +507,143 @@ impl CardinalityEstimator {
             }
         }
         result
+    }
+
+    /// Compute equality selectivity once per independent edge of each
+    /// equivalence class.
+    ///
+    /// Walking filters in arbitrary order under-counts cyclic join graphs: as
+    /// soon as one spanning path connects the relation set, later equality
+    /// classes can be mistaken for redundant edges. Each column-equivalence
+    /// class instead contributes `NDV^(vertices-components)`, the rank of its
+    /// induced equality graph. Extra transitive predicates add cycles but no
+    /// additional selectivity.
+    fn equality_denominator(&self, requested_set: &JoinRelationSet) -> (f64, HashSet<usize>) {
+        let mut denominator = 1.0;
+        let mut consumed_filters = HashSet::new();
+
+        for stats in &self.relation_set_stats {
+            let mut edges = Vec::new();
+            let mut vertices = HashMap::<usize, DistinctDomainEstimate>::new();
+            for filter in &stats.filters {
+                if filter.join_type != JoinType::Inner
+                    || Self::get_comparison_type(&filter.filter) != Some(ComparisonKind::Equal)
+                    || !JoinRelationSet::is_subset(requested_set, &filter.set)
+                {
+                    continue;
+                }
+                let (Some(left), Some(right)) = (&filter.left_set, &filter.right_set) else {
+                    continue;
+                };
+                if left.count() != 1 || right.count() != 1 {
+                    continue;
+                }
+                let left = left.relations()[0];
+                let right = right.relations()[0];
+                if left == right {
+                    continue;
+                }
+                let fallback_distinct = if stats.has_distinct_count_hll {
+                    DistinctDomainEstimate::observed(stats.distinct_count_hll)
+                } else {
+                    DistinctDomainEstimate::upper_bound(stats.distinct_count_no_hll)
+                };
+                let left_distinct = filter
+                    .left_binding
+                    .and_then(|binding| self.binding_stats.get(&binding))
+                    .map_or(fallback_distinct, |binding| {
+                        if binding.from_hll {
+                            DistinctDomainEstimate::observed(binding.distinct_count)
+                        } else {
+                            DistinctDomainEstimate::upper_bound(binding.distinct_count)
+                        }
+                    });
+                let right_distinct = filter
+                    .right_binding
+                    .and_then(|binding| self.binding_stats.get(&binding))
+                    .map_or(fallback_distinct, |binding| {
+                        if binding.from_hll {
+                            DistinctDomainEstimate::observed(binding.distinct_count)
+                        } else {
+                            DistinctDomainEstimate::upper_bound(binding.distinct_count)
+                        }
+                    });
+                vertices
+                    .entry(left)
+                    .and_modify(|distinct| distinct.merge(left_distinct))
+                    .or_insert(left_distinct);
+                vertices
+                    .entry(right)
+                    .and_modify(|distinct| distinct.merge(right_distinct))
+                    .or_insert(right_distinct);
+                edges.push((left, right));
+                consumed_filters.insert(filter.filter_index);
+            }
+            if vertices.len() < 2 {
+                continue;
+            }
+
+            let mut vertices = vertices.into_iter().collect::<Vec<_>>();
+            vertices.sort_unstable_by_key(|(relation, _)| *relation);
+            let vertex_index = vertices
+                .iter()
+                .enumerate()
+                .map(|(idx, (relation, _))| (*relation, idx))
+                .collect::<HashMap<_, _>>();
+            let mut parents = (0..vertices.len()).collect::<Vec<_>>();
+            for (left, right) in edges {
+                let left = find_component(&mut parents, vertex_index[&left]);
+                let right = find_component(&mut parents, vertex_index[&right]);
+                if left != right {
+                    parents[right] = left;
+                }
+            }
+            let mut components = HashMap::<usize, Vec<DistinctDomainEstimate>>::new();
+            for (index, (_, distinct)) in vertices.iter().enumerate() {
+                let root = find_component(&mut parents, index);
+                components.entry(root).or_default().push(*distinct);
+            }
+            for mut distincts in components.into_values() {
+                let vertices = distincts.len();
+                let independent_edges = vertices.saturating_sub(1);
+                let component_denominator = if distincts.iter().all(|distinct| distinct.has_hll) {
+                    // Under uniformity and containment, equating N observed
+                    // domains contributes the product of the N-1 largest NDVs:
+                    // product(cardinality) * min(NDV) / product(NDV). This is
+                    // invariant to predicate order and does not over-select
+                    // heterogeneous domains by raising only the largest NDV to
+                    // the graph rank.
+                    distincts.sort_unstable_by_key(|distinct| distinct.value());
+                    distincts
+                        .iter()
+                        .skip(1)
+                        .fold(1.0, |product, distinct| product * distinct.value() as f64)
+                } else {
+                    // Cardinality-derived NDVs are upper bounds, not observed
+                    // domains. Preserve the equivalence-class estimate in that
+                    // case: an observed HLL wins when available, otherwise the
+                    // tightest upper bound is used for every independent edge.
+                    let mut class_distinct = distincts[0];
+                    for distinct in &distincts[1..] {
+                        class_distinct.merge(*distinct);
+                    }
+                    (class_distinct.value() as f64)
+                        .powi(independent_edges.min(i32::MAX as usize) as i32)
+                };
+                denominator *= component_denominator;
+                trace!(
+                    target: targets::OPTIMIZER,
+                    requested_set = %requested_set,
+                    class = ?stats.equivalent_relations,
+                    vertices,
+                    independent_edges,
+                    component_denominator,
+                    "Applied equality-class rank selectivity"
+                );
+            }
+        }
+
+        (denominator, consumed_filters)
     }
 
     /// Check if an edge connects to a subgraph.
@@ -662,9 +855,14 @@ impl CardinalityEstimator {
     fn get_denominator(&mut self, set: &JoinRelationSet) -> DenomInfo {
         let mut subgraphs: Vec<Subgraph2Denominator> = Vec::new();
         let mut unused_edge_tdoms: HashSet<usize> = HashSet::new();
+        let (equality_denominator, consumed_equalities) = self.equality_denominator(set);
 
         // Get edges sorted by largest tdom to smallest
-        let edges = self.get_edges(set);
+        let edges = self
+            .get_edges(set)
+            .into_iter()
+            .filter(|edge| !consumed_equalities.contains(&edge.filter_info.filter_index))
+            .collect::<Vec<_>>();
 
         for edge in &edges {
             // Check if we've already connected all relations
@@ -840,13 +1038,13 @@ impl CardinalityEstimator {
 
         // Handle empty subgraphs or zero denominator
         if subgraphs.is_empty() || subgraphs[0].denom == 0.0 {
-            return DenomInfo::new(Arc::new(set.clone()), 1.0, 1.0);
+            return DenomInfo::new(Arc::new(set.clone()), 1.0, equality_denominator);
         }
 
         DenomInfo::new(
             subgraphs[0].numerator_relations.clone().unwrap(),
             1.0,
-            subgraphs[0].denom * denom_multiplier,
+            subgraphs[0].denom * denom_multiplier * equality_denominator,
         )
     }
 }
@@ -1034,6 +1232,21 @@ mod tests {
         assert!(estimator.relation_set_stats[0]
             .equivalent_relations
             .contains(&ColumnBinding::new(2, 0)));
+    }
+
+    #[test]
+    fn merging_equivalence_classes_retains_all_join_edges() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+
+        let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        let filter_cd = create_equality_filter(&mut set_manager, 2, 0, 3, 0, 1);
+        let filter_bc = create_equality_filter(&mut set_manager, 1, 0, 2, 0, 2);
+
+        estimator.init_equivalent_relations(&[filter_ab, filter_cd, filter_bc]);
+
+        assert_eq!(estimator.relation_set_stats.len(), 1);
+        assert_eq!(estimator.relation_set_stats[0].filters.len(), 3);
     }
 
     #[test]

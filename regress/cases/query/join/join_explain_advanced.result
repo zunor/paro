@@ -60,13 +60,13 @@ FROM join_explain_piecewise_l AS l
 JOIN join_explain_piecewise_r AS r ON l.id < r.id;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3 loops=2)
-  SINK #1 MATERIALIZE (actual time=<time-range> rows=3 loops=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #1 MATERIALIZE (actual time=<time-range> rows=3 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #3 NESTED_LOOP_JOIN_PROBE (actual time=<time-range> rows=6 loops=1)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=6 loops=1)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=6 loops=1)
+  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #3 NESTED_LOOP_JOIN_PROBE (actual time=<time-range> rows=6 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=6 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=6 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -144,13 +144,13 @@ FROM join_explain_sort_range_l AS l
 JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3 loops=2)
-  SINK #1 MATERIALIZE (actual time=<time-range> rows=3 loops=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #1 MATERIALIZE (actual time=<time-range> rows=3 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #3 NESTED_LOOP_JOIN_PROBE (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
+  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #3 NESTED_LOOP_JOIN_PROBE (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=3 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -192,7 +192,7 @@ PROJECTION  (rows=5)
     Join Type: LEFT
     Join Condition: #0 = #0
     Cardinality: [5, 5, 5]
-    Output Schema: k INTEGER, k INTEGER, payload VARCHAR
+    Output Schema: k INTEGER, payload VARCHAR
     ->  ROWSET_SCAN on public.join_explain_hash_l l  (rows=5)
       Columns: k
       Cardinality: [5, 5, 5]
@@ -209,17 +209,17 @@ FROM join_explain_hash_l AS l
 LEFT JOIN join_explain_hash_r AS r ON l.k = r.k;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=2 loops=2)
-  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=1 runtime_filter_installed_count=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=<loops> runtime_filter_installed_count=1)
 PIPELINE 1
-  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=5 loops=2)
-  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=5 loops=2)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=5 loops=2)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=5 loops=2)
+  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
-  SOURCE #6 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=1)
-  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=0 loops=0)
-  SINK #8 CLIENT_RESULT (actual time=<time-range> rows=0 loops=0)
+  SOURCE #6 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #8 CLIENT_RESULT (actual time=<time-range> rows=0 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -242,17 +242,17 @@ FROM join_explain_hash_l AS l
 SEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=2 loops=2)
-  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=1 runtime_filter_installed_count=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=<loops> runtime_filter_installed_count=1)
 PIPELINE 1
-  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=5 loops=2)
-  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=1)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=2 loops=1)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=2 loops=1)
+  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
 PIPELINE 2
-  SOURCE #6 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=1)
-  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=0 loops=0)
-  SINK #8 CLIENT_RESULT (actual time=<time-range> rows=0 loops=0)
+  SOURCE #6 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #8 CLIENT_RESULT (actual time=<time-range> rows=0 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -297,17 +297,17 @@ FROM join_explain_spill_l AS l
 LEFT JOIN join_explain_spill_r AS r ON l.k = r.k;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=512 loops=2)
-  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=512 loops=1 runtime_filter_installed_count=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=512 loops=<loops>)
+  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=512 loops=<loops> runtime_filter_installed_count=1)
 PIPELINE 1
-  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=512 loops=2)
-  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=0 loops=0)
-  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=0 loops=0)
-  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=0 loops=0)
+  SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=512 loops=<loops>)
+  TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #4 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #5 CLIENT_RESULT (actual time=<time-range> rows=0 loops=<loops>)
 PIPELINE 2
-  SOURCE #6 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=512 loops=3)
-  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=512 loops=2)
-  SINK #8 CLIENT_RESULT (actual time=<time-range> rows=512 loops=2)
+  SOURCE #6 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=512 loops=<loops>)
+  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=512 loops=<loops>)
+  SINK #8 CLIENT_RESULT (actual time=<time-range> rows=512 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>

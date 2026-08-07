@@ -370,8 +370,8 @@ impl JoinElimination {
 
     fn join_shape_supported(&self, join: &ComparisonJoin) -> bool {
         join.mark_index.is_none()
-            && join.left_projection_map.is_empty()
-            && join.right_projection_map.is_empty()
+            && join.left_projection_map.len() == join.left.types().len()
+            && join.right_projection_map.len() == join.right.types().len()
             && join.duplicate_eliminated_columns.is_empty()
             && !join.delim_flipped
             && !join.conditions.is_empty()

@@ -228,10 +228,6 @@ pub(crate) fn project_by_index<T: Clone>(
     projection_map: &[usize],
     label: &str,
 ) -> Result<Vec<T>> {
-    if projection_map.is_empty() {
-        return Ok(values.to_vec());
-    }
-
     projection_map
         .iter()
         .map(|&idx| {
@@ -245,17 +241,29 @@ pub(crate) fn project_by_index<T: Clone>(
         .collect()
 }
 
+pub(crate) fn project_or_all_by_index<T: Clone>(
+    values: &[T],
+    projection_map: &[usize],
+    label: &str,
+) -> Result<Vec<T>> {
+    if projection_map.is_empty() {
+        Ok(values.to_vec())
+    } else {
+        project_by_index(values, projection_map, label)
+    }
+}
+
 pub(crate) fn hash_join_left_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
-        _ => canonical_projection(join.left.types().len(), &join.left_projection_map),
+        _ => join.left_projection_map.clone(),
     }
 }
 
 pub(crate) fn hash_join_right_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => Vec::new(),
-        _ => canonical_projection(join.right.types().len(), &join.right_projection_map),
+        _ => join.right_projection_map.clone(),
     }
 }
 
@@ -273,14 +281,6 @@ pub(crate) fn comparison_join_output_names(join: &ComparisonJoin) -> Result<Vec<
         "comparison join right output",
     )?;
     Ok(join_output_names(join.join_type, left_names, right_names))
-}
-
-pub(crate) fn canonical_projection(width: usize, projection_map: &[usize]) -> Vec<usize> {
-    if projection_map.is_empty() {
-        (0..width).collect()
-    } else {
-        projection_map.to_vec()
-    }
 }
 
 pub(crate) fn supports_typed_hash_join_type(join_type: JoinType) -> bool {
@@ -316,14 +316,14 @@ pub(crate) fn is_hash_join_comparison(comparison: JoinComparisonType) -> bool {
 pub(crate) fn nlj_left_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
-        _ => canonical_projection(join.left.types().len(), &join.left_projection_map),
+        _ => join.left_projection_map.clone(),
     }
 }
 
 pub(crate) fn nlj_right_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => Vec::new(),
-        _ => canonical_projection(join.right.types().len(), &join.right_projection_map),
+        _ => join.right_projection_map.clone(),
     }
 }
 

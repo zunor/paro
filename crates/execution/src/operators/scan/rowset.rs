@@ -268,6 +268,15 @@ fn build_scan_morsels(
 }
 
 fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
+    if parallelism <= 1 {
+        // Morsels are scheduling units, not storage batches. With only one
+        // worker there is nobody to steal trailing work, so splitting a
+        // segment merely rebuilds its reader and reopens its columns. Keep one
+        // morsel per segment while respecting step_by's platform-sized input.
+        let max_step = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        return total_rows.max(MIN_ROWSET_MORSEL_ROWS).min(max_step);
+    }
+
     let parallelism = u64::try_from(parallelism).unwrap_or(u64::MAX).max(1);
     total_rows
         .div_ceil(parallelism)
@@ -290,6 +299,7 @@ mod tests {
     fn morsel_policy_handles_empty_and_single_thread_scans() {
         assert_eq!(rowset_morsel_rows(0, 0), MIN_ROWSET_MORSEL_ROWS);
         assert_eq!(rowset_morsel_rows(200_000, 1), 200_000);
+        assert_eq!(rowset_morsel_rows(6_000_000, 1), 6_000_000);
         assert_eq!(
             rowset_morsel_rows(u64::MAX, usize::MAX),
             MIN_ROWSET_MORSEL_ROWS

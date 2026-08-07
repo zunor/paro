@@ -414,11 +414,25 @@ impl PredicateColumnBatch {
         nulls: &mut Vec<u8>,
         row_ends: &mut Vec<usize>,
     ) -> Result<bool> {
+        let estimated_width = match encoding {
+            PredicateColumnReuse::Fixed { width } => width,
+            PredicateColumnReuse::Varlen => 16,
+        };
+        let additional_bytes = rows.len().checked_mul(estimated_width).ok_or_else(|| {
+            paro_error::out_of_memory("Reusable predicate column capacity overflow")
+        })?;
+        // Selected rows become an owned output batch, so one allocation is
+        // unavoidable. Reserve it up front instead of repeatedly growing and
+        // copying the buffer in the per-row append loop.
+        values.reserve(additional_bytes);
+        nulls.reserve(rows.len());
+
         match encoding {
             PredicateColumnReuse::Fixed { width } => {
-                self.append_reusable_fixed_rows(width, rows, values, nulls, row_ends)
+                self.append_reusable_fixed_rows(width, rows, values, nulls)
             }
             PredicateColumnReuse::Varlen => {
+                row_ends.reserve(rows.len());
                 self.append_reusable_varlen_rows(rows, values, nulls, row_ends)
             }
         }
@@ -438,7 +452,6 @@ impl PredicateColumnBatch {
         rows: &[usize],
         values: &mut Vec<u8>,
         nulls: &mut Vec<u8>,
-        row_ends: &mut Vec<usize>,
     ) -> Result<bool> {
         match self {
             Self::Raw(batch) => {
@@ -453,7 +466,6 @@ impl PredicateColumnBatch {
                         paro_error::data_corrupted("Predicate row exceeds the fixed-width batch")
                     })?);
                     nulls.push(batch.nulls.as_ref().map_or(0, |nulls| nulls[row_idx]));
-                    row_ends.push(values.len());
                 }
                 Ok(true)
             }
@@ -474,7 +486,6 @@ impl PredicateColumnBatch {
                         values.resize(end, 0);
                         nulls.push(1);
                     }
-                    row_ends.push(values.len());
                 }
                 Ok(true)
             }

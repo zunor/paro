@@ -316,8 +316,10 @@ impl PhysicalPlanGenerator {
             child_types.len(),
             "order child output",
         )?;
-        let output_names = project_by_index(&child_names, &order.projection_map, "order output")?;
-        let output_types = project_by_index(&child_types, &order.projection_map, "order output")?;
+        let output_names =
+            project_or_all_by_index(&child_names, &order.projection_map, "order output")?;
+        let output_types =
+            project_or_all_by_index(&child_types, &order.projection_map, "order output")?;
         let spec = SortSpec {
             orders: order.orders.clone().into_boxed_slice(),
             projection_map: order.projection_map.clone().into_boxed_slice(),

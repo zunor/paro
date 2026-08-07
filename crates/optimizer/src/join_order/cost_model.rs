@@ -470,6 +470,145 @@ mod tests {
     }
 
     #[test]
+    fn selective_snowflake_path_beats_unfiltered_fact_dimension_path() {
+        // Customer/order/lineitem/supplier/nation/region shape. The redundant
+        // customer=nation edge is the transitive equality that makes the
+        // selective dimension path representable without a Cartesian product.
+        let mut sets = JoinRelationSetManager::new();
+        let filters = vec![
+            create_equality_filter(&mut sets, 0, 0, 1, 1, 0),
+            create_equality_filter(&mut sets, 1, 0, 2, 0, 1),
+            create_equality_filter(&mut sets, 2, 1, 3, 0, 2),
+            create_equality_filter(&mut sets, 0, 1, 3, 1, 3),
+            create_equality_filter(&mut sets, 3, 1, 4, 0, 4),
+            create_equality_filter(&mut sets, 0, 1, 4, 0, 5),
+            create_equality_filter(&mut sets, 4, 1, 5, 0, 6),
+        ];
+        let stats = vec![
+            RelationStats {
+                cardinality: 150_000,
+                column_distinct_count: column_distinct_counts(
+                    0,
+                    [
+                        DistinctCount::new(150_000, false),
+                        DistinctCount::new(150_000, false),
+                    ],
+                ),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 135_000,
+                column_distinct_count: column_distinct_counts(
+                    1,
+                    [
+                        DistinctCount::new(1_500_000, false),
+                        DistinctCount::new(1_500_000, false),
+                    ],
+                ),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 6_001_215,
+                column_distinct_count: column_distinct_counts(
+                    2,
+                    [
+                        DistinctCount::new(6_001_215, false),
+                        DistinctCount::new(6_001_215, false),
+                    ],
+                ),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 10_000,
+                column_distinct_count: column_distinct_counts(
+                    3,
+                    [
+                        DistinctCount::new(10_000, false),
+                        DistinctCount::new(10_000, false),
+                    ],
+                ),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 25,
+                column_distinct_count: column_distinct_counts(
+                    4,
+                    [DistinctCount::new(25, false), DistinctCount::new(5, false)],
+                ),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 1,
+                column_distinct_count: column_distinct_counts(5, [DistinctCount::new(5, false)]),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+        ];
+        let mut model = CostModel::new();
+        model
+            .cardinality_estimator
+            .init_equivalent_relations(&filters);
+        model.init_cost_model(&mut sets, &stats);
+
+        let customer_nation_region = sets.get_relation_from_vec(vec![0, 4, 5]);
+        let customer_orders = sets.get_relation_from_vec(vec![0, 1]);
+        let filtered_orders = sets.get_relation_from_vec(vec![0, 1, 4, 5]);
+        let customer_supplier_nation_region = sets.get_relation_from_vec(vec![0, 3, 4, 5]);
+        let full_join = sets.get_relation_from_vec(vec![0, 1, 2, 3, 4, 5]);
+
+        assert_eq!(model.get_cardinality(&customer_nation_region), 30_000.0);
+        assert_eq!(model.get_cardinality(&customer_orders), 135_000.0);
+        assert_eq!(model.get_cardinality(&filtered_orders), 27_000.0);
+        assert_eq!(
+            model.get_cardinality(&customer_supplier_nation_region),
+            12_000_000.0
+        );
+        assert!((model.get_cardinality(&full_join) - 4_320.8748).abs() < 1e-6);
+    }
+
+    #[test]
+    fn equality_class_uses_each_observed_domain_once() {
+        let mut sets = JoinRelationSetManager::new();
+        let filters = vec![
+            create_equality_filter(&mut sets, 0, 0, 1, 0, 0),
+            create_equality_filter(&mut sets, 1, 0, 2, 0, 1),
+        ];
+        let stats = vec![
+            RelationStats {
+                cardinality: 10,
+                column_distinct_count: column_distinct_counts(0, [DistinctCount::new(10, true)]),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 100,
+                column_distinct_count: column_distinct_counts(1, [DistinctCount::new(100, true)]),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+            RelationStats {
+                cardinality: 1_000,
+                column_distinct_count: column_distinct_counts(2, [DistinctCount::new(1_000, true)]),
+                stats_initialized: true,
+                ..RelationStats::default()
+            },
+        ];
+        let mut model = CostModel::new();
+        model
+            .cardinality_estimator
+            .init_equivalent_relations(&filters);
+        model.init_cost_model(&mut sets, &stats);
+
+        let full_join = sets.get_relation_from_vec(vec![0, 1, 2]);
+        assert_eq!(model.get_cardinality(&full_join), 10.0);
+    }
+
+    #[test]
     fn test_cross_product_cost() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model = CostModel::new();

@@ -149,7 +149,6 @@ PROJECTION  (rows=1)
       Join Type: INNER
       Join Condition: #0 = #0
       Cardinality: [64, 64, 64]
-      Output Schema: k INTEGER, k INTEGER
       ->  ROWSET_SCAN on public.rowset_pushdown_case c
         Columns: k
         Pushed Predicate: col#1 >= 2 AND col#1 <= 8

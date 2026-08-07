@@ -105,27 +105,37 @@ impl std::fmt::Display for JoinType {
 }
 
 fn project_types(child_types: &[LogicalType], projection_map: &[usize]) -> Vec<LogicalType> {
-    if projection_map.is_empty() {
-        child_types.to_vec()
-    } else {
-        projection_map
-            .iter()
-            .filter_map(|&idx| child_types.get(idx).cloned())
-            .collect()
-    }
+    projection_map
+        .iter()
+        .filter_map(|&idx| child_types.get(idx).cloned())
+        .collect()
 }
 
 fn project_bindings(
     child_bindings: &[ColumnBinding],
     projection_map: &[usize],
 ) -> Vec<ColumnBinding> {
-    if projection_map.is_empty() {
-        child_bindings.to_vec()
-    } else {
-        projection_map
-            .iter()
-            .filter_map(|&idx| child_bindings.get(idx).copied())
-            .collect()
+    projection_map
+        .iter()
+        .filter_map(|&idx| child_bindings.get(idx).copied())
+        .collect()
+}
+
+fn full_projection(width: usize) -> Vec<usize> {
+    (0..width).collect()
+}
+
+fn default_join_projections(
+    join_type: JoinType,
+    left_width: usize,
+    right_width: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    match join_type {
+        JoinType::Semi | JoinType::Anti | JoinType::Mark => {
+            (full_projection(left_width), Vec::new())
+        }
+        JoinType::RightSemi | JoinType::RightAnti => (Vec::new(), full_projection(right_width)),
+        _ => (full_projection(left_width), full_projection(right_width)),
     }
 }
 
@@ -333,6 +343,8 @@ impl ComparisonJoin {
         right: LogicalPlan,
         conditions: Vec<JoinCondition>,
     ) -> Self {
+        let (left_projection_map, right_projection_map) =
+            default_join_projections(join_type, left.types().len(), right.types().len());
         Self {
             join_type,
             anti_join_mode: AntiJoinMode::Regular,
@@ -343,8 +355,8 @@ impl ComparisonJoin {
             mark_null_condition_start: matches!(join_type, JoinType::Mark).then_some(0),
             duplicate_eliminated_columns: vec![],
             delim_flipped: false,
-            left_projection_map: vec![],
-            right_projection_map: vec![],
+            left_projection_map,
+            right_projection_map,
         }
     }
 
@@ -422,14 +434,16 @@ impl AnyJoin {
         right: LogicalPlan,
         condition: Expression,
     ) -> Self {
+        let (left_projection_map, right_projection_map) =
+            default_join_projections(join_type, left.types().len(), right.types().len());
         Self {
             join_type,
             left: Box::new(left),
             right: Box::new(right),
             condition,
             mark_index: None,
-            left_projection_map: vec![],
-            right_projection_map: vec![],
+            left_projection_map,
+            right_projection_map,
         }
     }
 
