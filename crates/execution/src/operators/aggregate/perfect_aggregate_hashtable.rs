@@ -19,8 +19,8 @@ use paro_function::aggregate::{
 
 use super::aggregate_kernel::{
     combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
-    input_vectors_for_aggregate, update_filtered_states, update_states, with_aggregate_input_data,
-    AggregatePayload,
+    initialize_state_at_address, input_vectors_for_aggregate, update_filtered_states,
+    update_states, with_aggregate_input_data, AggregatePayload,
 };
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
@@ -295,9 +295,9 @@ impl PerfectAggregateHashTable {
                 *address_data.add(row_idx) = state_ptr;
             }
             if self.occupancy[slot] == 0 {
+                self.initialize_state(state_ptr);
                 self.occupancy[slot] = 1;
                 self.count += 1;
-                self.initialize_state(state_ptr);
                 new_groups.try_set(new_group_count, row_idx)?;
                 new_group_count += 1;
             }
@@ -444,9 +444,9 @@ impl PerfectAggregateHashTable {
                 continue;
             }
             if self.occupancy[slot] == 0 {
+                self.initialize_state(self.state_ptr(slot));
                 self.occupancy[slot] = 1;
                 self.count += 1;
-                self.initialize_state(self.state_ptr(slot));
             }
             source_ptrs.push(other.state_ptr(slot));
             target_ptrs.push(self.state_ptr(slot));
@@ -883,12 +883,11 @@ impl PerfectAggregateHashTable {
     }
 
     fn initialize_state(&self, state_ptr: *mut u8) {
-        for (agg_idx, object) in self.aggregate_objects.iter().enumerate() {
-            let offset = self.state_layout.state_offset(agg_idx);
-            unsafe {
-                (object.function.initialize)(state_ptr.add(offset));
-            }
-        }
+        // SAFETY: callers only pass an unoccupied slot backed by one full
+        // `state_layout` row, before publishing occupancy to consumers.
+        unsafe {
+            initialize_state_at_address(&self.state_layout, &self.aggregate_objects, state_ptr)
+        };
     }
 
     fn validate_group_chunk(&self, groups: &Chunk) -> Result<()> {

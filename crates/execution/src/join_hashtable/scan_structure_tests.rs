@@ -12,6 +12,21 @@ use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use paro_storage::buffer::BufferPool;
 use std::sync::Arc;
 
+#[test]
+fn existence_output_rejects_zero_capacity_without_advancing() {
+    let mut output =
+        SelectionVector::try_with_capacity(1, paro_common::test_utils::test_allocator())
+            .expect("selection allocation");
+    let mut candidate_offset = 0;
+
+    let error =
+        collect_existence_output::<true>(&mut output, &[true], &mut candidate_offset, None, 1, 0)
+            .expect_err("zero-capacity output must not be accepted");
+
+    assert!(error.to_string().contains("non-zero output capacity"));
+    assert_eq!(candidate_offset, 0);
+}
+
 fn create_test_buffer_pool() -> Arc<BufferPool> {
     BufferPool::new_arc(64 * 1024 * 1024)
 }

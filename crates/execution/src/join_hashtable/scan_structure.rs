@@ -547,7 +547,7 @@ impl ScanStructure {
             None,
             left.size(),
             result.capacity(),
-        );
+        )?;
 
         if selected_count == 0 {
             result.set_cardinality(0);
@@ -603,7 +603,7 @@ impl ScanStructure {
             Some(&self.probe_sel),
             self.probe_sel.len(),
             result.capacity(),
-        );
+        )?;
 
         construct_anti_join_result(
             left,
@@ -1220,8 +1220,12 @@ fn collect_existence_output<const MATCH: bool>(
     candidates: Option<&SelectionVector>,
     all_row_count: usize,
     output_capacity: usize,
-) -> (usize, bool) {
-    debug_assert!(output_capacity > 0);
+) -> Result<(usize, bool)> {
+    if output_capacity == 0 {
+        return Err(paro_common::error::internal(
+            "existence join requires a non-zero output capacity",
+        ));
+    }
     let candidate_count = candidates.map_or(all_row_count, SelectionVector::len);
     output.set_len(output_capacity.min(candidate_count));
     let selected_rows = output.as_mut_slice();
@@ -1237,7 +1241,7 @@ fn collect_existence_output<const MATCH: bool>(
     }
     *candidate_offset = cursor;
     output.set_len(selected_count);
-    (selected_count, cursor == candidate_count)
+    Ok((selected_count, cursor == candidate_count))
 }
 
 fn dictionary_gather_is_smaller(

@@ -24,7 +24,14 @@ pub mod distributive;
 pub use crate::scalar::FunctionData;
 
 /// Function to initialize the state.
-/// The state is a raw byte slice of size `state_size`.
+///
+/// # Safety
+///
+/// `state` points to writable storage of at least `state_size` bytes, but that
+/// storage is not guaranteed to be zeroed. Implementations must establish a
+/// valid empty-state representation without reading the previous bytes and
+/// must initialize every field that update/combine/finalize/destructor may
+/// read. Struct padding does not need to be initialized.
 pub type AggregateInitializeFn = unsafe fn(state: *mut u8);
 
 /// Whether `combine` may destructively modify the source state.
@@ -169,7 +176,9 @@ pub enum AggregateComparison {
 /// Evaluate a bound comparison directly against aggregate states.
 ///
 /// Implementations must preserve finalize-time validation (including overflow)
-/// and append matching logical row indices to `selection`.
+/// and append matching logical row indices to `selection`. `constant` has the
+/// aggregate function's exact return type; callers must decline the state fast
+/// path rather than coerce a different type here.
 pub type AggregateStateFilterFn = unsafe fn(
     states: &AggregateStateInput,
     input_data: &AggregateInputData,

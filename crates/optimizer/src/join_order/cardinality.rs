@@ -593,27 +593,27 @@ impl CardinalityEstimator {
     /// semi join against a selective grouped subquery: its output cardinality
     /// already bounds its NDV, whereas a fixed selectivity discards that signal.
     fn semi_anti_output_fraction(&self, filter: &FilterInfoWithTotalDomains) -> f64 {
+        let estimate = if Self::get_comparison_type(&filter.filter_info.filter)
+            == Some(ComparisonKind::Equal)
+        {
+            filter
+                .filter_info
+                .reduction_join_bindings()
+                .and_then(|bindings| {
+                    let preserved = *self.binding_stats.get(&bindings.preserved)?;
+                    let filtering = *self.binding_stats.get(&bindings.filtering)?;
+                    (preserved.distinct_count > 0).then_some((
+                        (filtering.distinct_count as f64
+                            / preserved.distinct_count.max(filtering.distinct_count) as f64)
+                            .clamp(0.0, 1.0),
+                        1.0 / preserved.relation_cardinality.max(1) as f64,
+                    ))
+                })
+        } else {
+            None
+        };
         let (matched_fraction, minimum_output_fraction) =
-            if Self::get_comparison_type(&filter.filter_info.filter) == Some(ComparisonKind::Equal)
-            {
-                filter
-                    .filter_info
-                    .left_binding
-                    .zip(filter.filter_info.right_binding)
-                    .and_then(|(left, right)| {
-                        let left = *self.binding_stats.get(&left)?;
-                        let right = *self.binding_stats.get(&right)?;
-                        (left.distinct_count > 0).then_some((
-                            (right.distinct_count as f64
-                                / left.distinct_count.max(right.distinct_count) as f64)
-                                .clamp(0.0, 1.0),
-                            1.0 / left.relation_cardinality.max(1) as f64,
-                        ))
-                    })
-                    .unwrap_or((DEFAULT_SEMI_ANTI_MATCH_FRACTION, f64::EPSILON))
-            } else {
-                (DEFAULT_SEMI_ANTI_MATCH_FRACTION, f64::EPSILON)
-            };
+            estimate.unwrap_or((DEFAULT_SEMI_ANTI_MATCH_FRACTION, 0.0));
 
         let output_fraction = match filter.filter_info.join_type {
             JoinType::Semi => matched_fraction,

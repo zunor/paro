@@ -208,6 +208,13 @@ fn compile_state_filter(spec: &AggregateSpec) -> Result<Option<PerfectAggregateS
     if aggregate.function.state_filter.is_none() {
         return Ok(None);
     }
+    // State filters compare the function's finalized value directly. Requiring
+    // an exact type match makes casts (including DECIMAL scale changes) an
+    // explicit generic-HAVING boundary instead of relying on binder coercion
+    // details or rounding inside a function-specific fast path.
+    if !state_filter_types_match(&reference.return_type, &aggregate.return_type, &constant) {
+        return Ok(None);
+    }
     let Some(comparison) = map_comparison(comparison_type) else {
         return Ok(None);
     };
@@ -216,6 +223,14 @@ fn compile_state_filter(spec: &AggregateSpec) -> Result<Option<PerfectAggregateS
         comparison,
         constant,
     }))
+}
+
+fn state_filter_types_match(
+    reference_type: &paro_common::types::LogicalType,
+    aggregate_type: &paro_common::types::LogicalType,
+    constant: &paro_common::runtime_value::Value,
+) -> bool {
+    reference_type == aggregate_type && constant.logical_type() == *aggregate_type
 }
 
 fn map_comparison(
@@ -247,4 +262,38 @@ fn invert_comparison(
         ComparisonType::GreaterThanOrEqual => ComparisonType::LessThanOrEqual,
         ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::runtime_value::Value;
+    use paro_common::types::LogicalType;
+
+    use super::state_filter_types_match;
+
+    #[test]
+    fn state_filter_requires_the_exact_finalized_value_type() {
+        let decimal_38_2 = LogicalType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        assert!(state_filter_types_match(
+            &decimal_38_2,
+            &decimal_38_2,
+            &Value::Decimal(30_000, 38, 2),
+        ));
+        assert!(!state_filter_types_match(
+            &decimal_38_2,
+            &decimal_38_2,
+            &Value::Decimal(300_001, 38, 3),
+        ));
+        assert!(!state_filter_types_match(
+            &LogicalType::Decimal {
+                precision: 38,
+                scale: 3,
+            },
+            &decimal_38_2,
+            &Value::Decimal(30_000, 38, 2),
+        ));
+    }
 }

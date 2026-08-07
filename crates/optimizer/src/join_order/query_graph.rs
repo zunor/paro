@@ -39,6 +39,18 @@ pub struct FilterInfo {
     pub right_binding: Option<ColumnBinding>,
 }
 
+/// Directional equality bindings for a reduction join.
+///
+/// SEMI and ANTI joins preserve their logical left side and use the logical
+/// right side only to decide whether a preserved row survives. Naming the two
+/// roles prevents cardinality code from silently reversing directional
+/// estimates such as `filtering_ndv / preserved_ndv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReductionJoinBindings {
+    pub preserved: ColumnBinding,
+    pub filtering: ColumnBinding,
+}
+
 impl FilterInfo {
     /// Create a new FilterInfo.
     pub fn new(
@@ -90,6 +102,34 @@ impl FilterInfo {
     /// Set the right column binding.
     pub fn set_right_binding(&mut self, binding: ColumnBinding) {
         self.right_binding = Some(binding);
+    }
+
+    /// Return equality-key bindings with reduction-join semantics attached.
+    ///
+    /// Filter extraction preserves the logical expression orientation for
+    /// SEMI/ANTI joins: the left expression belongs to the preserved input and
+    /// the right expression belongs to the filtering input.
+    pub(crate) fn reduction_join_bindings(&self) -> Option<ReductionJoinBindings> {
+        if !matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+            return None;
+        }
+        let bindings = ReductionJoinBindings {
+            preserved: self.left_binding?,
+            filtering: self.right_binding?,
+        };
+        debug_assert!(
+            self.left_set
+                .as_ref()
+                .is_none_or(|set| set.contains(bindings.preserved.table_index)),
+            "reduction-join preserved binding must belong to its left relation set"
+        );
+        debug_assert!(
+            self.right_set
+                .as_ref()
+                .is_none_or(|set| set.contains(bindings.filtering.table_index)),
+            "reduction-join filtering binding must belong to its right relation set"
+        );
+        Some(bindings)
     }
 }
 
@@ -402,6 +442,30 @@ mod tests {
         assert!(filter.right_set.is_some());
         assert!(filter.left_binding.is_some());
         assert!(filter.right_binding.is_some());
+        assert!(filter.reduction_join_bindings().is_none());
+    }
+
+    #[test]
+    fn reduction_join_bindings_name_preserved_and_filtering_sides() {
+        let mut manager = JoinRelationSetManager::new();
+        let set = manager.get_relation_from_vec(vec![0, 1]);
+        let expr = Expression::Constant(ConstantExpression {
+            value: Value::Boolean(true),
+            return_type: LogicalType::Boolean,
+        });
+        let mut filter = FilterInfo::new(expr, set, 0, JoinType::Semi, AntiJoinMode::Regular);
+        filter.set_left_set(manager.get_relation(0));
+        filter.set_right_set(manager.get_relation(1));
+        filter.set_left_binding(ColumnBinding::new(0, 2));
+        filter.set_right_binding(ColumnBinding::new(1, 3));
+
+        assert_eq!(
+            filter.reduction_join_bindings(),
+            Some(ReductionJoinBindings {
+                preserved: ColumnBinding::new(0, 2),
+                filtering: ColumnBinding::new(1, 3),
+            })
+        );
     }
 
     #[test]

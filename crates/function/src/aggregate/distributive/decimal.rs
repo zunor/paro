@@ -741,13 +741,20 @@ fn filter_sum_values(
     count: usize,
     mut value_at: impl FnMut(usize) -> Result<Option<i128>>,
 ) -> Result<usize> {
-    let paro_common::runtime_value::Value::Decimal(constant, _, constant_scale) = constant else {
+    let paro_common::runtime_value::Value::Decimal(constant, constant_precision, constant_scale) =
+        constant
+    else {
         return Err(paro_error::internal(format!(
             "decimal aggregate state filter requires DECIMAL constant, got {constant:?}"
         )));
     };
-    let constant = rescale_checked(*constant, *constant_scale, data.output_scale)
-        .ok_or_else(|| paro_error::out_of_range("Decimal state-filter scale overflow"))?;
+    if (*constant_precision, *constant_scale) != (data.output_precision, data.output_scale) {
+        return Err(paro_error::internal(format!(
+            "decimal aggregate state-filter constant type mismatch: expected=DECIMAL({}, {}) actual=DECIMAL({constant_precision}, {constant_scale})",
+            data.output_precision, data.output_scale
+        )));
+    }
+    let constant = *constant;
     if selection.capacity() < count {
         return Err(paro_error::internal(format!(
             "aggregate state-filter selection too small: capacity={}, count={count}",
@@ -1068,6 +1075,19 @@ mod tests {
         .unwrap();
         assert_eq!(selected, 1);
         assert_eq!(selection.as_slice(), &[2]);
+
+        let error = unsafe {
+            filter_narrow_sum_state(
+                &state_input,
+                &input_data,
+                AggregateComparison::GreaterThan,
+                &paro_common::runtime_value::Value::Decimal(300_000, 38, 3),
+                &mut selection,
+                states.len(),
+            )
+        }
+        .unwrap_err();
+        assert!(error.to_string().contains("constant type mismatch"));
 
         states[0].set_value(10_i128.pow(38));
         let error = unsafe {
