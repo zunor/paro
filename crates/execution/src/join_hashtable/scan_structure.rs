@@ -58,10 +58,10 @@ pub struct ScanStructure {
     pending_match_offset: usize,
     /// Matched build row per probe row for a SINGLE join (zero means unmatched).
     single_match_pointers: Vec<usize>,
-    /// Next SINGLE-join probe row to emit.
-    single_output_offset: usize,
-    /// Whether all SINGLE-join chains have been validated and collected.
-    single_matches_ready: bool,
+    /// Next probe row (or candidate row) to emit for one-row-per-probe joins.
+    probe_output_offset: usize,
+    /// Whether all match chains have been collected for one-row-per-probe joins.
+    probe_matches_ready: bool,
     /// Reusable probe hash buffer.
     pub hashes: Vec<u64>,
     /// Reusable flags for residual-filtered probe rows.
@@ -220,8 +220,8 @@ impl ScanStructure {
             pending_match_count: 0,
             pending_match_offset: 0,
             single_match_pointers: vec![0; VECTOR_SIZE],
-            single_output_offset: 0,
-            single_matches_ready: false,
+            probe_output_offset: 0,
+            probe_matches_ready: false,
             hashes: vec![0; VECTOR_SIZE],
             accepted_flags: vec![false; VECTOR_SIZE],
             match_count: 0,
@@ -270,8 +270,8 @@ impl ScanStructure {
         self.exact_key_matches = false;
         self.pending_match_count = 0;
         self.pending_match_offset = 0;
-        self.single_output_offset = 0;
-        self.single_matches_ready = false;
+        self.probe_output_offset = 0;
+        self.probe_matches_ready = false;
         for i in 0..self.pointers.len() {
             self.found_match[i] = false;
             self.pointers[i] = 0;
@@ -535,18 +535,19 @@ impl ScanStructure {
             return Ok(0);
         }
 
-        self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
-
-        self.scratch_sel.set_len(left.size());
-        let mut selected_count = 0usize;
-        let selected_rows = self.scratch_sel.as_mut_slice();
-        for idx in 0..left.size() {
-            if self.found_match[idx] == MATCH {
-                selected_rows[selected_count] = idx as u32;
-                selected_count += 1;
-            }
+        if !self.probe_matches_ready {
+            self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
+            self.probe_matches_ready = true;
         }
-        self.scratch_sel.set_len(selected_count);
+
+        let (selected_count, finished) = collect_existence_output::<MATCH>(
+            &mut self.scratch_sel,
+            &self.found_match,
+            &mut self.probe_output_offset,
+            None,
+            left.size(),
+            result.capacity(),
+        );
 
         if selected_count == 0 {
             result.set_cardinality(0);
@@ -568,7 +569,7 @@ impl ScanStructure {
             )?;
         }
 
-        self.finished = true;
+        self.finished = finished;
         Ok(result.size())
     }
 
@@ -590,19 +591,19 @@ impl ScanStructure {
             return Ok(0);
         }
 
-        self.scan_key_matches_with_filter(keys, hash_table, Self::accept_all_matches)?;
-
-        self.scratch_sel.set_len(self.probe_sel.len());
-        let mut selected_count = 0usize;
-        let selected_rows = self.scratch_sel.as_mut_slice();
-        for candidate_idx in 0..self.probe_sel.len() {
-            let row_idx = self.probe_sel.get(candidate_idx);
-            if !self.found_match[row_idx] {
-                selected_rows[selected_count] = row_idx as u32;
-                selected_count += 1;
-            }
+        if !self.probe_matches_ready {
+            self.scan_key_matches_with_filter(keys, hash_table, Self::accept_all_matches)?;
+            self.probe_matches_ready = true;
         }
-        self.scratch_sel.set_len(selected_count);
+
+        let (selected_count, finished) = collect_existence_output::<false>(
+            &mut self.scratch_sel,
+            &self.found_match,
+            &mut self.probe_output_offset,
+            Some(&self.probe_sel),
+            self.probe_sel.len(),
+            result.capacity(),
+        );
 
         construct_anti_join_result(
             left,
@@ -611,7 +612,7 @@ impl ScanStructure {
             left_projection_map,
             result,
         )?;
-        self.finished = true;
+        self.finished = finished;
         Ok(result.size())
     }
 
@@ -1007,7 +1008,7 @@ impl ScanStructure {
             return Ok(0);
         }
 
-        if !self.single_matches_ready {
+        if !self.probe_matches_ready {
             self.single_match_pointers[..left.size()].fill(0);
             while self.count > 0 {
                 let match_count = self.resolve_predicates(keys, hash_table, 0);
@@ -1033,14 +1034,14 @@ impl ScanStructure {
 
                 self.advance_pointers();
             }
-            self.single_matches_ready = true;
+            self.probe_matches_ready = true;
         }
 
-        let emit_count = (left.size() - self.single_output_offset).min(result.capacity());
+        let emit_count = (left.size() - self.probe_output_offset).min(result.capacity());
         let mut left_sel = SelectionVector::try_with_capacity(emit_count, self.allocator.clone())?;
         left_sel.set_len(emit_count);
         for output_idx in 0..emit_count {
-            left_sel.set(output_idx, self.single_output_offset + output_idx);
+            left_sel.set(output_idx, self.probe_output_offset + output_idx);
         }
         let left_indices: Vec<usize> = if left_projection_map.is_empty() {
             (0..left.column_count()).collect()
@@ -1065,7 +1066,7 @@ impl ScanStructure {
             let vector = result
                 .column_mut(right_offset + out_idx)
                 .expect("single join output vector must exist");
-            let start = self.single_output_offset;
+            let start = self.probe_output_offset;
             let row_ptrs = &self.single_match_pointers[start..start + emit_count];
             // SAFETY: match pointers are either zero for an unmatched probe row
             // or were obtained from `hash_table` while probing it.
@@ -1073,8 +1074,8 @@ impl ScanStructure {
         }
 
         result.set_cardinality(emit_count);
-        self.single_output_offset += emit_count;
-        self.finished = self.single_output_offset == left.size();
+        self.probe_output_offset += emit_count;
+        self.finished = self.probe_output_offset == left.size();
         Ok(result.size())
     }
 
@@ -1210,6 +1211,33 @@ impl ScanStructure {
         }
         Ok(self.rhs_unique_pointers.len())
     }
+}
+
+fn collect_existence_output<const MATCH: bool>(
+    output: &mut SelectionVector,
+    found_match: &[bool],
+    candidate_offset: &mut usize,
+    candidates: Option<&SelectionVector>,
+    all_row_count: usize,
+    output_capacity: usize,
+) -> (usize, bool) {
+    debug_assert!(output_capacity > 0);
+    let candidate_count = candidates.map_or(all_row_count, SelectionVector::len);
+    output.set_len(output_capacity.min(candidate_count));
+    let selected_rows = output.as_mut_slice();
+    let mut selected_count = 0usize;
+    let mut cursor = *candidate_offset;
+    while cursor < candidate_count && selected_count < output_capacity {
+        let row_idx = candidates.map_or(cursor, |selection| selection.get(cursor));
+        if found_match[row_idx] == MATCH {
+            selected_rows[selected_count] = row_idx as u32;
+            selected_count += 1;
+        }
+        cursor += 1;
+    }
+    *candidate_offset = cursor;
+    output.set_len(selected_count);
+    (selected_count, cursor == candidate_count)
 }
 
 fn dictionary_gather_is_smaller(

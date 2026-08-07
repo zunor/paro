@@ -272,6 +272,56 @@ fn test_next_semi_anti_and_mark_join() {
 }
 
 #[test]
+fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
+    let row_count = VECTOR_SIZE * 2;
+    let keys = (0..row_count as i32).collect::<Vec<_>>();
+    let payload = keys.clone();
+    let mut result =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], VECTOR_SIZE);
+
+    let semi_table = build_hash_table(JoinType::Semi, &keys, &payload);
+    let (mut semi_scan, probe_keys, left) = prepare_probe(&semi_table, &keys);
+    for batch in 0..2 {
+        let count = semi_scan
+            .next_semi_join(&probe_keys, &left, &mut result, &semi_table, &[])
+            .unwrap();
+        assert_eq!(count, VECTOR_SIZE);
+        assert_eq!(
+            result.data[0].get_value(0),
+            Value::Integer((batch * VECTOR_SIZE) as i32)
+        );
+    }
+    assert!(semi_scan.finished);
+
+    let anti_table = build_hash_table(JoinType::Anti, &[-1], &[-1]);
+    let (mut anti_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
+    for batch in 0..2 {
+        let count = anti_scan
+            .next_anti_join(&probe_keys, &left, &mut result, &anti_table, &[])
+            .unwrap();
+        assert_eq!(count, VECTOR_SIZE);
+        assert_eq!(
+            result.data[0].get_value(0),
+            Value::Integer((batch * VECTOR_SIZE) as i32)
+        );
+    }
+    assert!(anti_scan.finished);
+
+    let (mut null_aware_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
+    for batch in 0..2 {
+        let count = null_aware_scan
+            .next_null_aware_anti_join(&probe_keys, &left, &mut result, &anti_table, &[])
+            .unwrap();
+        assert_eq!(count, VECTOR_SIZE);
+        assert_eq!(
+            result.data[0].get_value(0),
+            Value::Integer((batch * VECTOR_SIZE) as i32)
+        );
+    }
+    assert!(null_aware_scan.finished);
+}
+
+#[test]
 fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
     let ht = build_hash_table_from_optional(
         JoinType::Semi,
