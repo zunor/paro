@@ -298,6 +298,14 @@ impl Parallelism {
         }
     }
 
+    pub fn bounded(max: usize) -> Self {
+        Self {
+            min: 1,
+            max: max.max(1),
+            saturates_threads: true,
+        }
+    }
+
     pub fn merge(self, other: Self) -> Self {
         Self {
             min: self.min.max(other.min),

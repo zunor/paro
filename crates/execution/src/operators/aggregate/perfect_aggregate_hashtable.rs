@@ -3,7 +3,7 @@
 
 //! Perfect-hash aggregate hash table with direct array indexing.
 
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::sync::Arc;
 
 use paro_common::allocator::{Allocator, ArenaAllocator, MemoryTag};
@@ -13,7 +13,9 @@ use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingC
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DecodedVectorRef, SelectionVector, Vector};
-use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
+use paro_function::aggregate::{
+    AggregateCombineType, AggregateComparison, AggregateInputData, AggregateStateInput,
+};
 
 use super::aggregate_kernel::{
     combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
@@ -24,10 +26,99 @@ use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
 use super::perfect_hash_key::PerfectHashKeyDomain;
 
-/// Scan cursor for [`PerfectAggregateHashTable::scan`].
+/// Scan cursor for a perfect aggregate hash table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PerfectHTScanPosition {
     pub offset: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct PerfectAggregateScanScratch {
+    slots: Vec<usize>,
+    state_addresses: Vector,
+    aggregates: Chunk,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PerfectAggregateStateFilter {
+    pub aggregate_index: usize,
+    pub comparison: AggregateComparison,
+    pub constant: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PerfectHashSlotLayout {
+    cardinalities: Vec<usize>,
+    strides: Vec<usize>,
+    slot_count: usize,
+}
+
+impl PerfectHashSlotLayout {
+    fn try_new(cardinalities: Vec<usize>) -> Result<Self> {
+        let mut strides = vec![0; cardinalities.len()];
+        let mut slot_count = 1usize;
+        for group_idx in (0..cardinalities.len()).rev() {
+            let cardinality = cardinalities[group_idx];
+            if cardinality < 2 {
+                return Err(paro_error::internal(format!(
+                    "Invalid perfect aggregate key cardinality: group_idx={group_idx}, cardinality={cardinality}"
+                )));
+            }
+            strides[group_idx] = slot_count;
+            slot_count = slot_count.checked_mul(cardinality).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Perfect aggregate slot count overflow: slots={slot_count}, cardinality={cardinality}"
+                ))
+            })?;
+        }
+        Ok(Self {
+            cardinalities,
+            strides,
+            slot_count,
+        })
+    }
+
+    fn add_component(&self, slot: usize, group_idx: usize, encoded: usize) -> Result<usize> {
+        let cardinality = self.cardinalities[group_idx];
+        if encoded >= cardinality {
+            return Err(paro_error::internal(format!(
+                "Perfect aggregate encoded key exceeds domain: encoded={encoded}, cardinality={cardinality}, group_idx={group_idx}"
+            )));
+        }
+        slot.checked_add(
+            encoded
+                .checked_mul(self.strides[group_idx])
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Perfect aggregate slot component overflow: encoded={encoded}, stride={}, group_idx={group_idx}",
+                        self.strides[group_idx]
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            paro_error::internal(format!(
+                "Perfect aggregate slot overflow: slot={slot}, group_idx={group_idx}"
+            ))
+        })
+    }
+
+    fn decode_component(&self, slot: usize, group_idx: usize) -> usize {
+        (slot / self.strides[group_idx]) % self.cardinalities[group_idx]
+    }
+}
+
+impl PerfectAggregateScanScratch {
+    pub(crate) fn try_new(
+        aggregate_types: &[LogicalType],
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        Ok(Self {
+            slots: Vec::with_capacity(capacity),
+            state_addresses: Vector::try_new(LogicalType::BigInt, capacity, allocator.clone())?,
+            aggregates: Chunk::try_initialize(aggregate_types, capacity, allocator)?,
+        })
+    }
 }
 
 /// Direct-addressing aggregate table used by perfect-hash GROUP BY.
@@ -35,17 +126,17 @@ pub struct PerfectHTScanPosition {
 pub struct PerfectAggregateHashTable {
     group_domains: Vec<PerfectHashKeyDomain>,
     group_minima: Vec<i128>,
-    required_bits: Vec<usize>,
-    bit_offsets: Vec<usize>,
-    total_groups: usize,
+    slot_layout: PerfectHashSlotLayout,
     state_layout: AggregateStateLayout,
     aggregate_objects: Vec<AggregateObject>,
     aggregate_inputs: Vec<Vec<usize>>,
-    aggregate_return_types: Vec<LogicalType>,
     // 0 = empty, 1 = occupied
     occupancy: AccountedVec<u8>,
     // Keep row storage 8-byte aligned so aggregate states can be safely cast to typed pointers.
-    data: AccountedVec<u64>,
+    // Slots are initialized lazily when their occupancy bit transitions from
+    // empty to occupied. MaybeUninit makes that lifecycle explicit and avoids
+    // touching the entire direct-addressing domain up front.
+    data: AccountedVec<MaybeUninit<u64>>,
     row_width: usize,
     aggregate_allocator: ArenaAllocator,
     count: usize,
@@ -57,7 +148,7 @@ impl PerfectAggregateHashTable {
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         group_minima: Vec<i128>,
-        required_bits: Vec<usize>,
+        group_cardinalities: Vec<usize>,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         Self::new_with_memory(
@@ -65,7 +156,7 @@ impl PerfectAggregateHashTable {
             aggregate_objects,
             aggregate_inputs,
             group_minima,
-            required_bits,
+            group_cardinalities,
             allocator,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
@@ -79,7 +170,7 @@ impl PerfectAggregateHashTable {
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         group_minima: Vec<i128>,
-        required_bits: Vec<usize>,
+        group_cardinalities: Vec<usize>,
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
@@ -88,12 +179,13 @@ impl PerfectAggregateHashTable {
                 "PerfectAggregateHashTable requires at least one group key".to_string(),
             ));
         }
-        if group_types.len() != group_minima.len() || group_types.len() != required_bits.len() {
+        if group_types.len() != group_minima.len() || group_types.len() != group_cardinalities.len()
+        {
             return Err(paro_error::internal(format!(
-                "PerfectAggregateHashTable group metadata mismatch: types={} minima={} bits={}",
+                "PerfectAggregateHashTable group metadata mismatch: types={} minima={} cardinalities={}",
                 group_types.len(),
                 group_minima.len(),
-                required_bits.len()
+                group_cardinalities.len()
             )));
         }
         let group_domains = group_types
@@ -108,42 +200,8 @@ impl PerfectAggregateHashTable {
             .collect::<Result<Vec<_>>>()?;
         validate_aggregate_inputs(&aggregate_objects, &aggregate_inputs)?;
 
-        let mut bit_offsets = Vec::with_capacity(required_bits.len());
-        let mut total_bits = 0usize;
-        for &bits in &required_bits {
-            if bits == 0 || bits >= usize::BITS as usize {
-                return Err(paro_error::internal(format!(
-                    "Invalid required bits for perfect aggregate hash table: bits={bits}"
-                )));
-            }
-            total_bits = total_bits.checked_add(bits).ok_or_else(|| {
-                paro_error::internal(format!(
-                    "Perfect aggregate bit width overflow: total_bits={total_bits} + bits={bits}"
-                ))
-            })?;
-        }
-        if total_bits >= usize::BITS as usize {
-            return Err(paro_error::internal(format!(
-                "Perfect aggregate bit width exceeds pointer width: total_bits={total_bits}"
-            )));
-        }
-
-        let mut shift = total_bits;
-        for &bits in &required_bits {
-            shift -= bits;
-            bit_offsets.push(shift);
-        }
-
-        let total_groups = 1usize.checked_shl(total_bits as u32).ok_or_else(|| {
-            paro_error::internal(format!(
-                "Perfect aggregate slot count overflow for total_bits={total_bits}"
-            ))
-        })?;
-        if total_groups == 0 {
-            return Err(paro_error::internal(
-                "Perfect aggregate slot count resolved to zero".to_string(),
-            ));
-        }
+        let slot_layout = PerfectHashSlotLayout::try_new(group_cardinalities)?;
+        let total_groups = slot_layout.slot_count;
 
         let state_layout = AggregateStateLayout::new(&aggregate_objects)?;
         let row_width = state_layout.total_size().max(1);
@@ -158,28 +216,20 @@ impl PerfectAggregateHashTable {
             MemoryTag::HashTable,
             MemoryAccountingClass::Revocable,
         )?;
-        data.try_resize_with(total_words, || 0)?;
+        data.try_resize_with(total_words, MaybeUninit::uninit)?;
         let mut occupancy = accounted_vec_for_context(
             &memory.with_class(MemoryAccountingClass::Metadata),
             MemoryTag::HashTable,
             MemoryAccountingClass::Metadata,
         )?;
         occupancy.try_resize_with(total_groups, || 0)?;
-        let aggregate_return_types = aggregate_objects
-            .iter()
-            .map(|obj| obj.return_type.clone())
-            .collect::<Vec<_>>();
-
         Ok(Self {
             group_domains,
             group_minima,
-            required_bits,
-            bit_offsets,
-            total_groups,
+            slot_layout,
             state_layout,
             aggregate_objects,
             aggregate_inputs,
-            aggregate_return_types,
             occupancy,
             data,
             row_width,
@@ -193,7 +243,7 @@ impl PerfectAggregateHashTable {
     }
 
     pub fn total_groups(&self) -> usize {
-        self.total_groups
+        self.slot_layout.slot_count
     }
 
     pub fn allocator(&self) -> Arc<dyn Allocator> {
@@ -385,11 +435,11 @@ impl PerfectAggregateHashTable {
         }
 
         let mut source_ptrs =
-            Vec::with_capacity(self.total_groups.min(paro_common::vector::VECTOR_SIZE));
+            Vec::with_capacity(self.total_groups().min(paro_common::vector::VECTOR_SIZE));
         let mut target_ptrs =
-            Vec::with_capacity(self.total_groups.min(paro_common::vector::VECTOR_SIZE));
+            Vec::with_capacity(self.total_groups().min(paro_common::vector::VECTOR_SIZE));
 
-        for slot in 0..self.total_groups {
+        for slot in 0..self.total_groups() {
             if other.occupancy[slot] == 0 {
                 continue;
             }
@@ -414,106 +464,249 @@ impl PerfectAggregateHashTable {
         Ok(())
     }
 
-    /// Scan grouped keys + finalized aggregate values into `result`.
-    ///
-    /// Returns `true` if output rows were produced, `false` when scan is complete.
-    pub fn scan(
+    pub(crate) fn scan_with_scratch(
         &mut self,
         position: &mut PerfectHTScanPosition,
         result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
     ) -> Result<bool> {
-        let group_count = self.group_domains.len();
-        let aggregate_count = self.aggregate_objects.len();
-        let required_columns = group_count + aggregate_count;
-        if result.column_count() < required_columns {
-            return Err(paro_error::internal(format!(
-                "Result chunk has insufficient columns for perfect aggregate scan: required={required_columns}, actual={}",
-                result.column_count()
-            )));
-        }
-        if position.offset >= self.total_groups {
+        if !self.collect_occupied_slots(position, result.capacity(), &mut scratch.slots) {
             result.try_set_cardinality(0)?;
             return Ok(false);
         }
+        self.finalize_slots(scratch)?;
+        self.write_selected_slots(result, scratch, None)?;
+        Ok(true)
+    }
 
-        let mut slots = Vec::with_capacity(result.capacity());
+    pub(crate) fn scan_with_aggregate_filter(
+        &mut self,
+        position: &mut PerfectHTScanPosition,
+        result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
+        selection: &mut SelectionVector,
+        mut select: impl FnMut(&Chunk, usize, &mut SelectionVector) -> Result<usize>,
+    ) -> Result<bool> {
+        loop {
+            if !self.collect_occupied_slots(position, result.capacity(), &mut scratch.slots) {
+                result.try_set_cardinality(0)?;
+                return Ok(false);
+            }
+            self.finalize_slots(scratch)?;
+            let selected_count = select(&scratch.aggregates, scratch.slots.len(), selection)?;
+            if selected_count == 0 {
+                continue;
+            }
+            self.write_selected_slots(result, scratch, Some(selection))?;
+            return Ok(true);
+        }
+    }
+
+    pub(crate) fn scan_with_state_filter(
+        &mut self,
+        position: &mut PerfectHTScanPosition,
+        result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
+        selection: &mut SelectionVector,
+        filter: &PerfectAggregateStateFilter,
+    ) -> Result<bool> {
+        let object = self
+            .aggregate_objects
+            .get(filter.aggregate_index)
+            .ok_or_else(|| {
+                paro_error::internal(format!(
+                    "perfect aggregate state-filter index out of bounds: index={}, aggregates={}",
+                    filter.aggregate_index,
+                    self.aggregate_objects.len()
+                ))
+            })?;
+        let state_filter = object.function.state_filter.ok_or_else(|| {
+            paro_error::internal(format!(
+                "aggregate {} does not implement state filtering",
+                object.function.name
+            ))
+        })?;
+        loop {
+            if !self.collect_occupied_slots(position, result.capacity(), &mut scratch.slots) {
+                result.try_set_cardinality(0)?;
+                return Ok(false);
+            }
+            self.populate_state_addresses(scratch)?;
+            let states = AggregateStateInput::try_new(
+                &scratch.state_addresses,
+                self.state_layout.state_offset(filter.aggregate_index),
+                None,
+                scratch.slots.len(),
+            )?;
+            let mut input_data = AggregateInputData::new(
+                object.bind_info.as_deref(),
+                &mut self.aggregate_allocator,
+                AggregateCombineType::PreserveInput,
+            );
+            let selected = unsafe {
+                state_filter(
+                    &states,
+                    &input_data,
+                    filter.comparison,
+                    &filter.constant,
+                    selection,
+                    scratch.slots.len(),
+                )?
+            };
+            if selected == 0 {
+                continue;
+            }
+            compact_state_addresses(&mut scratch.state_addresses, selection, selected)?;
+            finalize_states(
+                &self.aggregate_objects,
+                &mut input_data,
+                &scratch.state_addresses,
+                &mut scratch.aggregates,
+                selected,
+            )?;
+            self.write_state_filtered_slots(result, scratch, selection, selected)?;
+            return Ok(true);
+        }
+    }
+
+    fn collect_occupied_slots(
+        &self,
+        position: &mut PerfectHTScanPosition,
+        capacity: usize,
+        slots: &mut Vec<usize>,
+    ) -> bool {
+        slots.clear();
         let mut cursor = position.offset;
-        while cursor < self.total_groups && slots.len() < result.capacity() {
+        while cursor < self.total_groups() && slots.len() < capacity {
             if self.occupancy[cursor] != 0 {
                 slots.push(cursor);
             }
             cursor += 1;
         }
         position.offset = cursor;
+        !slots.is_empty()
+    }
 
-        if slots.is_empty() {
-            result.try_set_cardinality(0)?;
-            return Ok(false);
+    fn finalize_slots(&mut self, scratch: &mut PerfectAggregateScanScratch) -> Result<()> {
+        let count = scratch.slots.len();
+        self.populate_state_addresses(scratch)?;
+        let mut input_data = AggregateInputData::new(
+            None,
+            &mut self.aggregate_allocator,
+            AggregateCombineType::PreserveInput,
+        );
+        finalize_states(
+            &self.aggregate_objects,
+            &mut input_data,
+            &scratch.state_addresses,
+            &mut scratch.aggregates,
+            count,
+        )
+    }
+
+    fn populate_state_addresses(&self, scratch: &mut PerfectAggregateScanScratch) -> Result<()> {
+        scratch.state_addresses.try_set_count(scratch.slots.len())?;
+        // SAFETY: the address vector has one pointer-width slot per selected
+        // group and every occupied slot owns initialized aggregate state.
+        unsafe {
+            let addresses = scratch.state_addresses.flat_data_mut::<*mut u8>();
+            for (row_idx, &slot) in scratch.slots.iter().enumerate() {
+                *addresses.add(row_idx) = self.state_ptr(slot);
+            }
         }
+        Ok(())
+    }
 
-        result.try_set_cardinality(slots.len())?;
-
-        for group_idx in 0..group_count {
-            let result_vector = result.column_mut(group_idx).ok_or_else(|| {
+    fn write_selected_slots(
+        &self,
+        result: &mut Chunk,
+        scratch: &PerfectAggregateScanScratch,
+        selection: Option<&SelectionVector>,
+    ) -> Result<()> {
+        let count = selection.map_or(scratch.slots.len(), SelectionVector::len);
+        result.try_set_cardinality(count)?;
+        for group_idx in 0..self.group_domains.len() {
+            let target = result.column_mut(group_idx).ok_or_else(|| {
                 paro_error::internal(format!(
-                    "Missing group output column {group_idx} while scanning perfect aggregate hash table"
+                    "Missing group output column {group_idx} in perfect aggregate scan"
                 ))
             })?;
-            result_vector.try_set_count(slots.len())?;
-            for (row_idx, &slot) in slots.iter().enumerate() {
+            target.try_set_count(count)?;
+            for output_row in 0..count {
+                let source_row = selection.map_or(output_row, |sel| sel.get(output_row));
+                let slot = scratch.slots[source_row];
                 match self.decode_group_value(slot, group_idx)? {
-                    Some(value) => result_vector.set_value(row_idx, &value),
-                    None => result_vector.try_set_null(row_idx, true)?,
+                    Some(value) => target.set_value(output_row, &value),
+                    None => target.try_set_null(output_row, true)?,
                 }
             }
         }
-
-        if aggregate_count > 0 {
-            let mut state_addresses =
-                Vector::try_new(LogicalType::BigInt, slots.len(), result.allocator().clone())?;
-            state_addresses.try_set_count(slots.len())?;
-            unsafe {
-                let address_data = state_addresses.flat_data_mut::<*mut u8>();
-                for (row_idx, &slot) in slots.iter().enumerate() {
-                    *address_data.add(row_idx) = self.state_ptr(slot);
-                }
-            }
-
-            let mut aggregate_chunk = Chunk::try_initialize(
-                &self.aggregate_return_types,
-                slots.len(),
-                result.allocator().clone(),
-            )?;
-            let mut input_data = AggregateInputData::new(
-                None,
-                &mut self.aggregate_allocator,
-                AggregateCombineType::PreserveInput,
-            );
-            finalize_states(
-                &self.aggregate_objects,
-                &mut input_data,
-                &state_addresses,
-                &mut aggregate_chunk,
-                slots.len(),
-            )?;
-
-            for agg_idx in 0..aggregate_count {
-                let source = aggregate_chunk.column(agg_idx).ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "Missing finalized aggregate column {agg_idx} in perfect aggregate scan chunk"
-                    ))
-                })?;
-                let target = result.column_mut(group_count + agg_idx).ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "Missing aggregate output column {} while scanning perfect aggregate hash table",
-                        group_count + agg_idx
-                    ))
-                })?;
-                target.try_copy_range(0, source.as_ref(), 0, slots.len())?;
+        for aggregate_idx in 0..self.aggregate_objects.len() {
+            let source = scratch.aggregates.column(aggregate_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Missing finalized aggregate scratch column {aggregate_idx}"
+                ))
+            })?;
+            let target_idx = self.group_domains.len() + aggregate_idx;
+            let target = result.column_mut(target_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Missing aggregate output column {target_idx} in perfect aggregate scan"
+                ))
+            })?;
+            if let Some(selection) = selection {
+                target.try_copy_selection(
+                    0,
+                    source.as_ref(),
+                    &paro_common::vector::VectorSelection::from(selection),
+                    count,
+                )?;
+            } else {
+                target.try_copy_range(0, source.as_ref(), 0, count)?;
             }
         }
+        Ok(())
+    }
 
-        Ok(true)
+    fn write_state_filtered_slots(
+        &self,
+        result: &mut Chunk,
+        scratch: &PerfectAggregateScanScratch,
+        selection: &SelectionVector,
+        count: usize,
+    ) -> Result<()> {
+        result.try_set_cardinality(count)?;
+        for group_idx in 0..self.group_domains.len() {
+            let target = result.column_mut(group_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Missing group output column {group_idx} in perfect aggregate state filter"
+                ))
+            })?;
+            target.try_set_count(count)?;
+            for output_row in 0..count {
+                let slot = scratch.slots[selection.get(output_row)];
+                match self.decode_group_value(slot, group_idx)? {
+                    Some(value) => target.set_value(output_row, &value),
+                    None => target.try_set_null(output_row, true)?,
+                }
+            }
+        }
+        for aggregate_idx in 0..self.aggregate_objects.len() {
+            let source = scratch.aggregates.column(aggregate_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Missing state-filter aggregate scratch column {aggregate_idx}"
+                ))
+            })?;
+            let target_idx = self.group_domains.len() + aggregate_idx;
+            result
+                .column_mut(target_idx)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Missing state-filter aggregate output column {target_idx}"
+                    ))
+                })?
+                .try_copy_range(0, source.as_ref(), 0, count)?;
+        }
+        Ok(())
     }
 
     pub fn destroy(&mut self) -> Result<()> {
@@ -525,7 +718,7 @@ impl PerfectAggregateHashTable {
         }
 
         let mut ptrs = Vec::with_capacity(self.count);
-        for slot in 0..self.total_groups {
+        for slot in 0..self.total_groups() {
             if self.occupancy[slot] != 0 {
                 ptrs.push(self.state_ptr(slot));
             }
@@ -558,7 +751,8 @@ impl PerfectAggregateHashTable {
     }
 
     pub fn external_accounted_memory_usage(&self) -> usize {
-        self.data.capacity() * size_of::<u64>() + self.occupancy.capacity() * size_of::<u8>()
+        self.data.capacity() * size_of::<MaybeUninit<u64>>()
+            + self.occupancy.capacity() * size_of::<u8>()
     }
 
     pub fn reclaimable_finalized_memory(&self) -> usize {
@@ -609,12 +803,12 @@ impl PerfectAggregateHashTable {
         for group_idx in 0..self.group_domains.len() {
             let encoded =
                 self.encoded_group_value(&decoded_groups[group_idx], row_idx, group_idx)?;
-            slot |= encoded << self.bit_offsets[group_idx];
+            slot = self.slot_layout.add_component(slot, group_idx, encoded)?;
         }
-        if slot >= self.total_groups {
+        if slot >= self.total_groups() {
             return Err(paro_error::internal(format!(
                 "Perfect aggregate slot out of bounds: slot={slot}, total_groups={}",
-                self.total_groups
+                self.total_groups()
             )));
         }
         Ok(slot)
@@ -646,15 +840,15 @@ impl PerfectAggregateHashTable {
                 "Perfect aggregate key smaller than expected minimum: value={value}, min={min_value}, group_idx={group_idx}"
             )));
         }
-        let max_encoded = max_encoded_for_bits(self.required_bits[group_idx])?;
+        let cardinality = self.slot_layout.cardinalities[group_idx];
         let adjusted_u128 = u128::try_from(adjusted).map_err(|_| {
             paro_error::internal(format!(
                 "Perfect aggregate adjusted key conversion failed: adjusted={adjusted}, group_idx={group_idx}"
             ))
         })?;
-        if adjusted_u128 > max_encoded {
+        if adjusted_u128 >= cardinality as u128 {
             return Err(paro_error::internal(format!(
-                "Perfect aggregate key exceeds planned range: adjusted={adjusted_u128}, max={max_encoded}, group_idx={group_idx}"
+                "Perfect aggregate key exceeds planned range: adjusted={adjusted_u128}, cardinality={cardinality}, group_idx={group_idx}"
             )));
         }
         usize::try_from(adjusted_u128).map_err(|_| {
@@ -665,10 +859,7 @@ impl PerfectAggregateHashTable {
     }
 
     fn decode_group_value(&self, slot: usize, group_idx: usize) -> Result<Option<Value>> {
-        let bits = self.required_bits[group_idx];
-        let shift = self.bit_offsets[group_idx];
-        let mask = ((1usize << bits) - 1) as u128;
-        let encoded = ((slot >> shift) as u128) & mask;
+        let encoded = self.slot_layout.decode_component(slot, group_idx);
         if encoded == 0 {
             return Ok(None);
         }
@@ -729,8 +920,7 @@ impl PerfectAggregateHashTable {
     fn ensure_compatible(&self, other: &Self) -> Result<()> {
         if self.group_domains != other.group_domains
             || self.group_minima != other.group_minima
-            || self.required_bits != other.required_bits
-            || self.total_groups != other.total_groups
+            || self.slot_layout != other.slot_layout
             || self.state_layout.total_size() != other.state_layout.total_size()
         {
             return Err(paro_error::internal(
@@ -764,8 +954,12 @@ impl PerfectAggregateHashTable {
 
     #[inline]
     fn state_ptr(&self, slot: usize) -> *mut u8 {
-        debug_assert!(slot < self.total_groups);
+        debug_assert!(slot < self.total_groups());
         let offset = slot * self.row_width;
+        // SAFETY: `data` reserves `total_groups * row_width` bytes (rounded up
+        // to u64 words), and `slot` is in range. The returned MaybeUninit
+        // storage is written by every aggregate initializer before an occupied
+        // slot can be consumed, combined, finalized, or destroyed.
         unsafe { (self.data.as_ptr() as *mut u8).add(offset) }
     }
 }
@@ -774,6 +968,29 @@ impl Drop for PerfectAggregateHashTable {
     fn drop(&mut self) {
         let _ = self.destroy();
     }
+}
+
+fn compact_state_addresses(
+    addresses: &mut Vector,
+    selection: &SelectionVector,
+    count: usize,
+) -> Result<()> {
+    if count > selection.len() || selection.len() > addresses.len() {
+        return Err(paro_error::internal(format!(
+            "invalid aggregate state-filter compaction: selected={count}, selection={}, addresses={}",
+            selection.len(),
+            addresses.len()
+        )));
+    }
+    // Selection indices are monotonically increasing, so forward in-place
+    // compaction never overwrites a source pointer before it is read.
+    unsafe {
+        let data = addresses.flat_data_mut::<*mut u8>();
+        for output_row in 0..count {
+            *data.add(output_row) = *data.add(selection.get(output_row));
+        }
+    }
+    addresses.try_set_count(count)
 }
 
 fn validate_aggregate_inputs(
@@ -862,11 +1079,42 @@ fn accounted_vec_for_context<T>(
     ))
 }
 
-fn max_encoded_for_bits(bits: usize) -> Result<u128> {
-    if bits == 0 || bits >= 128 {
-        return Err(paro_error::internal(format!(
-            "Invalid bit width for perfect aggregate group key: bits={bits}"
-        )));
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::PerfectHashSlotLayout;
+
+    #[test]
+    fn mixed_radix_layout_is_dense_and_round_trips_every_component() {
+        let layout = PerfectHashSlotLayout::try_new(vec![3, 5, 2]).expect("layout");
+        assert_eq!(layout.strides, vec![10, 2, 1]);
+        assert_eq!(layout.slot_count, 30);
+
+        let mut slots = HashSet::new();
+        for first in 0..3 {
+            for second in 0..5 {
+                for third in 0..2 {
+                    let mut slot = 0;
+                    for (group_idx, encoded) in [first, second, third].into_iter().enumerate() {
+                        slot = layout
+                            .add_component(slot, group_idx, encoded)
+                            .expect("component");
+                    }
+                    assert!(slots.insert(slot));
+                    assert_eq!(layout.decode_component(slot, 0), first);
+                    assert_eq!(layout.decode_component(slot, 1), second);
+                    assert_eq!(layout.decode_component(slot, 2), third);
+                }
+            }
+        }
+        assert_eq!(slots.len(), layout.slot_count);
     }
-    Ok((1u128 << bits) - 1)
+
+    #[test]
+    fn mixed_radix_layout_rejects_invalid_domains_and_components() {
+        assert!(PerfectHashSlotLayout::try_new(vec![1]).is_err());
+        let layout = PerfectHashSlotLayout::try_new(vec![3]).expect("layout");
+        assert!(layout.add_component(0, 0, 3).is_err());
+    }
 }

@@ -30,13 +30,13 @@ use crate::operators::aggregate::build_helpers::{
     aggregate_objects, can_skip_regular_aggregate_sink, create_hash_aggregate_tables,
     group_payload_refs, group_types, has_aggregate_distinct, has_aggregate_ordered,
     normalized_grouping_sets, projected_payload_chunk, query_hash_table_memory,
-    query_modifier_memory, update_hash_aggregate_tables,
+    query_modifier_memory, update_hash_aggregate_tables, update_hash_aggregate_tables_with_scratch,
 };
 use crate::operators::aggregate::distinct_helpers::{
     collect_distinct_rows, finalize_distinct_into_tables,
 };
 use crate::operators::aggregate::distinct_state::DistinctAggregateState;
-use crate::operators::aggregate::group_hash::hash_group_columns;
+use crate::operators::aggregate::group_hash::{hash_group_columns, GroupHashScratch};
 use crate::operators::aggregate::group_key_codec::GroupKeyEncoder;
 use crate::operators::aggregate::ordered_helpers::{
     collect_ordered_rows, empty_ordered_collectors_with_memory, finalize_ordered_into_hash_tables,
@@ -85,21 +85,12 @@ impl HashAggregateBuildSinkExec {
                 "force_external hash aggregate requires a temporary directory",
             ));
         }
-        let external_payload_spill =
-            hash_aggregate_external_payload_spill_enabled(ctx.query, &self.spec);
-        let tables = if external_payload_spill {
-            Vec::new()
-        } else {
-            create_hash_aggregate_tables(
-                &self.spec,
-                ctx.query.allocator(MemoryTag::HashTable),
-                query_hash_table_memory(ctx.query),
-                ctx.query.session.number_of_threads(),
-            )?
-        };
         let group_refs = group_payload_refs(&self.spec)?;
         handle.initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
-            tables,
+            // Local tables own the build path. The first completed local is
+            // adopted as the global table during merge, avoiding an O(groups)
+            // copy into a separately allocated empty table.
+            tables: Vec::new(),
             distinct: DistinctAggregateState::new(aggregate_objects(&self.spec)?.len()),
             spilled_payloads: Vec::new(),
             spilled_states: Vec::new(),
@@ -237,6 +228,10 @@ impl HashAggregateBuildSinkExec {
                 VECTOR_SIZE,
                 ctx.query.allocator(MemoryTag::HashTable),
             )?,
+            group_hash_scratch: GroupHashScratch::try_new(
+                VECTOR_SIZE,
+                ctx.query.allocator(MemoryTag::HashTable),
+            )?,
             grouping_sets: normalized_grouping_sets(&self.spec)?
                 .into_iter()
                 .map(Vec::into_boxed_slice)
@@ -342,13 +337,14 @@ impl HashAggregateBuildSinkExec {
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
-        update_hash_aggregate_tables(
+        update_hash_aggregate_tables_with_scratch(
             &self.spec,
             &local.aggregate_objects,
             payload,
             groups,
             &local.grouping_sets,
             &mut tables,
+            &mut local.group_hash_scratch,
             &mut local.addresses,
             &mut local.new_groups,
         )?;
@@ -404,17 +400,7 @@ impl HashAggregateBuildSinkExec {
                 )?;
                 return Ok(());
             }
-            if global.tables.len() != local_tables.len() {
-                return Err(paro_error::internal(format!(
-                    "hash aggregate table count mismatch: global={} local={}",
-                    global.tables.len(),
-                    local_tables.len()
-                )));
-            }
-            for (global_table, local_table) in global.tables.iter_mut().zip(local_tables.iter_mut())
-            {
-                global_table.combine(local_table)?;
-            }
+            merge_local_tables(&mut global.tables, &mut local_tables)?;
             if let Some(spill) = local.payload_spill.take() {
                 global.spilled_payloads.push(spill.seal());
             }
@@ -441,7 +427,7 @@ impl HashAggregateBuildSinkExec {
 
     pub(crate) fn finish_work(
         &self,
-        _ctx: &mut OperatorFinishContext,
+        ctx: &mut OperatorFinishContext,
         global: &SinkGlobal,
     ) -> Result<FinishWork> {
         let SinkGlobal::HashAggregateBuild(global) = global else {
@@ -449,6 +435,14 @@ impl HashAggregateBuildSinkExec {
                 "hash aggregate sink global state mismatch",
             ));
         };
+        global.handle.with_state_mut(|state| {
+            let AggregateRuntimeState::Hash(global) = state else {
+                return Err(paro_error::internal(
+                    "aggregate handle does not contain hash aggregate state",
+                ));
+            };
+            ensure_modifier_target_tables(ctx.query, &self.spec, global)
+        })?;
         Ok(
             match prepare_parallel_distinct_finalize(global.handle.clone(), &self.spec)? {
                 Some(group) => FinishWork::Parallel(group),
@@ -493,6 +487,7 @@ impl HashAggregateBuildSinkExec {
             if global.spilled_outputs.is_some() {
                 return Ok(());
             }
+            ensure_modifier_target_tables(ctx.query, &self.spec, global)?;
             finalize_distinct_into_tables(
                 &self.spec,
                 &aggregate_objects,
@@ -516,6 +511,44 @@ impl HashAggregateBuildSinkExec {
         global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)
     }
+}
+
+fn ensure_modifier_target_tables(
+    query: &crate::runtime::context::QueryRuntimeContext,
+    spec: &AggregateSpec,
+    state: &mut HashAggregateRuntimeState,
+) -> Result<()> {
+    if !state.tables.is_empty() || (!has_aggregate_distinct(spec) && !has_aggregate_ordered(spec)) {
+        return Ok(());
+    }
+    state.tables = create_hash_aggregate_tables(
+        spec,
+        query.allocator(MemoryTag::HashTable),
+        query_hash_table_memory(query),
+        query.session.number_of_threads(),
+    )?;
+    Ok(())
+}
+
+fn merge_local_tables(
+    global: &mut Vec<AggregateHashTable>,
+    local: &mut Vec<AggregateHashTable>,
+) -> Result<()> {
+    if global.is_empty() {
+        *global = std::mem::take(local);
+        return Ok(());
+    }
+    if global.len() != local.len() {
+        return Err(paro_error::internal(format!(
+            "hash aggregate table count mismatch: global={} local={}",
+            global.len(),
+            local.len()
+        )));
+    }
+    for (global_table, local_table) in global.iter_mut().zip(local.iter_mut()) {
+        global_table.combine(local_table)?;
+    }
+    Ok(())
 }
 
 fn hash_aggregate_payload_spill_supported(spec: &AggregateSpec) -> bool {
@@ -1243,389 +1276,5 @@ fn finish_output_spill_writers(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
-    use paro_common::runtime_value::Value;
-    use paro_context::test_support::TestStatementContextBuilder;
-    use paro_function::aggregate::distributive::count::get_count_star_function;
-    use paro_function::aggregate::distributive::string_agg::get_string_agg_function;
-    use paro_planner::expression::{AggregateExpression, Expression, ReferenceExpression};
-    use paro_storage::row::RowSpillReader;
-
-    use crate::explain::profiler::OperatorProfiler;
-    use crate::memory_runtime::QueryMemoryPool;
-    use crate::physical::specs::GroupKeyEncoding;
-    use crate::pipeline::graph::PipelineId;
-    use crate::runtime::parameter::ParameterBindings;
-    use crate::runtime::scratch::TaskMemoryGrants;
-    use crate::runtime::{
-        OperatorWakeScope, PipelineTaskId, QueryOutputPort, QueryRuntimeContext, RuntimeOperatorId,
-        WakeGeneration,
-    };
-    use crate::thread_context::ThreadContext;
-
-    fn reference(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
-    }
-
-    fn grouped_count_spec() -> AggregateSpec {
-        AggregateSpec {
-            grouping_key_count: 1,
-            estimated_input_rows: None,
-            projection_exprs: Box::new([]),
-            payload_types: Box::new([LogicalType::Integer]),
-            groups: Box::new([reference(0, LogicalType::Integer)]),
-            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
-            grouping_sets: Box::new([]),
-            aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
-                get_count_star_function(),
-                vec![],
-                LogicalType::BigInt,
-            ))]),
-            grouping_functions: Box::new([]),
-            aggregate_inputs: Box::new([Box::new([])]),
-            aggregate_filters: Box::new([None]),
-            aggregate_orders: Box::new([Box::new([])]),
-            having_filter: Box::new([]),
-            perfect_hash: None,
-            output_names: Box::new(["k".to_string(), "count".to_string()]),
-            output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
-        }
-    }
-
-    fn grouped_string_agg_spec() -> AggregateSpec {
-        let (string_agg, _) = get_string_agg_function()
-            .bind(&[LogicalType::Varchar])
-            .expect("bind string_agg");
-        AggregateSpec {
-            grouping_key_count: 1,
-            estimated_input_rows: None,
-            projection_exprs: Box::new([]),
-            payload_types: Box::new([LogicalType::Integer, LogicalType::Varchar]),
-            groups: Box::new([reference(0, LogicalType::Integer)]),
-            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
-            grouping_sets: Box::new([]),
-            aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
-                string_agg,
-                vec![reference(1, LogicalType::Varchar)],
-                LogicalType::Varchar,
-            ))]),
-            grouping_functions: Box::new([]),
-            aggregate_inputs: Box::new([Box::new([1])]),
-            aggregate_filters: Box::new([None]),
-            aggregate_orders: Box::new([Box::new([])]),
-            having_filter: Box::new([]),
-            perfect_hash: None,
-            output_names: Box::new(["k".to_string(), "items".to_string()]),
-            output_types: Box::new([LogicalType::Integer, LogicalType::Varchar]),
-        }
-    }
-
-    fn int_payload(values: &[i32], allocator: Arc<dyn paro_common::allocator::Allocator>) -> Chunk {
-        let mut payload = Chunk::try_initialize(&[LogicalType::Integer], values.len(), allocator)
-            .expect("payload");
-        payload.set_cardinality(values.len());
-        for (row_idx, value) in values.iter().enumerate() {
-            payload
-                .column_mut(0)
-                .expect("payload column")
-                .set_value(row_idx, &Value::Integer(*value));
-        }
-        payload
-    }
-
-    fn string_agg_payload(
-        rows: &[(i32, &str)],
-        allocator: Arc<dyn paro_common::allocator::Allocator>,
-    ) -> Chunk {
-        let mut payload = Chunk::try_initialize(
-            &[LogicalType::Integer, LogicalType::Varchar],
-            rows.len(),
-            allocator,
-        )
-        .expect("payload");
-        payload.set_cardinality(rows.len());
-        for (row_idx, (key, value)) in rows.iter().enumerate() {
-            payload
-                .column_mut(0)
-                .expect("key column")
-                .set_value(row_idx, &Value::Integer(*key));
-            payload
-                .column_mut(1)
-                .expect("value column")
-                .set_value(row_idx, &Value::Varchar((*value).to_string()));
-        }
-        payload
-    }
-
-    fn query_context() -> QueryRuntimeContext {
-        QueryRuntimeContext::new(
-            TestStatementContextBuilder::minimal().build(),
-            Arc::new(ParameterBindings::empty()),
-            Arc::new(QueryMemoryPool::unbounded()),
-            QueryOutputPort::unbounded(),
-        )
-    }
-
-    #[test]
-    fn mixed_spilled_payload_and_global_state_writes_bounded_output() {
-        let allocator = paro_common::test_utils::test_allocator();
-        let query = query_context();
-        let thread = ThreadContext::single_threaded();
-        let memory = TaskMemoryGrants::detached(allocator.clone());
-        let wake = OperatorWakeScope {
-            task_id: PipelineTaskId(42),
-            generation: WakeGeneration(0),
-        };
-        let mut profiler = OperatorProfiler::disabled();
-        let mut ctx = OperatorFinishContext {
-            query: &query,
-            pipeline: PipelineId::new(0),
-            operator: RuntimeOperatorId::new(0),
-            finish_task: None,
-            thread: &thread,
-            memory: memory.call_scope(),
-            cancel: &query.cancellation,
-            wake: &wake,
-            profiler: &mut profiler,
-        };
-
-        let spec = grouped_count_spec();
-        let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
-        let group_refs = group_payload_refs(&spec).expect("group refs");
-        let grouping_sets = normalized_grouping_sets(&spec)
-            .expect("grouping sets")
-            .into_iter()
-            .map(Vec::into_boxed_slice)
-            .collect::<Vec<_>>();
-        let table_memory = MemoryAccountingContext::detached(
-            MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
-        );
-        let mut tables =
-            create_hash_aggregate_tables(&spec, allocator.clone(), table_memory.clone(), 1)
-                .expect("tables");
-        let global_payload = int_payload(&[1, 2, 1], allocator.clone());
-        let mut addresses =
-            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
-        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
-        let global_groups = build_groups_chunk(&global_payload, &group_refs).expect("groups");
-        update_hash_aggregate_tables(
-            &spec,
-            &aggregate_objects,
-            &global_payload,
-            &global_groups,
-            &grouping_sets,
-            &mut tables,
-            &mut addresses,
-            &mut new_groups,
-        )
-        .expect("build global table");
-
-        let spilled_payload = int_payload(&[1, 3, 2], allocator.clone());
-        let groups = build_groups_chunk(&spilled_payload, &group_refs).expect("groups");
-        let hashes = hash_group_columns(&groups).expect("hashes");
-        let mut payload_spill = AggregatePayloadSpillBuffer::new(
-            query.session.buffer_pool().clone(),
-            spilled_payload.types(),
-            aggregate_payload_spill_radix_bits(1),
-            table_memory,
-        )
-        .expect("payload spill");
-        payload_spill
-            .append_payload(&spilled_payload, &hashes)
-            .expect("append payload spill");
-        let spilled_payloads = vec![payload_spill.seal()];
-
-        let mut state = HashAggregateRuntimeState {
-            tables,
-            distinct: Default::default(),
-            spilled_payloads: Vec::new(),
-            spilled_states: Vec::new(),
-            spilled_outputs: None,
-            ordered_collectors: Vec::new(),
-        };
-        let spilled_bytes = spill_payload_partitions_to_outputs(
-            &mut ctx,
-            &spec,
-            &aggregate_objects,
-            &group_refs,
-            &grouping_sets,
-            &mut state,
-            &spilled_payloads,
-            &[],
-        )
-        .expect("spill mixed replay output");
-        assert!(spilled_bytes > 0);
-        assert!(state.tables.is_empty());
-
-        let outputs = state.spilled_outputs.take().expect("spilled outputs");
-        let mut reader = outputs
-            .into_iter()
-            .flatten()
-            .next()
-            .expect("first spilled output")
-            .into_reader();
-        let mut output =
-            Chunk::try_initialize(&[LogicalType::Integer, LogicalType::BigInt], 8, allocator)
-                .expect("output chunk");
-        let mut actual = Vec::new();
-        loop {
-            let count = reader.read_next(&mut output).expect("read output");
-            if count == 0 {
-                break;
-            }
-            actual.extend((0..output.size()).map(|row| {
-                (
-                    output.column(0).unwrap().get_i32(row).unwrap(),
-                    output.column(1).unwrap().get_i64(row).unwrap(),
-                )
-            }));
-        }
-        actual.sort_unstable();
-        assert_eq!(actual, vec![(1, 3), (2, 2), (3, 1)]);
-    }
-
-    #[test]
-    fn mixed_spilled_payload_and_serialized_string_state_writes_bounded_output() {
-        let allocator = paro_common::test_utils::test_allocator();
-        let query = query_context();
-        let thread = ThreadContext::single_threaded();
-        let memory = TaskMemoryGrants::detached(allocator.clone());
-        let wake = OperatorWakeScope {
-            task_id: PipelineTaskId(43),
-            generation: WakeGeneration(0),
-        };
-        let mut profiler = OperatorProfiler::disabled();
-        let mut ctx = OperatorFinishContext {
-            query: &query,
-            pipeline: PipelineId::new(0),
-            operator: RuntimeOperatorId::new(0),
-            finish_task: None,
-            thread: &thread,
-            memory: memory.call_scope(),
-            cancel: &query.cancellation,
-            wake: &wake,
-            profiler: &mut profiler,
-        };
-
-        let spec = grouped_string_agg_spec();
-        let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
-        assert!(hash_aggregate_state_spill_supported(
-            &spec,
-            &aggregate_objects
-        ));
-        assert_eq!(
-            hash_aggregate_state_spill_encoding(&aggregate_objects),
-            AggregateStateEncoding::FunctionSerialized
-        );
-
-        let group_refs = group_payload_refs(&spec).expect("group refs");
-        let grouping_sets = normalized_grouping_sets(&spec)
-            .expect("grouping sets")
-            .into_iter()
-            .map(Vec::into_boxed_slice)
-            .collect::<Vec<_>>();
-        let table_memory = MemoryAccountingContext::detached(
-            MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
-        );
-        let mut tables =
-            create_hash_aggregate_tables(&spec, allocator.clone(), table_memory.clone(), 1)
-                .expect("tables");
-        let global_payload =
-            string_agg_payload(&[(1, "alpha"), (2, "solo"), (1, "beta")], allocator.clone());
-        let mut addresses =
-            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
-        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
-        let global_groups = build_groups_chunk(&global_payload, &group_refs).expect("groups");
-        update_hash_aggregate_tables(
-            &spec,
-            &aggregate_objects,
-            &global_payload,
-            &global_groups,
-            &grouping_sets,
-            &mut tables,
-            &mut addresses,
-            &mut new_groups,
-        )
-        .expect("build global table");
-
-        let spilled_payload = string_agg_payload(&[(1, "gamma"), (3, "fresh")], allocator.clone());
-        let groups = build_groups_chunk(&spilled_payload, &group_refs).expect("groups");
-        let hashes = hash_group_columns(&groups).expect("hashes");
-        let mut payload_spill = AggregatePayloadSpillBuffer::new(
-            query.session.buffer_pool().clone(),
-            spilled_payload.types(),
-            aggregate_payload_spill_radix_bits(1),
-            table_memory,
-        )
-        .expect("payload spill");
-        payload_spill
-            .append_payload(&spilled_payload, &hashes)
-            .expect("append payload spill");
-        let spilled_payloads = vec![payload_spill.seal()];
-
-        let mut state = HashAggregateRuntimeState {
-            tables,
-            distinct: Default::default(),
-            spilled_payloads: Vec::new(),
-            spilled_states: Vec::new(),
-            spilled_outputs: None,
-            ordered_collectors: Vec::new(),
-        };
-        let spilled_bytes = spill_payload_partitions_to_outputs(
-            &mut ctx,
-            &spec,
-            &aggregate_objects,
-            &group_refs,
-            &grouping_sets,
-            &mut state,
-            &spilled_payloads,
-            &[],
-        )
-        .expect("spill mixed replay output");
-        assert!(spilled_bytes > 0);
-        assert!(state.tables.is_empty());
-
-        let outputs = state.spilled_outputs.take().expect("spilled outputs");
-        let mut reader = outputs
-            .into_iter()
-            .flatten()
-            .next()
-            .expect("first spilled output")
-            .into_reader();
-        let mut output =
-            Chunk::try_initialize(&[LogicalType::Integer, LogicalType::Varchar], 8, allocator)
-                .expect("output chunk");
-        let mut actual = Vec::new();
-        loop {
-            let count = reader.read_next(&mut output).expect("read output");
-            if count == 0 {
-                break;
-            }
-            actual.extend((0..output.size()).map(|row| {
-                (
-                    output.column(0).unwrap().get_i32(row).unwrap(),
-                    output
-                        .column(1)
-                        .unwrap()
-                        .get_string(row)
-                        .unwrap()
-                        .to_string(),
-                )
-            }));
-        }
-        actual.sort_unstable_by_key(|(key, _)| *key);
-        assert_eq!(
-            actual,
-            vec![
-                (1, "alpha,beta,gamma".to_string()),
-                (2, "solo".to_string()),
-                (3, "fresh".to_string()),
-            ]
-        );
-    }
-}
+#[path = "build_tests.rs"]
+mod tests;

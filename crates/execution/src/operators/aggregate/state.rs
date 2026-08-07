@@ -22,9 +22,13 @@ use crate::runtime::breaker::{AggregateHandle, UngroupedAggregateRuntimeState};
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
 use super::distinct_state::DistinctAggregateState;
+use super::group_hash::GroupHashScratch;
 use super::group_key_codec::GroupKeyEncoder;
 use super::ordered_helpers::OrderedAggregateCollector;
-use super::perfect_aggregate_hashtable::{PerfectAggregateHashTable, PerfectHTScanPosition};
+use super::perfect_aggregate_hashtable::{
+    PerfectAggregateHashTable, PerfectAggregateScanScratch, PerfectAggregateStateFilter,
+    PerfectHTScanPosition,
+};
 use super::radix_partitioned_aggregate_hashtable::{AggregateHTScanPosition, AggregateHashTable};
 use super::row_format::AggregateGroupFormat;
 
@@ -80,10 +84,10 @@ pub struct UngroupedAggregateEmitSourceLocal {
 pub struct PerfectHashAggregateEmitSourceLocal {
     pub table: Option<PerfectAggregateHashTable>,
     pub position: PerfectHTScanPosition,
-    pub filtered_chunk: Option<Chunk>,
+    pub(crate) scan_scratch: Option<PerfectAggregateScanScratch>,
+    pub(crate) state_filter: Option<PerfectAggregateStateFilter>,
     pub having_executor: Option<ExpressionExecutor>,
     pub having_selection: Option<SelectionVector>,
-    pub having_columns: Box<[usize]>,
 }
 
 impl Drop for HashAggregateEmitWork {
@@ -117,6 +121,7 @@ pub struct HashAggregateBuildSinkLocal {
     pub payload_chunk: Option<Chunk>,
     pub group_refs: Box<[usize]>,
     pub(crate) group_key_encoder: GroupKeyEncoder,
+    pub(crate) group_hash_scratch: GroupHashScratch,
     pub grouping_sets: Box<[Box<[usize]>]>,
     pub addresses: Vector,
     pub new_groups: SelectionVector,

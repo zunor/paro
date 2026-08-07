@@ -298,6 +298,37 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
     }
 }
 
+fn grouped_distinct_count_spec() -> AggregateSpec {
+    let (function, _) = get_count_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind count(integer)");
+    AggregateSpec {
+        grouping_key_count: 1,
+        estimated_input_rows: None,
+        projection_exprs: Box::new([]),
+        payload_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+        groups: Box::new([reference(0, LogicalType::Integer)]),
+        group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
+        grouping_sets: Box::new([]),
+        aggregates: Box::new([Expression::Aggregate(
+            AggregateExpression::new(
+                function,
+                vec![reference(1, LogicalType::Integer)],
+                LogicalType::BigInt,
+            )
+            .with_aggr_type(AggregateType::Distinct),
+        )]),
+        grouping_functions: Box::new([]),
+        aggregate_inputs: Box::new([Box::new([1])]),
+        aggregate_filters: Box::new([None]),
+        aggregate_orders: Box::new([Box::new([])]),
+        having_filter: Box::new([]),
+        perfect_hash: None,
+        output_names: Box::new(["k".to_string(), "count".to_string()]),
+        output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
+    }
+}
+
 fn run_to_done(
     executor: &mut PipelineTaskExecutor,
     query: &QueryRuntimeContext,

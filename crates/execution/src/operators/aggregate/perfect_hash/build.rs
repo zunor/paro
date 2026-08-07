@@ -40,13 +40,8 @@ pub struct PerfectHashAggregateSinkExec {
 impl PerfectHashAggregateSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        let table = create_perfect_aggregate_table(
-            &self.spec,
-            ctx.query.allocator(MemoryTag::HashTable),
-            query_hash_table_memory(ctx.query),
-        )?;
         handle.initialize(AggregateRuntimeState::Perfect(
-            PerfectHashAggregateRuntimeState { table },
+            PerfectHashAggregateRuntimeState { table: None },
         ))?;
         ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
             AggregateBuildCompactionReclaimer::new(handle.clone()),
@@ -161,18 +156,31 @@ impl PerfectHashAggregateSinkExec {
                 "perfect aggregate sink local state mismatch",
             ));
         };
-        let Some(mut local_table) = local.table.take() else {
+        let Some(local_table) = local.table.take() else {
             return Ok(MergePoll::Done);
         };
+        let mut local_table = Some(local_table);
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Perfect(global) = state else {
                 return Err(paro_error::internal(
                     "aggregate handle does not contain perfect aggregate state",
                 ));
             };
-            global.table.combine(&mut local_table)
+            if global.table.is_none() {
+                global.table = local_table.take();
+                return Ok(());
+            }
+            let global_table = global.table.as_mut().ok_or_else(|| {
+                paro_error::internal("perfect aggregate global table disappeared during merge")
+            })?;
+            let local_table = local_table.as_mut().ok_or_else(|| {
+                paro_error::internal("perfect aggregate local table was already adopted")
+            })?;
+            global_table.combine(local_table)
         })?;
-        local_table.destroy()?;
+        if let Some(mut local_table) = local_table {
+            local_table.destroy()?;
+        }
         Ok(MergePoll::Done)
     }
 
@@ -194,7 +202,7 @@ impl PerfectHashAggregateSinkExec {
 
     pub(crate) fn finish(
         &self,
-        _ctx: &mut OperatorFinishContext,
+        ctx: &mut OperatorFinishContext,
         global: &SinkGlobal,
     ) -> Result<FinishPoll> {
         let SinkGlobal::PerfectHashAggregate(global) = global else {
@@ -202,6 +210,21 @@ impl PerfectHashAggregateSinkExec {
                 "perfect aggregate sink global state mismatch",
             ));
         };
+        global.handle.with_state_mut(|state| {
+            let AggregateRuntimeState::Perfect(global) = state else {
+                return Err(paro_error::internal(
+                    "aggregate handle does not contain perfect aggregate state",
+                ));
+            };
+            if global.table.is_none() {
+                global.table = Some(create_perfect_aggregate_table(
+                    &self.spec,
+                    ctx.query.allocator(MemoryTag::HashTable),
+                    query_hash_table_memory(ctx.query),
+                )?);
+            }
+            Ok(())
+        })?;
         global.handle.mark_finalized();
         global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)

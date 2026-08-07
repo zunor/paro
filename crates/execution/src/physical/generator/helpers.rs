@@ -20,12 +20,10 @@ pub(crate) fn extract_payload_expression(
 #[derive(Debug, Clone)]
 pub(crate) struct PerfectHashPlanInfo {
     pub(crate) group_minima: Vec<i128>,
-    pub(crate) required_bits: Vec<usize>,
+    pub(crate) group_cardinalities: Vec<usize>,
 }
 
 const PERFECT_HASH_RANGE_LIMIT: u128 = 1u128 << 32;
-const PERFECT_HASH_MAX_BITS: usize = 20;
-
 pub(crate) fn can_use_perfect_hash_aggregate(
     aggregate: &LogicalAggregate,
     groups: &[Expression],
@@ -48,9 +46,8 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         }
     }
 
-    let mut total_bits = 0usize;
     let mut group_minima = Vec::with_capacity(aggregate.groups.len());
-    let mut required_bits = Vec::with_capacity(aggregate.groups.len());
+    let mut group_cardinalities = Vec::with_capacity(aggregate.groups.len());
 
     for group_idx in 0..aggregate.groups.len() {
         let group_type = aggregate.groups[group_idx].return_type();
@@ -65,28 +62,19 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         if range_u128 >= PERFECT_HASH_RANGE_LIMIT {
             return None;
         }
-        let bits = required_bits_for_value(range_u128.checked_add(2)?)?;
-        total_bits = total_bits.checked_add(bits)?;
-        if total_bits > PERFECT_HASH_MAX_BITS {
-            return None;
-        }
+        // One code for NULL and one-based codes for every value in the
+        // inclusive range. Mixed-radix indexing consumes exactly this domain;
+        // rounding each key to a power of two wastes a material fraction of a
+        // large direct-addressing table.
+        let cardinality = usize::try_from(range_u128.checked_add(2)?).ok()?;
         group_minima.push(min_value);
-        required_bits.push(bits);
+        group_cardinalities.push(cardinality);
     }
 
     Some(PerfectHashPlanInfo {
         group_minima,
-        required_bits,
+        group_cardinalities,
     })
-}
-
-pub(crate) fn required_bits_for_value(mut value: u128) -> Option<usize> {
-    let mut bits = 0usize;
-    while value > 0 {
-        bits = bits.checked_add(1)?;
-        value >>= 1;
-    }
-    Some(bits)
 }
 
 pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {

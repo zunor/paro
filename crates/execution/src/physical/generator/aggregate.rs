@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
+use crate::operators::aggregate::build_helpers::aggregate_objects;
 use crate::operators::aggregate::tuple_layout::TupleLayout;
 use crate::physical::specs::GroupKeyEncoding;
 use paro_planner::operator::DistinctType;
@@ -278,11 +280,12 @@ impl PhysicalPlanGenerator {
             can_use_perfect_hash_aggregate(aggregate, &groups, &aggregates).map(|info| {
                 PerfectHashAggregatePlan {
                     group_minima: info.group_minima.into_boxed_slice(),
-                    required_bits: info.required_bits.into_boxed_slice(),
+                    group_cardinalities: info.group_cardinalities.into_boxed_slice(),
+                    max_local_tables: 1,
                 }
             });
 
-        let spec = AggregateSpec {
+        let mut spec = AggregateSpec {
             grouping_key_count: groups.len(),
             estimated_input_rows: aggregate
                 .child
@@ -321,6 +324,16 @@ impl PhysicalPlanGenerator {
                 .into_boxed_slice(),
             output_types: aggregate.returned_types.clone().into_boxed_slice(),
         };
+        if spec.perfect_hash.is_some() {
+            match perfect_hash_max_local_tables(&spec, self.ctx.max_memory, self.ctx.max_threads) {
+                Some(max_local_tables) => {
+                    if let Some(plan) = spec.perfect_hash.as_mut() {
+                        plan.max_local_tables = max_local_tables;
+                    }
+                }
+                None => spec.perfect_hash = None,
+            }
+        }
         Ok((PhysicalNodeKind::Aggregate(spec), vec![child]))
     }
 
@@ -380,4 +393,32 @@ impl PhysicalPlanGenerator {
         };
         Ok((PhysicalNodeKind::Aggregate(spec), vec![child]))
     }
+}
+
+const CONSERVATIVE_PERFECT_HASH_MAX_SLOTS: usize = 1 << 20;
+const PERFECT_HASH_MEMORY_BUDGET_DIVISOR: usize = 4;
+
+fn perfect_hash_max_local_tables(
+    spec: &AggregateSpec,
+    max_memory: usize,
+    parallelism: usize,
+) -> Option<usize> {
+    let plan = spec.perfect_hash.as_ref()?;
+    let slots = plan
+        .group_cardinalities
+        .iter()
+        .try_fold(1usize, |total, cardinality| total.checked_mul(*cardinality))?;
+    if max_memory == 0 {
+        return (slots <= CONSERVATIVE_PERFECT_HASH_MAX_SLOTS).then_some(parallelism.max(1));
+    }
+    let objects = aggregate_objects(spec).ok()?;
+    let layout = AggregateStateLayout::new(&objects).ok()?;
+    let bytes_per_table = layout
+        .total_size()
+        .max(1)
+        .checked_add(1)
+        .and_then(|bytes_per_slot| bytes_per_slot.checked_mul(slots))?;
+    let table_budget = max_memory / PERFECT_HASH_MEMORY_BUDGET_DIVISOR;
+    let admitted_tables = table_budget / bytes_per_table;
+    (admitted_tables > 0).then_some(admitted_tables.min(parallelism.max(1)))
 }

@@ -361,6 +361,7 @@ mod tests {
             update: noop_update,
             combine: noop_combine,
             finalize: noop_finalize,
+            state_filter: None,
             simple_update: None,
             distinct_run_update: None,
             destructor: None,

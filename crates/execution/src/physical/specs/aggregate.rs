@@ -50,5 +50,8 @@ pub struct AggregateSpec {
 #[derive(Debug, Clone)]
 pub struct PerfectHashAggregatePlan {
     pub group_minima: Box<[i128]>,
-    pub required_bits: Box<[usize]>,
+    pub group_cardinalities: Box<[usize]>,
+    /// Maximum number of concurrent local direct-addressing tables admitted by
+    /// the aggregate memory budget.
+    pub max_local_tables: usize,
 }

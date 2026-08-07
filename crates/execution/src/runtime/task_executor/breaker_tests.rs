@@ -10,11 +10,14 @@ fn aggregate_breaker_graph(
     input_types: Vec<LogicalType>,
     output: RowType,
 ) -> PipelineGraph {
+    let input_names = (0..input_types.len())
+        .map(|index| format!("c{index}"))
+        .collect();
     aggregate_breaker_graph_from_source(
         build_sink,
         emit_source,
         SourceSpec::Values(values_spec(input_rows, input_types.clone())),
-        RowType::new(vec!["k".to_string()], input_types),
+        RowType::new(input_names, input_types),
         output,
     )
 }
@@ -439,6 +442,54 @@ fn ungrouped_distinct_accepts_batches_larger_than_vector_size() {
 }
 
 #[test]
+fn grouped_distinct_lazily_creates_its_finalize_target_table() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let spec = grouped_distinct_count_spec();
+    let graph = aggregate_breaker_graph(
+        SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
+            handle: BreakerHandleId::new(0),
+            spec: spec.clone(),
+            required: Default::default(),
+        }),
+        SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
+            handle: BreakerHandleId::new(0),
+            spec,
+        }),
+        vec![
+            vec![int_constant(1), int_constant(10)],
+            vec![int_constant(1), int_constant(10)],
+            vec![int_constant(1), int_constant(11)],
+            vec![int_constant(2), int_constant(10)],
+            vec![int_constant(2), int_constant(10)],
+        ],
+        vec![LogicalType::Integer, LogicalType::Integer],
+        RowType::new(
+            vec!["k".to_string(), "count".to_string()],
+            vec![LogicalType::Integer, LogicalType::BigInt],
+        ),
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(21),
+        generation: WakeGeneration(0),
+    };
+    run_two_stage_breaker(graph, &query, &thread, &wake);
+
+    let mut rows = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        rows.extend((0..chunk.size()).map(|row| {
+            (
+                chunk.column(0).unwrap().get_i32(row).unwrap(),
+                chunk.column(1).unwrap().get_i64(row).unwrap(),
+            )
+        }));
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 2), (2, 1)]);
+}
+
+#[test]
 fn ungrouped_aggregate_having_can_suppress_its_single_row() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
@@ -730,7 +781,8 @@ fn perfect_hash_aggregate_breaker_groups_and_emits_counts() {
     let query = query_context(output.clone());
     let spec = grouped_count_spec(Some(PerfectHashAggregatePlan {
         group_minima: vec![1].into_boxed_slice(),
-        required_bits: vec![3].into_boxed_slice(),
+        group_cardinalities: vec![4].into_boxed_slice(),
+        max_local_tables: 1,
     }));
     let graph = aggregate_breaker_graph(
         SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {

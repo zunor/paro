@@ -52,3 +52,11 @@ validate = "row_count"
 expected = 18314
 collect_explain_profile = true
 allow_reexecute = true
+
+[[query]]
+id = "q18_large_volume_customer"
+file = "sql/q18.sql"
+validate = "row_count"
+expected = 57
+collect_explain_profile = true
+allow_reexecute = true

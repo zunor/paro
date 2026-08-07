@@ -68,6 +68,14 @@ impl PipelinePropertyAccumulator {
     }
 
     pub fn close_with_sink(mut self, sink: &SinkSpec) -> PipelinePropertyBuild {
+        if let SinkSpec::PerfectHashAggregate(spec) = sink {
+            if let Some(plan) = spec.spec.perfect_hash.as_ref() {
+                self.capabilities.parallelism = self
+                    .capabilities
+                    .parallelism
+                    .merge(Parallelism::bounded(plan.max_local_tables));
+            }
+        }
         let required = sink.required_properties();
         let repair =
             PhysicalPropertySolver::reconcile(&required, &self.current, &self.capabilities);

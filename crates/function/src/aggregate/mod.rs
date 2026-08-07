@@ -12,6 +12,7 @@
 
 use paro_common::allocator::ArenaAllocator;
 use paro_common::error::Result;
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionRef, SelectionVector, Vector};
 use std::fmt;
@@ -155,6 +156,29 @@ pub type AggregateFinalizeFn = unsafe fn(
     count: usize,
 ) -> Result<()>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateComparison {
+    Equal,
+    NotEqual,
+    LessThan,
+    GreaterThan,
+    LessThanOrEqual,
+    GreaterThanOrEqual,
+}
+
+/// Evaluate a bound comparison directly against aggregate states.
+///
+/// Implementations must preserve finalize-time validation (including overflow)
+/// and append matching logical row indices to `selection`.
+pub type AggregateStateFilterFn = unsafe fn(
+    states: &AggregateStateInput,
+    input_data: &AggregateInputData,
+    comparison: AggregateComparison,
+    constant: &Value,
+    selection: &mut SelectionVector,
+    count: usize,
+) -> Result<usize>;
+
 /// Function to destruct complex states (if state contains allocated resources like StringHeap).
 pub type AggregateDestructorFn =
     unsafe fn(states: &Vector, input_data: &AggregateInputData, count: usize);
@@ -237,6 +261,9 @@ pub struct AggregateFunction {
     /// Finalize state to result (vectorized).
     pub finalize: AggregateFinalizeFn,
 
+    /// Optional finalized-value comparison implemented on raw state.
+    pub state_filter: Option<AggregateStateFilterFn>,
+
     /// Simple update (for ungrouped aggregation optimization).
     /// If None, the execution engine must use `update` with a vector of identical pointers.
     pub simple_update: Option<AggregateSimpleUpdateFn>,
@@ -297,6 +324,7 @@ impl AggregateFunction {
             update,
             combine,
             finalize,
+            state_filter: None,
             simple_update,
             distinct_run_update: None,
             destructor,
@@ -305,6 +333,11 @@ impl AggregateFunction {
             varargs: None,
             bind_data: None,
         }
+    }
+
+    pub fn with_state_filter(mut self, filter: AggregateStateFilterFn) -> Self {
+        self.state_filter = Some(filter);
+        self
     }
 
     /// Set the reducer used when DISTINCT finalization has contiguous group runs.

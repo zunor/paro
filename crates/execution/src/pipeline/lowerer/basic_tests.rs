@@ -249,6 +249,7 @@ fn forced_external_hash_join_keeps_spill_replay_pipeline() {
         PlanBuildContext {
             force_external: true,
             rowset_scan_pushdown: true,
+            ..PlanBuildContext::default()
         },
     );
     let mut lowerer = PipelineLowerer::new(&plan);

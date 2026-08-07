@@ -667,7 +667,10 @@ impl AggregateRuntimeState {
         match self {
             Self::Hash(state) => state.reclaimable_finalized_memory(),
             Self::Ungrouped(_) => 0,
-            Self::Perfect(state) => state.table.reclaimable_finalized_memory(),
+            Self::Perfect(state) => state
+                .table
+                .as_ref()
+                .map_or(0, PerfectAggregateHashTable::reclaimable_finalized_memory),
         }
     }
 
@@ -694,11 +697,13 @@ impl AggregateRuntimeState {
         match self {
             Self::Hash(state) => state.reclaim_finalized_memory(target_bytes, buffer_pool, memory),
             Self::Ungrouped(_) => Ok(ReclaimStats::empty(target_bytes)),
-            Self::Perfect(state) => Ok(ReclaimStats::new(
-                target_bytes,
-                state.table.reclaim_finalized_memory(target_bytes),
-                0,
-            )),
+            Self::Perfect(state) => {
+                let reclaimed = state
+                    .table
+                    .as_mut()
+                    .map_or(0, |table| table.reclaim_finalized_memory(target_bytes));
+                Ok(ReclaimStats::new(target_bytes, reclaimed, 0))
+            }
         }
     }
 }
@@ -848,12 +853,14 @@ impl AggregateSpilledOutput {
 
 #[derive(Debug)]
 pub struct PerfectHashAggregateRuntimeState {
-    pub table: PerfectAggregateHashTable,
+    pub table: Option<PerfectAggregateHashTable>,
 }
 
 impl PerfectHashAggregateRuntimeState {
     fn destroy(&mut self) -> Result<()> {
-        self.table.destroy()
+        self.table
+            .as_mut()
+            .map_or(Ok(()), PerfectAggregateHashTable::destroy)
     }
 }
 

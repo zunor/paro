@@ -361,7 +361,7 @@ fn extract_constant_value(expr: &Expression, get: &Get, col_idx: usize) -> Resul
     }
 }
 
-fn evaluate_bound_constant(expr: &Expression) -> Result<Option<Value>> {
+pub(crate) fn evaluate_bound_constant(expr: &Expression) -> Result<Option<Value>> {
     match expr {
         Expression::Constant(constant) => Ok(Some(constant.value.clone())),
         Expression::Cast(cast) => {

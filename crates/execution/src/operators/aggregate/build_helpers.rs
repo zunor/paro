@@ -28,6 +28,7 @@ use crate::operators::aggregate::group_key_codec::{logical_group_types, physical
 use crate::operators::aggregate::grouped_aggregate_data::reference_index;
 use paro_storage::buffer::BufferPool;
 
+use crate::operators::aggregate::group_hash::GroupHashScratch;
 use crate::operators::aggregate::ordered_helpers::empty_ordered_collectors_with_memory;
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
@@ -544,7 +545,7 @@ pub(crate) fn create_perfect_aggregate_table(
         aggregate_objects(spec)?,
         aggregate_inputs(spec),
         perfect.group_minima.to_vec(),
-        perfect.required_bits.to_vec(),
+        perfect.group_cardinalities.to_vec(),
         allocator,
         memory,
     )
@@ -558,6 +559,32 @@ pub(crate) fn update_hash_aggregate_tables(
     all_groups: &Chunk,
     grouping_sets: &[Box<[usize]>],
     tables: &mut [AggregateHashTable],
+    addresses: &mut Vector,
+    new_groups: &mut SelectionVector,
+) -> Result<()> {
+    let mut hash_scratch =
+        GroupHashScratch::try_new(payload.size().max(1), payload.allocator().clone())?;
+    update_hash_aggregate_tables_with_scratch(
+        spec,
+        aggregate_objects,
+        payload,
+        all_groups,
+        grouping_sets,
+        tables,
+        &mut hash_scratch,
+        addresses,
+        new_groups,
+    )
+}
+
+pub(crate) fn update_hash_aggregate_tables_with_scratch(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+    payload: &Chunk,
+    all_groups: &Chunk,
+    grouping_sets: &[Box<[usize]>],
+    tables: &mut [AggregateHashTable],
+    hash_scratch: &mut GroupHashScratch,
     addresses: &mut Vector,
     new_groups: &mut SelectionVector,
 ) -> Result<()> {
@@ -592,7 +619,7 @@ pub(crate) fn update_hash_aggregate_tables(
     for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
         let groups =
             build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
-        let hashes = table.hash_groups(&groups)?;
+        let hashes = hash_scratch.hash(&groups)?;
         ensure_group_update_scratch(
             addresses,
             new_groups,

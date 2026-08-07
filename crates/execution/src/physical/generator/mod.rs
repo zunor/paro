@@ -50,7 +50,7 @@ use super::specs::{
     VectorSearchSpec, WindowSpec,
 };
 
-mod predicate_builder;
+pub(crate) mod predicate_builder;
 
 mod aggregate;
 mod dml;
@@ -70,6 +70,10 @@ use inequality_join_gate::*;
 pub struct PlanBuildContext {
     pub force_external: bool,
     pub rowset_scan_pushdown: bool,
+    /// Query-scoped memory available to physical operators. Zero means the
+    /// planner has no budget information and must use conservative defaults.
+    pub max_memory: usize,
+    pub max_threads: usize,
 }
 
 impl Default for PlanBuildContext {
@@ -77,6 +81,8 @@ impl Default for PlanBuildContext {
         Self {
             force_external: false,
             rowset_scan_pushdown: true,
+            max_memory: 0,
+            max_threads: 1,
         }
     }
 }
