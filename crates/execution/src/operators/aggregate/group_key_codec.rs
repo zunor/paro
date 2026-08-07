@@ -414,8 +414,8 @@ fn encode_offset_rows<S: IntegerValue, T: PackedWord>(
         let value = unsafe { *source_data.add(source_idx) }
             .to_i128()
             .ok_or_else(|| {
-                paro_error::data_corrupted(format!(
-                    "integer group key cannot be represented as i128 at row {row_idx}"
+                paro_error::internal(format!(
+                    "guaranteed integer group-key bound violated at row {row_idx}: value is not representable as i128"
                 ))
             })?;
         let offset = value
@@ -423,8 +423,8 @@ fn encode_offset_rows<S: IntegerValue, T: PackedWord>(
             .and_then(|offset| u128::try_from(offset).ok())
             .and_then(T::from_u128)
             .ok_or_else(|| {
-                paro_error::data_corrupted(format!(
-                    "integer group key exceeded its planned domain at row {row_idx}: value={value}, minimum={minimum}, physical_width={}",
+                paro_error::internal(format!(
+                    "guaranteed integer group-key bound violated at row {row_idx}: value={value}, minimum={minimum}, physical_width={}",
                     T::WIDTH
                 ))
             })?;

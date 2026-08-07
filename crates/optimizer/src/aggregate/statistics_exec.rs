@@ -418,8 +418,8 @@ mod tests {
     fn extract_numeric_min_max() {
         let mut base = BaseStatistics::new(LogicalType::Integer);
         base.set_has_no_null_fast();
-        NumericStats::set_min(&mut base, &Value::Integer(10));
-        NumericStats::set_max(&mut base, &Value::Integer(42));
+        NumericStats::set_guaranteed_min(&mut base, &Value::Integer(10));
+        NumericStats::set_guaranteed_max(&mut base, &Value::Integer(42));
         let stats = ColumnStatistics::new(base);
 
         assert_eq!(

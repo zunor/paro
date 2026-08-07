@@ -35,6 +35,14 @@ fn write_display(buffer: &mut BytesMut, value: impl fmt::Display) -> Result<()> 
         .map_err(|_| paro_error::internal("failed to format PostgreSQL text value"))
 }
 
+#[inline]
+fn append_timestamp_text(buffer: &mut BytesMut, micros: i64, with_timezone: bool) {
+    buffer.extend_from_slice(format_timestamp_micros(micros).as_bytes());
+    if with_timezone && !matches!(micros, i64::MIN | i64::MAX) {
+        buffer.extend_from_slice(b"+00");
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IntervalPhysical {
@@ -203,19 +211,12 @@ impl<'a> TextVectorEncoder<'a> {
             }
             LogicalType::Timestamp => {
                 let value = unsafe { self.fixed::<i64>(row_idx) };
-                buffer.extend_from_slice(format_timestamp_micros(value).as_bytes());
+                append_timestamp_text(buffer, value, false);
                 Ok(())
             }
             LogicalType::TimestampTz => {
                 let value = unsafe { self.fixed::<i64>(row_idx) };
-                if value == i64::MAX {
-                    buffer.extend_from_slice(b"infinity");
-                } else if value == i64::MIN {
-                    buffer.extend_from_slice(b"-infinity");
-                } else {
-                    buffer.extend_from_slice(format_timestamp_micros(value).as_bytes());
-                    buffer.extend_from_slice(b"+00");
-                }
+                append_timestamp_text(buffer, value, true);
                 Ok(())
             }
             LogicalType::Time => {
@@ -304,4 +305,29 @@ fn format_pg_array_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timestamp_text(micros: i64, with_timezone: bool) -> String {
+        let mut buffer = BytesMut::new();
+        append_timestamp_text(&mut buffer, micros, with_timezone);
+        String::from_utf8(buffer.to_vec()).expect("timestamp text should be UTF-8")
+    }
+
+    #[test]
+    fn timestamp_infinities_match_postgres_for_both_timestamp_types() {
+        for with_timezone in [false, true] {
+            assert_eq!(timestamp_text(i64::MIN, with_timezone), "-infinity");
+            assert_eq!(timestamp_text(i64::MAX, with_timezone), "infinity");
+        }
+    }
+
+    #[test]
+    fn timestamp_with_time_zone_appends_utc_offset_only_to_finite_values() {
+        assert_eq!(timestamp_text(0, false), "1970-01-01 00:00:00");
+        assert_eq!(timestamp_text(0, true), "1970-01-01 00:00:00+00");
+    }
 }

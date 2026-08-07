@@ -41,13 +41,13 @@ fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
             LogicalType::BigInt,
         ) => {
             statistics.set(StatsInfo::CannotHaveNullValues);
-            NumericStats::set_min(&mut statistics, &Value::BigInt(1));
-            NumericStats::set_max(&mut statistics, &Value::BigInt(i64::MAX));
+            NumericStats::set_guaranteed_min(&mut statistics, &Value::BigInt(1));
+            NumericStats::set_guaranteed_max(&mut statistics, &Value::BigInt(i64::MAX));
         }
         (WindowFunctionType::PercentRank | WindowFunctionType::CumeDist, LogicalType::Double) => {
             statistics.set(StatsInfo::CannotHaveNullValues);
-            NumericStats::set_min(&mut statistics, &Value::Double(0.0));
-            NumericStats::set_max(&mut statistics, &Value::Double(1.0));
+            NumericStats::set_guaranteed_min(&mut statistics, &Value::Double(0.0));
+            NumericStats::set_guaranteed_max(&mut statistics, &Value::Double(1.0));
         }
         (
             WindowFunctionType::RowNumber
@@ -440,8 +440,12 @@ impl StatisticsPropagator {
                                             }
                                             _ => {
                                                 if !min.is_null() && !max.is_null() {
-                                                    NumericStats::set_min(&mut base, &min);
-                                                    NumericStats::set_max(&mut base, &max);
+                                                    NumericStats::set_guaranteed_min(
+                                                        &mut base, &min,
+                                                    );
+                                                    NumericStats::set_guaranteed_max(
+                                                        &mut base, &max,
+                                                    );
                                                 }
                                             }
                                         }
@@ -690,8 +694,8 @@ impl StatisticsPropagator {
             }
 
             if let (Some(min), Some(max)) = (s.min_value(), s.max_value()) {
-                NumericStats::set_min(&mut new_base, &min);
-                NumericStats::set_max(&mut new_base, &max);
+                NumericStats::set_guaranteed_min(&mut new_base, &min);
+                NumericStats::set_guaranteed_max(&mut new_base, &max);
             }
 
             Some(column_statistics_arc(new_base))
@@ -757,13 +761,13 @@ impl StatisticsPropagator {
 
                         {
                             let lb = left_col.statistics_mut();
-                            NumericStats::set_min(lb, &new_min);
-                            NumericStats::set_max(lb, &new_max);
+                            NumericStats::set_guaranteed_min(lb, &new_min);
+                            NumericStats::set_guaranteed_max(lb, &new_max);
                         }
                         {
                             let rb = right_col.statistics_mut();
-                            NumericStats::set_min(rb, &new_min);
-                            NumericStats::set_max(rb, &new_max);
+                            NumericStats::set_guaranteed_min(rb, &new_min);
+                            NumericStats::set_guaranteed_max(rb, &new_max);
                         }
 
                         self.statistics_map.insert(left_binding, Arc::new(left_col));
@@ -773,56 +777,56 @@ impl StatisticsPropagator {
                     ComparisonType::LessThan => {
                         if lx < rx {
                             let mut rc = right_col.clone();
-                            NumericStats::set_min(rc.statistics_mut(), &ln);
-                            NumericStats::set_max(rc.statistics_mut(), &rx);
+                            NumericStats::set_guaranteed_min(rc.statistics_mut(), &ln);
+                            NumericStats::set_guaranteed_max(rc.statistics_mut(), &rx);
                             self.statistics_map.insert(right_binding, Arc::new(rc));
                         }
                         if rn > ln {
                             let mut lc = left_col.clone();
-                            NumericStats::set_min(lc.statistics_mut(), &ln);
-                            NumericStats::set_max(lc.statistics_mut(), &rx);
+                            NumericStats::set_guaranteed_min(lc.statistics_mut(), &ln);
+                            NumericStats::set_guaranteed_max(lc.statistics_mut(), &rx);
                             self.statistics_map.insert(left_binding, Arc::new(lc));
                         }
                     }
                     ComparisonType::LessThanOrEqual => {
                         if lx <= rx {
                             let mut rc = right_col.clone();
-                            NumericStats::set_min(rc.statistics_mut(), &ln);
-                            NumericStats::set_max(rc.statistics_mut(), &rx);
+                            NumericStats::set_guaranteed_min(rc.statistics_mut(), &ln);
+                            NumericStats::set_guaranteed_max(rc.statistics_mut(), &rx);
                             self.statistics_map.insert(right_binding, Arc::new(rc));
                         }
                         if rn >= ln {
                             let mut lc = left_col.clone();
-                            NumericStats::set_min(lc.statistics_mut(), &ln);
-                            NumericStats::set_max(lc.statistics_mut(), &rx);
+                            NumericStats::set_guaranteed_min(lc.statistics_mut(), &ln);
+                            NumericStats::set_guaranteed_max(lc.statistics_mut(), &rx);
                             self.statistics_map.insert(left_binding, Arc::new(lc));
                         }
                     }
                     ComparisonType::GreaterThan => {
                         if ln > rn {
                             let mut rc = right_col.clone();
-                            NumericStats::set_min(rc.statistics_mut(), &rn);
-                            NumericStats::set_max(rc.statistics_mut(), &lx);
+                            NumericStats::set_guaranteed_min(rc.statistics_mut(), &rn);
+                            NumericStats::set_guaranteed_max(rc.statistics_mut(), &lx);
                             self.statistics_map.insert(right_binding, Arc::new(rc));
                         }
                         if rx < lx {
                             let mut lc = left_col.clone();
-                            NumericStats::set_min(lc.statistics_mut(), &rn);
-                            NumericStats::set_max(lc.statistics_mut(), &lx);
+                            NumericStats::set_guaranteed_min(lc.statistics_mut(), &rn);
+                            NumericStats::set_guaranteed_max(lc.statistics_mut(), &lx);
                             self.statistics_map.insert(left_binding, Arc::new(lc));
                         }
                     }
                     ComparisonType::GreaterThanOrEqual => {
                         if ln >= rn {
                             let mut rc = right_col.clone();
-                            NumericStats::set_min(rc.statistics_mut(), &rn);
-                            NumericStats::set_max(rc.statistics_mut(), &lx);
+                            NumericStats::set_guaranteed_min(rc.statistics_mut(), &rn);
+                            NumericStats::set_guaranteed_max(rc.statistics_mut(), &lx);
                             self.statistics_map.insert(right_binding, Arc::new(rc));
                         }
                         if rx <= lx {
                             let mut lc = left_col.clone();
-                            NumericStats::set_min(lc.statistics_mut(), &rn);
-                            NumericStats::set_max(lc.statistics_mut(), &lx);
+                            NumericStats::set_guaranteed_min(lc.statistics_mut(), &rn);
+                            NumericStats::set_guaranteed_max(lc.statistics_mut(), &lx);
                             self.statistics_map.insert(left_binding, Arc::new(lc));
                         }
                     }

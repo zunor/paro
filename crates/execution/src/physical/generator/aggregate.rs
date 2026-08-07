@@ -136,15 +136,11 @@ fn plan_integer_group_key(
     logical_type: &LogicalType,
     stats: &paro_storage::statistics::BaseStatistics,
 ) -> GroupKeyEncoding {
-    let Some(minimum) = NumericStats::min(stats)
-        .as_ref()
-        .and_then(integer_value_as_i128)
-    else {
+    let Some((minimum, maximum)) = NumericStats::guaranteed_bounds(stats) else {
         return GroupKeyEncoding::Identity;
     };
-    let Some(maximum) = NumericStats::max(stats)
-        .as_ref()
-        .and_then(integer_value_as_i128)
+    let Some((minimum, maximum)) =
+        integer_value_as_i128(&minimum).zip(integer_value_as_i128(&maximum))
     else {
         return GroupKeyEncoding::Identity;
     };

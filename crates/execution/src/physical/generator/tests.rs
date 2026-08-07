@@ -26,7 +26,7 @@ use paro_storage::search::{
     NormalizedSearchRequest, ProjectionSpec, SearchCapabilityState, SearchIntent,
     SearchRequestMode,
 };
-use paro_storage::statistics::StringStats;
+use paro_storage::statistics::{NumericStats, StringStats};
 
 use super::*;
 use crate::physical::specs::GroupKeyEncoding;
@@ -176,11 +176,11 @@ fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
         vec![],
     );
     let mut stats = paro_storage::statistics::NumericStats::create_empty(LogicalType::Integer);
-    paro_storage::statistics::NumericStats::set_min(
+    paro_storage::statistics::NumericStats::set_guaranteed_min(
         &mut stats,
         &paro_common::runtime_value::Value::Integer(-5),
     );
-    paro_storage::statistics::NumericStats::set_max(
+    paro_storage::statistics::NumericStats::set_guaranteed_max(
         &mut stats,
         &paro_common::runtime_value::Value::Integer(250),
     );
@@ -197,6 +197,78 @@ fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
     assert_eq!(
         spec.group_key_encodings.as_ref(),
         [GroupKeyEncoding::Identity]
+    );
+}
+
+#[test]
+fn aggregate_requires_complete_bounds_for_offset_keys() {
+    fn lower_with_stats(
+        first_stats: paro_storage::statistics::BaseStatistics,
+        second_stats: paro_storage::statistics::BaseStatistics,
+    ) -> Box<[GroupKeyEncoding]> {
+        let ctx = BindContext::new();
+        let values = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                vec![],
+                vec!["first".to_string(), "second".to_string()],
+                vec![LogicalType::BigInt, LogicalType::BigInt],
+            )),
+        );
+        let count = Expression::Aggregate(AggregateExpression::new(
+            get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        ));
+        let mut aggregate = Aggregate::new(
+            1,
+            2,
+            3,
+            values,
+            vec![
+                ref_expr(0, LogicalType::BigInt),
+                ref_expr(1, LogicalType::BigInt),
+            ],
+            vec![],
+            vec![count],
+            vec![],
+        );
+        aggregate.group_stats = vec![Some(first_stats), Some(second_stats)];
+        let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+        let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+        let plan = generator
+            .generate(&aggregate)
+            .expect("aggregate should lower");
+        let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+            panic!("expected aggregate root");
+        };
+        spec.group_key_encodings.clone()
+    }
+
+    let mut known = NumericStats::create_empty(LogicalType::BigInt);
+    NumericStats::update_i64(&mut known, 10);
+    NumericStats::update_i64(&mut known, 20);
+    assert_eq!(
+        lower_with_stats(known.copy(), known.copy()).as_ref(),
+        [
+            GroupKeyEncoding::OffsetInteger {
+                physical_type: LogicalType::UTinyInt,
+                minimum: 10,
+            },
+            GroupKeyEncoding::OffsetInteger {
+                physical_type: LogicalType::UTinyInt,
+                minimum: 10,
+            },
+        ]
+    );
+
+    let mut incomplete = known.copy();
+    incomplete.merge(&NumericStats::create_unknown(LogicalType::BigInt));
+    assert_eq!(
+        lower_with_stats(incomplete, known).as_ref(),
+        [GroupKeyEncoding::Identity, GroupKeyEncoding::Identity]
     );
 }
 

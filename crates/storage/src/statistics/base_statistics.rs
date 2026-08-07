@@ -11,7 +11,7 @@ use paro_common::error as paro_error;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
-use super::numeric_stats::NumericStatsData;
+use super::numeric_stats::{NumericStats, NumericStatsData};
 use super::string_stats::StringStatsData;
 use super::types::{StatisticsType, StatsInfo};
 
@@ -155,9 +155,7 @@ impl BaseStatistics {
     pub fn create_empty(data_type: LogicalType) -> Self {
         let stats_type = StatisticsType::from_logical_type(&data_type);
         let stats_data = match stats_type {
-            StatisticsType::NumericStats => {
-                StatsData::Numeric(NumericStatsData::new_empty(&data_type))
-            }
+            StatisticsType::NumericStats => StatsData::Numeric(NumericStatsData::new_empty()),
             StatisticsType::StringStats => StatsData::String(StringStatsData::new_empty()),
             _ => StatsData::Base,
         };
@@ -426,8 +424,8 @@ impl BaseStatistics {
         // 4. Type-specific data
         match &self.stats_data {
             StatsData::Numeric(data) => {
-                buffer.write_all(&[data.has_min as u8, data.has_max as u8])?;
-                // Serialize min/max based on type
+                // Each bound carries its own presence byte. A second pair of
+                // flags would duplicate state and permit invalid combinations.
                 if let Some(min) = data.min_value(&self.data_type) {
                     Self::serialize_value(&Some(min), &mut buffer)?;
                 } else {
@@ -471,6 +469,10 @@ impl BaseStatistics {
                     Value::Decimal(v, _, _) => buffer.write_all(&v.to_le_bytes())?,
                     Value::Float(f) => buffer.write_all(&f.to_le_bytes())?,
                     Value::Double(d) => buffer.write_all(&d.to_le_bytes())?,
+                    Value::Date(days) => buffer.write_all(&days.to_le_bytes())?,
+                    Value::Timestamp(micros) | Value::TimestampTz(micros) | Value::Time(micros) => {
+                        buffer.write_all(&micros.to_le_bytes())?
+                    }
                     _ => {
                         return Err(paro_error::not_implemented(
                             "Unsupported type for stats serialization",
@@ -505,7 +507,11 @@ impl BaseStatistics {
         let mut st_buf = [0u8; 1];
         cursor.read_exact(&mut st_buf)?;
 
-        let mut result = BaseStatistics::new(data_type.clone());
+        let mut result = if has_no_null {
+            BaseStatistics::new(data_type.clone())
+        } else {
+            BaseStatistics::create_empty(data_type.clone())
+        };
         result.has_null = has_null;
         result.has_no_null = has_no_null;
         result.distinct_count = distinct_count;
@@ -513,24 +519,14 @@ impl BaseStatistics {
         // Type-specific data
         match result.get_stats_type() {
             StatisticsType::NumericStats => {
-                let mut flags = [0u8; 2];
-                cursor.read_exact(&mut flags)?;
-                let has_min = flags[0] != 0;
-                let has_max = flags[1] != 0;
+                let minimum = Self::deserialize_value(&mut cursor, &data_type)?;
+                let maximum = Self::deserialize_value(&mut cursor, &data_type)?;
 
-                if let StatsData::Numeric(data) = &mut result.stats_data {
-                    data.has_min = has_min;
-                    data.has_max = has_max;
-                    if has_min {
-                        if let Some(min) = Self::deserialize_value(&mut cursor, &data_type)? {
-                            data.set_min(&min);
-                        }
-                    }
-                    if has_max {
-                        if let Some(max) = Self::deserialize_value(&mut cursor, &data_type)? {
-                            data.set_max(&max);
-                        }
-                    }
+                if let Some(minimum) = minimum {
+                    NumericStats::set_guaranteed_min(&mut result, &minimum);
+                }
+                if let Some(maximum) = maximum {
+                    NumericStats::set_guaranteed_max(&mut result, &maximum);
                 }
             }
             StatisticsType::StringStats => {
@@ -551,12 +547,18 @@ impl BaseStatistics {
     ) -> paro_common::error::Result<Option<Value>> {
         use std::io::Read;
         let mut present = [0u8; 1];
-        if cursor.read_exact(&mut present).is_err() {
-            return Ok(None);
-        }
+        cursor.read_exact(&mut present).map_err(|_| {
+            paro_error::data_corrupted("truncated numeric statistics bound presence tag")
+        })?;
 
-        if present[0] == 0 {
-            return Ok(None);
+        match present[0] {
+            0 => return Ok(None),
+            1 => {}
+            tag => {
+                return Err(paro_error::data_corrupted(format!(
+                    "invalid numeric statistics bound presence tag: {tag}"
+                )))
+            }
         }
 
         match data_type {
@@ -637,12 +639,22 @@ impl BaseStatistics {
             LogicalType::Date => {
                 let mut buf = [0u8; 4];
                 cursor.read_exact(&mut buf)?;
-                Ok(Some(Value::Integer(i32::from_le_bytes(buf))))
+                Ok(Some(Value::Date(i32::from_le_bytes(buf))))
             }
-            LogicalType::Timestamp | LogicalType::TimestampTz | LogicalType::Time => {
+            LogicalType::Timestamp => {
                 let mut buf = [0u8; 8];
                 cursor.read_exact(&mut buf)?;
-                Ok(Some(Value::BigInt(i64::from_le_bytes(buf))))
+                Ok(Some(Value::Timestamp(i64::from_le_bytes(buf))))
+            }
+            LogicalType::TimestampTz => {
+                let mut buf = [0u8; 8];
+                cursor.read_exact(&mut buf)?;
+                Ok(Some(Value::TimestampTz(i64::from_le_bytes(buf))))
+            }
+            LogicalType::Time => {
+                let mut buf = [0u8; 8];
+                cursor.read_exact(&mut buf)?;
+                Ok(Some(Value::Time(i64::from_le_bytes(buf))))
             }
             _ => Err(paro_error::not_implemented(format!(
                 "Unsupported type for stats deserialization: {:?}",
@@ -657,18 +669,15 @@ impl BaseStatistics {
 
         let stats_data = if value.is_null() {
             match stats_type {
-                StatisticsType::NumericStats => {
-                    StatsData::Numeric(NumericStatsData::new_empty(&data_type))
-                }
+                StatisticsType::NumericStats => StatsData::Numeric(NumericStatsData::new_empty()),
                 StatisticsType::StringStats => StatsData::String(StringStatsData::new_empty()),
                 _ => StatsData::Base,
             }
         } else {
             match stats_type {
                 StatisticsType::NumericStats => {
-                    let mut data = NumericStatsData::new_empty(&data_type);
-                    data.set_min(value);
-                    data.set_max(value);
+                    let mut data = NumericStatsData::new_empty();
+                    data.update(value);
                     StatsData::Numeric(data)
                 }
                 StatisticsType::StringStats => {
@@ -746,16 +755,12 @@ impl BaseStatistics {
 
         let type_info = match &self.stats_data {
             StatsData::Numeric(data) => {
-                let min_str = if data.has_min {
-                    format!("{:?}", data.min)
-                } else {
-                    "None".to_string()
-                };
-                let max_str = if data.has_max {
-                    format!("{:?}", data.max)
-                } else {
-                    "None".to_string()
-                };
+                let min_str = data
+                    .min_value(&self.data_type)
+                    .map_or_else(|| "None".to_string(), |value| value.to_string());
+                let max_str = data
+                    .max_value(&self.data_type)
+                    .map_or_else(|| "None".to_string(), |value| value.to_string());
                 format!("[Min: {}, Max: {}]", min_str, max_str)
             }
             StatsData::String(data) => {
@@ -897,6 +902,55 @@ mod tests {
         } else {
             panic!("Expected numeric stats");
         }
+    }
+
+    #[test]
+    fn test_numeric_partial_bound_round_trip_keeps_slot_alignment() {
+        let mut stats = BaseStatistics::create_unknown(LogicalType::Integer);
+        NumericStats::set_guaranteed_max(&mut stats, &Value::Integer(42));
+
+        let bytes = stats.to_bytes().expect("statistics should serialize");
+        let restored = BaseStatistics::from_bytes(&bytes, LogicalType::Integer)
+            .expect("statistics should deserialize");
+        let StatsData::Numeric(data) = restored.stats_data() else {
+            panic!("expected numeric statistics");
+        };
+        assert_eq!(data.min_value(&LogicalType::Integer), None);
+        assert_eq!(
+            data.max_value(&LogicalType::Integer),
+            Some(Value::Integer(42))
+        );
+    }
+
+    #[test]
+    fn test_temporal_bounds_round_trip_with_logical_value_types() {
+        for value in [
+            Value::Date(-7),
+            Value::Timestamp(42),
+            Value::TimestampTz(i64::MAX),
+            Value::Time(123),
+        ] {
+            let stats = BaseStatistics::from_constant(&value);
+            let bytes = stats.to_bytes().expect("statistics should serialize");
+            let restored = BaseStatistics::from_bytes(&bytes, value.logical_type())
+                .expect("statistics should deserialize");
+            assert_eq!(restored.min_value(), Some(value.clone()));
+            assert_eq!(restored.max_value(), Some(value));
+        }
+    }
+
+    #[test]
+    fn test_numeric_bound_deserialization_rejects_invalid_presence_tags() {
+        const NUMERIC_PAYLOAD_OFFSET: usize = 2 + 8 + 1;
+
+        let stats = BaseStatistics::from_constant(&Value::Integer(42));
+        let mut bytes = stats.to_bytes().expect("statistics should serialize");
+        bytes[NUMERIC_PAYLOAD_OFFSET] = 2;
+        assert!(BaseStatistics::from_bytes(&bytes, LogicalType::Integer).is_err());
+
+        let truncated =
+            &stats.to_bytes().expect("statistics should serialize")[..NUMERIC_PAYLOAD_OFFSET];
+        assert!(BaseStatistics::from_bytes(truncated, LogicalType::Integer).is_err());
     }
 
     #[test]

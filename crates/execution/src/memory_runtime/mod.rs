@@ -46,7 +46,7 @@ pub use system_reserve::{SystemReserve, SystemReserveClass, SystemReserveReserva
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     use paro_common::allocator::{DefaultAllocator, MemoryTag};
     use paro_common::chunk::Chunk;
@@ -87,6 +87,52 @@ mod tests {
         }
 
         drop(local);
+        assert_eq!(pool.issued_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_pipeline_grants_share_one_query_capacity() {
+        const WORKER_COUNT: usize = 16;
+        const GRANT_BYTES: usize = 64;
+        const CAPACITY_BYTES: usize = GRANT_BYTES * 4;
+
+        let pool = Arc::new(QueryMemoryPool::new(CAPACITY_BYTES));
+        let start = Arc::new(Barrier::new(WORKER_COUNT + 1));
+        let acquired = Arc::new(Barrier::new(WORKER_COUNT + 1));
+        let release = Arc::new(Barrier::new(WORKER_COUNT + 1));
+        let successful_grants = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::with_capacity(WORKER_COUNT);
+
+        for _ in 0..WORKER_COUNT {
+            let pool = pool.clone();
+            let start = start.clone();
+            let acquired = acquired.clone();
+            let release = release.clone();
+            let successful_grants = successful_grants.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let granted = pool.try_grow(GRANT_BYTES).is_ok();
+                if granted {
+                    successful_grants.fetch_add(1, Ordering::Relaxed);
+                }
+                acquired.wait();
+                release.wait();
+                if granted {
+                    pool.release(GRANT_BYTES);
+                }
+            }));
+        }
+
+        start.wait();
+        acquired.wait();
+        assert_eq!(successful_grants.load(Ordering::Relaxed), 4);
+        assert_eq!(pool.issued_bytes(), CAPACITY_BYTES);
+        assert!(pool.issued_bytes() <= pool.capacity_bytes());
+        release.wait();
+
+        for worker in workers {
+            worker.join().expect("memory grant worker should finish");
+        }
         assert_eq!(pool.issued_bytes(), 0);
     }
 
