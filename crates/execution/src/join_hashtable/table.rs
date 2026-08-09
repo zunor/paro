@@ -37,7 +37,7 @@ use paro_storage::buffer::BufferPool;
 use paro_storage::buffer::MemoryTag;
 use paro_storage::row::RowLayout;
 
-use super::build_store::{BuildRowLayout, BuildStoreScanState, HashBuildStore};
+use super::build_store::{BuildHashInput, BuildRowLayout, BuildStoreScanState, HashBuildStore};
 use super::hash_kernel::JoinKeyLayout;
 use super::ht_entry::HtEntry;
 use super::integer_index::{ExactIntegerJoinIndex, IntegerKeyKind};
@@ -173,6 +173,10 @@ pub struct JoinHashTable {
     /// Build-time bounds accumulated from hot key vectors. Keeping this local
     /// to each parallel table removes a full serialized-row pass at finalize.
     integer_index_build_stats: Mutex<IntegerIndexBuildStats>,
+
+    /// Candidate exact integer joins do not need canonical hashes. The flag is
+    /// cleared after a fallback materializes hashes from serialized keys.
+    deferred_build_hashes: AtomicBool,
 
     /// Lock-free read pointer published with `finalized`.
     probe_integer_index: AtomicPtr<ExactIntegerJoinIndex>,
@@ -439,6 +443,7 @@ impl JoinHashTable {
             entries: Mutex::new(HtEntryTable::default()),
             integer_index: Mutex::new(None),
             integer_index_build_stats: Mutex::new(integer_index_build_stats),
+            deferred_build_hashes: AtomicBool::new(false),
             probe_integer_index: AtomicPtr::new(ptr::null_mut()),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
@@ -595,6 +600,7 @@ impl JoinHashTable {
         );
         let drained_store = {
             let mut store = self.build_store.lock().unwrap();
+            self.materialize_deferred_hashes(&store)?;
             std::mem::replace(&mut *store, empty_store)
         };
         self.count.store(0, Ordering::Relaxed);
@@ -623,6 +629,7 @@ impl JoinHashTable {
         if drained_bytes == 0 {
             return Ok(Some(0));
         }
+        self.materialize_deferred_hashes(&store)?;
         let empty_store = HashBuildStore::new_with_memory(
             self.buffer_pool.clone(),
             self.allocator.clone(),
@@ -765,6 +772,7 @@ impl JoinHashTable {
             &self.equality_types,
             &self.equality_comparisons,
         );
+        self.deferred_build_hashes.store(false, Ordering::Relaxed);
     }
 
     pub fn refresh_count_from_data_collection(&self) {
@@ -774,6 +782,7 @@ impl JoinHashTable {
         // collection. The optional exact index must decline rather than trust
         // incomplete bounds.
         *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::Ineligible;
+        self.deferred_build_hashes.store(false, Ordering::Relaxed);
     }
 
     /// Build by appending keys and payload to the build store.
@@ -818,18 +827,6 @@ impl JoinHashTable {
             return Ok(0);
         }
 
-        hashes.resize(appended_count, 0);
-        self.key_layout
-            .hash_selected_into(keys, build_sel, appended_count, hashes)?;
-        let appended_count = self.build_store.lock().unwrap().append_key_payload_chunk(
-            keys,
-            payload,
-            build_sel,
-            appended_count,
-            hashes,
-            false,
-        )?;
-
         let mut integer_stats = self.integer_index_build_stats.lock().unwrap();
         if !matches!(*integer_stats, IntegerIndexBuildStats::Ineligible) {
             let key = keys.column(0).ok_or_else(|| {
@@ -837,6 +834,31 @@ impl JoinHashTable {
             })?;
             integer_stats.add_batch(key, keys.size(), &build_sel.as_slice()[..appended_count])?;
         }
+        let defer_hashes = !matches!(*integer_stats, IntegerIndexBuildStats::Ineligible);
+        drop(integer_stats);
+
+        let hash_input = if defer_hashes {
+            BuildHashInput::Deferred
+        } else {
+            hashes.resize(appended_count, 0);
+            self.key_layout
+                .hash_selected_into(keys, build_sel, appended_count, hashes)?;
+            BuildHashInput::Computed(hashes)
+        };
+        let appended_count = {
+            let mut store = self.build_store.lock().unwrap();
+            if defer_hashes {
+                self.deferred_build_hashes.store(true, Ordering::Relaxed);
+            }
+            store.append_key_payload_chunk(
+                keys,
+                payload,
+                build_sel,
+                appended_count,
+                hash_input,
+                false,
+            )?
+        };
 
         // Update count
         self.count.fetch_add(appended_count, Ordering::Relaxed);
@@ -904,6 +926,11 @@ impl JoinHashTable {
             self.probe_integer_index.store(index_ptr, Ordering::Release);
             self.finalized.store(true, Ordering::Release);
             return Ok(());
+        }
+
+        {
+            let store = self.build_store.lock().unwrap();
+            self.materialize_deferred_hashes(&store)?;
         }
 
         // Step 1: Allocate and initialize pointer table
@@ -981,7 +1008,34 @@ impl JoinHashTable {
             Err(error) if error.error_class() == ErrorClass::Resource => return Ok(None),
             Err(error) => return Err(error),
         }
+        if index.needs_pointer_population() {
+            store.visit_row_ptrs(|row_ptr| {
+                let ordinal = kind
+                    .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "integer join build key does not match declared type {:?}",
+                            self.equality_types[0]
+                        ))
+                    })?;
+                index.populate_pointer(ordinal, row_ptr)
+            })?;
+        }
+        index.seal()?;
         Ok(Some(index))
+    }
+
+    fn materialize_deferred_hashes(&self, store: &HashBuildStore) -> Result<()> {
+        if !self.deferred_build_hashes.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        store.visit_row_ptrs(|row_ptr| {
+            let hash = self
+                .key_layout
+                .hash_build_row(&self.build_row_layout, row_ptr as *const u8);
+            self.build_row_layout.set_hash(row_ptr as *mut u8, hash);
+            Ok(())
+        })
     }
 
     #[cfg(test)]
@@ -1032,6 +1086,9 @@ impl JoinHashTable {
             .lock()
             .unwrap()
             .merge(incoming_stats);
+        if other.deferred_build_hashes.load(Ordering::Relaxed) {
+            self.deferred_build_hashes.store(true, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -1435,11 +1492,16 @@ mod tests {
                 JoinHashTableConfig::default(),
             );
             let payload = chunk_from_optional_i32(&[Some(20), Some(30)]);
-            ht.build(&chunk_from_optional_i32(&keys), &payload)
-                .expect("build keys");
+            let key_chunk = chunk_from_optional_i32(&keys);
+            ht.build(&key_chunk, &payload).expect("build keys");
             ht.finalize().expect("finalize join");
             assert!(!ht.has_integer_index());
             assert!(!ht.probe_entries.load(Ordering::Acquire).is_null());
+
+            let mut scan = ht.create_scan_structure().expect("scan state");
+            ht.probe(&key_chunk, &mut scan, None, key_chunk.size())
+                .expect("probe reconstructed hashes");
+            assert_eq!(scan.count, key_chunk.size());
         }
     }
 

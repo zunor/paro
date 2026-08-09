@@ -381,9 +381,10 @@ impl TopNHeap {
 
         // Collect indices of rows that pass the boundary check
         let mut passing_rows = Vec::new();
+        let mut sort_key = Vec::new();
 
         for row_idx in 0..sort_chunk.size() {
-            let sort_key = self.encode_sort_key(sort_chunk, row_idx, &sort_indices)?;
+            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
 
             // Row passes if its sort key is less than the boundary
             if compare_keys(&sort_key, &boundary_key) == Ordering::Less {
@@ -422,17 +423,18 @@ impl TopNHeap {
         let sort_indices: Vec<usize> = (0..sort_chunk.column_count()).collect();
 
         let mut any_added = false;
+        let mut sort_key = Vec::new();
 
         // First pass: add entries with temporary indices
         for row_idx in 0..sort_chunk.size() {
-            let sort_key = self.encode_sort_key(sort_chunk, row_idx, &sort_indices)?;
+            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
 
             if !self.should_add_entry(&sort_key) {
                 continue;
             }
 
             let entry = TopNEntry {
-                sort_key,
+                sort_key: std::mem::take(&mut sort_key),
                 index: BASE_INDEX + row_idx,
             };
 
@@ -491,17 +493,18 @@ impl TopNHeap {
 
         // The sort chunk materializes ORDER BY expressions densely as [0, 1, 2, ...].
         let sort_indices: Vec<usize> = (0..sort_chunk.column_count()).collect();
+        let mut sort_key = Vec::new();
 
         // Process each row
         for row_idx in 0..sort_chunk.size() {
-            let sort_key = self.encode_sort_key(sort_chunk, row_idx, &sort_indices)?;
+            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
 
             if !self.should_add_entry(&sort_key) {
                 continue;
             }
 
             let entry = TopNEntry {
-                sort_key,
+                sort_key: std::mem::take(&mut sort_key),
                 index: base_index + rows_to_copy.len(),
             };
 
@@ -560,12 +563,6 @@ impl TopNHeap {
         }
 
         false
-    }
-
-    fn encode_sort_key(&self, chunk: &Chunk, row_idx: usize, columns: &[usize]) -> Result<Vec<u8>> {
-        let mut result = Vec::new();
-        self.encode_sort_key_into(chunk, row_idx, columns, &mut result)?;
-        Ok(result)
     }
 
     fn encode_sort_key_into(

@@ -220,10 +220,15 @@ enum IntegerJoinStorage {
     },
     RankedBuilding {
         bits: GrantBuffer,
-        offsets: GrantBuffer,
-        input_pointers: GrantBuffer,
         count: usize,
         inserted: usize,
+    },
+    RankedPopulating {
+        bits: GrantBuffer,
+        ranks: GrantBuffer,
+        pointers: GrantBuffer,
+        count: usize,
+        populated: usize,
     },
     Ranked {
         bits: GrantBuffer,
@@ -277,23 +282,11 @@ impl ExactIntegerJoinIndex {
                 .checked_add(rank_bytes)
                 .and_then(|bytes| bytes.checked_add(pointer_bytes))
                 .ok_or_else(|| paro_error::internal("ranked join index size overflow"))?;
-            let offset_bytes = build_count
-                .checked_mul(std::mem::size_of::<u32>())
-                .ok_or_else(|| paro_error::internal("ranked join offset size overflow"))?;
-            // Finalization constructs ranks and the compact pointer array while
-            // the build-time offsets and input pointers are still live. Admit
-            // against that peak, not only the smaller published representation.
-            let peak_bytes = final_bytes
-                .checked_add(offset_bytes)
-                .and_then(|bytes| bytes.checked_add(pointer_bytes))
-                .ok_or_else(|| paro_error::internal("ranked join peak size overflow"))?;
-            if peak_bytes > MAX_RANKED_INDEX_BYTES {
+            if final_bytes > MAX_RANKED_INDEX_BYTES {
                 return Ok(None);
             }
             IntegerJoinStorage::RankedBuilding {
-                bits: memory.allocate_zeroed_buffer(allocator.clone(), bit_bytes)?,
-                offsets: memory.allocate_buffer(allocator.clone(), offset_bytes)?,
-                input_pointers: memory.allocate_buffer(allocator, pointer_bytes)?,
+                bits: memory.allocate_zeroed_buffer(allocator, bit_bytes)?,
                 count: build_count,
                 inserted: 0,
             }
@@ -310,13 +303,14 @@ impl ExactIntegerJoinIndex {
         match &self.storage {
             IntegerJoinStorage::Empty => 0,
             IntegerJoinStorage::Direct { pointers } => pointers.size(),
-            IntegerJoinStorage::RankedBuilding {
+            IntegerJoinStorage::RankedBuilding { bits, .. } => bits.size(),
+            IntegerJoinStorage::RankedPopulating {
                 bits,
-                offsets,
-                input_pointers,
+                ranks,
+                pointers,
                 ..
-            } => bits.size() + offsets.size() + input_pointers.size(),
-            IntegerJoinStorage::Ranked {
+            }
+            | IntegerJoinStorage::Ranked {
                 bits,
                 ranks,
                 pointers,
@@ -353,8 +347,6 @@ impl ExactIntegerJoinIndex {
             }
             IntegerJoinStorage::RankedBuilding {
                 bits,
-                offsets,
-                input_pointers,
                 count,
                 inserted,
             } => {
@@ -371,16 +363,9 @@ impl ExactIntegerJoinIndex {
                     ));
                 }
                 *word |= mask;
-                let offset = u32::try_from(index).map_err(|_| {
-                    paro_error::internal("ranked join key offset exceeds its physical format")
-                })?;
-                let offset_values = unsafe { grant_slice_mut::<u32>(offsets, *count) };
-                offset_values[*inserted] = offset;
-                let pointer_values = unsafe { grant_slice_mut::<usize>(input_pointers, *count) };
-                pointer_values[*inserted] = row_ptr;
                 *inserted += 1;
             }
-            IntegerJoinStorage::Ranked { .. } => {
+            IntegerJoinStorage::RankedPopulating { .. } | IntegerJoinStorage::Ranked { .. } => {
                 return Err(paro_error::internal(
                     "cannot insert into a finalized ranked join index",
                 ));
@@ -400,14 +385,12 @@ impl ExactIntegerJoinIndex {
         memory: &MemoryAccountingContext,
     ) -> Result<()> {
         let storage = std::mem::replace(&mut self.storage, IntegerJoinStorage::Empty);
-        let (bits, offsets, input_pointers, count, inserted) = match storage {
+        let (bits, count, inserted) = match storage {
             IntegerJoinStorage::RankedBuilding {
                 bits,
-                offsets,
-                input_pointers,
                 count,
                 inserted,
-            } => (bits, offsets, input_pointers, count, inserted),
+            } => (bits, count, inserted),
             other => {
                 self.storage = other;
                 return Ok(());
@@ -427,7 +410,7 @@ impl ExactIntegerJoinIndex {
             .checked_mul(std::mem::size_of::<usize>())
             .ok_or_else(|| paro_error::internal("ranked join pointer size overflow"))?;
         let mut ranks = memory.allocate_buffer(allocator.clone(), rank_bytes)?;
-        let mut pointers = memory.allocate_zeroed_buffer(allocator, pointer_bytes)?;
+        let pointers = memory.allocate_zeroed_buffer(allocator, pointer_bytes)?;
         let words = unsafe { grant_slice::<u64>(&bits, word_count) };
         let rank_values = unsafe { grant_slice_mut::<u32>(&mut ranks, word_count) };
         let mut running = 0_u32;
@@ -443,19 +426,84 @@ impl ExactIntegerJoinIndex {
             ));
         }
 
-        let source_offsets = unsafe { grant_slice::<u32>(&offsets, count) };
-        let source_pointers = unsafe { grant_slice::<usize>(&input_pointers, count) };
-        let ranked_pointers = unsafe { grant_slice_mut::<usize>(&mut pointers, count) };
-        for (&offset, &row_ptr) in source_offsets.iter().zip(source_pointers) {
-            let slot = ranked_slot(words, rank_values, offset as usize);
-            if ranked_pointers[slot] != 0 {
-                return Err(paro_error::internal(
-                    "ranked join index produced a duplicate rank",
-                ));
-            }
-            ranked_pointers[slot] = row_ptr;
-        }
+        self.storage = IntegerJoinStorage::RankedPopulating {
+            bits,
+            ranks,
+            pointers,
+            count,
+            populated: 0,
+        };
+        Ok(())
+    }
 
+    pub(super) fn needs_pointer_population(&self) -> bool {
+        matches!(self.storage, IntegerJoinStorage::RankedPopulating { .. })
+    }
+
+    pub(super) fn populate_pointer(&mut self, ordinal: u128, row_ptr: usize) -> Result<()> {
+        if row_ptr == 0 {
+            return Err(paro_error::internal(
+                "integer join index cannot store a null build-row pointer",
+            ));
+        }
+        let Some(index) = self.index_for_ordinal(ordinal) else {
+            return Err(paro_error::internal(
+                "ranked join pointer key fell outside its measured domain",
+            ));
+        };
+        let IntegerJoinStorage::RankedPopulating {
+            bits,
+            ranks,
+            pointers,
+            count,
+            populated,
+        } = &mut self.storage
+        else {
+            return Err(paro_error::internal(
+                "ranked join pointer population used outside its build phase",
+            ));
+        };
+        let words = unsafe { grant_slice::<u64>(bits, self.len.div_ceil(u64::BITS as usize)) };
+        let word = words[index / u64::BITS as usize];
+        let mask = 1_u64 << (index % u64::BITS as usize);
+        if word & mask == 0 {
+            return Err(paro_error::internal(
+                "ranked join pointer has no corresponding membership bit",
+            ));
+        }
+        let rank_values = unsafe { grant_slice::<u32>(ranks, words.len()) };
+        let slot = ranked_slot(words, rank_values, index);
+        let pointer_values = unsafe { grant_slice_mut::<usize>(pointers, *count) };
+        if pointer_values[slot] != 0 {
+            return Err(paro_error::internal(
+                "ranked join pointer slot was populated more than once",
+            ));
+        }
+        pointer_values[slot] = row_ptr;
+        *populated += 1;
+        Ok(())
+    }
+
+    pub(super) fn seal(&mut self) -> Result<()> {
+        let storage = std::mem::replace(&mut self.storage, IntegerJoinStorage::Empty);
+        let (bits, ranks, pointers, count, populated) = match storage {
+            IntegerJoinStorage::RankedPopulating {
+                bits,
+                ranks,
+                pointers,
+                count,
+                populated,
+            } => (bits, ranks, pointers, count, populated),
+            other => {
+                self.storage = other;
+                return Ok(());
+            }
+        };
+        if populated != count {
+            return Err(paro_error::internal(format!(
+                "ranked join pointer count mismatch: expected={count}, actual={populated}",
+            )));
+        }
         self.storage = IntegerJoinStorage::Ranked {
             bits,
             ranks,
@@ -521,9 +569,11 @@ impl ExactIntegerJoinIndex {
                     },
                 )
             }
-            IntegerJoinStorage::RankedBuilding { .. } | IntegerJoinStorage::Empty => Err(
-                paro_error::internal("integer join index was published before finalization"),
-            ),
+            IntegerJoinStorage::RankedBuilding { .. }
+            | IntegerJoinStorage::RankedPopulating { .. }
+            | IntegerJoinStorage::Empty => Err(paro_error::internal(
+                "integer join index was published before finalization",
+            )),
         }
     }
 
@@ -747,6 +797,11 @@ mod tests {
         index
             .finish(allocator.clone(), &memory)
             .expect("finish ranked index");
+        assert!(index.needs_pointer_population());
+        index
+            .populate_pointer(ordinal, 123)
+            .expect("populate ranked pointer");
+        index.seal().expect("seal ranked index");
 
         let vector = paro_common::test_utils::test_i32_vector_with_allocator(&[14, 15], allocator);
         let mut pointers = [0; 2];

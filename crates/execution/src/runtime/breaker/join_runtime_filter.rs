@@ -9,14 +9,11 @@
 //! keeps boxed [`Value`] conversion at the storage-predicate boundary rather
 //! than on every build row.
 
-use std::hash::Hash;
-
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::hash::ExecutionHashBuilder;
 use paro_common::memory::{
-    AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle,
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle,
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -47,8 +44,6 @@ impl Default for JoinRuntimeFilterPolicy {
     }
 }
 
-type ExecutionHashSet<T> = AccountedHashSet<T, ExecutionHashBuilder>;
-
 #[derive(Debug)]
 struct RuntimeFilterReservation(MemoryReleaseHandle);
 
@@ -61,7 +56,8 @@ impl Drop for RuntimeFilterReservation {
 #[derive(Debug)]
 enum ExactValues<T> {
     Enabled {
-        values: ExecutionHashSet<T>,
+        values: AccountedVec<T>,
+        normalized: bool,
         memory: MemoryAccountingContext,
     },
     Disabled,
@@ -75,34 +71,82 @@ struct FrozenExactValues {
 
 impl<T> ExactValues<T>
 where
-    T: Copy + Eq + Hash + Ord,
+    T: Copy + Eq + Ord,
 {
     fn mutable(memory: MemoryAccountingContext) -> Self {
         let Ok(grant) = memory.grant() else {
             return Self::Disabled;
         };
         Self::Enabled {
-            values: ExecutionHashSet::new_with_accounting_and_hasher(
+            values: AccountedVec::new_with_accounting(
                 grant,
                 memory.tag(),
                 memory.accounting_class(),
-                ExecutionHashBuilder,
             ),
+            normalized: true,
             memory,
         }
     }
 
     fn insert(&mut self, value: T, max_values: usize) {
-        let Self::Enabled { values, .. } = self else {
+        let Self::Enabled {
+            values, normalized, ..
+        } = self
+        else {
             return;
         };
-        if values.len() == max_values && !values.contains(&value) {
+        if max_values == 0 {
             *self = Self::Disabled;
             return;
         }
-        if values.try_insert(value).is_err() {
+
+        if !*normalized && values.len() >= max_values {
+            normalize_exact_values(values);
+            *normalized = true;
+        }
+
+        // Once the normalized domain reaches its distinct-value budget, a
+        // lookup decides whether the new value is a duplicate or requires a
+        // safe degradation to min/max. Below the budget, analytical keys are
+        // appended linearly and normalized in one batch instead of paying a
+        // hash-table insertion for every build row.
+        if *normalized && values.len() == max_values {
+            if values.binary_search(&value).is_err() {
+                *self = Self::Disabled;
+            }
+            return;
+        }
+        if values.try_push(value).is_err() {
             // Exact membership is optional. Query-memory pressure degrades to
             // the min/max domain maintained alongside this set.
+            *self = Self::Disabled;
+            return;
+        }
+        *normalized = false;
+        if values.len() >= max_values {
+            normalize_exact_values(values);
+            *normalized = true;
+            if values.len() > max_values {
+                *self = Self::Disabled;
+            }
+        }
+    }
+
+    /// Reserve the largest exact-domain prefix that an input batch can add
+    /// before the next normalization boundary.
+    ///
+    /// `AccountedVec` deliberately uses exact reservations so its query-memory
+    /// charge matches the physical allocation. Growing it one value at a time
+    /// would consequently put allocator and accounting work in the build-row
+    /// loop. Runtime filters consume vector batches, so reserve once at that
+    /// boundary instead. A failed reservation only disables optional exact
+    /// membership; min/max collection continues independently.
+    fn prepare_batch(&mut self, additional: usize, max_values: usize) {
+        let Self::Enabled { values, .. } = self else {
+            return;
+        };
+        let reservable = additional.min(max_values.saturating_sub(values.len()));
+        if reservable > 0 && values.try_reserve(reservable).is_err() {
             *self = Self::Disabled;
         }
     }
@@ -112,40 +156,73 @@ where
             Self::Disabled => *self = Self::Disabled,
             Self::Enabled {
                 values: mut incoming,
+                normalized: incoming_normalized,
                 memory: incoming_memory,
             } => {
-                let Self::Enabled { values, memory } = self else {
+                let Self::Enabled {
+                    values,
+                    normalized,
+                    memory,
+                } = self
+                else {
                     return;
                 };
-                if incoming.len() > values.len() {
-                    // Adopt the larger table and its accounting context. This
-                    // keeps combine linear in the smaller local domain and
-                    // avoids growing a second large allocation while both
-                    // tables are live.
+                if values.is_empty() {
+                    // The global builder starts empty. Adopt the first local
+                    // batch together with its accounting context without a
+                    // copy or a second allocation.
                     std::mem::swap(values, &mut incoming);
+                    *normalized = incoming_normalized;
                     *memory = incoming_memory;
+                    return;
                 }
-                for value in incoming.drain() {
-                    if values.len() == max_values && !values.contains(&value) {
+                if incoming.is_empty() {
+                    return;
+                }
+                normalize_exact_values(values);
+                normalize_exact_values(&mut incoming);
+                *normalized = true;
+
+                let normalized_len = values.len();
+                let reservable = incoming
+                    .len()
+                    .min(max_values.saturating_sub(normalized_len));
+                if reservable > 0 && values.try_reserve(reservable).is_err() {
+                    *self = Self::Disabled;
+                    return;
+                }
+                for value in incoming.iter().copied() {
+                    if values[..normalized_len].binary_search(&value).is_ok() {
+                        continue;
+                    }
+                    // `incoming` is normalized, so appended values cannot
+                    // duplicate one another. Only the original sorted prefix
+                    // needs a lookup while the suffix is appended.
+                    if values.len() == max_values || values.try_push(value).is_err() {
                         *self = Self::Disabled;
                         return;
                     }
-                    if values.try_insert(value).is_err() {
-                        *self = Self::Disabled;
-                        return;
-                    }
                 }
+                *normalized = values.len() == normalized_len;
             }
         }
     }
 
-    fn freeze_with(self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) -> FrozenExactValues {
-        let Self::Enabled { mut values, memory } = self else {
+    fn freeze_with(mut self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) -> FrozenExactValues {
+        let Self::Enabled {
+            values,
+            normalized,
+            memory,
+        } = &mut self
+        else {
             return FrozenExactValues {
                 values: None,
                 _reservation: None,
             };
         };
+        if !*normalized {
+            normalize_exact_values(values);
+        }
         let frozen = freeze(values.drain().collect());
         if frozen.is_contiguous() {
             return FrozenExactValues {
@@ -166,6 +243,21 @@ where
     }
 }
 
+fn normalize_exact_values<T: Copy + Eq + Ord>(values: &mut AccountedVec<T>) {
+    if values.len() < 2 {
+        return;
+    }
+    values.sort_unstable();
+    let mut write = 1usize;
+    for read in 1..values.len() {
+        if values[read] != values[write - 1] {
+            values[write] = values[read];
+            write += 1;
+        }
+    }
+    values.truncate(write);
+}
+
 #[derive(Debug)]
 struct ExactDomainBuilder<T> {
     min: Option<T>,
@@ -176,7 +268,7 @@ struct ExactDomainBuilder<T> {
 
 impl<T> ExactDomainBuilder<T>
 where
-    T: Copy + Eq + Hash + Ord,
+    T: Copy + Eq + Ord,
 {
     fn new(policy: JoinRuntimeFilterPolicy, memory: MemoryAccountingContext) -> Self {
         Self {
@@ -192,6 +284,11 @@ where
         self.min = Some(self.min.map_or(value, |current| current.min(value)));
         self.max = Some(self.max.map_or(value, |current| current.max(value)));
         self.values.insert(value, self.policy.max_exact_values);
+    }
+
+    fn prepare_batch(&mut self, additional: usize) {
+        self.values
+            .prepare_batch(additional, self.policy.max_exact_values);
     }
 
     fn merge(&mut self, incoming: Self) {
@@ -530,16 +627,19 @@ impl JoinRuntimeFilterKeyBuilder {
         let selected = &selection.as_slice()[..selected_count];
         match &mut self.domain {
             RuntimeFilterDomainBuilder::I32(domain) => {
+                domain.prepare_batch(selected_count);
                 visit_fixed(vector, logical_count, selected, Vector::get_i32, |value| {
                     add_exact_value(domain, &mut self.non_null_count, value)
                 })
             }
             RuntimeFilterDomainBuilder::I64(domain) => {
+                domain.prepare_batch(selected_count);
                 visit_fixed(vector, logical_count, selected, Vector::get_i64, |value| {
                     add_exact_value(domain, &mut self.non_null_count, value)
                 })
             }
             RuntimeFilterDomainBuilder::I128(domain) => {
+                domain.prepare_batch(selected_count);
                 visit_fixed(vector, logical_count, selected, Vector::get_i128, |value| {
                     add_exact_value(domain, &mut self.non_null_count, value)
                 })
@@ -720,7 +820,7 @@ fn add_exact_value<T>(
     non_null_count: &mut u64,
     value: Option<T>,
 ) where
-    T: Copy + Eq + Hash + Ord,
+    T: Copy + Eq + Ord,
 {
     let Some(value) = value else {
         return;
@@ -729,7 +829,7 @@ fn add_exact_value<T>(
     domain.add(value);
 }
 
-fn exact_or_range_predicate<T: Copy + Eq + Hash + Ord>(
+fn exact_or_range_predicate<T: Copy + Eq + Ord>(
     column_id: ColumnId,
     domain: &FrozenExactDomain<T>,
     to_value: impl Fn(T) -> Value,
@@ -838,6 +938,46 @@ mod tests {
             Some(PredicateTree::leaf(Predicate::Eq {
                 column_id: 9,
                 value: Value::BigInt(42),
+            }))
+        );
+    }
+
+    #[test]
+    fn exact_domain_budget_counts_distinct_values() {
+        let allocator = test_allocator();
+        let vector =
+            test_i64_vector_with_allocator(&[30, 10, 20, 10, 30, 20, 10], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(7, allocator).unwrap();
+        let mut builder =
+            JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&[LogicalType::BigInt], 3);
+        builder.add_key_chunk(&keys, &selection, 7).unwrap();
+
+        assert_eq!(
+            builder.freeze().predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 9,
+                values: FixedMembership::i64(vec![10, 20, 30]),
+            }))
+        );
+    }
+
+    #[test]
+    fn exact_domain_degrades_after_distinct_value_budget() {
+        let allocator = test_allocator();
+        let vector = test_i64_vector_with_allocator(&[30, 10, 20, 40], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(4, allocator).unwrap();
+        let mut builder =
+            JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&[LogicalType::BigInt], 3);
+        builder.add_key_chunk(&keys, &selection, 4).unwrap();
+
+        assert_eq!(
+            builder.freeze().predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::Range {
+                column_id: 9,
+                lower: Value::BigInt(10),
+                upper: Value::BigInt(40),
             }))
         );
     }
